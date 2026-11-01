@@ -134,13 +134,18 @@ impl Emulator {
     }
 }
 
-/// A one-stage, one-action declaration — the smallest thing that is a pipeline.
+/// The smallest declaration that is a pipeline: a source stage, and one stage that acts
+/// on what it fetched.
+///
+/// Two stages because that is the floor a declaration is held to, and the second stage's
+/// action is outside the `Source` category because a pipeline has to do something with
+/// the revision its source stage brings in (`state::validate_declaration`).
 pub(crate) fn declaration(name: &str) -> Value {
     json!({
         "name": name,
         "roleArn": ROLE_ARN,
         "artifactStore": {"type": "S3", "location": "my-bucket"},
-        "stages": [source_stage("Source")],
+        "stages": [source_stage("Source"), build_stage("Build", 1)],
     })
 }
 
@@ -385,7 +390,7 @@ async fn every_declaration_round_trips_as_stored() {
     // (case, declaration, expected pipelineType, expected executionMode)
     let cases: Vec<(&str, Value, &str, &str)> = vec![
         (
-            "one stage, one action",
+            "the smallest declaration there is",
             declaration("single"),
             // No V2-only parameter, so the type resolves to V1.
             "V1",
@@ -411,7 +416,7 @@ async fn every_declaration_round_trips_as_stored() {
                     "us-east-1": {"type": "S3", "location": "east"},
                     "eu-west-1": {"type": "S3", "location": "west"},
                 },
-                "stages": [source_stage("Source")],
+                "stages": [source_stage("Source"), build_stage("Build", 1)],
             }),
             "V1",
             "SUPERSEDED",
@@ -422,7 +427,7 @@ async fn every_declaration_round_trips_as_stored() {
                 "name": "with-variables",
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [source_stage("Source")],
+                "stages": [source_stage("Source"), build_stage("Build", 1)],
                 "variables": [{"name": "Env", "defaultValue": "test"}],
                 "triggers": [{
                     "providerType": "CodeStarSourceConnection",
@@ -438,7 +443,7 @@ async fn every_declaration_round_trips_as_stored() {
                 "name": "explicit",
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [source_stage("Source")],
+                "stages": [source_stage("Source"), build_stage("Build", 1)],
                 "pipelineType": "V2",
                 "executionMode": "QUEUED",
                 "variables": [{"name": "Env", "defaultValue": "test"}],
@@ -456,7 +461,7 @@ async fn every_declaration_round_trips_as_stored() {
                     "location": "my-bucket",
                     "encryptionKey": {"id": "alias/cp", "type": "KMS"},
                 },
-                "stages": [source_stage("Source")],
+                "stages": [source_stage("Source"), build_stage("Build", 1)],
             }),
             "V1",
             "SUPERSEDED",
@@ -553,28 +558,35 @@ async fn a_structurally_impossible_declaration_is_refused() {
                 "name": "empty-stage",
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [{"name": "Source", "actions": []}],
+                "stages": [{"name": "Source", "actions": []}, build_stage("Build", 1)],
             }),
             "InvalidStageDeclarationException",
         ),
         (
-            "the second stage has no actions",
+            "a middle stage with no actions",
             json!({
                 "name": "empty-second-stage",
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [source_stage("Source"), {"name": "Build", "actions": []}],
+                "stages": [
+                    source_stage("Source"),
+                    {"name": "Gate", "actions": []},
+                    build_stage("Build", 1),
+                ],
             }),
             "InvalidStageDeclarationException",
         ),
         (
+            // The requirement is the service's own, stated over the input rather than
+            // as a defect of the pipeline's structure
+            // (`state::MISSING_ARTIFACT_STORE_MESSAGE`).
             "neither artifactStore nor artifactStores",
             json!({
                 "name": "no-store",
                 "roleArn": ROLE_ARN,
                 "stages": [source_stage("Source")],
             }),
-            "InvalidStructureException",
+            "ValidationException",
         ),
         (
             "both artifactStore and artifactStores",
@@ -681,7 +693,7 @@ async fn a_name_in_use_is_refused_and_the_stored_pipeline_is_untouched() {
         .await;
 
     let mut second = declaration("demo");
-    second["stages"] = json!([source_stage("Different")]);
+    second["stages"] = json!([source_stage("Different"), build_stage("Build", 1)]);
     let (status, code) = emulator
         .expect_error("CreatePipeline", &json!({"pipeline": second}))
         .await;
@@ -694,7 +706,7 @@ async fn a_name_in_use_is_refused_and_the_stored_pipeline_is_untouched() {
     let fetched = emulator.ok("GetPipeline", &json!({"name": "demo"})).await;
     assert_eq!(
         stage_names(&fetched["pipeline"]),
-        vec!["Source".to_string()],
+        vec!["Source".to_string(), "Build".to_string()],
         "the refused create must not overwrite the stored declaration, got {fetched}"
     );
 }
@@ -907,7 +919,7 @@ async fn execution_variables_resolve_against_the_declaration() {
         "name": "vars",
         "roleArn": ROLE_ARN,
         "artifactStore": {"type": "S3", "location": "my-bucket"},
-        "stages": [source_stage("Source")],
+        "stages": [source_stage("Source"), build_stage("Build", 1)],
         "variables": [
             {"name": "Env", "defaultValue": "test"},
             {"name": "Release", "defaultValue": "none"},
@@ -989,7 +1001,7 @@ async fn execution_variables_resolve_against_the_declaration() {
                 "name": "needs-value",
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [source_stage("Source")],
+                "stages": [source_stage("Source"), build_stage("Build", 1)],
                 "variables": [{"name": "Env", "description": "no default"}],
             }}),
         )

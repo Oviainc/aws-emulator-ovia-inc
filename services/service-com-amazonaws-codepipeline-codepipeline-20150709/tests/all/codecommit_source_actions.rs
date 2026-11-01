@@ -321,6 +321,20 @@ fn extracting_deploy(artifact: &str, bucket: &str) -> Value {
     })
 }
 
+/// A manual-approval stage: the non-`Source` stage a declaration has to carry
+/// (`state::validate_declaration`) when the row under test delivers nothing.
+fn approval_gate() -> Value {
+    json!({
+        "name": "Gate",
+        "actions": [{
+            "name": "Approve",
+            "actionTypeId": {
+                "category": "Approval", "owner": "AWS", "provider": "Manual", "version": "1"
+            },
+        }],
+    })
+}
+
 /// A `Deploy` stage whose action invokes the Lambda function `function`.
 fn lambda_deploy(artifact: &str, function: &str) -> Value {
     json!({
@@ -413,17 +427,17 @@ async fn action_execution(emulator: &Emulator, pipeline: &str, action: &str) -> 
 /// RULE: creating a pipeline runs it once, and that run's trigger is the
 /// `CreatePipeline` member of `TriggerType`.
 ///
-/// The rows differ along what the rule generalises over: how many stages the pipeline
-/// declares, which provider its source action names, and whether that source can be
-/// resolved at all — none of which decides whether the creation runs the pipeline.
+/// The rows differ along what the rule generalises over: what the pipeline does with the
+/// revision it fetched, which provider its source action names, and whether that source
+/// can be resolved at all — none of which decides whether the creation runs the pipeline.
 #[tokio::test]
 async fn creating_a_pipeline_runs_it_once_with_the_create_pipeline_trigger() {
-    // (case, the stages the pipeline declares, whether the source is seeded)
+    // (case, whether the second stage deploys the artifact, whether the source is seeded)
     let rows: Vec<(&str, bool, bool)> = vec![
-        ("one stage, a source that resolves", false, true),
-        ("one stage, a source that does not", false, false),
-        ("two stages, a source that resolves", true, true),
-        ("two stages, a source that does not", true, false),
+        ("a deploying pipeline, a source that resolves", true, true),
+        ("a deploying pipeline, a source that does not", true, false),
+        ("a gated pipeline, a source that resolves", false, true),
+        ("a gated pipeline, a source that does not", false, false),
     ];
 
     for (index, (case, deploys, seeded)) in rows.into_iter().enumerate() {
@@ -444,6 +458,8 @@ async fn creating_a_pipeline_runs_it_once_with_the_create_pipeline_trigger() {
         let mut stages = vec![code_commit_source(&repository, "main", "SourceArtifact")];
         if deploys {
             stages.push(extracting_deploy("SourceArtifact", &delivered));
+        } else {
+            stages.push(approval_gate());
         }
         emulator
             .cp_ok(

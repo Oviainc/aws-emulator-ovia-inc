@@ -3976,9 +3976,16 @@ pub enum DeclarationProblem {
     Structure(String),
     /// Refused as `InvalidStageDeclarationException`: one stage is malformed.
     Stage(String),
+    /// Refused as `InvalidActionDeclarationException`: one action declaration is
+    /// malformed — a defect of that action rather than of the stage holding it or of
+    /// the pipeline as a whole.
+    Action(String),
     /// Refused as `LimitExceededException`: the declaration is past a quota rather than
     /// malformed — more stages, actions or configuration entries than this service runs.
     Limit(String),
+    /// Refused as `ValidationException`: an input the service states a requirement for
+    /// in its own words rather than a defect of the pipeline's structure.
+    Validation(String),
 }
 
 impl DeclarationProblem {
@@ -3986,10 +3993,34 @@ impl DeclarationProblem {
     /// fix the declaration from this text alone.
     pub fn message(&self) -> &str {
         match self {
-            Self::Structure(message) | Self::Stage(message) | Self::Limit(message) => message,
+            Self::Structure(message)
+            | Self::Stage(message)
+            | Self::Action(message)
+            | Self::Limit(message)
+            | Self::Validation(message) => message,
         }
     }
 }
+
+/// The message a declaration that names NO artifact store is refused with.
+///
+/// A FIXED sentence: the requirement is the service's, not a property of the declaration
+/// the caller sent, so nothing of the request is interpolated into it. `CreatePipeline`
+/// documents that "you must include either artifactStore or artifactStores in your
+/// pipeline", and the refusal states that requirement and the member a cross-region
+/// pipeline states it with. Shared by every operation that takes a
+/// `PipelineDeclaration`.
+pub const MISSING_ARTIFACT_STORE_MESSAGE: &str =
+    "Your pipeline must have an artifact store, such as an artifact bucket. Use \
+     'pipeline.artifactStores' to specify an artifact store for each region where you \
+     have an action.";
+
+/// The fewest stages one pipeline declaration may carry.
+///
+/// A pipeline brings a revision in through its source stage and then does something
+/// with it, so a declaration carrying fewer stages than this describes nothing the
+/// service could run and is refused as a structural defect rather than stored.
+pub const MIN_STAGES_PER_PIPELINE: usize = 2;
 
 /// The most stages one pipeline declaration may carry.
 ///
@@ -4044,6 +4075,45 @@ pub const CATEGORY_SOURCE: &str = "Source";
 /// `CreatePipeline` and `UpdatePipeline` cannot word one law two ways.
 pub const FIRST_STAGE_NOT_SOURCE_ONLY_MESSAGE: &str =
     "Pipeline should start with a stage that only contains source actions";
+
+/// The message `InvalidStructureException` carries when a declaration carries no action
+/// outside the `Source` category.
+///
+/// A FIXED sentence for the same reason as [`FIRST_STAGE_NOT_SOURCE_ONLY_MESSAGE`]: the
+/// defect is a property of the declaration as a whole — nothing in it would act on the
+/// revision its source actions bring in — so the refusal states the law and interpolates
+/// nothing. Shared by every operation that takes a `PipelineDeclaration`.
+pub const NO_NON_SOURCE_ACTION_MESSAGE: &str =
+    "Pipeline should contain at least 1 action whose category is not Source";
+
+/// The message `InvalidStructureException` carries for a declaration with too few
+/// stages: the count the request declared, and the floor it fell below.
+pub fn too_few_stages_message(stages: usize) -> String {
+    format!(
+        "Pipeline has only {stages} stage(s). There should be a minimum of \
+         {MIN_STAGES_PER_PIPELINE} stages in a pipeline"
+    )
+}
+
+/// The message `InvalidActionDeclarationException` carries when one stage declares two
+/// actions under one name.
+///
+/// Built from the request: an action is addressed by its name WITHIN a stage (an
+/// approval, a job, an action execution), so the refusal names the repeated action and
+/// the stage whose declaration repeats it.
+pub fn duplicate_action_name_message(action_name: &str, stage_name: &str) -> String {
+    format!("Action name '{action_name}' is used more than once in pipeline stage '{stage_name}'")
+}
+
+/// The fewest characters a `codepipeline` resource ARN carries.
+///
+/// `ResourceArn` declares a `@pattern` and no `@length`
+/// (`smithy_query query="shape" shape="ResourceArn"`), while CodePipeline holds the
+/// member to this floor as well. It is the length of the SHORTEST string that pattern
+/// can match — `arn:aws:codepipeline:` with one Region character, a colon, twelve
+/// account digits, a colon and one resource character — so no value the pattern admits
+/// falls below it, and a value below it is one the pattern already refused.
+pub const RESOURCE_ARN_MIN_LENGTH: i64 = 37;
 
 /// The message `PipelineNotFoundException` carries, for every operation that raises it.
 ///
@@ -4214,10 +4284,22 @@ pub fn arn_resource(resource_arn: &str) -> String {
 /// a declaration that could never execute:
 ///
 /// * `CreatePipeline` documents "you must include either `artifactStore` or
-///   `artifactStores` in your pipeline, but you cannot use both".
+///   `artifactStores` in your pipeline, but you cannot use both". A declaration that
+///   names NEITHER is refused with [`MISSING_ARTIFACT_STORE_MESSAGE`], the fixed
+///   sentence that requirement is stated in.
 /// * `stages` and `StageDeclaration$actions` are `@required`, which only makes the
 ///   members mandatory — an EMPTY list satisfies the constraint, yet a pipeline
-///   with no stage, or a stage with no action, has nothing to run.
+///   with no stage, or a stage with no action, has nothing to run. A declaration
+///   carrying fewer than [`MIN_STAGES_PER_PIPELINE`] stages is refused with
+///   [`too_few_stages_message`], over the count it declared.
+/// * a pipeline acts on the revision its source stage brings in, so the declaration
+///   must carry at least one action outside the `Source` category
+///   ([`NO_NON_SOURCE_ACTION_MESSAGE`]). That is a property of the declaration as a
+///   whole — not of any one stage — so it is stated before the per-stage rules below.
+/// * an action is addressed by its name within a stage, so one stage cannot declare
+///   two actions under one name ([`duplicate_action_name_message`]): that is a defect
+///   of the action declaration, and is refused before the artifact walk, whose own
+///   rules the repeated action would otherwise be reported against.
 /// * an `inputArtifacts` entry must name an artifact some EARLIER action outputs (an
 ///   earlier stage, or the same stage at a lower `runOrder`): an action cannot consume
 ///   an artifact nothing produces, and two actions cannot output the same name.
@@ -4244,14 +4326,14 @@ pub fn validate_declaration(
         ));
     }
     if !has_store && !has_stores {
-        return Err(DeclarationProblem::Structure(
-            "pipeline must include either artifactStore or artifactStores".to_string(),
+        return Err(DeclarationProblem::Validation(
+            MISSING_ARTIFACT_STORE_MESSAGE.to_string(),
         ));
     }
-    if declaration.stages.is_empty() {
-        return Err(DeclarationProblem::Structure(
-            "pipeline must include at least one stage in stages".to_string(),
-        ));
+    if declaration.stages.len() < MIN_STAGES_PER_PIPELINE {
+        return Err(DeclarationProblem::Structure(too_few_stages_message(
+            declaration.stages.len(),
+        )));
     }
 
     // The quotas come FIRST: every walk below is sized by the stage and action counts,
@@ -4331,22 +4413,15 @@ pub fn validate_declaration(
         )));
     }
 
-    if let Some(stage) = declaration
-        .stages
-        .iter()
-        .find(|stage| stage.actions.is_empty())
-    {
-        return Err(DeclarationProblem::Stage(format!(
-            "stage {} must include at least one action in actions",
-            stage.name
-        )));
-    }
-
-    // The first stage is the source stage: EVERY action it carries is a Source action
-    // (the stage is already known to carry at least one, by the check above), and no
-    // later stage carries one. One check for the whole first-stage law, so a first stage
-    // carrying no Source action and one mixing a Source action with a non-source action
-    // are refused identically — they are the same defect, stated by the same fixed
+    // The WHOLE-PIPELINE rules come before the per-stage and per-action ones: a
+    // declaration the pipeline-level laws refuse is refused for that, whatever any one
+    // stage of it also gets wrong, so a stage that happens to be empty does not hide the
+    // structural defect the caller has to fix first.
+    //
+    // The first stage is the source stage: EVERY action it carries is a Source action,
+    // and no later stage carries one. One check for the whole first-stage law, so a first
+    // stage carrying no Source action and one mixing a Source action with a non-source
+    // action are refused identically — they are the same defect, stated by the same fixed
     // sentence.
     let (first, rest) = declaration.stages.split_at(1);
     let first = &first[0];
@@ -4357,6 +4432,20 @@ pub fn validate_declaration(
     {
         return Err(DeclarationProblem::Structure(
             FIRST_STAGE_NOT_SOURCE_ONLY_MESSAGE.to_string(),
+        ));
+    }
+    // Something has to act on the revision the source stage brings in: a declaration
+    // whose actions are all `Source` ones — including one whose only other stage
+    // declares no action at all — describes a pipeline that would do nothing with what
+    // it fetched.
+    if !declaration
+        .stages
+        .iter()
+        .flat_map(|stage| stage.actions.iter())
+        .any(|action| action.action_type_id.category != CATEGORY_SOURCE)
+    {
+        return Err(DeclarationProblem::Structure(
+            NO_NON_SOURCE_ACTION_MESSAGE.to_string(),
         ));
     }
     for stage in rest {
@@ -4370,6 +4459,33 @@ pub fn validate_declaration(
                  action {} is in stage {}",
                 action.name, stage.name
             )));
+        }
+    }
+
+    if let Some(stage) = declaration
+        .stages
+        .iter()
+        .find(|stage| stage.actions.is_empty())
+    {
+        return Err(DeclarationProblem::Stage(format!(
+            "stage {} must include at least one action in actions",
+            stage.name
+        )));
+    }
+
+    // One stage cannot declare two actions under one name: every later call that
+    // addresses an action — an approval, a job, an action execution — names it by its
+    // stage and its name, so a repeated name leaves that addressing ambiguous. A SET
+    // per stage, so the walk stays linear in the declared action count.
+    for stage in &declaration.stages {
+        let mut names: BTreeSet<&str> = BTreeSet::new();
+        for action in &stage.actions {
+            if !names.insert(action.name.as_str()) {
+                return Err(DeclarationProblem::Action(duplicate_action_name_message(
+                    &action.name,
+                    &stage.name,
+                )));
+            }
         }
     }
 

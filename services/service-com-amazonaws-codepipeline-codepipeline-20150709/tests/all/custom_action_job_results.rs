@@ -151,12 +151,17 @@ fn worker_action(name: &str, run_order: i64, configuration: Value, namespace: Op
     action
 }
 
-/// Create a pipeline whose one stage runs `actions`, and answer the id of the execution
-/// its creation started.
+/// Create a pipeline whose `Build` stage runs `actions`, and answer the id of the
+/// execution its creation started.
 ///
 /// Creating a pipeline RUNS it once — `TriggerType` carries `CreatePipeline` for that
 /// run — so the pipeline's first execution is the one the create began, and that is the
 /// execution whose job the worker in each case below reports for.
+///
+/// The `Gate` stage after it is the non-`Source` action a declaration has to carry
+/// (`state::validate_declaration`): a manual approval does no work of its own, so the
+/// worker's own outcome is still what settles the `Build` stage, and a case that waits
+/// for the whole execution answers the approval through [`approve`].
 async fn start(emulator: &Emulator, name: &str, actions: Value) -> String {
     emulator
         .ok(
@@ -165,7 +170,18 @@ async fn start(emulator: &Emulator, name: &str, actions: Value) -> String {
                 "name": name,
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": format!("{name}-artifacts")},
-                "stages": [{"name": "Build", "actions": actions}],
+                "stages": [
+                    {"name": "Build", "actions": actions},
+                    {"name": GATE_STAGE, "actions": [{
+                        "name": GATE_ACTION,
+                        "actionTypeId": {
+                            "category": "Approval",
+                            "owner": "AWS",
+                            "provider": "Manual",
+                            "version": "1",
+                        },
+                    }]},
+                ],
             }}),
         )
         .await;
@@ -220,6 +236,54 @@ async fn claimed_job(emulator: &Emulator, case: &str) -> String {
         "case {case:?}: a claimed job is InProgress, got {acknowledged}"
     );
     job_id
+}
+
+/// The approval stage every fixture pipeline carries after its `Build` stage, and the
+/// action in it.
+const GATE_STAGE: &str = "Gate";
+/// See [`GATE_STAGE`].
+const GATE_ACTION: &str = "Approve";
+
+/// Answer the approval the `Gate` stage publishes once the execution reaches it, so an
+/// execution whose worker reported success can settle.
+async fn approve(emulator: &Emulator, pipeline: &str, case: &str) {
+    let deadline = Instant::now() + WAIT;
+    let token = loop {
+        let state = emulator
+            .ok("GetPipelineState", &json!({"name": pipeline}))
+            .await;
+        let token = state["stageStates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|stage| stage["stageName"] == json!(GATE_STAGE))
+            .filter_map(|stage| stage["actionStates"].as_array())
+            .flatten()
+            .find(|action| action["actionName"] == json!(GATE_ACTION))
+            .and_then(|action| action["latestExecution"]["token"].as_str())
+            .map(str::to_string);
+        if let Some(token) = token {
+            break token;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the approval action never published a token within {WAIT:?}, \
+             last {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    emulator
+        .ok(
+            "PutApprovalResult",
+            &json!({
+                "pipelineName": pipeline,
+                "stageName": GATE_STAGE,
+                "actionName": GATE_ACTION,
+                "token": token,
+                "result": {"summary": "approved by the suite", "status": "Approved"},
+            }),
+        )
+        .await;
 }
 
 /// Wait until the execution reaches a terminal status, answering it.
@@ -328,6 +392,12 @@ async fn the_outcome_a_worker_reports_is_the_actions_outcome() {
         let job_id = claimed_job(&emulator, case).await;
         result["jobId"] = json!(job_id);
         emulator.ok(operation, &result).await;
+
+        // A worker's success carries the execution into the approval stage, which only
+        // a caller can answer; a failure settles the execution at the Build stage.
+        if execution_status == "Succeeded" {
+            approve(&emulator, "demo", case).await;
+        }
 
         assert_eq!(
             terminal_status(&emulator, "demo", &execution_id, case).await,
@@ -521,6 +591,7 @@ async fn a_continuation_token_keeps_the_action_running() {
             }),
         )
         .await;
+    approve(&emulator, "demo", "continuation").await;
     assert_eq!(
         terminal_status(&emulator, "demo", &execution_id, "continuation").await,
         "Succeeded",

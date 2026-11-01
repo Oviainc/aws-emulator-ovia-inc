@@ -337,7 +337,16 @@ async fn a_stop_naming_what_the_store_does_not_hold_is_refused() {
             "CreatePipeline",
             &declaration(
                 "neighbour",
-                json!([source_stage("source-bucket", "source.zip", "SourceArtifact")]),
+                json!([
+                    source_stage("source-bucket", "source.zip", "SourceArtifact"),
+                    deploy_stage(
+                        "Deploy0",
+                        "SourceArtifact",
+                        "deploy-bucket",
+                        "neighbour.zip",
+                        false,
+                    ),
+                ]),
                 None,
             ),
         )

@@ -108,11 +108,11 @@ fn rule(name: &str, provider: &str) -> Value {
 /// stage and action for action.
 fn cases() -> Vec<Case> {
     vec![
-        // The smallest thing that is a pipeline: one stage, one action, so no stage
-        // has an inbound transition.
+        // The smallest thing that is a pipeline: the source stage, and one stage that
+        // acts on what it fetched (`state::validate_declaration`).
         Case {
-            label: "one-stage",
-            stages: vec![source_stage("Source")],
+            label: "smallest",
+            stages: vec![source_stage("Source"), build_stage("Build", 1)],
         },
         // Two stages, the second with three actions.
         Case {
@@ -411,7 +411,7 @@ async fn an_unknown_or_deleted_pipeline_has_no_state() {
             .await;
     }
 
-    for name in ["missing", "one-stage.gone", "ONE-STAGE"] {
+    for name in ["missing", "smallest.gone", "SMALLEST"] {
         let (status, code) = emulator
             .expect_error("GetPipelineState", &json!({"name": name}))
             .await;
@@ -435,11 +435,11 @@ async fn an_unknown_or_deleted_pipeline_has_no_state() {
     );
     // Deleting one pipeline leaves the others reportable.
     let survivor = emulator
-        .ok("GetPipelineState", &json!({"name": "one-stage"}))
+        .ok("GetPipelineState", &json!({"name": "smallest"}))
         .await;
     assert_eq!(
         survivor["pipelineName"].as_str(),
-        Some("one-stage"),
+        Some("smallest"),
         "deleting one pipeline must not remove another's state, got {survivor}"
     );
 }

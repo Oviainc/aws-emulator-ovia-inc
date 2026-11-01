@@ -83,8 +83,26 @@ fn later_action(name: &str) -> Value {
     })
 }
 
-/// A `PipelineDeclaration` named `name` with `stages`.
+/// A `PipelineDeclaration` named `name` with `stages` — plus the acting stage a
+/// declaration has to carry when `stages` declares no action outside the `Source`
+/// category (`state::validate_declaration` refuses a pipeline that would do nothing
+/// with the revision it fetched, and one carrying fewer than two stages).
+///
+/// Appending it changes nothing a case here asserts: every source action is
+/// `Custom`-owned, so each execution waits at the source stage and no action of a later
+/// stage has started.
 fn pipeline(name: &str, stages: Vec<Value>) -> Value {
+    let mut stages = stages;
+    let acts = stages.iter().any(|stage| {
+        stage["actions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|action| action["actionTypeId"]["category"] != json!("Source"))
+    });
+    if !acts {
+        stages.push(stage("Build", vec![later_action("Compile")]));
+    }
     json!({
         "name": name,
         "roleArn": ROLE_ARN,

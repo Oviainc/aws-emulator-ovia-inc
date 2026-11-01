@@ -213,10 +213,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         InvalidStageDeclarationException { message },
                     )
                 }
+                crate::state::DeclarationProblem::Action(_) => {
+                    UpdatePipelineErrorModeled::InvalidActionDeclarationException(
+                        InvalidActionDeclarationException { message },
+                    )
+                }
                 // A declaration past a quota is not malformed: it is more than this
                 // service runs, which is what `LimitExceededException` reports.
                 crate::state::DeclarationProblem::Limit(_) => {
                     UpdatePipelineErrorModeled::LimitExceededException(LimitExceededException {
+                        message,
+                    })
+                }
+                // A requirement this service states over the input itself, rather than
+                // a defect of the pipeline's structure.
+                crate::state::DeclarationProblem::Validation(_) => {
+                    UpdatePipelineErrorModeled::ValidationException(ValidationException {
                         message,
                     })
                 }

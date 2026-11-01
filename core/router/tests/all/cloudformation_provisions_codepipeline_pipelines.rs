@@ -481,6 +481,17 @@ const REFUSED_TEMPLATE: &str = r#"{
         "OutputArtifacts": [ { "Name": "SourceArtifact" } ]
        }
       ]
+     },
+     {
+      "Name": "Approve",
+      "Actions": [
+       {
+        "Name": "ApproveAction",
+        "ActionTypeId": {
+         "Category": "Approval", "Owner": "AWS", "Provider": "Manual", "Version": "1"
+        }
+       }
+      ]
      }
     ]
    }

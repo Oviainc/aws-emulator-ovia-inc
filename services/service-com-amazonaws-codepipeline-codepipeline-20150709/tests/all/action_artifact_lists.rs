@@ -172,17 +172,31 @@ fn cases() -> Vec<(&'static str, Vec<StageSpec>)> {
     vec![
         (
             "a one-action source pipeline declaring neither member",
-            vec![StageSpec {
-                name: "Source",
-                actions: vec![ActionSpec::source("Src", None)],
-            }],
+            vec![
+                StageSpec {
+                    name: "Source",
+                    actions: vec![ActionSpec::source("Src", None)],
+                },
+                // The non-`Source` stage every declaration carries
+                // (`state::validate_declaration`), declaring neither member either.
+                StageSpec {
+                    name: "Deploy",
+                    actions: vec![ActionSpec::deploy("Dep", None, None)],
+                },
+            ],
         ),
         (
             "a source action declaring only outputArtifacts",
-            vec![StageSpec {
-                name: "Source",
-                actions: vec![ActionSpec::source("Src", Some(vec!["SourceArtifact"]))],
-            }],
+            vec![
+                StageSpec {
+                    name: "Source",
+                    actions: vec![ActionSpec::source("Src", Some(vec!["SourceArtifact"]))],
+                },
+                StageSpec {
+                    name: "Deploy",
+                    actions: vec![ActionSpec::deploy("Dep", None, None)],
+                },
+            ],
         ),
         (
             "a deploy action declaring only inputArtifacts",
@@ -203,15 +217,21 @@ fn cases() -> Vec<(&'static str, Vec<StageSpec>)> {
         ),
         (
             "both members declared as explicitly empty arrays",
-            vec![StageSpec {
-                name: "Source",
-                actions: vec![ActionSpec {
-                    name: "Src",
-                    category: "Source",
-                    inputs: Some(Vec::new()),
-                    outputs: Some(Vec::new()),
-                }],
-            }],
+            vec![
+                StageSpec {
+                    name: "Source",
+                    actions: vec![ActionSpec {
+                        name: "Src",
+                        category: "Source",
+                        inputs: Some(Vec::new()),
+                        outputs: Some(Vec::new()),
+                    }],
+                },
+                StageSpec {
+                    name: "Deploy",
+                    actions: vec![ActionSpec::deploy("Dep", Some(Vec::new()), Some(Vec::new()))],
+                },
+            ],
         ),
         (
             "an action declaring both members, with several names each",

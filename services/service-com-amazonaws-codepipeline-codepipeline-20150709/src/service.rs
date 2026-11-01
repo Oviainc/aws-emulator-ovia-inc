@@ -199,12 +199,106 @@ pub(crate) fn constraint_clause(violation: &Violation) -> Option<String> {
     ))
 }
 
+/// One member of this service's input surface whose value is held to a `@length` floor
+/// the MODEL does not declare.
+///
+/// `smithy_query query="shape" shape="ResourceArn"` reports a `@pattern` and no
+/// `@length`, while CodePipeline states both a pattern clause and a length clause for a
+/// malformed ARN. The floor ([`crate::state::RESOURCE_ARN_MIN_LENGTH`]) is the shortest
+/// string that pattern can match, so no value the pattern ADMITS falls below it: the
+/// floor only ever adds a clause to a value the pattern already refused, which is why
+/// stating it here — where the violations of one request are worded — is the whole rule
+/// rather than half of it.
+struct LengthFloor {
+    /// The member name the value is bound to, at any depth in the input.
+    member: &'static str,
+    /// The inclusive minimum character count the service requires of it.
+    min: i64,
+}
+
+/// Every member of this service's inputs whose length floor the model leaves unstated.
+const LENGTH_FLOORS: &[LengthFloor] = &[LengthFloor {
+    member: "resourceArn",
+    min: crate::state::RESOURCE_ARN_MIN_LENGTH,
+}];
+
+/// The undeclared length floor the member a violation path names is held to, if any.
+///
+/// The path is REQUEST-derived text, so it is only ever compared and split: a path this
+/// table does not name yields `None`, which states exactly the model's own constraints.
+fn length_floor(path: &str) -> Option<&'static LengthFloor> {
+    LENGTH_FLOORS
+        .iter()
+        .find(|floor| path == floor.member || path.ends_with(&format!(".{}", floor.member)))
+}
+
+/// The violations one refusal STATES, from the ones the framework's walk collected.
+///
+/// Two rules, each applied over every member rather than to one operation's:
+///
+/// * a value below a length floor the model leaves unstated ([`LENGTH_FLOORS`]) is
+///   reported for that too, after the clause for the constraint the model does declare,
+///   so the clauses stay in the order the model states them in;
+/// * a `@pattern` is not evaluated against an EMPTY value that already violated a
+///   `@length` minimum the MODEL declares: the floor is the violation such a value has,
+///   and the expression it would have had to match is not a second one. Keyed on the
+///   model's own constraint, so a member whose floor only this file states keeps both
+///   clauses — nothing says the service drops one there.
+fn stated_violations(violations: &[Violation]) -> Vec<Violation> {
+    let mut stated: Vec<Violation> = Vec::with_capacity(violations.len());
+    let mut floored: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for violation in violations {
+        stated.push(violation.clone());
+        let Some(floor) = length_floor(&violation.path) else {
+            continue;
+        };
+        let Some(value) = violation.value.as_deref() else {
+            // An absent member has no value to measure: `Member must not be null` is
+            // the whole of what the request got wrong there.
+            continue;
+        };
+        // Stated once per member, after that member's first modelled clause: a member
+        // with two modelled violations has one floor, not one per clause.
+        let modelled = violations
+            .iter()
+            .filter(|other| other.path == violation.path)
+            .any(|other| matches!(other.kind, ViolationKind::MinLength(_)));
+        // The same count `@length` is checked with on a string: characters.
+        if !modelled
+            && (value.chars().count() as i64) < floor.min
+            && floored.insert(violation.path.as_str())
+        {
+            stated.push(Violation {
+                path: violation.path.clone(),
+                kind: ViolationKind::MinLength(floor.min),
+                value: violation.value.clone(),
+            });
+        }
+    }
+    let floored_empty: std::collections::BTreeSet<&str> = violations
+        .iter()
+        .filter(|violation| {
+            matches!(violation.kind, ViolationKind::MinLength(_))
+                && violation.value.as_deref() == Some("")
+        })
+        .map(|violation| violation.path.as_str())
+        .collect();
+    stated
+        .iter()
+        .filter(|violation| {
+            !matches!(violation.kind, ViolationKind::Pattern(_))
+                || !floored_empty.contains(violation.path.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
 /// The `ValidationException` message for a refusal: the AWS envelope
 /// (`N validation error(s) detected: `) over one clause per violation.
 ///
 /// `None` declines the whole refusal — see [`constraint_clause`].
 pub(crate) fn constraint_envelope(violations: &[Violation]) -> Option<String> {
-    let clauses: Vec<String> = violations
+    let clauses: Vec<String> = stated_violations(violations)
         .iter()
         .map(constraint_clause)
         .collect::<Option<Vec<_>>>()?;

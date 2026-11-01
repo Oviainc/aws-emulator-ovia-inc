@@ -207,13 +207,20 @@ async fn every_rule_of_a_reached_condition_is_recorded_most_recent_first() {
     for (index, (case, site, value, declared)) in rows.into_iter().enumerate() {
         let emulator = Emulator::new();
         let pipeline = format!("ruled-{index}");
-        seed_buckets(&emulator, &pipeline, &[]).await;
+        let deploy_bucket = format!("ruled-{index}-delivery");
+        seed_buckets(&emulator, &pipeline, &[deploy_bucket.as_str()]).await;
         emulator
             .ok(
                 "CreatePipeline",
                 &declaration(
                     &pipeline,
-                    json!([conditioned_source_stage(site, value)]),
+                    // The delivery stage is the non-`Source` action every declaration
+                    // carries (`state::validate_declaration`); the conditions under
+                    // test sit on the source stage.
+                    json!([
+                        conditioned_source_stage(site, value),
+                        deploy_stage("Delivery", &deploy_bucket, None),
+                    ]),
                     None,
                 ),
             )
@@ -710,28 +717,32 @@ async fn the_result_of_a_met_condition_is_what_the_execution_does() {
 async fn the_listing_is_ordered_paged_and_filtered_by_execution() {
     let emulator = Emulator::new();
     let pipeline = "ordered-rules";
-    seed_buckets(&emulator, pipeline, &[]).await;
+    let deploy_bucket = "ordered-rules-delivery";
+    seed_buckets(&emulator, pipeline, &[deploy_bucket]).await;
     emulator
         .ok(
             "CreatePipeline",
             &declaration(
                 pipeline,
-                json!([conditioned_source_stage(
-                    "beforeEntry",
-                    json!({
-                        "conditions": [{
-                            "result": "FAIL",
-                            "rules": [
-                                configured_rule(
-                                    "Older",
-                                    "VariableCheck",
-                                    json!({"Variable": "#{variables.absent}", "Value": "1"}),
-                                ),
-                                rule("Newer", "DeploymentWindow"),
-                            ],
-                        }]
-                    }),
-                )]),
+                json!([
+                    conditioned_source_stage(
+                        "beforeEntry",
+                        json!({
+                            "conditions": [{
+                                "result": "FAIL",
+                                "rules": [
+                                    configured_rule(
+                                        "Older",
+                                        "VariableCheck",
+                                        json!({"Variable": "#{variables.absent}", "Value": "1"}),
+                                    ),
+                                    rule("Newer", "DeploymentWindow"),
+                                ],
+                            }]
+                        }),
+                    ),
+                    deploy_stage("Delivery", deploy_bucket, None),
+                ]),
                 // PARALLEL, so the second execution runs on its own rather than being
                 // held behind the first.
                 Some("PARALLEL"),

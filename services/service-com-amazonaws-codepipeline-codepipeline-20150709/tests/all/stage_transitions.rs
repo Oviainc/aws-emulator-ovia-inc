@@ -204,7 +204,6 @@ fn inbound_enablement(state: &Value, stages: &[&str]) -> Vec<Option<bool>> {
 #[tokio::test]
 async fn disabling_one_transition_changes_only_that_transitions_reported_state() {
     let shapes: Vec<Vec<&str>> = vec![
-        vec!["Source"],
         vec!["Source", "Build"],
         vec!["Source", "Build", "Test", "Deploy"],
     ];
@@ -501,7 +500,7 @@ async fn a_transition_that_names_no_stored_target_is_refused() {
         for operation in ["DisableStageTransition", "EnableStageTransition"] {
             let emulator = Emulator::new();
             emulator.create("demo", &["Source", "Build"]).await;
-            emulator.create("other", &["Other"]).await;
+            emulator.create("other", &["Other", "OtherBuild"]).await;
             let mut body = json!({
                 "pipelineName": pipeline_name,
                 "stageName": stage_name,

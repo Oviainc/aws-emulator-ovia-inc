@@ -191,6 +191,16 @@ fn deploy_stage(name: &str, input: &str) -> Value {
     })
 }
 
+/// A stage carrying one action outside the `Source` category and no artifact members.
+///
+/// What a declaration has to carry beside its source stage: a pipeline acts on the
+/// revision it fetched, and carries at least two stages
+/// (`state::validate_declaration`). A row whose own subject is the stage list builds
+/// its stages itself.
+fn acting_stage(name: &str) -> Value {
+    json!({"name": name, "actions": [categorised_action("Act", "Build", "CodeBuild", 1)]})
+}
+
 /// A declaration built from its stages, with the role IAM holds.
 fn declaration(name: &str, stages: Value) -> Value {
     json!({"pipeline": {
@@ -240,7 +250,7 @@ async fn create_pipeline_refuses_a_structurally_impossible_declaration() {
             declaration(
                 "mixed-first-stage",
                 json!([{
-                    "name": "Source",
+                    "name": "Ingest",
                     "actions": [
                         {
                             "name": "Src",
@@ -259,7 +269,7 @@ async fn create_pipeline_refuses_a_structurally_impossible_declaration() {
                             "runOrder": 2,
                         },
                     ],
-                }]),
+                }, acting_stage("Build")]),
             ),
         ),
         (
@@ -319,7 +329,10 @@ async fn create_pipeline_refuses_a_structurally_impossible_declaration() {
             }]),
         ),
     ] {
-        let mut body = declaration("v1-pipeline", json!([source_stage("SourceArtifact")]));
+        let mut body = declaration(
+            "v1-pipeline",
+            json!([source_stage("SourceArtifact"), acting_stage("Build")]),
+        );
         body["pipeline"]["pipelineType"] = json!("V1");
         body["pipeline"][member] = value;
         let (status, code, message) = emulator.refusal("CreatePipeline", &body).await;
@@ -338,7 +351,10 @@ async fn create_pipeline_refuses_a_structurally_impossible_declaration() {
     // A roleArn IAM holds no role for is refused the same way; the SAME declaration with
     // the role that does exist is accepted, so the rule is the role's existence and not
     // the shape of the ARN.
-    let mut absent_role = declaration("absent-role", json!([source_stage("SourceArtifact")]));
+    let mut absent_role = declaration(
+        "absent-role",
+        json!([source_stage("SourceArtifact"), acting_stage("Build")]),
+    );
     absent_role["pipeline"]["roleArn"] =
         json!(format!("arn:aws:iam::{ACCOUNT_ID}:role/role-nobody-created"));
     let (status, code, message) = emulator.refusal("CreatePipeline", &absent_role).await;
@@ -347,8 +363,34 @@ async fn create_pipeline_refuses_a_structurally_impossible_declaration() {
         (400, "InvalidStructureException"),
         "a roleArn naming no role is refused, got {status} {code} {message:?}"
     );
+    let absent_role_message = message.clone();
 
-    let accepted = declaration("valid-pipeline", json!([source_stage("SourceArtifact")]));
+    // The role is settled BEFORE the declaration is walked: the service decides whether
+    // it could run this pipeline's actions at all before it judges what those actions
+    // are, so a declaration that is ALSO malformed in its own right — here, below the
+    // stage floor — is still refused for the role, with the role's own message.
+    let mut absent_role_and_malformed =
+        declaration("absent-role-malformed", json!([source_stage("SourceArtifact")]));
+    absent_role_and_malformed["pipeline"]["roleArn"] =
+        json!(format!("arn:aws:iam::{ACCOUNT_ID}:role/role-nobody-created"));
+    let (status, code, message) = emulator
+        .refusal("CreatePipeline", &absent_role_and_malformed)
+        .await;
+    assert_eq!(
+        (status, code.as_str(), message.as_str()),
+        (
+            400,
+            "InvalidStructureException",
+            absent_role_message.as_str()
+        ),
+        "the role is resolved before the declaration is walked, got {status} {code} \
+         {message:?}"
+    );
+
+    let accepted = declaration(
+        "valid-pipeline",
+        json!([source_stage("SourceArtifact"), acting_stage("Build")]),
+    );
     let (status, answer) = emulator.cp("CreatePipeline", &accepted).await;
     assert_eq!(
         status, 200,
@@ -483,17 +525,21 @@ async fn a_declaration_past_a_quota_is_refused_before_it_is_walked() {
             .collect();
         let body = declaration(
             &format!("quota-artifacts-{count}"),
-            json!([{
-                "name": "Source",
-                "actions": [{
-                    "name": "Src",
-                    "actionTypeId": {
-                        "category": "Source", "owner": "AWS", "provider": "S3", "version": "1"
-                    },
-                    "configuration": {"S3Bucket": "b", "S3ObjectKey": "k"},
-                    "outputArtifacts": outputs,
-                }],
-            }]),
+            json!([
+                {
+                    "name": "Source",
+                    "actions": [{
+                        "name": "Src",
+                        "actionTypeId": {
+                            "category": "Source", "owner": "AWS", "provider": "S3",
+                            "version": "1"
+                        },
+                        "configuration": {"S3Bucket": "b", "S3ObjectKey": "k"},
+                        "outputArtifacts": outputs,
+                    }],
+                },
+                acting_stage("Build"),
+            ]),
         );
         if accepted {
             let (status, answer) = emulator.cp("CreatePipeline", &body).await;
@@ -526,7 +572,10 @@ async fn the_pipeline_name_refusals_carry_the_text_their_rule_builds() {
     // The rule generalises over the NAME, so the rows differ in the name's alphabet and
     // length rather than only in spelling.
     for name in ["dup", "a.b@c-d_e", &"n".repeat(100)] {
-        let body = declaration(name, json!([source_stage("SourceArtifact")]));
+        let body = declaration(
+            name,
+            json!([source_stage("SourceArtifact"), acting_stage("Build")]),
+        );
         let (status, answer) = emulator.cp("CreatePipeline", &body).await;
         assert_eq!(
             status, 200,
@@ -606,7 +655,10 @@ async fn a_constraint_violation_names_the_member_and_the_constraint_only() {
         (
             "a pipeline name with a non-ASCII character",
             "CreatePipeline",
-            declaration("pipe-ünïcode", json!([source_stage("SourceArtifact")])),
+            declaration(
+                "pipe-ünïcode",
+                json!([source_stage("SourceArtifact"), acting_stage("Build")]),
+            ),
             "pipeline.name".to_string(),
             "pipe-ünïcode",
         ),
@@ -788,9 +840,9 @@ async fn a_first_stage_that_is_not_the_source_stage_carries_the_fixed_message() 
 
     // The law generalises over the COMPOSITION of the first stage, so the rows differ in
     // how it is composed: no source action at all, a source action mixed with a
-    // non-source one (in either order of `runOrder`), several non-source actions, and a
-    // pipeline whose single stage carries no source action. `tokens` is the text each row
-    // puts in the request that an interpolating message would leak.
+    // non-source one (in either order of `runOrder`), and several non-source actions.
+    // `tokens` is the text each row puts in the request that an interpolating message
+    // would leak.
     let rows: Vec<(&str, Value, Vec<&str>)> = vec![
         (
             "an approval stage first, the source stage second",
@@ -814,18 +866,24 @@ async fn a_first_stage_that_is_not_the_source_stage_carries_the_fixed_message() 
         ),
         (
             "a source action and a non-source action in the first stage",
-            json!([{"name": "Ingest", "actions": [
-                bare_source_action("Src", 1),
-                categorised_action("Hold", "Approval", "Manual", 2),
-            ]}]),
+            json!([
+                {"name": "Ingest", "actions": [
+                    bare_source_action("Src", 1),
+                    categorised_action("Hold", "Approval", "Manual", 2),
+                ]},
+                acting_stage("Build"),
+            ]),
             vec!["Ingest", "Hold", "Approval", "Manual"],
         ),
         (
             "a non-source action before the source action in the first stage",
-            json!([{"name": "Ingest", "actions": [
-                categorised_action("Hold", "Invoke", "Lambda", 1),
-                bare_source_action("Src", 2),
-            ]}]),
+            json!([
+                {"name": "Ingest", "actions": [
+                    categorised_action("Hold", "Invoke", "Lambda", 1),
+                    bare_source_action("Src", 2),
+                ]},
+                acting_stage("Build"),
+            ]),
             vec!["Ingest", "Hold", "Invoke", "Lambda"],
         ),
         (
@@ -840,10 +898,13 @@ async fn a_first_stage_that_is_not_the_source_stage_carries_the_fixed_message() 
             vec!["Zulu", "Hold", "Probe", "Test", "CodeBuild"],
         ),
         (
-            "a single stage carrying no source action",
-            json!([{"name": "Verify", "actions": [
-                categorised_action("Probe", "Test", "CodeBuild", 1),
-            ]}]),
+            "a first stage carrying no source action",
+            json!([
+                {"name": "Verify", "actions": [
+                    categorised_action("Probe", "Test", "CodeBuild", 1),
+                ]},
+                acting_stage("Ship"),
+            ]),
             vec!["Verify", "Probe", "Test", "CodeBuild"],
         ),
     ];

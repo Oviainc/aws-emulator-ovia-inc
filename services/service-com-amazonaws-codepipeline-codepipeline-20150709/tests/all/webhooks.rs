@@ -106,8 +106,9 @@ impl Emulator {
         (status, code)
     }
 
-    /// Store a one-stage, one-action pipeline named `name` — the smallest thing a
-    /// webhook can target.
+    /// Store the smallest pipeline named `name` a webhook can target: a source stage,
+    /// and the non-`Source` stage every declaration has to carry
+    /// (`state::validate_declaration`).
     async fn create_pipeline(&self, name: &str) {
         self.ok(
             "CreatePipeline",
@@ -115,18 +116,32 @@ impl Emulator {
                 "name": name,
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [{
-                    "name": "Source",
-                    "actions": [{
-                        "name": "Src",
-                        "actionTypeId": {
-                            "category": "Source",
-                            "owner": "AWS",
-                            "provider": "S3",
-                            "version": "1",
-                        },
-                    }],
-                }],
+                "stages": [
+                    {
+                        "name": "Source",
+                        "actions": [{
+                            "name": "Src",
+                            "actionTypeId": {
+                                "category": "Source",
+                                "owner": "AWS",
+                                "provider": "S3",
+                                "version": "1",
+                            },
+                        }],
+                    },
+                    {
+                        "name": "Build",
+                        "actions": [{
+                            "name": "Build0",
+                            "actionTypeId": {
+                                "category": "Build",
+                                "owner": "AWS",
+                                "provider": "CodeBuild",
+                                "version": "1",
+                            },
+                        }],
+                    },
+                ],
             }}),
         )
         .await;

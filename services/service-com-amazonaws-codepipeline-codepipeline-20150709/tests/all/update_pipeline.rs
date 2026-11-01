@@ -52,7 +52,7 @@ async fn an_update_replaces_the_stored_structure_at_the_next_version() {
             "SUPERSEDED",
         ),
         (
-            "the only stage replaced by a different one",
+            "the source stage replaced by a different one",
             json!({
                 "name": "demo",
                 "roleArn": ROLE_ARN,
@@ -60,8 +60,8 @@ async fn an_update_replaces_the_stored_structure_at_the_next_version() {
                 // A pipeline's first stage is its SOURCE stage (AWS: "the first stage
                 // must contain at least one source action, and can only contain source
                 // actions", enforced by `state::validate_declaration`), so a
-                // replacement of the only stage is a different SOURCE stage.
-                "stages": [source_stage("Origin")],
+                // replacement of the source stage is a different SOURCE stage.
+                "stages": [source_stage("Origin"), build_stage("Build", 1)],
             }),
             "V1",
             "SUPERSEDED",
@@ -72,7 +72,7 @@ async fn an_update_replaces_the_stored_structure_at_the_next_version() {
                 "name": "demo",
                 "roleArn": ROLE_ARN,
                 "artifactStores": artifact_stores(),
-                "stages": [source_stage("Source")],
+                "stages": [source_stage("Source"), build_stage("Build", 1)],
             }),
             "V1",
             "SUPERSEDED",
@@ -83,7 +83,7 @@ async fn an_update_replaces_the_stored_structure_at_the_next_version() {
                 "name": "demo",
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [source_stage("Source")],
+                "stages": [source_stage("Source"), build_stage("Build", 1)],
                 "variables": [{"name": "Env", "defaultValue": "test"}],
                 "triggers": [{
                     "providerType": "CodeStarSourceConnection",
@@ -99,7 +99,7 @@ async fn an_update_replaces_the_stored_structure_at_the_next_version() {
                 "name": "demo",
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [source_stage("Source")],
+                "stages": [source_stage("Source"), build_stage("Build", 1)],
                 "pipelineType": "V2",
                 "executionMode": "PARALLEL",
             }),
@@ -116,7 +116,7 @@ async fn an_update_replaces_the_stored_structure_at_the_next_version() {
                     "location": "other-bucket",
                     "encryptionKey": {"id": "alias/cp", "type": "KMS"},
                 },
-                "stages": [source_stage("Source")],
+                "stages": [source_stage("Source"), build_stage("Build", 1)],
             }),
             "V1",
             "SUPERSEDED",
@@ -144,7 +144,7 @@ async fn an_update_replaces_the_stored_structure_at_the_next_version() {
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
                 "artifactStores": {},
-                "stages": [source_stage("Source")],
+                "stages": [source_stage("Source"), build_stage("Build", 1)],
             }),
             "V1",
             "SUPERSEDED",
@@ -155,7 +155,7 @@ async fn an_update_replaces_the_stored_structure_at_the_next_version() {
                 "name": "demo",
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [source_stage("Source")],
+                "stages": [source_stage("Source"), build_stage("Build", 1)],
                 "variables": [],
             }),
             "V1",
@@ -439,7 +439,11 @@ async fn an_update_drops_the_transitions_of_the_stages_it_no_longer_declares() {
         "name": "demo",
         "roleArn": ROLE_ARN,
         "artifactStore": {"type": "S3", "location": "my-bucket"},
-        "stages": [source_stage("Source"), build_stage("Build", 1)],
+        "stages": [
+            source_stage("Source"),
+            build_stage("Build", 1),
+            build_stage("Test", 1),
+        ],
     });
     emulator
         .ok("CreatePipeline", &json!({"pipeline": with_build}))
@@ -469,7 +473,7 @@ async fn an_update_drops_the_transitions_of_the_stages_it_no_longer_declares() {
         "name": "demo",
         "roleArn": ROLE_ARN,
         "artifactStore": {"type": "S3", "location": "my-bucket"},
-        "stages": [source_stage("Source")],
+        "stages": [source_stage("Source"), build_stage("Test", 1)],
     });
     emulator
         .ok("UpdatePipeline", &json!({"pipeline": without_build}))
@@ -520,28 +524,35 @@ async fn a_structurally_impossible_update_is_refused_and_changes_nothing() {
                 "name": "demo",
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [{"name": "Source", "actions": []}],
+                "stages": [{"name": "Source", "actions": []}, build_stage("Build", 1)],
             }),
             "InvalidStageDeclarationException",
         ),
         (
-            "the second stage has no actions",
+            "a middle stage with no actions",
             json!({
                 "name": "demo",
                 "roleArn": ROLE_ARN,
                 "artifactStore": {"type": "S3", "location": "my-bucket"},
-                "stages": [source_stage("Source"), {"name": "Build", "actions": []}],
+                "stages": [
+                    source_stage("Source"),
+                    {"name": "Gate", "actions": []},
+                    build_stage("Build", 1),
+                ],
             }),
             "InvalidStageDeclarationException",
         ),
         (
+            // The requirement is the service's own, stated over the input rather than
+            // as a defect of the pipeline's structure
+            // (`state::MISSING_ARTIFACT_STORE_MESSAGE`).
             "neither artifactStore nor artifactStores",
             json!({
                 "name": "demo",
                 "roleArn": ROLE_ARN,
                 "stages": [source_stage("Source")],
             }),
-            "InvalidStructureException",
+            "ValidationException",
         ),
         (
             "both artifactStore and artifactStores",

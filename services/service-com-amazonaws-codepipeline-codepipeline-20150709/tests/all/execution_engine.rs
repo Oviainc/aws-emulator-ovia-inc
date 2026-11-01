@@ -1155,12 +1155,16 @@ async fn an_artifact_store_with_a_customer_managed_key_fails_with_that_reason() 
     let pipeline = "cmk-pipe";
     emulator.bucket(&artifact_bucket(pipeline)).await;
     emulator.bucket("source-bucket").await;
+    emulator.bucket("deploy-bucket").await;
     emulator
         .put_object("source-bucket", "source.zip", b"cmk bytes")
         .await;
     let mut body = declaration(
         pipeline,
-        json!([source_stage("source-bucket", "source.zip", "SourceArtifact")]),
+        json!([
+            source_stage("source-bucket", "source.zip", "SourceArtifact"),
+            deploy_stage("Deploy", "SourceArtifact", "deploy-bucket", "cmk.zip", false),
+        ]),
         None,
     );
     body["pipeline"]["artifactStore"]["encryptionKey"] = json!({
@@ -1258,13 +1262,17 @@ async fn only_the_latest_executions_failed_stage_can_be_retried() {
     let pipeline = "retry-pipe";
     emulator.bucket(&artifact_bucket(pipeline)).await;
     emulator.bucket("source-bucket").await;
+    emulator.bucket("deploy-bucket").await;
     emulator
         .ok(
             "CreatePipeline",
             &declaration(
                 pipeline,
                 // No source object is written, so the source stage fails.
-                json!([source_stage("source-bucket", "absent.zip", "SourceArtifact")]),
+                json!([
+                    source_stage("source-bucket", "absent.zip", "SourceArtifact"),
+                    deploy_stage("Deploy", "SourceArtifact", "deploy-bucket", "retried.zip", false),
+                ]),
                 Some("PARALLEL"),
             ),
         )

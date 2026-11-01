@@ -47,8 +47,9 @@ fn rule(name: &str, provider: &str) -> Value {
     })
 }
 
-/// A one-stage declaration whose stage carries `site` (one of `StageDeclaration`'s
-/// three condition members) set to `value`.
+/// A declaration whose SOURCE stage carries `site` (one of `StageDeclaration`'s three
+/// condition members) set to `value`, with the acting stage every declaration carries
+/// after it (`state::validate_declaration`).
 fn declaration_with(name: &str, site: &str, value: Value) -> Value {
     let mut stage = source_stage("Source");
     stage[site] = value;
@@ -56,7 +57,7 @@ fn declaration_with(name: &str, site: &str, value: Value) -> Value {
         "name": name,
         "roleArn": ROLE_ARN,
         "artifactStore": {"type": "S3", "location": "my-bucket"},
-        "stages": [stage],
+        "stages": [stage, build_stage("Build", 1)],
     })
 }
 
@@ -118,7 +119,7 @@ async fn a_pipeline_with_no_condition_rules_reports_no_rule_execution() {
     // (case, declaration, executions to start, maxResults, filter)
     let cases: Vec<(&str, Value, usize, Option<i64>, Filter)> = vec![
         (
-            "one stage, no condition, no execution, no filter",
+            "the smallest pipeline, no condition, no execution, no filter",
             declaration("plain"),
             0,
             None,

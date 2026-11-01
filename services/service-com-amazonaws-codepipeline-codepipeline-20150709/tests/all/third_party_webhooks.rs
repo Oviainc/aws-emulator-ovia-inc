@@ -33,7 +33,7 @@ use service_com_amazonaws_codepipeline_codepipeline_20150709::state::{
     AUTHENTICATION_UNAUTHENTICATED,
 };
 
-use crate::pipeline_lifecycle::{Emulator, ROLE_ARN};
+use crate::pipeline_lifecycle::{build_stage, Emulator, ROLE_ARN};
 
 /// The operations under test: the pair that connects a webhook to the third party.
 const REGISTER: &str = "RegisterWebhookWithThirdParty";
@@ -53,7 +53,8 @@ fn pipeline_name(provider: &str) -> String {
     format!("hooked-{}", provider.to_lowercase())
 }
 
-/// A one-stage pipeline whose source action declares `provider`.
+/// A pipeline whose source action declares `provider`, with the non-`Source` stage
+/// every declaration has to carry (`state::validate_declaration`).
 ///
 /// The owners are the ones the catalog carries for each provider
 /// (`state::BUILT_IN_ACTION_TYPES`): `GitHub` is a `ThirdParty` source and `S3` an
@@ -63,20 +64,23 @@ fn pipeline(provider: &str, owner: &str) -> Value {
         "name": pipeline_name(provider),
         "roleArn": ROLE_ARN,
         "artifactStore": {"type": "S3", "location": "my-bucket"},
-        "stages": [{
-            "name": "Source",
-            "actions": [{
-                "name": "Src",
-                "actionTypeId": {
-                    "category": "Source",
-                    "owner": owner,
-                    "provider": provider,
-                    "version": "1",
-                },
-                "configuration": {"S3Bucket": "my-bucket", "S3ObjectKey": "app.zip"},
-                "outputArtifacts": [{"name": "SourceOut"}],
-            }],
-        }],
+        "stages": [
+            {
+                "name": "Source",
+                "actions": [{
+                    "name": "Src",
+                    "actionTypeId": {
+                        "category": "Source",
+                        "owner": owner,
+                        "provider": provider,
+                        "version": "1",
+                    },
+                    "configuration": {"S3Bucket": "my-bucket", "S3ObjectKey": "app.zip"},
+                    "outputArtifacts": [{"name": "SourceOut"}],
+                }],
+            },
+            build_stage("Build", 1),
+        ],
     })
 }
 
