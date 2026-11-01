@@ -50,7 +50,7 @@
 //! request and no sequence of requests can grow one record without limit: at least
 //! [`crate::state::MIN_AMENDMENTS_PER_REQUEST`] and at most
 //! [`crate::state::MAX_AMENDMENTS_PER_REQUEST`] amendments per request, a `FieldPath` of
-//! at most [`crate::state::MAX_FIELD_PATH_LEN`] bytes and
+//! at most [`crate::state::MAX_FIELD_PATH_LEN`] characters and
 //! [`crate::state::MAX_DETAILS_DEPTH`] segments, a details value — and a value written to
 //! a member the model leaves unconstrained ([`CONTACT_UNCONSTRAINED_MEMBERS`],
 //! [`FILE_UNCONSTRAINED_MEMBERS`]) — of at most
@@ -266,15 +266,13 @@ fn member_path(position: usize, member: &str) -> String {
 /// segment below a field name, the brackets are part of the name — a key of the details
 /// document is a name the CALLER chose and is addressed verbatim, brackets included.
 ///
-/// `None` for a path this service cannot read: one longer than
-/// [`crate::state::MAX_FIELD_PATH_LEN`], one with an empty segment, one whose subscript is
-/// unclosed, or one with more than [`crate::state::MAX_DETAILS_DEPTH`] segments.
-/// `FieldPath` is an unconstrained `String`, so those two bounds are what keep the walk
-/// below from recursing without limit and the path from being stored at arbitrary length.
+/// `None` for a path this service cannot read: one with an empty segment, one whose
+/// subscript is unclosed, or one with more than [`crate::state::MAX_DETAILS_DEPTH`]
+/// segments. `FieldPath` is an unconstrained `String`, so that bound is what keeps the
+/// walk below from recursing without limit; its LENGTH is bounded separately by
+/// [`field_path_length_clause`], which states the length requirement it failed instead of
+/// folding a legal-but-long path in with a path that names nothing.
 fn path_segments(field_path: &str) -> Option<Vec<&str>> {
-    if field_path.len() > crate::state::MAX_FIELD_PATH_LEN {
-        return None;
-    }
     let mut steps = field_path
         .strip_prefix("$.")
         .unwrap_or(field_path)
@@ -359,6 +357,19 @@ fn file_input(file: &FileDetail) -> FileInput {
         file_uri: file.file_uri.clone(),
         business_use_case: file.business_use_case.clone(),
     }
+}
+
+/// The requirement a `FieldPath` longer than [`crate::state::MAX_FIELD_PATH_LEN`] fails,
+/// or `None` for one within it.
+///
+/// `FieldPath` is an unconstrained `String`, so this bound is the handler's own and goes
+/// through the one length check of this service ([`crate::state::length_clause`]): it is
+/// counted in CHARACTERS, like every other length this service enforces and like the
+/// centralized walk counts a `@length` on a string, so a path's room does not depend on
+/// the script its caller-chosen keys are written in, and it is reported as the length
+/// requirement it is.
+fn field_path_length_clause(field_path: &str) -> Option<String> {
+    crate::state::length_clause(field_path, 0, crate::state::MAX_FIELD_PATH_LEN)
 }
 
 /// The requirement a `FieldPath` below a list member states: it addresses one element of
@@ -482,6 +493,9 @@ fn apply_amendment(
         AmendmentRefusal::new(member_path(position, "newValue"), requirement)
     };
 
+    if let Some(clause) = field_path_length_clause(&amendment.field_path) {
+        return Err(refused_path(clause));
+    }
     let segments = path_segments(&amendment.field_path).ok_or_else(&unamendable)?;
     let (head, rest) = segments
         .split_first()

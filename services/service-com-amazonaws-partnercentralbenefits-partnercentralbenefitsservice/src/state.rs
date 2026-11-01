@@ -353,7 +353,8 @@ pub const MAX_AMENDMENTS_PER_REQUEST: usize = 20;
 /// is refused rather than answered with a write that did not happen.
 pub const MIN_AMENDMENTS_PER_REQUEST: usize = 1;
 
-/// The longest `Amendment$FieldPath` this service reads.
+/// The longest `Amendment$FieldPath` this service reads, in CHARACTERS — the unit
+/// [`length_clause`] counts every length this service enforces in.
 ///
 /// The member is an unconstrained `String`, so this is what keeps a path (and the record
 /// of it below) from being arbitrarily long. CHOSEN: wider than any path into a document
@@ -455,9 +456,9 @@ pub const IDEMPOTENT_PARAMETER_MISMATCH: &str = "The request uses the same clien
 /// With [`MAX_AMENDMENTS_PER_REQUEST`], [`MAX_FIELD_PATH_LEN`],
 /// [`MAX_AMENDMENT_REASON_LEN`], [`MAX_CLIENT_TOKEN_LEN`] and
 /// [`REQUEST_FINGERPRINT_LEN`] — each enforced, or fixed, before the record is written —
-/// one application's write record holds at most 20 x (64-byte token + 64-byte
-/// fingerprint + 1000-byte reason + 20 x 256-byte path) of caller text: bounded, like
-/// every other part of this store.
+/// one application's write record holds at most 20 x (64-character token + 64-byte
+/// fingerprint + 1000-character reason + 20 x 256-character path) of caller text:
+/// bounded, like every other part of this store.
 pub const MAX_APPLIED_WRITE_HISTORY: usize = 20;
 
 /// The most members a stored `BenefitApplicationDetails` document may hold, counted over
@@ -1066,7 +1067,7 @@ pub struct AppliedWrite {
     /// The fields the write changed: an amendment's `FieldPath`s, or the input members
     /// an update applied, in the order they were applied. At most
     /// [`MAX_AMENDMENTS_PER_REQUEST`] of them, each at most [`MAX_FIELD_PATH_LEN`]
-    /// bytes.
+    /// characters.
     pub fields: Vec<String>,
     /// When the write was applied, as epoch milliseconds.
     pub applied_at_millis: i64,
