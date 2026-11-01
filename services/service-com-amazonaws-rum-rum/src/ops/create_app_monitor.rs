@@ -323,8 +323,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The PERMISSION is decided here, before anything is written. Provisioning the
         // group, though, is deferred until after the conflict and quota decisions below,
         // so a create this service then refuses leaves no log group behind in CloudWatch
-        // Logs: the two refusals are read off the store, so they are taken under its lock
-        // and the group is created in the gap between that lock and the insert.
+        // Logs: those refusals are read off the store, and the create HOLDS the name and
+        // the slot they granted it across the provisioning step, so nothing it was
+        // promised can be withdrawn after the group exists.
         let enables_delivery = input.cw_log_enabled == Some(true);
         if enables_delivery
             && crate::state::cw_log_delivery::caller_may_enable_delivery(
@@ -347,38 +348,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The refusals this create is subject to, read off the store under a SHORT
-        // lock so the group below is provisioned with no lock held.
-        {
-            let store = state.lock();
-            // A name identifies an app monitor for every other operation IN THIS REGION,
-            // so a second monitor of this region cannot take one that is in use there —
-            // while the same name in another region names a different, independent
-            // monitor and is free.
-            if store.contains_app_monitor(&region, &input.name) {
-                return Err(CreateAppMonitorErrorModeled::ConflictException(
-                    crate::state::app_monitor_already_exists(&input.name),
-                )
-                .into());
+        // The refusals this create is subject to, taken ONCE: the duplicate name, the
+        // per-region allowance and the region-bucket bound are decided under a single lock
+        // of the store they are read off, and the name and the slot they grant this create
+        // are HELD from that instant until the insert below stores the record
+        // (`crate::state::hold_app_monitor_name`). So the decisions are final before the
+        // step that needs no lock — provisioning the vended log group in another service,
+        // which is an `.await` — and a create that is refused is refused before that step
+        // runs, never after it. The hold is released whatever happens to this call: on the
+        // insert below, and on every error path (and on a dropped future) by its own drop.
+        let hold = match crate::state::hold_app_monitor_name(&state, &region, &input.name) {
+            Ok(hold) => hold,
+            Err(crate::state::AppMonitorHoldRefused::NameTaken(conflict)) => {
+                return Err(CreateAppMonitorErrorModeled::ConflictException(conflict).into());
             }
-            if store.app_monitor_count(&region) >= crate::state::MAX_APP_MONITORS {
-                return Err(CreateAppMonitorErrorModeled::ServiceQuotaExceededException(
-                    crate::state::app_monitor_quota_exceeded(crate::state::MAX_APP_MONITORS),
-                )
-                .into());
+            Err(crate::state::AppMonitorHoldRefused::QuotaExceeded(quota)) => {
+                return Err(
+                    CreateAppMonitorErrorModeled::ServiceQuotaExceededException(quota).into(),
+                );
             }
-            // The per-region allowance bounds each region's monitors; this bounds how
-            // many regions hold any, so the store's total stays finite whatever region a
-            // caller signs for (`crate::state::MAX_REGIONS`).
-            if store.region_bucket_exhausted(&region) {
-                return Err(CreateAppMonitorErrorModeled::ServiceQuotaExceededException(
-                    crate::state::app_monitor_quota_exceeded(
-                        crate::state::MAX_REGIONS * crate::state::MAX_APP_MONITORS,
-                    ),
-                )
-                .into());
-            }
-        }
+        };
         if enables_delivery {
             // The vended log group is created by CALLING the emulated CloudWatch Logs
             // service, over this emulator's OWN transport: the client is built with
@@ -413,29 +402,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::current_iso_timestamp();
 
         let mut store = state.lock();
-        // Every refusal is taken again under the write lock: the checks above held no
-        // lock across the provisioning step, so a concurrent create may have taken this
-        // name, the region's last slot or the last region bucket in between.
-        if store.contains_app_monitor(&region, &input.name) {
-            return Err(CreateAppMonitorErrorModeled::ConflictException(
-                crate::state::app_monitor_already_exists(&input.name),
-            )
-            .into());
-        }
-        if store.app_monitor_count(&region) >= crate::state::MAX_APP_MONITORS {
-            return Err(CreateAppMonitorErrorModeled::ServiceQuotaExceededException(
-                crate::state::app_monitor_quota_exceeded(crate::state::MAX_APP_MONITORS),
-            )
-            .into());
-        }
-        if store.region_bucket_exhausted(&region) {
-            return Err(CreateAppMonitorErrorModeled::ServiceQuotaExceededException(
-                crate::state::app_monitor_quota_exceeded(
-                    crate::state::MAX_REGIONS * crate::state::MAX_APP_MONITORS,
-                ),
-            )
-            .into());
-        }
+        // The name and the region's slot were granted to this create before the group was
+        // provisioned and have been held ever since, so no refusal is re-taken here:
+        // nothing could have taken either in the meantime. The hold is handed back under
+        // THIS lock, the one the insert runs in, so the name is never momentarily free.
+        hold.release_under(&mut store);
 
         let id = store.mint_app_monitor_id();
         store.insert_app_monitor(crate::state::AppMonitorRecord {

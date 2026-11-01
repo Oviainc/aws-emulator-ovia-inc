@@ -38,7 +38,10 @@
 //!   at that `.await` can leave the group behind. It is created under the name RUM vended
 //!   for that monitor ([`super::AppMonitorRecord::vended_log_group`]), so the next call
 //!   that turns delivery on for the same monitor adopts that very group rather than
-//!   colliding with it.
+//!   colliding with it. A create this service REFUSES leaves none: every refusal a create
+//!   reads off the store is decided, and the name and the monitor slot it grants are HELD
+//!   ([`super::hold_app_monitor_name`]), before this step runs — so the group is
+//!   provisioned only for a create nothing can still refuse.
 //!
 //! Turning delivery OFF needs neither: no policy is installed, and the group is left
 //! alone, because the telemetry already in it belongs to the account (the same reason

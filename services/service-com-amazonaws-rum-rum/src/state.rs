@@ -20,7 +20,7 @@
 //! are keyed through the one [`metric_destination_key`], so no two of those operations can
 //! disagree about which destination a request names.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
@@ -1300,6 +1300,18 @@ pub struct ComAmazonawsRumRumState {
     /// scanning. The region is part of the entry because it is part of the monitor's
     /// identity: an id is resolved WITHIN the region the request was signed for.
     pub monitor_ids: HashMap<String, (String, String)>,
+    /// The names a create has CLAIMED but not stored yet, keyed by region exactly as
+    /// `app_monitors` is — the holds [`hold_app_monitor_name`] takes.
+    ///
+    /// A create that provisions the monitor's vended CloudWatch Logs group has to release
+    /// this store's lock to make that in-process call, so without a hold the name and the
+    /// monitor slot it checked could be taken by a concurrent create while it is away, and
+    /// the refusal would land after the group had already been created in another service.
+    /// A claimed name is therefore counted exactly like a stored one — by the duplicate
+    /// name conflict, by the per-region allowance and by the region-bucket bound — and is
+    /// dropped again when the create either stores its record or gives up
+    /// ([`AppMonitorHold`]), so a name is never claimed for longer than one call.
+    app_monitor_holds: BTreeMap<String, BTreeSet<String>>,
     /// Per-state seed the minted ids are derived from, set on the first mint from the
     /// nanosecond clock so two runs of the emulator do not hand out the same ids. Only
     /// ever read by [`Self::mint_app_monitor_id`]; it is NOT an id itself.
@@ -1420,6 +1432,24 @@ impl ComAmazonawsRumRumState {
         self.app_monitor(region, name).is_some()
     }
 
+    /// Whether a create of `region` has already CLAIMED `name` and not stored it yet
+    /// ([`Self::app_monitor_holds`]). The same duplicate-name conflict as a stored
+    /// monitor: the name is in use by the call holding it until that call is done with it.
+    fn app_monitor_name_claimed(&self, region: &str, name: &str) -> bool {
+        self.app_monitor_holds
+            .get(region)
+            .is_some_and(|claimed| claimed.contains(name))
+    }
+
+    /// How many names creates of `region` are currently holding — monitors this store has
+    /// promised a slot to, which the per-region allowance has to count alongside the
+    /// stored ones.
+    fn claimed_app_monitor_count(&self, region: &str) -> usize {
+        self.app_monitor_holds
+            .get(region)
+            .map_or(0, ::std::collections::BTreeSet::len)
+    }
+
     /// How many monitors `region` holds: what [`MAX_APP_MONITORS`] bounds, counted per
     /// region because that is the scope AWS's own app-monitor quota is held at.
     pub fn app_monitor_count(&self, region: &str) -> usize {
@@ -1431,8 +1461,50 @@ impl ComAmazonawsRumRumState {
     /// Whether storing a monitor in `region` would open a new per-region bucket beyond
     /// [`MAX_REGIONS`]. The region comes from the request's own credential scope, so the
     /// number of buckets is capped as well as the monitors in each.
+    ///
+    /// A region a create is holding a name in counts as a bucket already: that create is
+    /// going to store its monitor there, so the bound is read the same way whether the
+    /// monitor is stored yet or still in flight.
     pub fn region_bucket_exhausted(&self, region: &str) -> bool {
-        !self.app_monitors.contains_key(region) && self.app_monitors.len() >= MAX_REGIONS
+        !self.region_bucket_open(region) && self.open_region_buckets() >= MAX_REGIONS
+    }
+
+    /// Whether `region` already has a bucket of this store — one holding a monitor, or one
+    /// a create is holding a name in.
+    fn region_bucket_open(&self, region: &str) -> bool {
+        self.app_monitors.contains_key(region) || self.app_monitor_holds.contains_key(region)
+    }
+
+    /// How many regions have a bucket, counting each region once however it was opened.
+    fn open_region_buckets(&self) -> usize {
+        self.app_monitors.len()
+            + self
+                .app_monitor_holds
+                .keys()
+                .filter(|region| !self.app_monitors.contains_key(*region))
+                .count()
+    }
+
+    /// Claim `name` in `region` for the create that is about to store it
+    /// ([`hold_app_monitor_name`], the only caller, which has just decided the name is
+    /// free).
+    fn claim_app_monitor_name(&mut self, region: &str, name: &str) {
+        self.app_monitor_holds
+            .entry(region.to_string())
+            .or_default()
+            .insert(name.to_string());
+    }
+
+    /// Drop the claim on `name` in `region`, emptying the region's entry with it so the
+    /// region-bucket count does not keep counting a bucket nothing is in. Called from
+    /// [`AppMonitorHold`] and nowhere else, so a hold is released exactly once.
+    fn release_app_monitor_name(&mut self, region: &str, name: &str) {
+        if let Some(claimed) = self.app_monitor_holds.get_mut(region) {
+            claimed.remove(name);
+            if claimed.is_empty() {
+                self.app_monitor_holds.remove(region);
+            }
+        }
     }
 
     /// The monitors `region` owns in `Name` order, resuming strictly after `after` when a
@@ -1533,6 +1605,121 @@ impl ComAmazonawsRumRumState {
             .values()
             .find(|record| record.arn == arn)
     }
+}
+
+/// Why a create may not take the name and the monitor slot it asked for — the two
+/// refusals `CreateAppMonitor` reads off this store, each already in the modelled shape
+/// the operation answers it with ([`hold_app_monitor_name`]).
+#[derive(Debug)]
+pub enum AppMonitorHoldRefused {
+    /// The region is already using that name: a stored monitor carries it, or a create in
+    /// flight is holding it.
+    NameTaken(ConflictException),
+    /// Storing one more monitor in that region would pass an app-monitor ceiling — the
+    /// per-region allowance or the store's total.
+    QuotaExceeded(ServiceQuotaExceededException),
+}
+
+/// A create's claim on ONE name in ONE region, held from the moment the create's
+/// store-read refusals are decided until the record is stored or the call gives up.
+///
+/// Released on drop, so a create that answers an error — or a request whose future is
+/// dropped — hands the name back without a handler having to remember to, and
+/// [`Self::release_under`] releases it under the lock the insert already holds, since the
+/// state lock is not reentrant.
+pub struct AppMonitorHold {
+    state: ::engine::ServiceState<ComAmazonawsRumRumState>,
+    region: String,
+    name: String,
+    /// Whether the claim is still in the store: cleared by [`Self::release_under`] so the
+    /// drop that follows it does not take the lock a second time.
+    claimed: bool,
+}
+
+impl AppMonitorHold {
+    /// Release the claim through a guard the caller already holds — what the create calls
+    /// under the very lock its insert runs in, so the name goes from claimed to stored
+    /// with no instant in between where it is neither.
+    pub fn release_under(mut self, store: &mut ComAmazonawsRumRumState) {
+        store.release_app_monitor_name(&self.region, &self.name);
+        self.claimed = false;
+    }
+}
+
+impl ::std::fmt::Debug for AppMonitorHold {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("AppMonitorHold")
+            .field("region", &self.region)
+            .field("name", &self.name)
+            .field("claimed", &self.claimed)
+            .finish()
+    }
+}
+
+impl Drop for AppMonitorHold {
+    fn drop(&mut self) {
+        if self.claimed {
+            self.state
+                .lock()
+                .release_app_monitor_name(&self.region, &self.name);
+        }
+    }
+}
+
+/// Decide the refusals a create reads off this store — the duplicate name, the per-region
+/// allowance and the region-bucket bound — and, when none of them applies, HOLD the name
+/// and the slot the create just won.
+///
+/// The decision and the claim are taken under ONE lock, so they are final: the create can
+/// then do the work that needs no lock (provisioning the monitor's vended CloudWatch Logs
+/// group, which is an in-process call to another service and therefore an `.await`) knowing
+/// that nothing it was promised can be taken away while it is away, and that its insert
+/// needs no second opinion. That ordering is what keeps a side effect in another service
+/// out of a call this service goes on to refuse: a create either holds its name before
+/// anything is provisioned, or it is refused before anything is provisioned.
+///
+/// Call it with NO guard of this state held — it takes the lock itself.
+pub fn hold_app_monitor_name(
+    state: &::engine::ServiceState<ComAmazonawsRumRumState>,
+    region: &str,
+    name: &str,
+) -> Result<AppMonitorHold, AppMonitorHoldRefused> {
+    {
+        let mut store = state.lock();
+        // A name identifies an app monitor for every other operation IN THIS REGION, so a
+        // second monitor of this region cannot take one that is in use there — while the
+        // same name in another region names a different, independent monitor and is free.
+        if store.contains_app_monitor(region, name) || store.app_monitor_name_claimed(region, name)
+        {
+            return Err(AppMonitorHoldRefused::NameTaken(app_monitor_already_exists(
+                name,
+            )));
+        }
+        // The per-region allowance bounds each region's monitors, counting the ones
+        // creates in flight are holding slots for.
+        if store.app_monitor_count(region) + store.claimed_app_monitor_count(region)
+            >= MAX_APP_MONITORS
+        {
+            return Err(AppMonitorHoldRefused::QuotaExceeded(
+                app_monitor_quota_exceeded(MAX_APP_MONITORS),
+            ));
+        }
+        // And this bounds how many regions hold any, so the store's total stays finite
+        // whatever region a caller signs for ([`MAX_REGIONS`]).
+        if store.region_bucket_exhausted(region) {
+            return Err(AppMonitorHoldRefused::QuotaExceeded(
+                app_monitor_quota_exceeded(MAX_REGIONS * MAX_APP_MONITORS),
+            ));
+        }
+        store.claim_app_monitor_name(region, name);
+    }
+    Ok(AppMonitorHold {
+        state: state.clone(),
+        region: region.to_string(),
+        name: name.to_string(),
+        claimed: true,
+    })
 }
 
 /// The current nanosecond clock, the seed [`ComAmazonawsRumRumState::mint_app_monitor_id`]
