@@ -257,20 +257,12 @@ impl Case {
 /// `ImportCrl` persists the whole record and `GetCrl` rebuilds it unchanged: a table
 /// spanning both published `name` `@length` bounds, both published `crlData` `@length`
 /// bounds plus a non-UTF-8 blob, `enabled` true / false / absent, tagged and untagged
-/// imports, and two different trust anchors (one of them in another partition, which
-/// `TrustAnchorArn`'s `@pattern` admits).
+/// imports, and two different trust anchors.
 #[tokio::test]
 async fn imported_crl_round_trips_through_get_crl() {
     let client = Client::new();
     let first_anchor = trust_anchor_arn(&client, "crl-anchor-one").await;
     let second_anchor = trust_anchor_arn(&client, "crl anchor two").await;
-    // `TrustAnchorArn` is `@pattern("^arn:aws(-[^:]+)?:rolesanywhere(:.*){2}(:trust-anchor.*)$")`
-    // (`smithy_query(query="operation", operation="ImportCrl")`), so a non-default
-    // partition is a legal link target too.
-    let gov_anchor = format!(
-        "arn:aws-us-gov:rolesanywhere:us-gov-west-1:{ACCOUNT}:trust-anchor/\
-         11111111-2222-3333-4444-555555555555"
-    );
 
     let cases = vec![
         Case {
@@ -347,12 +339,12 @@ async fn imported_crl_round_trips_through_get_crl() {
             expected_enabled: false,
         },
         Case {
-            name: "other-partition-trust-anchor",
-            crl_name: "gov crl".to_string(),
+            name: "third-import-against-the-first-anchor",
+            crl_name: "shared anchor crl".to_string(),
             data: CRL_PEM.as_bytes().to_vec(),
             enabled: Some(true),
             tags: Vec::new(),
-            trust_anchor: gov_anchor,
+            trust_anchor: first_anchor.clone(),
             expected_enabled: true,
         },
     ];
@@ -600,8 +592,14 @@ async fn get_crl_refuses_an_unknown_crl_id() {
         );
         assert_eq!(
             answer.body.get("message").and_then(Value::as_str),
-            Some("Crl not found"),
-            "case {case:?}: expected the fixed not-found wording, got {answer:?}"
+            Some(
+                format!(
+                    "The item doesn't exist. arn: arn:aws:rolesanywhere:{REGION}:{ACCOUNT}:crl/{id} \
+                     ; aborting."
+                )
+                .as_str()
+            ),
+            "case {case:?}: the refusal must name the requested CRL by ARN, got {answer:?}"
         );
     }
 }

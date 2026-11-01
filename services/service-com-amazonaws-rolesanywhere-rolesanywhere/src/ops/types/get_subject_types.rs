@@ -23,7 +23,9 @@ pub struct GetSubjectOutput {
     pub subject: Option<SubjectDetail>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.rolesanywhere#SubjectDetail")]
+/// The schema and codec for this shape are hand-declared in
+/// [`super::date_time_wire`], because `lastSeenAt`/`createdAt`/`updatedAt` carry
+/// `@timestampFormat("date-time")` and the derive cannot emit that trait.
 #[derive(Debug, Clone, Default)]
 pub struct SubjectDetail {
     pub subject_arn: Option<String>,
@@ -37,7 +39,9 @@ pub struct SubjectDetail {
     pub instance_properties: Option<Vec<InstanceProperty>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.rolesanywhere#CredentialSummary")]
+/// The schema and codec for this shape are hand-declared in
+/// [`super::date_time_wire`], because `seenAt` carries
+/// `@timestampFormat("date-time")` and the derive cannot emit that trait.
 #[derive(Debug, Clone, Default)]
 pub struct CredentialSummary {
     pub seen_at: Option<::aws_smithy_types::DateTime>,
@@ -48,7 +52,9 @@ pub struct CredentialSummary {
     pub failed: Option<bool>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.rolesanywhere#InstanceProperty")]
+/// The schema and codec for this shape are hand-declared in
+/// [`super::date_time_wire`], because `seenAt` carries
+/// `@timestampFormat("date-time")` and the derive cannot emit that trait.
 #[derive(Debug, Clone, Default)]
 pub struct InstanceProperty {
     pub seen_at: Option<::aws_smithy_types::DateTime>,

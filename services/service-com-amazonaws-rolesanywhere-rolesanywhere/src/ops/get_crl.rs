@@ -130,16 +130,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
 
         // An id no stored CRL carries — never imported, or already deleted — is a 404,
-        // never a canned success.
+        // never a canned success. The refusal names the resource that is missing by the
+        // ARN the requested id would carry, which is the only part of it that says WHAT
+        // was not found.
         let record = store.crls.get(&input.crl_id).ok_or_else(|| {
             GetCrlErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(CRL_NOT_FOUND_MESSAGE.to_string()),
+                message: Some(crate::state::arn_not_found_message(&crate::state::crl_arn(
+                    &region,
+                    &input.crl_id,
+                ))),
             })
         })?;
 
@@ -148,8 +153,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The message a not-found CRL refusal carries. Fixed text with no interpolation, the
-/// shape this service words a missing resource of a named type with (its trust-anchor
-/// read answers the fixed `TrustAnchor not found`).
-const CRL_NOT_FOUND_MESSAGE: &str = "Crl not found";

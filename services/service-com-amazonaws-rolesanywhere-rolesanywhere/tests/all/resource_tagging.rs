@@ -227,6 +227,34 @@ impl Kind {
     }
 }
 
+/// Create a trust anchor and answer its ARN. A CRL import names one, and `ImportCrl`
+/// refuses an ARN that resolves to nothing, so every CRL row needs a real one.
+async fn create_trust_anchor_arn(client: &Client, name: &str) -> String {
+    let answer = client
+        .send(
+            "POST",
+            "/trustanchors",
+            Some(json!({
+                "name": name,
+                "source": {
+                    "sourceType": "CERTIFICATE_BUNDLE",
+                    "sourceData": {"x509CertificateData": CERTIFICATE_BUNDLE_PEM},
+                },
+            })),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 201,
+        "trust anchor {name:?}: expected CreateTrustAnchor 201, got {answer:?}"
+    );
+    answer
+        .body
+        .pointer("/trustAnchor/trustAnchorArn")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("trust anchor {name:?}: no trustAnchorArn in {answer:?}"))
+        .to_string()
+}
+
 /// Create a resource of `kind` carrying `tags`, and answer its ARN.
 async fn create_resource(
     client: &Client,
@@ -234,6 +262,14 @@ async fn create_resource(
     name: &str,
     tags: &[(String, String)],
 ) -> String {
+    // A CRL is imported AGAINST a trust anchor, and `ImportCrl` resolves that reference
+    // before it stores anything, so a CRL row mints the anchor it links to first.
+    let crl_trust_anchor = match kind {
+        Kind::Crl => {
+            create_trust_anchor_arn(client, &format!("{name}-anchor")).await
+        }
+        Kind::TrustAnchor | Kind::Profile => String::new(),
+    };
     let (uri, mut body, pointer) = match kind {
         Kind::TrustAnchor => (
             "/trustanchors",
@@ -259,10 +295,7 @@ async fn create_resource(
             json!({
                 "name": name,
                 "crlData": aws_smithy_types::base64::encode(CRL_PEM.as_bytes()),
-                "trustAnchorArn": format!(
-                    "arn:aws:rolesanywhere:{REGION}:{ACCOUNT}:trust-anchor/\
-                     11111111-2222-3333-4444-555555555555"
-                ),
+                "trustAnchorArn": crl_trust_anchor,
             }),
             "/crl/crlArn",
         ),

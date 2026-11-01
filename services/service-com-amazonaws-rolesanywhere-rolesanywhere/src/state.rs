@@ -415,6 +415,37 @@ pub fn arn_not_found_message(resource_arn: &str) -> String {
     format!("The item doesn't exist. arn: {resource_arn} ; aborting.")
 }
 
+/// The ARN of the certificate revocation list this id names, in the Region the request
+/// was signed for: the ARN its import minted, so a refusal naming a CRL that is not
+/// stored words the SAME ARN the read of a stored one answers with.
+pub fn crl_arn(region: &str, crl_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("crl/{crl_id}"))
+}
+
+/// The trust-anchor id a `TrustAnchorArn` names, or the empty string when the ARN carries
+/// no id.
+///
+/// `TrustAnchorArn` is `@pattern("^arn:aws(-[^:]+)?:rolesanywhere(:.*){2}(:trust-anchor.*)$")`
+/// (`smithy_query(query="operation", operation="ImportCrl")`), so the resource — everything
+/// past the fifth colon of `arn:<partition>:rolesanywhere:<region>:<account>:<resource>` —
+/// starts with `trust-anchor` and names the id after a separator. Parsing is total: a
+/// resource part that is not `trust-anchor` plus a separator plus an id yields the empty
+/// string, which no trust anchor can be stored under.
+pub fn trust_anchor_id_in_arn(trust_anchor_arn: &str) -> &str {
+    let resource = trust_anchor_arn.splitn(6, ':').nth(5).unwrap_or_default();
+    resource
+        .strip_prefix("trust-anchor/")
+        .or_else(|| resource.strip_prefix("trust-anchor:"))
+        .unwrap_or_default()
+}
+
+/// The `message` a refusal carries when a request references a trust anchor that is not
+/// stored: the fixed wording, whose only variable part is the id taken from the ARN the
+/// request carried.
+pub fn trust_anchor_not_found_message(trust_anchor_id: &str) -> String {
+    format!("Unable to find Trust Anchor with ID {trust_anchor_id}.")
+}
+
 /// The region this request was signed for, from its SigV4 credential scope; an
 /// unsigned request is attributed to [`DEFAULT_REGION`].
 pub fn request_region(parts: &::http::request::Parts) -> String {

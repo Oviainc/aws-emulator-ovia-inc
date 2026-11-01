@@ -14,6 +14,11 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The schema and codec for each response shape with a `@timestampFormat("date-time")`
+// member, because the vendored codegen drops that trait. Hand-added, not generated; see
+// the module's own note.
+pub mod date_time_wire;
+
 pub mod create_profile_types;
 pub mod create_trust_anchor_types;
 pub mod delete_attribute_mapping_types;
@@ -50,6 +55,8 @@ pub mod update_trust_anchor_types;
 pub use create_profile_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_trust_anchor_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use date_time_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_attribute_mapping_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

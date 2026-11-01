@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the submitted members to the stored certificate revocation list in
+//! [`crate::state::ComAmazonawsRolesanywhereRolesanywhereState::crls`], so `GetCrl`,
+//! `ListCrls` and `DeleteCrl` all report the updated record.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +140,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCrl"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An id no stored CRL carries is the modelled 404, named by the ARN the requested
+        // id would carry — the same refusal the read and the delete word.
+        let record = store.crls.get_mut(&input.crl_id).ok_or_else(|| {
+            UpdateCrlErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::arn_not_found_message(&crate::state::crl_arn(
+                    &region,
+                    &input.crl_id,
+                ))),
+            })
+        })?;
+
+        // Each member is optional, so the request names WHICH parts of the CRL it
+        // replaces: a member it carries is written, a member it omits keeps the value the
+        // import (or an earlier update) stored. `trustAnchorArn` and `enabled` are not
+        // this operation's to change — the model gives it no member for either.
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        if let Some(crl_data) = input.crl_data {
+            record.crl_data = crl_data;
+        }
+        // `updatedAt` is "the ISO-8601 timestamp when the certificate revocation list
+        // (CRL) was last updated" (`smithy_query(query="shape", shape="CrlDetail")`), so
+        // the write that serves this call is what it reports; `createdAt` never moves.
+        record.updated_at = now;
+
+        Ok(UpdateCrlOutput {
+            crl: record.to_detail(),
+        })
     }
 }

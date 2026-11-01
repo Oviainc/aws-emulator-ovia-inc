@@ -71,6 +71,8 @@
 //! * `AccessDeniedException` (HTTP 403) — You do not have sufficient access to perform this
 //!   action.
 //! * `ValidationException` (HTTP 400) — Validation exception error.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see
+//!   below): the refusal a `trustAnchorArn` naming no stored trust anchor gets.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -86,10 +88,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-rolesanywhere-rolesanyw
 // here — hence the `ImportCrlError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.rolesanywhere#ImportCrl")]
+// `ResourceNotFoundException` is widened in through `extra_errors`: `trustAnchorArn` is a
+// required member naming the trust anchor this CRL "will provide revocation for", this
+// SERVICE models that shape for a resource that is not there
+// (`com.amazonaws.rolesanywhere#ResourceNotFoundException`, HTTP 404, "The resource could
+// not be found", declared in `types/shared_types.rs`), and this operation's own `errors`
+// list omits it. So an ARN that resolves to no trust anchor is reported MISSING rather
+// than accepted — a CRL that revokes for nothing is not a resource this service can hold.
+#[smithy_macros::operation_error(
+    "com.amazonaws.rolesanywhere#ImportCrl",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum ImportCrlErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
 
@@ -150,6 +163,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The trust anchor the request names has to exist: `trustAnchorArn` is a
+        // REFERENCE, and this service resolves it before it stores a CRL against it, so a
+        // stale or mistyped ARN is reported missing instead of producing a CRL that
+        // revokes for nothing. The id the ARN carries is the lookup key — the same key
+        // every trust-anchor operation resolves by, and the only part of the reference
+        // the refusal names.
+        let trust_anchor_id = crate::state::trust_anchor_id_in_arn(&input.trust_anchor_arn);
+        if !store.trust_anchors.contains_key(trust_anchor_id) {
+            return Err(ImportCrlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::trust_anchor_not_found_message(trust_anchor_id)),
+                },
+            )
+            .into());
+        }
         // The CRL store is bounded by an entry count, refused here before anything is
         // inserted, so repeating this call cannot grow the store without limit. This
         // operation models no quota error, so the refusal is its own
@@ -166,11 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let crl_id = store.mint_uuid();
         let record = crate::state::CrlRecord {
-            crl_arn: ::engine::emulator_arn(
-                crate::state::ARN_NAMESPACE,
-                &region,
-                &format!("crl/{crl_id}"),
-            ),
+            crl_arn: crate::state::crl_arn(&region, &crl_id),
             crl_id: crl_id.clone(),
             name: input.name,
             // A request that says nothing about `enabled` imports an inert CRL: the
@@ -180,9 +204,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             enabled: input.enabled.unwrap_or(false),
             crl_data: input.crl_data,
             // The trust anchor this CRL "will provide revocation for"
-            // (`ImportCrlRequest$trustAnchorArn`), stored as sent: the member's shape
-            // constraints are all the model states about it, and this operation models
-            // no not-found failure for the resource it names.
+            // (`ImportCrlRequest$trustAnchorArn`), stored as sent: the reference resolved
+            // above, and a read reports the ARN the caller linked the CRL with.
             trust_anchor_arn: input.trust_anchor_arn,
             created_at: now,
             updated_at: now,

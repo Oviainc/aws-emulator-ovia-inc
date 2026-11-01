@@ -45,7 +45,9 @@ pub struct NotificationSetting {
     pub channel: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.rolesanywhere#TrustAnchorDetail")]
+/// The schema and codec for this shape are hand-declared in
+/// [`super::date_time_wire`], because `createdAt`/`updatedAt` carry
+/// `@timestampFormat("date-time")` and the derive cannot emit that trait.
 #[derive(Debug, Clone, Default)]
 pub struct TrustAnchorDetail {
     pub trust_anchor_id: Option<String>,
@@ -89,7 +91,9 @@ pub struct ImportCrlOutput {
     pub crl: CrlDetail,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.rolesanywhere#CrlDetail")]
+/// The schema and codec for this shape are hand-declared in
+/// [`super::date_time_wire`], because `createdAt`/`updatedAt` carry
+/// `@timestampFormat("date-time")` and the derive cannot emit that trait.
 #[derive(Debug, Clone, Default)]
 pub struct CrlDetail {
     pub crl_id: Option<String>,
@@ -121,7 +125,9 @@ pub struct CreateProfileOutput {
     pub profile: Option<ProfileDetail>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.rolesanywhere#ProfileDetail")]
+/// The schema and codec for this shape are hand-declared in
+/// [`super::date_time_wire`], because `createdAt`/`updatedAt` carry
+/// `@timestampFormat("date-time")` and the derive cannot emit that trait.
 #[derive(Debug, Clone, Default)]
 pub struct ProfileDetail {
     pub profile_id: Option<String>,

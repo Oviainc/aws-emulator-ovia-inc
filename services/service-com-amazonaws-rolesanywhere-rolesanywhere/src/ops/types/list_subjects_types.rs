@@ -18,7 +18,9 @@ pub struct ListSubjectsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.rolesanywhere#SubjectSummary")]
+/// The schema and codec for this shape are hand-declared in
+/// [`super::date_time_wire`], because `lastSeenAt`/`createdAt`/`updatedAt` carry
+/// `@timestampFormat("date-time")` and the derive cannot emit that trait.
 #[derive(Debug, Clone, Default)]
 pub struct SubjectSummary {
     pub subject_arn: Option<String>,
