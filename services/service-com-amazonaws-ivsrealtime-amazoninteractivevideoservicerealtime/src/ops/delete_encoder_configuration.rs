@@ -151,8 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The transitions the clock has already made due are written down FIRST, so the
         // refusal below decides against the same store a read at this instant would
         // report: a composition whose stop the clock has already finished is gone, and
-        // holds nothing back.
-        store.materialize_due_compositions(::std::time::SystemTime::now());
+        // holds nothing back. What the clock owes a REPLICATION comes first of the two —
+        // a replication ending takes its replica out of the destination stage, which is
+        // one of the ways the stage a composition composites comes to hold nobody and so
+        // earns that composition the stop that releases this configuration.
+        let now = ::std::time::SystemTime::now();
+        crate::state::materialize_due_replications(&mut store, now);
+        store.materialize_due_compositions(now);
 
         // A delete of a resource this store does not hold is the modelled
         // `ResourceNotFoundException` (HTTP 404), the same answer `DeleteStage` gives —

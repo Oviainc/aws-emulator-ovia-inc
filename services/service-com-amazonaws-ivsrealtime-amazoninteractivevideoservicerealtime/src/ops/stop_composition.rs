@@ -157,9 +157,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // What the clock owes a replication is written down FIRST, exactly as the readers
+        // of these records and `StartComposition` write it: a replication whose publisher
+        // stayed away for its whole reconnect window ends with its replica leaving the
+        // destination stage, which is one of the ways the stage a composition composites
+        // comes to hold nobody and so earns that composition its own deadline.
+        crate::state::materialize_due_replications(&mut store, now);
         // A composition's state moves on the clock, so the stop acts on the state the
-        // clock has already reached: one whose ephemeral resource it has reclaimed is not
-        // found here rather than stopped a second time.
+        // clock has already reached: one whose end the clock already began is not stopped a
+        // second time, and one whose ephemeral resource it has reclaimed is not found here.
         store.materialize_due_compositions(now);
 
         let Some(composition) = store.composition_in_mut(&region, &input.arn) else {

@@ -430,6 +430,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &record.source_stage_arn,
             &record.source_session_id,
             event,
+            ::std::time::SystemTime::now(),
         );
 
         store

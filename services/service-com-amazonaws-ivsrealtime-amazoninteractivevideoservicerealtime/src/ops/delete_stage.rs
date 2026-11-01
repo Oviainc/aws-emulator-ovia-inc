@@ -150,12 +150,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(DeleteStageErrorModeled::InternalServerException)
         })?;
+        // This delete takes effect at one instant, which dates every record it writes: the
+        // replications it ends and the departures of the replicas they put into the stages
+        // that survive it.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A replication of a publisher that has stayed away for its whole reconnect window
         // has already ended, so what the clock owes is written down before this delete ends
         // what is left: a replication this delete reports as ending is one a caller reading
         // at this instant is told is still running.
-        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
+        crate::state::materialize_due_replications(&mut store, now);
         if store.stage_in(&region, &input.arn).is_none() {
             return Err(crate::state::resource_not_found(
                 DeleteStageErrorModeled::ResourceNotFoundException,
@@ -176,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not touch, leaves that stage's session, exactly as it would had the replication
         // been stopped — so both halves happen in the one place that ends a stage's
         // replications (`crate::state::end_replications_of_stage`).
-        crate::state::end_replications_of_stage(&mut store, &input.arn);
+        crate::state::end_replications_of_stage(&mut store, &input.arn, now);
         // So does every composition of this stage: a composition composites one stage,
         // and this operation shuts the stage down "disconnecting all participants", which
         // is one of the conditions the model's own `StartComposition` doc ends a

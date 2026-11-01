@@ -2786,12 +2786,17 @@ impl ParticipantEvent {
     }
 }
 
-/// Record `event` as having just occurred in the session `session_id` of `stage_arn`.
+/// Record `event` as having occurred at `at` in the session `session_id` of `stage_arn`.
 ///
 /// The ONE place an event record is created, so every seam that observes an occurrence
 /// writes the same representation of it: the instant is the one it occurred at and the
 /// position is the session's next occurrence position, which is what keeps a page of
 /// events in occurrence order.
+///
+/// `at` is the instant the occurrence HAPPENED, which for one a caller performs is that
+/// call and for one the clock owed is the instant it fell due — never the later call that
+/// writes it down — so what a reader is told about when something happened does not depend
+/// on when something else looked.
 ///
 /// `false` — nothing recorded — when this store holds no such session, or when the
 /// session is at [`MAX_EVENTS_PER_SESSION`] events.
@@ -2800,6 +2805,7 @@ pub fn record_participant_event(
     stage_arn: &str,
     session_id: &str,
     event: ParticipantEvent,
+    at: SystemTime,
 ) -> bool {
     if state
         .stage_session(stage_arn, session_id)
@@ -2814,7 +2820,7 @@ pub fn record_participant_event(
     session.events.push(EventRecord {
         name: event.name,
         participant_id: event.participant_id,
-        event_time: SystemTime::now(),
+        event_time: at,
         remote_participant_id: event.remote_participant_id,
         error_code: event.error_code,
         destination_stage_arn: event.destination_stage_arn,
@@ -3154,7 +3160,10 @@ pub fn join_stage_session(
         event.replica = replica;
         event
     };
-    record_participant_event(state, stage_arn, &session_id, occurrence(EVENT_JOINED));
+    // One instant for everything this join writes down, so the occurrences it records and
+    // the deadlines it decides cannot disagree about when the participant arrived.
+    let now = SystemTime::now();
+    record_participant_event(state, stage_arn, &session_id, occurrence(EVENT_JOINED), now);
     if publishes
         && !state
             .stage_session(stage_arn, &session_id)
@@ -3165,22 +3174,17 @@ pub fn join_stage_session(
             stage_arn,
             &session_id,
             occurrence(EVENT_PUBLISH_STARTED),
+            now,
         );
     }
     // A publisher that is back is publishing again, so every replication it sources is
     // owed no end: "if the participant disconnects and then reconnects within the
     // specified interval, replication will continue to be `ACTIVE`", through the one place
     // a publisher's connection is observed.
-    observe_replication_publisher(
-        state,
-        stage_arn,
-        &session_id,
-        &participant_id,
-        SystemTime::now(),
-    );
+    observe_replication_publisher(state, stage_arn, &session_id, &participant_id, now);
     // The stage now has somebody in it, so no composition of it is counting out the
     // empty-stage timeout the model's `StartComposition` doc ends a composition on.
-    state.observe_stage_occupancy(stage_arn, SystemTime::now());
+    state.observe_stage_occupancy(stage_arn, now);
     Some(record)
 }
 
@@ -3260,6 +3264,32 @@ pub fn leave_stage_session(
     session_id: &str,
     participant_id: &str,
 ) -> bool {
+    leave_stage_session_at(
+        state,
+        stage_arn,
+        session_id,
+        participant_id,
+        SystemTime::now(),
+    )
+}
+
+/// [`leave_stage_session`] for a departure that happened at `at` rather than now.
+///
+/// A departure the CLOCK owed — the replica of a replication whose publisher stayed away
+/// for its whole reconnect window ([`materialize_due_replications`]) — happened at the
+/// instant it fell due, whether or not anybody called then, so everything it decides is
+/// measured from THAT instant: the session's end, the occurrences it records, the reconnect
+/// deadline it earns a replication the departing participant sources, and the empty-stage
+/// deadline it earns every composition of the stage. Writing it down late therefore leaves
+/// exactly the store an on-time materialisation would have left, which is what keeps a read
+/// from changing what a later caller sees.
+pub fn leave_stage_session_at(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    session_id: &str,
+    participant_id: &str,
+    at: SystemTime,
+) -> bool {
     let session_ended = {
         let Some(session) = session_mut(state, stage_arn, session_id) else {
             return false;
@@ -3280,7 +3310,7 @@ pub fn leave_stage_session(
             .iter()
             .all(|participant| participant.state == PARTICIPANT_STATE_DISCONNECTED);
         if emptied {
-            session.end_time = Some(SystemTime::now());
+            session.end_time = Some(at);
         }
         emptied
     };
@@ -3309,9 +3339,10 @@ pub fn leave_stage_session(
             stage_arn,
             session_id,
             occurrence(EVENT_PUBLISH_STOPPED),
+            at,
         );
     }
-    record_participant_event(state, stage_arn, session_id, occurrence(EVENT_LEFT));
+    record_participant_event(state, stage_arn, session_id, occurrence(EVENT_LEFT), at);
     if session_ended {
         if let Some(stage) = state.stages.get_mut(stage_arn) {
             if stage.active_session_id.as_deref() == Some(session_id) {
@@ -3324,12 +3355,12 @@ pub fn leave_stage_session(
     // earns it, through the one place a publisher's connection is observed. The end itself
     // is the clock's ([`materialize_due_replications`]), so this records a deadline and
     // nothing else.
-    observe_replication_publisher(state, stage_arn, session_id, participant_id, SystemTime::now());
+    observe_replication_publisher(state, stage_arn, session_id, participant_id, at);
     // A departure can leave the stage with no participant in it at all, which is when the
     // timeout the model's `StartComposition` doc ends a composition on starts running for
     // every composition of that stage ("After a 1-minute timeout, when all participants
     // are disconnected from the stage").
-    state.observe_stage_occupancy(stage_arn, SystemTime::now());
+    state.observe_stage_occupancy(stage_arn, at);
     true
 }
 
@@ -3348,13 +3379,15 @@ pub fn leave_stage_session(
 ///
 /// `ended` must already have stopped being [`REPLICATION_STATE_ACTIVE`] in this store (the
 /// caller has stopped it, or is about to drop its record), so that no replication still
-/// running is reported as having ended.
+/// running is reported as having ended. `at` is the instant it ended — a caller's stop, the
+/// delete of a stage it names, or the deadline the clock ran out on it.
 ///
 /// `false` — nothing recorded — when this store no longer holds that source session, which
 /// is what the SOURCE stage of the replication being the one going away leaves.
 pub fn record_replication_stopped(
     state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     ended: &ParticipantReplicaRecord,
+    at: SystemTime,
 ) -> bool {
     let mut event = ParticipantEvent::new(EVENT_REPLICATION_STOPPED, &ended.participant_id);
     event.destination_stage_arn = Some(ended.destination_stage_arn.clone());
@@ -3364,6 +3397,7 @@ pub fn record_replication_stopped(
         &ended.source_stage_arn,
         &ended.source_session_id,
         event,
+        at,
     )
 }
 
@@ -3381,13 +3415,16 @@ pub fn record_replication_stopped(
 /// `ended` must already have stopped being [`REPLICATION_STATE_ACTIVE`] in this store (the
 /// caller has stopped it, or is about to drop its record), because the replica stays in the
 /// destination stage while ANY replication still running puts that same participant into
-/// that same session: only the last one to end takes the replica out.
+/// that same session: only the last one to end takes the replica out. `at` is the instant
+/// that last replication ended, which is the instant the replica left
+/// ([`leave_stage_session_at`]).
 ///
 /// `false` — nothing recorded — when another running replication still puts that
 /// participant there, or when there is no such departure to record.
 pub fn release_ended_replica(
     state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     ended: &ParticipantReplicaRecord,
+    at: SystemTime,
 ) -> bool {
     let still_replicated = state.participant_replicas.values().flatten().any(|replica| {
         replica.participant_id == ended.participant_id
@@ -3398,11 +3435,12 @@ pub fn release_ended_replica(
     if still_replicated {
         return false;
     }
-    leave_stage_session(
+    leave_stage_session_at(
         state,
         &ended.destination_stage_arn,
         &ended.destination_session_id,
         &ended.participant_id,
+        at,
     )
 }
 
@@ -3477,6 +3515,13 @@ fn observe_replication_publisher(
 /// is why a reporting operation may call it, exactly as it may materialise what the clock
 /// owes a composition
 /// ([`ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::materialize_due_compositions`]).
+///
+/// Every end is written down AS OF its own deadline rather than as of this call, the same
+/// discipline [`CompositionRecord::materialize_due`] keeps: the consequences an end carries
+/// — the session it closes, the occurrences it records, the empty-stage deadline it earns
+/// every composition of the destination stage — all run out of that instant, so a store
+/// materialised late holds exactly what one materialised on time held and no read can
+/// change what a later caller sees.
 pub fn materialize_due_replications(
     state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     now: SystemTime,
@@ -3487,34 +3532,39 @@ pub fn materialize_due_replications(
     // until this store holds no due replication. Every pass ends at least one of the
     // finitely many running replications, so it terminates.
     loop {
-        let mut due: Vec<ParticipantReplicaRecord> = Vec::new();
+        // Each end beside the deadline it fell due at, which is the instant it happened.
+        let mut due: Vec<(SystemTime, ParticipantReplicaRecord)> = Vec::new();
         for replication in state.participant_replicas.values_mut().flatten() {
-            let owed = replication.is_active()
-                && replication
+            let owed = if replication.is_active() {
+                replication
                     .reconnect_deadline
-                    .is_some_and(|deadline| deadline <= now);
-            if owed {
+                    .filter(|deadline| *deadline <= now)
+            } else {
+                None
+            };
+            if let Some(deadline) = owed {
                 replication.stop();
-                due.push(replication.clone());
+                due.push((deadline, replication.clone()));
             }
         }
         if due.is_empty() {
             return;
         }
-        // Start order, so what this writes down does not depend on the order this store
-        // happens to hold its replications in: the occurrences of one session are in
-        // occurrence order, and two replications ending at the same instant are recorded in
-        // the order they were started.
-        due.sort_by_key(|ended| ended.sequence);
+        // In the order they ENDED, ties in start order, so what this writes down does not
+        // depend on the order this store happens to hold its replications in: the
+        // occurrences of one session are in occurrence order, the departures they cause are
+        // applied in the order they happened, and two replications ending at the same
+        // instant are recorded in the order they were started.
+        due.sort_by_key(|(deadline, ended)| (*deadline, ended.sequence));
         // Each end is written over a store in which every replication ending in this pass
         // has ALREADY stopped, which is the premise both of these take: no replication
         // still running is reported as having ended, and a replica stays in the destination
         // stage while any other replication still puts it there.
-        for ended in &due {
-            record_replication_stopped(state, ended);
+        for (deadline, ended) in &due {
+            record_replication_stopped(state, ended, *deadline);
         }
-        for ended in &due {
-            release_ended_replica(state, ended);
+        for (deadline, ended) in &due {
+            release_ended_replica(state, ended, *deadline);
         }
     }
 }
@@ -3533,9 +3583,12 @@ pub fn materialize_due_replications(
 /// this stage's own sessions, which go with the stage. Their SOURCE session is what survives
 /// that delete, and it is left as a stop would have left it: the end of each of those
 /// replications is an occurrence of it ([`record_replication_stopped`]).
+///
+/// `at` is the instant the stage went away, which is when each of these replications ended.
 pub fn end_replications_of_stage(
     state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     stage_arn: &str,
+    at: SystemTime,
 ) {
     // Each replication this stage sources reaches its stopped state FIRST, as a caller
     // stopping it would leave it: that is what makes it no longer one of the running
@@ -3565,10 +3618,10 @@ pub fn end_replications_of_stage(
         // The end of a replication is an occurrence of the session its publisher is in,
         // through the one place that is written — which records nothing for a replication
         // this stage SOURCED, whose source session went with the stage above.
-        record_replication_stopped(state, replication);
+        record_replication_stopped(state, replication, at);
     }
     for replication in &sourced_here {
-        release_ended_replica(state, replication);
+        release_ended_replica(state, replication, at);
     }
     // The replications sourced from this stage go with its key; the ones replicated INTO it
     // are dropped from the stages that source them.
@@ -3761,7 +3814,7 @@ pub fn record_replicated_participant(
                 let mut event =
                     ParticipantEvent::new(EVENT_PUBLISH_STARTED, &replica.participant_id);
                 event.replica = is_replica;
-                record_participant_event(state, stage_arn, session_id, event);
+                record_participant_event(state, stage_arn, session_id, event, SystemTime::now());
             }
             continue;
         }
@@ -6509,8 +6562,12 @@ pub fn resource_tags_mut<'a>(
     region: &str,
 ) -> Option<&'a mut HashMap<String, String>> {
     // A composition's own lifetime is the clock's: materialise what it already owed, so
-    // a tag cannot be written onto a composition that no longer exists.
-    state.materialize_due_compositions(SystemTime::now());
+    // a tag cannot be written onto a composition that no longer exists — and what the
+    // clock owes a replication first of the two, because a replication ending can be what
+    // left the composited stage empty and so earned the composition its stop.
+    let now = SystemTime::now();
+    materialize_due_replications(state, now);
+    state.materialize_due_compositions(now);
     match TaggedResourceKind::from_arn(arn)? {
         TaggedResourceKind::Stage => state.stage_in_mut(region, arn).map(|stage| &mut stage.tags),
         TaggedResourceKind::Composition => state

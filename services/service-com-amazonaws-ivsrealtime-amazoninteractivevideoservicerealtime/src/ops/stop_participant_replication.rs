@@ -188,12 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // This stop takes effect at one instant, which is what every record it writes —
+        // the replication's end, the occurrence of it, and the replica's departure — is
+        // dated with.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A replication of a publisher that has stayed away for its whole reconnect window
         // has already ended, so what the clock owes is written down before this resolves
         // the RUNNING replication below: a stop names the replication a caller reading at
         // this instant is told is `ACTIVE`.
-        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
+        crate::state::materialize_due_replications(&mut store, now);
         // Both stages the request names are resources of this service, so neither being
         // held in this request's own region's view of the account is the modelled
         // `ResourceNotFoundException` (HTTP 404) — the same two lookups, in the same
@@ -249,7 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::record_replication_stopped`) — so this stop and the end of the
         // same replication reached by deleting a stage it names leave that session the
         // same.
-        crate::state::record_replication_stopped(&mut store, &stopped);
+        crate::state::record_replication_stopped(&mut store, &stopped, now);
 
         // The replica is what the replication put into the destination stage, so stopping
         // it takes that participant back out of the destination stage's session, through
@@ -265,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // into it is, so only the last one to stop takes the replica out — which is the
         // check that helper makes, over a store in which THIS replication is already
         // stopped.
-        crate::state::release_ended_replica(&mut store, &stopped);
+        crate::state::release_ended_replica(&mut store, &stopped, now);
 
         // Every member of `StopParticipantReplicationResponse` is an `@httpHeader` binding
         // for a CORS or security response header, so the whole modelled output of this

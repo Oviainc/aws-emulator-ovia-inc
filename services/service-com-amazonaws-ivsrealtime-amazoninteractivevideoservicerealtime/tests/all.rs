@@ -27,6 +27,8 @@ mod composition_stage_emptied_by_replication;
 mod composition_stop;
 #[path = "all/composition_stop_conflict_wording.rs"]
 mod composition_stop_conflict_wording;
+#[path = "all/composition_stop_due_replication.rs"]
+mod composition_stop_due_replication;
 #[path = "all/composition_tag_lifetime.rs"]
 mod composition_tag_lifetime;
 #[path = "all/composition_terminal_state_retention.rs"]
