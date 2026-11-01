@@ -70,13 +70,19 @@ const OTHER_REGION: &str = "eu-central-1";
 /// are taken of or pulled from: not what any case here is about.
 const ORIGIN_INSTANCE: &str = "pw-origin-instance";
 
-/// The disk a row's disk snapshots — and the snapshot a row's exports and stacks
-/// are made from — are taken of.
+/// The disk a row's disk snapshots — and the snapshot a row's exports are made
+/// from — are taken of.
 const SOURCE_DISK: &str = "pw-source-disk";
 
-/// The snapshot a row's export snapshot records and CloudFormation stack records
-/// are made from.
+/// The snapshot a row's export snapshot records are made from.
 const SOURCE_SNAPSHOT: &str = "pw-source-snapshot";
+
+/// The instance the snapshot a row's CloudFormation stack records are made from
+/// is taken of: a stack is built from the export of an INSTANCE snapshot.
+const STACK_SOURCE_INSTANCE: &str = "pw-stack-source-instance";
+
+/// That instance snapshot.
+const STACK_SOURCE_SNAPSHOT: &str = "pw-stack-source-snapshot";
 
 /// The managed database a row's database snapshots are taken of.
 const SOURCE_DATABASE: &str = "pw-source-database";
@@ -331,7 +337,7 @@ async fn create_disk(emulator: &Emulator, name: &str) {
         .await;
 }
 
-/// Create the disk snapshot a row's exports and stacks are made from, and wait
+/// Create the disk snapshot a row's exports are made from, and wait
 /// until the service has finished taking it — which is when it can be exported
 /// (the refusal before that is pinned in `export_snapshot_completeness.rs`).
 async fn create_source_snapshot(emulator: &Emulator) {
@@ -347,6 +353,28 @@ async fn create_source_snapshot(emulator: &Emulator) {
         Kind::DiskSnapshot,
         SOURCE_SNAPSHOT,
         Kind::DiskSnapshot.settled(),
+    )
+    .await;
+}
+
+/// Create the instance snapshot a row's stacks are made from, and wait until the
+/// service has finished taking it — which is when it can be exported.
+async fn create_stack_source_snapshot(emulator: &Emulator) {
+    create_instance(emulator, STACK_SOURCE_INSTANCE).await;
+    emulator
+        .ok(
+            "CreateInstanceSnapshot",
+            json!({
+                "instanceName": STACK_SOURCE_INSTANCE,
+                "instanceSnapshotName": STACK_SOURCE_SNAPSHOT,
+            }),
+        )
+        .await;
+    wait_for_snapshot_state(
+        emulator,
+        Kind::InstanceSnapshot,
+        STACK_SOURCE_SNAPSHOT,
+        Kind::InstanceSnapshot.settled(),
     )
     .await;
 }
@@ -595,7 +623,7 @@ async fn stock(emulator: &Emulator, row: &Row, count: usize) -> Option<Vec<Strin
             return None;
         }
         Listing::CloudFormationStackRecords => {
-            create_source_snapshot(emulator).await;
+            create_stack_source_snapshot(emulator).await;
             // A stack is built from an export the clock has settled into
             // `Succeeded`, and a second stack from one export waits for the first
             // — so each stack here is built from an export of its own.
@@ -603,7 +631,7 @@ async fn stock(emulator: &Emulator, row: &Row, count: usize) -> Option<Vec<Strin
                 emulator
                     .ok(
                         "ExportSnapshot",
-                        json!({"sourceSnapshotName": SOURCE_SNAPSHOT}),
+                        json!({"sourceSnapshotName": STACK_SOURCE_SNAPSHOT}),
                     )
                     .await;
             }

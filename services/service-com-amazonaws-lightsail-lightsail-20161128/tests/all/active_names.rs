@@ -624,35 +624,41 @@ fn regional_name(kind: Kind, region: &str) -> String {
 #[tokio::test]
 async fn a_record_whose_name_the_service_mints_is_an_active_name() {
     let emulator = Emulator::new();
-    let source_disk = "minted-source-disk";
-    let snapshot = "minted-source-disk-snapshot";
+    let source_instance = "minted-source-instance";
+    let snapshot = "minted-source-instance-snapshot";
     emulator
         .ok_at(
             None,
             Some(REGION),
-            "CreateDisk",
-            json!({"diskName": source_disk, "availabilityZone": "us-east-1a", "sizeInGb": 8}),
+            "CreateInstances",
+            json!({
+                "instanceNames": [source_instance],
+                "availabilityZone": "us-east-1a",
+                "blueprintId": "amazon_linux_2023",
+                "bundleId": "micro_3_0",
+            }),
         )
         .await;
     emulator
         .ok_at(
             None,
             Some(REGION),
-            "CreateDiskSnapshot",
-            json!({"diskName": source_disk, "diskSnapshotName": snapshot}),
+            "CreateInstanceSnapshot",
+            json!({"instanceName": source_instance, "instanceSnapshotName": snapshot}),
         )
         .await;
 
     // The export snapshot record: the service mints its name, so it is read back
-    // from that record's own reader. Only a snapshot the service has finished
-    // taking can be exported — [`REGION`] is the Region an unscoped read is
-    // served in, so the shared wait reads this very snapshot (the refusal before
-    // the capture is finished is pinned in `export_snapshot_completeness.rs`).
+    // from that record's own reader. A stack is created from the export of an
+    // INSTANCE snapshot, and only a snapshot the service has finished taking can
+    // be exported — [`REGION`] is the Region an unscoped read is served in, so
+    // the shared wait reads this very snapshot (the refusal before the capture is
+    // finished is pinned in `export_snapshot_completeness.rs`).
     wait_for_snapshot_state(
         &emulator,
-        SnapshotKind::DiskSnapshot,
+        SnapshotKind::InstanceSnapshot,
         snapshot,
-        SnapshotKind::DiskSnapshot.settled(),
+        SnapshotKind::InstanceSnapshot.settled(),
     )
     .await;
     emulator
@@ -704,7 +710,7 @@ async fn a_record_whose_name_the_service_mints_is_an_active_name() {
     let contact = minted_record_name(&emulator, "GetContactMethods", "contactMethods").await;
 
     let account_wide: BTreeSet<String> = [
-        source_disk.to_string(),
+        source_instance.to_string(),
         snapshot.to_string(),
         export.clone(),
         stack.clone(),

@@ -6747,6 +6747,19 @@ pub struct StoredExportSnapshotRecord {
 }
 
 impl StoredExportSnapshotRecord {
+    /// Which KIND of snapshot this export was taken of, as the modelled
+    /// `ExportSnapshotRecordSourceType` names it: [`RESOURCE_TYPE_INSTANCE_SNAPSHOT`]
+    /// or [`RESOURCE_TYPE_DISK_SNAPSHOT`].
+    ///
+    /// The distinction is what the export produced in Amazon EC2 — a machine
+    /// image for an instance snapshot, a volume for a disk snapshot (see
+    /// [`EC2_IMAGE_ID_PREFIX`] and [`EC2_VOLUME_ID_PREFIX`]) — so an operation
+    /// that consumes the exported resource asks the record for it rather than
+    /// re-deriving it.
+    pub fn exported_snapshot_type(&self) -> &str {
+        self.source_info.resource_type.as_deref().unwrap_or_default()
+    }
+
     /// This record as the modelled `ExportSnapshotRecord`.
     pub fn view(&self) -> ExportSnapshotRecord {
         ExportSnapshotRecord {

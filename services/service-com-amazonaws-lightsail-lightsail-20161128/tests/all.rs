@@ -73,6 +73,8 @@ mod certificate_render_parity;
 mod certificate_request;
 #[path = "all/cloud_formation_stack.rs"]
 mod cloud_formation_stack;
+#[path = "all/cloud_formation_stack_source_kind.rs"]
+mod cloud_formation_stack_source_kind;
 #[path = "all/contact_method_notifications.rs"]
 mod contact_method_notifications;
 #[path = "all/contact_method_tag_bound.rs"]

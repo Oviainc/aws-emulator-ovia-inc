@@ -178,9 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what the model cannot express: one entry per call, an Amazon EC2
         // instance type, a launch script Amazon EC2 accepts, a zone a served
         // Region publishes, and a source that is an export snapshot record of
-        // this account whose export has finished and whose region the new
-        // instance is created in. Every one of those is checked BEFORE the first
-        // write, so a refused request creates nothing.
+        // this account which exported an INSTANCE snapshot, whose export has
+        // finished and whose region the new instance is created in. Every one of
+        // those is checked BEFORE the first write, so a refused request creates
+        // nothing.
         //
         // "You can only pass one instance entry at a time in this array. You
         // will get an invalid parameter error if you pass more than one instance
@@ -240,6 +241,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let source = store
                 .export_snapshot_record(&source_name)
                 .ok_or_else(|| not_found(&source_name))?;
+            // The record must contain "the exported Lightsail instance snapshot
+            // that will be used as the source of the new Amazon EC2 instance",
+            // so of the two kinds of snapshot an export records only an INSTANCE
+            // snapshot is a source: that export creates the machine image the
+            // stack launches the new instance from, while a disk snapshot's
+            // export creates a block storage volume, which no instance can be
+            // launched from.
+            let exported = source.exported_snapshot_type();
+            if exported != crate::state::RESOURCE_TYPE_INSTANCE_SNAPSHOT {
+                return Err(invalid(format!(
+                    "the export snapshot record '{source_name}' exported a {exported}: the stack \
+                     creates the new Amazon EC2 instance from the exported Lightsail {} the \
+                     record contains",
+                    crate::state::RESOURCE_TYPE_INSTANCE_SNAPSHOT
+                )));
+            }
             if source.state != crate::state::RECORD_STATE_SUCCEEDED {
                 return Err(invalid(format!(
                     "the export snapshot record '{source_name}' is {}: the stack creates the new \

@@ -526,11 +526,11 @@ async fn settled_sources(emulator: &Emulator) -> Sources {
     .await;
 
     // The export snapshot record a stack is built from, once the export has
-    // succeeded.
+    // succeeded: a stack is built from the export of an INSTANCE snapshot.
     emulator
         .ok(
             "ExportSnapshot",
-            json!({"sourceSnapshotName": "zone-source-disk-snapshot"}),
+            json!({"sourceSnapshotName": "zone-source-instance-snapshot"}),
         )
         .await;
     let export_record = succeeded_export_record(emulator).await;

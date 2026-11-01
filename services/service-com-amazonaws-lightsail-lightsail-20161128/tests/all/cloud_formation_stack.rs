@@ -69,7 +69,9 @@ const PORT_INFO_SOURCES: &[&str] = &["DEFAULT", "INSTANCE", "NONE", "CLOSED"];
 ///
 /// Answers the records in page order together with the size of each page, so a
 /// caller can assert both the contents and the paging.
-async fn all_records(emulator: &Emulator) -> (Vec<Value>, Vec<usize>) {
+///
+/// `pub(crate)` for the same reason as [`all_export_records`].
+pub(crate) async fn all_records(emulator: &Emulator) -> (Vec<Value>, Vec<usize>) {
     let mut records = Vec::new();
     let mut page_sizes = Vec::new();
     let mut token: Option<String> = None;
@@ -161,7 +163,11 @@ async fn wait_for_state(emulator: &Emulator, name: &str, want: &str) -> Value {
 
 /// Every export snapshot record `GetExportSnapshotRecords` reports, walking every
 /// page.
-async fn all_export_records(emulator: &Emulator) -> Vec<Value> {
+///
+/// `pub(crate)` so the sibling suite for which KIND of export a stack can be
+/// built from (`cloud_formation_stack_source_kind.rs`) reads the records the same
+/// way rather than walking the pages a second time.
+pub(crate) async fn all_export_records(emulator: &Emulator) -> Vec<Value> {
     let mut records = Vec::new();
     let mut token: Option<String> = None;
     loop {
@@ -190,7 +196,9 @@ async fn all_export_records(emulator: &Emulator) -> Vec<Value> {
 
 /// The export snapshot record `name` names, as `GetExportSnapshotRecords` reports
 /// it.
-async fn export_record(emulator: &Emulator, name: &str) -> Value {
+///
+/// `pub(crate)` for the same reason as [`all_export_records`].
+pub(crate) async fn export_record(emulator: &Emulator, name: &str) -> Value {
     all_export_records(emulator)
         .await
         .into_iter()
@@ -202,19 +210,6 @@ async fn export_record(emulator: &Emulator, name: &str) -> Value {
 // The stack table
 // ---------------------------------------------------------------------------
 
-/// What one row's exported snapshot was taken of: the two sources
-/// `CreateDiskSnapshot` admits in this emulator.
-#[derive(Debug)]
-enum Source {
-    /// A block storage disk of this size in GB, created through `CreateDisk`.
-    Disk { size_in_gb: i64 },
-    /// An instance's system volume: the instance is created from this blueprint
-    /// and bundle.
-    Instance {
-        blueprint_id: &'static str,
-        bundle_id: &'static str,
-    },
-}
 
 /// The launch script one row's instance entry carries.
 #[derive(Debug)]
@@ -242,9 +237,14 @@ impl UserData {
 /// One stack to create, and how many stacks to create from the one export
 /// snapshot record.
 ///
-/// The rows differ along everything the rule generalises over: the KIND of
-/// resource the exported snapshot was taken of, the Availability Zone (and so the
-/// region in every ARN and in the location), the Amazon EC2 instance type's form
+/// Every row's source is an export of an INSTANCE snapshot, because that is the
+/// only source a stack can be built from (pinned in
+/// `cloud_formation_stack_source_kind.rs`).
+///
+/// The rows differ along everything the rule generalises over: the blueprint and
+/// bundle the snapshotted instance was created from, the Availability Zone (and
+/// so the region in every ARN and in the location), the Amazon EC2 instance
+/// type's form
 /// (family and size, a family carrying a letter suffix, a numbered size), the
 /// port configuration — every member of the modelled `PortInfoSourceType` enum
 /// appears across the table — the launch script (absent, an ASCII script, a
@@ -260,22 +260,25 @@ struct Row {
     snapshot_name: &'static str,
     availability_zone: &'static str,
     region: &'static str,
-    source: Source,
+    blueprint_id: &'static str,
+    bundle_id: &'static str,
     instance_type: &'static str,
     port_info_source: &'static str,
     user_data: UserData,
     stacks: usize,
 }
 
-/// The table.
+/// The table. Blueprint and bundle ids are entries of this service's own
+/// published catalogs (`GetBlueprints` and `GetBundles`).
 const ROWS: &[Row] = &[
     Row {
-        case: "a disk snapshot's export, the default firewall, no launch script",
-        source_name: "Disk-Virginia-1",
-        snapshot_name: "my-disk-snapshot",
+        case: "the default firewall, no launch script",
+        source_name: "Instance-Virginia-1",
+        snapshot_name: "my-instance-snapshot",
         availability_zone: "us-east-1a",
         region: "us-east-1",
-        source: Source::Disk { size_in_gb: 32 },
+        blueprint_id: "amazon_linux_2023",
+        bundle_id: "micro_3_0",
         instance_type: "t2.micro",
         port_info_source: "DEFAULT",
         user_data: UserData::None,
@@ -283,11 +286,12 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "another region, the source instance's firewall, a launch script, two stacks",
-        source_name: "small-disk-8",
-        snapshot_name: "small_disk_snapshot_1",
+        source_name: "small-instance-8",
+        snapshot_name: "small_instance_snapshot_1",
         availability_zone: "eu-west-1c",
         region: "eu-west-1",
-        source: Source::Disk { size_in_gb: 8 },
+        blueprint_id: "ubuntu_22_04",
+        bundle_id: "nano_3_0",
         instance_type: "m5d.2xlarge",
         port_info_source: "INSTANCE",
         user_data: UserData::Script("#!/bin/sh\napt-get -y update\n"),
@@ -295,26 +299,25 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "all ports closed, a multi-byte launch script",
-        source_name: "data-disk-4096",
-        snapshot_name: "data-disk-4096-backup",
+        source_name: "WinInstance",
+        snapshot_name: "WinInstance-backup",
         availability_zone: "ap-southeast-2b",
         region: "ap-southeast-2",
-        source: Source::Disk { size_in_gb: 4096 },
+        blueprint_id: "windows_server_2022",
+        bundle_id: "large_3_0",
         instance_type: "mac2-m2pro.metal",
         port_info_source: "CLOSED",
         user_data: UserData::Script("#!/bin/sh\necho 'café ☕ für alle'\n"),
         stacks: 1,
     },
     Row {
-        case: "an instance's system volume, the default EC2 security group",
+        case: "the default EC2 security group",
         source_name: "nano-instance",
-        snapshot_name: "nano-system-volume-snapshot",
+        snapshot_name: "nano-instance-snapshot",
         availability_zone: "us-west-2a",
         region: "us-west-2",
-        source: Source::Instance {
-            blueprint_id: "amazon_linux_2023",
-            bundle_id: "nano_3_0",
-        },
+        blueprint_id: "amazon_linux_2023",
+        bundle_id: "nano_3_0",
         instance_type: "t3a.nano",
         port_info_source: "NONE",
         user_data: UserData::None,
@@ -323,13 +326,11 @@ const ROWS: &[Row] = &[
     Row {
         case: "the largest launch script Amazon EC2 accepts",
         source_name: "medium_instance_2",
-        snapshot_name: "medium-system-volume-snapshot",
+        snapshot_name: "medium-instance-snapshot",
         availability_zone: "ca-central-1a",
         region: "ca-central-1",
-        source: Source::Instance {
-            blueprint_id: "debian_12",
-            bundle_id: "medium_3_0",
-        },
+        blueprint_id: "debian_12",
+        bundle_id: "medium_3_0",
         instance_type: "m6i.32xlarge",
         port_info_source: "DEFAULT",
         user_data: UserData::LargestAccepted,
@@ -337,56 +338,41 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// Create the resource one row's snapshot is taken of.
+/// Create the instance one row's snapshot is taken of.
 async fn create_source(emulator: &Emulator, row: &Row) {
-    match row.source {
-        Source::Disk { size_in_gb } => {
-            emulator
-                .ok(
-                    "CreateDisk",
-                    json!({
-                        "diskName": row.source_name,
-                        "availabilityZone": row.availability_zone,
-                        "sizeInGb": size_in_gb,
-                    }),
-                )
-                .await;
-        }
-        Source::Instance {
-            blueprint_id,
-            bundle_id,
-        } => {
-            emulator
-                .ok(
-                    "CreateInstances",
-                    json!({
-                        "instanceNames": [row.source_name],
-                        "availabilityZone": row.availability_zone,
-                        "blueprintId": blueprint_id,
-                        "bundleId": bundle_id,
-                    }),
-                )
-                .await;
-        }
-    }
+    emulator
+        .ok(
+            "CreateInstances",
+            json!({
+                "instanceNames": [row.source_name],
+                "availabilityZone": row.availability_zone,
+                "blueprintId": row.blueprint_id,
+                "bundleId": row.bundle_id,
+            }),
+        )
+        .await;
 }
 
-/// Create one row's snapshot, from the resource it is taken of, and wait until
-/// the service has finished taking it — which is when it can be exported (the
-/// refusal before that is pinned in `export_snapshot_completeness.rs`).
+/// Create one row's instance snapshot, from the instance it is taken of, and
+/// wait until the service has finished taking it — which is when it can be
+/// exported (the refusal before that is pinned in
+/// `export_snapshot_completeness.rs`).
 async fn create_snapshot(emulator: &Emulator, row: &Row) {
     create_source(emulator, row).await;
-    let mut body = json!({"diskSnapshotName": row.snapshot_name});
-    match row.source {
-        Source::Disk { .. } => body["diskName"] = json!(row.source_name),
-        Source::Instance { .. } => body["instanceName"] = json!(row.source_name),
-    }
-    emulator.ok("CreateDiskSnapshot", body).await;
+    emulator
+        .ok(
+            "CreateInstanceSnapshot",
+            json!({
+                "instanceName": row.source_name,
+                "instanceSnapshotName": row.snapshot_name,
+            }),
+        )
+        .await;
     wait_for_snapshot_state(
         emulator,
-        Kind::DiskSnapshot,
+        Kind::InstanceSnapshot,
         row.snapshot_name,
-        Kind::DiskSnapshot.settled(),
+        Kind::InstanceSnapshot.settled(),
     )
     .await;
 }
@@ -1266,13 +1252,13 @@ async fn a_source_that_is_not_an_export_record_is_refused() {
 
     // Each name below is admitted by the modelled `ResourceName` pattern and
     // names no export snapshot record: one that was never created, the stored
-    // name in another case, the SNAPSHOT that was exported, and the disk the
+    // name in another case, the SNAPSHOT that was exported, and the instance the
     // snapshot was taken of.
     let refused = [
         ("a name that was never created", "no-such-export-record".to_string()),
         ("the stored name in upper case", export_name.to_uppercase()),
         ("the snapshot that was exported", row.snapshot_name.to_string()),
-        ("the disk the snapshot was taken of", row.source_name.to_string()),
+        ("the instance the snapshot was taken of", row.source_name.to_string()),
     ];
     for (case, source_name) in refused {
         let (status, body) = emulator
