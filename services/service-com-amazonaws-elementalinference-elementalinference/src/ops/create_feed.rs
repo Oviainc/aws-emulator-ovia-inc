@@ -282,7 +282,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::OutputListRefusal::DuplicateName(_) => {
                     CreateFeedErrorModeled::ConflictException(ConflictException { message })
                 }
-                crate::state::OutputListRefusal::TooManyOutputs => {
+                crate::state::OutputListRefusal::TooManyOutputs
+                | crate::state::OutputListRefusal::TooManyAppendedOutputs => {
                     CreateFeedErrorModeled::ServiceQuotaExceededException(
                         ServiceQuotaExceededException { message },
                     )

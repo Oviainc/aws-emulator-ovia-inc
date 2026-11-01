@@ -419,6 +419,18 @@ pub const OUTPUT_STATUS_DISABLED: &str = "DISABLED";
 /// too.
 pub const MAX_OUTPUTS_PER_FEED: usize = 20;
 
+/// Whether a feed LEFT HOLDING `count` outputs would be past [`MAX_OUTPUTS_PER_FEED`].
+///
+/// The bound is ONE rule about the list a feed ends up holding, so it is measured in one
+/// place for every operation that carries such a list: what the carriers differ in is
+/// which list the feed is left holding — the request's own, for the operations that
+/// REPLACE it ([`output_list_refusal`]), the stored one plus what the call really adds,
+/// for the one that APPENDS to it ([`appended_output_list_refusal`]) — never the figure
+/// they compare it against.
+fn exceeds_max_outputs_per_feed(count: usize) -> bool {
+    count > MAX_OUTPUTS_PER_FEED
+}
+
 /// A request whose output list is longer than [`MAX_OUTPUTS_PER_FEED`], for the
 /// operations that SET the list (`CreateFeed`, `UpdateFeed`).
 ///
@@ -431,6 +443,22 @@ pub fn too_many_outputs_message() -> String {
     )
 }
 
+/// A request that would carry a feed past [`MAX_OUTPUTS_PER_FEED`] by APPENDING to the
+/// list it already holds (`AssociateFeed`).
+///
+/// The same bound as [`too_many_outputs_message`], stating the same quota and, like it,
+/// nothing about the request or the stored feed — not even how many of the bound the feed
+/// is already using. What differs is the remedy the sentence names: the caller of an
+/// append cannot shorten a list it did not supply, and removes an output the feed holds
+/// with `UpdateFeed` instead. The figure comes from the one constant either way, so the
+/// two sentences cannot come to state different bounds.
+pub fn too_many_appended_outputs_message() -> String {
+    format!(
+        "You can't add these outputs because a feed holds at most {MAX_OUTPUTS_PER_FEED} \
+         outputs. Remove outputs with UpdateFeed or request a quota increase."
+    )
+}
+
 /// A request whose output list would leave a feed holding NO output at all.
 ///
 /// "The key contents of the feed is an array of outputs", and a create "must specify at
@@ -439,10 +467,9 @@ pub fn too_many_outputs_message() -> String {
 /// `UpdateFeed`, whose list is the one the feed is left holding — refuse an empty list,
 /// because the feed it describes holds nothing. An APPEND is not one of them: it leaves
 /// the feed holding what it already holds, so a list that adds nothing takes nothing
-/// away either (its one rule about the names the request carries is
-/// [`first_duplicate_output_name`]). The rule is about the shape of the
-/// request rather than about any one value it carried, so the message is the rule's
-/// invariant sentence and interpolates nothing.
+/// away either (the rules an append IS held to are [`appended_output_list_refusal`]). The
+/// rule is about the shape of the request rather than about any one value it carried, so
+/// the message is the rule's invariant sentence and interpolates nothing.
 pub const MISSING_OUTPUTS_MESSAGE: &str = "You must specify at least one output.";
 
 /// Why a supplied output list is not one a feed may hold.
@@ -454,8 +481,7 @@ pub const MISSING_OUTPUTS_MESSAGE: &str = "You must specify at least one output.
 /// class each failure earns are stated ONCE here, so no two operations that carry such a
 /// list can come to disagree about what a feed's outputs may look like — the operations
 /// that REPLACE the list through [`output_list_refusal`] and the one that APPENDS to it
-/// through the name scan that statement shares with it
-/// ([`first_duplicate_output_name`]). A handler only lifts the outcome into its
+/// through [`appended_output_list_refusal`]. A handler only lifts the outcome into its
 /// own modelled error enum, which is per-operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputListRefusal<'a> {
@@ -467,9 +493,16 @@ pub enum OutputListRefusal<'a> {
     /// repeats ([`first_duplicate_output_name`]). Reported as the modelled
     /// `ConflictException` (HTTP 409).
     DuplicateName(&'a str),
-    /// The list is longer than [`MAX_OUTPUTS_PER_FEED`]. Reported as the modelled
+    /// The list is the feed's WHOLE list and is longer than [`MAX_OUTPUTS_PER_FEED`]
+    /// ([`too_many_outputs_message`]). Reported as the modelled
     /// `ServiceQuotaExceededException` (HTTP 402).
     TooManyOutputs,
+    /// The list ADDS to the one the feed holds, and together they are longer than
+    /// [`MAX_OUTPUTS_PER_FEED`] ([`too_many_appended_outputs_message`]). The same bound as
+    /// [`Self::TooManyOutputs`] and the same modelled
+    /// `ServiceQuotaExceededException` (HTTP 402); what the two carriers differ in is the
+    /// remedy their own operation offers the caller.
+    TooManyAppendedOutputs,
 }
 
 impl OutputListRefusal<'_> {
@@ -480,6 +513,7 @@ impl OutputListRefusal<'_> {
             Self::MissingOutputs => MISSING_OUTPUTS_MESSAGE.to_string(),
             Self::DuplicateName(name) => duplicate_output_name_message(name),
             Self::TooManyOutputs => too_many_outputs_message(),
+            Self::TooManyAppendedOutputs => too_many_appended_outputs_message(),
         }
     }
 }
@@ -496,11 +530,8 @@ impl OutputListRefusal<'_> {
 /// replacement is the request's own length. `names` is only walked, so a handler can run
 /// this before it takes the store and still owns the outputs it goes on to store.
 ///
-/// An APPEND (`AssociateFeed`) is held to the name rule below through the same scan
-/// ([`first_duplicate_output_name`], whose refusal is worded by
-/// [`duplicate_output_name_message`]), and to neither of the other two: a list that adds
-/// no output leaves the feed holding what it already holds, and what an append may leave
-/// the feed holding depends on the stored list, so only that feed can say it.
+/// An APPEND (`AssociateFeed`) is held to its own two of the three, stated in
+/// [`appended_output_list_refusal`].
 pub fn output_list_refusal<'a>(
     names: impl Iterator<Item = &'a str> + Clone,
 ) -> Option<OutputListRefusal<'a>> {
@@ -510,8 +541,41 @@ pub fn output_list_refusal<'a>(
     if let Some(name) = first_duplicate_output_name(names.clone()) {
         return Some(OutputListRefusal::DuplicateName(name));
     }
-    if names.count() > MAX_OUTPUTS_PER_FEED {
+    if exceeds_max_outputs_per_feed(names.count()) {
         return Some(OutputListRefusal::TooManyOutputs);
+    }
+    None
+}
+
+/// Which refusal, if any, an output list APPENDED to a feed's stored list earns.
+///
+/// The one operation that appends is `AssociateFeed`, whose outputs "supplement any
+/// outputs that you specified when you created or updated the feed": the feed is left
+/// holding what it already holds PLUS the supplied list, so of the three rules above it is
+/// held to two. The name rule is one of them — through the very scan a replacement goes
+/// through ([`first_duplicate_output_name`]), because an output's name identifies it
+/// whichever operation supplied it. The bound is the other, measured against what the feed
+/// would be LEFT holding: `held` plus what the call really adds. The list's cardinality is
+/// NOT a rule here: a list that adds no output leaves the feed holding the outputs it
+/// already held — at least one, which the create made sure of — so it is served, which is
+/// also why a list that adds nothing is never past the bound.
+///
+/// An append decides the two from different things, so it reaches them as its inputs
+/// arrive: `held` is the stored count once the feed is resolved, and `None` while it is
+/// not — with `None` only the rules the supplied names settle are decided, so a request
+/// naming a feed this Region does not hold still earns the not-found refusal rather than
+/// one about the list. `names` is only walked, so a handler can run this and still own the
+/// outputs it goes on to store.
+pub fn appended_output_list_refusal<'a>(
+    held: Option<usize>,
+    names: impl Iterator<Item = &'a str> + Clone,
+) -> Option<OutputListRefusal<'a>> {
+    if let Some(name) = first_duplicate_output_name(names.clone()) {
+        return Some(OutputListRefusal::DuplicateName(name));
+    }
+    let appended = names.count();
+    if appended > 0 && held.is_some_and(|held| exceeds_max_outputs_per_feed(held + appended)) {
+        return Some(OutputListRefusal::TooManyAppendedOutputs);
     }
     None
 }
