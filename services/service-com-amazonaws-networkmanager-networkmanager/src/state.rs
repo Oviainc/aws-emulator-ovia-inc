@@ -298,6 +298,17 @@ pub const ATTACHMENT_TYPE_DIRECT_CONNECT_GATEWAY: &str = "DIRECT_CONNECT_GATEWAY
 /// [`AttachmentDetail::TransitGatewayRouteTable`]).
 pub const ATTACHMENT_TYPE_TRANSIT_GATEWAY_ROUTE_TABLE: &str = "TRANSIT_GATEWAY_ROUTE_TABLE";
 
+/// The tunnel protocols a Connect attachment's options may ask for, the two the model
+/// enumerates (GRE, NO_ENCAP: `smithy_query shape=TunnelProtocol`, mirrored in
+/// `ops::types::TUNNEL_PROTOCOL_VALUES`), and therefore the two a Connect peer can inherit
+/// from the attachment it is carried over.
+///
+/// They are named here because the protocol decides which of a Connect peer create's
+/// members apply at all ([`check_protocol_scoped_member`]).
+pub const TUNNEL_PROTOCOL_GRE: &str = "GRE";
+/// See [`TUNNEL_PROTOCOL_GRE`].
+pub const TUNNEL_PROTOCOL_NO_ENCAP: &str = "NO_ENCAP";
+
 /// Network Manager is a global (partition-scoped) service, so its ARNs carry an empty
 /// region segment: `arn:aws:networkmanager::<account>:global-network/<id>`.
 const ARN_REGION: &str = "";
@@ -1093,7 +1104,50 @@ pub fn check_tunnel_addresses(
     Ok(())
 }
 
-/// How many route analyses one global network may hold here.
+/// Check a request member the model scopes to ONE tunnel protocol against the protocol the
+/// peering actually runs.
+///
+/// A Connect peer takes its protocol from the attachment it is carried over, and the model
+/// scopes two of the create's members to a single protocol each: "This only applies only
+/// when the protocol is `GRE`" on `CoreNetworkAddress` and "...when the protocol is
+/// NO_ENCAP" on `SubnetArn` (`smithy_query query="doc" shape="CreateConnectPeerRequest"
+/// member="CoreNetworkAddress"`, `member="SubnetArn"`). A member supplied against the OTHER
+/// protocol describes configuration that peering has no place for — a tunnel address on a
+/// peering that builds no tunnel, a subnet on one that reaches its appliance through a
+/// tunnel — so it is refused with the modelled `ValidationException` (HTTP 400) naming the
+/// member that carried it and nothing is stored. That is what keeps a stored peer from
+/// contradicting the `Protocol` its own configuration reports.
+///
+/// The refusal is against STORED state rather than against the value — the member parses
+/// and satisfies its constraints, and only the attachment's protocol makes it inapplicable
+/// — so it carries [`VALIDATION_REASON_OTHER`], and it is judged after the member's own
+/// value has been.
+///
+/// `supplied` says whether the request named the member at all (a member whose spelling
+/// names nothing, like the empty `SubnetArn`, is not supplied); `applies_to` is the protocol
+/// the model scopes it to; `protocol` is the attachment's, which is `None` where its options
+/// named none — then no stated protocol excludes anything and the member stands.
+pub fn check_protocol_scoped_member(
+    member: &str,
+    supplied: bool,
+    applies_to: &str,
+    connect_attachment_id: &str,
+    protocol: Option<&str>,
+) -> Result<(), ValidationException> {
+    match protocol {
+        Some(running) if supplied && running != applies_to => Err(field_rejection(
+            member,
+            VALIDATION_REASON_OTHER,
+            format!(
+                "{member} only applies when the protocol is {applies_to}, but Connect \
+                 attachment {connect_attachment_id} carries protocol {running}"
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+
 ///
 /// CHOSEN, like [`MAX_ATTACHMENTS_PER_CORE_NETWORK`]: every `StartRouteAnalysis` records
 /// one more analysis a later `GetRouteAnalysis` can read back, and neither the model nor
@@ -3369,6 +3423,10 @@ pub struct ConnectPeerRecord {
     /// peering needs ("This only applies only when the protocol is GRE", `smithy_query
     /// query="doc" shape="CreateConnectPeerRequest" member="CoreNetworkAddress"`), and the
     /// appliance side, which every peering requires.
+    ///
+    /// A peering whose [`Self::protocol`] is another one carries NONE: the create that
+    /// named it against that protocol is refused rather than stored
+    /// ([`check_protocol_scoped_member`]), so this is held only where it applies.
     pub core_network_address: Option<String>,
     /// See [`Self::core_network_address`].
     pub peer_address: String,
@@ -3386,6 +3444,9 @@ pub struct ConnectPeerRecord {
     /// needs (`smithy_query query="doc" shape="CreateConnectPeerRequest"
     /// member="SubnetArn"`), or `None` where the request named none — the modelled pattern
     /// admits the empty string, which names no subnet and is held as none.
+    ///
+    /// Like [`Self::core_network_address`], a peering whose [`Self::protocol`] is another
+    /// one carries none ([`check_protocol_scoped_member`]).
     pub subnet_arn: Option<String>,
     pub created_at: SystemTime,
     /// The instant the `CREATING` -> `AVAILABLE` transition the clock owes becomes due.

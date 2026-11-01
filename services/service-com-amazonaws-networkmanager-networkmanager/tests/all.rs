@@ -47,6 +47,8 @@ mod connect_peer_delete;
 mod connect_peer_delete_cascade;
 #[path = "all/connect_peer_lifecycle.rs"]
 mod connect_peer_lifecycle;
+#[path = "all/connect_peer_protocol_scoped_members.rs"]
+mod connect_peer_protocol_scoped_members;
 #[path = "all/connect_peer_tie_removal_refusals.rs"]
 mod connect_peer_tie_removal_refusals;
 #[path = "all/connect_peer_tunnel_address_family.rs"]

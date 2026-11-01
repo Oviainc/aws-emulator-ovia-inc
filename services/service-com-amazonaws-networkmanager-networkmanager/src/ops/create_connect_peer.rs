@@ -16,7 +16,11 @@
 //! than any of its own. The two ends of the BGP session it peers over — the appliance's
 //! address and the core network's — are addresses of ONE IP address family, so a request
 //! whose pair straddles the two is refused and nothing is stored
-//! ([`crate::state::check_tunnel_addresses`]). A created peer waits in `CREATING` until the
+//! ([`crate::state::check_tunnel_addresses`]). That inherited protocol also decides which
+//! members apply at all: the model scopes `CoreNetworkAddress` to GRE and `SubnetArn` to
+//! `NO_ENCAP`, so a request naming one against the other protocol is refused
+//! ([`crate::state::check_protocol_scoped_member`]) and no stored peer contradicts the
+//! protocol its own configuration reports. A created peer waits in `CREATING` until the
 //! transition the clock owes falls due and is `AVAILABLE` after it.
 //!
 //! ## Reaching this service's state
@@ -303,6 +307,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+
+        // A peering carries only the configuration its own tunnel protocol gives meaning
+        // to, and the protocol is the attachment's, read above. The model scopes each of
+        // these two members to ONE protocol — `CoreNetworkAddress` to GRE and `SubnetArn`
+        // to `NO_ENCAP` (`smithy_query query="doc" shape="CreateConnectPeerRequest"
+        // member="CoreNetworkAddress"`, `member="SubnetArn"`) — so a member named against
+        // the other protocol is refused by the one rule that owns that scoping
+        // ([`crate::state::check_protocol_scoped_member`]) and nothing is stored. A peer
+        // therefore never reports configuration its own `Protocol` says cannot apply. Each
+        // member's own value has already been judged above, so what is left here is only
+        // whether it applies at all.
+        crate::state::check_protocol_scoped_member(
+            crate::state::FIELD_CORE_NETWORK_ADDRESS,
+            input.core_network_address.is_some(),
+            crate::state::TUNNEL_PROTOCOL_GRE,
+            &input.connect_attachment_id,
+            protocol.as_deref(),
+        )
+        .map_err(CreateConnectPeerErrorModeled::ValidationException)?;
+        crate::state::check_protocol_scoped_member(
+            crate::state::FIELD_SUBNET_ARN,
+            subnet_arn.is_some(),
+            crate::state::TUNNEL_PROTOCOL_NO_ENCAP,
+            &input.connect_attachment_id,
+            protocol.as_deref(),
+        )
+        .map_err(CreateConnectPeerErrorModeled::ValidationException)?;
 
         let peer_asn = input
             .bgp_options
