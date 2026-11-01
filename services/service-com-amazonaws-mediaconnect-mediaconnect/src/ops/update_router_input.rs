@@ -375,7 +375,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             router_input.transit_encryption = transit_encryption;
         }
         if let Some(maintenance_configuration) = input.maintenance_configuration.clone() {
-            router_input.maintenance_configuration = maintenance_configuration;
+            // The window the input is next maintained in is DERIVED from the configuration
+            // this request replaces, so storing the new preference re-derives a window the
+            // new one no longer accounts for (the rule `crate::state` owns for every
+            // resource that holds a derived maintenance window).
+            crate::state::apply_maintenance_configuration(
+                &mut router_input.maintenance_configuration,
+                &mut router_input.maintenance_schedule,
+                maintenance_configuration,
+                now,
+            );
         }
         if let Some(configuration) = input.content_quality_analysis_configuration.clone() {
             router_input.content_quality_analysis_configuration = configuration;

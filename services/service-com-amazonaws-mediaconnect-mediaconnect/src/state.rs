@@ -3797,6 +3797,14 @@ const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 /// Days in a week — how far apart two occurrences of one preferred weekday are.
 const DAYS_PER_WEEK: u64 = 7;
 
+/// The Monday-first index of the epoch day, 1970-01-01, which was a Thursday.
+///
+/// The anchor every weekday this module derives from an epoch second is counted from, so the
+/// weekday a window OPENS on ([`maintenance_window_matches_configuration`]) and the weekday
+/// the next occurrence of a preference falls on ([`next_time_of_day_occurrence`]) cannot
+/// disagree.
+const EPOCH_DAY_OF_WEEK: u64 = 3;
+
 /// The time of day a maintenance window opens for a resource whose maintenance
 /// configuration names no preferred time.
 ///
@@ -3919,19 +3927,81 @@ pub fn maintenance_window_schedule(
     configuration: &MaintenanceConfiguration,
     from: SystemTime,
 ) -> MaintenanceSchedule {
-    let (preferred_day, time_of_day) = match configuration {
-        MaintenanceConfiguration::PreferredDayTime(preference) => (
-            maintenance_day_of_week(&preference.day),
-            maintenance_time_of_day(&preference.time).unwrap_or(DEFAULT_MAINTENANCE_TIME_OF_DAY),
-        ),
-        MaintenanceConfiguration::Default(_) => (None, DEFAULT_MAINTENANCE_TIME_OF_DAY),
-    };
+    let (preferred_day, time_of_day) = maintenance_preference(configuration);
     let start = next_time_of_day_occurrence(preferred_day, time_of_day, from);
     MaintenanceSchedule::Window(WindowMaintenanceSchedule {
         start: ::aws_smithy_types::DateTime::from(start),
         end: ::aws_smithy_types::DateTime::from(start + MAINTENANCE_WINDOW_SPAN),
         scheduled_time: ::aws_smithy_types::DateTime::from(start),
     })
+}
+
+/// The preference `configuration` states, as the weekday a window opens on (`None` for a
+/// configuration that prefers no day, so every day qualifies) and its time of day past
+/// midnight UTC.
+///
+/// The ONE reading of a maintenance configuration, so the window a schedule is derived at
+/// ([`maintenance_window_schedule`]) and the test of whether a window still belongs to a
+/// preference ([`maintenance_window_matches_configuration`]) cannot read one differently.
+fn maintenance_preference(configuration: &MaintenanceConfiguration) -> (Option<u64>, Duration) {
+    match configuration {
+        MaintenanceConfiguration::PreferredDayTime(preference) => (
+            maintenance_day_of_week(&preference.day),
+            maintenance_time_of_day(&preference.time).unwrap_or(DEFAULT_MAINTENANCE_TIME_OF_DAY),
+        ),
+        MaintenanceConfiguration::Default(_) => (None, DEFAULT_MAINTENANCE_TIME_OF_DAY),
+    }
+}
+
+/// Whether the window `schedule` reports is an occurrence of the preference `configuration`
+/// states: it opens on a weekday that configuration prefers, at the time of day it prefers.
+///
+/// A window is DERIVED from a maintenance configuration ([`maintenance_window_schedule`]),
+/// so this is what tells a window that still belongs to the preference a resource carries
+/// from one derived from a preference it no longer carries (see
+/// [`apply_maintenance_configuration`]). Only the instant the window OPENS is read: its end
+/// and its scheduled time follow from that instant.
+fn maintenance_window_matches_configuration(
+    schedule: &MaintenanceSchedule,
+    configuration: &MaintenanceConfiguration,
+) -> bool {
+    let MaintenanceSchedule::Window(window) = schedule;
+    let Ok(start) = u64::try_from(window.start.secs()) else {
+        return false;
+    };
+    let (preferred_day, time_of_day) = maintenance_preference(configuration);
+    if start % SECONDS_PER_DAY != time_of_day.as_secs() {
+        return false;
+    }
+    preferred_day
+        .is_none_or(|day| (start / SECONDS_PER_DAY + EPOCH_DAY_OF_WEEK) % DAYS_PER_WEEK == day)
+}
+
+/// Store `configuration` as the maintenance preference of the resource whose derived window
+/// is `stored_schedule`, re-deriving a window that the new preference no longer accounts
+/// for.
+///
+/// A maintenance window is never carried by a request: it is DERIVED from the resource's
+/// maintenance configuration ([`maintenance_window_schedule`]), so it belongs to the
+/// preference it was derived from. Once that preference is replaced, a window that is not an
+/// occurrence of the preference the resource now carries is spent — the resource is next
+/// maintained at the next occurrence of the NEW preference, which is the window every later
+/// read reports. A resource nothing has scheduled a window for keeps none: the start is the
+/// call that schedules the first one. This is the rule the crate already applies to the
+/// derived maintenance value on the flow side, where a rescheduled window drops the deadline
+/// that was issued for the old one (see `crate::ops::update_flow`).
+pub fn apply_maintenance_configuration(
+    stored_configuration: &mut MaintenanceConfiguration,
+    stored_schedule: &mut Option<MaintenanceSchedule>,
+    configuration: MaintenanceConfiguration,
+    now: SystemTime,
+) {
+    *stored_configuration = configuration;
+    if stored_schedule.as_ref().is_some_and(|schedule| {
+        !maintenance_window_matches_configuration(schedule, stored_configuration)
+    }) {
+        *stored_schedule = Some(maintenance_window_schedule(stored_configuration, now));
+    }
 }
 
 /// Whether the maintenance window `schedule` reports has closed by `now`.
@@ -3965,9 +4035,6 @@ fn next_time_of_day_occurrence(
     time_of_day: Duration,
     from: SystemTime,
 ) -> SystemTime {
-    /// The Monday-first index of the epoch day, 1970-01-01, which was a Thursday.
-    const EPOCH_DAY_OF_WEEK: u64 = 3;
-
     let since_epoch = from
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -4462,7 +4529,8 @@ pub struct StoredRouterInput {
     /// CONFIGURATION ([`maintenance_window_schedule`]); it is held on the record rather than
     /// recomputed per read so every later read reports the same window — until the clock
     /// passes its end, when the next occurrence of the same preference is owed (see
-    /// [`Self::settle`]).
+    /// [`Self::settle`]), or until that preference is replaced, when the next occurrence of
+    /// the NEW one is ([`apply_maintenance_configuration`]).
     pub maintenance_schedule: Option<MaintenanceSchedule>,
     /// When the record stops existing, or `None` while the input is not being deleted.
     ///
@@ -4952,7 +5020,8 @@ pub struct StoredRouterOutput {
     /// [`StoredRouterInput::maintenance_schedule`], held rather than recomputed per read so
     /// every later read reports the window the caller was told about — until the clock
     /// passes its end, when the next occurrence of the same preference is owed (see
-    /// [`Self::settle`]).
+    /// [`Self::settle`]), or until that preference is replaced, when the next occurrence of
+    /// the NEW one is ([`apply_maintenance_configuration`]).
     pub maintenance_schedule: Option<MaintenanceSchedule>,
     /// The `@idempotencyToken` of the create that minted this output
     /// (`CreateRouterOutputRequest$ClientToken`, "a unique identifier for the request to

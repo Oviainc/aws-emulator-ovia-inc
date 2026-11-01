@@ -407,7 +407,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             output.routing_scope = routing_scope;
         }
         if let Some(maintenance_configuration) = input.maintenance_configuration.clone() {
-            output.maintenance_configuration = maintenance_configuration;
+            // The window the output is next maintained in is DERIVED from the configuration
+            // this request replaces, so storing the new preference re-derives a window the
+            // new one no longer accounts for (the rule `crate::state` owns for every
+            // resource that holds a derived maintenance window).
+            crate::state::apply_maintenance_configuration(
+                &mut output.maintenance_configuration,
+                &mut output.maintenance_schedule,
+                maintenance_configuration,
+                now,
+            );
         }
         if let Some(fabric_configuration) = input.fabric_configuration.clone() {
             output.fabric_configuration = fabric_configuration;
