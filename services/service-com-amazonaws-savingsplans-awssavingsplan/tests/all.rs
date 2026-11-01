@@ -29,6 +29,8 @@ mod offering_product_type_coverage;
 mod offering_rate_catalog;
 #[path = "all/offering_service_code.rs"]
 mod offering_service_code;
+#[path = "all/page_cursor_canonical_spelling.rs"]
+mod page_cursor_canonical_spelling;
 #[path = "all/plan_id_not_found_message.rs"]
 mod plan_id_not_found_message;
 #[path = "all/plan_rate_card.rs"]

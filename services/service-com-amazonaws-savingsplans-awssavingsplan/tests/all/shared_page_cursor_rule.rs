@@ -25,13 +25,13 @@ use service_com_amazonaws_savingsplans_awssavingsplan::state;
 use crate::savings_plans_lifecycle::{text, Emulator, ONE_YEAR, THREE_YEARS};
 
 /// The sentence with which this service refuses a cursor it did not mint.
-const REFUSAL: &str = "nextToken is not a token this operation issued";
+pub(crate) const REFUSAL: &str = "nextToken is not a token this operation issued";
 
 /// Every paginated operation of this service, as `(operation, page kind, the
 /// member it reports its page in)`. The page kind is the one each handler
 /// passes to the shared cursor rule, so a token minted under any OTHER kind is
 /// foreign to this operation.
-const PAGINATED: [(&str, &str, &str); 4] = [
+pub(crate) const PAGINATED: [(&str, &str, &str); 4] = [
     ("DescribeSavingsPlansOfferings", "offerings", "searchResults"),
     (
         "DescribeSavingsPlansOfferingRates",
@@ -65,7 +65,7 @@ async fn two_plans(emulator: &Emulator) -> String {
 }
 
 /// The request that drives `operation` with the smallest page the model admits.
-fn request(operation: &str, savings_plan_id: &str, page_size: i64) -> Value {
+pub(crate) fn request(operation: &str, savings_plan_id: &str, page_size: i64) -> Value {
     let mut body = json!({ "maxResults": page_size });
     if operation == "DescribeSavingsPlanRates" {
         body["savingsPlanId"] = json!(savings_plan_id);
@@ -75,7 +75,7 @@ fn request(operation: &str, savings_plan_id: &str, page_size: i64) -> Value {
 
 /// Assert `answer` is the shared refusal: a 400 `ValidationException` carrying
 /// the one sentence.
-fn assert_refused(case: &str, answer: &crate::savings_plans_lifecycle::Answer) {
+pub(crate) fn assert_refused(case: &str, answer: &crate::savings_plans_lifecycle::Answer) {
     assert_eq!(
         answer.status, 400,
         "case {case:?}: expected 400, got {} {:?}",

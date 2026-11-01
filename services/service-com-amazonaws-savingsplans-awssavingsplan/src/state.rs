@@ -413,10 +413,19 @@ pub fn encode_page_token(kind: &str, offset: usize) -> String {
 
 /// Decode a token [`encode_page_token`] produced, or `None` when it was not
 /// produced by this paginator.
+///
+/// A cursor is opaque, so the only tokens this answers an offset for are the
+/// ones [`encode_page_token`] itself writes: the offset is read back, and the
+/// token is honoured only when re-minting that offset reproduces it
+/// byte-for-byte. That closes every spelling the mint cannot write but
+/// `usize::from_str` would still accept (a leading `+`, leading zeros) and every
+/// re-encoding of the same payload (upper-case hex), each of which would
+/// otherwise resume a walk from a cursor this service never handed out.
 pub fn decode_page_token(kind: &str, token: &str) -> Option<usize> {
     let raw = hex::decode(token).ok()?;
     let text = String::from_utf8(raw).ok()?;
-    text.strip_prefix(kind)?.strip_prefix(':')?.parse().ok()
+    let offset: usize = text.strip_prefix(kind)?.strip_prefix(':')?.parse().ok()?;
+    (encode_page_token(kind, offset) == token).then_some(offset)
 }
 
 /// The offset a request's `nextToken` resumes a `kind` walk at, or the message
