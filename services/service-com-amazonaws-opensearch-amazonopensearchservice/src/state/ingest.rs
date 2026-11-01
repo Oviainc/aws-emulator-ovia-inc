@@ -338,24 +338,52 @@ pub fn iam_decision(
     }
     Err(WriteRefusal::Rejected {
         error_type: SECURITY_EXCEPTION,
-        // Worded by the one place each of IAM's two refusals is worded: the policy that
-        // refused decides which sentence it is — the domain's own access policy where it
-        // carries one, and the principal's identity policies otherwise. Every value in it
-        // comes from the write and from the stored policy.
-        message: if access_policy.is_some() {
-            iam::not_authorized_by_resource_policy(principal_arn, &action, resource)
-        } else {
-            super::authorization::not_authorized(
+        // Worded by the one place each of IAM's refusals is worded, and WHICH of them it is
+        // follows the policy that refused: an explicit `Deny` names the side it was read
+        // from, and with neither side allowing, the sentence names the kind of policy that
+        // would have had to allow — the domain's own access policy where it carries one,
+        // and the principal's identity policies otherwise. Every value in it comes from the
+        // request and from the stored policy.
+        message: match (identity_decision, resource_decision) {
+            (_, Decision::Denied) => super::authorization::not_authorized(
+                principal_arn,
+                &action,
+                resource,
+                EXPLICIT_DENY_IN_A_RESOURCE_POLICY,
+            )
+            .message
+            .unwrap_or_default(),
+            (Decision::Denied, _) => super::authorization::not_authorized(
+                principal_arn,
+                &action,
+                resource,
+                EXPLICIT_DENY_IN_AN_IDENTITY_POLICY,
+            )
+            .message
+            .unwrap_or_default(),
+            _ if access_policy.is_some() => {
+                iam::not_authorized_by_resource_policy(principal_arn, &action, resource)
+            }
+            _ => super::authorization::not_authorized(
                 principal_arn,
                 &action,
                 resource,
                 &format!("because no identity-based policy allows the {action} action"),
             )
             .message
-            .unwrap_or_default()
+            .unwrap_or_default(),
         },
     })
 }
+
+/// The clause IAM refuses a request with that a RESOURCE-based policy explicitly denies —
+/// the rule that wins over every allow, whichever side stated it.
+const EXPLICIT_DENY_IN_A_RESOURCE_POLICY: &str =
+    "with an explicit deny in a resource-based policy";
+
+/// The same clause for an explicit `Deny` read from the principal's own identity policies.
+const EXPLICIT_DENY_IN_AN_IDENTITY_POLICY: &str =
+    "with an explicit deny in an identity-based policy";
 
 /// The resource an index's data-plane write is decided against: the index under its
 /// domain's ARN, which is how an IAM policy for this service names one
@@ -365,10 +393,17 @@ fn index_resource(domain_arn: &str, index_name: &str) -> String {
 }
 
 /// The spellings a resource policy's `Principal` element names this principal by: the
-/// principal's own ARN, and the account spellings a statement about the whole account
-/// uses.
+/// identities the principal IS — its own ARN, and for an assumed-role session the IAM role
+/// it is a session of, the one reading of that pair this crate has
+/// ([`super::fgac::identities`]) — and the account spellings a statement about the whole
+/// account uses.
+///
+/// A resource policy is written with the identity a client CREATED, which for a role is the
+/// role's own ARN rather than any one session of it, so a statement naming a role is about
+/// every session of that role: without the role spelling, a policy that explicitly denies a
+/// role would state nothing about the requests that role actually makes.
 fn principal_spellings(principal_arn: &str) -> Vec<String> {
-    let mut spellings = vec![principal_arn.to_string()];
+    let mut spellings = super::fgac::identities(principal_arn);
     spellings.extend(iam::account_principals(principal_arn));
     spellings
 }

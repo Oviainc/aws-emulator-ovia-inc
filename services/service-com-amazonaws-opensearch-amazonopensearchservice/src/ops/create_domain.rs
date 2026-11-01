@@ -569,7 +569,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&name)
             .ok_or_else(crate::state::state_unavailable)?;
         Ok(CreateDomainOutput {
-            domain_status: Some(stored.to_status()),
+            domain_status: Some(
+                stored.to_status(crate::state::local_endpoint_host(ctx.parts()).as_deref()),
+            ),
         })
     }
 }

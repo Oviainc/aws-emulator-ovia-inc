@@ -506,6 +506,14 @@ fn serve_resolved(domain: &mut Domain, request: &Request<'_>, now: SystemTime) -
         ["_plugins", "_security", "api", "rolesmapping", name] => {
             security_role_mapping(domain, request, name)
         }
+        // A refresh with no index named is the whole cluster's, and this arm comes before
+        // the single-segment one below so the reserved name is never read as an index.
+        ["_refresh"] => match request.method {
+            "GET" | "POST" => guarded(domain, request, fgac::ACTION_REFRESH, |domain| {
+                refresh(domain, request, None)
+            }),
+            _ => wrong_method(request, "GET, POST"),
+        },
         [index] => index_request(domain, request, index),
         // `_doc` upserts; `_create` must NOT overwrite, and neither must a `_doc` write
         // whose `op_type` asks for a create.
@@ -523,6 +531,12 @@ fn serve_resolved(domain: &mut Domain, request: &Request<'_>, now: SystemTime) -
         [index, "_search"] => match request.method {
             "GET" | "POST" => guarded(domain, request, fgac::ACTION_SEARCH, |domain| {
                 search(domain, request, index)
+            }),
+            _ => wrong_method(request, "GET, POST"),
+        },
+        [index, "_refresh"] => match request.method {
+            "GET" | "POST" => guarded(domain, request, fgac::ACTION_REFRESH, |domain| {
+                refresh(domain, request, Some(index))
             }),
             _ => wrong_method(request, "GET, POST"),
         },
@@ -1033,6 +1047,47 @@ fn write_shards(domain: &Domain, index_name: &str) -> Value {
         "successful": assigned.saturating_add(1),
         "failed": 0,
     })
+}
+
+/// What a `_refresh` answers: the shards the refresh ran on, over the indexes it was asked
+/// about — every index the domain holds, or the ONE the path names.
+///
+/// A refresh "makes recent operations performed on one or more indices available for
+/// search": it flushes what is already written, so it changes nothing about a document and
+/// reports no document. Every write this emulator takes is visible to the next read the
+/// moment it lands, so what is left to answer is the shard summary, computed from each
+/// index's own settings and the nodes the domain has — the same arithmetic the cluster
+/// health and a write's `_shards` are computed with.
+fn refresh(domain: &Domain, request: &Request<'_>, index_name: Option<&str>) -> RtResponse {
+    let named: Vec<&state::Index> = match index_name {
+        None => domain.indexes.values().collect(),
+        Some(name) => match domain.indexes.get(name) {
+            Some(index) => vec![index],
+            None => return index_not_found(name),
+        },
+    };
+    let _ = request;
+    let data_nodes = domain.cluster_config.instance_count.unwrap_or(1).max(1);
+    let mut total = 0_i64;
+    let mut successful = 0_i64;
+    for index in named {
+        // Both come from the index's own settings, which a caller wrote, so both are
+        // clamped before they are multiplied out.
+        let shards = setting_number(&index.schema, "number_of_shards")
+            .unwrap_or(1)
+            .clamp(1, MAX_SHARDS_PER_INDEX);
+        let copies = setting_number(&index.schema, "number_of_replicas")
+            .unwrap_or(1)
+            .clamp(0, MAX_SHARDS_PER_INDEX);
+        // A replica copy needs a node other than the one holding its primary, so on a
+        // single-node cluster only the primaries are refreshed.
+        let assigned = if data_nodes > 1 { copies } else { 0 };
+        total = total.saturating_add(shards.saturating_mul(copies.saturating_add(1)));
+        successful = successful.saturating_add(shards.saturating_mul(assigned.saturating_add(1)));
+    }
+    ok(&json!({
+        "_shards": { "total": total, "successful": successful, "failed": 0 },
+    }))
 }
 
 /// The count a `_count` answers, over the documents the selected indexes hold.

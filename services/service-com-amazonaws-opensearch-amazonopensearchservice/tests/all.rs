@@ -143,6 +143,8 @@ mod package_versions;
 mod pagination_contract;
 #[path = "all/published_catalog_order.rs"]
 mod published_catalog_order;
+#[path = "all/published_domain_address.rs"]
+mod published_domain_address;
 #[path = "all/reference_catalogs.rs"]
 mod reference_catalogs;
 #[path = "all/reserved_instance_offerings.rs"]

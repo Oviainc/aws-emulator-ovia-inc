@@ -40,6 +40,9 @@ pub const ACTION_INDEX_DOCUMENT: &str = "indices:data/write/index";
 /// The action a search asks for.
 pub const ACTION_SEARCH: &str = "indices:data/read/search";
 
+/// The action a refresh asks for — making the writes already taken visible to search.
+pub const ACTION_REFRESH: &str = "indices:admin/refresh";
+
 /// The action a count asks for.
 pub const ACTION_COUNT: &str = "indices:data/read/count";
 

@@ -429,7 +429,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The address the snapshot below publishes the domain's data plane at follows the
+        // endpoint THIS request reached (`Domain::to_status`).
+        let local_endpoint = crate::state::local_endpoint_host(ctx.parts());
         let state =
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
 
@@ -595,7 +597,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store.settled_mut(&name, now).map(|domain| {
                     domain
                         .begin_dry_run(
-                            merged.to_status(),
+                            merged.to_status(local_endpoint.as_deref()),
                             deployment,
                             accepted_warnings,
                             now,

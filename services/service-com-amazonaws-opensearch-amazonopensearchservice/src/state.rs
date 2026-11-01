@@ -5559,11 +5559,32 @@ impl Domain {
 
     /// This domain as `DomainStatus` — what `CreateDomain`, `DescribeDomain` and
     /// `DeleteDomain` answer with.
-    pub fn to_status(&self) -> DomainStatus {
+    ///
+    /// `local_endpoint` is the emulator's own endpoint the READING request reached, when it
+    /// reached that rather than one of AWS's service hosts
+    /// ([`local_endpoint_host`]): every address this status publishes for the domain's data
+    /// plane is then that endpoint with the path this service serves the domain at
+    /// ([`announced_domain_endpoint`]), because a caller that resolves nothing but the
+    /// emulator's endpoint cannot reach an AWS-shaped host. It is read per CALL rather than
+    /// stored, so a domain created by one caller (a resource provisioner reaching this
+    /// service in-process, say) publishes to each reader the address that reader can use.
+    pub fn to_status(&self, local_endpoint: Option<&str>) -> DomainStatus {
         // Where this domain is reachable decides which endpoint members it reports:
         // the map is present exactly for a VPC-access domain, and the public endpoint
         // exactly for the domain that has one.
-        let vpc_access_endpoints = self.vpc_access_endpoints();
+        let vpc_access_endpoints = self.vpc_access_endpoints().map(|endpoints| {
+            endpoints
+                .into_iter()
+                .map(|(key, host)| {
+                    (
+                        key,
+                        announced_domain_endpoint(&host, &self.domain_name, local_endpoint),
+                    )
+                })
+                .collect::<BTreeMap<String, String>>()
+        });
+        let announced =
+            |host: &str| announced_domain_endpoint(host, &self.domain_name, local_endpoint);
         DomainStatus {
             domain_id: self.domain_id.clone(),
             domain_name: self.domain_name.clone(),
@@ -5576,13 +5597,15 @@ impl Domain {
             // `Endpoints` below carries instead.
             endpoint: vpc_access_endpoints
                 .is_none()
-                .then(|| self.endpoint.clone()),
+                .then(|| announced(&self.endpoint)),
             // `EndpointV2` is the dual-stack PUBLIC endpoint, which a domain whose
             // `IPAddressType` is `dualstack` is provisioned beside its IPv4 one
             // ([`Self::public_endpoint_v2`]); a VPC-access domain has no public host of
             // either version and reports its dual-stack host in `Endpoints` below,
             // under `vpcv2`.
-            endpoint_v2: self.public_endpoint_v2(),
+            endpoint_v2: self
+                .public_endpoint_v2()
+                .map(|host| announced(&host)),
             // "The key-value pair that exists if the OpenSearch Service domain uses VPC
             // endpoints": present for a VPC-access domain and absent for a public one.
             // A service-managed VPC endpoint is a resource of its own, reported by
@@ -10254,6 +10277,53 @@ fn dual_stack_host(label: &str, region: &str) -> String {
 /// one a domain's own endpoint carries, so the two are never mistaken for each other.
 pub fn vpc_endpoint_host(domain_name: &str, suffix: &str, region: &str) -> String {
     format!("vpc-{domain_name}-{suffix}.{region}.{ARN_NAMESPACE}.amazonaws.com")
+}
+
+/// The endpoint a request REACHED this emulator at when that endpoint is the EMULATOR'S
+/// OWN — a loopback address, an IP literal or any other host that names no service — and
+/// `None` when the host names a service, which is a client that resolves AWS's own hosts.
+///
+/// Both readings it composes are `services/common`'s, so no second rule for "which host is
+/// a service's" or "which host did this request address" is written here:
+/// `data_plane_addressing::addressed_host` (the `Host` header, else an absolute URI's
+/// authority) and `data_plane_addressing::names_a_service`, which defers to the front
+/// door's own host reader.
+///
+/// What it decides is the ADDRESS a domain publishes for its data plane
+/// ([`announced_domain_endpoint`]): a caller that reached this emulator at its own endpoint
+/// resolves nothing else, so an AWS-shaped host told to it names no address it can reach.
+pub fn local_endpoint_host(parts: &::http::request::Parts) -> Option<String> {
+    let host = ::service_common::data_plane_addressing::addressed_host(
+        &parts.uri.to_string(),
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+    )?;
+    (!::service_common::data_plane_addressing::names_a_service(&host)).then_some(host)
+}
+
+/// The address a domain of this service PUBLISHES for index, search and data-upload
+/// requests, as announced to a caller that reached this emulator at `local_endpoint`: that
+/// same endpoint, with the reserved path this service's data plane serves the domain at
+/// (`<endpoint>/_aws/es/<domain>`, the addressing `crate::service::domain_rest` resolves).
+///
+/// `aws_host` is the host AWS publishes for that domain ([`domain_endpoint`] and the
+/// VPC-access hosts beside it), which is what a caller that resolves AWS's own hosts is
+/// told — so one reading decides every endpoint member of a domain's status, and a member
+/// that names an address the caller cannot reach is never published.
+pub fn announced_domain_endpoint(
+    aws_host: &str,
+    domain_name: &str,
+    local_endpoint: Option<&str>,
+) -> String {
+    match local_endpoint {
+        Some(endpoint) => format!(
+            "{endpoint}/{}/{ARN_NAMESPACE}/{domain_name}",
+            ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
+        ),
+        None => aws_host.to_string(),
+    }
 }
 
 /// The region this request was signed for — what a domain's ARN and endpoint name.
