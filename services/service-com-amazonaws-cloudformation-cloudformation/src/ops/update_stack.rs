@@ -472,6 +472,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  Amazon S3)",
             ));
         }
+        // The same rule a create's rollback triggers are held to: a trigger naming a type
+        // CloudFormation cannot monitor is refused before the stack is touched, so an
+        // update never puts unusable rollback monitoring on it
+        // (`crate::state::validate_rollback_configuration`).
+        crate::state::validate_rollback_configuration(input.rollback_configuration.as_ref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no stack to update, and nothing

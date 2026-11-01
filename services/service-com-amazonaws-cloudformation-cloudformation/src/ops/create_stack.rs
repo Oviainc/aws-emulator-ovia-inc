@@ -78,6 +78,12 @@
 //! that stack's OTHER operations is not a retry at all and is refused with the modelled
 //! `TokenAlreadyExistsException`.
 //!
+//! `RollbackConfiguration` is held to the resource types a rollback trigger may name: a
+//! trigger naming anything but the two CloudWatch alarm types the member documents is
+//! refused with HTTP 400 `ValidationError` before anything is written, so no stack carries
+//! rollback monitoring that could never fire
+//! (`crate::state::validate_rollback_configuration`).
+//!
 //! The submitted template is VALIDATED before anything is written: a body whose own
 //! declarations CloudFormation cannot resolve is refused with HTTP 400 `ValidationError`
 //! and leaves no stack behind — a body neither reader will read, a function no template may
@@ -373,6 +379,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "You cannot specify both OnFailure and DisableRollback",
             ));
         }
+        // "Specify either AWS::CloudWatch::Alarm or AWS::CloudWatch::CompositeAlarm
+        // resource types": a trigger naming anything else is refused HERE, before anything
+        // is written, so no stack is created carrying rollback monitoring that could never
+        // fire (`crate::state::validate_rollback_configuration`).
+        crate::state::validate_rollback_configuration(input.rollback_configuration.as_ref())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // A `StackPolicyURL` names a policy document in an Amazon S3 bucket, which would
         // have to be fetched over the network — this emulator makes no outbound
         // connections, so it is answered 501 rather than with a stack whose policy nobody

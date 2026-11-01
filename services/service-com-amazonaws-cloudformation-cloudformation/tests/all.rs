@@ -217,6 +217,8 @@ mod resource_scans;
 mod resource_signal_waits;
 #[path = "all/resource_signals.rs"]
 mod resource_signals;
+#[path = "all/rollback_trigger_types.rs"]
+mod rollback_trigger_types;
 #[path = "all/rolled_back_resource_records.rs"]
 mod rolled_back_resource_records;
 #[path = "all/rolled_back_stack_configuration.rs"]

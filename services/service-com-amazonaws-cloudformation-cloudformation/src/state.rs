@@ -7077,6 +7077,42 @@ pub fn rollback_configuration_in_force(
     ))
 }
 
+/// The resource types a rollback trigger may name, which `RollbackTrigger$Type` states as
+/// a closed pair: "The resource type of the rollback trigger. Specify either
+/// `AWS::CloudWatch::Alarm` or `AWS::CloudWatch::CompositeAlarm` resource types." The
+/// model gives the member a plain string target rather than an enum, so the handler is
+/// what holds a request to the pair.
+pub const ROLLBACK_TRIGGER_TYPES: [&str; 2] =
+    ["AWS::CloudWatch::Alarm", "AWS::CloudWatch::CompositeAlarm"];
+
+/// CloudFormation's refusal for a rollback trigger naming any other resource type, which
+/// carries no variable part.
+pub const ROLLBACK_TRIGGER_TYPE_NOT_SUPPORTED: &str = "Rollback Trigger Type not supported";
+
+/// `Err(message)` where the configuration names a rollback trigger whose `Type` is not one
+/// of [`ROLLBACK_TRIGGER_TYPES`].
+///
+/// A trigger CloudFormation monitors is an alarm — "If any of the alarms you specify goes
+/// to ALARM state during the stack operation [...] CloudFormation rolls back the entire
+/// stack operation" — so a type nothing can alarm on is a request the service cannot
+/// honour, and it is refused rather than stored as monitoring that could never fire.
+/// Shared by every operation that takes a `RollbackConfiguration` (`CreateStack`,
+/// `UpdateStack` and `CreateChangeSet`), which all set the configuration a later rollback
+/// would be driven by and so all hold it to the same rule.
+pub fn validate_rollback_configuration(
+    configuration: Option<&crate::ops::types::RollbackConfiguration>,
+) -> Result<(), String> {
+    let unsupported = configuration
+        .and_then(|configuration| configuration.rollback_triggers.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .any(|trigger| !ROLLBACK_TRIGGER_TYPES.contains(&trigger.r#type.as_str()));
+    if unsupported {
+        return Err(ROLLBACK_TRIGGER_TYPE_NOT_SUPPORTED.to_string());
+    }
+    Ok(())
+}
+
 /// The request's `RollbackConfiguration` as stored configuration.
 pub fn stored_rollback_configuration(
     configuration: Option<&crate::ops::types::RollbackConfiguration>,
