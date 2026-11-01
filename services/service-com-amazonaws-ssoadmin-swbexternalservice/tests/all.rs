@@ -141,6 +141,8 @@ mod managed_policies;
 mod managed_policies_in_permission_set;
 #[path = "all/managed_policy_attach_independence.rs"]
 mod managed_policy_attach_independence;
+#[path = "all/page_token_canonical_spelling.rs"]
+mod page_token_canonical_spelling;
 #[path = "all/permission_set_delete_owed_provisioning.rs"]
 mod permission_set_delete_owed_provisioning;
 #[path = "all/permission_set_provisioning.rs"]

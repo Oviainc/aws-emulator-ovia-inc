@@ -5026,11 +5026,17 @@ pub fn encode_page_token(scope: &str, key: &str) -> String {
 }
 
 /// Decode a cursor [`encode_page_token`] issued for `scope`; `None` for anything else.
+///
+/// Accepted ONLY when the token is byte for byte what [`encode_page_token`] mints for the
+/// cursor it carries: the decoder's acceptance set is the encoder's output set and nothing
+/// wider, which is what makes the cursor self-identifying. `::hex::decode` also reads
+/// spellings `::hex::encode` never writes (uppercase and mixed-case digits), and those
+/// spell a token this service never handed out, so the decoded cursor is re-minted and
+/// compared — keeping the two exact inverses whatever the encoding is.
 pub fn decode_page_token(scope: &str, token: &str) -> Option<String> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    decoded
-        .strip_prefix(&format!("ssoadmin:v1:{scope}:"))
-        .map(str::to_string)
+    let key = decoded.strip_prefix(&format!("ssoadmin:v1:{scope}:"))?;
+    (encode_page_token(scope, key) == token).then(|| key.to_string())
 }
 
 /// The key a paginated read resumes after, from the caller's `NextToken`.
