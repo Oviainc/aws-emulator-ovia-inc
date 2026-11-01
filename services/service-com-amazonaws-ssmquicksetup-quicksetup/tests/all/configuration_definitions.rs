@@ -277,6 +277,8 @@ fn baseline() -> Value {
                     "TargetOrganizationalUnits": TARGET_OU,
                     "TargetRegions": TARGET_REGIONS,
                     "TargetTagKey": "Env",
+                    "TargetTagValue": "production",
+                    "ICalendarString": "BEGIN:VCALENDAR",
                 },
                 "TypeVersion": "2.0",
             },

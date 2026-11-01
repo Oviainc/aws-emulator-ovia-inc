@@ -172,10 +172,16 @@ async fn emulator_with_deployments() -> MultiServiceRouter {
             json!({
                 "Type": type_,
                 "TypeVersion": version,
-                "Parameters": {
-                    "TargetOrganizationalUnits": "ou-1",
-                    "TargetRegions": REGION,
-                },
+                // Somewhere to deploy to, the Region to deploy into and every parameter
+                // the table documented for that type marks `(Required)`: no row here is
+                // about those requirements.
+                "Parameters": super::type_parameter_fixtures::with_required_parameters(
+                    type_,
+                    json!({
+                        "TargetOrganizationalUnits": "ou-1",
+                        "TargetRegions": REGION,
+                    }),
+                ),
             })
         })
         .collect();

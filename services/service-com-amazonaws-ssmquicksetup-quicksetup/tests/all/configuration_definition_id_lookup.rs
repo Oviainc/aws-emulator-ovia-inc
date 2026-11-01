@@ -197,7 +197,8 @@ struct Manager {
 ///
 /// `Type` must name a configuration type this service publishes and no case here is about
 /// the type, so every definition uses the catalog's first entry; its parameters name
-/// somewhere to deploy to and the Regions to deploy into, which every accepted definition
+/// somewhere to deploy to and the Regions to deploy into, and provide every parameter the
+/// table documented for that type marks `(Required)`, which every accepted definition
 /// must. A definition deploys one configuration per Region it targets, so the entries
 /// differ in how many configurations the definition they describe fans out to.
 async fn create_manager(
@@ -206,15 +207,19 @@ async fn create_manager(
     name: &str,
     target_regions: &[&[&str]],
 ) -> Manager {
+    let type_ = QUICK_SETUP_TYPE_CATALOG[0].type_;
     let definitions: Vec<Value> = target_regions
         .iter()
         .map(|targets| {
             json!({
-                "Type": QUICK_SETUP_TYPE_CATALOG[0].type_,
-                "Parameters": {
-                    "TargetOrganizationalUnits": "ou-1",
-                    "TargetRegions": targets.join(","),
-                },
+                "Type": type_,
+                "Parameters": super::type_parameter_fixtures::with_required_parameters(
+                    type_,
+                    json!({
+                        "TargetOrganizationalUnits": "ou-1",
+                        "TargetRegions": targets.join(","),
+                    }),
+                ),
             })
         })
         .collect();

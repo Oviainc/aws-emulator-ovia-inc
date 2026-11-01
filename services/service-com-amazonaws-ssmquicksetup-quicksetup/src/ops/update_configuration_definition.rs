@@ -135,13 +135,18 @@ fn update_rejection(input: &UpdateConfigurationDefinitionInput) -> Option<String
 ///   stores, so an update can never put a definition past what a create may hold;
 /// * a definition is deployed where its parameters say, so the parameter set it holds
 ///   must name somewhere to deploy to, must name the Regions to deploy
-///   into and must name no more deployments than may be served;
-///   [`crate::state::deployment_targets_rejection`] is the one place
+///   into and must name no more deployments than may be served; and it must provide
+///   every parameter the documented table for the definition's own `Type` requires of
+///   it, since that type is what selects the service-owned template the parameters are
+///   deployed with — `Type` is not an input of this operation, so the STORED type is
+///   what the parameter set is judged against;
+///   [`crate::state::configuration_parameters_rejection`] is the one place
 ///   that rule lives, shared with the create that stores a definition, and it counts the
 ///   very deployments the fan-out below performs — hence the `local_account`
 ///   default, which it needs to count them.
 fn held_parameters_rejection(
     held: &::std::collections::BTreeMap<String, String>,
+    type_: &str,
     local_account: &str,
 ) -> Option<String> {
     let parameters = held.len();
@@ -152,7 +157,7 @@ fn held_parameters_rejection(
             crate::state::MAX_PARAMETERS
         ));
     }
-    crate::state::deployment_targets_rejection("Parameters", held, local_account)
+    crate::state::configuration_parameters_rejection("Parameters", held, type_, local_account)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -356,9 +361,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // update the store cannot take changes nothing. The Region is the manager's own:
         // only the endpoint that created a manager serves it.
         if let Some(parameters) = held_parameters.as_ref() {
-            if let Some(why) =
-                held_parameters_rejection(parameters, ::engine::emulator_account_id())
-            {
+            if let Some(why) = held_parameters_rejection(
+                parameters,
+                &definition.type_,
+                ::engine::emulator_account_id(),
+            ) {
                 return Err(
                     UpdateConfigurationDefinitionErrorModeled::ValidationException(
                         ValidationException { message: Some(why) },

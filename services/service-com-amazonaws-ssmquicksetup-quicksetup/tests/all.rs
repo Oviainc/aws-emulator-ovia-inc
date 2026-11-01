@@ -7,6 +7,10 @@
 //!
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
+//!
+//! `all/type_parameter_fixtures.rs` is declared the same way but carries no case of its
+//! own: it is the one place the suites below take a parameter map completed for the
+//! configuration type it deploys from.
 
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
@@ -47,6 +51,8 @@ mod partial_parameter_updates;
 mod quick_setup_type_versions;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
+#[path = "all/required_type_parameters.rs"]
+mod required_type_parameters;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tags.rs"]
@@ -67,5 +73,7 @@ mod store_bounds_after_teardown;
 mod target_authorization;
 #[path = "all/target_regions_required.rs"]
 mod target_regions_required;
+#[path = "all/type_parameter_fixtures.rs"]
+mod type_parameter_fixtures;
 #[path = "all/type_version_filter.rs"]
 mod type_version_filter;

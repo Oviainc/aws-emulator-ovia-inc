@@ -42,16 +42,23 @@ fn local_account() -> String {
 /// The parameters every manager below is created with, so each update starts from a
 /// definition that DOES name the Regions to deploy into and a refused update is visibly
 /// the one that left it alone.
-fn baseline_parameters() -> Value {
-    json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": "us-east-1" })
+///
+/// A definition of `type_` must also provide every parameter that type's own documented
+/// table marks `(Required)`, and no case here is about that rule, so those are added
+/// too.
+fn baseline_parameters(type_: &str) -> Value {
+    super::type_parameter_fixtures::with_required_parameters(
+        type_,
+        json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": "us-east-1" }),
+    )
 }
 
 /// [`baseline_parameters`] with every entry `entries` names written over it: the
 /// parameter map a definition HOLDS once an update carrying `entries` has been served,
 /// since an update writes the entries it names and leaves the rest of the stored map
 /// alone.
-fn parameters_after(entries: &Value) -> Value {
-    let mut map = baseline_parameters()
+fn parameters_after(type_: &str, entries: &Value) -> Value {
+    let mut map = baseline_parameters(type_)
         .as_object()
         .cloned()
         .unwrap_or_default();
@@ -417,7 +424,11 @@ fn cases() -> Vec<RegionCase> {
         (
             "the Region the request itself was signed for",
             "AWSQuickSetupType-Distributor",
-            json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": REGION }),
+            json!({
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": REGION,
+                "PackagesToInstall": "AWSCWAgent",
+            }),
             Some(vec![REGION]),
         ),
     ]
@@ -623,11 +634,11 @@ async fn an_update_writes_parameter_entries_only_when_the_definition_still_names
     for (case, type_, entries, deployed) in update_cases() {
         // One manager per row, so no row observes another row's writes.
         let router = emulator();
-        let manager_arn = create_ok(&router, case, type_, &baseline_parameters()).await;
+        let manager_arn = create_ok(&router, case, type_, &baseline_parameters(type_)).await;
         let (id, before) = stored_definition(&router, case, &manager_arn).await;
         assert_eq!(
             before,
-            baseline_parameters(),
+            baseline_parameters(type_),
             "case {case:?}: the baseline create must store the baseline parameters, got {before:?}"
         );
 
@@ -641,7 +652,7 @@ async fn an_update_writes_parameter_entries_only_when_the_definition_still_names
                     "case {case:?}: UpdateConfigurationDefinition must accept {entries:?}, \
                      got {status} / {answer:?}"
                 );
-                let want_parameters = parameters_after(&entries);
+                let want_parameters = parameters_after(type_, &entries);
                 assert_eq!(
                     after, want_parameters,
                     "case {case:?}: the stored definition must hold {want_parameters:?}, \
@@ -675,7 +686,7 @@ async fn an_update_writes_parameter_entries_only_when_the_definition_still_names
                 );
                 assert_eq!(
                     after,
-                    baseline_parameters(),
+                    baseline_parameters(type_),
                     "case {case:?}: a refused update must leave the stored parameters alone, \
                      got {after:?}"
                 );

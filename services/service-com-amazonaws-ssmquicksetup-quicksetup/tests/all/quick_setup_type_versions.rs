@@ -122,12 +122,15 @@ fn label(value: &str) -> String {
 }
 
 /// One definition naming `type_`, carrying `version` only when the case supplies one.
-/// Its parameters name somewhere to deploy to, which every accepted definition must.
+/// Its parameters name somewhere to deploy to, the Regions to deploy into and every
+/// parameter that type's own documented table marks `(Required)`, which every accepted
+/// definition must provide; no case here is about those requirements.
 fn definition(type_: &str, version: Option<&str>) -> Value {
-    let mut definition = json!({
-        "Type": type_,
-        "Parameters": { "TargetOrganizationalUnits": "ou-1", "TargetRegions": REGION },
-    });
+    let parameters = super::type_parameter_fixtures::with_required_parameters(
+        type_,
+        json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": REGION }),
+    );
+    let mut definition = json!({ "Type": type_, "Parameters": parameters });
     if let Some(version) = version {
         definition["TypeVersion"] = json!(version);
     }

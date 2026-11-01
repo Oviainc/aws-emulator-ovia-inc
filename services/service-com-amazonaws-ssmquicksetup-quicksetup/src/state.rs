@@ -218,6 +218,51 @@ pub const CONFIGURATION_FILTER_KEYS: &[&str] = &[
 /// rather than stored. Far above the number of regions AWS publishes.
 pub const MAX_SETTINGS_REGIONS: usize = 100;
 
+/// When the parameter table documented for a configuration type requires one of the
+/// parameters it marks `(Required)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequiredWhen {
+    /// The table states the requirement on its own, so a definition of that type must
+    /// always provide the parameter.
+    Always,
+    /// The table marks the parameter `(Required)` and its own description states the
+    /// condition: a definition must provide it only while the parameter `key` carries
+    /// one of `values`, and may leave it out otherwise.
+    ParameterIsOneOf {
+        /// The `Parameters` key the condition reads.
+        key: &'static str,
+        /// The values of that key the condition holds for.
+        values: &'static [&'static str],
+    },
+}
+
+/// One parameter the table documented for a configuration type requires of a
+/// configuration definition deploying that type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequiredParameter {
+    /// The `Parameters` key, spelled as the documented table writes it.
+    pub key: &'static str,
+    /// When that table requires it.
+    pub when: RequiredWhen,
+}
+
+impl RequiredParameter {
+    /// Whether a definition holding `parameters` must provide this parameter.
+    ///
+    /// A conditional requirement is read off the parameter set the definition HOLDS,
+    /// because the condition the documented table states is about another parameter of
+    /// that same set; a value is matched trimmed, the way every other parameter value
+    /// this service reads is.
+    pub fn applies<P: ConfigurationParameters + ?Sized>(&self, parameters: &P) -> bool {
+        match self.when {
+            RequiredWhen::Always => true,
+            RequiredWhen::ParameterIsOneOf { key, values } => parameters
+                .parameter(key)
+                .is_some_and(|value| values.contains(&value.trim())),
+        }
+    }
+}
+
 /// One entry of the Quick Setup type catalog `ListQuickSetupTypes` publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuickSetupTypeEntry {
@@ -235,6 +280,27 @@ pub struct QuickSetupTypeEntry {
     /// lives per entry rather than once for the whole catalog. Never empty; the
     /// newest entry is what [`Self::latest_version`] reports.
     pub versions: &'static [&'static str],
+    /// Every parameter a configuration definition of this type must provide, in the
+    /// order the documented table states them.
+    ///
+    /// Source: the parameter table this service's model documents for this type
+    /// (`smithy_query(query="doc", shape="ConfigurationDefinitionInput",
+    /// member="Parameters")`) — every entry that table marks `(Required)`, with the
+    /// condition the entry's own description states where it states one. A definition
+    /// deploys this type's service-owned template, and the template takes those
+    /// parameters, so a parameter set leaving one out cannot be deployed: that is what
+    /// [`Self::missing_required_parameter`] refuses.
+    ///
+    /// Two markers that table carries live elsewhere rather than being repeated per
+    /// entry, because they hold for a definition of EVERY type:
+    /// [`PARAMETER_TARGET_REGIONS`], which every table marks `(Required)`
+    /// ([`NO_DEPLOYMENT_REGION_MESSAGE`]), and the `(Optional)` either/or between
+    /// [`PARAMETER_TARGET_ACCOUNTS`] and [`PARAMETER_TARGET_ORGANIZATIONAL_UNITS`]
+    /// ([`NO_DEPLOYMENT_TARGET_MESSAGE`]) — which is why the tables that instead mark
+    /// [`PARAMETER_TARGET_ORGANIZATIONAL_UNITS`] itself `(Required)`, and name no
+    /// `TargetAccounts` at all, carry it here: for those types the either/or is not
+    /// what their own table says.
+    pub required_parameters: &'static [RequiredParameter],
 }
 
 /// The configuration version a published version history starts at: the first
@@ -282,6 +348,38 @@ impl QuickSetupTypeEntry {
             .unwrap_or(FIRST_TYPE_VERSION)
     }
 
+    /// Whether this type's documented table requires `key` of a definition holding
+    /// `parameters`: the table marks it `(Required)` and whatever condition it states
+    /// for it holds for that set.
+    pub fn requires<P: ConfigurationParameters + ?Sized>(&self, key: &str, parameters: &P) -> bool {
+        self.required_parameters
+            .iter()
+            .any(|required| required.key == key && required.applies(parameters))
+    }
+
+    /// The first parameter this type's documented table requires of a definition
+    /// holding `parameters` that the set does not provide, or `None` when it provides
+    /// every one of them.
+    ///
+    /// The requirements are read in the order the table states them, so a set leaving
+    /// out several is refused for the first one that table names. A key written with no
+    /// value, or with nothing but blanks, provides nothing: the same reading the
+    /// deployment-target keys get ([`comma_separated`]).
+    pub fn missing_required_parameter<P: ConfigurationParameters + ?Sized>(
+        &self,
+        parameters: &P,
+    ) -> Option<&'static str> {
+        self.required_parameters
+            .iter()
+            .filter(|required| required.applies(parameters))
+            .map(|required| required.key)
+            .find(|key| {
+                parameters
+                    .parameter(key)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+    }
+
     /// The version of this type a request naming `requested` means, in the spelling
     /// the catalog publishes it under, or `None` when this type publishes no such
     /// version.
@@ -324,32 +422,147 @@ impl QuickSetupTypeEntry {
 /// version history of that type's template ([`QuickSetupTypeEntry::versions`]), the
 /// newest of which it publishes as that type's `LatestVersion` and against which
 /// [`resolve_type_version`] resolves every member that names a configuration version.
+///
+/// It is the authority for the PARAMETERS a definition of a type must provide as well
+/// ([`QuickSetupTypeEntry::required_parameters`]): each entry carries the entries its
+/// own documented table marks `(Required)`, which is what
+/// [`configuration_parameters_rejection`] holds a definition's parameter map to.
 pub const QUICK_SETUP_TYPE_CATALOG: &[QuickSetupTypeEntry] = &[
     // Conformance Packs
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-CFGCPacks", versions: &["1.0", "1.1"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-CFGCPacks",
+        versions: &["1.0", "1.1"],
+        required_parameters: &[RequiredParameter { key: "CPackNames", when: RequiredWhen::Always }],
+    },
     // Config Recording
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-CFGRecording", versions: &["1.0", "1.1", "1.2"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-CFGRecording",
+        versions: &["1.0", "1.1", "1.2"],
+        // Its table marks every entry of its own `(Optional)`.
+        required_parameters: &[],
+    },
     // Default Host Management Configuration
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-DHMC", versions: &["1.0", "1.1"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-DHMC",
+        versions: &["1.0", "1.1"],
+        required_parameters: &[RequiredParameter {
+            key: PARAMETER_TARGET_ORGANIZATIONAL_UNITS,
+            when: RequiredWhen::Always,
+        }],
+    },
     // DevOps Guru
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-DevOpsGuru", versions: &["1.0"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-DevOpsGuru",
+        versions: &["1.0"],
+        // Its table marks every entry of its own `(Optional)`.
+        required_parameters: &[],
+    },
     // Distributor
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-Distributor", versions: &["1.0", "1.1"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-Distributor",
+        versions: &["1.0", "1.1"],
+        required_parameters: &[
+            RequiredParameter { key: "PackagesToInstall", when: RequiredWhen::Always },
+            RequiredParameter { key: "TargetTagKey", when: TARGET_TYPE_IS_TAGS },
+            RequiredParameter { key: "TargetTagValue", when: TARGET_TYPE_IS_TAGS },
+            RequiredParameter { key: "ResourceGroupName", when: TARGET_TYPE_IS_RESOURCE_GROUPS },
+        ],
+    },
     // Patch Policy
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-PatchPolicy", versions: &["1.0", "1.1", "2.0"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-PatchPolicy",
+        versions: &["1.0", "1.1", "2.0"],
+        required_parameters: &[
+            RequiredParameter { key: "PatchPolicyName", when: RequiredWhen::Always },
+            RequiredParameter { key: "SelectedPatchBaselines", when: RequiredWhen::Always },
+            RequiredParameter { key: "TargetTagKey", when: TARGET_TYPE_IS_TAGS },
+            RequiredParameter { key: "TargetTagValue", when: TARGET_TYPE_IS_TAGS },
+            RequiredParameter { key: "ResourceGroupName", when: TARGET_TYPE_IS_RESOURCE_GROUPS },
+        ],
+    },
     // Resource Explorer
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-ResourceExplorer", versions: &["1.0", "1.1"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-ResourceExplorer",
+        versions: &["1.0", "1.1"],
+        required_parameters: &[
+            RequiredParameter { key: "SelectedAggregatorRegion", when: RequiredWhen::Always },
+            RequiredParameter { key: "ReplaceExistingAggregator", when: RequiredWhen::Always },
+            RequiredParameter {
+                key: PARAMETER_TARGET_ORGANIZATIONAL_UNITS,
+                when: RequiredWhen::Always,
+            },
+        ],
+    },
     // Quick Setup default configuration
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSM", versions: &["1.0"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-SSM",
+        versions: &["1.0"],
+        // The default configuration type, whose own table the model does not itemise:
+        // nothing but the parameters common to every definition is documented for it.
+        required_parameters: &[],
+    },
     // Change Manager
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMChangeMgr", versions: &["1.0", "1.1"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-SSMChangeMgr",
+        versions: &["1.0", "1.1"],
+        required_parameters: &[
+            RequiredParameter { key: "DelegatedAccountId", when: RequiredWhen::Always },
+            RequiredParameter { key: "JobFunction", when: RequiredWhen::Always },
+            RequiredParameter {
+                key: PARAMETER_TARGET_ORGANIZATIONAL_UNITS,
+                when: RequiredWhen::Always,
+            },
+        ],
+    },
     // Host Management
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMHostMgmt", versions: &["1.0", "1.1", "2.0"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-SSMHostMgmt",
+        versions: &["1.0", "1.1", "2.0"],
+        // Its table marks every entry of its own `(Optional)` — including the three
+        // targeting keys the Distributor and Patch Policy tables mark `(Required)`.
+        required_parameters: &[],
+    },
     // OpsCenter
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-SSMOpsCenter", versions: &["1.0", "1.1"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-SSMOpsCenter",
+        versions: &["1.0", "1.1"],
+        required_parameters: &[
+            RequiredParameter { key: "DelegatedAccountId", when: RequiredWhen::Always },
+            RequiredParameter {
+                key: PARAMETER_TARGET_ORGANIZATIONAL_UNITS,
+                when: RequiredWhen::Always,
+            },
+        ],
+    },
     // Resource Scheduler
-    QuickSetupTypeEntry { type_: "AWSQuickSetupType-Scheduler", versions: &["1.0", "2.0"] },
+    QuickSetupTypeEntry {
+        type_: "AWSQuickSetupType-Scheduler",
+        versions: &["1.0", "2.0"],
+        required_parameters: &[
+            RequiredParameter { key: "TargetTagKey", when: RequiredWhen::Always },
+            RequiredParameter { key: "TargetTagValue", when: RequiredWhen::Always },
+            RequiredParameter { key: "ICalendarString", when: RequiredWhen::Always },
+        ],
+    },
 ];
+
+/// The condition the Distributor and Patch Policy tables state on the two tag-targeting
+/// parameters they mark `(Required)`: a value must be provided for either of them only
+/// when the definition targets instances by tag, which its `TargetType` parameter is
+/// what says ("You must provide a value for this parameter if you specify `Tags` for
+/// the `TargetType` parameter").
+const TARGET_TYPE_IS_TAGS: RequiredWhen = RequiredWhen::ParameterIsOneOf {
+    key: "TargetType",
+    values: &["Tags"],
+};
+
+/// The same condition on the resource-group parameter those two tables mark
+/// `(Required)`: it is required only when the definition targets instances by resource
+/// group.
+const TARGET_TYPE_IS_RESOURCE_GROUPS: RequiredWhen = RequiredWhen::ParameterIsOneOf {
+    key: "TargetType",
+    values: &["ResourceGroups"],
+};
 
 /// The catalog entry for a configuration type, or `None` when this service does not
 /// offer it. Membership is exact — a type name differing only in case is not a
@@ -526,8 +739,29 @@ pub const NO_DEPLOYMENT_TARGET_MESSAGE: &str =
 /// Worded the way this service words [`NO_DEPLOYMENT_TARGET_MESSAGE`], the other
 /// refusal of a parameter map that leaves out what it must provide, and naming the
 /// parameter that is missing. It carries no value of the request: one definition either
-/// names the Regions to deploy into or it does not.
+/// names the Regions to deploy into or it does not. The same sentence
+/// [`missing_parameter_message`] builds for every other parameter a definition must
+/// provide, this one being the parameter every type's table requires.
 pub const NO_DEPLOYMENT_REGION_MESSAGE: &str = "TargetRegions must be defined in parameters.";
+
+/// Why a configuration definition whose parameters leave out one the documented table
+/// for its own configuration type requires is refused.
+///
+/// `ConfigurationDefinitionInput$Parameters` documents one parameter table per
+/// configuration type and marks entries of it `(Required)`
+/// ([`QuickSetupTypeEntry::required_parameters`]): a definition deploys that type's
+/// service-owned template with the parameters it provides, so one that provides none
+/// for a parameter the template requires cannot be deployed.
+///
+/// Worded the way this service words the two refusals of a parameter map that leaves
+/// out a parameter every type requires ([`NO_DEPLOYMENT_TARGET_MESSAGE`] and
+/// [`NO_DEPLOYMENT_REGION_MESSAGE`], which is this sentence for
+/// [`PARAMETER_TARGET_REGIONS`]), naming the parameter that is missing. The key is one
+/// the catalog publishes rather than anything the request carried, so the sentence
+/// renders no value of the request.
+pub fn missing_parameter_message(key: &str) -> String {
+    format!("{key} must be defined in parameters.")
+}
 
 /// How many account-and-Region deployments ONE configuration definition may fan out
 /// to.
@@ -577,8 +811,8 @@ pub struct DeploymentTarget {
 /// Repeats are recognised through a set rather than by re-scanning what has been kept,
 /// so one caller-sized value costs work proportional to its entries and not to their
 /// square, and reading stops at [`MAX_PARAMETER_LIST_ENTRIES`] — one entry past what
-/// may be deployed, which is enough for [`deployment_targets_rejection`] to refuse the
-/// value.
+/// may be deployed, which is enough for [`configuration_parameters_rejection`] to
+/// refuse the value.
 pub fn comma_separated(value: Option<&str>) -> Vec<String> {
     let mut entries: Vec<String> = Vec::new();
     let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
@@ -654,10 +888,10 @@ fn deployment_target_parameters<P: ConfigurationParameters + ?Sized>(
 /// deployed in. The Regions are exactly the ones the definition's
 /// [`PARAMETER_TARGET_REGIONS`] names — nothing stands in for a Region a definition
 /// never asked for, so a parameter set naming none is deployed nowhere at all, which
-/// is what [`deployment_targets_rejection`] refuses before any of it is stored. One
-/// naming no account is deployed in `local_account` — the single account this emulator
-/// serves, which is also the only account the organizational units a definition may
-/// target instead could resolve to here.
+/// is what [`configuration_parameters_rejection`] refuses before any of it is stored.
+/// One naming no account is deployed in `local_account` — the single account this
+/// emulator serves, which is also the only account the organizational units a
+/// definition may target instead could resolve to here.
 pub fn deployment_targets<P: ConfigurationParameters + ?Sized>(
     parameters: &P,
     local_account: &str,
@@ -679,35 +913,70 @@ pub fn deployment_targets<P: ConfigurationParameters + ?Sized>(
         .collect()
 }
 
-/// Why the deployment targets a configuration definition's `parameters` name cannot be
-/// served, or `None` when they can.
+/// Why the parameter set a configuration definition of `type_` holds cannot be served,
+/// or `None` when it can.
 ///
 /// `ConfigurationParametersMap` bounds each key and value but says nothing about what
 /// a value means, so these rules live here: a parameter set must provide every
-/// parameter the documented parameter tables require of it — somewhere to deploy to
-/// ([`NO_DEPLOYMENT_TARGET_MESSAGE`]) and the Regions to deploy into
-/// ([`NO_DEPLOYMENT_REGION_MESSAGE`]) — a targeted account is named by its account id,
-/// and the number of account-and-Region deployments one definition fans out to is
-/// bounded by [`MAX_DEPLOYMENT_TARGETS`]. The one place the rule lives, so a create and
-/// an update refuse the same target sets — and, counting the deployments
+/// parameter the documented parameter tables require of it, which is
+/// `type_`-dependent because those tables are documented one per configuration type
+/// ([`QuickSetupTypeEntry::required_parameters`]):
+///
+/// * somewhere to deploy to — either of the two target keys for a type whose table
+///   marks them `(Optional)` and requires one of the two
+///   ([`NO_DEPLOYMENT_TARGET_MESSAGE`]), and [`PARAMETER_TARGET_ORGANIZATIONAL_UNITS`]
+///   itself for a type whose own table marks that key `(Required)` and names no
+///   `TargetAccounts` at all;
+/// * the Regions to deploy into, which every type's table marks `(Required)`
+///   ([`NO_DEPLOYMENT_REGION_MESSAGE`]);
+/// * every parameter of `type_`'s own service-owned template that its table marks
+///   `(Required)`, under the condition that table states for it
+///   ([`missing_parameter_message`]).
+///
+/// Beside those: a targeted account is named by its account id, and the number of
+/// account-and-Region deployments one definition fans out to is bounded by
+/// [`MAX_DEPLOYMENT_TARGETS`]. The one place the rule lives, so a create and an update
+/// refuse the same parameter sets — and, counting the deployments
 /// [`deployment_targets`] would build from the same parameters, with the same
 /// `local_account` default a definition naming no account is deployed in, refuse exactly
 /// the sets that cannot be deployed. `member` labels the request member the parameters
 /// arrived on, so a refusal stating one of this service's own bounds names what the
 /// caller sent.
-pub fn deployment_targets_rejection<P: ConfigurationParameters + ?Sized>(
+///
+/// A `type_` the catalog does not publish carries no documented table, and so no
+/// per-type requirement: it is refused for the type itself
+/// ([`quick_setup_type_rejection`]) rather than for the parameters of a template this
+/// service does not deploy.
+pub fn configuration_parameters_rejection<P: ConfigurationParameters + ?Sized>(
     member: &str,
     parameters: &P,
+    type_: &str,
     local_account: &str,
 ) -> Option<String> {
+    let entry = quick_setup_type_entry(type_);
     let target_parameters = deployment_target_parameters(parameters);
     let accounts = comma_separated(target_parameters.accounts);
-    // A definition is deployed where its parameters say, so a parameter set that names
-    // neither the accounts nor the organizational units to deploy to names nowhere: a
-    // value for one of the two is required, and a key written with no entries provides
-    // none.
     let organizational_units = comma_separated(target_parameters.organizational_units);
-    if accounts.is_empty() && organizational_units.is_empty() {
+    // A definition is deployed where its parameters say, so a parameter set that names
+    // nowhere to deploy to is refused. WHICH of the two target keys says so is the
+    // type's own table's to state: the tables that mark the organizational units
+    // `(Required)` name no accounts to stand in for them, while the rest leave both
+    // keys optional and require a value for either. A key written with no entries
+    // provides none, whichever rule reads it.
+    //
+    // The organizational units are also among the parameters the per-type requirement
+    // below reads, so this branch adds no requirement: it decides WHICH of the two
+    // refusals a set naming nowhere to deploy is answered with, and answers it here
+    // rather than after the Regions and the account form.
+    let organizational_units_required = entry
+        .is_some_and(|entry| entry.requires(PARAMETER_TARGET_ORGANIZATIONAL_UNITS, parameters));
+    if organizational_units_required {
+        if organizational_units.is_empty() {
+            return Some(missing_parameter_message(
+                PARAMETER_TARGET_ORGANIZATIONAL_UNITS,
+            ));
+        }
+    } else if accounts.is_empty() && organizational_units.is_empty() {
         return Some(NO_DEPLOYMENT_TARGET_MESSAGE.to_string());
     }
     // The Regions a definition deploys into are required of every configuration type
@@ -725,6 +994,14 @@ pub fn deployment_targets_rejection<P: ConfigurationParameters + ?Sized>(
              {ACCOUNT_ID_DIGITS}-digit Amazon Web Services account IDs{}",
             echoed_clause(member, malformed)
         ));
+    }
+    // A definition deploys the service-owned template its type names, with the
+    // parameters that template takes, so the parameters that type's documented table
+    // marks `(Required)` are required of it: a set leaving one out is refused rather
+    // than minting a manager and deploying a configuration from a parameter set that
+    // type cannot be deployed from.
+    if let Some(missing) = entry.and_then(|entry| entry.missing_required_parameter(parameters)) {
+        return Some(missing_parameter_message(missing));
     }
     // The bound is read off the deployments themselves rather than off a formula over
     // the parameter values, so what is counted here is exactly what the definition is
@@ -1088,7 +1365,7 @@ pub struct ConfigurationManagerRecord {
     /// is deployed into exactly the Regions its own parameters name
     /// ([`deployment_targets`], which is not even given this field), and a parameter
     /// set naming none is refused with [`NO_DEPLOYMENT_REGION_MESSAGE`]
-    /// ([`deployment_targets_rejection`]) rather than deployed here.
+    /// ([`configuration_parameters_rejection`]) rather than deployed here.
     pub region: String,
     pub name: Option<String>,
     pub description: Option<String>,

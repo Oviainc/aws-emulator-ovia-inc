@@ -86,15 +86,20 @@ async fn create_definition(
 }
 
 /// One definition of the catalog's first published type, deployed somewhere and into a
-/// Region, which every accepted definition must name — the row under test varies one
-/// member of this.
+/// Region, and providing every parameter the table documented for that type marks
+/// `(Required)` — all of which every accepted definition must name; the row under test
+/// varies one member of this.
 fn published_definition() -> Value {
+    let type_ = QUICK_SETUP_TYPE_CATALOG[0].type_;
     json!({
-        "Type": QUICK_SETUP_TYPE_CATALOG[0].type_,
-        "Parameters": {
-            "TargetOrganizationalUnits": "ou-1",
-            "TargetRegions": "us-east-1",
-        },
+        "Type": type_,
+        "Parameters": super::type_parameter_fixtures::with_required_parameters(
+            type_,
+            json!({
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": "us-east-1",
+            }),
+        ),
     })
 }
 

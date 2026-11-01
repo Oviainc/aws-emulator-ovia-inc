@@ -138,11 +138,15 @@ async fn create_manager(router: &MultiServiceRouter, region: &str, type_: &str) 
             "ConfigurationDefinitions": [{
                 "Type": type_,
                 // Every accepted definition's parameters name somewhere to deploy to
-                // and the Regions to deploy into.
-                "Parameters": {
-                    "TargetOrganizationalUnits": "ou-1",
-                    "TargetRegions": "us-east-1",
-                },
+                // and the Regions to deploy into, and provide every parameter the table
+                // documented for its own type marks `(Required)`.
+                "Parameters": super::type_parameter_fixtures::with_required_parameters(
+                    type_,
+                    json!({
+                        "TargetOrganizationalUnits": "ou-1",
+                        "TargetRegions": "us-east-1",
+                    }),
+                ),
             }],
         })),
     )
@@ -336,6 +340,9 @@ async fn a_published_catalog_entry_is_accepted_as_a_configuration_definition_typ
                 "TypeVersion": entry.latest_version(),
                 "Parameters": {
                     "DelegatedAccountId": "000000000000",
+                    // This type's documented table marks the job function `(Required)`
+                    // too.
+                    "JobFunction": "operators",
                     // Every accepted definition's parameters name somewhere to deploy
                     // to and the Regions to deploy into.
                     "TargetOrganizationalUnits": "ou-1",

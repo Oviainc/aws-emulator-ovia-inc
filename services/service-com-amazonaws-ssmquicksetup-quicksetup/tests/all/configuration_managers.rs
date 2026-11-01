@@ -225,15 +225,16 @@ async fn create_ok(router: &MultiServiceRouter, case: &str, body: &Value) -> Str
 }
 
 /// The minimum a create needs: one definition whose `Type` satisfies the modelled
-/// `^[a-zA-Z0-9_\-.:/]{3,200}$` pattern and whose `Parameters` name somewhere to deploy
-/// to and the Regions to deploy into.
+/// `^[a-zA-Z0-9_\-.:/]{3,200}$` pattern and whose `Parameters` provide what a
+/// definition of that type must.
 ///
 /// A definition that names neither the accounts nor the organizational units to deploy
-/// to is refused, and so is one that names no Regions to deploy into; no case here is
-/// about either rule, so the organizational unit and [`REGION`] — the Region every
-/// request below signs for — are added wherever the row's own `parameters` leave them
-/// out, which leaves the accounts and the Regions the definition fans out to exactly
-/// what those parameters name.
+/// to is refused, and so is one that names no Regions to deploy into, or one that leaves
+/// out a parameter its own type's documented table marks `(Required)`; no case here is
+/// about any of those rules, so the organizational unit, [`REGION`] — the Region every
+/// request below signs for — and each of that type's own required parameters are added
+/// wherever the row's own `parameters` leave them out, which leaves the accounts and the
+/// Regions the definition fans out to exactly what those parameters name.
 fn definition(type_: &str, parameters: Value) -> Value {
     let mut parameters = parameters.as_object().cloned().unwrap_or_default();
     parameters
@@ -242,7 +243,11 @@ fn definition(type_: &str, parameters: Value) -> Value {
     parameters
         .entry("TargetRegions".to_string())
         .or_insert_with(|| json!(REGION));
-    json!({ "Type": type_, "Parameters": Value::Object(parameters) })
+    let parameters = super::type_parameter_fixtures::with_required_parameters(
+        type_,
+        Value::Object(parameters),
+    );
+    json!({ "Type": type_, "Parameters": parameters })
 }
 
 /// The `TypeVersion` the stored definition (and every configuration deployed from it)
@@ -458,6 +463,7 @@ async fn a_created_manager_is_read_back_exactly_as_it_was_stored() {
                     "Type": "AWSQuickSetupType-ResourceExplorer",
                     "Parameters": {
                         "SelectedAggregatorRegion": "us-west-2",
+                        "ReplaceExistingAggregator": "false",
                         "TargetOrganizationalUnits": "ou-1",
                         "TargetRegions": "us-west-2",
                     },
@@ -966,6 +972,8 @@ async fn the_configuration_listing_reports_one_record_per_deployed_target() {
                         "TargetOrganizationalUnits": "ou-1",
                         "TargetRegions": REGION,
                         "TargetTagKey": "Env",
+                        "TargetTagValue": "production",
+                        "ICalendarString": "BEGIN:VCALENDAR",
                     },
                     "TypeVersion": "2.0",
                 },
@@ -1641,6 +1649,8 @@ async fn a_stored_configuration_is_read_back_by_its_service_generated_id() {
                         "Type": "AWSQuickSetupType-PatchPolicy",
                         "Parameters": {
                             "RateControlErrorThreshold": "10%",
+                            "PatchPolicyName": "patch-policy",
+                            "SelectedPatchBaselines": "[{\"baselineId\":\"AWS-DefaultPatchBaseline\"}]",
                             "TargetOrganizationalUnits": "ou-1",
                             "TargetRegions": "us-east-1",
                             "TargetType": "*",
@@ -1666,6 +1676,7 @@ async fn a_stored_configuration_is_read_back_by_its_service_generated_id() {
                     "Type": "AWSQuickSetupType-ResourceExplorer",
                     "Parameters": {
                         "SelectedAggregatorRegion": "us-west-2",
+                        "ReplaceExistingAggregator": "false",
                         "TargetOrganizationalUnits": "ou-1",
                         "TargetRegions": "us-west-2",
                     },
@@ -2125,10 +2136,17 @@ async fn every_published_configuration_type_is_accepted_and_read_back() {
                 "ConfigurationDefinitions": [{
                     "Type": entry.type_,
                     "TypeVersion": entry.latest_version(),
-                    "Parameters": {
-                        "TargetOrganizationalUnits": "ou-1",
-                        "TargetRegions": REGION,
-                    },
+                    // Somewhere to deploy to, the Region to deploy into and every
+                    // parameter this entry's own documented table marks `(Required)`:
+                    // this case is about the TYPE being accepted, not about those
+                    // requirements, which `tests/all/required_type_parameters.rs` covers.
+                    "Parameters": super::type_parameter_fixtures::with_required_parameters(
+                        entry.type_,
+                        json!({
+                            "TargetOrganizationalUnits": "ou-1",
+                            "TargetRegions": REGION,
+                        }),
+                    ),
                 }],
             }),
         )

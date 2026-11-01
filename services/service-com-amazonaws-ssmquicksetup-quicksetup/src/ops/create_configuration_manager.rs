@@ -125,9 +125,12 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
 /// that same catalog in the handler, once the type is known to be published
 /// (`crate::state::resolve_type_version`). The deployment targets a definition's
 /// parameters name must be servable, because each targeted account and Region pair
-/// becomes a stored configuration (`crate::state::deployment_targets_rejection`, which
-/// counts those pairs the way the handler below deploys them, from `local_account` for
-/// a definition naming no account). The
+/// becomes a stored configuration, and it must provide every parameter the table
+/// documented for its own `Type` requires of it, because the definition deploys that
+/// type's service-owned template with the parameters it provides
+/// (`crate::state::configuration_parameters_rejection`, which counts those pairs the
+/// way the handler below deploys them, from `local_account` for a definition naming no
+/// account). The
 /// remaining checks are
 /// the store's own bounds on collections the model gives no length (see
 /// `crate::state`'s `MAX_*` constants), the provider-reserved tag-key namespace a
@@ -184,15 +187,18 @@ fn definitions_rejection(
     .or_else(|| {
         // A definition's parameters name where it is deployed, and the service
         // deploys one configuration per targeted account and Region, so the targets
-        // are checked before anything is stored; `crate::state` is the one place that
-        // rule lives, shared with `UpdateConfigurationDefinition`.
+        // are checked before anything is stored; so is every parameter the documented
+        // table for the definition's own `Type` requires of it, which is why the type
+        // is read alongside the map. `crate::state` is the one place that rule lives,
+        // shared with `UpdateConfigurationDefinition`.
         input
             .configuration_definitions
             .iter()
             .find_map(|definition| {
-                crate::state::deployment_targets_rejection(
+                crate::state::configuration_parameters_rejection(
                     "ConfigurationDefinitions.Parameters",
                     &definition.parameters,
+                    &definition.r#type,
                     local_account,
                 )
             })

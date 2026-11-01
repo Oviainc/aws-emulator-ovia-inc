@@ -88,15 +88,17 @@ async fn call(
 }
 
 /// The minimum a create needs: one definition naming a published Quick Setup type,
-/// somewhere to deploy to and the Regions to deploy into. One organizational unit and
-/// one Region, so the create deploys exactly ONE configuration per manager and both
-/// listings hold the same number of records.
+/// somewhere to deploy to, the Regions to deploy into and every parameter that type's
+/// documented table marks `(Required)`. One organizational unit and one Region, so the
+/// create deploys exactly ONE configuration per manager and both listings hold the same
+/// number of records.
 fn create_body(index: usize) -> Value {
     json!({
         "Name": format!("manager-{index}"),
         "ConfigurationDefinitions": [{
             "Type": "AWSQuickSetupType-SSMOpsCenter",
             "Parameters": {
+                "DelegatedAccountId": "111122223333",
                 "TargetOrganizationalUnits": "ou-1",
                 "TargetRegions": REGION,
             },

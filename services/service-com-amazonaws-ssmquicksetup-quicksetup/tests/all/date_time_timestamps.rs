@@ -256,7 +256,9 @@ const MANAGER_CASES: &[ManagerCase] = &[
 ];
 
 /// The create body for one row. Every definition names exactly one organizational unit
-/// and one Region, so each deploys exactly one configuration.
+/// and one Region, so each deploys exactly one configuration, and provides every
+/// parameter its own type's documented table requires of it — no row here is about that
+/// requirement.
 fn create_body(case: &ManagerCase) -> Value {
     let definitions: Vec<Value> = case
         .definitions
@@ -267,7 +269,11 @@ fn create_body(case: &ManagerCase) -> Value {
                 .collect();
             parameters.insert("TargetOrganizationalUnits".to_string(), json!("ou-1"));
             parameters.insert("TargetRegions".to_string(), json!(REGION));
-            json!({ "Type": type_, "Parameters": Value::Object(parameters) })
+            let parameters = super::type_parameter_fixtures::with_required_parameters(
+                type_,
+                Value::Object(parameters),
+            );
+            json!({ "Type": type_, "Parameters": parameters })
         })
         .collect();
     let mut body = json!({ "ConfigurationDefinitions": definitions });
