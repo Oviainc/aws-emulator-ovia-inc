@@ -660,6 +660,11 @@ pub struct StoredApplication {
     /// `GetApplication` resolves an application by
     /// ([`RegionState::resolve_application_id`]). Not optional, because there is no
     /// registered application without one.
+    ///
+    /// Minted per registration ([`new_app_registry_application_id`]) and never
+    /// reassigned, so it is also the identity of THIS registration, as opposed to any
+    /// other made under the same `ApplicationId`: that is what the records of the calls
+    /// made on this application are filed against ([`StoredOperation::registration`]).
     pub app_registry_arn: String,
     /// An `ApplicationStatus` value; see the `APPLICATION_STATUS_*` constants.
     pub status: String,
@@ -1310,6 +1315,20 @@ pub struct StoredOperation {
     pub resource_type: String,
     pub resource_id: String,
     pub resource_arn: String,
+    /// WHICH registration this record was filed against: the ARN of the AppRegistry
+    /// application assigned when that application was registered
+    /// ([`StoredApplication::app_registry_arn`]). Not a modelled member — `Operation`
+    /// reports the resource, not the registration — and nothing but the join below reads
+    /// it.
+    ///
+    /// An `ApplicationId` is free again the instant a deregistration completes, and the
+    /// ARNs of this service are a pure function of the ids they embed, so neither the id
+    /// nor the ARN this record names tells the registration it was filed against apart
+    /// from a later one made under the same id. The AppRegistry application is minted per
+    /// registration and never reassigned, so this does — which is what lets a listing
+    /// scoped to one application report that application's OWN records alone
+    /// ([`RegionState::operations_for`]).
+    pub registration: String,
     pub start_time: SystemTime,
     pub end_time: Option<SystemTime>,
     pub last_updated_time: SystemTime,
@@ -2817,7 +2836,9 @@ impl RegionState {
         // check runs that inspected it, which describe a configuration that no longer
         // exists. Its `Operation` records stay: they are the history of calls already
         // made, which `GetOperation` resolves by id, and [`MAX_RETAINED_OPERATIONS`] is
-        // what bounds them.
+        // what bounds them — and they stay the records of the registration they were filed
+        // against, which has ended, so no later registration made under the same id
+        // reports them as its own ([`Self::operations_for`]).
         //
         // What is held PER RESOURCE goes with it for every resource of that
         // registration — the application's own ARN and the ARNs of the resources
@@ -3335,6 +3356,10 @@ impl RegionState {
                 resource_type: APPLICATION_RESOURCE_TYPE.to_string(),
                 resource_id: application.id.clone(),
                 resource_arn: application.arn.clone(),
+                // The registration the call acted on, by the identity that is minted per
+                // registration rather than by the id it reused
+                // ([`StoredOperation::registration`]).
+                registration: application.app_registry_arn.clone(),
                 start_time: now,
                 // An operation that has not finished has no end time yet.
                 end_time: None,
@@ -3369,17 +3394,32 @@ impl RegionState {
     /// [`Self::operations`] is keyed in, so the keys a page is taken over are already
     /// ascending and a `NextToken` resumes where the previous page stopped.
     ///
-    /// A record names the resource the call that filed it acted on
-    /// ([`Self::record_operation`]), so the records of an application are the ones whose
-    /// `ResourceId` is its id — which is the `ResourceId` the listing reports for each of
-    /// them.
+    /// A record names the REGISTRATION the call that filed it acted on
+    /// ([`StoredOperation::registration`]), so the records of an application are the ones
+    /// filed against the registration this id currently names — and an id this Region
+    /// holds no application under has no records, the way it holds no tags and no
+    /// permissions ([`Self::forget_resource`]). Every such record names that application's
+    /// own id and ARN, which is what the listing reports as the `ResourceId` and
+    /// `ResourceArn` of each of them.
+    ///
+    /// Joining on the registration rather than on the id is what keeps a registration from
+    /// inheriting a dead one's history: an `ApplicationId` is free again the instant a
+    /// deregistration completes, so a later registration can be made under the same id —
+    /// and under the same ARN, these being a pure function of the ids they embed — but it
+    /// is a NEW application that carries nothing of the old one, so the calls made on that
+    /// one are no part of what has been done to this one. Those records are not destroyed:
+    /// they are the history of calls already made, which `GetOperation` resolves by id,
+    /// and [`MAX_RETAINED_OPERATIONS`] is what bounds them.
     ///
     /// Call [`Self::settle`] first, so a record whose terminal status the clock already
     /// owes is reported in it.
     pub fn operations_for(&self, application_id: &str) -> Vec<&StoredOperation> {
+        let Some(application) = self.applications.get(application_id) else {
+            return Vec::new();
+        };
         self.operations
             .values()
-            .filter(|record| record.resource_id == application_id)
+            .filter(|record| record.registration == application.app_registry_arn)
             .collect()
     }
 
@@ -3586,6 +3626,18 @@ impl ComAmazonawsSsmsapSsmsapState {
     /// The partition of `region` for WRITING, created when this is the first thing
     /// stored there. A caller that has already found a resource in `region` through
     /// [`Self::region`] creates nothing by reaching for it.
+    ///
+    /// [`MAX_REGIONS`] bounds how many partitions this store keeps, and the check that
+    /// holds that bound sits on the ONE call that can store the first thing in a Region:
+    /// `RegisterApplication` refuses with its modelled `ConflictException` when the store
+    /// already holds that many Regions and this one is new ([`Self::holds_region`] /
+    /// [`Self::region_count`]). Every OTHER write first RESOLVES a resource of the Region
+    /// through [`Self::region`] — a registered application, or an ARN
+    /// [`RegionState::holds_resource`] answers for — and a Region that answers for one
+    /// already has a partition, so none of them can create one. What a request names is
+    /// therefore never what decides how many partitions exist, and a partition left
+    /// holding nothing is dropped again by the next request ([`Self::settle`]), so only
+    /// Regions that hold something count against the bound.
     pub fn region_entry(&mut self, region: &str) -> &mut RegionState {
         self.regions.entry(region.to_string()).or_default()
     }

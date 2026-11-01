@@ -6,9 +6,11 @@
 //! `StartApplicationRefresh` / `StopApplication` / `DeregisterApplication` filed against
 //! ONE registered application, read out of persisted state: the same records
 //! `GetOperation` resolves by id, narrowed by every `Filter` the request carries and
-//! handed out in pages. An `ApplicationId` that names no application registered in this
-//! account and Region is refused with the modelled `ValidationException`; nothing is
-//! synthesised.
+//! handed out in pages. The records are the ones filed against the registration the
+//! `ApplicationId` currently names, so a registration made under an id a completed
+//! deregistration freed reports its own calls alone. An `ApplicationId` that names no
+//! application registered in this account and Region is refused with the modelled
+//! `ValidationException`; nothing is synthesised.
 //!
 //! ## Shape of an operation
 //!
@@ -192,6 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The records filed against that application, narrowed by every filter the
         // request carries (several filters narrow together), each paired with the key the
         // listing is ordered and paged by: its own `OperationId`.
+        //
+        // "That application" is the registration this id currently names, not every
+        // record ever filed under the id
+        // ([`crate::state::RegionState::operations_for`]): an `ApplicationId` is free
+        // again once a deregistration completes, so a registration made under a reused id
+        // is a new application whose history is its own calls alone.
         //
         // The store this selects from is bounded by a ceiling enforced where a record is
         // written (`MAX_RETAINED_OPERATIONS` per Region), so the work one request does

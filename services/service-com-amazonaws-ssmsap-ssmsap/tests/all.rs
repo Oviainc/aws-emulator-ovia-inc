@@ -89,6 +89,8 @@ mod registration_derived_state;
 mod registration_operation_properties;
 #[path = "all/registration_tag_ceiling.rs"]
 mod registration_tag_ceiling;
+#[path = "all/reregistered_application_history.rs"]
+mod reregistered_application_history;
 #[path = "all/resource_permission_reads.rs"]
 mod resource_permission_reads;
 #[path = "all/resource_permissions.rs"]
