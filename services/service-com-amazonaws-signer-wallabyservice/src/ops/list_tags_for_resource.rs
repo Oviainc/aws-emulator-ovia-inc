@@ -113,31 +113,6 @@ impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     }
 }
 
-/// The modelled refusal for a `resourceArn` that reaches no signing profile.
-///
-/// The two conditions answer different modelled shapes and statuses — see
-/// [`crate::state::TaggingArnProblem`] — and each carries the `code` naming the
-/// condition, which is the only machine-readable discriminator the body has.
-fn refused(
-    problem: crate::state::TaggingArnProblem,
-    resource_arn: &str,
-) -> ListTagsForResourceError {
-    let message = Some(problem.message(resource_arn));
-    let code = Some(problem.error_code().to_string());
-    match problem {
-        crate::state::TaggingArnProblem::Malformed => {
-            ListTagsForResourceErrorModeled::BadRequestException(BadRequestException {
-                message,
-                code,
-            })
-        }
-        crate::state::TaggingArnProblem::NoSuchProfile => {
-            ListTagsForResourceErrorModeled::NotFoundException(NotFoundException { message, code })
-        }
-    }
-    .into()
-}
-
 /// A 400 `BadRequestException` carrying `message` and `code` — the shape the
 /// tagging operations refuse a bad request with.
 fn bad_request(message: String, code: String) -> ListTagsForResourceError {
@@ -202,10 +177,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // A `resourceArn` that reaches no signing profile is refused by the one
+        // mapping all three tagging operations expand (`tagging_arn_refusal!`,
+        // stated beside `crate::state::TaggingArnProblem`): the two conditions
+        // answer different modelled shapes and statuses, and each carries the
+        // `code` naming the condition, which is the only machine-readable
+        // discriminator the body has.
         let store = state.lock();
         let profile = store
             .profile_for_tagging(&region, &input.resource_arn)
-            .map_err(|problem| refused(problem, &input.resource_arn))?;
+            .map_err(|problem| -> ListTagsForResourceError {
+                crate::tagging_arn_refusal!(
+                    ListTagsForResourceErrorModeled,
+                    problem,
+                    &input.resource_arn
+                )
+            })?;
 
         // A canceled profile is the one status the modelled bad request names, and
         // it names the CALL rather than the write: this operation is one of the

@@ -1112,6 +1112,38 @@ impl TaggingArnProblem {
     }
 }
 
+/// The modelled refusal one of this service's tagging operations answers a
+/// [`TaggingArnProblem`] with, in that operation's OWN error channel.
+///
+/// The branch from a problem to the shape that answers it is stated HERE, once,
+/// beside the enum that tells the two cases apart and owns their `code` and prose:
+/// `Malformed` answers `BadRequestException` (400) and `NoSuchProfile` answers
+/// `NotFoundException` (404), so which condition answers which shape is one fact in
+/// one place for all three operations bound to the tagging route.
+///
+/// Each of those operations has its OWN generated error enum, so the mapping cannot
+/// be a function over one type; it is this macro instead, expanded once per handler
+/// with `$modeled` naming that handler's `{Op}ErrorModeled`. Everything in the body
+/// — both members of both shapes — comes off the problem itself, so every expansion
+/// answers the same status, code and message for the same `resourceArn`.
+#[macro_export]
+macro_rules! tagging_arn_refusal {
+    ($modeled:ident, $problem:expr, $resource_arn:expr) => {{
+        let problem: $crate::state::TaggingArnProblem = $problem;
+        let message = ::std::option::Option::Some(problem.message($resource_arn));
+        let code = ::std::option::Option::Some(problem.error_code().to_string());
+        let modeled = match problem {
+            $crate::state::TaggingArnProblem::Malformed => $modeled::BadRequestException(
+                $crate::ops::types::BadRequestException { message, code },
+            ),
+            $crate::state::TaggingArnProblem::NoSuchProfile => $modeled::NotFoundException(
+                $crate::ops::types::NotFoundException { message, code },
+            ),
+        };
+        modeled.into()
+    }};
+}
+
 /// True when `character` is one the modelled tag-key character set admits.
 ///
 /// `TagKey`'s pattern is `^(?!aws:)[a-zA-Z+-=._:/]+$`

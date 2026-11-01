@@ -113,5 +113,8 @@ mod supplied_nothing_refusal_wording;
 #[path = "all/tag_keys_supplied_nothing_wording.rs"]
 mod tag_keys_supplied_nothing_wording;
 
+#[path = "all/tagging_arn_refusal_mapping.rs"]
+mod tagging_arn_refusal_mapping;
+
 #[path = "all/wire_probe.rs"]
 mod wire_probe;
