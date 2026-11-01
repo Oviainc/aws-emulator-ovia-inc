@@ -37,6 +37,8 @@ use smithy_server_runtime::{
     ServerHttpProtocol, Service, ServiceIdentity,
 };
 
+use crate::service::management_events::AuditedDefinition;
+
 /// The closing tag of the awsQuery error envelope.
 const ERROR_RESPONSE_CLOSE: &str = "</ErrorResponse>";
 
@@ -141,16 +143,23 @@ impl ErasedOperation for RequestIdEnvelopeOperation {
 ///
 /// Identity, the routing table and the protocol come from the generated
 /// [`crate::ServiceDefinition`] untouched — nothing model-derived is restated here.
+///
+/// The generated entry is reached through the AUDIT wrapper
+/// ([`crate::service::management_events`]), which sits INSIDE this one: the routing table
+/// every layer resolves an operation from — the router itself and the operation wrapper
+/// above — is then the audited one, so no request can be served by a path that records
+/// nothing. Everything else about the definition is the generated entry's, unchanged.
 pub struct CloudFormationDefinition<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    entry: AuditedDefinition<crate::ServiceDefinition<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> CloudFormationDefinition<Eng> {
     /// Build the definition from the shared engine, which the generated entry threads
-    /// into every operation.
-    pub fn new(engine: std::sync::Arc<Eng>) -> Self {
+    /// into every operation, routing through `audited` — the same modelled operations
+    /// built from that same engine, each wrapped in the management-event recorder.
+    pub fn new(engine: std::sync::Arc<Eng>, audited: OperationRoutingTable) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: AuditedDefinition::new(crate::ServiceDefinition::new(engine), audited),
         }
     }
 

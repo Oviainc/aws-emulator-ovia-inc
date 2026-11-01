@@ -50,6 +50,12 @@
 //! [`Scaffolded::ValidationError`] variant, built with
 //! [`Scaffolded::validation_error`] — the same single `message`, rendered under the code
 //! a CloudFormation client actually branches on. Prefer it in this crate's handlers.
+//!
+//! That code is stated as its QUERY code ([`OperationError::query_error_code`]) and not as
+//! the fault shape's name, exactly as a modelled error whose `awsQueryError` code differs
+//! from its shape states it: the shape both refusals render is the synthetic
+//! `ValidationException`, so a `<Code>` a client branches on and an audit record of the
+//! call naming the fault shape are each the right value without either being restated.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -304,14 +310,17 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
 
     /// The wire error code (`__type` on JSON/CBOR, `<Code>` on XML).
     ///
-    /// Keep the literal as it is: changing it changes the wire error code clients match
-    /// on. It is intentionally not tied to the Rust variant name.
+    /// The FAULT SHAPE's own name, which is what the framework names a failure by outside a
+    /// query envelope and what an audit record of the call carries. The code a
+    /// CloudFormation client branches on is the query one below, which is what this
+    /// service's `awsQuery` envelope renders.
     fn shape_name(&self) -> &'static str {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
-            Self::ValidationError(_) => "ValidationError",
-            Self::ValidationException(_) => "ValidationException",
+            // Both refusals are the one synthetic shape (`VALIDATION_EXCEPTION_SCHEMA`),
+            // so both name it; they differ in the code the wire carries.
+            Self::ValidationError(_) | Self::ValidationException(_) => "ValidationException",
         }
     }
 
@@ -334,10 +343,17 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shapes carry no `awsQueryError` trait, so the
-            // `<Code>` falls through to `shape_name` above — which is already the code
-            // the service answers.
-            Self::ValidationError(_) | Self::ValidationException(_) => None,
+            // The code this service's Query API publishes for a request refused on input
+            // grounds, and the one a CloudFormation client branches on — exactly what a
+            // modelled error's `awsQueryError` trait states for a fault whose shape name is
+            // not the code the wire carries (`ValidationException` the shape,
+            // `ValidationError` the code). Keep the literal as it is: changing it changes
+            // the wire error code clients match on.
+            Self::ValidationError(_) => Some("ValidationError"),
+            // The synthetic `ValidationException` carries no `awsQueryError` trait of its
+            // own, so the `<Code>` falls through to `shape_name` above — which is already
+            // the code that refusal answers.
+            Self::ValidationException(_) => None,
         }
     }
 }

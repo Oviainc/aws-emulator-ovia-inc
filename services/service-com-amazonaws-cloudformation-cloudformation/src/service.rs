@@ -59,8 +59,16 @@
 //! `override_protocol` is taken for one rendering: a floating-point member is written as a
 //! double, with its fractional part, which is how CloudFormation's envelope writes one —
 //! see [`double_members`].
+//!
+//! The definition this file hands back is also where this front door's AUDIT leg hangs: the
+//! generated entry is reached through the shared management-event recorder
+//! ([`management_events`]), so every call this service serves — accepted and refused alike —
+//! is recorded in the account's event history where CloudTrail's `LookupEvents` reports it,
+//! through one code path for every operation rather than a recording written into each
+//! handler.
 
 pub mod double_members;
+pub mod management_events;
 pub mod query_error_envelope;
 
 use crate::state::registry;
@@ -219,7 +227,15 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: CloudFormationDefinition::new(engine),
+            // The generated entry, routing through the AUDITED table: every modelled
+            // operation, each constructed from this same shared engine and wrapped in the
+            // management-event recorder (see [`management_events`]), so each call this
+            // front door serves is recorded as a management event of
+            // `cloudformation.amazonaws.com`.
+            entry: CloudFormationDefinition::new(
+                Arc::clone(&engine),
+                management_events::audited_table(&engine),
+            ),
             envelope: RequestIdEnvelopeOperation,
         }
     }

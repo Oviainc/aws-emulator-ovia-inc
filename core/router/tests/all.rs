@@ -693,6 +693,12 @@ mod rds_docdb_neptune_signing_name_routing;
 // comment above names, and not the tail every concurrently landing suite appends to.
 #[path = "all/rds_management_events.rs"]
 mod rds_management_events;
+// Declared beside its sibling management-event suite, in the same quiet span and for the
+// same reason: the head of this file and its appended tail are both where concurrently
+// landing suites add their line. This one pins that a CloudFormation call — accepted and
+// refused alike — is in CloudTrail event history.
+#[path = "all/cloudformation_management_events.rs"]
+mod cloudformation_management_events;
 #[path = "all/rds_query_front_door.rs"]
 mod rds_query_front_door;
 #[path = "all/rds_shared_query_front_door_routing.rs"]

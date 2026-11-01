@@ -155,6 +155,8 @@ mod list_types;
 mod macro_acknowledgement_and_include_refresh;
 #[path = "all/malformed_policy_document_rollback.rs"]
 mod malformed_policy_document_rollback;
+#[path = "all/management_event_recording.rs"]
+mod management_event_recording;
 #[path = "all/nested_resource_outputs.rs"]
 mod nested_resource_outputs;
 #[path = "all/no_echo_parameters.rs"]
