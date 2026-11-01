@@ -428,6 +428,263 @@ const TLS13_RESTRICTED_CIPHERS: &[&str] = &[
     "ECDHE-RSA-AES256-GCM-SHA384",
 ];
 
+/// The first extended TLS13 policy's cipher list: [`TLS13_SHA2_CIPHERS`] then the
+/// static-RSA SHA-2 suites, which is the compatibility the `Ext1` policies add — the
+/// forward-secrecy suites are unchanged, so a client that negotiates one of those reads
+/// the same priority as under the unextended policy.
+const TLS13_EXT1_CIPHERS: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "AES128-GCM-SHA256",
+    "AES128-SHA256",
+    "AES256-GCM-SHA384",
+    "AES256-SHA256",
+];
+
+/// The second extended TLS13 policy's cipher list: [`TLS13_EXT1_CIPHERS`] with the
+/// SHA-1 suites added as well — the ECDHE SHA-1 pairs beside their SHA-2 counterparts
+/// and the static-RSA SHA-1 suites after theirs, each key exchange's ECDSA suite ahead
+/// of its RSA one.
+const TLS13_EXT2_CIPHERS: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-ECDSA-AES256-SHA",
+    "ECDHE-RSA-AES256-SHA",
+    "AES128-GCM-SHA256",
+    "AES128-SHA256",
+    "AES128-SHA",
+    "AES256-GCM-SHA384",
+    "AES256-SHA256",
+    "AES256-SHA",
+];
+
+// ---------------------------------------------------------------------------
+// The FIPS cipher lists
+//
+// A FIPS policy offers the same suites as the policy of the same shape outside the FIPS
+// family, less the ones whose primitives a FIPS-validated module does not provide: the
+// ChaCha20-Poly1305 TLS 1.3 suite is the only such suite in these lists, so each FIPS
+// list below is its counterpart above with that suite dropped and the remaining order
+// kept.
+// ---------------------------------------------------------------------------
+
+/// The TLS 1.3 cipher suites of a FIPS policy: [`TLS13_SUITES`] without the
+/// ChaCha20-Poly1305 suite.
+const TLS13_FIPS_SUITES: &[&str] = &["TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384"];
+
+/// [`TLS13_SHA2_CIPHERS`] as a FIPS policy offers them.
+const TLS13_SHA2_FIPS_CIPHERS: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+];
+
+/// [`TLS13_SHA2_FIPS_CIPHERS`] with the static-RSA SHA-2 suites added, which is the step
+/// `Ext1` is beyond the unextended policy — a different concession from `Ext0`'s, which
+/// keeps every suite ephemeral.
+const TLS13_EXT1_FIPS_CIPHERS: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "AES128-GCM-SHA256",
+    "AES128-SHA256",
+    "AES256-GCM-SHA384",
+    "AES256-SHA256",
+];
+
+/// [`TLS13_FULL_CIPHERS`] as a FIPS policy offers them. This is every suite the FIPS
+/// family offers, so it is also the `Ext2` list: the policies that carry it differ in the
+/// protocol versions they negotiate, not in their suites.
+const TLS13_FULL_FIPS_CIPHERS: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-ECDSA-AES256-SHA",
+    "AES128-GCM-SHA256",
+    "AES128-SHA256",
+    "AES128-SHA",
+    "AES256-GCM-SHA384",
+    "AES256-SHA256",
+    "AES256-SHA",
+];
+
+/// [`TLS13_RESTRICTED_CIPHERS`] as a FIPS policy offers them.
+const TLS13_RESTRICTED_FIPS_CIPHERS: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+];
+
+/// The `Ext0` extension, which the FIPS and RFC 9151 families publish and the 2021-06
+/// family does not: the unextended list with the SHA-1 ECDHE suites added behind the
+/// SHA-2 ones of the same key size, and no static-RSA suite at all — a smaller step than
+/// `Ext1`, which is where a static-RSA suite first appears.
+const TLS13_EXT0_FIPS_CIPHERS: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-ECDSA-AES256-SHA",
+];
+
+// ---------------------------------------------------------------------------
+// The RFC 9151 cipher lists
+//
+// An RFC 9151 policy offers only the suites that profile admits: AES-256-GCM-SHA384 for
+// TLS 1.3, and the ephemeral-ECDH AES-256-GCM-SHA384 suites for TLS 1.2. Its
+// interoperability variants relax that one step at a time, and because the profile is an
+// AES-256 one, every list of this family prefers the 256-bit suite of a pair to the
+// 128-bit one — the reverse of the families above, which lead with AES-128.
+// ---------------------------------------------------------------------------
+
+/// The TLS 1.2 and TLS 1.3 suites of an RFC 9151 policy.
+const RFC9151_CIPHERS: &[&str] = &[
+    "TLS_AES_256_GCM_SHA384",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+];
+
+/// The `Ext0` extension of an RFC 9151 policy: [`RFC9151_CIPHERS`] plus the static-RSA
+/// suite of the same strength — the one suite that step adds within what this profile's
+/// restriction leaves.
+const RFC9151_EXT0_CIPHERS: &[&str] = &[
+    "TLS_AES_256_GCM_SHA384",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "AES256-GCM-SHA384",
+];
+
+/// The TLS 1.3 suite of an RFC 9151 policy that negotiates TLS 1.3 only.
+const RFC9151_TLS13_CIPHERS: &[&str] = &["TLS_AES_256_GCM_SHA384"];
+
+/// The first interoperability step away from [`RFC9151_CIPHERS`]: the AEAD suites of
+/// both key sizes, so a client that offers only AES-128 GCM still negotiates.
+const RFC9151_INTEROP1_CIPHERS: &[&str] = &[
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_AES_128_GCM_SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+];
+
+/// The second step: [`RFC9151_INTEROP1_CIPHERS`] with the CBC SHA-2 suite of each key
+/// size added behind that size's AEAD suites.
+const RFC9151_INTEROP2_CIPHERS: &[&str] = &[
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_AES_128_GCM_SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+];
+
+/// The third step: [`RFC9151_INTEROP2_CIPHERS`] with the SHA-1 ECDHE suites added, again
+/// behind the SHA-2 suites of their own key size — the `Ext0` concession, inside this
+/// family's ordering.
+const RFC9151_INTEROP3_CIPHERS: &[&str] = &[
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_AES_128_GCM_SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-ECDSA-AES256-SHA",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA",
+];
+
+/// The fourth and widest step: [`RFC9151_INTEROP3_CIPHERS`] with the static-RSA suites
+/// added after every ephemeral one, which leaves this variant offering every suite the
+/// FIPS family offers, ordered by this family's preference for AES-256.
+const RFC9151_INTEROP4_CIPHERS: &[&str] = &[
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_AES_128_GCM_SHA256",
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES256-SHA384",
+    "ECDHE-RSA-AES256-SHA384",
+    "ECDHE-ECDSA-AES256-SHA",
+    "ECDHE-RSA-AES256-SHA",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES128-SHA256",
+    "ECDHE-RSA-AES128-SHA256",
+    "ECDHE-ECDSA-AES128-SHA",
+    "ECDHE-RSA-AES128-SHA",
+    "AES256-GCM-SHA384",
+    "AES256-SHA256",
+    "AES256-SHA",
+    "AES128-GCM-SHA256",
+    "AES128-SHA256",
+    "AES128-SHA",
+];
+
 /// The predefined security policies this service publishes, in the order a page walks
 /// them (the order of this table, which is stable across calls — pagination resumes by
 /// position).
@@ -442,11 +699,14 @@ const TLS13_RESTRICTED_CIPHERS: &[&str] = &[
 /// policies" in the Application Load Balancers Guide and in the Network Load Balancers
 /// Guide, which this operation's own model documentation points at).
 ///
-/// AWS adds predefined policies over time (the FIPS family and the post-quantum family
-/// are the newest), so this table is the set this emulator publishes rather than a claim
-/// that AWS publishes no others: a policy whose cipher list no source here states is left
-/// out instead of invented, and `Names` naming it is the modelled `SSLPolicyNotFound`
-/// rather than a guess.
+/// AWS adds predefined policies over time, and a policy is published in FAMILIES: each
+/// policy of one family is a named shape (the lowest TLS version it negotiates, `Ext0`,
+/// `Ext1` or `Ext2` for an extended cipher list, `Res` for a restricted one), and a
+/// family offers those shapes under one constraint — FIPS-validated primitives only, the
+/// RFC 9151 profile's suites only, a post-quantum hybrid key agreement. So a family's
+/// entry reports the suites of the shape it mirrors, less the ones its constraint
+/// excludes; only the key agreement is invisible here, because the reported shape carries
+/// no member for it.
 const POLICY_CATALOGUE: &[PolicyEntry] = &[
     // The default policy for a new HTTPS or TLS listener.
     PolicyEntry {
@@ -536,13 +796,13 @@ const POLICY_CATALOGUE: &[PolicyEntry] = &[
     PolicyEntry {
         name: "ELBSecurityPolicy-TLS13-1-2-Ext1-2021-06",
         ssl_protocols: TLS13_FROM_1_2,
-        ciphers: TLS13_FULL_CIPHERS,
+        ciphers: TLS13_EXT1_CIPHERS,
         load_balancer_types: APPLICATION_AND_NETWORK,
     },
     PolicyEntry {
         name: "ELBSecurityPolicy-TLS13-1-2-Ext2-2021-06",
         ssl_protocols: TLS13_FROM_1_2,
-        ciphers: TLS13_FULL_CIPHERS,
+        ciphers: TLS13_EXT2_CIPHERS,
         load_balancer_types: APPLICATION_AND_NETWORK,
     },
     PolicyEntry {
@@ -555,6 +815,180 @@ const POLICY_CATALOGUE: &[PolicyEntry] = &[
         name: "ELBSecurityPolicy-TLS13-1-3-2021-06",
         ssl_protocols: TLS13_ONLY,
         ciphers: TLS13_SUITES,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    // The FIPS family: the shapes above, offered with FIPS-validated primitives only.
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-0-FIPS-2023-04",
+        ssl_protocols: TLS13_FROM_1_0,
+        ciphers: TLS13_FULL_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-1-FIPS-2023-04",
+        ssl_protocols: TLS13_FROM_1_1,
+        ciphers: TLS13_FULL_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-FIPS-2023-04",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_SHA2_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Ext0-FIPS-2023-04",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_EXT0_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Ext1-FIPS-2023-04",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_EXT1_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Ext2-FIPS-2023-04",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_FULL_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Res-FIPS-2023-04",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_RESTRICTED_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-3-FIPS-2023-04",
+        ssl_protocols: TLS13_ONLY,
+        ciphers: TLS13_FIPS_SUITES,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    // The RFC 9151 family: the FIPS primitives narrowed to the suites that profile
+    // admits, with one extended and four interoperability variants.
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-RFC9151-FIPS-2023-07",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: RFC9151_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Ext0-RFC9151-FIPS-2023-07",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: RFC9151_EXT0_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-RFC9151-INTEROP1-FIPS-2023-07",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: RFC9151_INTEROP1_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-RFC9151-INTEROP2-FIPS-2023-07",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: RFC9151_INTEROP2_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-RFC9151-INTEROP3-FIPS-2023-07",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: RFC9151_INTEROP3_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-RFC9151-INTEROP4-FIPS-2023-07",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: RFC9151_INTEROP4_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-3-RFC9151-FIPS-2023-07",
+        ssl_protocols: TLS13_ONLY,
+        ciphers: RFC9151_TLS13_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    // The post-quantum family: the shapes above again, negotiating a hybrid key
+    // agreement. The key agreement is not a member of the reported shape, so each of
+    // these offers the suites of the policy whose shape it mirrors.
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-0-PQ-2025-09",
+        ssl_protocols: TLS13_FROM_1_0,
+        ciphers: TLS13_FULL_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-0-FIPS-PQ-2025-09",
+        ssl_protocols: TLS13_FROM_1_0,
+        ciphers: TLS13_FULL_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-PQ-2025-09",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_SHA2_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-FIPS-PQ-2025-09",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_SHA2_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Ext0-FIPS-PQ-2025-09",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_EXT0_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Ext1-PQ-2025-09",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_EXT1_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Ext1-FIPS-PQ-2025-09",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_EXT1_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Ext2-PQ-2025-09",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_EXT2_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Ext2-FIPS-PQ-2025-09",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_FULL_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Res-PQ-2025-09",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_RESTRICTED_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-2-Res-FIPS-PQ-2025-09",
+        ssl_protocols: TLS13_FROM_1_2,
+        ciphers: TLS13_RESTRICTED_FIPS_CIPHERS,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-3-PQ-2025-09",
+        ssl_protocols: TLS13_ONLY,
+        ciphers: TLS13_SUITES,
+        load_balancer_types: APPLICATION_AND_NETWORK,
+    },
+    PolicyEntry {
+        name: "ELBSecurityPolicy-TLS13-1-3-FIPS-PQ-2025-09",
+        ssl_protocols: TLS13_ONLY,
+        ciphers: TLS13_FIPS_SUITES,
         load_balancer_types: APPLICATION_AND_NETWORK,
     },
 ];

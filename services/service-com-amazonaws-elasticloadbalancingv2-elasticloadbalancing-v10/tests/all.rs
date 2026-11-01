@@ -59,6 +59,8 @@ mod rule_transforms_and_fixed_response_content_type;
 mod shared_endpoint_routing;
 #[path = "all/ssl_policies.rs"]
 mod ssl_policies;
+#[path = "all/ssl_policy_families.rs"]
+mod ssl_policy_families;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/subnet_vpc_membership.rs"]
