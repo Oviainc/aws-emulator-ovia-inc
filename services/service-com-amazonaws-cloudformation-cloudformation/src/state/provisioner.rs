@@ -539,6 +539,20 @@ const RDS_DB_PARAMETER_GROUP: &str = "AWS::RDS::DBParameterGroup";
 /// `DBClusterParameterGroupName` names.
 const RDS_DB_CLUSTER_PARAMETER_GROUP: &str = "AWS::RDS::DBClusterParameterGroup";
 
+/// `AWS::RDS::DBProxy`: "Ref returns the DBProxyName" — the identifier every Amazon RDS
+/// call on a proxy takes, which is the physical id the naming rules already compute for the
+/// type (its own `DBProxyName` property), so the type needs no entry in
+/// [`super::template::identity_is_service_assigned`].
+const RDS_DB_PROXY: &str = "AWS::RDS::DBProxy";
+
+/// `AWS::RDS::DBProxyTargetGroup`: not a resource Amazon RDS creates on its own account —
+/// a proxy comes up with the one target group it has, named `default` — but the
+/// REGISTRATION of the databases that group routes to, plus the connection pool settings
+/// of the group. Its identity is the `TargetGroupArn` that service minted, which is what
+/// this type's `Ref` returns, so [`super::template::identity_is_service_assigned`] names
+/// it.
+const RDS_DB_PROXY_TARGET_GROUP: &str = "AWS::RDS::DBProxyTargetGroup";
+
 /// `AWS::BedrockAgentCore::WorkloadIdentity`: "Ref returns the name" of the workload
 /// identity — the handle every call of the Amazon Bedrock AgentCore control plane on one
 /// takes (`GetWorkloadIdentity`, `UpdateWorkloadIdentity` and `DeleteWorkloadIdentity` each
@@ -665,6 +679,15 @@ pub(super) enum Provisioner {
     RdsDbSubnetGroup,
     RdsDbParameterGroup,
     RdsDbClusterParameterGroup,
+    /// `AWS::RDS::DBProxy`: an RDS proxy, which `CreateDBProxy` creates under the name the
+    /// template states and `DeleteDBProxy` deletes. The create answers the proxy
+    /// `creating`, so its creation is held open until Amazon RDS reports it `available`.
+    RdsDbProxy,
+    /// `AWS::RDS::DBProxyTargetGroup`: the databases one of those proxies routes to, which
+    /// `RegisterDBProxyTargets` registers in the proxy's own target group and
+    /// `DeregisterDBProxyTargets` removes, with the connection pool settings the
+    /// declaration asks for applied by `ModifyDBProxyTargetGroup`.
+    RdsDbProxyTargetGroup,
     RedshiftCluster,
     EventsRule,
     SsmParameter,
@@ -807,6 +830,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
         RDS_DB_PARAMETER_GROUP => Some(Provisioner::RdsDbParameterGroup),
         RDS_DB_CLUSTER_PARAMETER_GROUP => Some(Provisioner::RdsDbClusterParameterGroup),
+        RDS_DB_PROXY => Some(Provisioner::RdsDbProxy),
+        RDS_DB_PROXY_TARGET_GROUP => Some(Provisioner::RdsDbProxyTargetGroup),
         REDSHIFT_CLUSTER => Some(Provisioner::RedshiftCluster),
         EVENTS_RULE => Some(Provisioner::EventsRule),
         SSM_PARAMETER => Some(Provisioner::SsmParameter),
@@ -1060,6 +1085,13 @@ impl Provisioner {
                     DB_CLUSTER_PARAMETER_GROUP_CALLS,
                 )
                 .await
+            }
+            Self::RdsDbProxy => create_db_proxy(ctx, region, resource, propagated).await,
+            // `AWS::RDS::DBProxyTargetGroup` publishes no `Tags` property — Amazon RDS
+            // holds tags on the PROXY, not on the registrations in its target group — so
+            // the type is not taggable and no tags are propagated to one.
+            Self::RdsDbProxyTargetGroup => {
+                create_db_proxy_target_group(ctx, region, resource).await
             }
             // `AWS::Events::Rule` publishes `Description`, `EventBusName`, `EventPattern`,
             // `Name`, `RoleArn`, `ScheduleExpression`, `State` and `Targets` and no
@@ -1451,6 +1483,12 @@ impl Provisioner {
             Self::ApiGatewayDomainName => {
                 domain_name_readiness(ctx, region, physical_resource_id).await
             }
+            // "A status of `available` means the proxy is ready to handle requests. Other
+            // values indicate that you must wait for the proxy to be ready, or take some
+            // action to resolve an issue" (`DBProxy$Status`), so a proxy the create has
+            // just answered for handles no connection yet and the resource's creation is
+            // finished once Amazon RDS reports it `available`.
+            Self::RdsDbProxy => db_proxy_readiness(ctx, region, physical_resource_id).await,
             _ => Ok(Readiness::Ready),
         }
     }
@@ -1929,6 +1967,15 @@ impl Provisioner {
                 )
                 .await
             }
+            // The proxy is addressed by the name it was created under, which is this
+            // resource's physical id.
+            Self::RdsDbProxy => delete_db_proxy(ctx, region, physical_resource_id).await,
+            // A registration is addressed by the PROXY and the target group that hold it,
+            // and only the resource's own declaration carries either, so the delete takes
+            // the record rather than its id — which is the group's ARN.
+            Self::RdsDbProxyTargetGroup => {
+                delete_db_proxy_target_group(ctx, region, resource).await
+            }
             // A rule still carrying targets cannot be deleted, and only the rule's own
             // record says which bus it is on, so the delete takes the record.
             Self::EventsRule => delete_rule(ctx, region, resource).await,
@@ -2258,6 +2305,13 @@ impl Provisioner {
                     DB_CLUSTER_PARAMETER_GROUP_CALLS,
                 )
                 .await
+            }
+            // Amazon RDS's own read of the proxy, by the name it was created under.
+            Self::RdsDbProxy => read_db_proxy(ctx, region, physical_resource_id).await,
+            // Read back by the same proxy-and-group pair the delete addresses the
+            // registrations by, which only the resource's own declaration carries.
+            Self::RdsDbProxyTargetGroup => {
+                describe_db_proxy_target_group(ctx, region, resource).await
             }
             // The read is addressed by the rule's name AND the bus it is bound to, which
             // only the resource's own record carries.
@@ -13653,6 +13707,510 @@ async fn describe_parameter_group(
         Err(refusal) if refusal.code == DB_PARAMETER_GROUP_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Amazon RDS Proxy: AWS::RDS::DBProxy, AWS::RDS::DBProxyTargetGroup
+// ---------------------------------------------------------------------------
+
+/// `DBProxyNotFoundFault`'s and `DBProxyTargetNotFoundFault`'s own `awsQueryError` codes
+/// (`smithy_query(query="operation", operation="DeleteDBProxy,DeregisterDBProxyTargets")`),
+/// which is what an awsQuery client branches on for a proxy Amazon RDS does not hold and
+/// for a database its target group does not have registered.
+const DB_PROXY_NOT_FOUND: &str = "DBProxyNotFoundFault";
+const DB_PROXY_TARGET_NOT_FOUND: &str = "DBProxyTargetNotFoundFault";
+
+/// `DBProxyStatus$available` — "A status of `available` means the proxy is ready to handle
+/// requests" — and the values a proxy that is still on its way to it reports. "Other values
+/// indicate that you must wait for the proxy to be ready, or take some action to resolve an
+/// issue", so every status outside these two sets is one no wait brings a NEW proxy out of
+/// (`incompatible-network`, `insufficient-resource-limits`, `suspended`, `suspending`,
+/// `deleting`; `smithy_query(query="shape", shape="DBProxyStatus")` lists them all).
+const DB_PROXY_STATUS_AVAILABLE: &str = "available";
+const DB_PROXY_STATUSES_COMING_UP: &[&str] = &["creating", "modifying", "reactivating"];
+
+/// The one target group a proxy has: "Currently, this name must be `default`"
+/// (`RegisterDBProxyTargets$TargetGroupName`), which is the group an
+/// `AWS::RDS::DBProxyTargetGroup` that states no `TargetGroupName` means.
+const DEFAULT_DB_PROXY_TARGET_GROUP: &str = "default";
+
+/// How often this module checks whether a proxy has finished coming up, and how many times.
+///
+/// The product is the longest the deployment of a proxy's target group waits for the proxy
+/// it belongs to: an upper bound on the wait, not a duration anything is owed. Amazon RDS
+/// answers `CreateDBProxy` with the proxy `creating` and reports it `available` a moment
+/// later (its own transition span), so the check is far shorter than that moment and the
+/// whole wait is a small multiple of it — enough that a loaded machine still gets there,
+/// and bounded so a stack operation cannot hold its request open.
+const DB_PROXY_CHECK_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_millis(25);
+const DB_PROXY_CHECKS: usize = 24;
+
+/// The members `CreateDBProxy` takes, from Amazon RDS's own model
+/// (`smithy_query(query="operation", operation="CreateDBProxy")`), with each list's element
+/// name from its list shape's member `@xmlName` — `UserAuthConfigList` and `StringList` fix
+/// none, so their entries are indexed under the Smithy default `member`, and `TagList`
+/// spells its own `Tag` (`smithy_query(query="shape",
+/// shape="UserAuthConfigList,StringList,TagList")`).
+///
+/// This is the catalogue the declaration of an `AWS::RDS::DBProxy` is walked against: the
+/// type's properties ARE these members, named identically on both sides, so a property
+/// whose name is one of them is passed through under it.
+const CREATE_DB_PROXY_MEMBERS: &[(&str, QueryMember)] = &[
+    ("Auth", QueryMember::List("member")),
+    ("DBProxyName", QueryMember::Scalar),
+    ("DebugLogging", QueryMember::Scalar),
+    ("DefaultAuthScheme", QueryMember::Scalar),
+    ("EndpointNetworkType", QueryMember::Scalar),
+    ("EngineFamily", QueryMember::Scalar),
+    ("IdleClientTimeout", QueryMember::Scalar),
+    ("RequireTLS", QueryMember::Scalar),
+    ("RoleArn", QueryMember::Scalar),
+    ("Tags", QueryMember::List("Tag")),
+    ("TargetConnectionNetworkType", QueryMember::Scalar),
+    ("VpcSecurityGroupIds", QueryMember::List("member")),
+    ("VpcSubnetIds", QueryMember::List("member")),
+];
+
+/// `AWS::RDS::DBProxy`'s two properties the arm itself pushes, for the same reasons the DB
+/// instance's are ([`DB_INSTANCE_PROPERTIES_NOT_SENT`]): the name CloudFormation decides,
+/// which is this resource's physical id ("Ref returns the DBProxyName"), and the tag list
+/// it merges.
+const DB_PROXY_PROPERTIES_NOT_SENT: &[&str] = &["DBProxyName", "Tags"];
+
+/// The properties an `AWS::RDS::DBProxyTargetGroup` declares, each of which this arm acts
+/// on: the proxy and the target group it addresses, the databases it registers there and
+/// the connection pool settings it applies to the group. A declaration carrying any other
+/// property is REFUSED rather than dropped, for the reason [`query_members`] records.
+const DB_PROXY_TARGET_GROUP_PROPERTIES: &[&str] = &[
+    "ConnectionPoolConfigurationInfo",
+    "DBClusterIdentifiers",
+    "DBInstanceIdentifiers",
+    "DBProxyName",
+    "TargetGroupName",
+];
+
+/// The two properties of `AWS::RDS::DBProxyTargetGroup` that name the databases the group
+/// routes to, each the member `RegisterDBProxyTargets` and `DeregisterDBProxyTargets` take
+/// that kind of database under — named identically on both sides.
+const DB_PROXY_TARGET_PROPERTIES: &[&str] = &["DBInstanceIdentifiers", "DBClusterIdentifiers"];
+
+/// Create the RDS proxy an `AWS::RDS::DBProxy` declares.
+///
+/// The type's properties are `CreateDBProxy`'s own members ([`CREATE_DB_PROXY_MEMBERS`]),
+/// so the evaluated declaration IS the request, with the one value CloudFormation decides —
+/// the `DBProxyName`, which is this resource's physical id — set on the way out and the tag
+/// list built from the declared tags plus the ones CloudFormation propagates.
+///
+/// What the create ANSWERS replaces the identifiers CloudFormation's naming rules had
+/// computed for the resource: the proxy's ARN and its endpoint are Amazon RDS's to assign,
+/// and the whole point of provisioning the proxy is that the handle the stack publishes
+/// addresses the proxy RDS really holds. `VpcId` is not among them — that service reports
+/// none for a proxy, so nothing is re-pointed at a value it does not know.
+async fn create_db_proxy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        CREATE_DB_PROXY_MEMBERS,
+        &[],
+        DB_PROXY_PROPERTIES_NOT_SENT,
+        RDS_DB_PROXY,
+    )?;
+    parameters.push((
+        "DBProxyName".to_string(),
+        resource.physical_resource_id.clone(),
+    ));
+    push_tag_list(
+        &mut parameters,
+        "Tags",
+        "Tag",
+        &tags_of(&resource.properties, propagated),
+    );
+    let answered = call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        "CreateDBProxy",
+        &parameters,
+    )
+    .await?;
+
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = xml_element(&answered, "DBProxyArn").filter(|arn| !arn.is_empty()) {
+        // The type publishes one ARN, so the conventional `Arn` attribute every type
+        // answers is that same value ([`super::template::conventional_attributes`]): both
+        // are re-pointed at the ARN the proxy really carries.
+        attributes.insert("Arn".to_string(), arn.clone());
+        attributes.insert("DBProxyArn".to_string(), arn);
+    }
+    if let Some(endpoint) = xml_element(&answered, "Endpoint").filter(|host| !host.is_empty())
+    {
+        attributes.insert("Endpoint".to_string(), endpoint);
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Whether the proxy a stack created is ready to handle requests yet: `available` is the
+/// status Amazon RDS reports a usable proxy in, the statuses in
+/// [`DB_PROXY_STATUSES_COMING_UP`] are ones a proxy comes up out of, and every other one is
+/// a state no wait brings a new proxy out of. A proxy that service no longer holds is in the
+/// same position: nothing is going to create it.
+async fn db_proxy_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    db_proxy_name: &str,
+) -> Result<Readiness, Refusal> {
+    let Some(reported) = read_db_proxy(ctx, region, db_proxy_name).await? else {
+        return Ok(Readiness::Failed(format!(
+            "Amazon RDS holds no DB proxy named {db_proxy_name}"
+        )));
+    };
+    let status = reported
+        .get("Status")
+        .and_then(scalar_text)
+        .unwrap_or_default();
+    if status == DB_PROXY_STATUS_AVAILABLE {
+        return Ok(Readiness::Ready);
+    }
+    if DB_PROXY_STATUSES_COMING_UP.contains(&status.as_str()) {
+        return Ok(Readiness::Pending(status));
+    }
+    Ok(Readiness::Failed(format!(
+        "Amazon RDS reports the DB proxy {db_proxy_name} in status {status}"
+    )))
+}
+
+/// Wait until Amazon RDS reports the proxy `db_proxy_name` out of the statuses it comes up
+/// in.
+///
+/// Returns as soon as the proxy is no longer coming up, and gives up after
+/// [`DB_PROXY_CHECKS`] checks — a wait that runs out is not a failure of its own; what fails
+/// then is the call that needed the proxy ready, reported as Amazon RDS's own refusal of it
+/// (`InvalidDBProxyStateFault`). Any refusal of the READ ends the wait the same way: it says
+/// nothing about whether the proxy is ready.
+///
+/// This is what a target group's deployment needs: "Other values indicate that you must wait
+/// for the target group to be ready", and the group is ready exactly when its proxy is, so
+/// the registration a declaration asks for cannot be made before then.
+async fn await_db_proxy_ready(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    db_proxy_name: &str,
+) {
+    for _ in 0..DB_PROXY_CHECKS {
+        match db_proxy_readiness(ctx, region, db_proxy_name).await {
+            Ok(Readiness::Pending(_)) => {}
+            Ok(_) | Err(_) => return,
+        }
+        ::tokio::time::sleep(DB_PROXY_CHECK_INTERVAL).await;
+    }
+}
+
+/// Delete the RDS proxy a stack created, addressed by its name — this resource's physical
+/// id. A proxy Amazon RDS no longer has (`DBProxyNotFoundFault`) is already in the state the
+/// delete asks for.
+///
+/// A proxy that has not finished coming up is one that service refuses the delete of, so the
+/// delete waits for it first ([`await_db_proxy_ready`]) — the position a rollback of a stack
+/// whose proxy was still `creating` is in. Amazon RDS answers the delete by putting the
+/// proxy in `deleting` and removing it a moment later, so this arm then WAITS for it to be
+/// gone ([`confirm_db_proxy_deleted`]): CloudFormation deletes a stack's resources in
+/// dependency order and waits for each deletion to complete before it deletes what that
+/// resource sat in.
+async fn delete_db_proxy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    await_db_proxy_ready(ctx, region, physical_resource_id).await;
+    let parameters = vec![("DBProxyName".to_string(), physical_resource_id.to_string())];
+    match call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        "DeleteDBProxy",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => {
+            confirm_db_proxy_deleted(ctx, region, physical_resource_id).await;
+            Ok(())
+        }
+        Err(refusal) if refusal.code == DB_PROXY_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Wait until Amazon RDS no longer holds the proxy whose deletion it has ACCEPTED, bounded
+/// the way [`await_db_proxy_ready`] is and for the same reasons.
+async fn confirm_db_proxy_deleted(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) {
+    for _ in 0..DB_PROXY_CHECKS {
+        match read_db_proxy(ctx, region, physical_resource_id).await {
+            // The proxy is gone: the deletion RDS accepted has finished.
+            Ok(None) | Err(_) => return,
+            Ok(Some(_)) => {}
+        }
+        ::tokio::time::sleep(DB_PROXY_CHECK_INTERVAL).await;
+    }
+}
+
+/// The proxy's configuration as Amazon RDS reports it, for drift detection and for the
+/// readiness read above. A proxy it no longer has (`DBProxyNotFoundFault`) was deleted.
+///
+/// A proxy is reported as one `<member>` of the answer's `DBProxies` list, whose scalar
+/// members are named exactly as this type's properties are (`EngineFamily`, `RoleArn`,
+/// `RequireTLS`, `IdleClientTimeout`, `DebugLogging`), so those members are the actual
+/// configuration the declared one is compared against. Its composite members are not:
+/// `VpcSubnetIds`, `VpcSecurityGroupIds` and `Auth` are lists, which
+/// [`xml_scalar_children`] leaves out, so a declaration can drift in them without this
+/// read's saying so — the position every arm whose property is not a scalar on the wire is
+/// in, and what [`super::drift`] documents.
+async fn read_db_proxy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    db_proxy_name: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![("DBProxyName".to_string(), db_proxy_name.to_string())];
+    match call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        "DescribeDBProxies",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(xml_scalar_children(
+            &answered, "member",
+        )))),
+        Err(refusal) if refusal.code == DB_PROXY_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Register the databases an `AWS::RDS::DBProxyTargetGroup` declares in the target group of
+/// the proxy it names, with the connection pool settings it asks for applied to that group.
+///
+/// The target group itself is NOT created here: a proxy comes up with the one target group
+/// it has, so what this type declares is the group's CONTENTS and its settings — which is
+/// what `RegisterDBProxyTargets` and `ModifyDBProxyTargetGroup` are, the same pair a client
+/// makes. The proxy has to be ready before either is accepted ("The requested operation
+/// can't be performed while the proxy is in this state"), so the deployment waits for it.
+///
+/// The resource's identity is the `TargetGroupArn` Amazon RDS minted for the group, which is
+/// what this type's `Ref` returns, so it is read back off that service rather than computed.
+async fn create_db_proxy_target_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    if let Some(properties) = resource.properties.as_object() {
+        for property in properties.keys() {
+            if !DB_PROXY_TARGET_GROUP_PROPERTIES.contains(&property.as_str()) {
+                return Err(property_not_sent(RDS_DB_PROXY_TARGET_GROUP, property));
+            }
+        }
+    }
+    let proxy = declared_db_proxy_name(resource)?;
+    let group = declared_target_group_name(resource);
+    await_db_proxy_ready(ctx, region, &proxy).await;
+
+    if let Some(declared) = resource.properties.get("ConnectionPoolConfigurationInfo") {
+        // The property's members are `ConnectionPoolConfiguration`'s own
+        // (`MaxConnectionsPercent`, `MaxIdleConnectionsPercent`,
+        // `ConnectionBorrowTimeout`, `SessionPinningFilters`, `InitQuery`), so the declared
+        // structure IS the member the modify takes it under.
+        let mut parameters = vec![
+            ("DBProxyName".to_string(), proxy.clone()),
+            ("TargetGroupName".to_string(), group.clone()),
+        ];
+        push_structure(&mut parameters, "ConnectionPoolConfig", declared, 0)?;
+        call_query(
+            ctx,
+            RDS_SIGNING_NAME,
+            region,
+            RDS_API_VERSION,
+            "ModifyDBProxyTargetGroup",
+            &parameters,
+        )
+        .await?;
+    }
+    if let Some(parameters) = db_proxy_target_parameters(resource, &proxy, &group) {
+        call_query(
+            ctx,
+            RDS_SIGNING_NAME,
+            region,
+            RDS_API_VERSION,
+            "RegisterDBProxyTargets",
+            &parameters,
+        )
+        .await?;
+    }
+
+    let reported = read_db_proxy_target_group(ctx, region, &proxy, &group).await?;
+    let arn = reported
+        .as_ref()
+        .and_then(|group| group.get("TargetGroupArn"))
+        .and_then(scalar_text)
+        .filter(|arn| !arn.is_empty());
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = &arn {
+        attributes.insert("TargetGroupArn".to_string(), arn.clone());
+    }
+    Ok(Created {
+        physical_resource_id: arn,
+        attributes,
+    })
+}
+
+/// Deregister the databases a stack registered in a proxy's target group.
+///
+/// There is no target group to delete — the group belongs to the proxy and goes away with it
+/// — so what this resource's deletion undoes is exactly what its create did: the
+/// registrations it made. A proxy Amazon RDS no longer holds, and a database its group no
+/// longer has registered, are both already in the state the deregistration asks for.
+async fn delete_db_proxy_target_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let proxy = declared_db_proxy_name(resource)?;
+    let group = declared_target_group_name(resource);
+    let Some(parameters) = db_proxy_target_parameters(resource, &proxy, &group) else {
+        return Ok(());
+    };
+    await_db_proxy_ready(ctx, region, &proxy).await;
+    match call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        "DeregisterDBProxyTargets",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal)
+            if refusal.code == DB_PROXY_NOT_FOUND
+                || refusal.code == DB_PROXY_TARGET_NOT_FOUND =>
+        {
+            Ok(())
+        }
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The target group's configuration as Amazon RDS reports it, for drift detection, read by
+/// the proxy-and-group pair the declaration names. A proxy that service no longer holds
+/// means the group is gone with it.
+///
+/// Its scalar members cover the two properties a declaration can drift in under the same
+/// name (`DBProxyName`, `TargetGroupName`); `ConnectionPoolConfigurationInfo` is reported
+/// under the API's own `ConnectionPoolConfig` and as a structure, and the two identifier
+/// lists are not members of this record at all, so none of the three takes part in the
+/// comparison — what [`super::drift`] documents.
+async fn describe_db_proxy_target_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let proxy = declared_db_proxy_name(resource)?;
+    let group = declared_target_group_name(resource);
+    read_db_proxy_target_group(ctx, region, &proxy, &group).await
+}
+
+/// One target group of one proxy as Amazon RDS reports it, or `None` where that service
+/// holds neither.
+async fn read_db_proxy_target_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    db_proxy_name: &str,
+    target_group_name: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![
+        ("DBProxyName".to_string(), db_proxy_name.to_string()),
+        ("TargetGroupName".to_string(), target_group_name.to_string()),
+    ];
+    match call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        "DescribeDBProxyTargetGroups",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(xml_scalar_children(
+            &answered, "member",
+        )))),
+        Err(refusal) if refusal.code == DB_PROXY_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The proxy an `AWS::RDS::DBProxyTargetGroup` names, which every call this type makes is
+/// addressed by. The property is required on the type, so a declaration carrying none names
+/// no proxy at all — refused rather than sent, for the reason [`property_not_sent`] records.
+fn declared_db_proxy_name(resource: &StoredResource) -> Result<String, Refusal> {
+    declared_text(&resource.properties, "DBProxyName").ok_or_else(|| Refusal {
+        code: NOT_IMPLEMENTED.to_string(),
+        message: format!(
+            "{RDS_DB_PROXY_TARGET_GROUP} names no DBProxyName, so there is no proxy whose \
+             target group this resource is"
+        ),
+    })
+}
+
+/// The target group an `AWS::RDS::DBProxyTargetGroup` names, or the one group every proxy
+/// has where the declaration names none.
+fn declared_target_group_name(resource: &StoredResource) -> String {
+    declared_text(&resource.properties, "TargetGroupName")
+        .unwrap_or_else(|| DEFAULT_DB_PROXY_TARGET_GROUP.to_string())
+}
+
+/// The registration call's parameters for the databases a declaration names, or `None`
+/// where it names none.
+///
+/// Both identifier properties are optional, and a registration of nothing is not a
+/// registration — which is the request Amazon RDS refuses ("Missing DB instance or DB
+/// cluster identifier") — so a declaration that states the group and its settings alone
+/// makes no registration call at all.
+fn db_proxy_target_parameters(
+    resource: &StoredResource,
+    db_proxy_name: &str,
+    target_group_name: &str,
+) -> Option<Vec<(String, String)>> {
+    let mut parameters = vec![
+        ("DBProxyName".to_string(), db_proxy_name.to_string()),
+        ("TargetGroupName".to_string(), target_group_name.to_string()),
+    ];
+    let mut named = 0usize;
+    for member in DB_PROXY_TARGET_PROPERTIES {
+        for (index, identifier) in declared_text_list(&resource.properties, member)
+            .iter()
+            .enumerate()
+        {
+            parameters.push((
+                format!("{member}.member.{}", index + 1),
+                identifier.clone(),
+            ));
+            named += 1;
+        }
+    }
+    (named > 0).then_some(parameters)
 }
 
 /// The awsQuery parameters an evaluated property document is, against the member catalogue

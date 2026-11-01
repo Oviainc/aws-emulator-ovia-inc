@@ -14,8 +14,8 @@ use std::time::Instant;
 
 use super::{PendingChange, PendingStatus, ARN_NAMESPACE};
 use crate::ops::types::{
-    ConnectionPoolConfigurationInfo, DBProxy, DBProxyTarget, DBProxyTargetGroup, Tag, TargetHealth,
-    UserAuthConfigInfo,
+    ConnectionPoolConfiguration, ConnectionPoolConfigurationInfo, DBProxy, DBProxyTarget,
+    DBProxyTargetGroup, Tag, TargetHealth, UserAuthConfigInfo,
 };
 
 /// How many proxies one region holds. The cap is this emulator's, and it bounds the store
@@ -35,6 +35,10 @@ pub const DB_PROXY_STATUS_CREATING: &str = "creating";
 /// `DBProxyStatus` — "A status of `available` means the proxy is ready to handle
 /// requests."
 pub const DB_PROXY_STATUS_AVAILABLE: &str = "available";
+
+/// `DBProxyStatus` — the status a proxy reports once a delete has been accepted for it and
+/// before this service has finished taking it away.
+pub const DB_PROXY_STATUS_DELETING: &str = "deleting";
 
 /// The only target group name a proxy has: "Currently, this name must be `default`"
 /// (`RegisterDBProxyTargets$TargetGroupName`), because each proxy has exactly one target
@@ -82,6 +86,97 @@ pub fn default_connection_pool_config(engine_family: &str) -> ConnectionPoolConf
         // connection" — none until a modification sets one.
         init_query: None,
     }
+}
+
+/// `ConnectionPoolConfiguration$MaxConnectionsPercent`'s published constraint: "Must be
+/// between 1 and 100."
+const MAX_CONNECTIONS_PERCENT_RANGE: ::std::ops::RangeInclusive<i32> = 1..=100;
+
+/// `ConnectionPoolConfiguration$ConnectionBorrowTimeout`'s published constraint: "Must be
+/// between 0 and 300."
+const CONNECTION_BORROW_TIMEOUT_RANGE: ::std::ops::RangeInclusive<i32> = 0..=300;
+
+/// How many session pinning filters one target group holds. The cap is this emulator's: it
+/// bounds a caller-sized list that enters the store, which the API publishes no limit for.
+pub const MAX_SESSION_PINNING_FILTERS: usize = 20;
+
+/// The sentence `ModifyDBProxyTargetGroup` refuses a rename of the group every proxy has
+/// with: "You can't rename the default target group" (`ModifyDBProxyTargetGroup$NewName`),
+/// and that group is the only one a proxy has.
+pub const DEFAULT_TARGET_GROUP_RENAME_MESSAGE: &str =
+    "You can't rename the default target group.";
+
+/// The settings a target group holds once `ConnectionPoolConfiguration` has been applied
+/// over them.
+///
+/// `ModifyDBProxyTargetGroup` carries the settings a caller wants CHANGED, so a member the
+/// request leaves out keeps the value the group already holds — which is what makes the
+/// call that sets an initialization query alone leave the pool sizes as they were. `Err`
+/// carries the sentence a value outside the constraints that shape publishes is refused
+/// with: each range is quoted on the constant that holds it, and
+/// `MaxIdleConnectionsPercent` "must be between 0 and the value of
+/// `MaxConnectionsPercent`" — the value in force after this call, not the one the group
+/// held before it.
+pub fn merged_connection_pool_config(
+    held: &ConnectionPoolConfigurationInfo,
+    requested: &ConnectionPoolConfiguration,
+) -> Result<ConnectionPoolConfigurationInfo, String> {
+    let mut merged = held.clone();
+    if let Some(percent) = requested.max_connections_percent {
+        check_range(
+            "MaxConnectionsPercent",
+            percent,
+            &MAX_CONNECTIONS_PERCENT_RANGE,
+        )?;
+        merged.max_connections_percent = Some(percent);
+    }
+    if let Some(timeout) = requested.connection_borrow_timeout {
+        check_range(
+            "ConnectionBorrowTimeout",
+            timeout,
+            &CONNECTION_BORROW_TIMEOUT_RANGE,
+        )?;
+        merged.connection_borrow_timeout = Some(timeout);
+    }
+    if let Some(percent) = requested.max_idle_connections_percent {
+        let ceiling = merged
+            .max_connections_percent
+            .unwrap_or(*MAX_CONNECTIONS_PERCENT_RANGE.end());
+        check_range("MaxIdleConnectionsPercent", percent, &(0..=ceiling))?;
+        merged.max_idle_connections_percent = Some(percent);
+    }
+    if let Some(filters) = &requested.session_pinning_filters {
+        super::check_request_list_len(
+            "SessionPinningFilters",
+            filters.len(),
+            MAX_SESSION_PINNING_FILTERS,
+        )?;
+        for filter in filters {
+            super::check_free_form("SessionPinningFilters", filter)?;
+        }
+        merged.session_pinning_filters = Some(filters.clone());
+    }
+    if let Some(query) = &requested.init_query {
+        super::check_free_form("InitQuery", query)?;
+        merged.init_query = Some(query.clone());
+    }
+    Ok(merged)
+}
+
+/// Refuse a connection pool setting outside the range that member's own doc publishes.
+fn check_range(
+    member: &str,
+    value: i32,
+    range: &::std::ops::RangeInclusive<i32>,
+) -> Result<(), String> {
+    if range.contains(&value) {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid value {value} for {member}. Must be between {} and {}.",
+        range.start(),
+        range.end()
+    ))
 }
 
 /// `CreateDBProxy$DefaultAuthScheme`'s default, the `DefaultAuthScheme` value that leaves
@@ -259,6 +354,15 @@ impl DbProxyRecord {
             }
         }
         false
+    }
+
+    /// Accept a delete: the proxy reports `deleting` from now on, and the clock owes its
+    /// removal from the store [`crate::state::STATUS_TRANSITION_DELAY`] from now, after
+    /// which every read of the name is a `DBProxyNotFoundFault`. Nothing sleeps: the due
+    /// instant is stored and materialised by `settle_due_transitions`.
+    pub fn begin_deletion(&mut self) {
+        self.status = DB_PROXY_STATUS_DELETING.to_string();
+        self.pending_status = Some(PendingStatus::removal_in_a_moment());
     }
 
     /// `DBProxyArn`, from the stored region and the proxy's name.

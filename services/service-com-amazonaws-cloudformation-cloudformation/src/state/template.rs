@@ -2619,6 +2619,12 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         "AWS::RDS::DBParameterGroup"
         | "AWS::RDS::DBClusterParameterGroup"
         | "AWS::RDS::DBSubnetGroup" => rules(255, Characters::LowercaseAlphanumeric),
+        // Amazon RDS `CreateDBProxy.DBProxyName`: `@length(min: 1, max: 63)` with pattern
+        // `^[a-zA-Z](?:-?[a-zA-Z0-9]+)*$` (`smithy_query(query="operation",
+        // operation="CreateDBProxy")`) — which, unlike the identifiers above, is NOT folded
+        // to lower case, and admits only the letters, digits and single hyphens a generated
+        // name is already built from; the bound is what such a name may break.
+        RDS_DB_PROXY => rules(63, Characters::AsGenerated),
         // Amazon Redshift `CreateCluster.ClusterIdentifier`: "Must contain from 1 to 63
         // alphanumeric characters or hyphens", "Alphabetic characters must be lowercase",
         // "Cannot end with a hyphen or contain two consecutive hyphens" (that member's own
@@ -4766,6 +4772,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // ID", and that id is what `GetHealthCheck` and a record set's own `HealthCheckId`
         // take — the type declares no name a rule could compute it from.
         || resource_type == ROUTE53_HEALTH_CHECK
+        // An Amazon RDS Proxy target group is one more: a proxy comes up WITH the one
+        // target group it has, so a declaration of this type states the proxy and the
+        // databases the group routes to, never an identifier — and that type's `Ref`
+        // returns the `TargetGroupArn` Amazon RDS minted for the group, which is what
+        // every call that reports one carries.
+        || resource_type == RDS_DB_PROXY_TARGET_GROUP
         || resource_type == TRANSFER_SERVER
         // An Amazon MQ broker is one more: `CreateBroker` takes the broker's NAME and
         // answers with the `brokerId` Amazon MQ generated for it, which is the id that
@@ -5378,6 +5390,18 @@ pub const GUARDDUTY_DETECTOR: &str = "AWS::GuardDuty::Detector";
 /// address the list by — so the id a stack reports for the resource is the one that
 /// service answered with. That is what [`identity_is_service_assigned`] names it for.
 pub const GUARDDUTY_IP_SET: &str = "AWS::GuardDuty::IPSet";
+
+/// The two Amazon RDS Proxy resource types a stack creates in that service (the Amazon RDS
+/// model: `cloudFormationName: RDS`).
+///
+/// `AWS::RDS::DBProxy`'s `Ref` returns the `DBProxyName` the declaration states, which is
+/// the identifier every Amazon RDS call on a proxy takes — so it has no service-assigned
+/// identity. `AWS::RDS::DBProxyTargetGroup`'s does: a proxy comes up with the one target
+/// group it has, and that type's `Ref` returns the `TargetGroupArn` Amazon RDS minted for
+/// it, which no naming rule could compute — which is what
+/// [`identity_is_service_assigned`] names it for.
+pub const RDS_DB_PROXY: &str = "AWS::RDS::DBProxy";
+pub const RDS_DB_PROXY_TARGET_GROUP: &str = "AWS::RDS::DBProxyTargetGroup";
 
 /// An AWS X-Ray sampling rule's resource type (the X-Ray model:
 /// `cloudFormationName: XRay`). This is a type `super::provisioning` creates in X-Ray

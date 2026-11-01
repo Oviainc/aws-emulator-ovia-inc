@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBProxyTargetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBProxyTargetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Changes the connection pool settings of a proxy's target group — the one group every
+//! proxy has, named `default`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBProxyTargetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The request carries the settings a caller wants CHANGED, so a member it leaves out
+//! keeps the value the group already holds, and the modified group is what the call
+//! answers with.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +149,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBProxyTargetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBProxyTargetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBProxyTargetGroup"))
+        let region = crate::state::request_region(ctx)
+            .map_err(ModifyDBProxyTargetGroupError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated modification.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), input.db_proxy_name.clone());
+        let Some(proxy) = store.db_proxies.get(&key) else {
+            return Err(
+                ModifyDBProxyTargetGroupErrorModeled::DBProxyNotFoundFault(
+                    DBProxyNotFoundFault {
+                        message: Some(crate::state::db_proxy_not_found_message(
+                            &input.db_proxy_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        if let Err(message) = crate::state::check_target_group_name(
+            &input.db_proxy_name,
+            Some(&input.target_group_name),
+        ) {
+            return Err(
+                ModifyDBProxyTargetGroupErrorModeled::DBProxyTargetGroupNotFoundFault(
+                    DBProxyTargetGroupNotFoundFault {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A proxy that is still coming up, or on its way out, cannot take a modification:
+        // the state the clock has yet to settle is real.
+        if proxy.status != crate::state::DB_PROXY_STATUS_AVAILABLE {
+            return Err(
+                ModifyDBProxyTargetGroupErrorModeled::InvalidDBProxyStateFault(
+                    InvalidDBProxyStateFault {
+                        message: Some(format!(
+                            "DB proxy {} is in state {} and its target group cannot be \
+                             modified",
+                            input.db_proxy_name, proxy.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "You can't rename the default target group", and that group is the only group a
+        // proxy has — so a request carrying a new name asks for a rename this service has
+        // nothing to apply it to.
+        if input.new_name.is_some() {
+            return Err(
+                ModifyDBProxyTargetGroupError::invalid_parameter_value(
+                    crate::state::DEFAULT_TARGET_GROUP_RENAME_MESSAGE,
+                ),
+            );
+        }
+
+        // The settings the request changes, over the ones the group holds. A request
+        // carrying no `ConnectionPoolConfig` at all changes nothing and answers the group
+        // as it stands.
+        let merged = match &input.connection_pool_config {
+            Some(requested) => crate::state::merged_connection_pool_config(
+                &proxy.target_group.connection_pool_config,
+                requested,
+            )
+            .map_err(ModifyDBProxyTargetGroupError::invalid_parameter_value)?,
+            None => proxy.target_group.connection_pool_config.clone(),
+        };
+        let now = crate::state::now_as_wire_timestamp();
+        let proxy = store
+            .db_proxies
+            .get_mut(&key)
+            .expect("the proxy was found above and the store is locked");
+        proxy.target_group.connection_pool_config = merged;
+        proxy.target_group.updated_date = now;
+
+        Ok(ModifyDBProxyTargetGroupOutput {
+            db_proxy_target_group: Some(proxy.target_group_to_wire()),
+        })
     }
 }
