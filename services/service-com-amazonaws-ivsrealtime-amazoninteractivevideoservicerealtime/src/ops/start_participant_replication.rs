@@ -230,11 +230,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // One instant for this call: the ends the clock already owed and the start this
+        // records are all stamped with the same "now".
+        let now = ::std::time::SystemTime::now();
         // A replication of a publisher that has stayed away for its whole reconnect window
         // has ended, so what the clock already owes is written down before this resolves
         // what is running: the replication a start would conflict with is one a caller
         // reading at this instant is told is `ACTIVE`.
-        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
+        crate::state::materialize_due_replications(&mut store, now);
         // Both stages have to exist in this request's own region's view of the account:
         // one to publish in, one to replicate into.
         for stage_arn in [&input.source_stage_arn, &input.destination_stage_arn] {
@@ -343,16 +346,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // needs and reuses the one a stage already has; see
         // `crate::state::ensure_active_session`.
         let source_session_id =
-            crate::state::ensure_active_session(&mut store, &input.source_stage_arn).ok_or_else(
-                || {
+            crate::state::ensure_active_session(&mut store, &input.source_stage_arn, now)
+                .ok_or_else(|| {
                     crate::state::resource_not_found(
                         StartParticipantReplicationErrorModeled::ResourceNotFoundException,
                         &input.source_stage_arn,
                     )
-                },
-            )?;
+                })?;
         let destination_session_id =
-            crate::state::ensure_active_session(&mut store, &input.destination_stage_arn)
+            crate::state::ensure_active_session(&mut store, &input.destination_stage_arn, now)
                 .ok_or_else(|| {
                     crate::state::resource_not_found(
                         StartParticipantReplicationErrorModeled::ResourceNotFoundException,
@@ -376,7 +378,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // earns it (`crate::state::leave_stage_session`).
             reconnect_deadline: None,
             attributes,
-            started_at: ::std::time::SystemTime::now(),
+            started_at: now,
             sequence,
         };
 
@@ -430,7 +432,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &record.source_stage_arn,
             &record.source_session_id,
             event,
-            ::std::time::SystemTime::now(),
+            now,
         );
 
         store

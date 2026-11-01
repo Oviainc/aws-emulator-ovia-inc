@@ -227,9 +227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the clock owes a replication FIRST: a replication whose publisher stayed
         // away for its whole reconnect window ends with its replica leaving the
         // destination stage, which is one of the ways the stage a composition composites
-        // comes to hold nobody and so earns that composition its own deadline.
-        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
-        store.materialize_due_compositions(::std::time::SystemTime::now());
+        // comes to hold nobody and so earns that composition its own deadline. One
+        // instant for both clocks, so neither runs ahead of the other within this call.
+        let now = ::std::time::SystemTime::now();
+        crate::state::materialize_due_replications(&mut store, now);
+        store.materialize_due_compositions(now);
 
         // Start order, so a composition starting or being reclaimed mid-pagination
         // cannot shift a later page onto an already-returned one, and each filter the

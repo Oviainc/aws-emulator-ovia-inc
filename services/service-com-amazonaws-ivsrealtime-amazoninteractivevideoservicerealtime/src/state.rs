@@ -2789,9 +2789,11 @@ impl ParticipantEvent {
 /// Record `event` as having occurred at `at` in the session `session_id` of `stage_arn`.
 ///
 /// The ONE place an event record is created, so every seam that observes an occurrence
-/// writes the same representation of it: the instant is the one it occurred at and the
-/// position is the session's next occurrence position, which is what keeps a page of
-/// events in occurrence order.
+/// writes the same representation of it: the instant is the one it occurred at — which is
+/// `at`, supplied by the seam that observed it rather than read off the wall clock here,
+/// so an occurrence the clock owed at a deadline is stamped with that deadline and not
+/// with the call that happens to write it down — and the position is the session's next
+/// occurrence position, which is what keeps a page of events in occurrence order.
 ///
 /// `at` is the instant the occurrence HAPPENED, which for one a caller performs is that
 /// call and for one the clock owed is the instant it fell due — never the later call that
@@ -3087,9 +3089,12 @@ pub fn join_stage_session(
     stage_arn: &str,
     joined: JoinedParticipant,
 ) -> Option<ParticipantRecord> {
+    // One instant for the whole join, so the record, its occurrences and what the
+    // replication and composition clocks are told all agree about when it happened.
+    let now = SystemTime::now();
     // The session the stage is in, or a fresh one: "a stage session begins when the
     // first participant joins a stage".
-    let session_id = ensure_active_session(state, stage_arn)?;
+    let session_id = ensure_active_session(state, stage_arn, now)?;
     // Read off before the join is applied, because applying it consumes `joined`.
     let participant_id = joined.participant_id.clone();
     let publishes = joined.published;
@@ -3146,7 +3151,7 @@ pub fn join_stage_session(
 
     let record = match rejoined {
         Some(record) => record,
-        None => new_participant_record(state, stage_arn, &session_id, joined)?,
+        None => new_participant_record(state, stage_arn, &session_id, joined, now)?,
     };
 
     // Both a first join and a rejoin are a participant joining the session, so each is
@@ -3160,9 +3165,6 @@ pub fn join_stage_session(
         event.replica = replica;
         event
     };
-    // One instant for everything this join writes down, so the occurrences it records and
-    // the deadlines it decides cannot disagree about when the participant arrived.
-    let now = SystemTime::now();
     record_participant_event(state, stage_arn, &session_id, occurrence(EVENT_JOINED), now);
     if publishes
         && !state
@@ -3199,6 +3201,7 @@ fn new_participant_record(
     stage_arn: &str,
     session_id: &str,
     joined: JoinedParticipant,
+    at: SystemTime,
 ) -> Option<ParticipantRecord> {
     // Only a participant that is NEW to the session takes a page position, so the join
     // order of a session's participants stays contiguous.
@@ -3208,7 +3211,7 @@ fn new_participant_record(
         user_id: joined.user_id,
         attributes: joined.attributes,
         state: PARTICIPANT_STATE_CONNECTED.to_string(),
-        first_join_time: SystemTime::now(),
+        first_join_time: at,
         published: joined.published,
         recording_state: joined
             .recording_state
@@ -3243,7 +3246,7 @@ fn session_mut<'a>(
 }
 
 /// Record the participant `participant_id` leaving the session `session_id` of
-/// `stage_arn`, and close that session when it was the last one in it.
+/// `stage_arn` NOW, and close that session when it was the last one in it.
 ///
 /// The counterpart of [`join_stage_session`], and the one place a participant leaves:
 /// the record stays in the session and moves to
@@ -3255,6 +3258,9 @@ fn session_mut<'a>(
 ///
 /// The departure is also an occurrence of the session ([`EVENT_LEFT`]), preceded by the
 /// end of its media ([`EVENT_PUBLISH_STOPPED`]) when the participant was publishing.
+///
+/// A departure that happened EARLIER than this call — one the clock owed — is recorded
+/// through [`leave_stage_session_at`], which this is the "it happened now" case of.
 ///
 /// `false` — nothing recorded — when this store holds no such stage, session or
 /// participant, or when that participant has already left.
@@ -3359,13 +3365,14 @@ pub fn leave_stage_session_at(
     // A departure can leave the stage with no participant in it at all, which is when the
     // timeout the model's `StartComposition` doc ends a composition on starts running for
     // every composition of that stage ("After a 1-minute timeout, when all participants
-    // are disconnected from the stage").
+    // are disconnected from the stage") — measured from the instant the stage was actually
+    // left empty, which is this departure's.
     state.observe_stage_occupancy(stage_arn, at);
     true
 }
 
-/// Record the end of a now-ENDED replication as an occurrence of the session its
-/// replicated publisher is in.
+/// Record the end of a now-ENDED replication, which happened AT `at`, as an occurrence of
+/// the session its replicated publisher is in.
 ///
 /// The ONE place the end of a replication is written into the SOURCE session, whichever way
 /// that replication ended — a caller stopping it, or a stage it names going away — so the
@@ -3402,7 +3409,7 @@ pub fn record_replication_stopped(
 }
 
 /// Take the replica a now-ENDED replication put into its destination stage back out of
-/// that stage's session.
+/// that stage's session, as of `at` — the instant that replication ended.
 ///
 /// The ONE place an ended replication's replica leaves, whichever way the replication
 /// ended — a caller stopping it, or a stage it names being deleted — so no participant
@@ -3528,11 +3535,14 @@ pub fn materialize_due_replications(
 ) {
     // Ending one replication takes its replica out of the destination stage, and that
     // replica can itself be the publisher of a FURTHER replication sourced from that stage,
-    // whose own deadline is then recorded and can already be due — so the walk repeats
-    // until this store holds no due replication. Every pass ends at least one of the
-    // finitely many running replications, so it terminates.
+    // whose own deadline is then recorded — one window after the end that released it, so
+    // still in the past of `now` — and can already be due, so the walk repeats until this
+    // store holds no due replication. Every pass ends at least one of the finitely many
+    // running replications, so it terminates.
     loop {
         // Each end beside the deadline it fell due at, which is the instant it happened.
+        // It is carried here because stopping the record is what clears the deadline it is
+        // read from ([`ParticipantReplicaRecord::stop`]).
         let mut due: Vec<(SystemTime, ParticipantReplicaRecord)> = Vec::new();
         for replication in state.participant_replicas.values_mut().flatten() {
             let owed = if replication.is_active() {
@@ -3569,7 +3579,8 @@ pub fn materialize_due_replications(
     }
 }
 
-/// End every replication the stage `stage_arn` is an end of, and drop the records of them.
+/// End every replication the stage `stage_arn` is an end of AT `at`, and drop the records
+/// of them.
 ///
 /// A replica is a participant of its source stage replicated into its destination stage, so
 /// neither end of a replication can outlive the stage it names: a stage going away ends
@@ -4830,11 +4841,15 @@ pub fn stage_session_id(sequence: u64) -> String {
 /// the same session and a caller that read `activeSessionId` off the stage reads the same
 /// value again.
 ///
+/// A stage session "begins when the first participant joins a stage", so it begins at `at`
+/// — the instant of the join that needed it.
+///
 /// The ONE place a session begins, so the id a stage reports and the
 /// [`StageSessionRecord`] the reporting operations read are one session and not two.
 pub fn ensure_active_session(
     state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     stage_arn: &str,
+    at: SystemTime,
 ) -> Option<String> {
     let active = state
         .stages
@@ -4860,7 +4875,7 @@ pub fn ensure_active_session(
         .or_default()
         .push(StageSessionRecord {
             session_id: session_id.clone(),
-            start_time: SystemTime::now(),
+            start_time: at,
             end_time: None,
             participants: Vec::new(),
             events: Vec::new(),
