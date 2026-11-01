@@ -93,6 +93,22 @@ pub(crate) async fn call(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
+    call_as(router, AMBIENT_ACCESS_KEY_ID, operation, body).await
+}
+
+/// The access key id every call of this harness presents unless a suite names
+/// another: a key no session was ever minted under, so it speaks for the ambient
+/// identity this emulator publishes.
+pub(crate) const AMBIENT_ACCESS_KEY_ID: &str = "AKIAEXAMPLEEXAMPLE";
+
+/// [`call`], presenting `access_key_id` as the request's SigV4 credential — for
+/// a suite about an answer that depends on WHICH credential signed the request.
+pub(crate) async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("https://aco-automation.us-east-1.amazonaws.com/")
@@ -106,8 +122,10 @@ pub(crate) async fn call(
         // is not checked, because authentication is off above.
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLEEXAMPLE/20260101/us-east-1/aco-automation/\
-             aws4_request, SignedHeaders=host;x-amz-target, Signature=0",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/us-east-1/aco-automation/\
+                 aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
+            ),
         )
         .body(bytes::Bytes::from(
             serde_json::to_vec(body).expect("the request body serializes"),

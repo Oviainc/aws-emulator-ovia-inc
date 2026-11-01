@@ -15,6 +15,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
+// The identity a request speaks for is read from the SAME store
+// `sts:GetCallerIdentity` answers from, so this service and that read report one
+// principal for one credential. See [`caller_identity_arn`].
+use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
@@ -702,18 +706,82 @@ pub fn rule_not_found_message(rule_arn: &str) -> String {
 /// code and its HTTP 403; this is the service's own wording for it.
 pub const OPT_IN_REQUIRED_MESSAGE: &str = "Aws account is not registered for recommendation.";
 
-/// The message every `AccessDeniedException` of this service carries.
+/// The message an `AccessDeniedException` that names NO resource of the request
+/// carries: the sentence the shape itself documents
+/// (`smithy_query(query="shape",shape="AccessDeniedException")`).
 ///
-/// FIXED and request-independent: it is the sentence the shape itself documents
-/// (`smithy_query(query="shape",shape="AccessDeniedException")`). AWS's own text
-/// embeds the caller's ARN and the action, which is account-specific; the
-/// requirement is the code and its HTTP 403, so the modelled sentence is what
-/// this states. Worded here, like every other client error of this service, so
-/// the authorization refusal the dispatch seam renders (`crate::service`) and
-/// the one a handler raises cannot drift apart — and so the refusal names
-/// neither the resource the request reached for nor the account it belongs to.
+/// FIXED and request-independent, and raised where the decision is about which
+/// ACCOUNTS a rule would automate in rather than about a resource the request
+/// addressed: naming the accounts an organization reaches would disclose them to
+/// a caller the decision just refused. A refusal taken on the resource string a
+/// request DID supply is worded by [`unauthorized_resource_message`] instead.
 pub const ACCESS_DENIED_MESSAGE: &str =
     "You do not have sufficient permissions to perform this action.";
+
+/// The IAM action a request for `operation` of this service asks permission for.
+///
+/// An IAM action is `<service prefix>:<OperationName>`, and this service's
+/// prefix is the signing name the model vends (`aco-automation`, the model's
+/// `sigv4Name` and `endpointPrefix`,
+/// `smithy_query(query="service_info")`) — read off this service's own identity
+/// by the caller rather than restated here, so the action named in a refusal
+/// cannot drift from the name the request signed with.
+pub fn iam_action(signing_name: &str, operation: &str) -> String {
+    format!("{signing_name}:{operation}")
+}
+
+/// How an authorization decision taken on the resource string a request supplied
+/// is worded: the standard IAM denial, built from the request.
+///
+/// Authorization is evaluated against the identity the request signed with, the
+/// action it asks for and the resource string it carries, all three of which the
+/// request itself states — so the refusal names them: the principal
+/// ([`caller_identity_arn`]), the IAM action ([`iam_action`]) and the resource
+/// exactly as sent. A client parsing the denied action and resource out of the
+/// message, or telling a malformed identifier apart from a missing permission,
+/// reads them here.
+pub fn unauthorized_resource_message(principal: &str, action: &str, resource: &str) -> String {
+    format!("User: {principal} is not authorized to perform: {action} on resource: {resource}")
+}
+
+/// The ARN of the identity THIS request authenticates as, which is the principal
+/// an authorization refusal names.
+///
+/// Resolved from the same records `sts:GetCallerIdentity` answers from — the STS
+/// session the presented access key id names, else the IAM user that holds that
+/// key as a long-term credential, else the ambient identity this emulator
+/// publishes — so a caller that reads its own identity back from STS sees the
+/// principal this service blames, rather than a second identity invented here.
+pub fn caller_identity_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    sts_state::service_state(engine)
+        .and_then(|sts| {
+            // The identity a key that names no session speaks for: the IAM user
+            // holding it, read through STS's own accessor so the fallback is the
+            // one `GetCallerIdentity` uses.
+            let long_term = match sts_state::iam_state(engine) {
+                Some(iam) => sts_state::long_term_identity(Some(&iam.lock()), &access_key_id),
+                None => sts_state::long_term_identity(None, &access_key_id),
+            };
+            sts_state::resolve_request_caller(
+                &mut sts.lock(),
+                &access_key_id,
+                SystemTime::now(),
+                ctx.credential_store(),
+                long_term,
+            )
+            .ok()
+            .map(|caller| caller.identity)
+        })
+        // An engine bearing no STS store, or a session credential that has
+        // already expired: neither names a principal, so the refusal is about
+        // the identity this emulator publishes.
+        .unwrap_or_else(sts_state::ambient_identity)
+        .arn
+}
 
 /// The message every `IdempotentParameterMismatchException` of this service
 /// carries — the service's own wire wording for "this client token was first

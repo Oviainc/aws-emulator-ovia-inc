@@ -637,6 +637,11 @@ mod chime_app_instance_admin_authorization;
 // while this span of the sorted list is untouched by those appends.
 #[path = "all/mediaconvert_input_probe.rs"]
 mod mediaconvert_input_probe;
+// Declared HERE, in this same quiet `n`/`o` gap rather than in the appended tail, the head
+// region or the `c…` span: all three are where concurrently landing suites put their line,
+// and a line next to theirs cannot be merged with them.
+#[path = "all/compute_optimizer_automation_denial_principal_agrees_with_sts.rs"]
+mod compute_optimizer_automation_denial_principal_agrees_with_sts;
 // Declared HERE, in this quiet span of the sorted list, rather than appended at the end of
 // this file or beside the other `cloudformation_*` suites in the `c` span: both of those are
 // where every concurrently landing suite puts its line, so a declaration there conflicts

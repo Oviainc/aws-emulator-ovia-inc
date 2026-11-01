@@ -8,6 +8,11 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The principal an authorization refusal names is the identity STS reports for
+# the credential the request signed with, so it is resolved from the STS store
+# (see `state::caller_identity_arn`) rather than invented here: one credential
+# must have one principal across this service and `sts:GetCallerIdentity`.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

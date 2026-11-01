@@ -25,8 +25,10 @@
 //!   generated routing table. Return `Some(op)` to route one yourself. THIS
 //!   SERVICE uses it for authorization: a request whose resource member names no
 //!   automation rule of this service is answered `AccessDeniedException` (403)
-//!   there, because authorization is evaluated against the supplied resource
-//!   string before the service parses it — see [`DenyUnauthorizedResource`].
+//!   there — with the denial built from the request's own principal, action and
+//!   resource string — because authorization is evaluated against the supplied
+//!   resource string before the service parses it; see
+//!   [`DenyUnauthorizedResource`].
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -45,24 +47,19 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, ServerHttpProtocol,
+    Service,
 };
 use std::sync::Arc;
 
-/// The error code and message a request for a resource the caller is not
+/// The error code and HTTP status a request naming a resource the caller is not
 /// authorized for is answered with.
 ///
 /// `AccessDeniedException` is a service-common error of every operation of this
-/// service, `@httpError 403`, documented "You do not have sufficient permissions
-/// to perform this action."
-/// (`smithy_query(query="shape",shape="AccessDeniedException")`). AWS's own text
-/// embeds the caller's ARN and the action, which is account-specific; the
-/// requirement is the 403 classification, so the modelled sentence is what this
-/// states — taken from [`crate::state::ACCESS_DENIED_MESSAGE`], where every
-/// client error of this service is worded, so this seam and the handlers that
-/// raise the same error cannot word it differently.
+/// service, `@error("client")` at `@httpError 403`
+/// (`smithy_query(query="shape",shape="AccessDeniedException")`).
 const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
-const ACCESS_DENIED_MESSAGE: &str = crate::state::ACCESS_DENIED_MESSAGE;
+const ACCESS_DENIED_STATUS: u16 = 403;
 
 /// The operations whose input names a resource by ARN, and the member each one
 /// names it in.
@@ -83,7 +80,8 @@ const RESOURCE_MEMBERS: [(&str, &str); 6] = [
     ("ListTagsForResource", "resourceArn"),
 ];
 
-/// Answers one request `AccessDeniedException` (HTTP 403).
+/// Answers one request `AccessDeniedException` (HTTP 403), with the IAM denial
+/// message built from that request.
 ///
 /// Authorization is evaluated against the resource string a request supplies
 /// BEFORE the service parses that string, so a string that identifies no
@@ -93,31 +91,107 @@ const RESOURCE_MEMBERS: [(&str, &str); 6] = [
 /// `RuleArn` `@pattern` with a 400, which classifies a permissions failure as a
 /// request bug.
 ///
+/// The three things such a decision is taken from are all stated by the request,
+/// so the refusal names all three — the principal the credential speaks for, the
+/// IAM action the operation asks for and the resource string exactly as sent
+/// (`crate::state::unauthorized_resource_message`). It holds the shared engine
+/// because the principal is resolved from the store
+/// `sts:GetCallerIdentity` answers from.
+///
 /// It is an [`ErasedOperation`] rather than a handler because that refusal has
 /// to come BEFORE the modelled-constraint walk, and `override_operation` is the
 /// seam that sees a whole request first. The router still authenticates the
 /// request against the modelled operation's auth schemes before running this.
-struct DenyUnauthorizedResource;
+struct DenyUnauthorizedResource<Eng> {
+    engine: Arc<Eng>,
+}
 
-impl ErasedOperation for DenyUnauthorizedResource {
+impl<Eng: Send + Sync + 'static> ErasedOperation for DenyUnauthorizedResource<Eng> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
         req: &'r aws_smithy_runtime_api::http::Request,
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
-        let _ = (req, ctx);
-        // Rendered through the service's own envelope (`__type` + `message` on
-        // this service's awsJson protocol), with the 403 the modelled
-        // `AccessDeniedException` carries.
-        let response = svc.definition().framework_error_response(
-            aws_smithy_schema_server::ProtocolError::Unauthenticated {
-                code: ACCESS_DENIED_CODE,
-                message: ACCESS_DENIED_MESSAGE,
-            },
-        );
+        // The answer is computed in one call that reads, uses and drops the
+        // service definition: `&dyn ErasedServiceDefinition` is not `Sync`, so
+        // holding it across the await below would make this future non-`Send`.
+        let response = self.refusal(svc, req, ctx);
         Box::pin(async move { response })
     }
+}
+
+impl<Eng: Send + Sync + 'static> DenyUnauthorizedResource<Eng> {
+    /// The 403 for `req`, rendered through this service's own protocol — the
+    /// same envelope (`__type` + `message`, and the same error-type header) a
+    /// handler-raised `AccessDeniedException` goes out in, so a refusal taken
+    /// here and one taken in a handler are indistinguishable on the wire.
+    fn refusal(
+        &self,
+        svc: &dyn Service,
+        req: &aws_smithy_runtime_api::http::Request,
+        ctx: &OperationContext<'_>,
+    ) -> aws_smithy_runtime_api::http::Response {
+        let definition = svc.definition();
+        let Some((operation, resource)) = unauthorized_resource(definition.protocol(), req) else {
+            // Unreachable: this operation is reached only for a request whose
+            // operation and resource member [`Service::override_operation`] has
+            // already read out of these same bytes. A request whose resource
+            // this cannot read names none, so the refusal can name none either,
+            // and falls back to the service's resource-independent sentence.
+            return definition.framework_error_response(
+                aws_smithy_schema_server::ProtocolError::Unauthenticated {
+                    code: ACCESS_DENIED_CODE,
+                    message: crate::state::ACCESS_DENIED_MESSAGE,
+                },
+            );
+        };
+        let denial = crate::ops::types::AccessDeniedException {
+            message: Some(crate::state::unauthorized_resource_message(
+                &crate::state::caller_identity_arn(&*self.engine, ctx),
+                &crate::state::iam_action(definition.identity().signing_name(), operation),
+                &resource,
+            )),
+        };
+        definition
+            .protocol()
+            .serialize_error(
+                &denial,
+                &crate::ops::types::SCHEMA_ACCESS_DENIED_EXCEPTION,
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+            )
+            .unwrap_or_else(|error| definition.framework_error_response(error))
+    }
+}
+
+/// The operation `req` names and the resource string it carries, when that
+/// string names no automation rule of this service — the one read both the
+/// dispatch gate and the refusal it answers with are taken from.
+///
+/// Resolves the operation first, so only the operations that take a resource ARN
+/// ([`RESOURCE_MEMBERS`]) are judged at all, then reads that operation's
+/// resource member out of the body and asks
+/// [`crate::state::names_automation_rule`] whether it names an automation rule
+/// of this service. A request this cannot read — an unknown operation, a
+/// streamed body, a body that is not the protocol's JSON object — is `None` and
+/// is left to the modelled walk, which refuses it on its own terms.
+fn unauthorized_resource(
+    protocol: &dyn ServerHttpProtocol,
+    req: &aws_smithy_runtime_api::http::Request,
+) -> Option<(&'static str, String)> {
+    let routing_key = protocol.routing_key(req).ok()?;
+    let (operation, arn_member) = RESOURCE_MEMBERS
+        .iter()
+        .find(|(candidate, _)| *candidate == routing_key)?;
+    let body = req.body().bytes()?;
+    let serde_json::Value::Object(members) =
+        serde_json::from_slice::<serde_json::Value>(body).ok()?
+    else {
+        return None;
+    };
+    let supplied = members.get(*arn_member)?.as_str()?;
+    (!crate::state::names_automation_rule(supplied)).then(|| (*operation, supplied.to_string()))
 }
 
 /// The `com-amazonaws-computeoptimizerautomation-computeoptimizerautomationservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -129,8 +203,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// The 403 answer for a request naming a resource the caller cannot hold a
     /// permission for. Held here so [`Service::override_operation`] can hand out
-    /// a reference to it.
-    deny_unauthorized_resource: DenyUnauthorizedResource,
+    /// a reference to it; it carries the SAME shared engine the entry does, so
+    /// the principal it names is read from the one store, not a second one.
+    deny_unauthorized_resource: DenyUnauthorizedResource<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -139,40 +214,18 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
-            deny_unauthorized_resource: DenyUnauthorizedResource,
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            deny_unauthorized_resource: DenyUnauthorizedResource { engine },
         }
     }
 
     /// Does `req` name a resource no permission of this service can cover?
     ///
-    /// Resolves the operation the request names first, so only the operations
-    /// that take a resource ARN ([`RESOURCE_MEMBERS`]) are judged at all, then
-    /// reads that operation's resource member out of the body and asks
-    /// [`crate::state::names_automation_rule`] whether it names an automation
-    /// rule of this service. A request this cannot read — an unknown operation,
-    /// a streamed body, a body that is not the protocol's JSON object — is left
-    /// to the modelled walk, which refuses it on its own terms.
+    /// The read itself is [`unauthorized_resource`], the one the refusal is
+    /// built from too, so the gate and the message it answers with cannot
+    /// disagree about which request is refused.
     fn names_unauthorized_resource(&self, req: &aws_smithy_runtime_api::http::Request) -> bool {
-        let Ok(operation) = self.entry.protocol().routing_key(req) else {
-            return false;
-        };
-        let Some((_, arn_member)) = RESOURCE_MEMBERS
-            .iter()
-            .find(|(candidate, _)| *candidate == operation)
-        else {
-            return false;
-        };
-        let Some(body) = req.body().bytes() else {
-            return false;
-        };
-        let Ok(serde_json::Value::Object(members)) = serde_json::from_slice(body) else {
-            return false;
-        };
-        members
-            .get(*arn_member)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !crate::state::names_automation_rule(value))
+        unauthorized_resource(self.entry.protocol(), req).is_some()
     }
 }
 
