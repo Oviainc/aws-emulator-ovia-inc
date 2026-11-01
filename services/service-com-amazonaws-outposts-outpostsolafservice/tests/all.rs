@@ -99,6 +99,8 @@ mod outpost_server_asset_kind;
 mod outpost_server_connection;
 #[path = "all/page_boundary_rule.rs"]
 mod page_boundary_rule;
+#[path = "all/page_token_canonical_spelling.rs"]
+mod page_token_canonical_spelling;
 #[path = "all/page_token_refusal_shape.rs"]
 mod page_token_refusal_shape;
 #[path = "all/private_connectivity.rs"]

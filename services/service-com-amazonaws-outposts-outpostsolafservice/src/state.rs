@@ -6854,12 +6854,20 @@ pub fn encode_page_token(kind: &str, last_sequence: u64) -> String {
 /// The page boundary a `kind` token names, or `None` when it is not a token this
 /// service issued for that list — which the caller is told as a
 /// `ValidationException`, never as a silently truncated page.
+///
+/// A `NextToken` is OPAQUE: the only strings that name a resume point are the ones
+/// [`encode_page_token`] issues, so a candidate is accepted only when re-encoding the
+/// boundary read out of it reproduces the whole token character for character. That
+/// is what makes the check "is this a token this service issued", rather than "can an
+/// integer be read out of part of it": a value whose digits parse to a boundary but
+/// are spelled some other way (`007`, `+7`) is a string this service could never have
+/// minted, and honouring it would serve a page with everything up to that boundary
+/// silently dropped. The comparison covers the stamp too, so a token issued for
+/// another list is refused by the same one rule.
 pub fn decode_page_token(kind: &str, token: &str) -> Option<u64> {
-    let (sequence, stamp) = token.split_once("##")?;
-    if stamp != kind {
-        return None;
-    }
-    sequence.parse().ok()
+    let (sequence, _) = token.split_once("##")?;
+    let boundary: u64 = sequence.parse().ok()?;
+    (encode_page_token(kind, boundary) == token).then_some(boundary)
 }
 
 /// The stamp the page tokens of a list NESTED under one or more parent resources
