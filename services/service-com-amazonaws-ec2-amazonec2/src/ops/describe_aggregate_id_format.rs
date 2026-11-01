@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAggregateIdFormat
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAggregateIdFormat`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAggregateIdFormat::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! The Region's longer-ID (17-character ID) settings AGGREGATED over the account's
+//! principals: one status per resource type that has such a setting
+//! ([`crate::state::LONGER_ID_RESOURCE_TYPES`]), each on only when EVERY principal is on
+//! for that type, beside the single `UseLongIdsAggregated` that is on only when every type
+//! is. The settings are read through the same projection `DescribePrincipalIdFormat`
+//! reports ([`crate::state::ComAmazonawsEc2Amazonec2State::principal_id_formats`]), so the
+//! Region-wide view and the per-principal one cannot disagree about one type.
+//!
+//! A REPORT: it writes nothing, so two calls answer the same thing.
+//! `ModifyIdentityIdFormat` is what writes a principal's preference.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +149,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAggregateIdFormat` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAggregateIdFormatErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAggregateIdFormat"))
+        use crate::state;
+
+        // The ID format settings are facts of the account's principals, and this store is
+        // per account (`crate::state`'s module docs), so `ctx` carries nothing this
+        // operation needs; `DryRun` is the only member this request has.
+        let _ = ctx;
+
+        let store = state::require_service_state(&*self.engine)?;
+
+        // "If you have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`): every caller of this emulator holds them, so a dry run stops HERE,
+        // before anything is read, and reports nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "This request only returns information about resource types that support longer
+        // IDs": the types reported are the catalog of those that have such a setting at
+        // all, in its one stable order.
+        let resources = state::LONGER_ID_RESOURCE_TYPES;
+
+        // A REPORT: the principals are read out of the store and nothing is written back,
+        // so this call cannot change what a later caller sees. The same projection
+        // `DescribePrincipalIdFormat` reports is what this aggregate is taken over, so the
+        // Region-wide view and the per-principal one cannot disagree about one type.
+        let principals = store.lock().principal_id_formats(&resources);
+
+        // One status per type, each the setting EVERY principal of the account is on for
+        // it: "This value is only true if all users are configured to use longer IDs"
+        // (`$UseLongIdsAggregated`), so one principal that is off is what turns the
+        // Region's own status off. A principal that has overridden nothing follows the root
+        // user, which the projection above already reports, so the principals it carries
+        // are the whole account.
+        let statuses: Vec<IdFormat> = resources
+            .into_iter()
+            .map(|resource| IdFormat {
+                // "If a deadline is not yet available for this resource type, this field
+                // is not returned" (`IdFormat$Deadline`): this emulator mints longer ids
+                // for every type already, so there is no switch-over date to report.
+                deadline: None,
+                resource: Some(resource.to_string()),
+                use_long_ids: Some(principals.iter().all(|principal| {
+                    setting_of(principal, resource).unwrap_or(state::DEFAULT_USE_LONG_IDS)
+                })),
+            })
+            .collect();
+
+        // "Indicates whether all resource types in the Region are configured to use longer
+        // IDs" (`$UseLongIdsAggregated`): every status above taken together.
+        let use_long_ids_aggregated = statuses
+            .iter()
+            .all(|status| status.use_long_ids.unwrap_or(false));
+
+        Ok(DescribeAggregateIdFormatOutput {
+            use_long_ids_aggregated: Some(use_long_ids_aggregated),
+            statuses: Some(statuses),
+        })
     }
+}
+
+/// The setting `principal` was reported with for `resource`, or `None` when it carries no
+/// status for that type.
+fn setting_of(principal: &PrincipalIdFormat, resource: &str) -> Option<bool> {
+    principal
+        .statuses
+        .iter()
+        .flatten()
+        .find(|status| status.resource.as_deref() == Some(resource))
+        .and_then(|status| status.use_long_ids)
 }

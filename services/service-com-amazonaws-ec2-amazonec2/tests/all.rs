@@ -766,6 +766,12 @@ mod network_performance_subscriptions;
 mod placement_groups;
 #[path = "all/principal_id_format.rs"]
 mod principal_id_format;
+// The Region-wide audit of the same longer-ID settings `principal_id_format` writes and
+// reports per principal. Declared beside its sibling suite rather than in sorted position,
+// for the reason the note at the head of this file gives: the sorted neighbourhood and the
+// head of the list are where every new ec2 suite inserts its two lines.
+#[path = "all/aggregate_id_format.rs"]
+mod aggregate_id_format;
 // What `CreateRouteServerEndpoint` resolves before it writes, what it replays for a repeated
 // idempotency token, and what a dry run of it performs. Declared here rather than in sorted
 // position, for the reason the note at the head of this file gives: the sorted neighbourhood
