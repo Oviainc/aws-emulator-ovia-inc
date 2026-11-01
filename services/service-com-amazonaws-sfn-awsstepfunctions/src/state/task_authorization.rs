@@ -20,7 +20,9 @@
 //! 2. **what the call asks for** — the `(action, resource)` pair the call is subject
 //!    to, formed from the call itself ([`super::integration::access_request`]): the
 //!    IAM action is the invoked service's action namespace and the operation's own
-//!    name, and the resource is the ARN that integration's request names;
+//!    name, and the resource is the ARN of what that integration's request names —
+//!    the ARN itself where the operation takes one, and otherwise the ARN of the
+//!    resource of that NAME in the Region the call is made in;
 //! 3. **what the role may do** — the identity-based documents the IAM store holds for
 //!    it (its inline policies and the default version of each managed policy attached
 //!    to it), read through IAM's own
@@ -58,6 +60,7 @@ use ::service_common::iam_authorization::{self as iam, Decision};
 
 use super::integration::{access_request, Call, Failed, RoleGate};
 
+
 /// The IAM store a state machine's `roleArn` is resolved against.
 ///
 /// It is the IAM service's OWN state struct, reached through the SAME shared engine
@@ -77,11 +80,16 @@ const ACCESS_DENIED_STATUS: u16 = 400;
 /// there is nothing to decide them against — an engine with no IAM store, or an
 /// execution carrying no role at all.
 ///
+/// `region` is the Region the walk's calls are made in — the execution's own — which
+/// is where a resource a request names by NAME rather than by ARN lives, so it is
+/// what the ARN the access request is over is formed in.
+///
 /// The gate is consulted once per call the walk asks for, so a statement withdrawn
 /// between two states of one execution stops granting from the next call: nothing is
 /// read in advance and nothing is cached.
 pub fn role_gate<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
+    region: &str,
     role_arn: &str,
 ) -> Option<RoleGate> {
     if role_arn.is_empty() {
@@ -89,11 +97,12 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
     }
     iam_state(&**engine)?;
     let engine = Arc::clone(engine);
+    let region = region.to_string();
     let role_arn = role_arn.to_string();
     Some(Arc::new(move |call: &Call, request: &::serde_json::Value| {
         let targets = call.targets?;
         let iam = iam_state(&*engine)?;
-        let (action, resource) = access_request(call, request)?;
+        let (action, resource) = access_request(call, request, &region)?;
         let refused = refusal(
             &iam.lock(),
             &role_arn,

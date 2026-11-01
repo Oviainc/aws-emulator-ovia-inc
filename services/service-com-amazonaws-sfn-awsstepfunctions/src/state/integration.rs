@@ -491,9 +491,11 @@ pub struct Call {
 pub struct TargetResource {
     /// The `<namespace>:<action>` the OPTIMIZED family names this integration by.
     pub integration: &'static str,
-    /// The member of the integration's request that carries the ARN of the resource
-    /// the call acts on, named in the integration's own PascalCase.
+    /// The member of the integration's request that names the resource the call acts
+    /// on, named in the integration's own PascalCase.
     pub member: &'static str,
+    /// How that member spells the resource it names ([`TargetNaming`]).
+    pub named: TargetNaming,
     /// The error name a `Task` state reports when the invoked service refuses this
     /// call with an error its own operation does not model: the service as Step
     /// Functions names it in a task error, and that service's base SDK exception.
@@ -503,20 +505,51 @@ pub struct TargetResource {
     pub refusal_service: &'static str,
 }
 
+/// How the member of an integration's request that names the call's target SPELLS it.
+///
+/// An IAM access request is over the resource's ARN, whatever the operation's own
+/// member takes: an operation that addresses its resource by ARN carries the resource
+/// itself, while one that addresses it by NAME carries a name that is the ARN's last
+/// field, and the ARN it names is this account's own ARN for that resource in the
+/// Region the call is made in. Which of the two a member is, is a fact of the invoked
+/// operation's model, so it is stated per entry rather than guessed from the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetNaming {
+    /// The member carries the resource's ARN, so it IS the resource the access
+    /// request is over.
+    Arn,
+    /// The member carries the resource's NAME inside one account and Region, so the
+    /// ARN it names is minted from it. A value already written as an ARN is the
+    /// resource itself, because such a member is one the invoked operation takes
+    /// either way.
+    Named {
+        /// The ARN namespace of the service the resource belongs to.
+        service: &'static str,
+        /// What precedes the name in the ARN's resource field, the resource type the
+        /// invoked service writes it under (`table/`).
+        prefix: &'static str,
+    },
+}
+
 /// The integrations whose request names the resource their call acts on.
 ///
-/// One entry per integration, because which member names the target is that
-/// integration's own fact: an entry for an integration of another service also needs
-/// that service's base SDK exception, which only that service can state, so this
-/// table carries the integrations of the service this crate owns and a later entry is
-/// added beside them rather than guessed at. An integration with no entry is one no
-/// access request is formed for, and the call is made as before.
+/// One entry per integration, because which member names the target — and whether it
+/// names it by ARN or by name — is that integration's own fact. An entry also needs
+/// the invoked service's base SDK exception, the one a refusal its operation does not
+/// model is reported under, so an entry is added from that service's own model and
+/// SDK rather than guessed at. An integration with no entry is one no access request
+/// is formed for, and the call is made as before.
 ///
 /// An entry is keyed by the `<namespace>:<action>` the OPTIMIZED family writes, and
 /// serves BOTH families: the AWS SDK family names the same service and the same
 /// action, so it makes the same call on the same resource and is subject to the same
 /// access request. Only the SPELLING of the request's members differs between them,
 /// which [`TargetResource::resource_of`] reads either way.
+///
+/// Nothing here is per ACTION beyond the entry: the IAM action an entry's call is
+/// subject to is the invoked service's namespace and the operation's own name
+/// ([`access_request`]), so two actions of one service differ only in which member
+/// names their target.
 pub const TARGET_RESOURCES: &[TargetResource] = &[
     // `arn:aws:states:::states:startExecution` starts an execution of the state
     // machine its `StateMachineArn` parameter names, which is the resource
@@ -529,35 +562,109 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
     TargetResource {
         integration: "states:startExecution",
         member: "StateMachineArn",
+        named: TargetNaming::Arn,
         refusal_error: "StepFunctions.AWSStepFunctionsException",
         refusal_service: "AWSStepFunctions",
     },
+    // DynamoDB's item-level integrations each act on ONE table, the one their
+    // `TableName` parameter names: "The name of the table to contain the item" /
+    // "containing the requested item" / "from which to delete the item"
+    // (`smithy_query(query="operation",operation="PutItem,GetItem,UpdateItem,
+    // DeleteItem",model_path="services/
+    // service-com-amazonaws-dynamodb-dynamodb-20120810/smithy-model/
+    // com-amazonaws-dynamodb-dynamodb-20120810.json")`). The member is the table's
+    // NAME rather than its ARN, and a table's ARN writes that name under the `table`
+    // resource type — "The Amazon Resource Name (ARN) that uniquely identifies the
+    // table" (`TableDescription$TableArn` of the same model, which that service mints
+    // as `table/<name>`) — so the resource the access request is over is minted from
+    // it. A refusal none of these operations models is reported under DynamoDB's base
+    // SDK exception.
+    TargetResource {
+        integration: "dynamodb:putItem",
+        member: "TableName",
+        named: DYNAMODB_TABLE,
+        refusal_error: DYNAMODB_REFUSAL_ERROR,
+        refusal_service: DYNAMODB_REFUSAL_SERVICE,
+    },
+    TargetResource {
+        integration: "dynamodb:getItem",
+        member: "TableName",
+        named: DYNAMODB_TABLE,
+        refusal_error: DYNAMODB_REFUSAL_ERROR,
+        refusal_service: DYNAMODB_REFUSAL_SERVICE,
+    },
+    TargetResource {
+        integration: "dynamodb:updateItem",
+        member: "TableName",
+        named: DYNAMODB_TABLE,
+        refusal_error: DYNAMODB_REFUSAL_ERROR,
+        refusal_service: DYNAMODB_REFUSAL_SERVICE,
+    },
+    TargetResource {
+        integration: "dynamodb:deleteItem",
+        member: "TableName",
+        named: DYNAMODB_TABLE,
+        refusal_error: DYNAMODB_REFUSAL_ERROR,
+        refusal_service: DYNAMODB_REFUSAL_SERVICE,
+    },
 ];
 
+/// A DynamoDB table, named by the table name one of its item-level operations takes.
+const DYNAMODB_TABLE: TargetNaming = TargetNaming::Named {
+    service: "dynamodb",
+    prefix: "table/",
+};
+
+/// The error name a `Task` state reports for a DynamoDB refusal the invoked operation
+/// does not model, and the name that refusal's metadata names the service under: the
+/// service as Step Functions writes it in a task error, and DynamoDB's base SDK
+/// exception and client name.
+const DYNAMODB_REFUSAL_ERROR: &str = "DynamoDB.AmazonDynamoDBException";
+const DYNAMODB_REFUSAL_SERVICE: &str = "AmazonDynamoDBv2";
+
 impl TargetResource {
-    /// The ARN this call's `request` names as the resource it acts on.
+    /// The ARN of the resource this call's `request` names, in the Region `region`
+    /// the call is made in.
     ///
     /// The member is read under both spellings a definition may write it in — the
     /// integration's own PascalCase and the invoked model's ([`MemberCase`]) — because
-    /// either reaches the operation ([`wire_request`]).
-    fn resource_of(&self, request: &Value) -> Option<String> {
-        [MemberCase::Pascal, MemberCase::LowerCamel]
+    /// either reaches the operation ([`wire_request`]). What the value spells is the
+    /// entry's own fact ([`TargetNaming`]): a NAME is the last field of this account's
+    /// ARN for that resource in this Region, and an ARN is the resource itself.
+    fn resource_of(&self, request: &Value, region: &str) -> Option<String> {
+        let named = [MemberCase::Pascal, MemberCase::LowerCamel]
             .into_iter()
             .find_map(|case| request.get(case.spell(self.member)))
-            .and_then(Value::as_str)
-            .map(str::to_string)
+            .and_then(Value::as_str)?;
+        if named.is_empty() {
+            return None;
+        }
+        match self.named {
+            TargetNaming::Arn => Some(named.to_string()),
+            // A member that takes a name takes an ARN too, so one already written as
+            // an ARN names the resource it names rather than a resource of that name.
+            TargetNaming::Named { service, prefix } => {
+                Some(match ::service_common::arn::parse(named) {
+                    Some(_) => named.to_string(),
+                    None => ::engine::emulator_arn(service, region, &format!("{prefix}{named}")),
+                })
+            }
+        }
     }
 }
 
 /// The access request this call is subject to: the IAM action the invoked operation
 /// publishes, and the ARN of the resource the request names.
 ///
+/// `region` is the Region the call is made in, which is where a resource the request
+/// named by NAME lives.
+///
 /// `None` when no [`TARGET_RESOURCES`] entry is carried for the integration, or when
 /// the request names no resource at all — a request the invoked operation will itself
 /// refuse, which is its own answer to give rather than an authorization decision.
-pub fn access_request(call: &Call, request: &Value) -> Option<(String, String)> {
+pub fn access_request(call: &Call, request: &Value, region: &str) -> Option<(String, String)> {
     let targets = call.targets?;
-    let resource = targets.resource_of(request)?;
+    let resource = targets.resource_of(request, region)?;
     Some((
         format!("{}:{}", call.api.namespace, call.operation),
         resource,
@@ -1958,7 +2065,7 @@ mod tests {
         &'static str,
         &'static str,
         Value,
-        Option<(&'static str, &'static str)>,
+        Option<(&'static str, String)>,
     );
 
     /// One row of the envelope table: the case, the document the operation answered,
@@ -2503,43 +2610,72 @@ mod tests {
     /// The access request a call is subject to: the IAM action the invoked operation
     /// publishes, and the ARN the request names as the resource acted on.
     /// The rows span what the rule generalises over: both spellings a definition may
-    /// write the member in, the pattern suffixes (which name the same action), an
-    /// integration the table carries no entry for, the AWS SDK family, and a request
-    /// naming no resource at all.
+    /// write the member in, the pattern suffixes (which name the same action), a
+    /// member that names its resource by NAME rather than by ARN (and the same member
+    /// carrying an ARN instead), several actions of one service, an integration the
+    /// table carries no entry for, the AWS SDK family, and a request naming no
+    /// resource at all.
     #[test]
     fn an_access_request_is_the_action_and_the_resource_the_request_names() {
         let child = "arn:aws:states:us-west-2:000000000000:stateMachine:child";
+        let region = "eu-west-1";
+        let orders = ::engine::emulator_arn("dynamodb", region, "table/orders");
+        let elsewhere = "arn:aws:dynamodb:us-east-2:000000000000:table/elsewhere";
         // (case, the Resource, the request the state built, the expected pair)
-        let rows: [AccessRow; 6] = [
+        let rows: [AccessRow; 10] = [
             (
                 "a nested execution, the member in the integration's own spelling",
                 "arn:aws:states:::states:startExecution",
                 ::serde_json::json!({"StateMachineArn": child}),
-                Some(("states:StartExecution", child)),
+                Some(("states:StartExecution", child.to_string())),
             ),
             (
                 "the same member as the invoked model spells it",
                 "arn:aws:states:::states:startExecution",
                 ::serde_json::json!({"stateMachineArn": child}),
-                Some(("states:StartExecution", child)),
+                Some(("states:StartExecution", child.to_string())),
             ),
             (
                 "the run-a-job pattern, whose action is the same one",
                 "arn:aws:states:::states:startExecution.sync:2",
                 ::serde_json::json!({"StateMachineArn": child, "Input": {}}),
-                Some(("states:StartExecution", child)),
+                Some(("states:StartExecution", child.to_string())),
+            ),
+            (
+                "a member naming its table by name, which is the ARN of that table here",
+                "arn:aws:states:::dynamodb:putItem",
+                ::serde_json::json!({"TableName": "orders"}),
+                Some(("dynamodb:PutItem", orders.clone())),
+            ),
+            (
+                "another action of the same service, over the same table",
+                "arn:aws:states:::dynamodb:deleteItem",
+                ::serde_json::json!({"TableName": "orders"}),
+                Some(("dynamodb:DeleteItem", orders.clone())),
+            ),
+            (
+                "the AWS SDK family of that call, whose member its model spells lower",
+                "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                ::serde_json::json!({"tableName": "orders"}),
+                Some(("dynamodb:UpdateItem", orders.clone())),
+            ),
+            (
+                "the same member carrying an ARN, which names the table it names",
+                "arn:aws:states:::dynamodb:getItem",
+                ::serde_json::json!({"TableName": elsewhere}),
+                Some(("dynamodb:GetItem", elsewhere.to_string())),
             ),
             (
                 "an integration no entry is carried for",
-                "arn:aws:states:::dynamodb:putItem",
-                ::serde_json::json!({"TableName": "orders"}),
+                "arn:aws:states:::sqs:sendMessage",
+                ::serde_json::json!({"QueueUrl": "https://sqs.eu-west-1.amazonaws.com/0/q"}),
                 None,
             ),
             (
-                "the AWS SDK family of that same call, which acts on the same resource",
+                "the AWS SDK family of a nested execution, which acts on the same resource",
                 "arn:aws:states:::aws-sdk:sfn:startExecution",
                 ::serde_json::json!({"stateMachineArn": child}),
-                Some(("states:StartExecution", child)),
+                Some(("states:StartExecution", child.to_string())),
             ),
             (
                 "a request naming no resource at all",
@@ -2551,9 +2687,8 @@ mod tests {
 
         for (case, resource, request, expected) in rows {
             let call = read(resource).expect("every row names a call");
-            let asked = access_request(&call, &request);
-            let expected =
-                expected.map(|(action, named)| (action.to_string(), named.to_string()));
+            let asked = access_request(&call, &request, region);
+            let expected = expected.map(|(action, named)| (action.to_string(), named));
             assert_eq!(
                 asked, expected,
                 "case {case:?}: expected {expected:?}, got {asked:?}"

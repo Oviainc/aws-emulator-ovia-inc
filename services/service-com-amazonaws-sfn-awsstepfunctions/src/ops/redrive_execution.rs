@@ -336,8 +336,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let region = crate::state::arn_region(&context.state_machine_arn);
             // And they are made as the SAME execution role the first attempt ran as,
             // which is the one the record was started with.
-            let role =
-                crate::state::task_authorization::role_gate(&self.engine, &context.role_arn);
+            let role = crate::state::task_authorization::role_gate(
+                &self.engine,
+                &region,
+                &context.role_arn,
+            );
             crate::state::integration::interpret(ctx, &region, role, move |tasks| {
                 crate::state::plan_redrive(
                     &crate::state::RunAttempt {

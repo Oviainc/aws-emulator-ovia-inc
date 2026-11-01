@@ -125,6 +125,8 @@ mod sync_service_integration;
 mod task_execution_role;
 #[path = "all/task_integrations.rs"]
 mod task_integrations;
+#[path = "all/task_role_over_dynamodb.rs"]
+mod task_role_over_dynamodb;
 #[path = "all/terminal_runtime_errors.rs"]
 mod terminal_runtime_errors;
 #[path = "all/test_state.rs"]

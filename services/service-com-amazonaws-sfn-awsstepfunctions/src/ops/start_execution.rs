@@ -436,7 +436,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What this execution's `Task` states may do is what the policies in force on
         // the state machine's execution role allow them: the calls below are made as
         // that role ([`crate::state::task_authorization`]).
-        let role = crate::state::task_authorization::role_gate(&self.engine, &role_arn);
+        let role = crate::state::task_authorization::role_gate(&self.engine, &region, &role_arn);
         let interpreted = {
             let definition = definition.clone();
             let execution_input = execution_input.clone();

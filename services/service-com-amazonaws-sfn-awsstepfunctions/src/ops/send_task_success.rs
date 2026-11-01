@@ -339,8 +339,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let region = crate::state::arn_region(&machine_arn);
             // The states after the reply call as the SAME execution role the states
             // before it did.
-            let role =
-                crate::state::task_authorization::role_gate(&self.engine, &context.role_arn);
+            let role = crate::state::task_authorization::role_gate(
+                &self.engine,
+                &region,
+                &context.role_arn,
+            );
             crate::state::integration::interpret(ctx, &region, role, move |tasks| {
                 crate::state::plan_reply(
                     &definition,
