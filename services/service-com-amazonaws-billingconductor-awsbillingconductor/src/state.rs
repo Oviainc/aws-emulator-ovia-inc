@@ -4690,7 +4690,18 @@ const MAX_PAGE_TOKEN_LENGTH: usize = 1024;
 /// The cursor `token` carries for the listing `scope`, or `None` when `token` is not one
 /// this service minted for that listing — a value longer than any token it mints, one that
 /// is not hex, is too short to carry a tag, does not agree with the tag it carries, does
-/// not decode to UTF-8, carries no scope at all, or carries a different sequence's scope.
+/// not decode to UTF-8, carries no scope at all, carries a different sequence's scope, or
+/// is spelled any way other than the ONE spelling [`encode_next_token`] writes.
+///
+/// Decoding the bytes is only the first half of reading a token: `::hex::decode` reads more
+/// spellings than `::hex::encode` writes — it accepts `A-F` as well as the `a-f` the minter
+/// emits — and the tag is computed over the DECODED payload, so it is identical for every
+/// spelling of one cursor. A token is therefore kept only when it is, byte for byte, the
+/// token this service would mint for the cursor it decodes to: re-minting is what compares
+/// the two, so the accepted spelling is the ENCODER's rather than a second grammar
+/// maintained beside it, and a re-cased copy of an issued token — a value no response of
+/// this service ever carried, so not one the caller handed back unchanged — is refused with
+/// [`invalid_next_token`] like every other value this service did not mint.
 pub fn decode_next_token(scope: &str, token: &str) -> Option<String> {
     if token.len() > MAX_PAGE_TOKEN_LENGTH {
         return None;
@@ -4705,7 +4716,10 @@ pub fn decode_next_token(scope: &str, token: &str) -> Option<String> {
     }
     let decoded = std::str::from_utf8(payload).ok()?;
     let (minted_for, cursor) = decoded.split_once(PAGE_TOKEN_SEPARATOR)?;
-    (minted_for == scope).then(|| cursor.to_string())
+    if minted_for != scope {
+        return None;
+    }
+    (encode_next_token(scope, cursor) == token).then(|| cursor.to_string())
 }
 
 /// [`PAGE_TOKEN_TAG_BYTES`] bytes of the SHA-256 digest of a token's payload.
