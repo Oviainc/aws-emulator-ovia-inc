@@ -87,8 +87,11 @@
 //!   the allowed number of messages per second, and so on. For more information, see Quotas
 //!   in the IoT SiteWise User Guide.
 
+use std::collections::HashMap;
+
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::MappedInterfaceProperty;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -204,6 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| no_active_version(&id, record.state(now)))?;
         let record = &*record;
 
+        // Which interface each of this model's properties answers for a property
+        // of, read ONCE from the stored relationships for the whole listing, so
+        // every row reports the pairings the applications resolved to and two rows
+        // cannot disagree about them.
+        let interfaces = store.interface_properties_by_asset_model_property(&id);
+
         // The enumeration order: the model's own properties in definition order, then
         // the properties each composite model contributes, composite models in their
         // stored order.
@@ -211,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut summaries: Vec<AssetModelPropertySummary> = record
             .properties
             .iter()
-            .map(|property| summarize(property, None, &[]))
+            .map(|property| summarize(property, None, &[], &interfaces))
             .collect();
         if include_composite {
             // `composite_models` is the FLAT list of every composite model this
@@ -235,7 +244,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // which stores none of its own — the properties of the component
                 // model it reuses.
                 for property in store.composite_model_properties(record, composite_id) {
-                    summaries.push(summarize(&property, Some(composite_id), &prefix));
+                    summaries.push(summarize(
+                        &property,
+                        Some(composite_id),
+                        &prefix,
+                        &interfaces,
+                    ));
                 }
             }
         }
@@ -277,11 +291,15 @@ const FILTER_ALL: &str = "ALL";
 ///
 /// `composite_id` is the composite model the property is contributed by, or `None`
 /// for one of the model's own (base) properties; `prefix` is that composite model's
-/// path from the root of the asset model, empty for a base property.
+/// path from the root of the asset model, empty for a base property; `interfaces`
+/// is what every property of this model answers for under the applied interfaces,
+/// as [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::interface_properties_by_asset_model_property`]
+/// reads it.
 fn summarize(
     property: &AssetModelProperty,
     composite_id: Option<&str>,
     prefix: &[AssetModelCompositeModelPathSegment],
+    interfaces: &HashMap<String, Vec<MappedInterfaceProperty>>,
 ) -> AssetModelPropertySummary {
     // `path` is "the structured path to the property from the root of the asset
     // model": the composite models the property sits inside, outermost first, then
@@ -309,15 +327,37 @@ fn summarize(
         r#type: property.r#type.clone(),
         asset_model_composite_model_id: composite_id.map(ToString::to_string),
         path: Some(path),
-        // Which interfaces a property belongs to is reported by no member this
-        // enumeration derives: the store records an applied interface as a
-        // relationship between two asset models, and which of a model's
-        // properties each mapping covers is the subject of the interface reads,
-        // not of this list. Left ABSENT rather than reported as an empty list:
-        // the emulator has nothing to say here, which is not the same claim as
-        // "this property belongs to no interface".
-        interface_summaries: None,
+        interface_summaries: interface_summaries(property, interfaces),
     }
+}
+
+/// The interfaces one property belongs to, as this listing reports them.
+///
+/// The member is "a list of interface summaries that describe which interfaces
+/// this property belongs to, including the interface asset model ID and the
+/// corresponding property ID in the interface": one entry per interface an
+/// application of which mapped one of its properties to this property, naming
+/// that interface asset model and the property of it this one answers for. A
+/// property no applied interface covers belongs to none, which this member is
+/// ABSENT for rather than carrying an empty list — which is what a property
+/// missing from `interfaces` means, since that map holds an entry only for a
+/// property at least one mapping names.
+fn interface_summaries(
+    property: &AssetModelProperty,
+    interfaces: &HashMap<String, Vec<MappedInterfaceProperty>>,
+) -> Option<Vec<InterfaceSummary>> {
+    let mapped = interfaces.get(property.id.as_deref()?)?;
+    Some(
+        mapped
+            .iter()
+            .map(|mapping| InterfaceSummary {
+                interface_asset_model_id: mapping.interface_asset_model_id.clone(),
+                interface_asset_model_property_id: mapping
+                    .interface_asset_model_property_id
+                    .clone(),
+            })
+            .collect(),
+    )
 }
 
 /// This enumeration's resume key for one summary: unique, because a property id is

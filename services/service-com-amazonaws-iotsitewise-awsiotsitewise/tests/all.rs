@@ -511,6 +511,8 @@ mod asset_model_composite_model;
 mod asset_model_composite_model_delete;
 #[path = "all/asset_model_properties.rs"]
 mod asset_model_properties;
+#[path = "all/asset_model_property_interface_summaries.rs"]
+mod asset_model_property_interface_summaries;
 // Declared only because the build requires every file under `tests/all/` to be:
 // the suite was folded into `update_asset_model.rs` and this module now carries
 // no test. See the file's own note.

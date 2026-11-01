@@ -1354,6 +1354,21 @@ pub struct InterfaceRelationshipRecord {
     pub hierarchy_mappings: Vec<HierarchyMapping>,
 }
 
+/// One property of an interface asset model that a property of ANOTHER asset
+/// model answers for, under an interface relationship this store holds.
+///
+/// The pairing is the stored relationship's own, read rather than re-derived, so
+/// every view of an applied interface reports the same two ids. Ordered, so a
+/// caller reporting several of these reports them in one order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MappedInterfaceProperty {
+    /// The stored `assetModelId` of the interface asset model that declares the
+    /// property.
+    pub interface_asset_model_id: String,
+    /// The stored id of that interface asset model's property.
+    pub interface_asset_model_property_id: String,
+}
+
 /// A stored asset. `properties` is materialised from the referenced model's
 /// property definitions at create time, so property writes and reads resolve.
 /// It is ONE flat list holding the asset's own (base) properties and the ones
@@ -4292,6 +4307,47 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     ) -> Option<&InterfaceRelationshipRecord> {
         self.interface_relationships
             .get(&interface_relationship_key(asset_model_id, interface_asset_model_id))
+    }
+
+    /// Which property of which interface asset model each property of
+    /// `asset_model_id` answers for, keyed by that model's own property id.
+    ///
+    /// A property of a model belongs to an interface exactly while the
+    /// application of that interface to the model maps one of the interface's
+    /// properties to it — the pairing
+    /// [`InterfaceRelationshipRecord::property_mappings`] holds — so this is a
+    /// read of the stored relationships rather than a second derivation of
+    /// them. One model may implement several interfaces, so one of its
+    /// properties may answer for a property of each; a property no application
+    /// mapped belongs to none and is absent from the map. Each list is ordered
+    /// by the interface and then its property, so two reads of one store report
+    /// one order.
+    pub fn interface_properties_by_asset_model_property(
+        &self,
+        asset_model_id: &str,
+    ) -> HashMap<String, Vec<MappedInterfaceProperty>> {
+        let mut mapped: HashMap<String, Vec<MappedInterfaceProperty>> = HashMap::new();
+        for relationship in self
+            .interface_relationships
+            .values()
+            .filter(|relationship| relationship.asset_model_id == asset_model_id)
+        {
+            for mapping in &relationship.property_mappings {
+                mapped
+                    .entry(mapping.asset_model_property_id.clone())
+                    .or_default()
+                    .push(MappedInterfaceProperty {
+                        interface_asset_model_id: relationship.interface_asset_model_id.clone(),
+                        interface_asset_model_property_id: mapping
+                            .interface_asset_model_property_id
+                            .clone(),
+                    });
+            }
+        }
+        for interfaces in mapped.values_mut() {
+            interfaces.sort();
+        }
+        mapped
     }
 
     /// Drop every mapping of every stored interface relationship that names a
