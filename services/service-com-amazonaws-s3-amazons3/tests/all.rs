@@ -212,6 +212,8 @@ mod object_subresource_version_id;
 mod object_tag_set_removal;
 #[path = "all/object_tagging.rs"]
 mod object_tagging;
+#[path = "all/object_tagging_event_sub_types.rs"]
+mod object_tagging_event_sub_types;
 #[path = "all/object_tagging_on_put.rs"]
 mod object_tagging_on_put;
 #[path = "all/object_torrent.rs"]

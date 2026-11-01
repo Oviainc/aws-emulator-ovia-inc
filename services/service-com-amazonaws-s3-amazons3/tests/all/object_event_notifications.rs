@@ -231,7 +231,11 @@ impl Emulator {
     }
 
     /// An EventBridge call (`awsJson1_1`).
-    async fn events(&self, operation: &str, body: &Value) -> Value {
+    ///
+    /// `pub(crate)`: the tagging sub-type suite
+    /// ([`super::object_tagging_event_sub_types`]) puts its own rules on the default bus
+    /// through this one rather than building a second EventBridge request.
+    pub(crate) async fn events(&self, operation: &str, body: &Value) -> Value {
         self.rpc("events", "AWSEvents", "1.1", operation, body).await
     }
 
@@ -364,12 +368,33 @@ impl Emulator {
         answer
     }
 
-    /// `PUT /<bucket>/<key>?tagging` — `PutObjectTagging`.
+    /// `PUT /<bucket>/<key>?tagging` — `PutObjectTagging`, with the one tag the rows that
+    /// do not care which tags were written use.
     pub(crate) async fn put_object_tagging(&self, bucket: &str, key: &str) -> Answer {
-        let body = format!(
-            "<Tagging xmlns=\"{XMLNS}\"><TagSet><Tag><Key>reviewed</Key>\
-             <Value>yes</Value></Tag></TagSet></Tagging>"
-        );
+        self.put_object_tagging_of(bucket, key, &[("reviewed", "yes")])
+            .await
+    }
+
+    /// `PUT /<bucket>/<key>?tagging` — `PutObjectTagging` carrying exactly `tags`, which
+    /// "sets the supplied tag-set to an object": the container is the whole tag set, so an
+    /// empty slice writes an empty one.
+    ///
+    /// `pub(crate)`: the tagging sub-type suite
+    /// ([`super::object_tagging_event_sub_types`]) varies the tag set across its rows
+    /// through this one rather than writing a second tagging payload builder.
+    pub(crate) async fn put_object_tagging_of(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: &[(&str, &str)],
+    ) -> Answer {
+        let mut body = format!("<Tagging xmlns=\"{XMLNS}\"><TagSet>");
+        for (tag_key, value) in tags {
+            body.push_str(&format!(
+                "<Tag><Key>{tag_key}</Key><Value>{value}</Value></Tag>"
+            ));
+        }
+        body.push_str("</TagSet></Tagging>");
         let answer = self
             .s3_xml(
                 "PUT",
