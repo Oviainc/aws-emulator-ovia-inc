@@ -1484,6 +1484,17 @@ pub struct ChannelRecord {
     thumbnails: Vec<ThumbnailRecord>,
     /// The transition the clock owes this channel, if any.
     transition: Option<Transition>,
+    /// The instant this channel entered the state it is in NOW: the instant of
+    /// the call for a state a mutation put it in, and the instant the
+    /// transition came DUE for one the clock settled it into — never the
+    /// instant of the call that happened to materialise that transition.
+    ///
+    /// PRIVATE, read through [`Self::state_since`]: whether this channel's
+    /// pipelines are up is what the multiplex slice observes an alert condition
+    /// about a multiplex program from, and such a condition became true (or
+    /// stopped being true) when this channel last changed state, so this is the
+    /// instant the alert it raises carries.
+    state_since: SystemTime,
 }
 
 impl ChannelRecord {
@@ -1711,10 +1722,17 @@ impl ChannelRecord {
         self.is_deleted() || self.state == channel_state::DELETING
     }
 
+    /// The instant this channel entered the state it is in now — the one thing
+    /// anything derived from a channel's state can be dated by.
+    pub fn state_since(&self) -> SystemTime {
+        self.state_since
+    }
+
     /// Put the channel into `state` as of `now` and owe `to` once
     /// [`TRANSIENT_STATE_SPAN`] has passed.
     fn begin_transition(&mut self, state: &str, to: Settled, now: SystemTime) {
         self.state = state.to_string();
+        self.state_since = now;
         self.transition = Some(Transition {
             due: now + TRANSIENT_STATE_SPAN,
             to,
@@ -1743,6 +1761,9 @@ impl ChannelRecord {
             Settled::Deleted => channel_state::DELETED,
         }
         .to_string();
+        // The state was owed at `transition.due` whether or not anybody called,
+        // so that — and not this call's clock — is when the channel entered it.
+        self.state_since = transition.due;
         self.transition = None;
         Some(transition.to)
     }
@@ -6497,6 +6518,7 @@ pub fn new_channel(
         alerts: ChannelAlerts::default(),
         thumbnails: Vec::new(),
         transition: None,
+        state_since: now,
     };
     channel.begin_transition(channel_state::CREATING, Settled::Idle, now);
     channel

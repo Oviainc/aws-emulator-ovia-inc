@@ -166,11 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
         let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
         // Transitions the clock had already made due were owed whether or not
         // this delete ran, so they are materialised before anything is read: a
         // multiplex whose own delete has come due holds no program a caller may
         // still remove.
-        state.settle(::std::time::SystemTime::now());
+        state.settle(now);
 
         // The multiplex's state, the program's existence and the removal are one
         // step in the state slice, so this handler cannot check one of them and
@@ -178,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // described out of the state it was still in rather than from anything
         // in this request.
         let program = state
-            .remove_multiplex_program(&input.multiplex_id, &input.program_name)
+            .remove_multiplex_program(&input.multiplex_id, &input.program_name, now)
             .map_err(|refusal| refused(refusal, &input.multiplex_id, &input.program_name))?;
 
         Ok(crate::state::multiplex_program_description_output!(

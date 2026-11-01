@@ -203,6 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.multiplex_id,
                 input.program_name.clone(),
                 input.multiplex_program_settings,
+                now,
             )
             .map_err(|refusal| refused(refusal, &input.multiplex_id, &input.program_name))?;
         // Bounded, evicting write: a caller-chosen token can neither accumulate

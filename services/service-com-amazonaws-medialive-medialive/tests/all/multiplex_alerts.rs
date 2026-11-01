@@ -80,7 +80,7 @@ async fn page(
 
 /// Every alert the listing reports, walked page by page, and the size of each
 /// page.
-async fn every_alert(
+pub(crate) async fn every_alert(
     router: &MultiServiceRouter,
     case: &str,
     multiplex_id: &str,
@@ -129,7 +129,7 @@ async fn every_alert(
 
 /// A program created in `multiplex_id` under `program_name`, asserted to have
 /// succeeded. `program_number` is "Unique program number" within the multiplex.
-async fn program(
+pub(crate) async fn program(
     router: &MultiServiceRouter,
     case: &str,
     multiplex_id: &str,
@@ -155,7 +155,7 @@ async fn program(
 /// `program_name` (`OutputDestination$MultiplexSettings` is a
 /// `MultiplexProgramChannelDestinationSettings` carrying exactly that pair), as
 /// its minted id.
-async fn feeding_channel(
+pub(crate) async fn feeding_channel(
     router: &MultiServiceRouter,
     case: &str,
     multiplex_id: &str,
@@ -189,7 +189,7 @@ async fn feeding_channel(
 }
 
 /// Start the channel `channel_id` (`POST /prod/channels/{ChannelId}/start`).
-async fn start_channel(router: &MultiServiceRouter, case: &str, channel_id: &str) {
+pub(crate) async fn start_channel(router: &MultiServiceRouter, case: &str, channel_id: &str) {
     let (status, started) = call(
         router,
         "POST",
@@ -204,7 +204,7 @@ async fn start_channel(router: &MultiServiceRouter, case: &str, channel_id: &str
 }
 
 /// Stop the channel `channel_id` (`POST /prod/channels/{ChannelId}/stop`).
-async fn stop_channel(router: &MultiServiceRouter, case: &str, channel_id: &str) {
+pub(crate) async fn stop_channel(router: &MultiServiceRouter, case: &str, channel_id: &str) {
     let (status, stopped) = call(
         router,
         "POST",
@@ -220,7 +220,7 @@ async fn stop_channel(router: &MultiServiceRouter, case: &str, channel_id: &str)
 
 /// Start `multiplex_id` and let the clock settle it into `RUNNING`, asserting it
 /// got there.
-async fn run_multiplex(router: &MultiServiceRouter, case: &str, multiplex_id: &str) {
+pub(crate) async fn run_multiplex(router: &MultiServiceRouter, case: &str, multiplex_id: &str) {
     let (status, starting) = start_multiplex(router, multiplex_id).await;
     assert_eq!(
         status, 202,
@@ -249,7 +249,7 @@ fn alert_state(case: &str, alert: &Value) -> String {
 }
 
 /// The alert's `Id` member, which is also the `NextToken` a page resumes at.
-fn alert_id(case: &str, alert: &Value) -> String {
+pub(crate) fn alert_id(case: &str, alert: &Value) -> String {
     let id = alert["id"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected an alert id, got {alert}"));
@@ -264,7 +264,7 @@ fn alert_id(case: &str, alert: &Value) -> String {
 /// Every member of a `MultiplexAlert` asserted on a SET alert about
 /// `program_name`: the type, the state, the message naming the program, an
 /// `Id`, a `SetTimestamp` and NO `ClearedTimestamp`.
-fn assert_set_alert(case: &str, alert: &Value, program_name: &str) {
+pub(crate) fn assert_set_alert(case: &str, alert: &Value, program_name: &str) {
     assert_eq!(
         alert["alertType"],
         json!(NO_RUNNING_CHANNEL),
@@ -550,9 +550,8 @@ async fn an_alert_clears_when_its_condition_stops_and_a_later_occurrence_is_a_ne
     run_multiplex(&router, case, &multiplex_id).await;
 
     // The channel exists but is stopped, so the condition holds: one SET alert.
-    let before = std::time::SystemTime::now();
+    let observed_at = std::time::SystemTime::now();
     let (raised, _) = every_alert(&router, case, &multiplex_id, None, None).await;
-    let after = std::time::SystemTime::now();
     assert_eq!(
         raised.len(),
         1,
@@ -567,12 +566,15 @@ async fn an_alert_clears_when_its_condition_stops_and_a_later_occurrence_is_a_ne
         "case {case:?}: expected the message to name the channel that is not running and its \
          state, got {message:?}"
     );
+    // The alert is dated by the state change that made its condition true — the
+    // instant this multiplex began transmitting — and so by an instant BEFORE
+    // the call that first observed it rather than by that call's own clock.
     let set_at = epoch_seconds(timestamp(case, "setTimestamp", &first));
+    let observed = crate::support::unix_seconds(observed_at);
     assert!(
-        set_at <= crate::support::unix_seconds(after) + 1.0
-            && set_at >= crate::support::unix_seconds(before) - 2.0,
-        "case {case:?}: expected the set instant to be around the call that observed the \
-         condition, got {set_at}"
+        set_at <= observed && set_at >= observed - 2.0,
+        "case {case:?}: expected the set instant to be the instant the multiplex began \
+         transmitting, which is before the observing call at {observed}, got {set_at}"
     );
 
     // Starting the channel stops the condition holding, so the alert clears —
