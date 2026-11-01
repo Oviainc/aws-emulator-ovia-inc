@@ -534,6 +534,14 @@ pub fn store_unavailable() -> crate::ops::types::InternalServerException {
     }
 }
 
+/// The `ResourceNotFoundException` message for a profile object type a domain does not
+/// hold, as the service words that refusal: the resource kind, the name the request
+/// carried, and "not found". Shared by every operation addressing one object type, so
+/// the same absent name reads the same whichever of them was called.
+pub fn object_type_not_found(object_type_name: &str) -> String {
+    format!("ObjectType {object_type_name} not found")
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

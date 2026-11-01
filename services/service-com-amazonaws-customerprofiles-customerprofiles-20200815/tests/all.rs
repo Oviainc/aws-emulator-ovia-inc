@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/batch_get_profile.rs"]
 mod batch_get_profile;
+#[path = "all/delete_profile_object_type.rs"]
+mod delete_profile_object_type;
 #[path = "all/domain_profile_lifecycle.rs"]
 mod domain_profile_lifecycle;
 #[path = "all/merge_profiles.rs"]

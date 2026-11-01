@@ -183,9 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .object_types
             .get(&input.object_type_name)
             .ok_or_else(|| {
-                not_found(format!(
-                    "The object type {} does not exist in domain {}",
-                    input.object_type_name, input.domain_name
+                not_found(crate::state::object_type_not_found(
+                    &input.object_type_name,
                 ))
             })?;
 
