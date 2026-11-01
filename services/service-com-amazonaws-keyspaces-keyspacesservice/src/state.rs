@@ -705,8 +705,10 @@ pub const MAX_COLUMNS_PER_TABLE: usize = 1024;
 /// It is a different number from the modelled `TagList` bound (`len 1..60`), which caps
 /// what ONE REQUEST may carry: a request well inside the modelled bound can still carry a
 /// resource past this quota, and the request boundary cannot see that because it depends
-/// on the tags the resource already holds. Such a call is refused with the
-/// `ServiceQuotaExceededException` (HTTP 402) that every operation taking tags models.
+/// on the tags the resource already holds. Such a call is refused as a malformed REQUEST —
+/// the `ValidationException` (HTTP 400) every operation taking tags models, carrying the
+/// sentence [`TagRejection::message`] renders for it — rather than as the service-quota
+/// failure: what the caller has to do is supply fewer tags, not ask for more quota.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The prefix reserved for Amazon Web Services' own tag keys.
@@ -726,10 +728,12 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 /// the iteration order is total and stable.
 pub type TagSet = BTreeMap<String, String>;
 
-/// Why a tag a caller supplied was refused. Each variant maps onto the modelled error
-/// the operations that take tags declare for it, which is why this is not a bare string:
-/// a reserved key is a 400 `ValidationException` and a breached quota a 402
-/// `ServiceQuotaExceededException`.
+/// Why a tag a caller supplied was refused.
+///
+/// Both variants are faults of the REQUEST — one names a key the caller may not assign,
+/// the other asks for more tags than a resource may hold — so both are the 400
+/// `ValidationException` every operation taking tags models. This is not a bare string
+/// because each variant renders its own sentence, and one of them names the key at fault.
 #[derive(Debug, Clone)]
 pub enum TagRejection {
     /// A key the caller may not assign ([`RESERVED_TAG_KEY_PREFIX`]).
@@ -738,29 +742,26 @@ pub enum TagRejection {
         key: String,
     },
     /// The call would carry the resource past [`MAX_TAGS_PER_RESOURCE`].
-    QuotaExceeded {
-        /// How many tags the resource would have held.
-        resulting: usize,
-    },
+    ResourceTagCountExceeded,
 }
 
 impl TagRejection {
     /// What the caller has to fix, naming the member at fault and the rule it broke.
+    ///
+    /// The per-resource-count sentence is the service's own, FIXED text: it reports
+    /// neither the resource, nor how many tags it already holds, nor the count the call
+    /// would have left behind — the only value in it is the published per-resource limit
+    /// ([`MAX_TAGS_PER_RESOURCE`]).
     pub fn message(&self) -> String {
         match self {
             Self::ReservedKeyPrefix { key } => format!(
                 "tags contains key '{key}': the '{RESERVED_TAG_KEY_PREFIX}' prefix is reserved for Amazon Web Services and cannot be assigned."
             ),
-            Self::QuotaExceeded { resulting } => format!(
-                "the resource would hold {resulting} tags, which exceeds the limit of {MAX_TAGS_PER_RESOURCE} tags per resource"
+            Self::ResourceTagCountExceeded => format!(
+                "Tag count exceed the imposed limit, The resultant tag set must not have \
+                 more than {MAX_TAGS_PER_RESOURCE} user tags."
             ),
         }
-    }
-
-    /// Whether this refusal is the quota one, so a handler picks
-    /// `ServiceQuotaExceededException` over `ValidationException`.
-    pub fn is_quota(&self) -> bool {
-        matches!(self, Self::QuotaExceeded { .. })
     }
 }
 
@@ -781,9 +782,8 @@ pub fn merge_tags(existing: &mut TagSet, incoming: &[Tag]) -> Result<(), TagReje
             added.insert(tag.key.as_str());
         }
     }
-    let resulting = existing.len() + added.len();
-    if resulting > MAX_TAGS_PER_RESOURCE {
-        return Err(TagRejection::QuotaExceeded { resulting });
+    if existing.len() + added.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(TagRejection::ResourceTagCountExceeded);
     }
     for tag in incoming {
         existing.insert(tag.key.clone(), tag.value.clone());
@@ -800,9 +800,9 @@ pub fn merge_tags(existing: &mut TagSet, incoming: &[Tag]) -> Result<(), TagReje
 /// already taken — which is what makes one and the same reserved key answer the same 400
 /// `ValidationException` whichever of them was called and whatever the store holds.
 ///
-/// The quota ([`MAX_TAGS_PER_RESOURCE`]) is the other refusal [`merge_tags`] raises and is
-/// NOT request-only — it counts the tags the resource already holds — so it stays where
-/// the resource is known.
+/// The per-resource count ([`MAX_TAGS_PER_RESOURCE`]) is the other refusal [`merge_tags`]
+/// raises and is NOT request-only — it counts the tags the resource already holds — so it
+/// stays where the resource is known, even though both answer the same error.
 pub fn reject_reserved_tag_keys(supplied: &[Tag]) -> Result<(), TagRejection> {
     match supplied
         .iter()

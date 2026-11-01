@@ -309,15 +309,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // applies the same ones `TagResource` does: at most
         // `MAX_TAGS_PER_RESOURCE` tags on the resource, no reserved key, one tag per key.
         let to_tag_failure = |rejection: crate::state::TagRejection| {
-            let message = Some(rejection.message());
-            match rejection.is_quota() {
-                true => CreateTableErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException { message },
-                ),
-                false => {
-                    CreateTableErrorModeled::ValidationException(ValidationException { message })
-                }
-            }
+            CreateTableErrorModeled::ValidationException(ValidationException {
+                message: Some(rejection.message()),
+            })
         };
         let tags = crate::state::new_tag_set(input.tags.as_deref()).map_err(to_tag_failure)?;
         // The stream is a resource of its own, so the tags the CDC specification applies

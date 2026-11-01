@@ -408,11 +408,10 @@ async fn a_specification_with_no_stream_to_tag_stores_nothing() {
     );
 }
 
-/// The per-resource tag quota bounds the set a disabling specification writes too, counted
+/// The per-resource tag limit bounds the set a disabling specification writes too, counted
 /// against the tags the stream ALREADY holds: the published limit
-/// ([`keyspaces::MAX_TAGS_PER_RESOURCE`]) is accepted, one past it is refused with the
-/// modelled quota error, and a refused update leaves both the stream and its tags exactly
-/// as they were.
+/// ([`keyspaces::MAX_TAGS_PER_RESOURCE`]) is accepted, one past it is refused as an invalid
+/// request, and a refused update leaves both the stream and its tags exactly as they were.
 #[tokio::test]
 async fn the_quota_counts_a_disabling_specifications_tags_against_the_streams_own() {
     let quota = keyspaces::MAX_TAGS_PER_RESOURCE;
@@ -455,7 +454,7 @@ async fn the_quota_counts_a_disabling_specifications_tags_against_the_streams_ow
                 );
             }
             false => {
-                assert_failure(case, got, 400, "ServiceQuotaExceededException");
+                assert_failure(case, got, 400, "ValidationException");
                 // Refused before anything was written: the stream is untouched, so it is
                 // still the capturing stream it was and still holds just its own tag.
                 let tags = listed_tags(&emulator, case, &stream_arn).await;

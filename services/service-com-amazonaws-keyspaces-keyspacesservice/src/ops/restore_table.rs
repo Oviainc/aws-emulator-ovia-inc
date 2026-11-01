@@ -290,15 +290,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some(supplied) => Some(
                 crate::state::new_tag_set(Some(supplied)).map_err(|rejection| {
-                    let message = Some(rejection.message());
-                    match rejection.is_quota() {
-                        true => RestoreTableErrorModeled::ServiceQuotaExceededException(
-                            ServiceQuotaExceededException { message },
-                        ),
-                        false => RestoreTableErrorModeled::ValidationException(
-                            ValidationException { message },
-                        ),
-                    }
+                    RestoreTableErrorModeled::ValidationException(ValidationException {
+                        message: Some(rejection.message()),
+                    })
                 })?,
             ),
         };

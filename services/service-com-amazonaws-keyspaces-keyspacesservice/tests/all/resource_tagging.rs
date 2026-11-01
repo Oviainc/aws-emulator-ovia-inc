@@ -18,8 +18,10 @@
 //!    this service mints an ARN for (a keyspace and a table), whether they were supplied
 //!    at create time or added afterwards.
 //! 3. A resource holds at most 50 tags ("You can add up to 50 tags to a single Amazon
-//!    Keyspaces resource", `Tag`); a call that would carry it past that is refused with
-//!    the modelled `ServiceQuotaExceededException`, and stores nothing.
+//!    Keyspaces resource", `Tag`); a call that would carry it past that is refused as an
+//!    invalid request (the modelled `ValidationException`), and stores nothing. The
+//!    sentence that refusal carries, and the same rule at the other operations that take
+//!    tags, are pinned by `tests/all/tag_count_limit_refusal.rs`.
 //! 4. `UntagResource` removes the tags its keys name and is idempotent on a key the
 //!    resource does not hold.
 //! 5. A `resourceArn` that names no stored resource is the modelled
@@ -45,7 +47,10 @@ const TABLE: &str = "tag_tbl";
 
 /// A `TagList` request member built from key/value pairs, in the order given — so a case
 /// can repeat a key and pin which value wins.
-fn tags_json<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Value {
+///
+/// Shared with `tests/all/tag_count_limit_refusal.rs`, so there is ONE builder of a tag
+/// list for the suites that send one rather than a copy per file.
+pub(crate) fn tags_json<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Value {
     Value::Array(
         pairs
             .iter()
@@ -336,8 +341,8 @@ async fn tags_supplied_at_create_are_the_ones_the_reader_reports() {
 }
 
 /// RULE 3: a resource holds at most [`keyspaces::MAX_TAGS_PER_RESOURCE`] tags, and a call
-/// that would carry it past that is refused with the modelled quota error while the tag
-/// set it would have changed stays exactly as it was.
+/// that would carry it past that is refused as an invalid request while the tag set it
+/// would have changed stays exactly as it was.
 ///
 /// The rows span the boundary from both sides and in both shapes the quota can be
 /// breached: in one call, and across calls. A row at the limit, and one that repeats keys
@@ -356,7 +361,8 @@ async fn tagging_past_the_published_per_resource_quota_is_refused_and_stores_not
         name: String,
         /// Calls that must be accepted, in order.
         accepted: Vec<Vec<(String, String)>>,
-        /// The call that must be refused with the modelled quota error, if the row has one.
+        /// The call that must be refused for the tag count it would leave, if the row has
+        /// one.
         refused: Option<Vec<(String, String)>>,
         /// How many tags the resource holds afterwards.
         expected_count: usize,
@@ -445,7 +451,7 @@ async fn tagging_past_the_published_per_resource_quota_is_refused_and_stores_not
                         )
                         .await,
                     400,
-                    "ServiceQuotaExceededException",
+                    "ValidationException",
                 );
             }
             let after = list_tags(&case_name, &emulator, resource_arn, None).await;
@@ -464,7 +470,9 @@ async fn tagging_past_the_published_per_resource_quota_is_refused_and_stores_not
     }
 
     // One past the MODELLED request bound (`TagList` len 1..60) is refused by the
-    // boundary validator the model drives, with 400 — a different rule from the quota.
+    // boundary validator the model drives, with the same 400 `ValidationException` the
+    // handler answers for a resulting set past the per-resource limit — a different rule,
+    // decided a stage earlier.
     let emulator = Emulator::start();
     let arns = with_resources(&emulator).await;
     for resource_arn in &arns {

@@ -232,19 +232,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `merge_tags` upserts by key and refuses BEFORE storing anything, so a refused
         // call leaves the resource's tags exactly as they were. The reserved-key refusal
         // was already decided above, on the request alone; what is left here is the
-        // per-resource tag quota (402 `ServiceQuotaExceededException`), which counts the
-        // tags the resource already holds and so cannot be decided before it is resolved
-        // — nor expressed in the model.
+        // per-resource tag count, which counts the tags the resource already holds and so
+        // cannot be decided before it is resolved — nor expressed in the model.
+        //
+        // A request asking for more tags than a resource may hold is a request the caller
+        // has to make smaller, so it is refused as a malformed request (400
+        // `ValidationException`) and not as the service-quota failure a client would read
+        // as "ask for more quota, then retry".
         crate::state::merge_tags(tags, &input.tags).map_err(|rejection| {
-            let message = Some(rejection.message());
-            match rejection.is_quota() {
-                true => TagResourceErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException { message },
-                ),
-                false => {
-                    TagResourceErrorModeled::ValidationException(ValidationException { message })
-                }
-            }
+            TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(rejection.message()),
+            })
         })?;
 
         Ok(TagResourceOutput {})

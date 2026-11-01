@@ -312,25 +312,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to a stream from now on, and (for one being created) which images it publishes.
         let cdc = crate::state::resolve_cdc(input.cdc_specification.as_ref());
         let to_tag_failure = |rejection: crate::state::TagRejection| -> UpdateTableError {
-            let message = Some(rejection.message());
-            match rejection.is_quota() {
-                true => UpdateTableErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException { message },
-                )
-                .into(),
-                false => {
-                    UpdateTableErrorModeled::ValidationException(ValidationException { message })
-                        .into()
-                }
-            }
+            UpdateTableErrorModeled::ValidationException(ValidationException {
+                message: Some(rejection.message()),
+            })
+            .into()
         };
 
         // A key the caller may not name is a property of the REQUEST alone, so the tags a
         // `cdcSpecification` applies to the stream are checked for one here, before the
         // store is reached: the same reserved key is refused the same way whether or not
-        // the table it names exists or is updatable. The stream's tag QUOTA is not
+        // the table it names exists or is updatable. The stream's tag COUNT is not
         // request-only — it counts the tags the stream and the table already hold — so it
-        // stays below, where both are known.
+        // stays below, where both are known (both are the same refusal either way).
         if let Some(cdc) = cdc.as_ref() {
             crate::state::reject_reserved_tag_keys(&cdc.tags).map_err(to_tag_failure)?;
         }

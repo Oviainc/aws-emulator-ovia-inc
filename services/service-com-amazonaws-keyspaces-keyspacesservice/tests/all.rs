@@ -108,6 +108,8 @@ mod state_roundtrip;
 mod static_columns_require_clustering_keys;
 #[path = "all/system_keyspace_table_catalog.rs"]
 mod system_keyspace_table_catalog;
+#[path = "all/tag_count_limit_refusal.rs"]
+mod tag_count_limit_refusal;
 #[path = "all/tagging_a_deleting_resource.rs"]
 mod tagging_a_deleting_resource;
 #[path = "all/type_lifecycle.rs"]

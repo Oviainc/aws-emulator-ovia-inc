@@ -68,7 +68,10 @@ fn tags_json(key: &str) -> Value {
 }
 
 /// The `message` of a failure body, whichever casing the protocol serialized it under.
-fn message_of(body: &Value) -> String {
+///
+/// Shared with `tests/all/tag_count_limit_refusal.rs`, so there is ONE reader of a
+/// refusal's sentence for the suites that assert one rather than a copy per file.
+pub(crate) fn message_of(body: &Value) -> String {
     ["message", "Message"]
         .iter()
         .find_map(|member| body.get(*member).and_then(Value::as_str))

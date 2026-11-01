@@ -187,15 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // applies the same ones `TagResource` does: at most
         // `MAX_TAGS_PER_RESOURCE` tags on the resource, no reserved key, one tag per key.
         let tags = crate::state::new_tag_set(input.tags.as_deref()).map_err(|rejection| {
-            let message = Some(rejection.message());
-            match rejection.is_quota() {
-                true => CreateKeyspaceErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException { message },
-                ),
-                false => {
-                    CreateKeyspaceErrorModeled::ValidationException(ValidationException { message })
-                }
-            }
+            CreateKeyspaceErrorModeled::ValidationException(ValidationException {
+                message: Some(rejection.message()),
+            })
         })?;
 
         let mut store = state.lock();
