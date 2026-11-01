@@ -194,6 +194,158 @@ pub fn engine_type_of(version: Option<&str>) -> &'static str {
     }
 }
 
+/// Every engine version a domain of this service can run, in upgrade order:
+/// the Elasticsearch versions the service offers, then the OpenSearch versions
+/// a domain can be moved onto.
+///
+/// The model constrains only the FORM of a version string
+/// (`ElasticsearchVersionString`'s pattern — `X.Y`, `OpenSearch_X.Y`, `OS_X.Y`),
+/// never which versions exist, so the supported set is named here ONCE and
+/// every version answer is derived from it rather than from a per-operation
+/// list.
+pub const SUPPORTED_ENGINE_VERSIONS: [&str; 31] = [
+    "1.5",
+    "2.3",
+    "5.1",
+    "5.3",
+    "5.5",
+    "5.6",
+    "6.0",
+    "6.2",
+    "6.3",
+    "6.4",
+    "6.5",
+    "6.7",
+    "6.8",
+    "7.1",
+    "7.4",
+    "7.7",
+    "7.8",
+    "7.9",
+    "7.10",
+    "OpenSearch_1.0",
+    "OpenSearch_1.1",
+    "OpenSearch_1.2",
+    "OpenSearch_1.3",
+    "OpenSearch_2.3",
+    "OpenSearch_2.5",
+    "OpenSearch_2.7",
+    "OpenSearch_2.9",
+    "OpenSearch_2.11",
+    "OpenSearch_2.13",
+    "OpenSearch_2.15",
+    "OpenSearch_2.17",
+];
+
+/// One version's place in the upgrade order: its lineage (Elasticsearch before
+/// OpenSearch — a domain moves from the one to the other and never back), then
+/// its major and its minor as numbers, so `7.10` sorts after `7.9` rather than
+/// before it.
+///
+/// `None` for a string outside the three forms the model's pattern admits.
+pub fn version_order(version: &str) -> Option<(u8, u32, u32)> {
+    let (lineage, number) = match version.split_once('_') {
+        Some(("OpenSearch" | "OS", number)) => (1u8, number),
+        Some(_) => return None,
+        None => (0u8, version),
+    };
+    let (major, minor) = number.split_once('.')?;
+    Some((lineage, major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// The supported set in upgrade order, each entry with its order key.
+fn ordered_versions() -> Vec<((u8, u32, u32), &'static str)> {
+    let mut catalog: Vec<((u8, u32, u32), &'static str)> = SUPPORTED_ENGINE_VERSIONS
+        .iter()
+        .filter_map(|version| version_order(version).map(|order| (order, *version)))
+        .collect();
+    catalog.sort_unstable();
+    catalog
+}
+
+/// The versions ONE in-place upgrade can move a domain running `version` onto,
+/// in upgrade order.
+///
+/// The service's upgrade paths step through the supported set: from any version
+/// a domain reaches every LATER supported version of its own major, and a major
+/// boundary is crossed only from the last supported version of a major, into
+/// the versions of the major that follows it — so the last supported 5.x
+/// reaches the 6.x versions, the last 6.x the 7.x ones, and the last
+/// Elasticsearch version the first OpenSearch major. A version the supported
+/// set does not carry is placed in the same order and answered by the same
+/// rule; a string outside the modelled forms reaches nothing.
+pub fn compatible_target_versions(version: &str) -> Vec<String> {
+    let Some(source) = version_order(version) else {
+        return Vec::new();
+    };
+    let catalog = ordered_versions();
+    let source_major = (source.0, source.1);
+
+    // The majors the supported set carries, in order, so "the major after this
+    // one" is a single step along that list.
+    let mut majors: Vec<(u8, u32)> = catalog
+        .iter()
+        .map(|((lineage, major, _), _)| (*lineage, *major))
+        .collect();
+    majors.dedup();
+
+    // The last supported version of the source's own major: only a domain
+    // sitting at or past it may cross into the next major.
+    let last_of_source_major = catalog
+        .iter()
+        .filter(|((lineage, major, _), _)| (*lineage, *major) == source_major)
+        .map(|(order, _)| *order)
+        .next_back();
+    let next_major = match last_of_source_major {
+        Some(last) if source >= last => majors
+            .iter()
+            .position(|major| *major == source_major)
+            .and_then(|at| majors.get(at + 1))
+            .copied(),
+        Some(_) => None,
+        // A major the supported set carries no version of at all: the boundary
+        // to cross is into the first supported major after it.
+        None => majors
+            .iter()
+            .find(|(lineage, major)| (*lineage, *major) > source_major)
+            .copied(),
+    };
+
+    catalog
+        .into_iter()
+        .filter(|(order, _)| {
+            let major = (order.0, order.1);
+            *order > source && (major == source_major || Some(major) == next_major)
+        })
+        .map(|(_, version)| version.to_string())
+        .collect()
+}
+
+/// One source version's `CompatibleVersionsMap`: the version a domain is on and
+/// the versions one upgrade reaches from it.
+pub fn compatible_versions_map(version: &str) -> CompatibleVersionsMap {
+    CompatibleVersionsMap {
+        source_version: Some(version.to_string()),
+        target_versions: Some(compatible_target_versions(version)),
+    }
+}
+
+/// Every supported version an upgrade can move a domain OFF, with the versions
+/// it reaches — what `GetCompatibleElasticsearchVersions` answers when the
+/// request names no domain. A version nothing is reachable from (the newest one)
+/// carries no entry, since it is the source of no upgrade.
+pub fn compatible_versions_catalog() -> Vec<CompatibleVersionsMap> {
+    SUPPORTED_ENGINE_VERSIONS
+        .iter()
+        .map(|version| compatible_versions_map(version))
+        .filter(|map| {
+            map.target_versions
+                .as_ref()
+                .is_some_and(|targets| !targets.is_empty())
+        })
+        .collect()
+}
+
 /// One configuration option as stored: its value plus the provenance the
 /// model's `OptionStatus` reports.
 #[derive(Debug, Clone)]
