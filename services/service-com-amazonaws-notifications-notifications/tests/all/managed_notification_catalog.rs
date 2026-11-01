@@ -7,10 +7,13 @@
 //! The ordering, paging and filtering of the listing are covered by
 //! `tests/all/managed_notification_configurations.rs`; this suite is about the
 //! catalog's CONTENTS and the rule they follow: the service publishes one entry
-//! per event-type category of every service whose events it covers, and each
-//! entry carries its OWN display `name` and prose `description` — neither of
-//! them a rendering of the arn's `category`/`sub-category` tokens, so a caller
-//! that renders `name` shows display text and not an arn segment.
+//! per event-type category of every service whose events it covers, each entry
+//! carrying its OWN display `name` and prose `description` — neither of them a
+//! rendering of the arn's `category`/`sub-category` tokens, so a caller that
+//! renders `name` shows display text and not an arn segment. Because nothing a
+//! caller does creates or removes a managed configuration, that published set
+//! and its text are the SAME for every account and every read: a fixed catalog,
+//! not a per-account or per-run value.
 //!
 //! Shape source for the bounds and the arn layout the rows below check:
 //! `smithy_query(query="shape",shape="ManagedNotificationConfigurationStructure,ManagedNotificationConfigurationName,ManagedNotificationConfigurationDescription,ManagedNotificationConfigurationOsArn",model_path="services/service-com-amazonaws-notifications-notifications/smithy-model/com-amazonaws-notifications-notifications.json")`.
@@ -27,20 +30,62 @@ const NAME_MAX: usize = 64;
 /// The published descriptions are prose, so each one is also asserted non-empty.
 const DESCRIPTION_MAX: usize = 256;
 
-/// The `category`/`sub-category` pairs the service publishes.
+/// The catalog the service publishes: `category`, `sub-category`, and the entry's
+/// own published `name` and `description`.
 ///
 /// Catalog source: the service's own published set, `MANAGED_NOTIFICATION_CATALOG`
 /// in `src/state.rs` — the model enumerates no entries (only their shape, see
 /// the module header's `smithy_query`), so this table is the published behaviour
 /// and the rows span every category the service covers rather than one of them.
-const PUBLISHED: &[(&str, &str)] = &[
-    ("AWS-Health", "Issue"),
-    ("AWS-Health", "AccountNotification"),
-    ("AWS-Health", "ScheduledChange"),
-    ("AWS-Health", "Investigation"),
-    ("AWS-Partner-Central", "PCProductListings"),
-    ("AWS-Partner-Central", "PCOffersAndAgreements"),
-    ("AWS-Partner-Central", "PCPaymentsAndDisbursements"),
+const PUBLISHED: &[(&str, &str, &str, &str)] = &[
+    (
+        "AWS-Health",
+        "Issue",
+        "Issues",
+        "AWS Health events reporting an issue that affects resources, services or regions you use, including the resources involved and the action to take.",
+    ),
+    (
+        "AWS-Health",
+        "AccountNotification",
+        "Account notifications",
+        "AWS Health events reporting account and service notifications for this account, including announcements, deprecations and changes that need your attention.",
+    ),
+    (
+        "AWS-Health",
+        "ScheduledChange",
+        "Scheduled changes",
+        "AWS Health events reporting a change scheduled against resources you use, including planned lifecycle events, maintenance windows and certificate rotations.",
+    ),
+    (
+        "AWS-Health",
+        "Investigation",
+        "Investigations",
+        "AWS Health events reporting an open investigation into possible impact on resources you use, published while the impact is still being confirmed.",
+    ),
+    (
+        "AWS-Partner-Central",
+        "PCProductListings",
+        "Product listings",
+        "Marketplace events related to your published AMI, container, and SaaS product catalog, including listing change set status, vulnerability scan findings, open product tasks, and Vendor Insights security profile snapshots.",
+    ),
+    (
+        "AWS-Partner-Central",
+        "PCOffersAndAgreements",
+        "Offers and Agreements",
+        "Marketplace events related to private offers, reseller activity, and post-acceptance agreement lifecycle, including offer publishing, acceptance, agreement creation, amendment, cancellation, compliance failures, and ISV entitlement events.",
+    ),
+    (
+        "AWS-Partner-Central",
+        "PCPaymentsAndDisbursements",
+        "Payments and disbursements",
+        "Marketplace events with payments and financial implications, including disbursement failures and pauses, payment failures, payment request rejections, billing adjustments on purchase agreements, and invoice submission outcomes.",
+    ),
+    (
+        "AWS-Partner-Central",
+        "PCAccountManagement",
+        "Account management",
+        "Marketplace events related to seller account standing, including business and bank account verification status.",
+    ),
 ];
 
 /// Every entry the unpaged listing answers, as `(arn, name, description)`.
@@ -87,14 +132,15 @@ async fn read_catalog_entry(emulator: &Emulator, arn: &str) -> (u16, Value) {
 }
 
 /// RULE: the catalog covers more than one service's events — one entry per
-/// event-type category of each covered service — so a caller enumerating it
-/// discovers every category the service publishes, not one category's worth.
+/// event-type category of each covered service — and each entry carries the
+/// `name` and `description` the service publishes for it, so a caller
+/// enumerating it discovers every category with the text AWS states for it.
 #[tokio::test]
 async fn the_catalog_spans_every_published_category() {
     let emulator = Emulator::new();
     let listed = listed_catalog(&emulator).await;
 
-    for (category, sub_category) in PUBLISHED {
+    for (category, sub_category, name, description) in PUBLISHED {
         let case = format!("{category}/{sub_category}");
         let suffix = format!(
             "managed-notification-configuration/category/{category}/sub-category/{sub_category}"
@@ -109,6 +155,18 @@ async fn the_catalog_spans_every_published_category() {
                 )
             });
 
+        // The published display text, which is the entry's own and the same for
+        // every account: no modelled operation creates, deletes or edits a
+        // managed configuration.
+        assert_eq!(
+            (found.1.as_str(), found.2.as_str()),
+            (*name, *description),
+            "case {case}: expected the published name {name:?} and description \
+             {description:?}, got {:?} and {:?}",
+            found.1,
+            found.2
+        );
+
         // The entry is readable by the arn the listing answered, and the read
         // reports the same display text the listing did.
         let (status, response) = read_catalog_entry(&emulator, &found.0).await;
@@ -118,15 +176,13 @@ async fn the_catalog_spans_every_published_category() {
         );
         assert_eq!(
             response["name"].as_str(),
-            Some(found.1.as_str()),
-            "case {case}: expected name {:?}, got {response:?}",
-            found.1
+            Some(*name),
+            "case {case}: expected name {name:?}, got {response:?}"
         );
         assert_eq!(
             response["description"].as_str(),
-            Some(found.2.as_str()),
-            "case {case}: expected description {:?}, got {response:?}",
-            found.2
+            Some(*description),
+            "case {case}: expected description {description:?}, got {response:?}"
         );
         assert_eq!(
             response["category"].as_str(),
@@ -158,6 +214,28 @@ async fn the_catalog_spans_every_published_category() {
         assert!(
             entries >= 2,
             "case {category}: a covered service publishes one entry per event-type category, got {entries}"
+        );
+
+        // And it publishes EXACTLY that service's categories: the published
+        // cluster of each covered service is the set above, so an entry that
+        // disappears from it, or one that appears without being published text
+        // of its own, fails here.
+        let expected: std::collections::BTreeSet<&str> = PUBLISHED
+            .iter()
+            .filter(|(published_category, _, _, _)| published_category == category)
+            .map(|(_, sub_category, _, _)| *sub_category)
+            .collect();
+        let found: std::collections::BTreeSet<String> = listed
+            .iter()
+            .filter_map(|(arn, _, _)| managed_configuration_arn_segments(arn))
+            .filter(|(listed_category, _)| listed_category == category)
+            .map(|(_, sub_category)| sub_category)
+            .collect();
+        let found_refs: std::collections::BTreeSet<&str> =
+            found.iter().map(String::as_str).collect();
+        assert_eq!(
+            found_refs, expected,
+            "case {category}: expected exactly the published event-type categories {expected:?}, got {found_refs:?}"
         );
     }
 }
@@ -235,4 +313,67 @@ async fn every_entry_carries_display_text_that_is_not_its_arn_segments() {
         unique,
         "case distinct names: every published entry carries its own name, got {names:?}"
     );
+}
+
+/// RULE: the catalog is FIXED — nothing a caller does creates, removes or edits a
+/// managed configuration, so every store publishes the same entries with the same
+/// text, whatever else has happened in it.
+#[tokio::test]
+async fn the_published_catalog_is_the_same_set_for_every_store() {
+    // Rows: a freshly booted store, the same store read again, a store that has
+    // had an unrelated configuration created and tagged in it, and a second,
+    // independently booted store — the catalog is the same in all of them, up to
+    // the account segment of the arn, which is the environment's.
+    let first = Emulator::new();
+    let baseline = tail_of(&listed_catalog(&first).await);
+
+    let repeated = tail_of(&listed_catalog(&first).await);
+    assert_eq!(
+        repeated, baseline,
+        "case repeated read: a read must not change the published catalog"
+    );
+
+    let body = serde_json::json!({
+        "name": "catalog-is-fixed",
+        "description": "an unrelated configuration",
+    });
+    let (status, created) = first
+        .send("POST", "/notification-configurations", Some(body))
+        .await;
+    assert_eq!(
+        status, 201,
+        "case unrelated write: create must answer 201, got {status} {created:?}"
+    );
+    let after_write = tail_of(&listed_catalog(&first).await);
+    assert_eq!(
+        after_write, baseline,
+        "case unrelated write: creating a configuration must not change the published catalog"
+    );
+
+    let second = Emulator::new();
+    let other_store = tail_of(&listed_catalog(&second).await);
+    assert_eq!(
+        other_store, baseline,
+        "case another store: every store publishes the same catalog"
+    );
+}
+
+/// Each listed entry as `(category/sub-category, name, description)` — the arn's
+/// account segment dropped, since that is the environment's value and not part of
+/// the published catalog.
+fn tail_of(listed: &[(String, String, String)]) -> Vec<(String, String, String)> {
+    let mut rows: Vec<(String, String, String)> = listed
+        .iter()
+        .map(|(arn, name, description)| {
+            let (category, sub_category) = managed_configuration_arn_segments(arn)
+                .unwrap_or_else(|| panic!("case {arn}: the arn must match the modelled pattern"));
+            (
+                format!("{category}/{sub_category}"),
+                name.clone(),
+                description.clone(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
 }

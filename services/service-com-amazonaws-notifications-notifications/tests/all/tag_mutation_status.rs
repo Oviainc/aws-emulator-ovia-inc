@@ -213,10 +213,12 @@ async fn a_successful_tag_mutation_answers_no_content() {
     }
 }
 
-/// RULE: an answer that carries no content states no length for it either, so a
-/// 204 answers with no `content-length` header at all.
+/// RULE: an answer that carries no content states the length that body has —
+/// zero — so a client framing by the stated length is not left waiting for a
+/// body. The whole framing rule, and what of it survives onto a socket, is
+/// `tests/all/no_content_framing.rs`.
 #[tokio::test]
-async fn a_no_content_answer_states_no_body_length() {
+async fn a_no_content_answer_states_its_empty_body_length() {
     let emulator = Emulator::new();
     let arn = emulator
         .create_configuration_for_status("status-framing")
@@ -253,8 +255,9 @@ async fn a_no_content_answer_states_no_body_length() {
             .get("content-length")
             .map(|value| String::from_utf8_lossy(value.as_bytes()).to_string());
         assert_eq!(
-            framing, None,
-            "case {case}: a no-content answer states no body length, got {framing:?}"
+            framing.as_deref(),
+            Some("0"),
+            "case {case}: a no-content answer states the zero length of its body, got {framing:?}"
         );
     }
 }

@@ -55,10 +55,20 @@
 //!
 //! [`Service::override_protocol`] below therefore serves a protocol that is the model's own
 //! in every respect except one: a `204` this service answers carries no body, whatever the
-//! serializer rendered for it, and so no header stating a length it does not have — which
-//! is also what that same section forbids on a 204. A response that carries content is left
-//! exactly as the model's protocol renders it. It is done here, at the one place every
-//! response of this service passes through, rather than per operation.
+//! serializer rendered for it, and states the length that body has — zero — so a client or
+//! intermediary that frames a bodyless answer by its stated length rather than by the
+//! status alone reads an explicitly empty message instead of one whose length it can only
+//! learn from the connection closing. A response that carries content is left exactly as
+//! the model's protocol renders it. It is done here, at the one place every response of
+//! this service passes through, rather than per operation.
+//!
+//! That stated length is the last word only up to the transport: the HTTP/1.1 writer the
+//! vendored listener is built on drops `content-length` from a `204` (RFC 9110 §8.6 forbids
+//! it there), and that writer is a dependency of the vendored HTTP layer rather than
+//! anything this crate decides — so a caller on the in-process front door (the
+//! inter-service callback path and the SDK connector, which both serve `dispatch`'s
+//! response unchanged) reads the stated length, while one on a socket reads the status and
+//! the empty body alone. See `tests/all/no_content_framing.rs`, which pins both.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -157,16 +167,30 @@ fn invalid_refusal(violations: &[Violation]) -> Option<Refused> {
 /// module docs.
 const NO_CONTENT_STATUS: u16 = 204;
 
-/// How an answer that carries no content is framed: with no body at all, and with no
-/// framing header stating a length it does not have. See the module docs.
+/// The header an answer states the length of its body in.
+const CONTENT_LENGTH: &str = "content-length";
+
+/// The length an answer with no body states: it has no bytes.
+const EMPTY_BODY_LENGTH: &str = "0";
+
+/// How an answer that carries no content is framed: with no body at all, and with the
+/// length of that nothing stated. See the module docs.
 ///
 /// A response that carries content is untouched: it keeps the body the protocol rendered
-/// and the framing that body already has.
+/// and the framing that body already has, and a length a renderer already stated is left
+/// alone so the one writer of it is whoever wrote it first. The insert is FALLIBLE: a
+/// header value the HTTP layer cannot represent is dropped rather than turned into a
+/// transport failure.
 fn frame_empty_body(response: &mut WireResponse) {
     if response.status().as_u16() == NO_CONTENT_STATUS {
         // The empty JSON object the serializer renders for an output structure with no
         // members goes no further: this status has no content to carry it.
         *response.body_mut() = aws_smithy_types::body::SdkBody::empty();
+        if response.headers().get(CONTENT_LENGTH).is_none() {
+            let _ = response
+                .headers_mut()
+                .try_insert(CONTENT_LENGTH, EMPTY_BODY_LENGTH);
+        }
     }
 }
 
@@ -342,7 +366,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Every response a modelled operation of this service produces is serialized by
         // the protocol returned here. See the module docs: it is the model's own protocol,
         // with one correction — an answer that carries no content carries no body and
-        // states `content-length: 0`, instead of an empty JSON object and no framing
+        // states `content-length: 0`, instead of an empty JSON object with no framing
         // header at all.
         Some(self)
     }

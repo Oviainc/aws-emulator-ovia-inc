@@ -29,6 +29,8 @@ mod harness;
 mod managed_notification_catalog;
 #[path = "all/managed_notification_configurations.rs"]
 mod managed_notification_configurations;
+#[path = "all/no_content_framing.rs"]
+mod no_content_framing;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
 #[path = "all/notification_configurations.rs"]

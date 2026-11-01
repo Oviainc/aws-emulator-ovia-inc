@@ -37,6 +37,14 @@ impl Emulator {
         Self { router, engine }
     }
 
+    /// This emulator's router, for a suite that serves it on a real socket
+    /// (`emulator_server::serve_on_ephemeral_port`) instead of dispatching
+    /// in-process. Consuming, so one emulator is either dispatched through or
+    /// served, never both at once.
+    pub(crate) fn into_router(self) -> MultiServiceRouter {
+        self.router
+    }
+
     /// Send one request and return its status and parsed JSON body (`Value::Null`
     /// for an empty body).
     pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {

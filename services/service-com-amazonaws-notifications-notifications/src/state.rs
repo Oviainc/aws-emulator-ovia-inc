@@ -652,8 +652,11 @@ struct PublishedManagedNotification {
 /// each with one entry per event-type category of that service: `AWS-Health`
 /// (whose sub-categories are AWS Health's own event type categories) and
 /// `AWS-Partner-Central` (whose sub-categories are the AWS Marketplace seller
-/// notification categories). A category is published for every account, since
-/// nothing a caller does creates or removes one.
+/// notification categories — product listings, offers and agreements, payments
+/// and disbursements, and seller account management). A category is published
+/// for every account, since nothing a caller does creates or removes one — the
+/// catalog is the same fixed set for every account, so an entry's arn, name and
+/// description are published values rather than per-account or per-run ones.
 const MANAGED_NOTIFICATION_CATALOG: &[PublishedManagedNotification] = &[
     PublishedManagedNotification {
         category: "AWS-Health",
@@ -689,13 +692,19 @@ const MANAGED_NOTIFICATION_CATALOG: &[PublishedManagedNotification] = &[
         category: "AWS-Partner-Central",
         sub_category: "PCOffersAndAgreements",
         name: "Offers and Agreements",
-        description: "Marketplace events related to your offers and the agreements buyers hold with you, including offer creation and expiry, and agreement acceptance, renewal and cancellation.",
+        description: "Marketplace events related to private offers, reseller activity, and post-acceptance agreement lifecycle, including offer publishing, acceptance, agreement creation, amendment, cancellation, compliance failures, and ISV entitlement events.",
     },
     PublishedManagedNotification {
         category: "AWS-Partner-Central",
         sub_category: "PCPaymentsAndDisbursements",
         name: "Payments and disbursements",
-        description: "Marketplace events related to the money you are owed and paid, including disbursement status, buyer payment and invoice events, and changes to your bank or tax settings.",
+        description: "Marketplace events with payments and financial implications, including disbursement failures and pauses, payment failures, payment request rejections, billing adjustments on purchase agreements, and invoice submission outcomes.",
+    },
+    PublishedManagedNotification {
+        category: "AWS-Partner-Central",
+        sub_category: "PCAccountManagement",
+        name: "Account management",
+        description: "Marketplace events related to seller account standing, including business and bank account verification status.",
     },
 ];
 
