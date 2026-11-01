@@ -17,9 +17,9 @@
 //! it was taken. `GetAutoSnapshots` reports exactly those copies for the one
 //! instance or disk the request names, together with that resource's own
 //! `ResourceType`: an empty list for a resource no copy has been taken of, the
-//! copies themselves for one that has them, nothing for a resource the account
-//! no longer holds (an automatic snapshot has no identity apart from the
-//! resource it was taken of), and the service's `DoesNotExist` envelope for a
+//! copies themselves for one that has them, nothing for a name that addresses no
+//! copies of this account — a resource it no longer holds whose add-ons a delete
+//! was asked to delete with it — and the service's `DoesNotExist` envelope for a
 //! name that is neither an instance nor a disk. Only the CLOCK takes a copy: a
 //! read reports what is held and never takes one.
 
@@ -599,10 +599,11 @@ async fn disabling_and_re_enabling_the_add_on_keeps_the_one_copy_of_the_day() {
     );
 }
 
-/// An automatic snapshot has no identity apart from the resource it was taken
-/// of, so a delete takes the copies with it: the name answers nothing while no
-/// resource holds it, and a resource created under the same name afterwards
-/// starts with none.
+/// A delete ASKED to delete the resource's add-ons (`forceDeleteAddOns`) takes
+/// the copies the add-on took with it: the name answers nothing afterwards, and
+/// a resource created under the same name starts with none. What a delete that
+/// was NOT asked does instead is pinned by
+/// [`crate::auto_snapshot_add_on_delete`].
 #[tokio::test]
 async fn a_deleted_resource_takes_its_automatic_snapshots_with_it() {
     let emulator = Emulator::new();
@@ -643,7 +644,9 @@ async fn a_deleted_resource_takes_its_automatic_snapshots_with_it() {
             "case {case:?}: expected the add-on's copy before the delete, got {taken:?}"
         );
 
-        emulator.ok(delete, json!({*member: name})).await;
+        emulator
+            .ok(delete, json!({*member: name, "forceDeleteAddOns": true}))
+            .await;
         let (status, answered) = emulator
             .call("GetAutoSnapshots", json!({"resourceName": name}))
             .await;

@@ -896,6 +896,21 @@ pub const MAX_RELATIONAL_DATABASE_SNAPSHOTS: usize = 500;
 /// `GetAutoSnapshots` make over one resource's copies.
 pub const MAX_AUTO_SNAPSHOTS_PER_RESOURCE: usize = 7;
 
+/// The most resources this emulator holds KEPT automatic snapshots of — copies
+/// a delete left in the account because it was not asked to delete the
+/// resource's add-ons, so the resource they were taken of is gone and the copies
+/// are not.
+///
+/// Emulator resource guard, not a refusal: nobody asks for an automatic
+/// snapshot, so there is no request to refuse — the copies kept longest ago drop
+/// out once a further delete would take the store past this, exactly as the
+/// oldest entry drops out of the operation log ([`MAX_OPERATION_HISTORY`]). It
+/// is also what keeps the walk
+/// [`ComAmazonawsLightsailLightsail20161128State::advance_clock`] makes over the
+/// schedules bounded once a resource no longer has to be held for its copies to
+/// be.
+pub const MAX_KEPT_AUTO_SNAPSHOT_SOURCES: usize = 500;
+
 /// The most export snapshot records this emulator will hold.
 ///
 /// Emulator resource guard, NOT an AWS quota: every `ExportSnapshot` call adds a
@@ -6603,6 +6618,23 @@ impl StoredAutoSnapshot {
     }
 }
 
+/// What a delete recorded about the resource a set of automatic snapshots was
+/// taken of, once that resource's own record is gone.
+///
+/// A delete that is not asked to delete the resource's add-ons leaves the copies
+/// the add-on took in the account, and the record that said where that resource
+/// was is no longer there to ask — so what a later call still needs of it is
+/// recorded here.
+#[derive(Debug, Clone)]
+pub struct KeptAutoSnapshotSource {
+    /// The instant the resource's record was removed, which is what orders one
+    /// account's kept copies against [`MAX_KEPT_AUTO_SNAPSHOT_SOURCES`].
+    pub removed_at_ms: i64,
+    /// Where that resource was: what an operation logged against one of these
+    /// copies is located at, exactly as it was while the resource was held.
+    pub location: StoredLocation,
+}
+
 /// What the `AutoSnapshot` add-on of one resource has taken, and when it next
 /// takes a copy.
 #[derive(Debug, Default)]
@@ -6615,6 +6647,11 @@ pub struct StoredAutoSnapshots {
     /// the order `GetAutoSnapshots` reports them in. At most
     /// [`MAX_AUTO_SNAPSHOTS_PER_RESOURCE`] of them.
     pub taken: Vec<StoredAutoSnapshot>,
+    /// Set once the resource these copies were taken of has been deleted and the
+    /// copies were KEPT, which is what a delete that was not asked to delete the
+    /// resource's add-ons does. `None` for as long as this account holds that
+    /// resource, whose own record is then what says where it is.
+    pub kept_source: Option<KeptAutoSnapshotSource>,
 }
 
 impl StoredAutoSnapshots {
@@ -14116,6 +14153,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
         let name = instance.name.clone();
         let created_at_ms = instance.created_at_ms;
         let hour = enabled_auto_snapshot_hour(&instance.add_ons);
+        self.discard_kept_auto_snapshots(&name);
         self.instances.insert(name.clone(), instance);
         self.reconcile_auto_snapshots(created_at_ms, RESOURCE_TYPE_INSTANCE, &name, hour.as_deref());
     }
@@ -14191,6 +14229,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
         let name = disk.name.clone();
         let created_at_ms = disk.created_at_ms;
         let hour = enabled_auto_snapshot_hour(&disk.add_ons);
+        self.discard_kept_auto_snapshots(&name);
         self.disks.insert(name.clone(), disk);
         self.reconcile_auto_snapshots(created_at_ms, RESOURCE_TYPE_DISK, &name, hour.as_deref());
     }
@@ -14215,14 +14254,19 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// [`Self::remove_instance`], whose resource other records do hold
     /// attachments to. A snapshot taken of the disk is a resource of its own and
     /// keeps the source name and ARN it recorded, so it outlives the disk.
-    pub fn remove_disk(&mut self, name: &str) -> Option<StoredDisk> {
-        // An automatic snapshot is not a resource of its own: it has no name,
-        // and it is addressed through the disk it was taken of, so it cannot
-        // outlive that disk the way a disk snapshot — a record of its own, with
-        // its own name and ARN — does.
-        self.auto_snapshots
-            .remove(&(RESOURCE_TYPE_DISK, name.to_string()));
-        self.disks.remove(name)
+    ///
+    /// `delete_add_ons` says the delete was asked to delete the disk's add-ons
+    /// with it, which is what decides the fate of the copies the disk's add-on
+    /// took — see [`Self::settle_auto_snapshots_of_removed`].
+    pub fn remove_disk(&mut self, name: &str, delete_add_ons: bool) -> Option<StoredDisk> {
+        let disk = self.disks.remove(name)?;
+        self.settle_auto_snapshots_of_removed(
+            RESOURCE_TYPE_DISK,
+            name,
+            &disk.location,
+            delete_add_ons,
+        );
+        Some(disk)
     }
 
     /// The instance `name` names as the modelled `Instance`, with every block
@@ -14308,24 +14352,17 @@ impl ComAmazonawsLightsailLightsail20161128State {
 
     /// The automatic snapshots this store holds of the resource `name` names,
     /// together with the `ResourceType` that resource reports — what
-    /// `GetAutoSnapshots` answers for it. `None` when this account holds no
-    /// instance or disk of that name.
+    /// `GetAutoSnapshots` answers for it. `None` when that name addresses no
+    /// automatic snapshots of this account at all.
     ///
-    /// ONE name addresses one resource, and the resources an automatic snapshot
-    /// is taken of are the ones the `AutoSnapshot` add-on describes — "an Amazon
-    /// Lightsail instance or disk" — so this asks the same two maps the add-on
-    /// resolution does ([`Self::with_add_on_record`]), in the same order. A
-    /// resource whose add-on has never been enabled holds no copy, which is an
-    /// EMPTY list rather than a refusal: the resource exists, and the answer is
-    /// that nothing has been copied of it.
+    /// The name is resolved as every operation that addresses a resource's
+    /// automatic snapshots resolves one ([`Self::auto_snapshot_source`]), so a
+    /// delete that kept a resource's copies kept them reportable under the name
+    /// they were taken under. A resource whose add-on has never been enabled
+    /// holds no copy, which is an EMPTY list rather than a refusal: the resource
+    /// exists, and the answer is that nothing has been copied of it.
     pub fn auto_snapshots_of(&self, name: &str) -> Option<(&'static str, Vec<AutoSnapshotDetails>)> {
-        let resource_type = if self.instances.contains_key(name) {
-            RESOURCE_TYPE_INSTANCE
-        } else if self.disks.contains_key(name) {
-            RESOURCE_TYPE_DISK
-        } else {
-            return None;
-        };
+        let (resource_type, _) = self.auto_snapshot_source(name)?;
         let reported = self
             .auto_snapshots
             .get(&(resource_type, name.to_string()))
@@ -14371,34 +14408,28 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// Remove the automatic snapshot of the resource `name` names that was taken
-    /// on `date`. `None` when this account holds no instance or disk of that
-    /// name.
+    /// on `date`. `None` when that name addresses no automatic snapshots of this
+    /// account at all.
     ///
     /// A copy is addressed by the resource it was taken of plus its DATE — it
     /// has no name and no ARN of its own — and the add-on takes one copy a day,
-    /// so the date identifies exactly one of a resource's copies. The resource is
-    /// resolved from the same two maps, in the same order, as every other
-    /// operation that addresses an automatic snapshot
-    /// ([`Self::auto_snapshots_of`]).
+    /// so the date identifies exactly one of a resource's copies. The name is
+    /// resolved as every other operation that addresses an automatic snapshot
+    /// resolves it ([`Self::auto_snapshot_source`]), so a copy a delete kept is
+    /// deletable under the name it was taken under.
     ///
     /// Removing a copy takes nothing else with it: the other copies stay, and
     /// the schedule keeps the instant its next copy falls due, so a deletion
     /// neither stops the add-on nor makes it take a replacement. A resource left
-    /// holding no copy and owed none — its add-on is disabled — holds no
+    /// holding no copy and owed none — its add-on is disabled, or the resource
+    /// itself is gone and this was the last copy a delete kept of it — holds no
     /// schedule either, exactly as it did before the add-on was ever enabled.
     pub fn delete_auto_snapshot(
         &mut self,
         name: &str,
         date: &str,
     ) -> Option<AutoSnapshotDeletion> {
-        let (resource_type, location) = if let Some(instance) = self.instances.get(name) {
-            (RESOURCE_TYPE_INSTANCE, instance.location.clone())
-        } else {
-            // The other resource type the add-on applies to; a name that is
-            // neither names no resource at all.
-            let disk = self.disks.get(name)?;
-            (RESOURCE_TYPE_DISK, disk.location.clone())
-        };
+        let (resource_type, location) = self.auto_snapshot_source(name)?;
         let key = (resource_type, name.to_string());
         let found = self
             .auto_snapshots
@@ -14493,6 +14524,131 @@ impl ComAmazonawsLightsailLightsail20161128State {
             &self.disks.get(name)?.add_ons
         };
         enabled_auto_snapshot_hour(add_ons)
+    }
+
+    /// Settle the automatic snapshots of the resource `name` of kind
+    /// `resource_type`, whose record a delete has just removed from `location`,
+    /// where `delete_add_ons` says that delete was asked to delete the
+    /// resource's add-ons with it.
+    ///
+    /// The add-on itself lives on the resource's record, so it goes with that
+    /// record either way; what the request decides is the fate of what the
+    /// add-on PRODUCED. A delete asked for the add-ons takes the copies with
+    /// them. A delete that was not asked KEEPS them — nothing asked for them to
+    /// be deleted — and stops the schedule: no further copy is owed of a
+    /// resource this account no longer holds, and the copies that are left stay
+    /// addressed by the name they were taken under
+    /// ([`Self::auto_snapshot_source`]) until something deletes them
+    /// ([`Self::delete_auto_snapshot`]), or a new resource takes that name over
+    /// ([`Self::discard_kept_auto_snapshots`]).
+    ///
+    /// A resource whose add-on took no copy leaves nothing behind either way:
+    /// an empty schedule that is owed nothing is not held, exactly as it is not
+    /// held before the add-on is ever enabled.
+    fn settle_auto_snapshots_of_removed(
+        &mut self,
+        resource_type: &'static str,
+        name: &str,
+        location: &StoredLocation,
+        delete_add_ons: bool,
+    ) {
+        let key = (resource_type, name.to_string());
+        if delete_add_ons {
+            self.auto_snapshots.remove(&key);
+            return;
+        }
+        let Some(schedule) = self.auto_snapshots.get_mut(&key) else {
+            return;
+        };
+        schedule.due_at_ms = None;
+        if schedule.taken.is_empty() {
+            self.auto_snapshots.remove(&key);
+            return;
+        }
+        schedule.kept_source = Some(KeptAutoSnapshotSource {
+            removed_at_ms: now_ms(),
+            location: location.clone(),
+        });
+        self.drop_oldest_kept_auto_snapshots();
+    }
+
+    /// Drop the kept copies of the resources removed longest ago until this
+    /// store holds no more than [`MAX_KEPT_AUTO_SNAPSHOT_SOURCES`] resources'
+    /// worth of them.
+    fn drop_oldest_kept_auto_snapshots(&mut self) {
+        let mut kept: Vec<(i64, (&'static str, String))> = self
+            .auto_snapshots
+            .iter()
+            .filter_map(|(key, schedule)| {
+                Some((schedule.kept_source.as_ref()?.removed_at_ms, key.clone()))
+            })
+            .collect();
+        if kept.len() <= MAX_KEPT_AUTO_SNAPSHOT_SOURCES {
+            return;
+        }
+        kept.sort();
+        let excess = kept.len() - MAX_KEPT_AUTO_SNAPSHOT_SOURCES;
+        for (_, key) in kept.into_iter().take(excess) {
+            self.auto_snapshots.remove(&key);
+        }
+    }
+
+    /// Discard every automatic snapshot kept under the name `name`, called as a
+    /// resource is stored under that name.
+    ///
+    /// A copy is addressed by the name of the resource it was taken of, and a
+    /// resource created under that name takes the name over: the copies kept
+    /// under it were taken of a resource this account no longer holds, so they
+    /// are not this one's, and a resource starts out with the copies its own
+    /// add-on has taken — none. Both kinds the add-on applies to are discarded,
+    /// whichever kind the new resource is: a name is unique per resource type,
+    /// so copies kept of an instance would otherwise sit behind a disk created
+    /// under the same name and come back when that disk went. A schedule the
+    /// account still holds the resource of is left exactly as it is, which is
+    /// what keeps a resource's own copies across the writes that re-store its
+    /// record.
+    fn discard_kept_auto_snapshots(&mut self, name: &str) {
+        for resource_type in [RESOURCE_TYPE_INSTANCE, RESOURCE_TYPE_DISK] {
+            let key = (resource_type, name.to_string());
+            if self
+                .auto_snapshots
+                .get(&key)
+                .is_some_and(|schedule| schedule.kept_source.is_some())
+            {
+                self.auto_snapshots.remove(&key);
+            }
+        }
+    }
+
+    /// The kind of resource the name `name` addresses automatic snapshots of,
+    /// and where that resource is: an instance or a block storage disk this
+    /// account holds, or — once a delete has kept its copies — the resource
+    /// those copies were taken of.
+    ///
+    /// ONE name addresses one resource, and the resources an automatic snapshot
+    /// is taken of are the ones the `AutoSnapshot` add-on describes ("an Amazon
+    /// Lightsail instance or disk"), so this asks the same two maps the add-on
+    /// resolution does ([`Self::with_add_on_record`]), in the same order, and
+    /// then the copies kept under that name. The ONE place an operation that
+    /// addresses a resource's automatic snapshots resolves the name, so the same
+    /// name finds the same copies at whichever of those doors it arrives.
+    fn auto_snapshot_source(&self, name: &str) -> Option<(&'static str, StoredLocation)> {
+        if let Some(instance) = self.instances.get(name) {
+            return Some((RESOURCE_TYPE_INSTANCE, instance.location.clone()));
+        }
+        if let Some(disk) = self.disks.get(name) {
+            return Some((RESOURCE_TYPE_DISK, disk.location.clone()));
+        }
+        [RESOURCE_TYPE_INSTANCE, RESOURCE_TYPE_DISK]
+            .into_iter()
+            .find_map(|resource_type| {
+                let kept = self
+                    .auto_snapshots
+                    .get(&(resource_type, name.to_string()))?
+                    .kept_source
+                    .as_ref()?;
+                Some((resource_type, kept.location.clone()))
+            })
     }
 
     /// The disk snapshot `name` names, for a reporting operation.
@@ -14741,13 +14897,22 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// through [`Self::monitored_resource`]), and a resource this account no
     /// longer holds is not one of them — so the removal and the release are
     /// one step, and no read can observe a reference to a record that is gone.
-    pub fn remove_instance(&mut self, name: &str) -> Option<RemovedInstance> {
+    /// `delete_add_ons` says the delete was asked to delete the instance's
+    /// add-ons with it, which is what decides the fate of the copies the
+    /// instance's add-on took — see
+    /// [`Self::settle_auto_snapshots_of_removed`].
+    pub fn remove_instance(
+        &mut self,
+        name: &str,
+        delete_add_ons: bool,
+    ) -> Option<RemovedInstance> {
         let instance = self.instances.remove(name)?;
-        // The instance's automatic snapshots go with it, for the reason spelled
-        // out on [`Self::remove_disk`]: they are addressed through the instance
-        // and have no identity without it.
-        self.auto_snapshots
-            .remove(&(RESOURCE_TYPE_INSTANCE, name.to_string()));
+        self.settle_auto_snapshots_of_removed(
+            RESOURCE_TYPE_INSTANCE,
+            name,
+            &instance.location,
+            delete_add_ons,
+        );
         let released_attachments = self.release_attachments_to_instance(name);
         Some(RemovedInstance {
             instance,

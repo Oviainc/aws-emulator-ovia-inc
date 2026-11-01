@@ -5,6 +5,12 @@
 //! attachment, access grant and alarm another stored resource held to it, and
 //! appends the operations that record the removal and each release.
 //!
+//! `forceDeleteAddOns` is what decides whether the instance's add-ons go with
+//! it: a delete asked for them takes the automatic snapshots the instance's
+//! add-on had taken with the record, and a delete that was not asked leaves
+//! those copies in the account, reportable and deletable under the name they
+//! were taken under.
+//!
 //! The delete is refused while a distribution of this account still pulls its
 //! content from the instance: a distribution's origin names a resource the
 //! account holds, so a delete that would leave one pulling from an instance that
@@ -169,12 +175,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         let name = input.instance_name;
-        // `forceDeleteAddOns` asks for the instance's add-ons to go with it. An
-        // add-on lives on the instance record, so removing the record removes
-        // them whatever the flag says; the only thing an add-on leaves behind is
-        // its automatic snapshots, and snapshots are not part of this slice, so
-        // there is nothing further for the flag to delete.
-        let _ = input.force_delete_add_ons;
+        // `forceDeleteAddOns` is "a Boolean value to indicate whether to delete
+        // all add-ons for the instance". The add-on's own record lives on the
+        // instance record, so it goes with it whatever the flag says; what the
+        // flag decides is the fate of what the add-on PRODUCED — the automatic
+        // snapshots its schedule took of the instance, which this account holds
+        // and `GetAutoSnapshots` reports. A request that does not ask for the
+        // add-ons to be deleted keeps those copies.
+        let delete_add_ons = input.force_delete_add_ons.unwrap_or(false);
         let now = crate::state::now_ms();
 
         crate::state::with_state(&*self.engine, |store| {
@@ -217,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The release is part of the same step, so no read can observe an
             // attachment to, an access held by, or an alarm watching, an
             // instance this account no longer holds.
-            let Some(deleted) = store.remove_instance(&name) else {
+            let Some(deleted) = store.remove_instance(&name, delete_add_ons) else {
                 return Err(not_found(&name));
             };
             // The record is gone as this call returns, so the work this operation

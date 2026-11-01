@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDisk
+//! Removes the stored block storage disk, which is served only while nothing
+//! holds it, and appends the operation that records the removal.
+//!
+//! `forceDeleteAddOns` is what decides whether the disk's add-ons go with it: a
+//! delete asked for them takes the automatic snapshots the disk's add-on had
+//! taken with the record, and a delete that was not asked leaves those copies in
+//! the account, reportable and deletable under the name they were taken under.
 //!
 //! ## Shape of an operation
 //!
@@ -164,12 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         let name = input.disk_name;
-        // `forceDeleteAddOns` asks for the disk's add-ons to go with it. An add-on
-        // lives on the disk record, so removing the record removes them whatever
-        // the flag says; the only thing a disk add-on leaves behind is the
-        // automatic snapshots it took, and those are not part of this slice, so
-        // there is nothing further for the flag to delete.
-        let _ = input.force_delete_add_ons;
+        // `forceDeleteAddOns` is "a Boolean value to indicate whether to delete
+        // all add-ons for the disk". The add-on's own record lives on the disk
+        // record, so it goes with it whatever the flag says; what the flag
+        // decides is the fate of what the add-on PRODUCED — the automatic
+        // snapshots its schedule took of the disk, which this account holds and
+        // `GetAutoSnapshots` reports. A request that does not ask for the
+        // add-ons to be deleted keeps those copies.
+        let delete_add_ons = input.force_delete_add_ons.unwrap_or(false);
         let now = crate::state::now_ms();
 
         crate::state::with_state(&*self.engine, |store| {
@@ -194,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let removed = store
-                .remove_disk(&name)
+                .remove_disk(&name, delete_add_ons)
                 .expect("the disk was resolved from this same store above");
             // The record is gone as this call returns — the modelled `DiskState`
             // carries no value for a disk being deleted, so there is no state left

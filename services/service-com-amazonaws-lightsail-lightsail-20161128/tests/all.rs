@@ -29,6 +29,8 @@ mod alarm_configuration;
 mod alarm_load_balancer;
 #[path = "all/alarm_state_test.rs"]
 mod alarm_state_test;
+#[path = "all/auto_snapshot_add_on_delete.rs"]
+mod auto_snapshot_add_on_delete;
 #[path = "all/auto_snapshot_delete.rs"]
 mod auto_snapshot_delete;
 #[path = "all/auto_snapshots.rs"]
