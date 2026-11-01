@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSequenceStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSequenceStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSequenceStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a sequence store and PERSISTS it in [`crate::state`]: this handler mints the
+//! ten-digit numeric id and the ARN, stores every member the request carried (plus the
+//! documented `eTagAlgorithmFamily` default), and answers from that record. `clientToken`
+//! is this operation's `@idempotencyToken`, so a replay of the same token answers with
+//! the store the first call created.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +198,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSequenceStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSequenceStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSequenceStore"))
+        // Every string length and pattern on this input, and the
+        // `propagatedSetLevelTags` 0..50 size, are modelled constraints the centralized
+        // walk has already refused anything outside of. The `tags` map carries NO
+        // modelled length, so its bound is checked here, under the one rule every
+        // tag-storing operation in this crate applies.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            CreateSequenceStoreErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics sequence store registry is unavailable".to_string(),
+            })
+        })?;
+
+        if let Some(why) = crate::state::tag_bounds_rejection(input.tags.as_ref()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                None,
+            );
+            return Err(CreateSequenceStoreErrorModeled::ValidationException(
+                ValidationException { message: why },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now_ms = crate::state::now_epoch_millis();
+
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // A replayed idempotency token answers with the store the first call created:
+        // same id, same ARN, same creation time, and the status that record holds now.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(key) =
+                registry.replayed(crate::state::IdempotencyScope::CreateSequenceStore, token)
+            {
+                let store = registry.sequence_stores.get(&key).ok_or_else(|| {
+                    crate::state::audit(
+                        Self::NAME,
+                        ctx,
+                        crate::state::AuditOutcome::StoreUnavailable,
+                        None,
+                    );
+                    CreateSequenceStoreErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message:
+                                "the sequence store this clientToken created is no longer held"
+                                    .to_string(),
+                        },
+                    )
+                })?;
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NoChange,
+                    Some(&store.id),
+                );
+                return Ok(reported(store));
+            }
+        }
+
+        // The registry is finite: a create that would take it past its cap is refused
+        // rather than growing it, the way the service refuses one past its quota.
+        if registry.sequence_stores.len() >= crate::state::MAX_SEQUENCE_STORES {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::QuotaExceeded,
+                None,
+            );
+            return Err(
+                CreateSequenceStoreErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} sequence stores",
+                            crate::state::MAX_SEQUENCE_STORES
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let (key, id) = registry.next_sequence_store_id();
+        let store = crate::state::SequenceStore {
+            arn: crate::state::sequence_store_arn(&region, &id),
+            id: id.clone(),
+            name: input.name,
+            description: input.description,
+            // What the caller declared is what is stored: this emulator resolves no KMS
+            // key, so no key ARN is invented for a create that named none.
+            sse_config: input.sse_config,
+            fallback_location: input.fallback_location,
+            e_tag_algorithm_family: input
+                .e_tag_algorithm_family
+                .unwrap_or_else(|| crate::state::DEFAULT_E_TAG_ALGORITHM_FAMILY.to_string()),
+            propagated_set_level_tags: input.propagated_set_level_tags,
+            access_log_location: input
+                .s3_access_config
+                .and_then(|config| config.access_log_location),
+            // A newly created store is not usable yet, so it starts in the modelled
+            // non-terminal `CREATING` and owes the clock its move to `ACTIVE`; a caller
+            // that reads it straight away still observes `CREATING`.
+            status: crate::state::SEQUENCE_STORE_STATUS_CREATING.to_string(),
+            status_message: None,
+            creation_time_ms: now_ms,
+            // A create is not an update, so nothing has changed this record yet.
+            update_time_ms: None,
+            status_due_at_ms: Some(now_ms + crate::state::TRANSITION_DELAY.as_millis() as i64),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+        let response = reported(&store);
+        registry.sequence_stores.insert(key, store);
+        // `clientToken` is optional, so only a request that presented one can be
+        // deduped; nothing is remembered for a request that carried none.
+        if let Some(token) = input.client_token {
+            registry.remember(
+                crate::state::IdempotencyScope::CreateSequenceStore,
+                token,
+                key,
+            );
+        }
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::SequenceStoreCreated,
+            Some(&id),
+        );
+
+        Ok(response)
+    }
+}
+
+/// This operation's response for `store`, read from the stored record alone, so a fresh
+/// create and a replayed `clientToken` answer with exactly the same members.
+fn reported(store: &crate::state::SequenceStore) -> CreateSequenceStoreOutput {
+    CreateSequenceStoreOutput {
+        id: store.id.clone(),
+        arn: store.arn.clone(),
+        name: Some(store.name.clone()),
+        description: store.description.clone(),
+        sse_config: store.sse_config.clone(),
+        creation_time: crate::state::timestamp(store.creation_time_ms),
+        fallback_location: store.fallback_location.clone(),
+        e_tag_algorithm_family: Some(store.e_tag_algorithm_family.clone()),
+        status: Some(store.status.clone()),
+        status_message: store.status_message.clone(),
+        propagated_set_level_tags: store.propagated_set_level_tags.clone(),
+        s3_access: store.s3_access_output(),
     }
 }

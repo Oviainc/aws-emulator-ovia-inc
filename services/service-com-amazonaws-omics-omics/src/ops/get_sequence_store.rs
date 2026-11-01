@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSequenceStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSequenceStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSequenceStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored sequence store [`crate::state`] holds under the requested id, or
+//! the modelled `ResourceNotFoundException` when it holds none. Reporting only: the one
+//! thing it changes is the `CREATING` -> `ACTIVE` move the clock already owed, which was
+//! due at the same instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +165,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSequenceStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSequenceStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSequenceStore"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            GetSequenceStoreErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics sequence store registry is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        let store = registry.sequence_store(&input.id).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.id),
+            );
+            GetSequenceStoreErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "no sequence store with id {} exists in this region",
+                    input.id
+                ),
+            })
+        })?;
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::Reported,
+            Some(&store.id),
+        );
+
+        Ok(GetSequenceStoreOutput {
+            id: store.id.clone(),
+            arn: store.arn.clone(),
+            name: Some(store.name.clone()),
+            description: store.description.clone(),
+            sse_config: store.sse_config.clone(),
+            creation_time: crate::state::timestamp(store.creation_time_ms),
+            fallback_location: store.fallback_location.clone(),
+            s3_access: store.s3_access_output(),
+            e_tag_algorithm_family: Some(store.e_tag_algorithm_family.clone()),
+            status: Some(store.status.clone()),
+            status_message: store.status_message.clone(),
+            propagated_set_level_tags: store.propagated_set_level_tags.clone(),
+            // Reported only once something has changed the store: a create is not an
+            // update, so a store nothing has changed carries no `updateTime`.
+            update_time: store.update_time_ms.map(crate::state::timestamp),
+        })
     }
 }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/private_workflow_runs.rs"]
 mod private_workflow_runs;
+#[path = "all/sequence_stores.rs"]
+mod sequence_stores;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/workflow_versions.rs"]

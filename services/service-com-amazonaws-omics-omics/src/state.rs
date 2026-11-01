@@ -2,15 +2,16 @@
 
 //! Engine state for the com-amazonaws-omics-omics service.
 //!
-//! This slice holds the service's primary resource pair: the **private workflow**
+//! This slice holds the service's primary resources: the **private workflow**
 //! (`CreateWorkflow` / `GetWorkflow` / `ListWorkflows` / `DeleteWorkflow`), the
-//! **versions** of that workflow (`CreateWorkflowVersion` / `GetWorkflowVersion`) and
-//! the **run** started from it (`StartRun` / `GetRun` / `ListRuns` / `DeleteRun`). Each
-//! resource is stored exactly once, keyed by the numeric id the model's
-//! `^[0-9]+$` patterns describe (a version by its name, inside its workflow's record),
-//! so every operation reads and writes the one record.
+//! **versions** of that workflow (`CreateWorkflowVersion` / `GetWorkflowVersion`), the
+//! **run** started from it (`StartRun` / `GetRun` / `ListRuns` / `DeleteRun`) and the
+//! **sequence store** that holds read sets (`CreateSequenceStore` /
+//! `GetSequenceStore`). Each resource is stored exactly once, keyed by the numeric id
+//! the model's `^[0-9]+$` patterns describe (a version by its name, inside its
+//! workflow's record), so every operation reads and writes the one record.
 //!
-//! Both stores are `BTreeMap<u64, _>` keyed by that numeric id. The ids are minted
+//! Every store is a `BTreeMap<u64, _>` keyed by that numeric id. The ids are minted
 //! from a monotonic counter, so the map's own key order IS creation order: a page
 //! token can simply name the id the next page starts at, and the order is stable
 //! across calls even when records in between are deleted.
@@ -20,7 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    ContainerRegistryMap, DefinitionRepository, DefinitionRepositoryDetails, WorkflowParameter,
+    ContainerRegistryMap, DefinitionRepository, DefinitionRepositoryDetails, SequenceStoreS3Access,
+    SseConfig, WorkflowParameter,
 };
 
 /// The ARN service namespace for this service (`arnNamespace`/sigv4 name `omics`).
@@ -41,6 +43,9 @@ pub const WORKFLOW_VERSION_ARN_INFIX: &str = "/version/";
 
 /// The resource portion a run ARN carries before its id.
 pub const RUN_ARN_RESOURCE_PREFIX: &str = "run/";
+
+/// The resource portion a sequence store ARN carries before its id.
+pub const SEQUENCE_STORE_ARN_RESOURCE_PREFIX: &str = "sequenceStore/";
 
 /// The first id either counter mints.
 ///
@@ -63,6 +68,29 @@ pub const RUN_ID_OFFSET: u64 = 500_000;
 pub const WORKFLOW_STATUS_CREATING: &str = "CREATING";
 /// The `WorkflowStatus` the clock owes a `CREATING` workflow.
 pub const WORKFLOW_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The first id the sequence-store counter mints.
+///
+/// The modelled `SequenceStoreId` is `^[0-9]+$` with length 10..36, so — unlike a
+/// workflow or run id — a sequence store id must be at least TEN digits and the
+/// counter above cannot serve it. Starting here makes every id this emulator mints
+/// exactly ten digits wide, inside that length and inside `u64` for the whole life of
+/// a process.
+pub const FIRST_SEQUENCE_STORE_ID: u64 = 1_000_000_000;
+
+/// `SequenceStoreStatus` a freshly created sequence store carries, from the modelled
+/// `SequenceStoreStatus` enum.
+pub const SEQUENCE_STORE_STATUS_CREATING: &str = "CREATING";
+/// The `SequenceStoreStatus` the clock owes a `CREATING` sequence store, from the same
+/// enum.
+pub const SEQUENCE_STORE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `ETagAlgorithmFamily` applied when `CreateSequenceStore` omits
+/// `eTagAlgorithmFamily`.
+///
+/// From that member's own documentation: "The ETag algorithm family to use for ingested
+/// read sets. The default value is MD5up."
+pub const DEFAULT_E_TAG_ALGORITHM_FAMILY: &str = "MD5up";
 
 /// `WorkflowType` of every workflow `CreateWorkflow` mints: the model's own
 /// `PRIVATE`, the type that operation's documentation describes ("Creates a private
@@ -204,6 +232,12 @@ pub const MAX_RUNS: usize = 1000;
 /// it is refused with the modelled `ServiceQuotaExceededException`.
 pub const MAX_WORKFLOW_VERSIONS: usize = 100;
 
+/// The most sequence stores this emulator will hold. Emulator resource guard, not an
+/// AWS quota — `CreateSequenceStore` documents that "You can create multiple sequence
+/// stores per region per account" and publishes no ceiling. A create past it is refused
+/// with the modelled `ServiceQuotaExceededException`.
+pub const MAX_SEQUENCE_STORES: usize = 500;
+
 /// The most tags one workflow or run may carry.
 ///
 /// From the `tags` member's own documentation on `CreateWorkflow`: "You can define
@@ -215,7 +249,7 @@ pub const MAX_TAGS: usize = 50;
 /// Emulator resource guard: the map is keyed by caller-supplied `requestId`, so it
 /// is capped at one entry per resource either store can hold, and a token whose
 /// resource is gone is reclaimed with it.
-pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_WORKFLOWS + MAX_RUNS;
+pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_WORKFLOWS + MAX_RUNS + MAX_SEQUENCE_STORES;
 
 /// One stored private workflow: every member `GetWorkflow` reports.
 #[derive(Debug, Clone, Default)]
@@ -265,7 +299,12 @@ impl Workflow {
     /// whether or not anybody called, and the status it lands on does not depend on
     /// when the read happened.
     pub fn settle(&mut self, now_ms: i64) {
-        settle_creating(&mut self.status, &mut self.status_due_at_ms, now_ms);
+        settle_creating(
+            &mut self.status,
+            &mut self.status_due_at_ms,
+            now_ms,
+            WORKFLOW_STATUS_ACTIVE,
+        );
         for version in self.versions.values_mut() {
             version.settle(now_ms);
         }
@@ -334,7 +373,12 @@ impl WorkflowVersion {
     /// Apply every status change the clock already owed this version by `now_ms`,
     /// under the same rule a workflow settles by.
     pub fn settle(&mut self, now_ms: i64) {
-        settle_creating(&mut self.status, &mut self.status_due_at_ms, now_ms);
+        settle_creating(
+            &mut self.status,
+            &mut self.status_due_at_ms,
+            now_ms,
+            WORKFLOW_STATUS_ACTIVE,
+        );
     }
 
     /// `parameterTemplate` as the wire shape wants it: omitted when the version
@@ -354,12 +398,86 @@ impl WorkflowVersion {
     }
 }
 
-/// Apply the `CREATING` -> `ACTIVE` move the clock owes a freshly created workflow or
-/// workflow version: one rule, stated once, so both records settle identically.
-fn settle_creating(status: &mut String, status_due_at_ms: &mut Option<i64>, now_ms: i64) {
+/// Apply the `CREATING` -> active move the clock owes a freshly created record: one
+/// rule, stated once, so every record that owes one settles identically. `active` is the
+/// status that record's own modelled status enum calls active, so a workflow, a workflow
+/// version and a sequence store each land on a value its own enum admits.
+fn settle_creating(
+    status: &mut String,
+    status_due_at_ms: &mut Option<i64>,
+    now_ms: i64,
+    active: &str,
+) {
     if status_due_at_ms.is_some_and(|due| due <= now_ms) {
-        *status = WORKFLOW_STATUS_ACTIVE.to_string();
+        *status = active.to_string();
         *status_due_at_ms = None;
+    }
+}
+
+/// One stored sequence store: every member `GetSequenceStore` reports.
+#[derive(Debug, Clone, Default)]
+pub struct SequenceStore {
+    /// The decimal numeric id: this record's store key, rendered.
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// The server-side encryption settings the create named, when it named any.
+    pub sse_config: Option<SseConfig>,
+    pub fallback_location: Option<String>,
+    /// The ETag algorithm family in force, which is
+    /// [`DEFAULT_E_TAG_ALGORITHM_FAMILY`] when the create named none.
+    pub e_tag_algorithm_family: String,
+    /// The tag keys that propagate to the objects of this store's read sets, exactly as
+    /// the create listed them; `None` when it listed none.
+    pub propagated_set_level_tags: Option<Vec<String>>,
+    /// `s3AccessConfig$accessLogLocation` the create named, reported back as part of
+    /// `s3Access`.
+    pub access_log_location: Option<String>,
+    pub status: String,
+    pub status_message: Option<String>,
+    pub creation_time_ms: i64,
+    /// When the store was last changed, in epoch millis; `None` until something
+    /// changes it, since a create is not an update.
+    pub update_time_ms: Option<i64>,
+    /// When the transition this record owes the clock becomes due, in epoch millis;
+    /// `None` once it has settled.
+    pub status_due_at_ms: Option<i64>,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl SequenceStore {
+    /// Apply the `CREATING` -> `ACTIVE` move the clock already owed this store by
+    /// `now_ms`, under the same rule every other record settles by.
+    pub fn settle(&mut self, now_ms: i64) {
+        settle_creating(
+            &mut self.status,
+            &mut self.status_due_at_ms,
+            now_ms,
+            SEQUENCE_STORE_STATUS_ACTIVE,
+        );
+    }
+
+    /// `s3Access` as the wire shapes want it.
+    ///
+    /// Only the access-log location the create named is reported. `s3Uri` and
+    /// `s3AccessPointArn` name an S3 bucket and access point the real service
+    /// provisions for the store; this emulator serves no object store and mints no
+    /// access point, so there is no location a client could reach and the members are
+    /// omitted rather than filled with an address nothing answers on. The structure
+    /// itself is omitted when the create named no S3 access configuration.
+    pub fn s3_access_output(&self) -> Option<SequenceStoreS3Access> {
+        let access_log_location = self.access_log_location.clone()?;
+        Some(SequenceStoreS3Access {
+            s3_uri: None,
+            s3_access_point_arn: None,
+            access_log_location: Some(access_log_location),
+        })
+    }
+
+    /// `tags` as the wire shapes want it: omitted when none were ever set.
+    pub fn tags_output(&self) -> Option<HashMap<String, String>> {
+        tags_output(&self.tags)
     }
 }
 
@@ -501,6 +619,7 @@ fn tags_output(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String
 pub enum IdempotencyScope {
     CreateWorkflow,
     StartRun,
+    CreateSequenceStore,
 }
 
 /// Per-service state for com-amazonaws-omics-omics. A handler reaches it through
@@ -512,12 +631,16 @@ pub struct ComAmazonawsOmicsOmicsState {
     pub workflows: BTreeMap<u64, Workflow>,
     /// Every run, keyed by its numeric id, in creation order for the same reason.
     pub runs: BTreeMap<u64, Run>,
+    /// Every sequence store, keyed by its numeric id, in creation order for the same
+    /// reason.
+    pub sequence_stores: BTreeMap<u64, SequenceStore>,
     /// `(operation, requestId)` -> the numeric id of the resource that request
     /// created, so a replayed `@idempotencyToken` answers with the original resource
     /// instead of minting a second one.
     pub idempotency: HashMap<(IdempotencyScope, String), u64>,
     next_workflow_id: u64,
     next_run_id: u64,
+    next_sequence_store_id: u64,
 }
 
 impl ComAmazonawsOmicsOmicsState {
@@ -530,6 +653,9 @@ impl ComAmazonawsOmicsOmicsState {
         }
         for run in self.runs.values_mut() {
             run.settle(now_ms);
+        }
+        for store in self.sequence_stores.values_mut() {
+            store.settle(now_ms);
         }
     }
 
@@ -550,6 +676,11 @@ impl ComAmazonawsOmicsOmicsState {
         self.runs.get(&numeric_id(id)?)
     }
 
+    /// The sequence store the modelled `SequenceStoreId` `id` names, or `None`.
+    pub fn sequence_store(&self, id: &str) -> Option<&SequenceStore> {
+        self.sequence_stores.get(&numeric_id(id)?)
+    }
+
     /// Mint the next workflow id, as the decimal string the model's pattern wants
     /// and the numeric key the store is ordered by.
     pub fn next_workflow_id(&mut self) -> (u64, String) {
@@ -566,6 +697,14 @@ impl ComAmazonawsOmicsOmicsState {
         (key, key.to_string())
     }
 
+    /// Mint the next sequence store id, from [`FIRST_SEQUENCE_STORE_ID`] so every one
+    /// is the ten-digit decimal the modelled `SequenceStoreId` length admits.
+    pub fn next_sequence_store_id(&mut self) -> (u64, String) {
+        let key = FIRST_SEQUENCE_STORE_ID + self.next_sequence_store_id;
+        self.next_sequence_store_id += 1;
+        (key, key.to_string())
+    }
+
     /// The resource a replayed `requestId` already created, if this emulator still
     /// holds it. A token whose resource has since been deleted is forgotten, so the
     /// same `requestId` can create a fresh one — the service cannot answer with a
@@ -576,6 +715,7 @@ impl ComAmazonawsOmicsOmicsState {
         let still_held = match scope {
             IdempotencyScope::CreateWorkflow => self.workflows.contains_key(&id),
             IdempotencyScope::StartRun => self.runs.contains_key(&id),
+            IdempotencyScope::CreateSequenceStore => self.sequence_stores.contains_key(&id),
         };
         if still_held {
             return Some(id);
@@ -593,9 +733,11 @@ impl ComAmazonawsOmicsOmicsState {
         if self.idempotency.len() >= MAX_IDEMPOTENCY_TOKENS {
             let workflows = &self.workflows;
             let runs = &self.runs;
+            let sequence_stores = &self.sequence_stores;
             self.idempotency.retain(|key, id| match key.0 {
                 IdempotencyScope::CreateWorkflow => workflows.contains_key(id),
                 IdempotencyScope::StartRun => runs.contains_key(id),
+                IdempotencyScope::CreateSequenceStore => sequence_stores.contains_key(id),
             });
         }
         if self.idempotency.len() < MAX_IDEMPOTENCY_TOKENS {
@@ -608,7 +750,10 @@ impl ComAmazonawsOmicsOmicsState {
 ///
 /// Both are `^[0-9]+$` with length 1..18, so every value the centralized walk admits
 /// parses; an id outside that (which cannot reach a handler) answers `None` and is
-/// then reported as "not found" rather than panicking.
+/// then reported as "not found" rather than panicking. The modelled `SequenceStoreId`
+/// is the same decimal with length 10..36, so an id wider than `u64` also answers
+/// `None`: no store this emulator minted can carry one, so "not found" is the right
+/// answer for it too.
 pub fn numeric_id(id: &str) -> Option<u64> {
     id.parse::<u64>().ok()
 }
@@ -686,6 +831,18 @@ pub fn workflow_version_arn(region: &str, workflow_id: &str, version_name: &str)
 /// The ARN of the run `id` in `region`.
 pub fn run_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("{RUN_ARN_RESOURCE_PREFIX}{id}"))
+}
+
+/// The ARN of the sequence store `id` in `region`.
+///
+/// Well inside the modelled `SequenceStoreArn` length (1..127): the account and region
+/// are fixed and the id is at most 36 characters.
+pub fn sequence_store_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{SEQUENCE_STORE_ARN_RESOURCE_PREFIX}{id}"),
+    )
 }
 
 /// Where this run's outputs land: the caller's `outputUri` with the run's own id
@@ -918,6 +1075,8 @@ pub enum AuditOutcome {
     RunStarted,
     /// A stored run was removed from the store.
     RunDeleted,
+    /// A sequence store was minted and stored.
+    SequenceStoreCreated,
     /// A replayed `@idempotencyToken` changed nothing and answered with the resource the
     /// first call created.
     NoChange,
@@ -948,6 +1107,7 @@ impl AuditOutcome {
             Self::WorkflowVersionDeleted => "workflow-version-deleted",
             Self::RunStarted => "run-started",
             Self::RunDeleted => "run-deleted",
+            Self::SequenceStoreCreated => "sequence-store-created",
             Self::NoChange => "no-change",
             Self::Reported => "reported",
             Self::ValidationRefused => "validation-refused",
