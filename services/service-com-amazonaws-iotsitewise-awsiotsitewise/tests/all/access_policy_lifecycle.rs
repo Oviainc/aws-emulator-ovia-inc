@@ -51,7 +51,10 @@ const PORTALS: &str = "/portals";
 /// `smithy_query(query="shape", shape="Identity")` — `user`, `group`, `iamUser`,
 /// `iamRole`, the whole member list — with each id/ARN inside the modelled
 /// `IdentityId` (len 1..256, `^\S+$`) and `IamArn` bounds.
-fn identity_catalog() -> Vec<(&'static str, Value)> {
+///
+/// `pub(crate)` because the sibling Monitor suites drive the same identity forms;
+/// they share this one catalogue rather than growing a second.
+pub(crate) fn identity_catalog() -> Vec<(&'static str, Value)> {
     vec![
         ("user", json!({ "user": { "id": "94effa50-e1b4-4a3c-9a5a-8bf2e0da6a21" } })),
         ("group", json!({ "group": { "id": "eb1b5f70-9b2b-4e1d-bc40-5b5f8f4df0c2" } })),
@@ -68,7 +71,7 @@ fn identity_catalog() -> Vec<(&'static str, Value)> {
 
 /// The `Permission` values. Source: `smithy_query(query="shape",
 /// shape="Permission")` — `ADMINISTRATOR` | `VIEWER`, the enum's whole list.
-const PERMISSIONS: [&str; 2] = ["ADMINISTRATOR", "VIEWER"];
+pub(crate) const PERMISSIONS: [&str; 2] = ["ADMINISTRATOR", "VIEWER"];
 
 /// The `Resource` alternatives. Source: `smithy_query(query="shape",
 /// shape="Resource")` — `portal` | `project`, the whole member list.

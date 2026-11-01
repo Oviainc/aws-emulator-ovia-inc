@@ -6116,14 +6116,35 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         Some(record)
     }
 
-    /// Forget an IoT SiteWise Monitor project and the dashboards created in it.
+    /// Forget every access policy whose `Resource` the predicate names.
+    ///
+    /// A policy is ABOUT one Monitor resource — the portal or the project its
+    /// `Resource` names — and both `CreateAccessPolicy` and
+    /// `UpdateAccessPolicy` resolve that resource against this store before they
+    /// write ([`Self::missing_monitor_resource`]), so a resource this service no
+    /// longer holds can leave no policy behind for a read or a listing to
+    /// report: no write of this crate could have produced such a record, and no
+    /// caller could repair one, because the rewrite asks the same resolution and
+    /// so refuses the only resource the stored policy names. The policy's tags
+    /// live on its record, which owns them, so they go with it — the same reason
+    /// [`Self::forget_asset`] drops what is keyed off an asset.
+    ///
+    /// The one place this is stated: a portal's delete and a project's delete
+    /// both reach it, so the two cannot drift.
+    fn forget_access_policies_about(&mut self, about: impl Fn(&Resource) -> bool) {
+        self.access_policies
+            .retain(|_, policy| !about(&policy.resource));
+    }
+
+    /// Forget an IoT SiteWise Monitor project, the dashboards created in it and
+    /// the access policies granted on it.
     ///
     /// A dashboard is created IN a project and names that project on every read —
     /// the create refuses a project this store does not hold — so one whose
     /// project is gone could never have been created. The project's tags go with
-    /// its record, which owns them. The access policies that name the project are
-    /// left alone: a policy is a resource of its own, addressed by its own id and
-    /// removed by `DeleteAccessPolicy`.
+    /// its record, which owns them. The access policies that NAME the project go
+    /// through [`Self::forget_access_policies_about`], for the reason stated
+    /// there.
     ///
     /// The one place this containment rule is stated: `DeleteProject` removes one
     /// project through it and [`Self::forget_portal`] removes every project of a
@@ -6132,12 +6153,19 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         let record = self.projects.remove(project_id)?;
         self.dashboards
             .retain(|_, dashboard| dashboard.project_id != project_id);
+        self.forget_access_policies_about(|resource| {
+            resource
+                .project
+                .as_ref()
+                .is_some_and(|project| project.id == project_id)
+        });
         Some(record)
     }
 
     /// Forget an IoT SiteWise Monitor portal and everything this service holds
-    /// only as a part of it: the projects created in it and the dashboards
-    /// created in those projects.
+    /// only as a part of or a reference to it: the projects created in it, the
+    /// dashboards created in those projects, and the access policies granted on
+    /// the portal or on one of those projects.
     ///
     /// A project is created IN a portal — the create refuses a portal this store
     /// does not hold — so a portal the service no longer holds can leave none of
@@ -6145,7 +6173,9 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// read from resolving to a project or a dashboard whose portal is gone, the
     /// same reason [`Self::forget_asset`] drops what is keyed off an asset. Each
     /// project goes through [`Self::forget_project`], so a portal's delete and a
-    /// project's own delete take exactly the same things with them.
+    /// project's own delete take exactly the same things with them — the policies
+    /// granted on those projects included; the ones granted on the PORTAL go
+    /// through [`Self::forget_access_policies_about`] here.
     pub fn forget_portal(&mut self, portal_id: &str) -> Option<PortalRecord> {
         let record = self.portals.remove(portal_id)?;
         let projects: Vec<String> = self
@@ -6157,6 +6187,12 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         for project in projects {
             self.forget_project(&project);
         }
+        self.forget_access_policies_about(|resource| {
+            resource
+                .portal
+                .as_ref()
+                .is_some_and(|portal| portal.id == portal_id)
+        });
         Some(record)
     }
 

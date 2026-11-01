@@ -160,9 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which a portal's delete removes its projects through too: a dashboard is
         // created in a project and names that project on every read, so one whose
         // project is gone could never have been created. The access policies that name
-        // the project are left alone — a policy is a resource of its own, addressed by
-        // its own id and removed by `DeleteAccessPolicy`. An id that resolves to no
-        // stored project is the modelled 404 rather than a silent success.
+        // the project go with it for the same reason: a grant is written and rewritten
+        // only against a Monitor resource this store holds, so one about a project
+        // this service no longer holds is a record no write could have produced and no
+        // caller could repair. An id that resolves to no stored project is the
+        // modelled 404 rather than a silent success.
         //
         // `clientToken` makes this delete idempotent, as the member documents: "A
         // unique case-sensitive identifier that you can provide to ensure the

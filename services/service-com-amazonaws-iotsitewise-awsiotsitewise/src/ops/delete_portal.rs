@@ -2,8 +2,8 @@
 
 //! @op DeletePortal
 //! IMPLEMENTED: removes the portal the request names from the store, together with the
-//! projects and dashboards it holds, and reports the `DELETING` state the operation
-//! documents.
+//! projects and dashboards it holds and the access policies granted on them, and
+//! reports the `DELETING` state the operation documents.
 //!
 //! ## Shape of an operation
 //!
@@ -187,10 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The portal goes, and with it everything this service holds only as a part
-        // of it: the projects created in it and those projects' dashboards, so no
-        // later read can still resolve to a Monitor resource whose portal is gone.
-        // The access policies that name the portal or one of its projects are left
-        // alone, as `DeleteProject` leaves the ones naming the project it removes.
+        // of it or as a reference to it: the projects created in it, those projects'
+        // dashboards, and the access policies granted on the portal or on one of
+        // those projects, so no later read can still resolve to a Monitor resource
+        // whose portal is gone, nor report a grant about one — a record no write of
+        // this service could have produced and no caller could repair.
         //
         // A portal is addressed by its own id, so an id this store holds no portal
         // under is the modelled 404 — and nothing is removed for it, because the

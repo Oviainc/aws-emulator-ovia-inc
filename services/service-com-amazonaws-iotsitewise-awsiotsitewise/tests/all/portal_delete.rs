@@ -5,14 +5,12 @@
 //! wire behaviour a real client sees.
 //!
 //! The rule this suite pins: deleting an IoT SiteWise Monitor portal removes it and
-//! every Monitor resource the service holds only as a part of it — the projects
-//! created in it and those projects' dashboards — so a later read of any of them
-//! resolves to nothing, while every portal the call did not name, and everything
-//! inside it, is left exactly as it was. An access policy is a resource of its own,
-//! addressed by its own id and removed by `DeleteAccessPolicy`, so one that names
-//! the deleted portal or one of its projects stays readable — the same line
-//! `DeleteProject` draws for the policies naming the project it removes. A portal id
-//! no portal is stored under is a modelled 404 that removes nothing.
+//! every record the service holds only as a part of it or as a reference to it — the
+//! projects created in it, those projects' dashboards, and the access policies
+//! granted on the portal or on one of those projects — so a later read of any of
+//! them resolves to nothing, while every portal the call did not name, and
+//! everything inside it, is left exactly as it was. A portal id no portal is stored
+//! under is a modelled 404 that removes nothing.
 //!
 //! The HTTP harness (`call`, `router`, `error_code`) is the one the asset suite
 //! already has; this suite reuses it rather than growing a second.
@@ -286,7 +284,9 @@ async fn build(router: &MultiServiceRouter, case: &DeleteCase, tag: &str) -> Mon
 }
 
 /// The `(path, kind)` pairs the portal and everything it CONTAINS are read back
-/// through: the resources a delete of the portal takes with it.
+/// through: the resources a delete of the portal takes with it, the grants about
+/// the portal and its projects included — a policy is written and rewritten only
+/// against a Monitor resource the store holds, so none may outlive it.
 fn contained_readers(monitor: &Monitor) -> Vec<(String, String)> {
     let mut paths = vec![(format!("{PORTALS}/{}", monitor.portal), "portal".to_string())];
     for project in &monitor.projects {
@@ -295,11 +295,11 @@ fn contained_readers(monitor: &Monitor) -> Vec<(String, String)> {
     for dashboard in &monitor.dashboards {
         paths.push((format!("{DASHBOARDS}/{dashboard}"), "dashboard".to_string()));
     }
+    paths.extend(policy_readers(monitor));
     paths
 }
 
-/// The `(path, kind)` pairs the grants ABOUT `monitor` are read back through: a
-/// resource of its own, which the portal's delete does not remove.
+/// The `(path, kind)` pairs the grants ABOUT `monitor` are read back through.
 fn policy_readers(monitor: &Monitor) -> Vec<(String, String)> {
     monitor
         .policies
@@ -368,14 +368,9 @@ async fn deleting_a_portal_removes_it_and_everything_it_holds() {
             );
         }
 
-        // The portal the delete did not name, and everything inside it, is readable
-        // exactly as before — and so is every access policy, the deleted portal's
-        // included: a grant is a resource of its own, removed only by its own delete.
-        for (path, kind) in contained_readers(&bystander)
-            .into_iter()
-            .chain(policy_readers(&bystander))
-            .chain(policy_readers(&target))
-        {
+        // The portal the delete did not name, and everything inside it — its grants
+        // included — is readable exactly as before.
+        for (path, kind) in contained_readers(&bystander) {
             let (status, body) = call(&router, "GET", &path, None).await;
             assert_eq!(
                 status, 200,
@@ -451,11 +446,10 @@ async fn deleting_a_portal_removes_it_and_everything_it_holds() {
         let mut remaining_policies: Vec<String> = store.access_policies.keys().cloned().collect();
         remaining_policies.sort();
         let mut expected_policies = bystander.policies.clone();
-        expected_policies.extend(target.policies.iter().cloned());
         expected_policies.sort();
         assert_eq!(
             remaining_policies, expected_policies,
-            "case {:?}: every grant must survive the portal's delete",
+            "case {:?}: only the untouched portal's grants may remain",
             case.label
         );
     }
@@ -513,10 +507,7 @@ async fn deleting_a_portal_that_was_never_created_removes_nothing() {
     }
 
     // Every piece of the stored portal survived the refusals.
-    for (path, kind) in contained_readers(&stored)
-        .into_iter()
-        .chain(policy_readers(&stored))
-    {
+    for (path, kind) in contained_readers(&stored) {
         let (status, body) = call(&router, "GET", &path, None).await;
         assert_eq!(
             status, 200,
