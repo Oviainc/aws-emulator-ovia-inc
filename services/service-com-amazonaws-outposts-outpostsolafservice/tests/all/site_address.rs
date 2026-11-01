@@ -14,8 +14,10 @@
 //!    stores the WHOLE `Address` the request carried in that type's slot, replacing
 //!    whatever was there, leaves the other type's slot alone, and answers the address
 //!    as stored under the type it was stored as — which is exactly what every later
-//!    read of that type answers. A site carrying no address of a type reports the
-//!    optional `Address` member absent rather than failing.
+//!    read of that type answers. A type the site records no address under is read as
+//!    404 `NotFoundException` naming that type and the site, and the first write of
+//!    that type makes the identical read answer the address
+//!    ([`crate::precondition_gates`] states that refusal over its own table).
 //! 2. Writing the OPERATING address re-derives the three members `Site` projects from
 //!    it (`OperatingAddress{CountryCode,StateOrRegion,City}`) and changes nothing else
 //!    about the site; writing the SHIPPING address changes no member of `Site` at all.
@@ -110,6 +112,26 @@ async fn update_site_address(
         .await
 }
 
+/// `GET /sites/{SiteId}/address?AddressType=…`, returning the whole reply — including
+/// the refusal a type the site records no address under is read as.
+async fn read_site_address(
+    outposts: &Outposts,
+    identifier: &str,
+    address_type: &str,
+) -> crate::site_and_outpost_lifecycle::Reply {
+    outposts
+        .call(
+            "GET",
+            &format!(
+                "/sites/{}/address?AddressType={}",
+                segment(identifier),
+                query_value(address_type)
+            ),
+            None,
+        )
+        .await
+}
+
 /// `GET /sites/{SiteId}/address?AddressType=…`, returning the whole output.
 async fn get_site_address(outposts: &Outposts, identifier: &str, address_type: &str) -> Value {
     outposts
@@ -126,13 +148,9 @@ async fn get_site_address(outposts: &Outposts, identifier: &str, address_type: &
 }
 
 /// What a read of `address_type` must answer: the site's bare id, the type that was
-/// asked for, and the address stored for it — with the member absent when none is.
-fn expected_read(site_id: &str, address_type: &str, stored: Option<&Value>) -> Value {
-    let mut output = json!({ "SiteId": site_id, "AddressType": address_type });
-    if let Some(address) = stored {
-        output["Address"] = address.clone();
-    }
-    output
+/// asked for, and the address stored for it.
+fn expected_read(site_id: &str, address_type: &str, stored: &Value) -> Value {
+    json!({ "SiteId": site_id, "AddressType": address_type, "Address": stored })
 }
 
 /// Rules 1 + 2, over a table of addresses applied in sequence to ONE site: each row's
@@ -261,15 +279,30 @@ async fn site_addresses_round_trip_per_type_and_project_into_the_site() {
 
         // Both types are read back after every row, so a write that landed in the
         // wrong slot — or leaked into the other one — shows up immediately, by
-        // either identifier form.
+        // either identifier form. A type nothing has been written to yet holds no
+        // address to answer, so it is read as the operation's 404.
         for (index, known) in ADDRESS_TYPES.iter().enumerate() {
-            let expected = expected_read(&site_id, known, stored[index].as_ref());
             for named_by in [site_id.as_str(), site_arn.as_str()] {
-                let read = get_site_address(&outposts, named_by, known).await;
-                assert_eq!(
-                    read, expected,
-                    "case {case:?}: GetSiteAddress({known}) by {named_by} must answer the stored address, got {read:?}"
-                );
+                match stored[index].as_ref() {
+                    Some(address) => {
+                        let expected = expected_read(&site_id, known, address);
+                        let read = get_site_address(&outposts, named_by, known).await;
+                        assert_eq!(
+                            read, expected,
+                            "case {case:?}: GetSiteAddress({known}) by {named_by} must answer the stored address, got {read:?}"
+                        );
+                    }
+                    None => {
+                        let reply = read_site_address(&outposts, named_by, known).await;
+                        assert_eq!(
+                            (reply.status, reply.error_code.as_str()),
+                            (404, "NotFoundException"),
+                            "case {case:?}: GetSiteAddress({known}) by {named_by} must be refused while the site records no address of that type, got {} {:?}",
+                            reply.status,
+                            reply.body
+                        );
+                    }
+                }
             }
         }
 
@@ -289,12 +322,11 @@ async fn site_addresses_round_trip_per_type_and_project_into_the_site() {
     }
 }
 
-/// Rule 1's absent-address half: a site that holds no address of the requested type is
-/// reported with the optional `Address` member absent — for a site created with neither
-/// address and for one created with only the other — and the first write of that type
-/// makes it appear.
+/// Rule 1's unconfigured half: a type the site records no address under is read as the
+/// operation's 404 — for a site created with neither address and for one created with
+/// only the other — and the first write of that type makes the identical read answer it.
 #[tokio::test]
-async fn a_type_the_site_holds_no_address_for_is_reported_absent() {
+async fn a_type_the_site_holds_no_address_for_is_refused() {
     let outposts = Outposts::new();
     let bare = outposts.create_site(&json!({ "Name": "no addresses" })).await;
     let bare_id = text(&bare, "SiteId");
@@ -316,21 +348,23 @@ async fn a_type_the_site_holds_no_address_for_is_reported_absent() {
         ),
     ];
     for (case, site, address_type) in &cases {
-        let read = get_site_address(&outposts, site, address_type).await;
+        let reply = read_site_address(&outposts, site, address_type).await;
         assert_eq!(
-            read,
-            expected_read(site, address_type, None),
-            "case {case:?}: a site with no address of that type reports the member absent, got {read:?}"
+            (reply.status, reply.error_code.as_str()),
+            (404, "NotFoundException"),
+            "case {case:?}: a site recording no address of that type must refuse the read, got {} {:?}",
+            reply.status,
+            reply.body
         );
     }
 
     // The create's own address is readable the same way, and the first write of the
-    // other type makes that one appear.
+    // other type makes that one readable too.
     let created_operating = address("US", "WA", "Seattle");
     let read = get_site_address(&outposts, &operating_only_id, OPERATING).await;
     assert_eq!(
         read,
-        expected_read(&operating_only_id, OPERATING, Some(&created_operating)),
+        expected_read(&operating_only_id, OPERATING, &created_operating),
         "case \"address stored by CreateSite\": GetSiteAddress must answer it, got {read:?}"
     );
     let first = address("US", "OR", "Portland");
@@ -338,7 +372,7 @@ async fn a_type_the_site_holds_no_address_for_is_reported_absent() {
     let read = get_site_address(&outposts, &operating_only_id, SHIPPING).await;
     assert_eq!(
         read,
-        expected_read(&operating_only_id, SHIPPING, Some(&first)),
+        expected_read(&operating_only_id, SHIPPING, &first),
         "case \"first shipping address\": the written address must be readable, got {read:?}"
     );
 }
@@ -356,6 +390,10 @@ async fn the_operating_address_is_held_while_an_outpost_belongs_to_an_ordered_si
         .create_site(&json!({
             "Name": "occupied site",
             "OperatingAddress": address("US", "WA", "Seattle"),
+            // An order is placed at the site below, and an order can only be placed at
+            // a site whose details are complete ([`crate::precondition_gates`]), so the
+            // site records the shipping address too.
+            "ShippingAddress": address("US", "WA", "Kirkland"),
         }))
         .await;
     let site_id = text(&site, "SiteId");
@@ -410,7 +448,7 @@ async fn the_operating_address_is_held_while_an_outpost_belongs_to_an_ordered_si
     let read = get_site_address(&outposts, &site_id, OPERATING).await;
     assert_eq!(
         read,
-        expected_read(&site_id, OPERATING, Some(&before)),
+        expected_read(&site_id, OPERATING, &before),
         "case \"refused operating change\": the stored address must be untouched, got {read:?}"
     );
 
@@ -420,7 +458,7 @@ async fn the_operating_address_is_held_while_an_outpost_belongs_to_an_ordered_si
     let read = get_site_address(&outposts, &site_id, SHIPPING).await;
     assert_eq!(
         read,
-        expected_read(&site_id, SHIPPING, Some(&shipping)),
+        expected_read(&site_id, SHIPPING, &shipping),
         "case \"shipping change with an Outpost at the site\": it must be stored, got {read:?}"
     );
 
@@ -438,7 +476,7 @@ async fn the_operating_address_is_held_while_an_outpost_belongs_to_an_ordered_si
     let read = get_site_address(&outposts, &site_id, OPERATING).await;
     assert_eq!(
         read,
-        expected_read(&site_id, OPERATING, Some(&attempt)),
+        expected_read(&site_id, OPERATING, &attempt),
         "case \"operating change after the Outpost is gone\": it must read back, got {read:?}"
     );
     let site = outposts.get_site(&site_id).await;

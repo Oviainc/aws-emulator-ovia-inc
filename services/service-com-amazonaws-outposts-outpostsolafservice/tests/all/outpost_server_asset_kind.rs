@@ -34,7 +34,9 @@ use service_com_amazonaws_outposts_outpostsolafservice::ops::types::ASSET_TYPE_V
 use service_com_amazonaws_outposts_outpostsolafservice::state::ASSET_ID_MEMBER;
 
 use crate::outpost_assets::{asset, record};
-use crate::site_and_outpost_lifecycle::{install_hardware, segment, text, Outposts};
+use crate::site_and_outpost_lifecycle::{
+    install_hardware, orderable_site, segment, text, Outposts,
+};
 
 /// The route `StartConnection` is bound to, from
 /// `smithy_query(query="operation",operation="StartConnection")`.
@@ -207,7 +209,7 @@ async fn only_server_hardware_starts_an_installation_connection() {
 /// `OutpostId`. An Outpost belongs to a site, so the site comes first.
 async fn an_outpost(outposts: &Outposts, name: &str, form_factor: &str) -> String {
     let site = outposts
-        .create_site(&json!({ "Name": format!("{name}-site") }))
+        .create_site(&orderable_site(&format!("{name}-site")))
         .await;
     let outpost = outposts
         .create_outpost(&json!({

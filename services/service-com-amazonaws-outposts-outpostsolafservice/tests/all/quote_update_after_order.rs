@@ -406,7 +406,7 @@ async fn an_update_that_re_derives_nothing_is_applied_to_such_a_quote() {
 async fn a_refused_association_move_leaves_the_record_of_the_order_where_the_order_is() {
     let outposts = Outposts::new();
     let submitted = a_quote_an_order_was_submitted_from(&outposts, "record-after-order").await;
-    let (elsewhere_id, _) = outposts.site_and_outpost("elsewhere").await;
+    let (elsewhere_id, _) = outposts.site_and_outpost_in_service("elsewhere").await;
 
     let reply = outposts
         .call(

@@ -33,7 +33,9 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
     ORDER_STATUS_DELIVERED, ORDER_STATUS_PREPARING, OUTPOST_PROVISIONING,
 };
 
-use crate::site_and_outpost_lifecycle::{deliver_orders, ids, segment, text, Outposts};
+use crate::site_and_outpost_lifecycle::{
+    deliver_orders, ids, orderable_site, segment, text, Outposts,
+};
 
 /// The `CatalogItemId` every line item below names: a value of the modelled `SkuCode`
 /// form (`^OR-[A-Z0-9]{7}$`), which is all this API says about the catalog item a line
@@ -52,7 +54,7 @@ pub(crate) async fn an_outpost(
     form_factor: Option<&str>,
 ) -> (String, String) {
     let site = outposts
-        .create_site(&json!({ "Name": format!("{name}-site") }))
+        .create_site(&orderable_site(&format!("{name}-site")))
         .await;
     let mut request = json!({ "Name": name, "SiteId": text(&site, "SiteId") });
     if let Some(form_factor) = form_factor {

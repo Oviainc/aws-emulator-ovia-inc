@@ -641,8 +641,15 @@ async fn a_quote_takes_an_order_only_while_it_is_still_created() {
 #[tokio::test]
 async fn an_outstanding_order_is_read_by_the_operations_that_name_one() {
     let outposts = Outposts::new();
-    let (ordered, _) = outposts.site_and_outpost("ordered-outpost").await;
-    let (bare, _) = outposts.site_and_outpost("unordered-outpost").await;
+    // A decommission is refused on an Outpost whose hardware is not in service
+    // ([`crate::precondition_gates`]), and the rows below decommission both, so both
+    // are past that gate.
+    let (ordered, _) = outposts
+        .site_and_outpost_in_service("ordered-outpost")
+        .await;
+    let (bare, _) = outposts
+        .site_and_outpost_in_service("unordered-outpost")
+        .await;
     let order_id = text(
         &create_order(
             &outposts,

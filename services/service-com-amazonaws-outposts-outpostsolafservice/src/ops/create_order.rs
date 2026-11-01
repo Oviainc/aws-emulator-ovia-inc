@@ -3,7 +3,10 @@
 //! @op CreateOrder
 //! IMPLEMENTED: mints an `OrderId`, persists the order the request describes against
 //! the Outpost it names, and answers it from what was persisted — which is what
-//! `GetOrder` reads back. Every line item the request sent gets a minted `LineItemId`
+//! `GetOrder` reads back. An order is placed at the SITE the Outpost stands on, so a
+//! site whose details are not complete — one missing either of the addresses an order
+//! is placed against ([`crate::state::SiteRecord::details_complete`]) — takes no order
+//! at all. Every line item the request sent gets a minted `LineItemId`
 //! and the status a just-submitted item carries, and names a configuration the
 //! published catalog still offers — one published as no longer offered is refused; an
 //! order taken from a quote is
@@ -272,6 +275,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(record) => record.outpost.site_id.clone(),
             None => return Err(outpost_not_found().into()),
         };
+        // An order is placed AT that site, against the details the site records: the
+        // address the hardware is operated at and the address it is shipped to, which
+        // are the site details this API's ordering requirements name
+        // (`OPERATING_ADDRESS_EXISTENCE_CHECK_ERROR`,
+        // `SHIPPING_ADDRESS_EXISTENCE_CHECK_ERROR` of the modelled
+        // `OrderingRequirementType`). A site missing either is a site whose details are
+        // not complete, so no order can be placed on an Outpost standing on it — the
+        // bad request the modelled `ValidationException` (HTTP 400) states, with
+        // nothing minted and nothing persisted, so the Outpost's orders stay empty. It
+        // is the SAME question the requirements an order submitted from a quote has to
+        // meet are read off ([`crate::state::SiteRecord::details_complete`]), asked
+        // here of every order however it is placed. An Outpost always belongs to a site
+        // — `CreateOutpost` takes the site it is placed on, and a site is not deletable
+        // while an Outpost names it — so a site that resolves to no record here records
+        // no details either, and the same refusal states it.
+        let details_complete = site_id
+            .as_deref()
+            .and_then(|site_id| store.site(&region, site_id))
+            .is_some_and(crate::state::SiteRecord::details_complete);
+        if !details_complete {
+            return Err(CreateOrderErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::site_details_incomplete()),
+                },
+            )
+            .into());
+        }
         // A line item orders one of the hardware configurations this service
         // publishes, and the catalog records on each one whether it can still be
         // ordered: a configuration published as no longer offered is not one an order

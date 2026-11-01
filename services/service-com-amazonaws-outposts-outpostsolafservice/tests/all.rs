@@ -107,6 +107,8 @@ mod page_boundary_rule;
 mod page_token_canonical_spelling;
 #[path = "all/page_token_refusal_shape.rs"]
 mod page_token_refusal_shape;
+#[path = "all/precondition_gates.rs"]
+mod precondition_gates;
 #[path = "all/private_connectivity.rs"]
 mod private_connectivity;
 #[path = "all/private_connectivity_ownership.rs"]

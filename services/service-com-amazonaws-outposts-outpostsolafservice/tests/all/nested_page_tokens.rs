@@ -41,7 +41,7 @@ use service_com_amazonaws_outposts_outpostsolafservice::ops::types::AssetInstanc
 use crate::blocking_instances::{record as record_instances, running};
 use crate::capacity_task_lifecycle::{pool, settle_capacity_task, start_ok};
 use crate::site_and_outpost_lifecycle::{
-    install_hardware, query_value, segment, settle, text, Outposts,
+    install_hardware, orderable_site, query_value, segment, settle, text, Outposts,
 };
 
 /// The member the modelled `ValidationException` carries its report in.
@@ -64,7 +64,7 @@ const PAGE_LIMIT: usize = 64;
 /// real workflow takes.
 async fn an_outpost(outposts: &Outposts, name: &str, form_factor: &str) -> String {
     let site = outposts
-        .create_site(&json!({ "Name": format!("{name}-site") }))
+        .create_site(&orderable_site(&format!("{name}-site")))
         .await;
     let created = outposts
         .create_outpost(&json!({

@@ -105,7 +105,7 @@ fn listed(output: &Value, listing: &Listing, case: &str) -> Vec<String> {
 /// the order this function is called in — which is the creation order both lists
 /// report their records in.
 async fn held(outposts: &Outposts, name: &str) -> Held {
-    let (outpost_id, outpost_arn) = outposts.site_and_outpost(name).await;
+    let (outpost_id, outpost_arn) = outposts.site_and_outpost_in_service(name).await;
     let order = outposts
         .ok(
             "POST",

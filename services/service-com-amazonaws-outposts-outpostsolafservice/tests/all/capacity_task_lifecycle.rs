@@ -264,12 +264,26 @@ pub(crate) fn stamp(task: &Value, member: &str) -> Option<f64> {
 
 /// One Outpost of a fresh site, so each case starts from an Outpost that has never
 /// run a capacity task. Returns its bare `OutpostId`.
+///
+/// Its site records both of the addresses an order is placed against, because several
+/// rows place one ([`an_order`]), and the Outpost reports the terminal `ACTIVE`
+/// lifecycle status
+/// ([`crate::site_and_outpost_lifecycle::mark_outpost_active`]), because a capacity task
+/// configures the capacity of an Outpost's installed hardware and is refused on an
+/// Outpost that holds none ([`crate::precondition_gates`]); the hardware each case
+/// weighs its configuration against is the hardware that case records.
 pub(crate) async fn outpost(outposts: &Outposts, name: &str) -> String {
-    let site = outposts.create_site(&json!({ "Name": format!("{name}-site") })).await;
+    let site = outposts
+        .create_site(&crate::site_and_outpost_lifecycle::orderable_site(&format!(
+            "{name}-site"
+        )))
+        .await;
     let created = outposts
         .create_outpost(&json!({ "Name": name, "SiteId": text(&site, "SiteId") }))
         .await;
-    text(&created, "OutpostId")
+    let outpost_id = text(&created, "OutpostId");
+    crate::site_and_outpost_lifecycle::mark_outpost_active(outposts, &outpost_id);
+    outpost_id
 }
 
 /// `StartCapacityTask` on `outpost_identifier`.

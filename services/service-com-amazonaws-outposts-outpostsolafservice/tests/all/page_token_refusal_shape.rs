@@ -96,7 +96,9 @@ fn expected_report(operation: &str) -> String {
 /// Every paged answer this service serves, with the resources the Outpost-scoped ones
 /// are asked on already created.
 async fn every_paged_answer(outposts: &Outposts) -> Vec<Paged> {
-    let (outpost_id, _) = outposts.site_and_outpost("page-token-shape").await;
+    let (outpost_id, _) = outposts
+        .site_and_outpost_in_service("page-token-shape")
+        .await;
     let task_id = text(
         &start_ok(
             outposts,

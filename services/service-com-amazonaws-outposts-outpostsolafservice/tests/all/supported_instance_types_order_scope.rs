@@ -33,7 +33,7 @@
 use serde_json::{json, Value};
 
 use crate::outpost_assets::{asset, compute, record};
-use crate::site_and_outpost_lifecycle::{query_value, segment, text, Outposts};
+use crate::site_and_outpost_lifecycle::{orderable_site, query_value, segment, text, Outposts};
 
 /// A `CatalogItemId` of the modelled `SkuCode` form (`^OR-[A-Z0-9]{7}$`) that this
 /// service publishes no hardware configuration under.
@@ -242,7 +242,7 @@ fn expected(catalog: &[Value], scope: &Scope<'_>) -> Vec<(String, i64)> {
 /// `OutpostId`.
 async fn an_outpost(outposts: &Outposts, name: &str, hardware_type: Option<&str>) -> String {
     let site = outposts
-        .create_site(&json!({ "Name": format!("{name}-site") }))
+        .create_site(&orderable_site(&format!("{name}-site")))
         .await;
     let mut request = json!({ "Name": name, "SiteId": text(&site, "SiteId") });
     if let Some(hardware_type) = hardware_type {

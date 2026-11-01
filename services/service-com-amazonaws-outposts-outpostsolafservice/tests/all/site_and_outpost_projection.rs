@@ -22,7 +22,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::site_and_outpost_lifecycle::{
-    ids, install_hardware, query_value, settle, text, without, Outposts,
+    ids, install_hardware, orderable_site, query_value, settle, text, without, Outposts,
 };
 
 /// The region codes rule B is exercised over, each with the Availability-Zone-ID
@@ -404,9 +404,7 @@ async fn an_unresolvable_zone_leaves_the_other_identity_absent() {
 #[tokio::test]
 async fn an_outpost_reports_the_status_its_ordered_hardware_gives_it() {
     let outposts = Outposts::new();
-    let site = outposts
-        .create_site(&json!({ "Name": "lifecycle site" }))
-        .await;
+    let site = outposts.create_site(&orderable_site("lifecycle site")).await;
     let site_id = text(&site, "SiteId");
 
     let requests: Vec<(&str, Value)> = vec![

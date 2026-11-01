@@ -46,7 +46,7 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
 use crate::blocking_instances::{record, running};
 use crate::capacity_task_lifecycle::{pool, settle_capacity_task, start_ok};
 use crate::outpost_decommission::{a_quote, set_quote_status};
-use crate::site_and_outpost_lifecycle::{segment, text, Outposts, Reply};
+use crate::site_and_outpost_lifecycle::{mark_outpost_active, segment, text, Outposts, Reply};
 
 /// An `OrderId` of the modelled form `^oo-[a-f0-9]{17}$` — the `SubmittedOrderId` a
 /// quote an order was submitted from reports, and so the `ResourceId` a conflict an
@@ -90,7 +90,12 @@ async fn get_task(outposts: &Outposts, outpost_id: &str, capacity_task_id: &str)
 }
 
 /// `StartCapacityTask` on `outpost_id`, returning the minted `CapacityTaskId`.
+///
+/// A capacity task configures the capacity of an Outpost's installed hardware and is
+/// refused on one whose hardware is not in service
+/// ([`crate::precondition_gates`]), so the Outpost is put past that gate first.
 async fn a_task(outposts: &Outposts, outpost_id: &str) -> String {
+    mark_outpost_active(outposts, outpost_id);
     let request = json!({ "InstancePools": [pool("m5.4xlarge", 1)] });
     text(
         &start_ok(outposts, outpost_id, &request).await,

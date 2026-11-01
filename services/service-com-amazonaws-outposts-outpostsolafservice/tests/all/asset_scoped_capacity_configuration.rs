@@ -29,7 +29,7 @@
 use serde_json::{json, Value};
 
 use crate::capacity_task_lifecycle::{pool, settle_capacity_task, start_ok};
-use crate::site_and_outpost_lifecycle::{deliver_orders, segment, text, Outposts};
+use crate::site_and_outpost_lifecycle::{deliver_orders, orderable_site, segment, text, Outposts};
 
 /// Which hardware ONE capacity task of a row names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,7 +182,7 @@ fn push_once(values: &mut Vec<String>, value: &str) {
 /// `OutpostId`. An Outpost belongs to a site, so the site comes first.
 pub(crate) async fn an_outpost(outposts: &Outposts, name: &str, hardware_type: &str) -> String {
     let site = outposts
-        .create_site(&json!({ "Name": format!("{name}-site") }))
+        .create_site(&orderable_site(&format!("{name}-site")))
         .await;
     let outpost = outposts
         .create_outpost(&json!({

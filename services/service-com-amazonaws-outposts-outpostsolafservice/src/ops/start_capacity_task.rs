@@ -3,7 +3,11 @@
 //! @op StartCapacityTask
 //! IMPLEMENTED: mints a capacity task on the Outpost the `OutpostIdentifier` names,
 //! persists everything the caller requested, and answers it from what was persisted;
-//! `GetCapacityTask` reads the same record back. The optional `OrderId` and `AssetId`
+//! `GetCapacityTask` reads the same record back. A task configures the capacity of the
+//! Outpost's installed hardware, so an Outpost that has not reached the terminal
+//! `ACTIVE` lifecycle status is refused with the modelled `ValidationException`
+//! ([`crate::state::capacity_task_lifecycle_report`]) and no task is created. The
+//! optional `OrderId` and `AssetId`
 //! name OTHER resources of this service, so both are resolved against the store
 //! before anything is created — the `OrderId` among the orders placed on the named
 //! Outpost in the region the request is addressed to, the `AssetId` among that same
@@ -269,8 +273,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_outposts();
         // A capacity task runs ON an Outpost, so an Outpost the store does not hold
         // cannot take one: the not-found error this operation models.
-        if store.outpost(&region, &outpost_id).is_none() {
+        let Some(record) = store.outpost(&region, &outpost_id) else {
             return Err(outpost_not_found().into());
+        };
+        // A capacity task configures the instance capacity of the Outpost's INSTALLED
+        // HARDWARE, so there is capacity to configure only once that hardware is in
+        // service: the terminal `ACTIVE` lifecycle status. An Outpost in any other
+        // status — one whose hardware was never installed — is one no capacity task can
+        // be created for, which is the bad request the modelled `ValidationException`
+        // (HTTP 400) states, naming the Outpost and the status it holds. Judged as the
+        // operation's precondition: after the request's own values have been validated
+        // and the Outpost resolved, and before anything is read of the tasks already
+        // stored or any task is minted, so `ListCapacityTasks` for the Outpost stays
+        // empty. It holds for a DRY RUN too: the verdict a dry run reports is weighed
+        // against the capacity of that same hardware, so an Outpost holding none has
+        // nothing to weigh a plan against either.
+        if !record.is_active() {
+            let message =
+                crate::state::capacity_task_lifecycle_report(&outpost_id, record.life_cycle_status());
+            return Err(
+                StartCapacityTaskErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+                .into(),
+            );
         }
         // The two OPTIONAL references a capacity task carries name other resources
         // of this service, so each is resolved against what the store holds before

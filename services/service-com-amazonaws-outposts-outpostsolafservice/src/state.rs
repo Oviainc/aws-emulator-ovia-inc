@@ -404,6 +404,28 @@ impl SiteRecord {
         }
     }
 
+    /// Whether the details an order placed at this site is placed AGAINST are
+    /// recorded: the address the hardware is operated at and the address it is
+    /// shipped to.
+    ///
+    /// Those are the site details the ordering requirements of this API name
+    /// ([`ORDERING_REQUIREMENT_OPERATING_ADDRESS`],
+    /// [`ORDERING_REQUIREMENT_SHIPPING_ADDRESS`]), so a site holding both carries
+    /// everything an order needs of it and a site missing either is a site no order
+    /// can be placed at yet — the one question both order paths ask of a site, asked
+    /// the same way (see [`site_details_incomplete`]).
+    ///
+    /// It is the ADDRESS details only. The modelled `OrderingRequirementType` names a
+    /// rack-properties check too, but a site's rack properties are the physical and
+    /// logistical details of a RACK at it — every member of the modelled
+    /// `RackPhysicalProperties` is optional and a site an Outpost server stands at
+    /// needs none of them — so they are not read here, and neither is the postal-code
+    /// check, which this service's addresses carry no validity rule for.
+    pub fn details_complete(&self) -> bool {
+        self.address(SiteAddressKind::Operating).is_some()
+            && self.address(SiteAddressKind::Shipping).is_some()
+    }
+
     /// Store `address` as this site's address of the given kind, replacing
     /// whatever it held before.
     ///
@@ -544,6 +566,31 @@ pub struct OutpostRecord {
 }
 
 impl OutpostRecord {
+    /// The `LifeCycleStatus` this Outpost reports NOW.
+    ///
+    /// An Outpost is registered in the non-terminal [`LIFE_CYCLE_STATUS_PENDING`] and
+    /// reaches the terminal [`LIFE_CYCLE_STATUS_ACTIVE`] when the hardware ordered for
+    /// it has been installed
+    /// ([`ComAmazonawsOutpostsOutpostsolafserviceState::settle_outposts`]), so the
+    /// member is never absent on a stored Outpost; a record that somehow carries none
+    /// is read as the status a registered Outpost starts in rather than as an empty
+    /// status no reader could act on.
+    pub fn life_cycle_status(&self) -> &str {
+        self.outpost
+            .life_cycle_status
+            .as_deref()
+            .unwrap_or(LIFE_CYCLE_STATUS_PENDING)
+    }
+
+    /// Whether this Outpost has reached the terminal [`LIFE_CYCLE_STATUS_ACTIVE`] —
+    /// hardware installed and in service.
+    ///
+    /// The one question every operation that acts on an Outpost's INSTALLED HARDWARE
+    /// asks of it, so each asks it the same way.
+    pub fn is_active(&self) -> bool {
+        self.life_cycle_status() == LIFE_CYCLE_STATUS_ACTIVE
+    }
+
     /// Every hardware asset installed on this Outpost, in installation order, each
     /// with the creation sequence that identifies the UNIT.
     ///
@@ -6045,6 +6092,71 @@ pub fn asset_not_found(asset_id: &str) -> String {
     const CLOSING: &str = " found.";
     let [asset_id] = echoes(OPENING.len() + CLOSING.len(), [asset_id]);
     format!("{OPENING}{asset_id}{CLOSING}")
+}
+
+/// How a refusal states that the site a request named has no ADDRESS of the type it
+/// asked for recorded: `<AddressType> not found for SiteId=<siteId>`.
+///
+/// The fixed text is AWS's own. The variable parts are the modelled `AddressType`
+/// value the request asked for and the bare site id its `SiteId` resolved to — the
+/// same value the success path reports in `GetSiteAddress$SiteId`, so the refusal
+/// names the site that was read whichever identifier form named it. The refusal
+/// tracks what the site HOLDS and not what the request said: an address type the
+/// site records reads back, and recording the missing one makes the same call
+/// succeed. See [`order_not_found`] for the bound.
+pub fn site_address_not_found(address_type: &str, site_id: &str) -> String {
+    const SEPARATOR: &str = " not found for SiteId=";
+    let [address_type, site_id] = echoes(SEPARATOR.len(), [address_type, site_id]);
+    format!("{address_type}{SEPARATOR}{site_id}")
+}
+
+/// How this service states that an Outpost's lifecycle status does not allow the
+/// decommission a request asked for: `Outpost <outpostId> has invalid
+/// lifecycleStatus=<status>`.
+///
+/// The fixed text is AWS's own; the variable parts are the bare Outpost id the
+/// request's identifier resolved to and the `LifeCycleStatus` that Outpost holds now
+/// ([`OutpostRecord::life_cycle_status`]). See [`order_not_found`] for the bound.
+pub fn outpost_lifecycle_invalid(outpost_id: &str, status: &str) -> String {
+    const OPENING: &str = "Outpost ";
+    const SEPARATOR: &str = " has invalid lifecycleStatus=";
+    let [outpost_id, status] = echoes(OPENING.len() + SEPARATOR.len(), [outpost_id, status]);
+    format!("{OPENING}{outpost_id}{SEPARATOR}{status}")
+}
+
+/// How this service states that no capacity task can be created for an Outpost that
+/// has not reached [`LIFE_CYCLE_STATUS_ACTIVE`]: `Failed to create capacity task for
+/// <outpostId>. Outpost should have LifeCycleStatus being ACTIVE, but <outpostId> has
+/// LifeCycleStatus <status>`.
+///
+/// The fixed text is AWS's own, and it names the Outpost TWICE: the bare id the
+/// request's identifier resolved to, with the status that Outpost holds now
+/// ([`OutpostRecord::life_cycle_status`]) as the only other variable part. See
+/// [`order_not_found`] for the bound.
+pub fn capacity_task_lifecycle_report(outpost_id: &str, status: &str) -> String {
+    const OPENING: &str = "Failed to create capacity task for ";
+    const REQUIRED: &str = ". Outpost should have LifeCycleStatus being ";
+    const JOIN: &str = ", but ";
+    const HELD: &str = " has LifeCycleStatus ";
+    let [addressed, named, status] = echoes(
+        OPENING.len() + REQUIRED.len() + LIFE_CYCLE_STATUS_ACTIVE.len() + JOIN.len() + HELD.len(),
+        [outpost_id, outpost_id, status],
+    );
+    format!(
+        "{OPENING}{addressed}{REQUIRED}{LIFE_CYCLE_STATUS_ACTIVE}{JOIN}{named}{HELD}{status}"
+    )
+}
+
+/// How this service states that an order cannot be placed at a site whose details are
+/// not complete: `The site details are incomplete. Reach out to AWS Support for
+/// assistance.`
+///
+/// The text is AWS's own and WHOLLY fixed — it names neither the site nor which of
+/// its details is missing — so nothing in it can be cut and the body is inside
+/// [`ERROR_MESSAGE_MAX`] for every request that reaches a handler. What a site's
+/// details ARE is [`SiteRecord::details_complete`].
+pub fn site_details_incomplete() -> String {
+    "The site details are incomplete. Reach out to AWS Support for assistance.".to_string()
 }
 
 /// How the CAPACITY paths of this service state that no Outpost is held under

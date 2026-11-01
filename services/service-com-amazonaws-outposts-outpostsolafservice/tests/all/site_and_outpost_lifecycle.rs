@@ -211,6 +211,30 @@ pub(crate) fn activate_outpost(outposts: &Outposts, outpost_id: &str) {
     record.active_at = Some(std::time::Instant::now());
 }
 
+/// Put `outpost_id` in the terminal `ACTIVE` lifecycle status, leaving the hardware it
+/// holds exactly as it is.
+///
+/// The counterpart of [`activate_outpost`] for a case about what an Outpost's STATUS
+/// gates — every operation that acts on installed hardware requires that status — and
+/// not about what hardware the install put there: an Outpost whose form factor names no
+/// configuration this service publishes settles ACTIVE holding nothing, so the state
+/// this records is one the service itself produces. The status is written through the
+/// same store seam [`activate_outpost`] moves an install's instant through; every
+/// assertion about behaviour still goes over the wire.
+pub(crate) fn mark_outpost_active(outposts: &Outposts, outpost_id: &str) {
+    let store = outposts.store();
+    let mut store = store.lock();
+    let record = store
+        .outposts
+        .get_mut(outpost_id)
+        .unwrap_or_else(|| panic!("the create persisted Outpost {outpost_id}"));
+    record.outpost.life_cycle_status = Some(
+        service_com_amazonaws_outposts_outpostsolafservice::state::LIFE_CYCLE_STATUS_ACTIVE
+            .to_string(),
+    );
+    record.active_at = None;
+}
+
 impl Outposts {
     pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -349,8 +373,11 @@ impl Outposts {
 
     /// A site created in `region` and named `name`, as its `SiteId` — what a case
     /// that places Outposts in `region` names in `SiteId`.
+    ///
+    /// It records both of the addresses an order is placed against
+    /// ([`orderable_site`]), for the reason [`Outposts::site_and_outpost`] does.
     pub(crate) async fn site_id_in(&self, region: &str, name: &str) -> String {
-        let site = self.create_site_in(region, &json!({ "Name": name })).await;
+        let site = self.create_site_in(region, &orderable_site(name)).await;
         text(&site, "SiteId")
     }
 
@@ -373,14 +400,33 @@ impl Outposts {
     /// An Outpost belongs to a site, so the site comes first: the same order a real
     /// workflow takes, and the one helper every suite that just needs "an Outpost"
     /// reaches for.
+    ///
+    /// The site records both of the addresses an order is placed against, because an
+    /// order can only be placed at a site whose details are complete
+    /// ([`crate::precondition_gates`]) and most suites reaching for "an Outpost"
+    /// place one; a case about the refusal itself builds its own site.
     pub(crate) async fn site_and_outpost(&self, name: &str) -> (String, String) {
         let site = self
-            .create_site(&json!({ "Name": format!("{name}-site") }))
+            .create_site(&orderable_site(&format!("{name}-site")))
             .await;
         let outpost = self
             .create_outpost(&json!({ "Name": name, "SiteId": text(&site, "SiteId") }))
             .await;
         (text(&outpost, "OutpostId"), text(&outpost, "OutpostArn"))
+    }
+
+    /// The same, for a suite that runs a CAPACITY TASK on the Outpost: one site and one
+    /// Outpost on it whose hardware is IN SERVICE
+    /// ([`mark_outpost_active`]).
+    ///
+    /// A capacity task configures the capacity of an Outpost's installed hardware, so it
+    /// is refused on an Outpost that has not reached the terminal `ACTIVE` lifecycle
+    /// status ([`crate::precondition_gates`], which states that refusal) — every suite
+    /// about what a task DOES starts from an Outpost past that gate.
+    pub(crate) async fn site_and_outpost_in_service(&self, name: &str) -> (String, String) {
+        let (outpost_id, outpost_arn) = self.site_and_outpost(name).await;
+        mark_outpost_active(self, &outpost_id);
+        (outpost_id, outpost_arn)
     }
 
     /// The same, for a suite that submits an order FROM A QUOTE: a site recording
@@ -544,6 +590,21 @@ pub(crate) fn address(country: &str, state: &str, city: &str) -> Value {
         "StateOrRegion": state,
         "PostalCode": "98109",
         "CountryCode": country,
+    })
+}
+
+/// A `CreateSite` request for a site AN ORDER CAN BE PLACED AT: the name, and both of
+/// the addresses an order is placed against.
+///
+/// An order is placed at the site its Outpost stands on, and a site missing either
+/// address is a site whose details are not complete, which `CreateOrder` refuses
+/// ([`crate::precondition_gates`]) — so every suite that places an order to get at
+/// something else starts from this request rather than restating the two addresses.
+pub(crate) fn orderable_site(name: &str) -> Value {
+    json!({
+        "Name": name,
+        "OperatingAddress": address("US", "WA", "Seattle"),
+        "ShippingAddress": address("US", "WA", "Kirkland"),
     })
 }
 
@@ -922,6 +983,10 @@ async fn listing_filters_select_only_matching_stored_records() {
         .create_site(&json!({
             "Name": "seattle",
             "OperatingAddress": address("US", "WA", "Seattle"),
+            // Orders are placed on this site's Outposts below, and an order can only be
+            // placed at a site whose details are complete
+            // ([`crate::precondition_gates`]).
+            "ShippingAddress": address("US", "WA", "Kirkland"),
         }))
         .await;
     let dublin = outposts

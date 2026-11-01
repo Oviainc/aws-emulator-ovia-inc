@@ -259,7 +259,13 @@ async fn the_operating_address_changes_inside_either_window_and_is_held_outside_
         // One store per row, so the order of the rows cannot matter.
         let outposts = Outposts::new();
         let site = outposts
-            .create_site(&json!({ "Name": "windowed site", "OperatingAddress": before }))
+            .create_site(&json!({
+                "Name": "windowed site",
+                "OperatingAddress": before,
+                // A row that places an order needs a site whose details are complete
+                // ([`crate::precondition_gates`]).
+                "ShippingAddress": address("US", "WA", "Kirkland"),
+            }))
             .await;
         let site_id = text(&site, "SiteId");
         let site_arn = text(&site, "SiteArn");
@@ -282,7 +288,9 @@ async fn the_operating_address_changes_inside_either_window_and_is_held_outside_
             Placed::Nowhere => None,
             Placed::AtAnotherSite => {
                 let other = outposts
-                    .create_site(&json!({ "Name": "another site" }))
+                    .create_site(&crate::site_and_outpost_lifecycle::orderable_site(
+                        "another site",
+                    ))
                     .await;
                 let elsewhere = outposts
                     .create_outpost(&json!({
@@ -407,7 +415,13 @@ async fn the_closed_window_follows_the_order_at_the_site_not_its_outpost_record(
     let outposts = Outposts::new();
     let before = address("US", "WA", "Seattle");
     let site = outposts
-        .create_site(&json!({ "Name": "ordered site", "OperatingAddress": before }))
+        .create_site(&json!({
+            "Name": "ordered site",
+            "OperatingAddress": before,
+            // An order is placed at this site below, and an order can only be placed at
+            // a site whose details are complete ([`crate::precondition_gates`]).
+            "ShippingAddress": address("US", "WA", "Kirkland"),
+        }))
         .await;
     let site_id = text(&site, "SiteId");
     let ordered = text(

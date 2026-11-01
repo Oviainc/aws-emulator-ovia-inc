@@ -57,7 +57,8 @@ fn read_path(identifier: &str, address_type: &str) -> String {
 }
 
 /// Everything a later caller can observe about one site through the implemented
-/// readers: the site record itself and both of its addresses.
+/// readers: the site record itself and, per address type, the answer a read of it gets
+/// — which is the address when the site records one and the refusal when it does not.
 ///
 /// This is the value rule 2 compares before and after a batch of reads; it is built
 /// only from calls over the wire, so a read that quietly moved stored state shows up
@@ -65,9 +66,8 @@ fn read_path(identifier: &str, address_type: &str) -> String {
 async fn observable(outposts: &Outposts, site_id: &str) -> Value {
     let mut view = json!({ "Site": outposts.get_site(site_id).await });
     for address_type in ADDRESS_TYPES {
-        view[address_type] = outposts
-            .ok("GET", &read_path(site_id, address_type), None)
-            .await;
+        let reply = outposts.call("GET", &read_path(site_id, address_type), None).await;
+        view[address_type] = json!({ "status": reply.status, "body": reply.body });
     }
     view
 }
@@ -95,16 +95,18 @@ async fn every_get_site_address_call_is_served_from_the_modelled_outcomes() {
 
     let mut cases: Vec<(String, String, u16)> = Vec::new();
     for address_type in ADDRESS_TYPES {
-        for (held, identifier) in [
-            ("holds it, by id", furnished_id.as_str()),
-            ("holds it, by ARN", furnished_arn.as_str()),
-            ("holds none, by id", bare_id.as_str()),
-            ("holds none, by ARN", bare_arn.as_str()),
+        for (held, identifier, expected) in [
+            ("holds it, by id", furnished_id.as_str(), 200),
+            ("holds it, by ARN", furnished_arn.as_str(), 200),
+            // A site recording no address of the type asked for holds nothing for the
+            // read to answer, so the model's own 404 is the outcome.
+            ("holds none, by id", bare_id.as_str(), 404),
+            ("holds none, by ARN", bare_arn.as_str(), 404),
         ] {
             cases.push((
                 format!("{address_type}, site {held}"),
                 read_path(identifier, address_type),
-                200,
+                expected,
             ));
         }
         // The modelled refusals: a well-formed identifier naming no site is the
@@ -234,15 +236,23 @@ async fn reading_a_site_address_changes_nothing_a_later_caller_sees() {
     let inventory_before = outposts.list_sites("").await;
 
     // The batch of reads whose effect is under test: every type, both identifier
-    // forms, each site, twice over — plus the refused routes, which must not create or
-    // move anything either.
+    // forms, each site, twice over — whether the site records an address of that type
+    // or the read is refused — plus the refused routes, which must not create or move
+    // anything either.
     for _ in 0..2 {
         for (_, site_id, site_arn) in &sites {
             for address_type in ADDRESS_TYPES {
                 for named_by in [site_id.as_str(), site_arn.as_str()] {
-                    outposts
-                        .ok("GET", &read_path(named_by, address_type), None)
+                    let reply = outposts
+                        .call("GET", &read_path(named_by, address_type), None)
                         .await;
+                    assert!(
+                        reply.status == 200 || reply.status == 404,
+                        "case {address_type:?} on {named_by}: a read is answered from the \
+                         model's own outcomes, got {} {:?}",
+                        reply.status,
+                        reply.body
+                    );
                 }
             }
         }

@@ -41,7 +41,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_outposts_outpostsolafservice::ops::types::ASSET_TYPE_VALUES;
 
 use crate::capacity_task_lifecycle::capacity_route;
-use crate::site_and_outpost_lifecycle::{install_hardware, query_value, segment, text, Outposts};
+use crate::site_and_outpost_lifecycle::{
+    install_hardware, orderable_site, query_value, segment, text, Outposts,
+};
 
 /// The route `ListAssets` binds, for one identifier form and one query string.
 fn assets_route(identifier: &str, query: &str) -> String {
@@ -74,7 +76,7 @@ const RACK_ELEVATION_MAX: f64 = 99.0;
 /// `OutpostId`. An Outpost belongs to a site, so the site comes first.
 async fn an_outpost(outposts: &Outposts, name: &str, form_factor: Option<&str>) -> String {
     let site = outposts
-        .create_site(&json!({ "Name": format!("{name}-site") }))
+        .create_site(&orderable_site(&format!("{name}-site")))
         .await;
     let mut request = json!({ "Name": name, "SiteId": text(&site, "SiteId") });
     if let Some(form_factor) = form_factor {

@@ -53,8 +53,8 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
 use crate::capacity_task_lifecycle::{an_order, pool, settle_capacity_task, start_ok, HOST_VCPUS};
 use crate::outpost_assets::record;
 use crate::site_and_outpost_lifecycle::{
-    deliver_orders, install_hardware, query_value, refusal, segment, text, Outposts, Refusal,
-    ABSENT_OUTPOST_ID, OUTPOST_ARN_PREFIX,
+    deliver_orders, install_hardware, mark_outpost_active, orderable_site, query_value, refusal,
+    segment, text, Outposts, Refusal, ABSENT_OUTPOST_ID, OUTPOST_ARN_PREFIX,
 };
 
 /// An instance type the modelled `InstanceTypeName` pattern (`^[a-z0-9\-]+\.[a-z0-9\-]+$`)
@@ -135,20 +135,26 @@ fn expected(catalog: &[Value], want: &[&str]) -> Vec<(String, Option<i64>)> {
 
 /// One site and one Outpost on it carrying `hardware_type`, as that Outpost's
 /// `(OutpostId, OutpostArn)`.
+///
+/// The Outpost reports the terminal `ACTIVE` lifecycle status, because the rows start
+/// capacity tasks on the hardware they record and a task is refused on an Outpost whose
+/// hardware is not in service ([`crate::precondition_gates`]).
 async fn an_outpost(
     outposts: &Outposts,
     name: &str,
     hardware_type: Option<&str>,
 ) -> (String, String) {
     let site = outposts
-        .create_site(&json!({ "Name": format!("{name}-site") }))
+        .create_site(&orderable_site(&format!("{name}-site")))
         .await;
     let mut request = json!({ "Name": name, "SiteId": text(&site, "SiteId") });
     if let Some(hardware_type) = hardware_type {
         request["SupportedHardwareType"] = json!(hardware_type);
     }
     let outpost = outposts.create_outpost(&request).await;
-    (text(&outpost, "OutpostId"), text(&outpost, "OutpostArn"))
+    let (outpost_id, outpost_arn) = (text(&outpost, "OutpostId"), text(&outpost, "OutpostArn"));
+    mark_outpost_active(outposts, &outpost_id);
+    (outpost_id, outpost_arn)
 }
 
 /// One recorded compute asset, so a capacity task can be scoped to a piece of this

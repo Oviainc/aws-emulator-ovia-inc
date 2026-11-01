@@ -167,6 +167,9 @@ async fn create_everything(outposts: &Outposts, region: &str) -> Created {
         )
         .await;
     let outpost_id = text(&outpost, "OutpostId");
+    // A capacity task is created on this Outpost below, and a task is refused on one
+    // whose hardware is not in service ([`crate::precondition_gates`]).
+    crate::site_and_outpost_lifecycle::mark_outpost_active(outposts, &outpost_id);
     let quote = outposts
         .ok_in(
             region,

@@ -204,13 +204,31 @@ impl Emulator {
 
     /// One site and one Outpost on it in `region`, through `outposts:CreateSite` and
     /// `outposts:CreateOutpost`, as that Outpost's `OutpostId`.
+    ///
+    /// The site records both of the addresses an order is placed against — the address
+    /// the hardware is operated at and the address it ships to — because an order can
+    /// only be placed at a site whose details are complete, and the orders below are
+    /// what put hardware on this Outpost.
     pub(crate) async fn an_outpost_in(&self, region: &str, name: &str) -> String {
+        let address = json!({
+            "ContactName": "Sam Site",
+            "ContactPhoneNumber": "+12065550100",
+            "AddressLine1": "410 Terry Ave N",
+            "City": "Seattle",
+            "StateOrRegion": "WA",
+            "PostalCode": "98109",
+            "CountryCode": "US",
+        });
         let site = self
             .outposts_ok(
                 region,
                 "POST",
                 "/sites",
-                Some(json!({ "Name": format!("{name}-site") })),
+                Some(json!({
+                    "Name": format!("{name}-site"),
+                    "OperatingAddress": address,
+                    "ShippingAddress": address,
+                })),
             )
             .await;
         let site_id = string_at(&site["Site"], "SiteId");

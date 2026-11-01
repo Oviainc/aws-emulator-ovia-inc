@@ -653,7 +653,12 @@ async fn each_region_lists_only_its_own_orders() {
     let mut expected: Vec<(&str, BTreeSet<String>)> = Vec::new();
     for (region, count) in &plan {
         let site = outposts
-            .create_site_in(region, &json!({ "Name": format!("{region}-order-site") }))
+            .create_site_in(
+                region,
+                &crate::site_and_outpost_lifecycle::orderable_site(&format!(
+                    "{region}-order-site"
+                )),
+            )
             .await;
         let outpost = outposts
             .create_outpost_in(

@@ -107,6 +107,10 @@ async fn a_call_held_back_by_a_dependent_resource_is_a_conflict_naming_that_depe
                 &json!({
                     "Name": "site with dependents",
                     "OperatingAddress": address("US", "WA", "Seattle"),
+                    // An order is placed at the site below, and an order can only be
+                    // placed at a site whose details are complete
+                    // ([`crate::precondition_gates`]).
+                    "ShippingAddress": address("US", "WA", "Kirkland"),
                 }),
             )
             .await;

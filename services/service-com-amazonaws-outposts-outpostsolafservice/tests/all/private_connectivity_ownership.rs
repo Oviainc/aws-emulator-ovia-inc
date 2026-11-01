@@ -22,7 +22,9 @@
 
 use serde_json::{json, Value};
 
-use crate::site_and_outpost_lifecycle::{install_hardware, segment, text, Outposts};
+use crate::site_and_outpost_lifecycle::{
+    install_hardware, orderable_site, segment, text, Outposts,
+};
 
 /// The route both operations are bound to:
 /// `(GET|POST) /outposts/{OutpostId}/privateConnectivity`, from
@@ -164,7 +166,7 @@ impl Change {
 /// One site and one Outpost on it, as `(SiteId, OutpostId, OutpostArn)`.
 async fn site_and_outpost(outposts: &Outposts, name: &str) -> (String, String, String) {
     let site = outposts
-        .create_site(&json!({ "Name": format!("{name} site") }))
+        .create_site(&orderable_site(&format!("{name} site")))
         .await;
     let site_id = text(&site, "SiteId");
     let outpost = outposts

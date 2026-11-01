@@ -36,7 +36,9 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::order_not_found;
 use crate::capacity_task_lifecycle::{
     an_order, capacity_route, install, pool, task_route, ABSENT_ORDER_ID, INSTALLED,
 };
-use crate::site_and_outpost_lifecycle::{query_value, segment, text, Outposts, Reply, HOME_REGION};
+use crate::site_and_outpost_lifecycle::{
+    mark_outpost_active, query_value, segment, text, Outposts, Reply, HOME_REGION,
+};
 
 /// The wire error code an `OrderId` that names no order of the Outpost in hand
 /// arrives as, from `smithy_query(query="operation",operation="StartCapacityTask")`:
@@ -68,6 +70,11 @@ impl Placed {
 }
 
 /// One Outpost on `site_id`, with `orders` orders placed on it over the wire.
+///
+/// The Outpost reports the terminal `ACTIVE` lifecycle status, because a capacity task
+/// configures the capacity of an Outpost's installed hardware and is refused on one
+/// whose hardware is not in service ([`crate::precondition_gates`], which states that
+/// refusal); what these rows are about is the `OrderId` resolution behind that gate.
 async fn place(
     outposts: &Outposts,
     name: &'static str,
@@ -78,6 +85,7 @@ async fn place(
         .create_outpost(&json!({ "Name": name, "SiteId": site_id }))
         .await;
     let outpost_id = text(&outpost, "OutpostId");
+    mark_outpost_active(outposts, &outpost_id);
     let mut placed = Vec::new();
     for _ in 0..orders {
         placed.push(an_order(outposts, &outpost_id).await);

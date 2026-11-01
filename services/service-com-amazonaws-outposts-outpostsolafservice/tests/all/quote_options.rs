@@ -49,7 +49,7 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
 use crate::quote_lifecycle::{create_quote, get_quote, request};
 use crate::renewal_pricing::{assert_price, months, price, upfront_share, CENT};
 use crate::site_and_outpost_lifecycle::{
-    address, install_hardware, is_minted_id, segment, text, Outposts,
+    address, install_hardware, is_minted_id, mark_outpost_active, segment, text, Outposts,
 };
 
 /// The two `OrderingRequirementStatus` values a check this service RAN reports.
@@ -567,9 +567,11 @@ fn priced_details(quote: &Value, case: &str) -> Vec<Value> {
 async fn a_quote_reports_the_outcome_of_every_check_this_store_can_decide() {
     let outposts = Outposts::new();
 
-    // One Outpost per shape of site the rows need. Hardware is ordered for each and
-    // installed, which is what makes them active, so every row but the last reads an
-    // active Outpost.
+    // One Outpost per shape of site the rows need. Each is put in its terminal ACTIVE
+    // lifecycle status, which is what the active check reads, so every row but the last
+    // reads an active Outpost. It is recorded rather than ordered, because a site whose
+    // details are not complete takes no order at all
+    // ([`crate::precondition_gates`]) and two of these sites are exactly that.
     let complete = an_outpost(
         &outposts,
         "quote-checks-complete",
@@ -587,7 +589,7 @@ async fn a_quote_reports_the_outcome_of_every_check_this_store_can_decide() {
     .await;
     let addressless = an_outpost(&outposts, "quote-checks-addressless", json!({})).await;
     for outpost_id in [&complete, &operating_only, &addressless] {
-        install_hardware(&outposts, outpost_id).await;
+        mark_outpost_active(&outposts, outpost_id);
     }
 
     // Each row: the country code the quote is for, the Outpost it names, and the

@@ -22,7 +22,12 @@
 //!
 //! An `OutpostIdentifier` the store holds no Outpost for is `NotFoundException` (404),
 //! worded as this service's identifier echo of the value as supplied; a value that is
-//! not an Outpost identifier at all is `ValidationException` (400).
+//! not an Outpost identifier at all is `ValidationException` (400). So is an Outpost
+//! whose hardware is not in service: a decommission takes installed hardware out, so
+//! an Outpost that has not reached the terminal `ACTIVE` lifecycle status is refused
+//! with the modelled `ValidationException` naming it and the status it holds
+//! ([`crate::state::outpost_lifecycle_invalid`]) — the operation's precondition, so it
+//! is judged before any plan above is produced and on the `ValidateOnly` path too.
 //!
 //! The other two modelled errors are NOT reachable here, so no test should read deny or
 //! conflict coverage into this operation: this handler makes no authorization decision
@@ -209,12 +214,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 
         let mut store = state.lock();
-        // Only the quote and order statuses matter to this call, and each moves on
-        // the clock — a quote expires, an order gets past being prepared — so settle
-        // both before reading what is still associated with the Outpost. That writes
-        // only what was already due at this same instant — nothing a later caller
-        // would not have seen anyway. The Outpost's own lifecycle status is not read
-        // here, so it is not settled.
+        // The Outpost's own lifecycle status decides whether there is anything to
+        // decommission, and it moves on the clock — hardware ordered for the Outpost
+        // gets installed — so it is settled before being read. The quote and order
+        // statuses this call also reads move on the clock too (a quote expires, an
+        // order gets past being prepared), and `settle_outposts` settles the orders an
+        // install waits on; the quotes are settled beside it. All of that writes only
+        // what was already due at this same instant — nothing a later caller would not
+        // have seen anyway.
+        store.settle_outposts();
         store.settle_quotes();
         store.settle_orders();
 
@@ -223,8 +231,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // identifier echo of the value AS SUPPLIED — not of the bare id an ARN
         // resolved to. Judged before anything else is looked at, so an identifier
         // that names nothing costs nothing.
-        if store.outpost(&region, &outpost_id).is_none() {
+        let Some(record) = store.outpost(&region, &outpost_id) else {
             return Err(not_found().into());
+        };
+        // Decommissioning takes an Outpost's INSTALLED HARDWARE out of service, so
+        // there is hardware to take out only once that hardware is in service: the
+        // terminal `ACTIVE` lifecycle status. An Outpost in any other status — one
+        // whose hardware was never installed — is one this call cannot decommission,
+        // which is the bad request the modelled `ValidationException` (HTTP 400)
+        // states, naming the Outpost and the status that blocks it. It is the
+        // PRECONDITION of the operation, so it is judged before any plan is produced
+        // and whether or not the caller asked to validate only: validating a request
+        // is checking exactly this, not skipping it. Nothing is written either way, so
+        // the Outpost reads back afterwards exactly as it stood.
+        if !record.is_active() {
+            let message = crate::state::outpost_lifecycle_invalid(
+                &outpost_id,
+                record.life_cycle_status(),
+            );
+            return Err(
+                StartOutpostDecommissionErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+                .into(),
+            );
         }
 
         // Something still associated with the Outpost stops the decommission from

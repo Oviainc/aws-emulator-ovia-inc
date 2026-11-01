@@ -55,8 +55,8 @@ use crate::capacity_task_lifecycle::{
     pool, settle_capacity_task, start_ok, ABSENT_CAPACITY_TASK_ID,
 };
 use crate::site_and_outpost_lifecycle::{
-    query_value, refusal, segment, settle, text, Outposts, Refusal, ABSENT_OUTPOST_ID,
-    ABSENT_SITE_ID, OUTPOST_ARN_PREFIX,
+    mark_outpost_active, orderable_site, query_value, refusal, segment, settle, text, Outposts,
+    Refusal, ABSENT_OUTPOST_ID, ABSENT_SITE_ID, OUTPOST_ARN_PREFIX,
 };
 
 /// The account id every request this emulator serves arrives as, which is therefore the
@@ -281,14 +281,20 @@ fn blocking_ids(recorded: &[AssetInstance], exclude: &Exclude) -> Vec<String> {
 
 /// An Outpost to record instances on, as its `OutpostId`. An Outpost belongs to a site,
 /// so the site comes first — the same order a real workflow takes.
+///
+/// It reports the terminal `ACTIVE` lifecycle status, because the rows start capacity
+/// tasks on it and a task is refused on an Outpost whose hardware is not in service
+/// ([`crate::precondition_gates`]).
 async fn an_outpost(outposts: &Outposts, name: &str) -> String {
     let site = outposts
-        .create_site(&json!({ "Name": format!("{name}-site") }))
+        .create_site(&orderable_site(&format!("{name}-site")))
         .await;
     let outpost = outposts
         .create_outpost(&json!({ "Name": name, "SiteId": text(&site, "SiteId") }))
         .await;
-    text(&outpost, "OutpostId")
+    let outpost_id = text(&outpost, "OutpostId");
+    mark_outpost_active(outposts, &outpost_id);
+    outpost_id
 }
 
 /// Record `instances` as the Amazon EC2 instances running on the stored Outpost. See

@@ -4,8 +4,10 @@
 //! IMPLEMENTED: answers the whole `Address` stored on the site the `SiteId` resolves to
 //! for the `AddressType` the request names — the slot `CreateSite` and `UpdateSiteAddress`
 //! write — together with the site's id and that type. A site carrying no address of the
-//! requested type is reported with the member absent, which is what the model declares it
-//! as; the 404 is reserved for a `SiteId` that names no site.
+//! requested type holds nothing for this call to answer, so the read is refused with the
+//! modelled `NotFoundException` (404) naming the type and the site
+//! ([`crate::state::site_address_not_found`]) rather than answered a success with the
+//! member absent; the same 404 reports a `SiteId` that names no site at all.
 //!
 //! ## Shape of an operation
 //!
@@ -190,13 +192,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let record = store.site(&region, &site_id).ok_or_else(not_found)?;
+        // The read answers the site's address OF THE TYPE asked for, so a type the
+        // site records no address under is a read of something this service does not
+        // hold: the not-found error this operation models (HTTP 404), naming the type
+        // and the site ([`crate::state::site_address_not_found`]) — never a success
+        // whose `Address` is simply absent, which a caller could not tell from an
+        // address withheld. It tracks what the site HOLDS: the type it does record
+        // reads back, and recording the missing one through `UpdateSiteAddress` makes
+        // the identical call succeed.
+        let address = record.address(kind).cloned().ok_or_else(|| {
+            GetSiteAddressErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::site_address_not_found(
+                    kind.address_type(),
+                    &site_id,
+                )),
+            })
+        })?;
 
         Ok(GetSiteAddressOutput {
             // The bare id of the site that was read, whichever form the request
             // named it by — the same value `Site$SiteId` carries.
             site_id: Some(site_id.clone()),
             address_type: Some(kind.address_type().to_string()),
-            address: record.address(kind).cloned(),
+            address: Some(address),
         })
     }
 }

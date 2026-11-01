@@ -528,6 +528,9 @@ async fn an_identifier_this_region_holds_nothing_for_is_not_found() {
             .await,
         "OutpostId",
     );
+    // A capacity task is refused on an Outpost whose hardware is not in service
+    // ([`crate::precondition_gates`]), so this one is put past that gate too.
+    crate::site_and_outpost_lifecycle::mark_outpost_active(&outposts, &other_outpost);
     let other_task = text(
         &outposts
             .ok_in(

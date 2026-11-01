@@ -23,12 +23,16 @@
 //!    requirement unmet; a quote that has one is refused (409 `ConflictException`)
 //!    naming the quote in `ResourceId` and exactly the checks it reports `FAIL` for
 //!    in the message, and the checks are the ones the store gives at the instant of
-//!    the submit.
+//!    the submit. A site whose DETAILS are not complete is the order's own
+//!    precondition and is refused before the quote is weighed at all (400
+//!    `ValidationException`, [`crate::precondition_gates`]), so a row missing one of
+//!    the site's addresses is refused there.
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    ORDERING_REQUIREMENT_FAIL, QUOTE_STATUS_CREATED, QUOTE_STATUS_ORDER_SUBMITTED,
+    site_details_incomplete, ORDERING_REQUIREMENT_FAIL, QUOTE_STATUS_CREATED,
+    QUOTE_STATUS_ORDER_SUBMITTED,
 };
 
 use crate::quote_lifecycle::{create_quote, get_quote, request as quote_request};
@@ -594,6 +598,27 @@ async fn an_order_is_submitted_only_from_a_quote_whose_requirements_are_met() {
             }),
         );
         let reply = outposts.call("POST", "/orders", Some(&body)).await;
+        // An order is placed at the site through the Outpost, so a site whose details
+        // are not complete refuses the order on its own precondition — before anything
+        // about the quote is weighed.
+        if !setup.operating_address || !setup.shipping_address {
+            assert_eq!(
+                (reply.status, reply.error_code.as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: an incomplete site refuses the order, got {} {} {}",
+                reply.status,
+                reply.error_code,
+                reply.body
+            );
+            assert_eq!(
+                message(&reply.body),
+                site_details_incomplete(),
+                "case {case:?}: expected the incomplete-site sentence, got {}",
+                reply.body
+            );
+            assert_nothing_persisted(&outposts, &quote_id, &held_before, case).await;
+            continue;
+        }
         if unmet.is_empty() {
             assert_eq!(
                 reply.status, 200,

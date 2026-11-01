@@ -52,7 +52,8 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
 };
 
 use crate::site_and_outpost_lifecycle::{
-    query_value, refusal, segment, text, Outposts, Refusal, ABSENT_OUTPOST_ID, OUTPOST_ARN_PREFIX,
+    orderable_site, query_value, refusal, segment, text, Outposts, Refusal, ABSENT_OUTPOST_ID,
+    OUTPOST_ARN_PREFIX,
 };
 
 /// The modelled `SupportedHardwareType` values (`RACK` | `SERVER`), as
@@ -185,7 +186,7 @@ async fn an_outpost(
     hardware_type: Option<&str>,
 ) -> (String, String) {
     let site = outposts
-        .create_site(&json!({ "Name": format!("{name}-site") }))
+        .create_site(&orderable_site(&format!("{name}-site")))
         .await;
     let mut request = json!({ "Name": name, "SiteId": text(&site, "SiteId") });
     if let Some(hardware_type) = hardware_type {

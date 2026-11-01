@@ -161,6 +161,10 @@ async fn update_outpost_applies_present_members_and_reads_back() {
         .create_site(&json!({
             "Name": "update site",
             "OperatingAddress": address("US", "WA", "Seattle"),
+            // Hardware is ordered for this site's Outpost below, and an order can only
+            // be placed at a site whose details are complete
+            // ([`crate::precondition_gates`]).
+            "ShippingAddress": address("US", "WA", "Kirkland"),
         }))
         .await;
     let created = outposts

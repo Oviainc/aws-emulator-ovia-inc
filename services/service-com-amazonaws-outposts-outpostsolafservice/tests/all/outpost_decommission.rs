@@ -40,6 +40,17 @@ use crate::site_and_outpost_lifecycle::{
     refusal, segment, settle, text, Outposts, ABSENT_OUTPOST_ID, ABSENT_SITE_ID, OUTPOST_ARN_PREFIX,
 };
 
+/// One site and one Outpost on it whose hardware is IN SERVICE, as that Outpost's
+/// `(OutpostId, OutpostArn)`.
+///
+/// A decommission takes an Outpost's installed hardware out of service, so it is
+/// refused on an Outpost that has not reached the terminal `ACTIVE` lifecycle status
+/// ([`crate::precondition_gates`], which states that refusal): every row about what a
+/// decommission DOES starts from an Outpost past that gate.
+async fn an_active_outpost(outposts: &Outposts, name: &str) -> (String, String) {
+    outposts.site_and_outpost_in_service(name).await
+}
+
 /// The `BlockingResourceType` an outstanding Outpost order is reported as, from
 /// `smithy_query(query="shape",shape="BlockingResourceType")`'s value list.
 const OUTPOST_ORDER_CANCELLABLE: &str = "OUTPOST_ORDER_CANCELLABLE";
@@ -126,7 +137,7 @@ async fn a_decommission_is_started_once_and_every_later_call_is_skipped() {
     // which is only a statement about the decommission once the clock owes it nothing.
     let mut outposts_under_test = Vec::new();
     for (case, ..) in &cases {
-        outposts_under_test.push(outposts.site_and_outpost(case).await);
+        outposts_under_test.push(an_active_outpost(&outposts, case).await);
     }
     settle();
 
@@ -194,7 +205,7 @@ async fn validate_only_answers_skipped_and_starts_nothing() {
     ];
 
     for (case, validations, form) in &cases {
-        let (outpost_id, outpost_arn) = outposts.site_and_outpost(case).await;
+        let (outpost_id, outpost_arn) = an_active_outpost(&outposts, case).await;
         let forms = [outpost_id.as_str(), outpost_arn.as_str()];
         for attempt in 1..=*validations {
             let validated =
@@ -275,8 +286,8 @@ async fn an_outstanding_order_blocks_the_decommission_and_nothing_else_does() {
         // A store of its own per row: what blocks a decommission is what the store
         // holds, so each row starts from an empty one.
         let outposts = Outposts::new();
-        let (outpost_id, _) = outposts.site_and_outpost(case).await;
-        let (other_outpost_id, _) = outposts.site_and_outpost("another-outpost").await;
+        let (outpost_id, _) = an_active_outpost(&outposts, case).await;
+        let (other_outpost_id, _) = an_active_outpost(&outposts, "another-outpost").await;
         let quote_id = match association {
             Association::None => None,
             Association::ThisOutpost => Some(a_quote(&outposts, Some(&outpost_id)).await),

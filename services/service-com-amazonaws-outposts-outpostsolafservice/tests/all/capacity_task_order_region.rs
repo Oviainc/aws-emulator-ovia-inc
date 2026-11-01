@@ -92,6 +92,12 @@ async fn place(outposts: &Outposts, region: &'static str) -> Placed {
         )
         .await;
     let outpost_id = text(&outpost, "OutpostId");
+    // A capacity task is refused on an Outpost whose hardware is not in service
+    // ([`crate::precondition_gates`]), and both Outposts here take one.
+    let spare_outpost_id = text(&spare, "OutpostId");
+    for outpost_id in [outpost_id.as_str(), spare_outpost_id.as_str()] {
+        crate::site_and_outpost_lifecycle::mark_outpost_active(outposts, outpost_id);
+    }
     let order = outposts
         .ok_in(
             region,
@@ -111,7 +117,7 @@ async fn place(outposts: &Outposts, region: &'static str) -> Placed {
         region,
         outpost_id,
         outpost_arn: text(&outpost, "OutpostArn"),
-        spare_outpost_id: text(&spare, "OutpostId"),
+        spare_outpost_id,
         order_id: text(&order, "OrderId"),
     }
 }

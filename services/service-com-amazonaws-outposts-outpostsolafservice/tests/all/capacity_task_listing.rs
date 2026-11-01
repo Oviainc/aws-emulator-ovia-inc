@@ -164,7 +164,7 @@ async fn started_tasks(outposts: &Outposts) -> Vec<Started> {
     let mut started: Vec<Started> = Vec::new();
     for (index, (case, request)) in rows.into_iter().enumerate() {
         let (outpost_id, _) = outposts
-            .site_and_outpost(&format!("task-listing-{index}"))
+            .site_and_outpost_in_service(&format!("task-listing-{index}"))
             .await;
         let mut request = request;
         // The two optional references a task carries name OTHER resources, so a row
@@ -401,7 +401,9 @@ async fn paging_the_list_covers_every_capacity_task_exactly_once() {
 #[tokio::test]
 async fn a_foreign_page_token_or_an_unmodelled_filter_value_is_refused() {
     let outposts = Outposts::new();
-    let (outpost_id, _) = outposts.site_and_outpost("task-listing-refusals").await;
+    let (outpost_id, _) = outposts
+        .site_and_outpost_in_service("task-listing-refusals")
+        .await;
     let _ = outposts
         .ok(
             "POST",
@@ -506,9 +508,15 @@ async fn a_foreign_page_token_or_an_unmodelled_filter_value_is_refused() {
 #[tokio::test]
 async fn the_filters_narrow_the_list() {
     let outposts = Outposts::new();
-    let (first, first_arn) = outposts.site_and_outpost("task-filter-first").await;
-    let (second, _) = outposts.site_and_outpost("task-filter-second").await;
-    let (idle, _) = outposts.site_and_outpost("task-filter-idle").await;
+    let (first, first_arn) = outposts
+        .site_and_outpost_in_service("task-filter-first")
+        .await;
+    let (second, _) = outposts
+        .site_and_outpost_in_service("task-filter-second")
+        .await;
+    let (idle, _) = outposts
+        .site_and_outpost_in_service("task-filter-idle")
+        .await;
 
     // One task per modelled status, spread across the two Outposts that hold tasks,
     // so no row can pass by selecting everything.
@@ -637,6 +645,9 @@ async fn each_region_lists_only_its_own_capacity_tasks() {
                 .create_outpost_in(region, &json!({ "Name": name, "SiteId": site_id }))
                 .await;
             let outpost_id = text(&outpost, "OutpostId");
+            // A capacity task is refused on an Outpost whose hardware is not in
+            // service ([`crate::precondition_gates`]).
+            crate::site_and_outpost_lifecycle::mark_outpost_active(&outposts, &outpost_id);
             let answered = outposts
                 .ok_in(
                     region,
@@ -672,7 +683,9 @@ async fn each_region_lists_only_its_own_capacity_tasks() {
 #[tokio::test]
 async fn the_list_reports_the_status_each_task_holds_now() {
     let outposts = Outposts::new();
-    let (outpost_id, _) = outposts.site_and_outpost("task-listing-clock").await;
+    let (outpost_id, _) = outposts
+        .site_and_outpost_in_service("task-listing-clock")
+        .await;
     // Hardware that can hold the configuration the task below asks for, so the task
     // this row follows across the span is one that COMPLETES.
     install_capacity(&outposts, &outpost_id, &INSTALLED[..1], "task-listing-clock");

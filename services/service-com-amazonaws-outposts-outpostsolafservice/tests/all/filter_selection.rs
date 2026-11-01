@@ -107,7 +107,9 @@ async fn assert_selects(outposts: &Outposts, listing: &Listing, rows: &[Row]) {
 async fn outpost_list_selects_by_the_rule() {
     let outposts = Outposts::new();
     let site = outposts
-        .create_site(&json!({ "Name": "filter-rule-site" }))
+        .create_site(&crate::site_and_outpost_lifecycle::orderable_site(
+            "filter-rule-site",
+        ))
         .await;
     let site_id = text(&site, "SiteId");
 
@@ -577,8 +579,12 @@ fn record_task(outposts: &Outposts, outpost_id: &str, status: &str, index: usize
 /// below narrow with alongside the list filter.
 async fn capacity_task_list_selects_by_the_rule() {
     let outposts = Outposts::new();
-    let (first_outpost, _) = outposts.site_and_outpost("filter-rule-tasks-first").await;
-    let (second_outpost, _) = outposts.site_and_outpost("filter-rule-tasks-second").await;
+    let (first_outpost, _) = outposts
+        .site_and_outpost_in_service("filter-rule-tasks-first")
+        .await;
+    let (second_outpost, _) = outposts
+        .site_and_outpost_in_service("filter-rule-tasks-second")
+        .await;
 
     // Four statuses of the model's own `CapacityTaskStatus` enum
     // (`ops::types::CAPACITY_TASK_STATUS_VALUES`), spread across the two Outposts so

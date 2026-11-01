@@ -158,7 +158,7 @@ struct Paged {
 /// Every paged answer this service serves, with the resources the Outpost-scoped ones
 /// are asked on already created, and each route's URI as the model binds it.
 async fn every_route(outposts: &Outposts) -> Vec<Paged> {
-    let (outpost_id, _) = outposts.site_and_outpost("page-boundary").await;
+    let (outpost_id, _) = outposts.site_and_outpost_in_service("page-boundary").await;
     let task_id = text(
         &start_ok(
             outposts,

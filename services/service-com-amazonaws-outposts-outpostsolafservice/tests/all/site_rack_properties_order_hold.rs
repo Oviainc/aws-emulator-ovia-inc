@@ -107,6 +107,9 @@ async fn site_with_an_order(outposts: &Outposts, name: &str) -> (String, String,
         .create_site(&json!({
             "Name": name,
             "OperatingAddress": address("US", "WA", "Seattle"),
+            // An order is placed at this site, and an order can only be placed at a
+            // site whose details are complete ([`crate::precondition_gates`]).
+            "ShippingAddress": address("US", "WA", "Kirkland"),
             "RackPhysicalProperties": properties_at_create(),
         }))
         .await;
