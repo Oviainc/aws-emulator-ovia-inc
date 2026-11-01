@@ -757,16 +757,23 @@ pub fn check_option_group_engine_name(engine_name: &str) -> Result<(), String> {
     ))
 }
 
-/// The engines a DB instance can run, as `CreateDBInstanceMessage$Engine` lists them
+/// The engines a DB instance can run: the union of the engine value lists this model's own
+/// members publish, because one member's list is only as new as the release that wrote it.
+/// `CreateDBInstanceMessage$Engine`
 /// (`smithy_query(query="doc",shape="CreateDBInstanceMessage",member="Engine")`:
 /// "Valid Values: aurora-mysql aurora-postgresql custom-oracle-ee custom-oracle-ee-cdb
 /// custom-oracle-se2 custom-oracle-se2-cdb custom-sqlserver-ee custom-sqlserver-se
 /// custom-sqlserver-web custom-sqlserver-dev db2-ae db2-ce db2-se mariadb mysql
 /// oracle-ee oracle-ee-cdb oracle-se2 oracle-se2-cdb postgres sqlserver-dev-ee
-/// sqlserver-ee sqlserver-se sqlserver-ex sqlserver-web"). These are values AWS
-/// allocated, so the only honest source is the model's own list; extend it when the
+/// sqlserver-ee sqlserver-se sqlserver-ex sqlserver-web") names all but one of them, and
+/// `CreateDBCapacityReservationRequest$Engine`
+/// (`smithy_query(query="doc",shape="CreateDBCapacityReservationRequest",member="Engine")`)
+/// names the remaining one, the second Developer Edition engine: "…  sqlserver-dev-ee |
+/// sqlserver-dev-se | db2-ae …". Capacity is reserved for DB instances of an engine, so an
+/// engine that list carries is an engine a DB instance runs. These are values AWS
+/// allocated, so the only honest source is the model's own lists; extend it when the
 /// model does.
-pub const DB_INSTANCE_ENGINES: [&str; 25] = [
+pub const DB_INSTANCE_ENGINES: [&str; 26] = [
     "aurora-mysql",
     "aurora-postgresql",
     "custom-oracle-ee",
@@ -788,6 +795,7 @@ pub const DB_INSTANCE_ENGINES: [&str; 25] = [
     "oracle-se2-cdb",
     "postgres",
     "sqlserver-dev-ee",
+    "sqlserver-dev-se",
     "sqlserver-ee",
     "sqlserver-ex",
     "sqlserver-se",
@@ -1113,7 +1121,9 @@ pub fn is_published_engine(engine: &str) -> bool {
 /// engine" but "report this engine's entries": a value that is no engine names no engine
 /// family at all, so Amazon RDS refuses it rather than answering the empty report that
 /// would read as "this engine has no versions". The message is the one the real service
-/// answers that with, naming the value the request carried.
+/// answers that with, naming the value the request carried. What it is resolved against is
+/// the WHOLE published vocabulary ([`is_published_engine`]), so an engine the model
+/// publishes on one member and not on another is still an engine here.
 pub fn check_published_engine(engine: &str) -> Result<(), String> {
     if is_published_engine(engine) {
         return Ok(());

@@ -331,8 +331,9 @@ async fn an_engine_that_names_no_published_engine_is_refused() {
         // The positive control: every engine the member publishes is served, and the name
         // is resolved case-insensitively like every other per-engine rule here. The engine
         // list is this service's own published vocabulary
-        // (`smithy_query(query="doc",shape="CreateDBInstanceMessage",member="Engine")`,
-        // plus the two sibling control planes this front door serves).
+        // (`smithy_query(query="doc",shape="CreateDBInstanceMessage",member="Engine")` and
+        // `…shape="CreateDBCapacityReservationRequest",member="Engine"`, plus the two
+        // sibling control planes this front door serves).
         for engine in DB_INSTANCE_ENGINES
             .iter()
             .chain(SIBLING_CONTROL_PLANE_ENGINES.iter())

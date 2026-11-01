@@ -211,6 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // engine this front door publishes is refused instead of answered with an empty
         // report that would read as "this engine has no versions". The `engine` FILTER
         // below is a different member and keeps its filter semantics.
+        //
+        // What the value is resolved against is the whole published engine vocabulary
+        // ([`crate::state::is_published_engine`]), which is the UNION of the engine value
+        // lists this model's members publish: a list on one member is only as new as the
+        // release that wrote it, so resolving against a single member's list would refuse
+        // an engine the model publishes elsewhere and whose versions this report carries.
         if let Some(engine) = &input.engine {
             crate::state::check_published_engine(engine)
                 .map_err(DescribeDBEngineVersionsError::invalid_parameter_value)?;
@@ -1179,6 +1185,20 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
     },
     EngineFacts {
         engine: "sqlserver-dev-ee",
+        product: "Microsoft SQL Server Developer Edition",
+        description: "Microsoft SQL Server Developer Edition",
+        exportable_log_types: SQLSERVER_LOG_TYPES,
+        character_sets: SQLSERVER_COLLATIONS,
+        nchar_character_sets: &[],
+        timezones: SQLSERVER_TIMEZONES,
+    },
+    // Developer Edition is offered as TWO engines, one per edition whose feature set it
+    // mirrors ("The Developer Edition engines `sqlserver-dev-ee` and `sqlserver-dev-se`",
+    // `smithy_query(query="doc",shape="CreateDBCapacityReservationRequest",member="Engine")`).
+    // Both run the same product, so they report the same engine facts; what differs is the
+    // per-version capability profile the catalogue rows carry.
+    EngineFacts {
+        engine: "sqlserver-dev-se",
         product: "Microsoft SQL Server Developer Edition",
         description: "Microsoft SQL Server Developer Edition",
         exportable_log_types: SQLSERVER_LOG_TYPES,
@@ -2368,6 +2388,27 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "16.00.4165.4.v1",
         "16.00",
         "sqlserver-dev-ee-16.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Engine,
+        &SQLSERVER,
+    ),
+    // The second Developer Edition engine (see its entry in [`ENGINES`]) publishes the same
+    // releases as the first, because the edition is the engine and the release is the
+    // product version — the same rule the Enterprise/Standard/Express/Web rows below follow.
+    row(
+        "sqlserver-dev-se",
+        "15.00.4385.2.v1",
+        "15.00",
+        "sqlserver-dev-se-15.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER,
+    ),
+    row(
+        "sqlserver-dev-se",
+        "16.00.4165.4.v1",
+        "16.00",
+        "sqlserver-dev-se-16.0",
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
         &SQLSERVER,
