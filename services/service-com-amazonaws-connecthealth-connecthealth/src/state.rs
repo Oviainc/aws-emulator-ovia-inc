@@ -495,7 +495,10 @@ impl PatientInsightsJobSpec {
     ///
     /// Every value is length-prefixed before it is folded in, so two different parameter
     /// sets cannot collide by running their text together, and an optional member
-    /// contributes a part whether or not it was supplied.
+    /// contributes a part whether or not it was supplied — an omitted one a part of its
+    /// own, so omitting a member and supplying it are different requests even when what
+    /// was supplied is empty. A variable-length section folds in its element count ahead
+    /// of the elements, so the sections cannot be read into one another.
     pub fn fingerprint(&self) -> String {
         let mut parts: Vec<String> = vec![
             self.patient_context.patient_id.clone(),
@@ -516,8 +519,18 @@ impl PatientInsightsJobSpec {
             }
             None => parts.push(String::new()),
         }
-        for source in self.input_data_config.s3_sources.iter().flatten() {
-            parts.push(source.uri.clone());
+        match &self.input_data_config.s3_sources {
+            Some(sources) => {
+                parts.push("s3Sources".to_string());
+                // The element count goes in AHEAD of the elements, so a list and a
+                // longer list that starts with it are different requests and this
+                // section cannot be read into whatever follows it.
+                parts.push(sources.len().to_string());
+                for source in sources {
+                    parts.push(source.uri.clone());
+                }
+            }
+            None => parts.push(String::new()),
         }
         fingerprint_of(parts.iter().map(String::as_str))
     }

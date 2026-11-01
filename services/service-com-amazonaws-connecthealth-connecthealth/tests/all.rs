@@ -65,6 +65,8 @@ mod resource_tagging;
 mod shared_due_materialisation;
 #[path = "all/shared_pagination_policy.rs"]
 mod shared_pagination_policy;
+#[path = "all/start_patient_insights_job_request_identity.rs"]
+mod start_patient_insights_job_request_identity;
 #[path = "all/start_patient_insights_job_write_discipline.rs"]
 mod start_patient_insights_job_write_discipline;
 #[path = "all/state_roundtrip.rs"]
