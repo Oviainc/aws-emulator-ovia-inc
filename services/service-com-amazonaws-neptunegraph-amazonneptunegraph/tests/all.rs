@@ -107,6 +107,8 @@ mod records_outlive_their_graph;
 mod region_scoping;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/restore_refusal_precedence.rs"]
+mod restore_refusal_precedence;
 #[path = "all/snapshot_of_a_graph_at_rest.rs"]
 mod snapshot_of_a_graph_at_rest;
 #[path = "all/state_roundtrip.rs"]
