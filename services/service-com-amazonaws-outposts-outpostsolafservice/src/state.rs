@@ -3674,22 +3674,40 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         })
     }
 
-    /// The instance types the hardware the Outpost `outpost_id` names in `region`
-    /// arrived carrying: the largest size of each instance family the configurations
-    /// its uncancelled orders subscribe to publish EC2 capacity of, in the order those
-    /// orders name them. See [`Self::configured_instance_types`].
-    fn ordered_instance_type_names(&self, region: &str, outpost_id: &str) -> Vec<String> {
-        let mut names: Vec<String> = Vec::new();
+    /// The orders the Outpost `outpost_id` names in `region` is SUBSCRIBED to the
+    /// hardware of: every order placed against that Outpost that was not cancelled, in
+    /// the order the hardware was ordered.
+    ///
+    /// The ONE walk behind every report of what an Outpost's orders bought — the
+    /// configuration its hardware arrived carrying
+    /// ([`Self::ordered_instance_type_names`]) and the capacity under subscription on
+    /// it ([`Self::subscribed_capacity_vcpus`]) — so no two of those reports can
+    /// disagree about which orders count. Which they are is [`subscribes_hardware`]:
+    /// nothing was ever delivered for a cancelled order, so it subscribes nothing.
+    ///
+    /// Ordered by the order's own creation sequence, so a report built from it does not
+    /// depend on how the order store happens to be keyed.
+    fn subscribed_orders(&self, region: &str, outpost_id: &str) -> Vec<&OrderRecord> {
         let mut orders: Vec<&OrderRecord> = all_in_region(&self.orders, region)
             .filter(|record| {
                 record.order.outpost_id.as_deref() == Some(outpost_id)
-                    && record.order.status.as_deref() != Some(ORDER_STATUS_CANCELLED)
+                    && subscribes_hardware(&record.order)
             })
             .collect();
-        // In the order the hardware was ordered, so the report does not depend on how
-        // the order store happens to be keyed.
         orders.sort_by_key(|record| record.sequence);
-        for record in orders {
+        orders
+    }
+
+    /// The instance types the hardware the Outpost `outpost_id` names in `region`
+    /// arrived carrying: the largest size of each instance family the configurations
+    /// its uncancelled orders subscribe to publish EC2 capacity of, in the order those
+    /// orders name them.
+    ///
+    /// Read off the one walk over those orders ([`Self::subscribed_orders`]). See
+    /// [`Self::configured_instance_types`].
+    fn ordered_instance_type_names(&self, region: &str, outpost_id: &str) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for record in self.subscribed_orders(region, outpost_id) {
             for item in record.order.line_items.iter().flatten() {
                 let Some(catalog_item) = item
                     .catalog_item_id
@@ -3714,26 +3732,22 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// quantity of it the order carries.
     ///
     /// This is the hardware a renewal of the Outpost's contract covers, and the only
-    /// thing the store knows about its size. A line item naming a catalog item this
-    /// service publishes no configuration for contributes nothing: the capacity of
-    /// hardware the catalog does not describe is not a figure the emulator has, and
-    /// never one it invents.
+    /// thing the store knows about its size. The orders it is read off are the ones the
+    /// Outpost is subscribed to the hardware of ([`Self::subscribed_orders`]) and what
+    /// each of their line items subscribes is the one per-line-item fold
+    /// ([`subscribed_capacities`]), asked for the vCPU figure the catalog publishes —
+    /// so a line item naming a catalog item this service publishes no configuration for
+    /// contributes nothing, for the reason stated there.
     pub fn subscribed_capacity_vcpus(&self, region: &str, outpost_id: &str) -> i64 {
-        all_in_region(&self.orders, region)
-            .filter(|record| {
-                record.order.outpost_id.as_deref() == Some(outpost_id)
-                    && record.order.status.as_deref() != Some(ORDER_STATUS_CANCELLED)
+        self.subscribed_orders(region, outpost_id)
+            .into_iter()
+            .flat_map(|record| {
+                subscribed_capacities(&record.order, |catalog_item_id| {
+                    self.catalog_item_capacity_vcpus(catalog_item_id)
+                        .map(i64::from)
+                })
             })
-            .flat_map(|record| record.order.line_items.iter().flatten())
-            .filter_map(|item| {
-                let capacity =
-                    self.catalog_item_capacity_vcpus(item.catalog_item_id.as_deref()?)?;
-                // `LineItem$Quantity` is modelled `range(min: 1)`, so a quantity the
-                // boundary accepted is at least one unit of that configuration.
-                let quantity = i64::from(item.quantity.unwrap_or(1).max(0));
-                Some(i64::from(capacity) * quantity)
-            })
-            .sum()
+            .fold(0, i64::saturating_add)
     }
 
     /// The Amazon S3 storage capacity, in bytes, PROVISIONED on each Outpost that has
@@ -3746,45 +3760,37 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// Storage capacity is installed on an Outpost by ordering hardware that carries
     /// it, so what is provisioned is what the orders on it bought, and an Outpost
     /// nobody ordered S3-capable hardware for is absent rather than present with
-    /// zero: it has no S3 storage on it at all. A line item naming a catalog item
-    /// this service publishes no configuration for contributes nothing, for the
-    /// reason it contributes no vCPUs to [`Self::subscribed_capacity_vcpus`]: the
-    /// capacity of hardware the catalog does not describe is not a figure the
-    /// emulator has, and never one it invents.
+    /// zero: it has no S3 storage on it at all. Which orders bought it is the same
+    /// question [`Self::subscribed_orders`] answers ([`subscribes_hardware`]), and what
+    /// each of their line items bought is the one per-line-item fold
+    /// ([`subscribed_capacities`]), asked for the S3 figure the catalog publishes — so
+    /// a line item naming a catalog item this service publishes no configuration for
+    /// contributes nothing, for the reason it contributes no vCPUs to
+    /// [`Self::subscribed_capacity_vcpus`].
     ///
-    /// Totalled in ONE pass over the orders, so a caller that needs the figure for
-    /// every Outpost at once — the S3 on Outposts inventory does — pays for the
-    /// orders the store holds and not for their product with the Outposts.
+    /// Totalled in ONE pass over the orders, which is why it walks the whole order
+    /// store rather than asking [`Self::subscribed_orders`] per Outpost: a caller that
+    /// needs the figure for every Outpost at once — the S3 on Outposts inventory does —
+    /// pays for the orders the store holds and not for their product with the Outposts.
     pub fn provisioned_s3_capacity(&self) -> BTreeMap<String, BTreeMap<String, i64>> {
         let mut provisioned: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
-        for record in self.orders.values() {
-            if record.order.status.as_deref() == Some(ORDER_STATUS_CANCELLED) {
-                continue;
-            }
+        for record in self
+            .orders
+            .values()
+            .filter(|record| subscribes_hardware(&record.order))
+        {
             let Some(outpost_id) = record.order.outpost_id.as_deref() else {
                 continue;
             };
-            for item in record.order.line_items.iter().flatten() {
-                let capacity = item
-                    .catalog_item_id
-                    .as_deref()
-                    .and_then(|sku| self.catalog_item_s3_capacity_bytes(sku))
-                    .unwrap_or_default();
-                if capacity <= 0 {
-                    continue;
-                }
-                // `LineItem$Quantity` is modelled `range(min: 1)`, so a quantity the
-                // boundary accepted is at least one unit of that configuration — which
-                // is also what an absent member means. The floor is belt and braces
-                // against a value the boundary cannot deliver: a negative quantity
-                // would otherwise subtract capacity the order never cancelled.
-                let quantity = i64::from(item.quantity.unwrap_or(1).max(0));
+            for capacity in subscribed_capacities(&record.order, |catalog_item_id| {
+                self.catalog_item_s3_capacity_bytes(catalog_item_id)
+            }) {
                 let total = provisioned
                     .entry(record.region.clone())
                     .or_default()
                     .entry(outpost_id.to_string())
                     .or_default();
-                *total = total.saturating_add(capacity.saturating_mul(quantity));
+                *total = total.saturating_add(capacity);
             }
         }
         provisioned
@@ -6977,6 +6983,57 @@ pub fn page_size(max_results: Option<i32>) -> usize {
     usize::try_from(max_results.unwrap_or(MAX_RESULTS))
         .unwrap_or(MAX_RESULTS as usize)
         .clamp(1, MAX_RESULTS as usize)
+}
+
+/// Whether the order `order` subscribes the Outpost it was placed on to the hardware
+/// its line items name: whether it was not cancelled.
+///
+/// Nothing was ever delivered for a cancelled order, so it installed no hardware and
+/// pays for none — which is why every report of what an Outpost's orders bought skips
+/// it ([`ComAmazonawsOutpostsOutpostsolafserviceState::subscribed_orders`]).
+fn subscribes_hardware(order: &Order) -> bool {
+    order.status.as_deref() != Some(ORDER_STATUS_CANCELLED)
+}
+
+/// What each line item of `order` subscribes of the capacity figure `published` reads
+/// off the published catalog: that figure for the configuration the line item names,
+/// times the quantity of that configuration the item carries.
+///
+/// The ONE per-line-item fold behind every capacity an order buys, parameterised with
+/// the catalog figure the caller wants — the EC2 vCPUs a renewal is priced by
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::subscribed_capacity_vcpus`]) and
+/// the Amazon S3 storage bytes an Outpost has provisioned
+/// ([`ComAmazonawsOutpostsOutpostsolafserviceState::provisioned_s3_capacity`]) — so one
+/// rule answers how much of it an order holds whichever figure is asked for, and the
+/// two can never drift apart on the arithmetic.
+///
+/// A line item contributes nothing when it names no configuration, when it names a
+/// catalog item this service publishes no configuration for, or when the figure that
+/// configuration publishes is not positive: the capacity of hardware the catalog does
+/// not describe is not a figure the emulator has, and never one it invents, and
+/// hardware the catalog publishes none of that capacity for carries none.
+///
+/// Per item rather than one total, so a caller totalling over several orders at once
+/// adds up exactly the contributing items and the fold itself holds no total.
+fn subscribed_capacities<'a>(
+    order: &'a Order,
+    published: impl Fn(&str) -> Option<i64> + 'a,
+) -> impl Iterator<Item = i64> + 'a {
+    order.line_items.iter().flatten().filter_map(move |item| {
+        let capacity = published(item.catalog_item_id.as_deref()?)?;
+        if capacity <= 0 {
+            return None;
+        }
+        // `LineItem$Quantity` is modelled `range(min: 1)`, so a quantity the boundary
+        // accepted is at least one unit of that configuration — which is also what an
+        // absent member means. The floor is belt and braces against a value the
+        // boundary cannot deliver: a negative quantity would otherwise subtract
+        // capacity the order never cancelled. Saturating, so a quantity and a figure
+        // whose product no `Long` holds reports the largest capacity one can rather
+        // than wrapping to a negative one.
+        let quantity = i64::from(item.quantity.unwrap_or(1).max(0));
+        Some(capacity.saturating_mul(quantity))
+    })
 }
 
 /// Append `value` to `values` unless it is already there, keeping the position it

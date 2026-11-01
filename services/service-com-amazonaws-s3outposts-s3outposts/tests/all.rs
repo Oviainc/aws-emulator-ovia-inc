@@ -37,6 +37,8 @@ mod listing_harness;
 mod not_found_messages;
 #[path = "all/one_listing_rule.rs"]
 mod one_listing_rule;
+#[path = "all/one_ordered_capacity_rule.rs"]
+mod one_ordered_capacity_rule;
 #[path = "all/one_outpost_resolution_rule.rs"]
 mod one_outpost_resolution_rule;
 #[path = "all/outpost_cursor_scope.rs"]
