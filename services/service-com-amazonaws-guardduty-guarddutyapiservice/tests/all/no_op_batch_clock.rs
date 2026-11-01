@@ -49,7 +49,7 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state::now_millis;
 /// of it per call, and the burst must advance that clock by more than
 /// [`READING_SLACK_MILLIS`] past the wall-clock time the burst itself takes for the
 /// difference to be an assertion.
-const NO_OPS_PER_BURST: usize = 300;
+pub(crate) const NO_OPS_PER_BURST: usize = 300;
 
 /// The member account a row seeds, as `(accountId, email)`: 12 decimal digits
 /// (`smithy_query(shape="AccountId")`) and the email `CreateMembers` records.
@@ -274,7 +274,7 @@ async fn members_snapshot(router: &Router, detector_id: &str, case: &str) -> Val
 }
 
 /// Every finding of the detector, read back through `GetFindings` and keyed by id.
-async fn findings_snapshot(
+pub(crate) async fn findings_snapshot(
     router: &Router,
     detector_id: &str,
     ids: &[String],
@@ -305,17 +305,19 @@ async fn findings_snapshot(
         .collect()
 }
 
-/// Repeat one accepted call [`NO_OPS_PER_BURST`] times and assert what the rule
-/// requires of the clock: the detector the calls address does not move, and the
+/// Repeat one call that writes nothing [`NO_OPS_PER_BURST`] times — each answering
+/// `expected_status`, the status the row says that call carries — and assert what the
+/// rule requires of the clock: the detector the calls address does not move, and the
 /// accepted create that follows the burst stamps a WALL-CLOCK instant rather than one
 /// the burst pushed into the future. The probing create is read back, so the instant
 /// asserted records a change that really landed.
-async fn a_burst_of_it_consumes_no_instant(
+pub(crate) async fn a_burst_of_it_consumes_no_instant(
     router: &Router,
     detector_id: &str,
     case: &str,
     path: &str,
     body: &Value,
+    expected_status: u16,
 ) {
     // The instant the last ACCEPTED write stamped, and the wall clock just after it:
     // between these two readings and the accepted create below, every call the
@@ -327,8 +329,9 @@ async fn a_burst_of_it_consumes_no_instant(
     for attempt in 0..NO_OPS_PER_BURST {
         let (status, answered) = call(router, "POST", path, Some(body.clone())).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: call {attempt} must answer 200, got {status} {answered:?}"
+            status, expected_status,
+            "case {case:?}: call {attempt} must answer {expected_status}, got {status} \
+             {answered:?}"
         );
     }
 
@@ -438,7 +441,7 @@ async fn accepted_calls_that_move_no_record_leave_the_clock_where_the_wall_clock
         let before_members = members_snapshot(&router, &detector_id, case).await;
 
         let path = format!("/detector/{detector_id}{}", row.suffix);
-        a_burst_of_it_consumes_no_instant(&router, &detector_id, case, &path, &row.body).await;
+        a_burst_of_it_consumes_no_instant(&router, &detector_id, case, &path, &row.body, 200).await;
 
         let after_members = members_snapshot(&router, &detector_id, case).await;
         assert_eq!(
@@ -544,7 +547,7 @@ async fn repeating_a_finding_metadata_write_consumes_no_instant() {
         let before = findings_snapshot(&router, &detector_id, &ids, case).await;
 
         let path = format!("/detector/{detector_id}/findings/{}", row.segment);
-        a_burst_of_it_consumes_no_instant(&router, &detector_id, case, &path, &body).await;
+        a_burst_of_it_consumes_no_instant(&router, &detector_id, case, &path, &body, 200).await;
 
         let after = findings_snapshot(&router, &detector_id, &ids, case).await;
         assert_eq!(

@@ -85,6 +85,8 @@ mod findings_archive_shared_rule;
 mod findings_archive_state;
 #[path = "all/findings_feedback.rs"]
 mod findings_feedback;
+#[path = "all/findings_metadata_batch_clock.rs"]
+mod findings_metadata_batch_clock;
 #[path = "all/findings_statistics.rs"]
 mod findings_statistics;
 #[path = "all/free_trial_days.rs"]
