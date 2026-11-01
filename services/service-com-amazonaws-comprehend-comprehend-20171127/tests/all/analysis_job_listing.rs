@@ -46,6 +46,11 @@ struct Family {
     /// documentation of `start` in the Smithy model (e.g.
     /// `arn::comprehend:::key-phrases-detection-job/`).
     arn_resource_type: &'static str,
+    /// Does this family model `LanguageCode` on its request and its properties
+    /// shape? The dominant-language family does not — the language is what that job
+    /// detects — so a submission to it carries no `LanguageCode` and its records
+    /// report none.
+    models_language_code: bool,
 }
 
 /// Every family whose `List*DetectionJobs` is implemented. The rule holds for each.
@@ -57,6 +62,7 @@ const FAMILIES: &[Family] = &[
         list: "ListKeyPhrasesDetectionJobs",
         properties_list: "KeyPhrasesDetectionJobPropertiesList",
         arn_resource_type: "key-phrases-detection-job",
+        models_language_code: true,
     },
     Family {
         start: "StartSentimentDetectionJob",
@@ -65,12 +71,25 @@ const FAMILIES: &[Family] = &[
         list: "ListSentimentDetectionJobs",
         properties_list: "SentimentDetectionJobPropertiesList",
         arn_resource_type: "sentiment-detection-job",
+        models_language_code: true,
+    },
+    Family {
+        start: "StartDominantLanguageDetectionJob",
+        describe: "DescribeDominantLanguageDetectionJob",
+        properties: "DominantLanguageDetectionJobProperties",
+        list: "ListDominantLanguageDetectionJobs",
+        properties_list: "DominantLanguageDetectionJobPropertiesList",
+        arn_resource_type: "dominant-language-detection-job",
+        models_language_code: false,
     },
 ];
 
 /// The members a `Start*DetectionJob` persists and the family's `List*` reports
 /// back. `OutputDataConfig` is among them because a job whose run was not performed
-/// keeps the output location it was submitted with.
+/// keeps the output location it was submitted with. `LanguageCode` is among them for
+/// the families that model it, and absent from both the submission and the record for
+/// the family that does not (see [`Family::models_language_code`]), so comparing the
+/// member against the body that was sent covers both.
 const PERSISTED_MEMBERS: &[&str] = &[
     "JobName",
     "LanguageCode",
@@ -157,6 +176,19 @@ fn submission(index: usize) -> Value {
     }
 }
 
+/// [`submission`], narrowed to the members `family` models: the dominant-language
+/// family's request shape declares no `LanguageCode`, so a submission to it carries
+/// none.
+fn submission_for(family: &Family, index: usize) -> Value {
+    let mut body = submission(index);
+    if !family.models_language_code {
+        if let Some(members) = body.as_object_mut() {
+            members.remove("LanguageCode");
+        }
+    }
+    body
+}
+
 /// How many jobs each family is seeded with: more than the largest page size the
 /// paging suite asks for, so truncation and the cursor are both exercised.
 const SEEDED_JOBS: usize = 5;
@@ -182,7 +214,7 @@ async fn seed(comprehend: &Comprehend) -> Vec<Vec<String>> {
     let mut per_family: Vec<Vec<String>> = FAMILIES.iter().map(|_| Vec::new()).collect();
     for index in 0..SEEDED_JOBS {
         for (family_index, family) in FAMILIES.iter().enumerate() {
-            let body = submission(index);
+            let body = submission_for(family, index);
             let (job_id, _) = start(comprehend, family, &format!("seed-{index}"), &body).await;
             per_family[family_index].push(job_id);
         }
@@ -313,7 +345,7 @@ async fn a_listed_record_is_the_submitted_record_and_agrees_with_describe() {
         // One submission per shape of body, each read back through the family's own
         // List and then through its Describe.
         for index in 0..SEEDED_JOBS {
-            let body = submission(index);
+            let body = submission_for(family, index);
             let case = format!("{}/submission-{index}", family.list);
             let (job_id, job_arn) = start(&comprehend, family, &case, &body).await;
 
@@ -358,6 +390,13 @@ async fn a_listed_record_is_the_submitted_record_and_agrees_with_describe() {
             assert!(
                 listed.get("Tags").is_none(),
                 "case {case:?}: {} models no Tags member, got {listed}",
+                family.properties
+            );
+            // Nor is `LanguageCode` for the family whose properties shape declares
+            // none: that job DETECTS the language rather than being told it.
+            assert!(
+                family.models_language_code || listed.get("LanguageCode").is_none(),
+                "case {case:?}: {} models no LanguageCode member, got {listed}",
                 family.properties
             );
 
@@ -513,7 +552,7 @@ async fn each_filter_member_narrows_and_orders_as_its_documentation_states() {
         // `JobName` "Filters on the name of the job": it selects exactly the jobs
         // carrying that name, and a name no job carries selects nothing.
         for (index, job_id) in expected.iter().enumerate() {
-            let Some(name) = submission(index)
+            let Some(name) = submission_for(family, index)
                 .get("JobName")
                 .and_then(Value::as_str)
                 .map(str::to_string)

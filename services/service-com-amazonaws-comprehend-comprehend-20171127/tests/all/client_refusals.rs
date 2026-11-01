@@ -288,7 +288,7 @@ async fn every_modelled_refusal_is_served_with_the_status_the_frontend_gives_its
         // so a client does not retry an operation nobody has written.
         Refusal {
             case: "an operation that is still a scaffold stub",
-            operation: "ListDominantLanguageDetectionJobs",
+            operation: "ListFlywheels",
             body: |_| json!({}),
             code: "NotImplemented",
             declared: 501,
