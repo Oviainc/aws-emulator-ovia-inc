@@ -15,9 +15,11 @@
 //! the create did not name stays absent. A retried create carrying the same `ClientToken`
 //! (`@idempotencyToken`) answers with the first call's destination instead of storing a
 //! second one, an identifier no create stored answers the modelled
-//! `ResourceNotFoundException` (HTTP 404) — from a read, an update and a delete alike —
+//! `ResourceNotFoundException` (HTTP 404) — from a read and from an update —
 //! `UpdateConnectorDestination` applies the members its request names and leaves the rest
-//! as they were, and `DeleteConnectorDestination` removes the record the read reported. A
+//! as they were, and `DeleteConnectorDestination` removes the record the read reported,
+//! reporting the state the caller asked for (HTTP 200) when there is no record left to
+//! remove. A
 //! destination is regional: only the region whose endpoint created it resolves, updates or
 //! deletes it — and only that region's connectors can be named by a create.
 //!
@@ -770,8 +772,9 @@ async fn a_destination_no_create_stored_in_this_region_is_not_found() {
 
 /// RULE: a delete removes the stored record, so the read that reported it answers the
 /// modelled 404 afterwards and the identifier is gone from the store; a delete of an
-/// identifier the signing region holds no record for is itself the modelled 404, and a
-/// destination of another region cannot be deleted through this one.
+/// identifier the signing region holds no record for reports the state the caller asked
+/// for instead of a refusal, and a destination of another region is not this region's to
+/// remove, so such a call leaves it where it is.
 #[tokio::test]
 async fn a_delete_removes_the_record_the_read_reported() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -797,10 +800,17 @@ async fn a_delete_removes_the_record_the_read_reported() {
         )
         .await;
         assert_eq!(
-            elsewhere.status, 404,
-            "case {:?}: a destination of another region must not be deleted, got {} \
+            elsewhere.status, 200,
+            "case {:?}: a delete this region holds no record for is a success, got {} \
              with body {:?}",
             case.label, elsewhere.status, elsewhere.body
+        );
+        let untouched = call(&router, "GET", &format!("{DESTINATIONS}/{id}"), None).await;
+        assert_eq!(
+            untouched.status, 200,
+            "case {:?}: another region's delete must leave the record where it is, got {} \
+             with body {:?}",
+            case.label, untouched.status, untouched.body
         );
 
         let deleted = call(&router, "DELETE", &format!("{DESTINATIONS}/{id}"), None).await;
@@ -817,25 +827,23 @@ async fn a_delete_removes_the_record_the_read_reported() {
             case.label, gone.status, gone.body
         );
 
-        // A second delete of the same identifier is the modelled 404, worded from the
-        // identifier the request carried, as every mutation of this service words it.
+        // A second delete of the same identifier asks for the state the store is already
+        // in, so it is the same success as the first one and carries no error member.
         let again = call(&router, "DELETE", &format!("{DESTINATIONS}/{id}"), None).await;
         assert_eq!(
-            again.status, 404,
-            "case {:?}: deleting it twice is the modelled 404, got {} with body {:?}",
+            again.status, 200,
+            "case {:?}: deleting it twice is a success, got {} with body {:?}",
             case.label, again.status, again.body
         );
         assert_eq!(
-            again.error_type.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {:?}: expected the modelled 404, got {:?}",
-            case.label,
-            again.error_type
+            again.error_type, None,
+            "case {:?}: a successful delete carries no error code, got {:?}",
+            case.label, again.error_type
         );
         assert_eq!(
             again.string("Message"),
-            Some(cannot_be_found_message(CONNECTOR_DESTINATION_RESOURCE_SUBJECT).as_str()),
-            "case {:?}: expected the mutating path's reason, got {:?}",
+            None,
+            "case {:?}: a successful delete carries no reason, got {:?}",
             case.label,
             again.string("Message")
         );

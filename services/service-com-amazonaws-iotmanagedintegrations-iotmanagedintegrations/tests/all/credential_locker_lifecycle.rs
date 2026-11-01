@@ -387,10 +387,14 @@ async fn a_create_stores_the_record_and_the_reads_project_it() {
             "case {case:?}: expected the get to report the stored Name, got {:?}",
             read.member("Name")
         );
+        // The tag map is part of the record, so the get reports it whatever it holds: the
+        // pairs the create stored, or the EMPTY map for a locker the create tagged with
+        // nothing.
+        let stored_tags = body.get("Tags").cloned().unwrap_or_else(|| json!({}));
         assert_eq!(
             read.member("Tags"),
-            body.get("Tags"),
-            "case {case:?}: expected the get to report the stored Tags, got {:?}",
+            Some(&stored_tags),
+            "case {case:?}: expected the get to report the stored Tags {stored_tags:?}, got {:?}",
             read.member("Tags")
         );
         assert_eq!(
@@ -418,13 +422,18 @@ async fn a_create_stores_the_record_and_the_reads_project_it() {
             "case {case:?}: expected HTTP 200 reading the tags of {arn:?}, got {} with body {:?}",
             tagged.status, tagged.body
         );
+        // The two readers report the same PAIRS. Their reporting of an EMPTY map differs:
+        // the locker's own read always carries the member (asserted above), so the
+        // comparison is over the pairs each reports.
+        let own = read
+            .tags()
+            .unwrap_or_else(|| panic!("case {case:?}: the locker read reports no Tags member"));
         assert_eq!(
-            tagged.tags(),
-            read.tags(),
+            tagged.tags().unwrap_or_default(),
+            own,
             "case {case:?}: expected the tagging surface to report the record's own tag map, \
-             got {:?} against {:?}",
-            tagged.tags(),
-            read.tags()
+             got {:?} against {own:?}",
+            tagged.tags()
         );
 
         created.push((case.to_string(), id, body.clone()));

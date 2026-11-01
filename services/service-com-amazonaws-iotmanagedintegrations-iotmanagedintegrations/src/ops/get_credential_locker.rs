@@ -2,6 +2,14 @@
 
 //! @op GetCredentialLocker
 //!
+//! Reports the credential locker `crate::state`'s `credential_lockers` store holds under
+//! the `Identifier` the request names, projected onto this operation's output shape. A
+//! pure read: the store is only read, so what a later caller sees is unchanged. Every
+//! member the stored record always holds is reported — the tag map as the EMPTY map for a
+//! locker nobody tagged — and only a member the record holds no value for (the optional
+//! `Name`) is left out. An `Identifier` this region's endpoint holds no locker under is the
+//! modelled `ResourceNotFoundException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -173,9 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: Some(locker.arn.clone()),
             name: locker.name.clone(),
             created_at: Some(crate::state::timestamp(locker.created_at)),
-            // `TagsMap` is `@length(1..50)`, so a locker nobody tagged reports no map
-            // rather than an empty one.
-            tags: Some(locker.tags.clone()).filter(|tags| !tags.is_empty()),
+            // The tag map is part of the record, so it is reported whatever it holds: a
+            // locker nobody tagged reports the EMPTY map, not a missing member. `TagsMap`'s
+            // `@length(1..50)` bounds what one tag write may carry, not what a read reports.
+            tags: Some(locker.tags.clone()),
         })
     }
 }

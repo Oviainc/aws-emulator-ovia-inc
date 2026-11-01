@@ -4,9 +4,10 @@
 //!
 //! Removes the connector destination the signing region's store holds under the
 //! `Identifier`, along with the idempotency record that would otherwise replay into the
-//! deleted id. An identifier that region holds no record for is the modelled
-//! `ResourceNotFoundException` (HTTP 404), so a delete of something that is not there is a
-//! 404 rather than a silent success.
+//! deleted id. The call reports the state the caller asked for rather than whether this
+//! call was the one that reached it: an `Identifier` the signing region holds no record
+//! under — never created, already deleted, or another region's — leaves every store
+//! untouched and answers the modelled success (HTTP 200, empty body).
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken".
@@ -176,32 +177,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // A connector destination is regional: only the region that created it resolves
-        // it.
+        // it, so another region's record is not this one's to remove.
         let region = crate::state::request_region(ctx.parts());
         if store
             .connector_destination_in(&region, &input.identifier)
-            .is_none()
+            .is_some()
         {
-            return Err(
-                DeleteConnectorDestinationErrorModeled::ResourceNotFoundException(
-                    // A mutation states the reason from the identifier the request
-                    // carried, through the one formatter every mutating path shares.
-                    crate::state::connector_destination_not_found_on_mutation(&input.identifier),
-                )
-                .into(),
+            store.connector_destinations.remove(&input.identifier);
+            store
+                .connector_destination_order
+                .retain(|id| id != &input.identifier);
+            // A `ClientToken` whose destination is gone must not replay into the deleted
+            // id, so the idempotency record goes with the resource.
+            store.forget_idempotency_tokens_for(
+                crate::state::CONNECTOR_DESTINATION_RESOURCE_TYPE,
+                &input.identifier,
             );
         }
-        store.connector_destinations.remove(&input.identifier);
-        store
-            .connector_destination_order
-            .retain(|id| id != &input.identifier);
-        // A `ClientToken` whose destination is gone must not replay into the deleted id,
-        // so the idempotency record goes with the resource.
-        store.forget_idempotency_tokens_for(
-            crate::state::CONNECTOR_DESTINATION_RESOURCE_TYPE,
-            &input.identifier,
-        );
 
+        // Nothing left to delete is the state the request asked for, so the answer is the
+        // same success as the call that did the removing.
         Ok(DeleteConnectorDestinationOutput)
     }
 }
