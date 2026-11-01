@@ -17,6 +17,13 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `GetManagedPrefixListEntries` reports: the entry set of the one prefix list a request
+// names — a list the account created or one the Region publishes — in CIDR order, how it
+// pages, which version it reports and what it refuses. Declared beside `prefix_lists` for the
+// reason the note above gives: the sorted neighbourhood and the tail of this file are where
+// every new ec2 suite inserts its lines.
+#[path = "all/get_managed_prefix_list_entries.rs"]
+mod get_managed_prefix_list_entries;
 // The entries (rules) of a network ACL: what `CreateNetworkAclEntry` stores on a stored ACL
 // and in which order, what `DeleteNetworkAclEntry` takes off it, and the not-found answer
 // every read of a `DeleteNetworkAcl`-ed ACL gets. Declared beside `prefix_lists` for the

@@ -35,9 +35,9 @@
 //!    carries the same ARN whichever narrowing path reports it, and the id in that ARN is the
 //!    id `DescribePrefixLists` reports for the same list.
 //!
-//! The entries a create stores are asserted through the engine's own store: the operation
-//! that reports them, `GetManagedPrefixListEntries`, is still a scaffold stub with its own
-//! open issue, so the store is the only place the stored entries can be read today.
+//! The entries a create stores are asserted through the engine's own store here; the
+//! operation that REPORTS them, `GetManagedPrefixListEntries`, has its own suite in
+//! `get_managed_prefix_list_entries.rs`, which asserts the same entries over the wire.
 
 use std::time::Duration;
 

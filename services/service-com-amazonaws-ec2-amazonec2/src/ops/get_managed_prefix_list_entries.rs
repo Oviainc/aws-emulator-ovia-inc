@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetManagedPrefixListEntries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetManagedPrefixListEntries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetManagedPrefixListEntries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the entry set of ONE prefix list the caller can see — a list the account created
+//! or one the Region publishes for a service, the two sources
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::visible_prefix_list_entries`] reads — in
+//! ascending order of the CIDR block's text, cut into `MaxResults`-sized pages. A reporting
+//! operation only: it writes nothing at all, no move the clock owes a prefix list touching
+//! the entries of a version.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +139,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetManagedPrefixListEntries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetManagedPrefixListEntriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetManagedPrefixListEntries"))
+        use crate::state;
+
+        // The request's own FORM first, before anything is resolved: "not a prefix list id at
+        // all" is a fact about the request, while "no such prefix list" is a fact about what
+        // the caller can see — the order every resource of this crate asks the two questions
+        // in (`crate::state::require_well_formed_id`).
+        state::require_well_formed_id(
+            state::PREFIX_LIST_ID_PREFIX,
+            &input.prefix_list_id,
+            state::INVALID_PREFIX_LIST_ID_MALFORMED,
+        )?;
+
+        // "The token for the next page of results"
+        // (`GetManagedPrefixListEntriesRequest$NextToken`) — anything else is refused rather
+        // than read as a position, and it is refused before the store is read, so whether a
+        // bogus token is caught never depends on what the store holds. The cursor carries the
+        // PREFIX LIST it was minted for, so a token presented back against another list is
+        // refused rather than resuming inside an entry set it never reported.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_scoped_page_token(token, &input.prefix_list_id)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "The maximum number of results to return with a single call"
+        // (`GetManagedPrefixListEntriesRequest$MaxResults`). A request that names none gets
+        // the largest page the model publishes, so the `NextToken` path below behaves the
+        // same whether or not a page size was asked for. The model's `range 1..100` has
+        // already refused anything outside it; the floor is applied anyway, because a page
+        // size of zero would mint a token for a page that carried nothing and leave a paging
+        // client in a loop that never advances.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .max(MIN_MAX_RESULTS);
+
+        // `DryRun` sits after every parameter has been validated and before anything is read:
+        // the flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused for its own reason is refused with that reason instead. "If you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`), and every
+        // caller of this emulator holds them.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // EC2 is a regional service reached through a regional endpoint: the Region the
+        // caller signed for is the Region whose published prefix lists it can see, the same
+        // Region `DescribeManagedPrefixLists` reports those lists for.
+        let region = state::request_region(ctx.parts());
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        // Nothing is written here, and no clock-owed move is materialized: what the clock
+        // owes a prefix list is the `create-in-progress` -> `create-complete` move of its
+        // STATE, which this operation does not report and which leaves the entries of a
+        // version exactly as they were.
+        let found = state_handle
+            .lock()
+            .visible_prefix_list_entries(&region, &input.prefix_list_id);
+        // A prefix list nothing the caller can see carries is an error, not an empty entry
+        // set — an empty entry set is what a list holding no entry reports.
+        let found =
+            found.ok_or_else(|| state::invalid_prefix_list_id_not_found(&input.prefix_list_id))?;
+
+        // "The version of the prefix list for which to return the entries. The default is
+        // the current version" (`$TargetVersion`): a request naming no version is answered
+        // with the version the list stands at, and one naming a version the list has no
+        // entry set for is refused — there is nothing to report for it, and answering the
+        // current version's entries instead would report an entry set the caller did not ask
+        // for. A list this emulator holds has exactly ONE version while the operations that
+        // revise an entry set — `ModifyManagedPrefixList` and
+        // `RestoreManagedPrefixListVersion` — are scaffold stubs; when they land they store
+        // the earlier versions, and an earlier version is then answered with ITS entries
+        // rather than refused here.
+        if let Some(target) = input
+            .target_version
+            .filter(|target| *target != found.version)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{target}' for targetVersion. \
+                 The prefix list '{prefix_list_id}' has no version {target}",
+                prefix_list_id = input.prefix_list_id,
+            )));
+        }
+
+        // One entry is one CIDR block — a prefix list cannot carry one block twice — so the
+        // block is both the order the entry set is reported in and the cursor a page resumes
+        // at, which is what makes that cursor total and always advancing. The order is the
+        // LEXICOGRAPHIC order of the block's text, the order AWS reports a prefix list's
+        // entries in (`10.0.0.0/8` ahead of `9.0.0.0/8`) — not the numeric order of the
+        // addresses, and changing it would strand every page token already minted.
+        let mut entries = found.entries;
+        entries.sort_by(|left, right| left.cidr.cmp(&right.cidr));
+        // Both sources fill the block in — `CreateManagedPrefixList` stores its canonical
+        // form and a published list derives it from the Region's ranges — and the cursor is
+        // total only while that holds: an entry carrying no block would share a position
+        // with every other one.
+        debug_assert!(
+            entries.iter().all(|entry| entry.cidr.is_some()),
+            "every entry of a prefix list carries its CIDR block"
+        );
+
+        // "This value is null when there are no more results to return"
+        // (`GetManagedPrefixListEntriesResult$NextToken`): a token only when an entry follows
+        // this page, scoped to the prefix list this report is of — the crate's one reading of
+        // that rule (`crate::state::scoped_page_from_cursor`), so this report cannot page
+        // differently from the others.
+        let (page, next_token) = state::scoped_page_from_cursor(
+            &input.prefix_list_id,
+            &entries,
+            start_at.as_deref(),
+            Some(limit),
+            state::PageTokenRule::WhenAnotherItemFollows,
+            |entry| entry.cidr.as_deref().unwrap_or_default(),
+        );
+
+        Ok(GetManagedPrefixListEntriesOutput {
+            entries: Some(page.to_vec()),
+            next_token,
+        })
     }
 }
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`PrefixListMaxResults`, `range 1..100`), which is also the most EC2 returns in one page.
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The smallest page this operation will serve: the minimum of that same published range
+/// (`PrefixListMaxResults`, `range 1..100`). The boundary validator refuses anything below
+/// it, so this is the floor that keeps a page of zero — which would mint a token for a page
+/// carrying nothing — unreachable however the request is read.
+const MIN_MAX_RESULTS: usize = 1;

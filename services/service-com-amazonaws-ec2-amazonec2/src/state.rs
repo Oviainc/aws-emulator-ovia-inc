@@ -19623,6 +19623,46 @@ pub fn page_from_cursor<'a, T>(
     rule: PageTokenRule,
     id_of: impl Fn(&T) -> &str,
 ) -> (&'a [T], Option<String>) {
+    let (page, position) = page_and_position(ordered, cursor, limit, rule, &id_of);
+    (page, position.map(encode_page_token))
+}
+
+/// One page of `ordered`, and the `NextToken` that page carries SCOPED to `scope` — the
+/// report the page belongs to.
+///
+/// [`page_from_cursor`]'s rule exactly, token minted through [`encode_scoped_page_token`]
+/// instead: an operation that reports the items of ONE resource (the entries of one prefix
+/// list, the routes of one endpoint) has one position order per resource, so a token minted
+/// while paging one of them must not resume inside another's page. The scope is what
+/// [`decode_scoped_page_token`] checks the token back against.
+pub fn scoped_page_from_cursor<'a, T>(
+    scope: &str,
+    ordered: &'a [T],
+    cursor: Option<&str>,
+    limit: Option<usize>,
+    rule: PageTokenRule,
+    id_of: impl Fn(&T) -> &str,
+) -> (&'a [T], Option<String>) {
+    let (page, position) = page_and_position(ordered, cursor, limit, rule, &id_of);
+    (
+        page,
+        position.map(|position| encode_scoped_page_token(scope, position)),
+    )
+}
+
+/// One page of `ordered`, and the POSITION the token that page carries names — `None` when
+/// no token is due.
+///
+/// The one reading of the paging rule, so the plain and the scoped form above cannot differ
+/// on where a page starts, how long it is or when a token is due: they differ only in how
+/// the position is encoded.
+fn page_and_position<'a, T>(
+    ordered: &'a [T],
+    cursor: Option<&str>,
+    limit: Option<usize>,
+    rule: PageTokenRule,
+    id_of: &impl Fn(&T) -> &str,
+) -> (&'a [T], Option<&'a str>) {
     // The cursor is a POSITION in `ordered`, found by binary search, so an unsorted set
     // would silently skip items rather than fail: a caller that has not sorted by the id
     // `id_of` reads is the bug, and it fails loudly here in a debug or test build.
@@ -19647,11 +19687,8 @@ pub fn page_from_cursor<'a, T>(
     };
     // `page.last()` is `None` only for an empty page, which no rule above mints a token
     // for: there is no item for the cursor to name.
-    let token = page
-        .last()
-        .filter(|_| due)
-        .map(|item| encode_page_token(id_of(item)));
-    (page, token)
+    let position = page.last().filter(|_| due).map(id_of);
+    (page, position)
 }
 
 // ---------------------------------------------------------------------------
@@ -30009,8 +30046,9 @@ pub struct ManagedPrefixListRecord {
     pub view: crate::ops::types::ManagedPrefixList,
     /// The entries of the list's CURRENT version, in the order the request named them. The
     /// modelled [`crate::ops::types::ManagedPrefixList`] carries no member for them —
-    /// `GetManagedPrefixListEntries` is what reports them (still a scaffold stub with its own
-    /// open issue) — so the entries a create accepted are kept here rather than dropped.
+    /// `GetManagedPrefixListEntries` is what reports them, through
+    /// [`ComAmazonawsEc2Amazonec2State::visible_prefix_list_entries`] — so the entries a
+    /// create accepted are kept here rather than dropped.
     pub entries: Vec<crate::ops::types::PrefixListEntry>,
     /// The `create-in-progress` -> `create-complete` move the clock owes the list, until
     /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it. `None` on a
@@ -30105,6 +30143,55 @@ impl ComAmazonawsEc2Amazonec2State {
             .insert(prefix_list_id.clone(), record);
         prefix_list_id
     }
+
+    /// The entries of the prefix list `prefix_list_id` as a caller signed for `region` can
+    /// see them — or `None` when no prefix list that caller can see carries that id.
+    ///
+    /// The two sources are the ones a report of a prefix list has: the lists the ACCOUNT
+    /// created ([`Self::managed_prefix_lists`]) and the ones the REGION publishes for its
+    /// services ([`service_prefix_lists_in_region`]) — the same pair
+    /// `DescribeManagedPrefixLists` reports, so one id names one list whichever operation is
+    /// asked, and the entries of a published list are read off that one derivation rather
+    /// than spelled a second time here.
+    ///
+    /// A published list is settled and has never been revised, so its entries belong to
+    /// [`FIRST_PREFIX_LIST_VERSION`], the version `to_managed_prefix_list` reports for it; a
+    /// stored list's belong to the version its record carries.
+    pub fn visible_prefix_list_entries(
+        &self,
+        region: &str,
+        prefix_list_id: &str,
+    ) -> Option<PrefixListEntriesView> {
+        if let Some(record) = self.managed_prefix_lists.get(prefix_list_id) {
+            return Some(PrefixListEntriesView {
+                version: record.view.version.unwrap_or(FIRST_PREFIX_LIST_VERSION),
+                entries: record.entries.clone(),
+            });
+        }
+        service_prefix_lists_in_region(region)
+            .into_iter()
+            .find(|published| published.prefix_list_id == prefix_list_id)
+            .map(|published| PrefixListEntriesView {
+                version: FIRST_PREFIX_LIST_VERSION,
+                entries: published.to_prefix_list_entries(),
+            })
+    }
+}
+
+/// One prefix list's entries and the version they belong to, as
+/// [`ComAmazonawsEc2Amazonec2State::visible_prefix_list_entries`] answers them.
+///
+/// The version travels WITH the entries because a report of them is version-scoped: "the
+/// version of the prefix list for which to return the entries. The default is the current
+/// version" (`GetManagedPrefixListEntriesRequest$TargetVersion`), so the reader has to know
+/// which version the entries it was handed are of.
+#[derive(Debug, Clone)]
+pub struct PrefixListEntriesView {
+    /// The version of the prefix list these entries are the entry set of
+    /// (`ManagedPrefixList$Version`).
+    pub version: i64,
+    /// The entries themselves, in the order the source holds them.
+    pub entries: Vec<crate::ops::types::PrefixListEntry>,
 }
 
 /// One Amazon Web Services SERVICE prefix list of one Region.
@@ -30137,6 +30224,26 @@ impl ServicePrefixList {
             prefix_list_name: Some(self.prefix_list_name.clone()),
             cidrs: Some(self.cidrs.clone()),
         }
+    }
+
+    /// The entry set of this prefix list, as the modelled `PrefixListEntry` shape
+    /// `GetManagedPrefixListEntries` reports one.
+    ///
+    /// One entry per range the list carries, and nothing else: "The CIDR block" and "The
+    /// description" are the shape's two members (`PrefixListEntry`), and a description is
+    /// something an ACCOUNT writes on an entry of its own list
+    /// (`AddPrefixListEntry$Description`) — a published list's entries carry none, so each
+    /// reports its range alone. Derived from the same [`Self::cidrs`] `to_prefix_list`
+    /// reports, so the ranges of one published list cannot differ between the operation that
+    /// reports the list and the one that reports its entries.
+    pub fn to_prefix_list_entries(&self) -> Vec<crate::ops::types::PrefixListEntry> {
+        self.cidrs
+            .iter()
+            .map(|cidr| crate::ops::types::PrefixListEntry {
+                cidr: Some(cidr.clone()),
+                description: None,
+            })
+            .collect()
     }
 
     /// This prefix list as the modelled `ManagedPrefixList` shape
