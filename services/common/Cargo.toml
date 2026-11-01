@@ -52,14 +52,16 @@ iso8601-duration = "0.2"
 # The module bounds the path's length, its segment count and its selectors before the
 # engine is handed anything, and hands it the module's own canonical rendering.
 serde_json_path = "0.7"
-# `jwt::verify`: the ES256 (ECDSA on NIST P-256 with SHA-256, RFC 7518 §3.4) signature
-# check a service makes against the public key its token's issuer published. An
-# in-process COMPUTATION over data: it opens no listener, spawns nothing and reads
-# nothing off the host. It is the cryptography library this workspace already signs those
-# tokens with (the user-pool service), so it is already in this workspace's build and
-# lockfile and no capability class arrives with this declaration — and no second
-# implementation of the primitive is written. Not a pure-Rust elliptic-curve stack,
-# whose `crypto-bigint` this repository's dependency audit blocks (RUSTSEC-2026-0387).
+# `jwt`: the JOSE primitives every service handed a JWS needs — the signature check
+# against the key a token's issuer published or an ACME client embedded (ECDSA, RSASSA
+# PKCS1-v1_5 and Ed25519, RFC 7518 section 3.1), the HMAC of RFC 7518 section 3.2, and the
+# digest the RFC 7638 thumbprint of a public key is. An in-process COMPUTATION over data:
+# it opens no listener, spawns nothing and reads nothing off the host. It is the
+# cryptography library this workspace already signs those tokens with (the user-pool
+# service), so it is already in this workspace's build and lockfile and no capability class
+# arrives with this declaration — and no second implementation of the primitive is written.
+# Not a pure-Rust elliptic-curve stack, whose `crypto-bigint` this repository's dependency
+# audit blocks (RUSTSEC-2026-0387).
 ring = "0.17"
 
 [lints]

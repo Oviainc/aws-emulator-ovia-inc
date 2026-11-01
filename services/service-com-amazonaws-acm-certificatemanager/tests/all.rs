@@ -19,6 +19,8 @@ mod account_configuration_authorization;
 mod account_configuration_tokens;
 #[path = "all/acme_account_listing.rs"]
 mod acme_account_listing;
+#[path = "all/acme_account_registration.rs"]
+mod acme_account_registration;
 #[path = "all/acme_authorization.rs"]
 mod acme_authorization;
 #[path = "all/acme_directory_endpoint.rs"]

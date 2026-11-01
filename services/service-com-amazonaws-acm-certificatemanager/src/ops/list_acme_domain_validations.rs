@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .map(|token| {
                 crate::state::decode_page_cursor(token, &input.acme_endpoint_arn)
-                    .ok_or_else(invalid_next_token)
+                    .ok_or_else(|| invalid_next_token(Self::NAME, token))
             })
             .transpose()?;
 
@@ -307,12 +307,15 @@ const MAX_PAGE_SIZE: usize = 100;
 ///
 /// `ValidationException` — "the supplied input failed to satisfy constraints of an Amazon
 /// Web Services service" — is the shape this service models for that class, and the
-/// sentence is the one every paginated read in this service renders
-/// ([`crate::state::INVALID_NEXT_TOKEN_MESSAGE`]), since a caller cannot repair an opaque
-/// value and can only restart the walk.
-fn invalid_next_token() -> ListAcmeDomainValidationsError {
+/// sentence is the pagination framework's own
+/// ([`crate::state::pagination_token_message`]), naming this operation and the wrapping
+/// schema the presented token carries.
+fn invalid_next_token(operation: &str, next_token: &str) -> ListAcmeDomainValidationsError {
     ListAcmeDomainValidationsErrorModeled::ValidationException(ValidationException {
-        message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+        message: Some(crate::state::pagination_token_message(
+            operation,
+            next_token,
+        )),
     })
     .into()
 }

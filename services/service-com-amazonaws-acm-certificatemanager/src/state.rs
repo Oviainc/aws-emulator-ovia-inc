@@ -26,9 +26,14 @@
 //!
 //! Beside the endpoints, one [`AcmeAccountRecord`] per ACME account registered with
 //! one of them, keyed by the (endpoint ARN, account URL) pair every ACME-account
-//! operation addresses an account by. `ListAcmeAccounts` reports that endpoint's
-//! records through [`acme_account_summary`], and deleting an endpoint drops the
-//! accounts registered with it ([`ComAmazonawsAcmCertificatemanagerState::remove_acme_endpoint`]).
+//! operation addresses an account by. The records are WRITTEN by the endpoint's own ACME
+//! data plane (`crate::service::acme_http`), where an ACME client registers with a JWS
+//! `newAccount` request (RFC 8555 §7.3) — no modelled operation creates one — and they are
+//! REPORTED by `DescribeAcmeAccount` through [`acme_account_detail`] and by
+//! `ListAcmeAccounts` through [`acme_account_summary`]. `RevokeAcmeAccount` moves one to
+//! [`ACME_ACCOUNT_STATUS_REVOKED`], which is what withdraws its authority on that data
+//! plane, and deleting an endpoint drops the accounts registered with it
+//! ([`ComAmazonawsAcmCertificatemanagerState::remove_acme_endpoint`]).
 //!
 //! Beside them, one [`AcmeDomainValidationRecord`] per domain validation an endpoint
 //! holds, keyed by its own ARN — which is a PATH under the endpoint's ARN
@@ -82,11 +87,12 @@
 //! [`ComAmazonawsAcmCertificatemanagerState::materialize_due`] applies whatever was
 //! already due, and every handler calls it before reading or writing the store.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AcmCertificateMetadata, AcmeAccountSummary, AcmeDomainValidation, AcmeDomainValidationSummary,
+    AcmCertificateMetadata, AcmeAccount, AcmeAccountSummary, AcmeDomainValidation,
+    AcmeDomainValidationSummary,
     AcmeEndpoint,
     AcmeEndpointSummary,
     AcmeExternalAccountBinding,
@@ -681,6 +687,30 @@ pub const ACME_ACCOUNT_STATUS_DEACTIVATED: &str = "DEACTIVATED";
 /// "prevent[s] it from requesting or revoking certificates" (`RevokeAcmeAccount` doc).
 pub const ACME_ACCOUNT_STATUS_REVOKED: &str = "REVOKED";
 
+/// The most ACME accounts one endpoint may hold.
+///
+/// ACM publishes no quota for this, so the bound is the one this store needs: an ACME
+/// account is registered by a client of the endpoint's own data plane rather than by a
+/// modelled operation, so without it one unauthenticated wire could grow the store
+/// without end. The same order as the other per-endpoint bounds this service applies
+/// ([`ACME_DOMAIN_VALIDATION_LIMIT`], [`ACME_EXTERNAL_ACCOUNT_BINDING_LIMIT`]).
+pub const ACME_ACCOUNT_LIMIT: usize = 500;
+
+/// The most ACME accounts this store holds across every endpoint, for the same reason
+/// [`ACME_DOMAIN_VALIDATION_STORE_LIMIT`] exists: the per-endpoint bound alone would let
+/// the store grow with the endpoints.
+pub const ACME_ACCOUNT_STORE_LIMIT: usize = 10_000;
+
+/// The most anti-replay nonces one endpoint keeps outstanding at a time.
+///
+/// RFC 8555 §6.5 fixes only that a nonce is single-use; how long a server remembers one
+/// it issued is the server's own choice, and this is that choice stated as a COUNT rather
+/// than as a span: the endpoint remembers its most recent nonces and forgets the ones
+/// behind them ([`AcmeEndpointRecord::issue_nonce`]), so the set cannot grow with the
+/// requests a client makes and a client that fetches a nonce and posts with it is always
+/// inside the window.
+pub const ACME_NONCE_WINDOW: usize = 256;
+
 /// The account-level configuration `PutAccountConfiguration` writes and
 /// `GetAccountConfiguration` reports. One per account, so the state holds a
 /// singleton rather than a map.
@@ -1270,11 +1300,48 @@ pub struct AcmeEndpointRecord {
     /// The status transition the clock owes this endpoint. `None` once it has
     /// reached a status the clock owes nothing beyond.
     pub pending_status: Option<PendingAcmeEndpointStatus>,
+    /// The anti-replay nonces this endpoint's ACME data plane has issued and not yet seen
+    /// back, newest last and at most [`ACME_NONCE_WINDOW`] of them.
+    ///
+    /// It lives on the endpoint because a nonce is issued BY one endpoint's ACME server
+    /// (RFC 8555 §7.2) and is spent by a JWS posted to that same server, so one
+    /// endpoint's nonces are no use at another and are dropped with the endpoint itself.
+    pub issued_nonces: VecDeque<String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
 }
 
 impl AcmeEndpointRecord {
+    /// Record `nonce` as outstanding for this endpoint, forgetting the oldest once the
+    /// window is full.
+    ///
+    /// Writing here is what `newNonce` DOES: "the server MUST include a Replay-Nonce
+    /// header field containing a fresh nonce" (RFC 8555 §7.2), and a nonce nothing
+    /// remembers is one no later POST could be checked against.
+    pub fn issue_nonce(&mut self, nonce: String) {
+        self.issued_nonces.push_back(nonce);
+        while self.issued_nonces.len() > ACME_NONCE_WINDOW {
+            self.issued_nonces.pop_front();
+        }
+    }
+
+    /// Spend `nonce`: whether this endpoint had issued it and had not yet seen it back.
+    ///
+    /// The nonce is forgotten by the same call, which is what makes it single-use — "the
+    /// server MUST consider each nonce valid only once" (RFC 8555 §6.5), so a replay of
+    /// the same JWS finds nothing to spend.
+    pub fn spend_nonce(&mut self, nonce: &str) -> bool {
+        let Some(position) = self
+            .issued_nonces
+            .iter()
+            .position(|issued| issued == nonce)
+        else {
+            return false;
+        };
+        self.issued_nonces.remove(position);
+        true
+    }
+
     /// Apply the status transition the clock already owes this endpoint at `now`.
     ///
     /// An endpoint ACM reports as `CREATING` is waiting on work ACM does on its own;
@@ -1562,6 +1629,14 @@ pub struct AcmeAccountRecord {
     /// "The thumbprint of the public key associated with the ACME account"
     /// (`AcmeAccount$PublicKeyThumbprint` doc) — the account's identity.
     pub public_key_thumbprint: String,
+    /// The account key itself, as the canonical JWK the thumbprint above is the digest of
+    /// (`service_common::jwt::canonical_jwk`).
+    ///
+    /// Kept because an ACME account's authority IS that key: every later request the
+    /// account makes is a JWS signed with it and naming the account's URL (RFC 8555
+    /// §6.2), so the server has to hold the key to check one. Only the PUBLIC parameters
+    /// are kept, which is all the canonical form carries.
+    pub public_key_jwk: String,
     /// An `AcmeAccountStatus` value.
     pub status: String,
     /// The external account binding the registration presented, when it presented
@@ -1736,6 +1811,17 @@ impl ComAmazonawsAcmCertificatemanagerState {
             .get(&acme_endpoint_arn(region, endpoint_id))
     }
 
+    /// [`Self::acme_endpoint_in`] for a caller that writes the record — the ACME data
+    /// plane, which records the nonces the endpoint it serves has issued.
+    pub fn acme_endpoint_in_mut(
+        &mut self,
+        region: &str,
+        endpoint_id: &str,
+    ) -> Option<&mut AcmeEndpointRecord> {
+        self.acme_endpoints
+            .get_mut(&acme_endpoint_arn(region, endpoint_id))
+    }
+
     /// The tag map of the non-certificate ACM resource `arn` names, or `None` when
     /// this account holds no such resource.
     ///
@@ -1869,6 +1955,73 @@ impl ComAmazonawsAcmCertificatemanagerState {
             .range((acme_endpoint_arn.to_string(), String::new())..)
             .take_while(move |((endpoint_arn, _), _)| endpoint_arn == acme_endpoint_arn)
             .map(|(_, account)| account)
+    }
+
+    /// The ACME account `account_url` names on `acme_endpoint_arn`, or `None` when that
+    /// endpoint holds no account under that URL.
+    ///
+    /// The pair IS the key every ACME-account operation addresses an account by
+    /// (`DescribeAcmeAccount` and `RevokeAcmeAccount` both take `AcmeEndpointArn` +
+    /// `AccountUrl`), so one lookup serves them and the data plane alike.
+    pub fn acme_account_for(
+        &self,
+        acme_endpoint_arn: &str,
+        account_url: &str,
+    ) -> Option<&AcmeAccountRecord> {
+        self.acme_accounts
+            .get(&(acme_endpoint_arn.to_string(), account_url.to_string()))
+    }
+
+    /// [`Self::acme_account_for`] for a caller that writes the record.
+    pub fn acme_account_for_mut(
+        &mut self,
+        acme_endpoint_arn: &str,
+        account_url: &str,
+    ) -> Option<&mut AcmeAccountRecord> {
+        self.acme_accounts
+            .get_mut(&(acme_endpoint_arn.to_string(), account_url.to_string()))
+    }
+
+    /// The account `acme_endpoint_arn` already holds for the public key whose RFC 7638
+    /// thumbprint is `public_key_thumbprint`, if any.
+    ///
+    /// An ACME account IS its key pair: "if the server already has an account registered
+    /// with the provided account key, then it MUST return a response with a 200 (OK)
+    /// status code and provide the URL of that account" (RFC 8555 §7.3), so a
+    /// registration is resolved by key rather than by anything the request names.
+    pub fn acme_account_by_thumbprint(
+        &self,
+        acme_endpoint_arn: &str,
+        public_key_thumbprint: &str,
+    ) -> Option<&AcmeAccountRecord> {
+        // The same range scan [`Self::acme_accounts_of`] walks, written out because the
+        // record outlives the borrow of the ARN this call was given.
+        self.acme_accounts
+            .range((acme_endpoint_arn.to_string(), String::new())..)
+            .take_while(|((endpoint_arn, _), _)| endpoint_arn == acme_endpoint_arn)
+            .map(|(_, account)| account)
+            .find(|account| account.public_key_thumbprint == public_key_thumbprint)
+    }
+
+    /// Store `account`, unless storing it would pass [`ACME_ACCOUNT_LIMIT`] for its
+    /// endpoint or [`ACME_ACCOUNT_STORE_LIMIT`] for this store; `false` when it would.
+    ///
+    /// The one place a registration is written, so both bounds are checked once and the
+    /// store cannot grow past them however many times a client registers.
+    pub fn register_acme_account(&mut self, account: AcmeAccountRecord) -> bool {
+        if self.acme_accounts.len() >= ACME_ACCOUNT_STORE_LIMIT
+            || self.acme_accounts_of(&account.acme_endpoint_arn).count() >= ACME_ACCOUNT_LIMIT
+        {
+            return false;
+        }
+        self.acme_accounts.insert(
+            (
+                account.acme_endpoint_arn.clone(),
+                account.account_url.clone(),
+            ),
+            account,
+        );
+        true
     }
 
     /// Every external account binding of `acme_endpoint_arn`, in the order
@@ -2538,7 +2691,8 @@ pub fn certificate_not_yet_issued_message(certificate_arn: &str) -> String {
     format!("Certificate {certificate_arn} in account {account} not yet issued")
 }
 
-/// The refusal sentence for a pagination token the service did not issue.
+/// The refusal sentence for a pagination token the service did not issue, as the
+/// certificate-scoped reads of this service word it.
 ///
 /// A `NextToken` is opaque and belongs to the page that issued it, so a token this
 /// service cannot read as one of its own names no position to resume from. The
@@ -2546,7 +2700,54 @@ pub fn certificate_not_yet_issued_message(certificate_arn: &str) -> String {
 /// class, naming neither the token nor what was wrong with it — a caller cannot
 /// repair an opaque value, it can only restart the walk. Rendered here so every
 /// paginated read that answers this class reports the same sentence.
+///
+/// The ACME reads answer the SAME class in the pagination framework's own words instead
+/// ([`pagination_token_message`]), which is what they are recorded doing.
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid next token.";
+
+/// The message the ACME reads of this service refuse an unreadable `NextToken` with: the
+/// AWS pagination framework's sentence, naming the operation the token was presented to
+/// and the wrapping schema that token's own payload carries.
+///
+/// Fixed text around two variable parts, both taken from the request: the operation name
+/// and [`payload_wrapping_schema`]. Nothing of the token itself travels in it, so an
+/// opaque value a caller sent is not echoed back.
+pub fn pagination_token_message(operation: &str, next_token: &str) -> String {
+    format!(
+        "Pagination token exception in operation '{operation}': invalid payload wrapping \
+         schema {}",
+        payload_wrapping_schema(next_token)
+    )
+}
+
+/// The wrapping schema a pagination token's own payload carries: the first 16 bits of the
+/// payload its leading base64url characters encode, read as a big-endian SIGNED integer.
+///
+/// That field is where a wrapped pagination payload states which schema it was written
+/// under, and it is the value the decoder reports back when it does not know the schema it
+/// read — so the number is a function of the token presented and of nothing else. Only the
+/// token's first base64 group is read, which is what carries those bits: a token shorter
+/// than one group is read as if padded with zero bits ([`ZERO_SEXTET`]), and one whose
+/// leading characters are not base64 at all carries no payload to read a schema out of,
+/// which is the zero that answer reports.
+fn payload_wrapping_schema(next_token: &str) -> i16 {
+    let mut leading: String = next_token.chars().take(BASE64_GROUP).collect();
+    while leading.chars().count() < BASE64_GROUP {
+        leading.push(ZERO_SEXTET);
+    }
+    let octets = ::service_common::jwt::decode_base64url(&leading).unwrap_or_default();
+    i16::from_be_bytes([
+        octets.first().copied().unwrap_or_default(),
+        octets.get(1).copied().unwrap_or_default(),
+    ])
+}
+
+/// The characters one base64 group spells three octets in (RFC 4648 §4).
+const BASE64_GROUP: usize = 4;
+
+/// The base64 character for six zero bits, which a token shorter than one group is read
+/// as if padded with.
+const ZERO_SEXTET: char = 'A';
 
 /// The byte that separates the two halves of a parent-scoped pagination cursor
 /// ([`encode_page_cursor`]). It is outside every ARN pattern this service mints, and
@@ -3591,6 +3792,33 @@ pub fn acme_account_summary(account: &AcmeAccountRecord) -> AcmeAccountSummary {
         acme_external_account_binding_arn: account.acme_external_account_binding_arn.clone(),
         contacts: (!account.contacts.is_empty()).then(|| account.contacts.clone()),
     }
+}
+
+/// A stored ACME account as `DescribeAcmeAccount`'s `AcmeAccount`.
+///
+/// `AcmeAccount` declares exactly the members `AcmeAccountSummary` does, so one account is
+/// reported identically whether it is described one at a time or listed: the detail is
+/// projected from the same record, member for member, through [`acme_account_summary`].
+pub fn acme_account_detail(account: &AcmeAccountRecord) -> AcmeAccount {
+    let summary = acme_account_summary(account);
+    AcmeAccount {
+        account_url: summary.account_url,
+        public_key_thumbprint: summary.public_key_thumbprint,
+        status: summary.status,
+        created_at: summary.created_at,
+        acme_external_account_binding_arn: summary.acme_external_account_binding_arn,
+        contacts: summary.contacts,
+    }
+}
+
+/// The `ResourceNotFoundException` message for an ACME account URL no stored record
+/// answers to on the endpoint the request named.
+///
+/// Worded like every other lookup miss in this service
+/// ([`acme_endpoint_not_found_message`]): one complete sentence naming what the request
+/// asked for, terminated by a period.
+pub fn acme_account_not_found_message(account_url: &str) -> String {
+    format!("Could not find ACME account {account_url}.")
 }
 
 /// A stored certificate as `SearchCertificates`' `CertificateSearchResult`: the same

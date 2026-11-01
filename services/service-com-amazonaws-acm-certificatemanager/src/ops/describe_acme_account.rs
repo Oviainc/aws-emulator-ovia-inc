@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAcmeAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAcmeAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the ACME account the (`AcmeEndpointArn`, `AccountUrl`) pair
+//! addresses, as the `AcmeAccount` projected from the stored record
+//! ([`crate::state::acme_account_detail`]) — so it and `ListAcmeAccounts` report one
+//! record and cannot disagree. An ARN naming another account is `ValidationException`
+//! before the store is read; an ARN no stored endpoint answers to, and an account URL
+//! that endpoint holds no account under, are each `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAcmeAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An account that has been REVOKED or DEACTIVATED is still an account, so it is
+//! REPORTED with that status rather than reported missing: the status is what
+//! `RevokeAcmeAccount` wrote.
+//!
+//! Reporting, not mutating (`@readonly`): the only write it makes is
+//! [`crate::state::ComAmazonawsAcmCertificatemanagerState::materialize_due`], which
+//! applies the transitions the clock already owed at this instant whether or not anybody
+//! described anything. The records themselves are written by the endpoint's own ACME data
+//! plane, where a client registers (`crate::service::acme_http`).
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +157,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAcmeAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAcmeAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAcmeAccount"))
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service looking at anything, so a caller whose identity-based policies do not
+        // allow the action is refused without being told what this account holds. `ctx`
+        // carries the credential the request presented, which is who is judged
+        // ([`crate::service::authorization`]).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.acme_endpoint_arn,
+        )
+        .map_err(DescribeAcmeAccountErrorModeled::AccessDeniedException)?;
+
+        // The account segment of the ARN is INPUT this operation validates: a caller
+        // addresses only their own account's resources, so an ARN carrying another
+        // account's id names nothing they could read — a fact about the REQUEST, decided
+        // before the store is consulted at all.
+        if !crate::state::arn_is_in_caller_account(&input.acme_endpoint_arn) {
+            return Err(DescribeAcmeAccountErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::cross_account_arn_refusal()),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(DescribeAcmeAccountErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the acm acme account store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // A read of the account record, except for the transitions the clock already
+        // owes: whichever call reaches the store first materialises them, so this answer
+        // and a list of the same records cannot disagree.
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // The account is described FOR an endpoint, so an ARN this account holds no
+        // endpoint for is a missing resource rather than a missing account.
+        if !store.acme_endpoints.contains_key(&input.acme_endpoint_arn) {
+            return Err(DescribeAcmeAccountErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::acme_endpoint_not_found_message(
+                        &input.acme_endpoint_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(account) = store.acme_account_for(&input.acme_endpoint_arn, &input.account_url)
+        else {
+            return Err(DescribeAcmeAccountErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::acme_account_not_found_message(
+                        &input.account_url,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeAcmeAccountOutput {
+            acme_account: Some(crate::state::acme_account_detail(account)),
+        })
     }
 }

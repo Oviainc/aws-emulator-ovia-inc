@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume_after = input
             .next_token
             .as_deref()
-            .map(decode_next_token)
+            .map(|token| decode_next_token(Self::NAME, token))
             .transpose()?;
 
         let mut store = state.lock();
@@ -254,13 +254,13 @@ fn encode_next_token(acme_endpoint_arn: &str) -> String {
 ///
 /// Every step is fallible on purpose: the token is caller-supplied, so no value read out
 /// of it may panic the handler, and a forged-but-well-encoded token is refused rather
-/// than silently answering some other page. The refusal renders the one sentence every
-/// paginated read in this service answers this class with
-/// ([`crate::state::INVALID_NEXT_TOKEN_MESSAGE`]).
-fn decode_next_token(token: &str) -> Result<String, ListAcmeEndpointsError> {
+/// than silently answering some other page. The refusal renders the pagination
+/// framework's own sentence ([`crate::state::pagination_token_message`]), naming this
+/// operation and the wrapping schema the presented token carries.
+fn decode_next_token(operation: &str, token: &str) -> Result<String, ListAcmeEndpointsError> {
     let invalid = || {
         ListAcmeEndpointsErrorModeled::ValidationException(ValidationException {
-            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+            message: Some(crate::state::pagination_token_message(operation, token)),
         })
     };
     let bytes = hex::decode(token).map_err(|_| invalid())?;

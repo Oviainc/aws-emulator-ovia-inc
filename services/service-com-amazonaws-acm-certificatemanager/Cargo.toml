@@ -56,6 +56,14 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The CLIENT half of the ACME wire: the tests generate account key pairs and sign the JWS
+# and the external-account-binding MAC an ACME client sends, with the same maintained
+# cryptography library the service verifies them through — never with the code under test.
+# TEST-ONLY.
+ring = "0.17"
+# RSA key GENERATION, which `ring` does not do, so one row of the account-key table can be
+# an RSA key. TEST-ONLY.
+aws-lc-rs = "1"
 # Generates the real certificates and key pairs the import tests feed the service,
 # independently of the DER this crate reads.
 rcgen = "0.13"

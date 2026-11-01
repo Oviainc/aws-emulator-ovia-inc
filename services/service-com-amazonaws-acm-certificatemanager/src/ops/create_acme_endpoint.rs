@@ -330,6 +330,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // transition is owed from here on; the instant it falls due is fixed now
             // and materialised by whichever call next touches the store.
             pending_status: Some(crate::state::PendingAcmeEndpointStatus::activating_at(now)),
+            // Nothing has asked this endpoint's ACME server for a nonce yet, and a nonce
+            // is issued only by that server answering a client
+            // (`crate::service::acme_http`).
+            issued_nonces: ::std::collections::VecDeque::new(),
             created_at: now,
             updated_at: now,
         };

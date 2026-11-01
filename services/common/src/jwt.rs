@@ -45,6 +45,23 @@
 //! A presentation prefix is NOT this module's concern: a token travelling in an
 //! `Authorization` header carries the RFC 6750 `Bearer` scheme in front of it, which the
 //! service reading that header strips before calling [`read`].
+//!
+//! # The JOSE primitives underneath
+//!
+//! A JWS is not always a compact token: the same signature, over the same
+//! `base64url(header) '.' base64url(payload)` octets, travels in the JSON serialization an
+//! ACME client posts (RFC 8555 §6.2), and the key it is checked against travels in the
+//! request itself rather than in a published key set. The pieces that reading needs are
+//! therefore public here, beside the compact reading that uses them, so no second copy of
+//! any of them is written:
+//!
+//! * [`jwk_signature_checks_out`] — the signature check for a key published as a JWK, over
+//!   [`VERIFIABLE_SIGNATURE_ALGORITHMS`];
+//! * [`hs256_checks_out`] — the same for the MAC-keyed algorithm of RFC 7518 §3.2;
+//! * [`jwk_thumbprint`] / [`canonical_jwk`] — RFC 7638, which is how a public key is
+//!   IDENTIFIED;
+//! * [`encode_base64url`] / [`decode_base64url`] — the one coding every JOSE value travels
+//!   in.
 
 /// The largest token this module reads, in bytes.
 ///
@@ -206,22 +223,45 @@ fn read_form(presented: &str) -> Result<(CompactJws, bool), FormDefect> {
 /// indicating which key was used to secure the JWS" (RFC 7515 §4.1.4).
 const KEY_ID_HEADER: &str = "kid";
 
-/// The `alg` a signature is CHECKED under here: ECDSA using P-256 and SHA-256, whose
-/// signature is the 64-byte `R || S` form (RFC 7518 §3.1/§3.4). It is the algorithm the
-/// issuers this emulator serves sign with, and the one its published keys advertise; a
-/// token naming any other algorithm is reported as one this module cannot check rather
-/// than as one that failed to check out.
+/// The `alg` a COMPACT token's signature is checked under by [`verify`]: ECDSA using
+/// P-256 and SHA-256, whose signature is the 64-byte `R || S` form (RFC 7518 §3.1/§3.4).
+/// It is the algorithm the issuers this emulator serves sign with, and the one its
+/// published keys advertise; a token naming any other algorithm is reported as one that
+/// check cannot make rather than as one that failed to check out.
 const VERIFIABLE_ALGORITHM: &str = "ES256";
 
-/// The `kty` of a key [`VERIFIABLE_ALGORITHM`] is defined over (RFC 7518 §6.2).
+/// The JOSE header parameter naming a key's family (RFC 7517 §4.1).
+const KEY_TYPE: &str = "kty";
+
+/// The `kty` of an elliptic-curve key (RFC 7518 §6.2).
 const EC_KEY_TYPE: &str = "EC";
 
-/// The `crv` of that same key (RFC 7518 §6.2.1.1).
+/// The `kty` of an RSA key (RFC 7518 §6.3).
+const RSA_KEY_TYPE: &str = "RSA";
+
+/// The `kty` of an octet-key-pair key — the family Edwards-curve keys are published
+/// under (RFC 8037 §2).
+const OKP_KEY_TYPE: &str = "OKP";
+
+/// The `crv` of a P-256 key (RFC 7518 §6.2.1.1).
 const P256_CURVE: &str = "P-256";
+
+/// The `crv` of a P-384 key (the same member, the other NIST curve RFC 7518 §6.2.1.1
+/// registers).
+const P384_CURVE: &str = "P-384";
+
+/// The `crv` of an Ed25519 key (RFC 8037 §3.1).
+const ED25519_CURVE: &str = "Ed25519";
 
 /// The width of one P-256 coordinate: RFC 7518 §6.2.1.2 publishes each as the field
 /// element's full-width octet string, which on this curve is 32 bytes.
 const P256_COORDINATE_BYTES: usize = 32;
+
+/// The width of one P-384 coordinate, by the same rule.
+const P384_COORDINATE_BYTES: usize = 48;
+
+/// The width of an Ed25519 public key, which RFC 8037 §2 publishes in the `x` member.
+const ED25519_KEY_BYTES: usize = 32;
 
 /// The JWK member each published key carries its own key id in (RFC 7517 §4.5).
 const JWK_KEY_ID: &str = "kid";
@@ -321,7 +361,7 @@ pub fn verify(
     }
     // A signature segment that is not base64url, or not the 64-byte `R || S` form, is no
     // signature of any key: the algorithm below accepts only that encoding.
-    let signature = decode_segment(signature).ok_or(SignatureDefect::Invalid)?;
+    let signature = decode_base64url(signature).ok_or(SignatureDefect::Invalid)?;
     let signing_input = format!("{header}.{claims}");
     let mut refused = None;
     for key in candidates {
@@ -341,55 +381,261 @@ pub fn verify(
 }
 
 /// Whether `key` — one entry of a published key set — signed `signing_input` with
-/// `signature`.
+/// `signature`, under the one algorithm [`verify`] checks.
 ///
-/// `Err(SignatureDefect::UnsupportedKey)` for a key this module cannot check a signature
-/// under, which says nothing about the token; `Err(SignatureDefect::Invalid)` for a key it
-/// can, that did not sign these bytes.
+/// `Err(SignatureDefect::UnsupportedKey)` for a key that check cannot be made under,
+/// which says nothing about the token; `Err(SignatureDefect::Invalid)` for a key it can,
+/// that did not sign these bytes.
 fn checks_out(
     key: &::serde_json::Value,
     signing_input: &[u8],
     signature: &[u8],
 ) -> Result<(), SignatureDefect> {
-    let member = |name: &str| key.get(name).and_then(::serde_json::Value::as_str);
-    if member("kty") != Some(EC_KEY_TYPE) || member("crv") != Some(P256_CURVE) {
+    jwk_signature_checks_out(VERIFIABLE_ALGORITHM, key, signing_input, signature)
+}
+
+/// Every JWS `alg` a signature can be checked under here, as RFC 7518 §3.1 registers the
+/// names: ECDSA on the two NIST curves, RSASSA-PKCS1-v1_5 at each digest width, and
+/// Edwards-curve `EdDSA` (RFC 8037 §3.1).
+///
+/// A caller that has to tell a client WHICH algorithms a signature may be presented
+/// under — RFC 8555 §6.2 asks an ACME server for exactly that list — states this one
+/// rather than a second copy of it.
+pub const VERIFIABLE_SIGNATURE_ALGORITHMS: &[&str] =
+    &["ES256", "ES384", "RS256", "RS384", "RS512", "EdDSA"];
+
+/// Whether the public key `jwk` publishes (RFC 7517 §4) signed `signing_input` with
+/// `signature` under the JWS algorithm `algorithm` names.
+///
+/// The ONE signature check in this workspace for a JWS whose verification key travels as
+/// a JWK — the key set a compact token names one key of ([`verify`]), or the key an ACME
+/// client embeds in its own request's protected header (RFC 8555 §6.2). Only PUBLIC key
+/// parameters are read, so a signature that verifies here is one any third party holding
+/// the same JWK could have verified.
+///
+/// `Err(SignatureDefect::UnsupportedAlgorithm)` for an `alg` outside
+/// [`VERIFIABLE_SIGNATURE_ALGORITHMS`] and `Err(SignatureDefect::UnsupportedKey)` for a
+/// key of a family that algorithm is not defined over: both leave the question UNDECIDED,
+/// rather than deciding it against the signature. `Err(SignatureDefect::Invalid)` is the
+/// decided answer — the key could be read and did not sign these bytes.
+///
+/// Total: every failure is a [`SignatureDefect`], never a panic — nothing is indexed,
+/// sliced or unwrapped on the way through.
+pub fn jwk_signature_checks_out(
+    algorithm: &str,
+    jwk: &::serde_json::Value,
+    signing_input: &[u8],
+    signature: &[u8],
+) -> Result<(), SignatureDefect> {
+    let member = |name: &str| jwk.get(name).and_then(::serde_json::Value::as_str);
+    let key_type = member(KEY_TYPE).unwrap_or_default();
+    match (algorithm, key_type) {
+        ("ES256", EC_KEY_TYPE) => ecdsa_checks_out(
+            jwk,
+            P256_CURVE,
+            P256_COORDINATE_BYTES,
+            &::ring::signature::ECDSA_P256_SHA256_FIXED,
+            signing_input,
+            signature,
+        ),
+        ("ES384", EC_KEY_TYPE) => ecdsa_checks_out(
+            jwk,
+            P384_CURVE,
+            P384_COORDINATE_BYTES,
+            &::ring::signature::ECDSA_P384_SHA384_FIXED,
+            signing_input,
+            signature,
+        ),
+        ("RS256", RSA_KEY_TYPE) => rsa_checks_out(
+            jwk,
+            &::ring::signature::RSA_PKCS1_2048_8192_SHA256,
+            signing_input,
+            signature,
+        ),
+        ("RS384", RSA_KEY_TYPE) => rsa_checks_out(
+            jwk,
+            &::ring::signature::RSA_PKCS1_2048_8192_SHA384,
+            signing_input,
+            signature,
+        ),
+        ("RS512", RSA_KEY_TYPE) => rsa_checks_out(
+            jwk,
+            &::ring::signature::RSA_PKCS1_2048_8192_SHA512,
+            signing_input,
+            signature,
+        ),
+        ("EdDSA", OKP_KEY_TYPE) => ed25519_checks_out(jwk, signing_input, signature),
+        // An algorithm this module checks, presented with a key of a family it is not
+        // defined over: a fact about the KEY, which says nothing about the signature.
+        (algorithm, _) if VERIFIABLE_SIGNATURE_ALGORITHMS.contains(&algorithm) => {
+            Err(SignatureDefect::UnsupportedKey)
+        }
+        _ => Err(SignatureDefect::UnsupportedAlgorithm(algorithm.to_string())),
+    }
+}
+
+/// Whether an ECDSA key on `curve` signed `signing_input`, its coordinates read at
+/// `coordinate_bytes` each.
+fn ecdsa_checks_out(
+    jwk: &::serde_json::Value,
+    curve: &str,
+    coordinate_bytes: usize,
+    algorithm: &'static ::ring::signature::EcdsaVerificationAlgorithm,
+    signing_input: &[u8],
+    signature: &[u8],
+) -> Result<(), SignatureDefect> {
+    let member = |name: &str| jwk.get(name).and_then(::serde_json::Value::as_str);
+    if member("crv") != Some(curve) {
         return Err(SignatureDefect::UnsupportedKey);
     }
     // SEC 1 §2.3.3: the uncompressed point a verifier reads the key's two published
     // coordinates into is `0x04 || X || Y`, each coordinate the curve's full width.
-    let mut point = Vec::with_capacity(1 + 2 * P256_COORDINATE_BYTES);
+    let mut point = Vec::with_capacity(1 + 2 * coordinate_bytes);
     point.push(0x04_u8);
     for coordinate in ["x", "y"] {
         let bytes = member(coordinate)
-            .and_then(decode_segment)
-            .filter(|bytes| bytes.len() == P256_COORDINATE_BYTES)
+            .and_then(decode_base64url)
+            .filter(|bytes| bytes.len() == coordinate_bytes)
             .ok_or(SignatureDefect::Invalid)?;
         point.extend_from_slice(&bytes);
     }
-    ::ring::signature::UnparsedPublicKey::new(&::ring::signature::ECDSA_P256_SHA256_FIXED, point)
+    ::ring::signature::UnparsedPublicKey::new(algorithm, point)
         .verify(signing_input, signature)
         .map_err(|_| SignatureDefect::Invalid)
+}
+
+/// Whether the RSA key `jwk` publishes as its modulus and exponent (RFC 7518 §6.3.1)
+/// signed `signing_input` under `algorithm`.
+fn rsa_checks_out(
+    jwk: &::serde_json::Value,
+    algorithm: &'static ::ring::signature::RsaParameters,
+    signing_input: &[u8],
+    signature: &[u8],
+) -> Result<(), SignatureDefect> {
+    let member = |name: &str| jwk.get(name).and_then(::serde_json::Value::as_str);
+    let component = |name: &str| {
+        member(name)
+            .and_then(decode_base64url)
+            .filter(|bytes| !bytes.is_empty())
+            .ok_or(SignatureDefect::Invalid)
+    };
+    ::ring::signature::RsaPublicKeyComponents {
+        n: component("n")?,
+        e: component("e")?,
+    }
+    .verify(algorithm, signing_input, signature)
+    .map_err(|_| SignatureDefect::Invalid)
+}
+
+/// Whether the Ed25519 key `jwk` publishes in its `x` member (RFC 8037 §2) signed
+/// `signing_input`.
+fn ed25519_checks_out(
+    jwk: &::serde_json::Value,
+    signing_input: &[u8],
+    signature: &[u8],
+) -> Result<(), SignatureDefect> {
+    let member = |name: &str| jwk.get(name).and_then(::serde_json::Value::as_str);
+    if member("crv") != Some(ED25519_CURVE) {
+        return Err(SignatureDefect::UnsupportedKey);
+    }
+    let key = member("x")
+        .and_then(decode_base64url)
+        .filter(|bytes| bytes.len() == ED25519_KEY_BYTES)
+        .ok_or(SignatureDefect::Invalid)?;
+    ::ring::signature::UnparsedPublicKey::new(&::ring::signature::ED25519, key)
+        .verify(signing_input, signature)
+        .map_err(|_| SignatureDefect::Invalid)
+}
+
+/// Whether `tag` is the HMAC-SHA-256 of `signed` under `key` — the `HS256` JWS algorithm
+/// (RFC 7518 §3.2), which is how a MAC-keyed JWS is checked.
+///
+/// The comparison is the MAC crate's own, which is constant-time; nothing here compares
+/// tag bytes itself.
+#[must_use]
+pub fn hs256_checks_out(key: &[u8], signed: &[u8], tag: &[u8]) -> bool {
+    let key = ::ring::hmac::Key::new(::ring::hmac::HMAC_SHA256, key);
+    ::ring::hmac::verify(&key, signed, tag).is_ok()
+}
+
+/// The RFC 7638 thumbprint of the public key `jwk` publishes: the base64url-encoded
+/// SHA-256 digest of its canonical form ([`canonical_jwk`]).
+///
+/// The one value that IDENTIFIES a public key independently of how its holder spelled
+/// the JWK — which is what RFC 8555 §8.1 keys an ACME account by. `None` for a key family
+/// RFC 7638 §3.2 registers no required-member list for.
+#[must_use]
+pub fn jwk_thumbprint(jwk: &::serde_json::Value) -> Option<String> {
+    use ::sha2::Digest as _;
+    let canonical = canonical_jwk(jwk)?;
+    Some(encode_base64url(
+        ::sha2::Sha256::digest(canonical.as_bytes()).as_slice(),
+    ))
+}
+
+/// The canonical form of the public key `jwk` publishes: exactly the members RFC 7638
+/// §3.2 requires for its key family, in the lexicographic order §3.3 fixes, with no
+/// whitespace — the octets a thumbprint is the digest of.
+///
+/// It carries the whole verification key and nothing else, so a caller that has to REMEMBER
+/// a key a client presented stores this rather than the JWK as received: two spellings of
+/// one key canonicalise to one value, and a private parameter a client sent along is not
+/// kept. Every value is rendered by the JSON serializer, so nothing escapes text by hand.
+#[must_use]
+pub fn canonical_jwk(jwk: &::serde_json::Value) -> Option<String> {
+    let member = |name: &str| jwk.get(name).and_then(::serde_json::Value::as_str);
+    // RFC 7638 §3.2's required members per key type, each list already in the
+    // lexicographic order §3.3 asks for.
+    let required: &[&str] = match member(KEY_TYPE)? {
+        EC_KEY_TYPE => &["crv", KEY_TYPE, "x", "y"],
+        RSA_KEY_TYPE => &["e", KEY_TYPE, "n"],
+        OKP_KEY_TYPE => &["crv", KEY_TYPE, "x"],
+        _ => return None,
+    };
+    let mut canonical = String::from("{");
+    for (position, name) in required.iter().enumerate() {
+        if position > 0 {
+            canonical.push(',');
+        }
+        let value = member(name)?;
+        canonical.push_str(&::serde_json::Value::String((*name).to_string()).to_string());
+        canonical.push(':');
+        canonical.push_str(&::serde_json::Value::String(value.to_string()).to_string());
+    }
+    canonical.push('}');
+    Some(canonical)
 }
 
 /// One base64url segment of a token, read as a JSON object. `None` when the segment is not
 /// base64url or does not decode to a JSON object — neither is a JOSE header or a claim set.
 fn json_segment(segment: &str) -> Option<::serde_json::Map<String, ::serde_json::Value>> {
-    let bytes = decode_segment(segment)?;
+    let bytes = decode_base64url(segment)?;
     match ::serde_json::from_slice::<::serde_json::Value>(&bytes) {
         Ok(::serde_json::Value::Object(members)) => Some(members),
         _ => None,
     }
 }
 
-/// Decode one segment of a compact JWS: base64url without padding (RFC 7515 §2, which is
-/// RFC 4648 §5 "with all trailing '=' characters omitted"), accepting a presenter that
+/// `bytes` as one base64url segment, unpadded — the encoding every JOSE value travels in
+/// (RFC 7515 §2), and the inverse of [`decode_base64url`].
+#[must_use]
+pub fn encode_base64url(bytes: &[u8]) -> String {
+    ::aws_smithy_types::base64::encode(bytes)
+        .trim_end_matches('=')
+        .replace('+', "-")
+        .replace('/', "_")
+}
+
+/// Decode one base64url segment of a JWS: base64url without padding (RFC 7515 §2, which
+/// is RFC 4648 §5 "with all trailing '=' characters omitted"), accepting a presenter that
 /// padded it anyway.
 ///
 /// The codec is `aws_smithy_types::base64`, the standard-alphabet decoder this workspace
 /// already uses for every Smithy blob, plus the two alphabet substitutions (`-` -> `+`,
 /// `_` -> `/`) and the restored padding that turn §5 back into §4. No second codec is
 /// introduced for it.
-fn decode_segment(segment: &str) -> Option<Vec<u8>> {
+#[must_use]
+pub fn decode_base64url(segment: &str) -> Option<Vec<u8>> {
     let mut standard = segment
         .trim_end_matches('=')
         .replace('-', "+")

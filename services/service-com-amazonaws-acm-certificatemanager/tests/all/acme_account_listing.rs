@@ -165,6 +165,17 @@ fn register_accounts(
             // A JWK thumbprint is base64url text (RFC 7638 §3); what matters here is
             // that each account carries its own, so a response cannot confuse two.
             public_key_thumbprint: format!("thumbprint-{}", case.account_id),
+            // The account key itself, as the canonical JWK that thumbprint is the digest
+            // of. No request in this suite verifies a signature under it (the ACME data
+            // plane's own suite does that); what matters here is that each account
+            // carries its own.
+            public_key_jwk: json!({
+                "crv": "P-256",
+                "kty": "EC",
+                "x": format!("x-{}", case.account_id),
+                "y": format!("y-{}", case.account_id),
+            })
+            .to_string(),
             status: case.status.to_string(),
             acme_external_account_binding_arn: case.with_binding.then(|| {
                 format!("{endpoint_arn}/acme-external-account-binding/{}", case.account_id)
@@ -562,11 +573,95 @@ async fn a_next_token_is_bound_to_the_endpoint_that_issued_it() {
             "ValidationException",
             "case {case:?}: expected ValidationException, got {response}"
         );
-        assert_eq!(
-            error_message(&response),
-            state::INVALID_NEXT_TOKEN_MESSAGE,
-            "case {case:?}: expected this service's invalid-token sentence, got {response}"
+        // The fixed text and the operation are the requirement for every row; the
+        // schema number each token yields is pinned row by row in
+        // `an_unreadable_next_token_is_refused_with_the_pagination_token_sentence`,
+        // because the token one of these rows carries is issued per run.
+        let message = error_message(&response);
+        assert!(
+            message.starts_with(
+                "Pagination token exception in operation 'ListAcmeAccounts': invalid payload \
+                 wrapping schema "
+            ),
+            "case {case:?}: expected the pagination-token sentence, got {message:?}"
         );
+        assert!(
+            !message.contains(&token),
+            "case {case:?}: the refusal must not echo the opaque token back, got {message:?}"
+        );
+    }
+}
+
+/// RULE: an unreadable `NextToken` is refused with the AWS pagination framework's own
+/// sentence — fixed text around two variable parts, the operation the token was presented
+/// to and the wrapping schema the token's own payload carries (the first 16 bits of its
+/// base64url-decoded octets, read as a big-endian signed integer).
+///
+/// The rows differ along the token, and each states the number its own bytes carry,
+/// worked out from the base64url alphabet rather than read back out of the service: an
+/// all-`A` token decodes to zero octets of payload, and the others to their own. The same
+/// token is presented to every ACME read of this service, so one rule answers all of
+/// them.
+#[tokio::test]
+async fn an_unreadable_next_token_is_refused_with_the_pagination_token_sentence() {
+    let (router, engine) = router_with_engine();
+    let endpoint_arn = create_endpoint(&router, "pagination token sentence").await;
+    register_accounts(&engine, &endpoint_arn, &account_cases());
+
+    // (the token a caller presents, the 16-bit schema its base64url payload begins with)
+    let rows: &[(&str, i32)] = &[
+        // "AAAA" decodes to three zero octets.
+        ("AAAA", 0),
+        // "foo" -> 0x7E 0x8A.
+        ("foo", 32394),
+        // "zzzz" -> 0xCF 0x3C.
+        ("zzzz", -12484),
+        // "not-a-real-pagination-token" -> 0x9E 0x8B.
+        ("not-a-real-pagination-token", -24949),
+        // "1f" (the hex of one control character) -> 0xD5, then the zero bits a group
+        // shorter than four characters is read as if padded with.
+        ("1f", -10768),
+    ];
+    // Every ACME read of this service pages with the same token form, so each is held to
+    // the same sentence — with its OWN name in it.
+    let operations = [
+        ("ListAcmeAccounts", json!({ "AcmeEndpointArn": endpoint_arn })),
+        (
+            "ListAcmeDomainValidations",
+            json!({ "AcmeEndpointArn": endpoint_arn }),
+        ),
+        (
+            "ListAcmeExternalAccountBindings",
+            json!({ "AcmeEndpointArn": endpoint_arn }),
+        ),
+        ("ListAcmeEndpoints", json!({})),
+    ];
+    for (operation, body) in operations {
+        for (token, schema) in rows {
+            let case = format!("{operation} with NextToken={token:?}");
+            let mut body = body.clone();
+            body["NextToken"] = json!(token);
+            let (status, response) = call(&router, operation, &body).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a token this service did not issue must be refused, \
+                 got {status} {response}"
+            );
+            assert_eq!(
+                error_code(&response),
+                "ValidationException",
+                "case {case:?}: expected ValidationException, got {response}"
+            );
+            assert_eq!(
+                error_message(&response),
+                format!(
+                    "Pagination token exception in operation '{operation}': invalid payload \
+                     wrapping schema {schema}"
+                ),
+                "case {case:?}: expected the pagination-token sentence for this token, \
+                 got {response}"
+            );
+        }
     }
 }
 

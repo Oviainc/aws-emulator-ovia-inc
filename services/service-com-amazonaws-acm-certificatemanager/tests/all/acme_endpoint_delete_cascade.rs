@@ -198,6 +198,15 @@ fn register_accounts(
             // A JWK thumbprint is base64url text (RFC 7638 §3); what matters here is
             // that each account carries its own, so two cannot be confused.
             public_key_thumbprint: format!("thumbprint-{label}-{nth}"),
+            // The account key that thumbprint is the digest of; nothing here verifies a
+            // signature under it, so what matters is that each account carries its own.
+            public_key_jwk: json!({
+                "crv": "P-256",
+                "kty": "EC",
+                "x": format!("x-{label}-{nth}"),
+                "y": format!("y-{label}-{nth}"),
+            })
+            .to_string(),
             status: ACCOUNT_STATUSES[nth % ACCOUNT_STATUSES.len()].to_string(),
             acme_external_account_binding_arn: binding_arn.map(str::to_string),
             contacts: vec![format!("mailto:{label}-{nth}@example.com")],

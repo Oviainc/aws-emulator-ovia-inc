@@ -11,9 +11,12 @@
 //! RULE 2: a URL this service advertises is a URL it SERVES. A plain `GET` of the
 //! `EndpointUrl` of an `ACTIVE` endpoint answers the RFC 8555 §7.1.1 directory
 //! resource, whose members are absolute URLs under that same endpoint's base; the
-//! `newNonce` resource answers a fresh anti-replay nonce (§7.2); an interaction this
-//! emulator cannot perform answers an ACME problem document rather than a success; and
-//! a URL no `ACTIVE` endpoint backs answers nothing at all.
+//! `newNonce` resource answers a fresh anti-replay nonce (§7.2); a JWS resource answers
+//! an ACME problem document rather than a success for a request that is not one it can
+//! serve — an interaction this emulator performs no work for whatever the body says, and
+//! a client error for one it does (the registration wire itself is
+//! [`crate::acme_account_registration`]); and a URL no `ACTIVE` endpoint backs answers
+//! nothing at all.
 //!
 //! Every assertion goes through [`MultiServiceRouter::dispatch`], the same path the
 //! emulator serves production traffic on, and every URL fetched is one a DIFFERENT
@@ -411,9 +414,16 @@ async fn new_nonce_answers_a_fresh_nonce_per_request() {
     }
 }
 
-/// RULE 2: an ACME interaction this emulator cannot perform is refused with an ACME
-/// problem document — `501`, never a success — and a method a resource is not addressed
-/// with is refused `405` naming the method it is.
+/// RULE 2: a JWS resource is refused with an ACME problem document — never a success —
+/// and a method a resource is not addressed with is refused `405` naming the method it
+/// is.
+///
+/// The rows differ along WHY the request is refused, which is what the two classes of JWS
+/// resource have in common and where they differ: an interaction this emulator performs
+/// no work for is `501` whatever the body says, while an interaction it DOES serve
+/// (`newAccount` and an account's own URL, exercised in full by
+/// [`crate::acme_account_registration`]) reads the body first, so a `POST` carrying no
+/// JWS at all is the client error it is.
 #[tokio::test]
 async fn unimplemented_acme_interactions_answer_problem_documents() {
     let (router, engine) = router_with_engine();
@@ -428,27 +438,32 @@ async fn unimplemented_acme_interactions_answer_problem_documents() {
     let directory = body_json("jws resources", &fetch(&router, "jws", "GET", &url).await);
 
     // The table: every resource the directory names that is reached with a JWS POST,
-    // plus an account's own URL, which is reached the same way.
-    let mut targets: Vec<String> = DIRECTORY_MEMBERS
+    // plus an account's own URL, which is reached the same way, beside the status a
+    // bodyless POST to each is refused with.
+    let mut targets: Vec<(String, u16)> = DIRECTORY_MEMBERS
         .iter()
         .filter(|(member, _)| *member != "newNonce")
         .map(|(member, _)| {
-            directory[*member]
+            let target = directory[*member]
                 .as_str()
                 .unwrap_or_else(|| panic!("no {member} in {directory}"))
-                .to_string()
+                .to_string();
+            // `newAccount` is served, so its refusal is about the request; the others are
+            // interactions nothing performs.
+            let refusal = if *member == "newAccount" { 400 } else { 501 };
+            (target, refusal)
         })
         .collect();
-    targets.push(format!("{base}/acct/1"));
+    targets.push((format!("{base}/acct/1"), 400));
 
-    for target in &targets {
+    for (target, expected) in &targets {
         let case = format!("POST {target}");
         let response = fetch(&router, &case, "POST", target).await;
         let status = response.status().as_u16();
         let document = body_json(&case, &response);
         assert_eq!(
-            status, 501,
-            "case {case:?}: an interaction nothing performs must not succeed, got {status} {document}"
+            status, *expected,
+            "case {case:?}: a bodyless POST must not succeed, got {status} {document}"
         );
         assert_eq!(
             header(&response, "content-type"),

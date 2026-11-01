@@ -495,6 +495,16 @@ async fn deleting_a_binding_leaves_the_accounts_it_registered_standing() {
                     acme_endpoint_arn: endpoint_arn.clone(),
                     account_url: state::acme_account_url(REGION, &endpoint_id, &account_id),
                     public_key_thumbprint: format!("thumbprint-{account_id}"),
+                    // The account key that thumbprint is the digest of; nothing here
+                    // verifies a signature under it, so what matters is that each account
+                    // carries its own.
+                    public_key_jwk: json!({
+                        "crv": "P-256",
+                        "kty": "EC",
+                        "x": format!("x-{account_id}"),
+                        "y": format!("y-{account_id}"),
+                    })
+                    .to_string(),
                     status: state::ACME_ACCOUNT_STATUS_VALID.to_string(),
                     acme_external_account_binding_arn: Some(binding_arn.clone()),
                     contacts: vec![format!("mailto:{account_id}@example.com")],

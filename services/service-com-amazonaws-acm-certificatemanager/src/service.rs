@@ -69,11 +69,13 @@
 //!   published URL — the same verification a control-plane request gets, rather than a
 //!   second signature check written into this service.
 //!
-//! What is served on that surface — the RFC 8555 directory, a fresh nonce, and a `501`
-//! problem document for the JWS interactions this emulator cannot perform — is
-//! documented in [`acme_http`].
+//! What is served on that surface — the RFC 8555 directory, a fresh nonce, the
+//! `newAccount` registration and an account's own resource, and a `501` problem document
+//! for the JWS interactions this emulator cannot perform — is documented in
+//! [`acme_http`]; the envelope those interactions arrive in is read by [`acme_jws`].
 
 pub mod acme_http;
+pub mod acme_jws;
 pub mod authorization;
 
 use smithy_server_runtime::{

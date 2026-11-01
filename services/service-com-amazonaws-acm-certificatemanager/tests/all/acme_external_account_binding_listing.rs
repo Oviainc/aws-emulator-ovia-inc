@@ -483,10 +483,13 @@ async fn a_next_token_is_bound_to_the_endpoint_that_issued_it() {
             "ValidationException",
             "case {case:?}: expected ValidationException, got {response}"
         );
-        assert_eq!(
-            error_message(&response),
-            state::INVALID_NEXT_TOKEN_MESSAGE,
-            "case {case:?}: expected this service's invalid-token sentence, got {response}"
+        let message = error_message(&response);
+        assert!(
+            message.starts_with(
+                "Pagination token exception in operation 'ListAcmeExternalAccountBindings': \
+                 invalid payload wrapping schema "
+            ),
+            "case {case:?}: expected the pagination-token sentence, got {message:?}"
         );
     }
 }

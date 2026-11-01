@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeAcmeAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeAcmeAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeAcmeAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the ACME account the (`AcmeEndpointArn`, `AccountUrl`) pair
+//! addresses to the terminal `REVOKED` status, which is what "prevent[s] it from
+//! requesting or revoking certificates" — the endpoint's ACME data plane refuses every
+//! later JWS that account signs (`crate::service::acme_http`). `@idempotent`, and the
+//! revocation "is irreversible", so repeating the call leaves the account exactly as the
+//! first one left it rather than conflicting. An ARN naming another account is
+//! `ValidationException`; an ARN no stored endpoint answers to, and an account URL that
+//! endpoint holds no account under, are each `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +168,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeAcmeAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeAcmeAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeAcmeAccount"))
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service looking at the resource, so a caller whose identity-based policies do
+        // not allow the action is refused without being told anything about the resource,
+        // and nothing is revoked.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.acme_endpoint_arn,
+        )
+        .map_err(RevokeAcmeAccountErrorModeled::AccessDeniedException)?;
+
+        // The account segment of the ARN is INPUT this operation validates: a caller
+        // addresses only their own account's resources, so an ARN carrying another
+        // account's id names nothing they could revoke — decided before the store is
+        // consulted at all.
+        if !crate::state::arn_is_in_caller_account(&input.acme_endpoint_arn) {
+            return Err(RevokeAcmeAccountErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::cross_account_arn_refusal()),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(RevokeAcmeAccountErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the acm acme account store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // The account is revoked ON an endpoint, so an ARN this account holds no endpoint
+        // for is a missing resource rather than a missing account.
+        if !store.acme_endpoints.contains_key(&input.acme_endpoint_arn) {
+            return Err(RevokeAcmeAccountErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::acme_endpoint_not_found_message(
+                        &input.acme_endpoint_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(account) =
+            store.acme_account_for_mut(&input.acme_endpoint_arn, &input.account_url)
+        else {
+            return Err(RevokeAcmeAccountErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::acme_account_not_found_message(
+                        &input.account_url,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "This operation is irreversible" (`RevokeAcmeAccount` doc) and the operation is
+        // `@idempotent`: `REVOKED` is the status the account carries from the first call
+        // on, so a repeat — or a call on an account its own client had already
+        // deactivated — asks for the state the record reaches here and is no conflict.
+        account.status = crate::state::ACME_ACCOUNT_STATUS_REVOKED.to_string();
+
+        Ok(RevokeAcmeAccountOutput)
     }
 }
