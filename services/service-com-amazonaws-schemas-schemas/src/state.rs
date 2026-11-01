@@ -2284,9 +2284,9 @@ pub const CLOUD_TRAIL_EVENT_FAMILY: &[(&str, &str)] = &[
 ///
 /// * it constrains the record's members but marks none of them required — CloudTrail
 ///   fills a member only for the records it applies to;
-/// * the record's nested structures (a resource of `resources`, the `tlsDetails` and
-///   the `userIdentity`) are declared INLINE, so the document carries no component
-///   beside the event's own;
+/// * the record's nested structures (a resource of `resources`, the `tlsDetails`, the
+///   `userIdentity` and the structures nested in that identity) are declared INLINE, so
+///   the document carries no component beside the event's own;
 /// * the four free-form members of a record — `addendum`, `additionalEventData`,
 ///   `requestParameters` and `responseElements`, whose contents are the called API's
 ///   rather than CloudTrail's — are marked `nullable`, OpenAPI 3.0's way of saying the
@@ -2294,9 +2294,15 @@ pub const CLOUD_TRAIL_EVENT_FAMILY: &[(&str, &str)] = &[
 ///   union. The document marks nothing else nullable: a member of a declared shape is
 ///   either written or absent;
 /// * a member whose own members the published document does not declare (the
-///   edge-device and event contexts, the session context, the identity an
-///   `inScopeOf`/`invokedByDelegate` names) is constrained to be an object and no
-///   further;
+///   edge-device and event contexts, the identity an `inScopeOf`/`invokedByDelegate`
+///   names, the provider attributes of a web-identity federation) is constrained to be
+///   an object and no further;
+/// * the session a temporary credential belongs to (`userIdentity.sessionContext`) is a
+///   nested structure like the others, so it is declared inline WITH its own members —
+///   the root-session marker, the session's attributes, the EC2 role-delivery version,
+///   the entity that issued the session, the source identity it carries and its
+///   web-identity federation data (CloudTrail User Guide, "CloudTrail userIdentity
+///   element");
 /// * `eventTime` carries both the `date-time` format and the `yyyy-MM-dd'T'HH:mm:ss'Z'`
 ///   pattern the record writes it in, which is what a generated binding parses it with.
 ///
@@ -2372,7 +2378,38 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
             }
           },
           "principalId": {"type": "string"},
-          "sessionContext": {"type": "object"}
+          "sessionContext": {
+            "type": "object",
+            "properties": {
+              "assumedRoot": {"type": "string"},
+              "attributes": {
+                "type": "object",
+                "properties": {
+                  "creationDate": {"type": "string"},
+                  "mfaAuthenticated": {"type": "string"}
+                }
+              },
+              "ec2RoleDelivery": {"type": "string"},
+              "sessionIssuer": {
+                "type": "object",
+                "properties": {
+                  "accountId": {"type": "string"},
+                  "arn": {"type": "string"},
+                  "principalId": {"type": "string"},
+                  "type": {"type": "string"},
+                  "userName": {"type": "string"}
+                }
+              },
+              "sourceIdentity": {"type": "string"},
+              "webIdFederationData": {
+                "type": "object",
+                "properties": {
+                  "attributes": {"type": "object"},
+                  "federatedProvider": {"type": "string"}
+                }
+              }
+            }
+          }
         }
       }
     }

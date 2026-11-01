@@ -709,6 +709,234 @@ async fn the_export_orders_member_names_without_regard_to_case() {
     }
 }
 
+/// The members the published document declares for the session a temporary credential
+/// belongs to (`userIdentity.sessionContext`), in the order it writes them, each with the
+/// type it declares.
+///
+/// Source: the session block of a CloudTrail record's identity (CloudTrail User Guide,
+/// "CloudTrail userIdentity element"), which the published document declares inline like
+/// the record's other nested structures — a recorded `ExportSchema` of a
+/// CloudTrail-delivered catalogue entry renders its first member as
+/// `"assumedRoot":{"type":"string"}`.
+const PUBLISHED_SESSION_MEMBERS: &[(&str, &str)] = &[
+    ("assumedRoot", "string"),
+    ("attributes", "object"),
+    ("ec2RoleDelivery", "string"),
+    ("sessionIssuer", "object"),
+    ("sourceIdentity", "string"),
+    ("webIdFederationData", "object"),
+];
+
+/// The members the published document declares for each structure nested in that session
+/// block, in the order it writes them. Source: the same identity element — the session's
+/// own attributes, the entity that issued it and the data of a web-identity federation.
+const PUBLISHED_SESSION_STRUCTURES: &[(&str, &[&str])] = &[
+    ("attributes", &["creationDate", "mfaAuthenticated"]),
+    (
+        "sessionIssuer",
+        &["accountId", "arn", "principalId", "type", "userName"],
+    ),
+    ("webIdFederationData", &["attributes", "federatedProvider"]),
+];
+
+/// The node `path` names in `node`, or a panic naming the case and the path.
+fn at<'a>(case: &str, node: &'a JsonNode, path: &[&str]) -> &'a JsonNode {
+    let mut walked = node;
+    for step in path {
+        walked = walked.member(step).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the document must declare {} (at {step:?}), got {:?}",
+                path.join("."),
+                member_names(walked)
+            )
+        });
+    }
+    walked
+}
+
+/// The `member_names` of `node`, as owned strings — the expectation an assertion compares
+/// a declared member list against.
+fn owned(members: &[&str]) -> Vec<String> {
+    members.iter().map(|member| (*member).to_string()).collect()
+}
+
+/// `members` in the order the draft-04 export renders them: by name, without regard to
+/// case.
+fn in_name_order(members: &[&str]) -> Vec<String> {
+    let mut ordered = owned(members);
+    ordered.sort_by_key(|member| (member.to_lowercase(), member.clone()));
+    ordered
+}
+
+/// RULE: a nested structure of the record a published document describes is declared
+/// INLINE with its own members — which holds for the session a temporary credential was
+/// issued for exactly as it does for the record's other nested structures, so a client
+/// that generates a binding or validates a delivered event from either read path
+/// constrains the session's members too, and only a structure whose members the published
+/// document states nowhere (the attributes an external identity provider supplies) is an
+/// object and no further.
+#[tokio::test]
+async fn a_cloud_trail_document_declares_the_session_a_credential_belongs_to() {
+    let emulator = Emulator::new();
+
+    // Rows: the whole CloudTrail-delivered family, published by four sources — three of
+    // which no issue cited. The `detail` of every one of them is the same record, so the
+    // session block is declared identically whichever source published it and whichever
+    // kind of record it is.
+    let sources = ["aws.events", "aws.s3", "aws.amazon.connect", "aws.xray"];
+    for source in sources {
+        for (_, event_name) in CLOUD_TRAIL_EVENT_FAMILY {
+            let name = format!("{source}@{event_name}");
+
+            // The describe path: the document the catalogue holds.
+            let described = emulator
+                .call("GET", &schema_uri(AWS_MANAGED_REGISTRY, &name), None)
+                .await;
+            assert_eq!(
+                described.status, 200,
+                "case {name:?}: expected 200, got {} {:?}",
+                described.status, described.body
+            );
+            let content = described.str_at("Content");
+            let document = ordered_document(&name, &content);
+            let session = at(
+                &name,
+                &document,
+                &[
+                    "components",
+                    "schemas",
+                    event_name,
+                    "properties",
+                    "userIdentity",
+                    "properties",
+                    "sessionContext",
+                ],
+            );
+            assert_eq!(
+                member_names(session),
+                vec!["type", "properties"],
+                "case {name:?}: the session block declares its type before its members, \
+                 got {content}"
+            );
+            assert_eq!(
+                session.member("type"),
+                Some(&JsonNode::text("object")),
+                "case {name:?}: the session block is an object, got {session:?}"
+            );
+            let declared = member_names(at(&name, session, &["properties"]));
+            let expected: Vec<String> = PUBLISHED_SESSION_MEMBERS
+                .iter()
+                .map(|(member, _)| (*member).to_string())
+                .collect();
+            assert_eq!(
+                declared, expected,
+                "case {name:?}: the published session members, got {declared:?}"
+            );
+            for (member, declared_type) in PUBLISHED_SESSION_MEMBERS {
+                let node = at(&name, session, &["properties", member]);
+                assert_eq!(
+                    node.member("type"),
+                    Some(&JsonNode::text(declared_type)),
+                    "case {name:?}: sessionContext.{member} is declared {declared_type:?}, \
+                     got {node:?}"
+                );
+            }
+            for (structure, members) in PUBLISHED_SESSION_STRUCTURES {
+                let nested = at(&name, session, &["properties", structure, "properties"]);
+                assert_eq!(
+                    member_names(nested),
+                    owned(members),
+                    "case {name:?}: sessionContext.{structure} declares the record's members, \
+                     got {:?}",
+                    member_names(nested)
+                );
+            }
+            // The attributes an external identity provider supplies are the provider's
+            // own, so the published document constrains them to be an object and no
+            // further — the one structure of the session block declared without members.
+            let provider_attributes = at(
+                &name,
+                session,
+                &["properties", "webIdFederationData", "properties", "attributes"],
+            );
+            assert_eq!(
+                member_names(provider_attributes),
+                vec!["type"],
+                "case {name:?}: the federation attributes are an object and no further, \
+                 got {provider_attributes:?}"
+            );
+
+            // The export path: the draft-04 rendering of that same document, which keeps
+            // every declared member and renders each schema's names in name order.
+            let exported = emulator
+                .call(
+                    "GET",
+                    &export_uri(AWS_MANAGED_REGISTRY, &name, "JSONSchemaDraft4"),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                exported.status, 200,
+                "case {name:?}: expected 200 from the export, got {} {:?}",
+                exported.status, exported.body
+            );
+            let export_content = exported.str_at("Content");
+            let converted = ordered_document(&name, &export_content);
+            let exported_session = at(
+                &name,
+                &converted,
+                &[
+                    "definitions",
+                    event_name,
+                    "properties",
+                    "userIdentity",
+                    "properties",
+                    "sessionContext",
+                ],
+            );
+            assert_eq!(
+                member_names(exported_session),
+                vec!["properties", "type"],
+                "case {name:?}: the export renders the session block in name order, \
+                 got {export_content}"
+            );
+            let session_members: Vec<&str> = PUBLISHED_SESSION_MEMBERS
+                .iter()
+                .map(|(member, _)| *member)
+                .collect();
+            let exported_members = member_names(at(&name, exported_session, &["properties"]));
+            assert_eq!(
+                exported_members,
+                in_name_order(&session_members),
+                "case {name:?}: the export carries every session member, got {exported_members:?}"
+            );
+            for (member, declared_type) in PUBLISHED_SESSION_MEMBERS {
+                let node = at(&name, exported_session, &["properties", member]);
+                assert_eq!(
+                    node.member("type"),
+                    Some(&JsonNode::text(declared_type)),
+                    "case {name:?}: the export declares sessionContext.{member} \
+                     {declared_type:?}, got {node:?}"
+                );
+            }
+            for (structure, members) in PUBLISHED_SESSION_STRUCTURES {
+                let nested = at(
+                    &name,
+                    exported_session,
+                    &["properties", structure, "properties"],
+                );
+                assert_eq!(
+                    member_names(nested),
+                    in_name_order(members),
+                    "case {name:?}: the export carries sessionContext.{structure}'s members, \
+                     got {:?}",
+                    member_names(nested)
+                );
+            }
+        }
+    }
+}
+
 /// RULE (an invariant over the whole catalogue): every entry the catalogue publishes is
 /// served as a published document and exports to a published draft-04 rendering — not
 /// only the entries a case names.
