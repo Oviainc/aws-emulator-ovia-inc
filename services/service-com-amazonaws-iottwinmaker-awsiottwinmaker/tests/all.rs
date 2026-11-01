@@ -83,6 +83,9 @@ mod composite_component_stranded_declaration;
 #[path = "all/create_entity_untyped_definition_order.rs"]
 mod create_entity_untyped_definition_order;
 
+#[path = "all/cross_region_page_token.rs"]
+mod cross_region_page_token;
+
 #[path = "all/entity_component_type_filter.rs"]
 mod entity_component_type_filter;
 

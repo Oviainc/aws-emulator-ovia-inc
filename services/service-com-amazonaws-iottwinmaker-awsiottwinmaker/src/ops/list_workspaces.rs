@@ -16,7 +16,9 @@
 //! serves more than [`crate::state::MAX_PAGE_SIZE`] rows whatever is asked for.
 //! The opaque `nextToken` resumes the listing at the next `workspaceId` rather
 //! than at an offset, so a page boundary survives a workspace being created or
-//! deleted between two pages; a token this listing did not mint is refused with
+//! deleted between two pages; it is bound to the Region it was minted in, since
+//! each Region holds its own independent set of workspaces, so a token this
+//! listing did not mint in the Region the request is signed for is refused with
 //! the `ValidationException` (HTTP 400) the operation models, since it declares
 //! no other client error for a malformed input.
 //!
@@ -181,11 +183,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` carries the `workspaceId` the page resumes AT
         // (inclusive), not an offset, so a page boundary survives a workspace
-        // being created or deleted between two pages.
+        // being created or deleted between two pages. It is bound to the Region
+        // it was minted in, which is the Region whose own store the walk below
+        // is positioned in, so a token minted at another Region's endpoint is
+        // refused rather than silently resumed past this Region's workspaces
+        // that sort before its key.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                decode_next_token(token)
+                decode_next_token(token, &region)
                     .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
@@ -236,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // over. Absent on the last page, which is how a caller knows to stop.
         let next_token = remaining
             .next()
-            .map(|workspace| encode_next_token(&workspace.workspace_id));
+            .map(|workspace| encode_next_token(&region, &workspace.workspace_id));
 
         Ok(ListWorkspacesOutput {
             // Present, not omitted, for an account holding no workspaces: the
@@ -252,17 +258,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The envelope a `nextToken` of this listing carries, so a token minted
 /// elsewhere — by another listing of this service, or by hand — is recognisably
 /// not one of ours. The token itself is the shape every paginated operation of
-/// this service mints ([`crate::state::encode_page_token`]); this listing is
-/// Region-wide, so unlike `ListEntities`' it is scoped to no parent resource.
+/// this service mints ([`crate::state::encode_page_token`]), bound to the Region
+/// the page was taken in; this listing is Region-wide, so unlike `ListEntities`'
+/// it is scoped to no parent resource inside that Region.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:workspaces:1:";
 
-/// The opaque `nextToken` for the page of workspaces starting at `workspace_id`.
-fn encode_next_token(workspace_id: &str) -> String {
-    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[], workspace_id)
+/// The opaque `nextToken` for the page of `region`'s workspaces starting at
+/// `workspace_id`.
+fn encode_next_token(region: &str, workspace_id: &str) -> String {
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, region, &[], workspace_id)
 }
 
-/// The workspace id inside a `nextToken`, or `None` when the token is not one
-/// this listing minted.
-fn decode_next_token(token: &str) -> Option<String> {
-    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[], token)
+/// The workspace id inside a `nextToken` minted in `region`, or `None` when the
+/// token is not one this listing minted there.
+fn decode_next_token(token: &str, region: &str) -> Option<String> {
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, region, &[], token)
 }

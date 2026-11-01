@@ -232,14 +232,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` carries the property NAME the page resumes AT
         // (inclusive), not an offset, so a page boundary survives a property
-        // being added or removed between two pages. It is bound to the
+        // being added or removed between two pages. It is bound to the Region,
         // workspace, entity and component it was minted for, so a token from
-        // another listing — or from this listing taken over another component —
-        // is refused rather than silently resumed.
+        // another listing — or from this listing taken over another component,
+        // including the independent one another Region's endpoint holds under
+        // the same ids — is refused rather than silently resumed.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                decode_next_token(&input, token)
+                decode_next_token(&input, &region, token)
                     .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
@@ -278,7 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // over. Absent on the last page, which is how a caller knows to stop.
         let next_token = remaining
             .next()
-            .map(|property_name| encode_next_token(&input, &property_name));
+            .map(|property_name| encode_next_token(&input, &region, &property_name));
 
         Ok(ListPropertiesOutput {
             property_summaries,
@@ -442,8 +443,8 @@ const _: () = assert!(crate::state::DEFAULT_PAGE_SIZE <= MODELLED_MAX_RESULTS);
 /// elsewhere — by another listing of this service, for another component, or by
 /// hand — is recognisably not one of ours. The token itself is the shape every
 /// paginated operation of this service mints
-/// ([`crate::state::encode_page_token`]), scoped to the component whose
-/// properties the page is.
+/// ([`crate::state::encode_page_token`]), scoped to the Region and the component
+/// whose properties the page is.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:properties:1:";
 
 /// The whole address of the component a page was taken over: the entity, and
@@ -460,19 +461,29 @@ fn token_scope(input: &ListPropertiesInput) -> String {
 
 /// The opaque `nextToken` for a page of one component's properties, starting at
 /// `property_name`.
-fn encode_next_token(input: &ListPropertiesInput, property_name: &str) -> String {
+fn encode_next_token(
+    input: &ListPropertiesInput,
+    region: &str,
+    property_name: &str,
+) -> String {
     crate::state::encode_page_token(
         NEXT_TOKEN_PREFIX,
+        region,
         &[&input.workspace_id, &token_scope(input)],
         property_name,
     )
 }
 
-/// The property name inside a `nextToken` minted for this component, or `None`
-/// when the token is not one this listing minted for it.
-fn decode_next_token(input: &ListPropertiesInput, token: &str) -> Option<String> {
+/// The property name inside a `nextToken` minted in `region` for this
+/// component, or `None` when the token is not one this listing minted for it.
+fn decode_next_token(
+    input: &ListPropertiesInput,
+    region: &str,
+    token: &str,
+) -> Option<String> {
     crate::state::decode_page_token(
         NEXT_TOKEN_PREFIX,
+        region,
         &[&input.workspace_id, &token_scope(input)],
         token,
     )

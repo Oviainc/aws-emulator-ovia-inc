@@ -254,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match &query {
                 Query::LatestValues(component) => {
                     return latest_values_response(
-                        workspace, component, &selected, page_size, &input,
+                        workspace, component, &selected, page_size, &region, &input,
                     )
                 }
                 Query::Table { conditions, .. } => (
@@ -293,7 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        table_response(rows, &selected, page_size, &input)
+        table_response(rows, &selected, page_size, &region, &input)
     }
 }
 
@@ -715,12 +715,13 @@ fn latest_values_response(
     component: &ScopedComponent<'_>,
     selected: &[String],
     page_size: usize,
+    region: &str,
     input: &GetPropertyValueInput,
 ) -> Result<GetPropertyValueOutput, GetPropertyValueError> {
     let resume_at = match input.next_token.as_deref() {
         None | Some("") => None,
         Some(token) => Some(
-            decode_value_token(input, token)
+            decode_value_token(input, region, token)
                 .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
         ),
     };
@@ -751,7 +752,7 @@ fn latest_values_response(
     }
     let next_token = remaining
         .next()
-        .map(|property_name| encode_value_token(input, property_name));
+        .map(|property_name| encode_value_token(input, region, property_name));
 
     Ok(GetPropertyValueOutput {
         property_values: Some(property_values),
@@ -1006,6 +1007,7 @@ fn table_response(
     rows: Vec<TableRow>,
     selected: &[String],
     page_size: usize,
+    region: &str,
     input: &GetPropertyValueInput,
 ) -> Result<GetPropertyValueOutput, GetPropertyValueError> {
     // A row has no key of its own — which rows there are and in what order is
@@ -1018,7 +1020,7 @@ fn table_response(
     let total = rows.len();
     let resume_at = match input.next_token.as_deref() {
         None | Some("") => 0,
-        Some(token) => decode_row_token(input, token)
+        Some(token) => decode_row_token(input, region, token)
             .filter(|resume_at| crate::state::ordinal_resumes_a_selected_row(*resume_at, total))
             .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
     };
@@ -1034,7 +1036,7 @@ fn table_response(
         })
         .collect();
     let served = resume_at.saturating_add(page.len());
-    let next_token = (served < total).then(|| encode_row_token(input, served));
+    let next_token = (served < total).then(|| encode_row_token(input, region, served));
 
     Ok(GetPropertyValueOutput {
         // No latest-value map: this request asked for a table.
@@ -1169,11 +1171,11 @@ const VALUE_TOKEN_PREFIX: &str = "iottwinmaker:property-values:1:";
 /// property name, and a row ordinal.
 const ROW_TOKEN_PREFIX: &str = "iottwinmaker:property-table:1:";
 
-/// What a `nextToken` is bound to besides its workspace: the members that
-/// decide WHICH properties of which components the page is of, and — for a
-/// TABULAR page — the conditions that decide which rows there are and in what
-/// order ([`conditions_scope`]), so a token is only resumed by the query that
-/// minted it.
+/// What a `nextToken` is bound to besides its Region and its workspace: the
+/// members that decide WHICH properties of which components the page is of,
+/// and — for a TABULAR page — the conditions that decide which rows there are
+/// and in what order ([`conditions_scope`]), so a token is only resumed by the
+/// query that minted it.
 ///
 /// Last of the token's scope parts ([`crate::state::encode_page_token`]), which
 /// is the one that may itself contain the separator, because the selected
@@ -1239,44 +1241,60 @@ fn conditions_scope(conditions: Option<&TabularConditions>) -> ::serde_json::Val
 
 /// The opaque `nextToken` for a latest-value page that resumes at
 /// `property_name`.
-fn encode_value_token(input: &GetPropertyValueInput, property_name: &str) -> String {
+fn encode_value_token(
+    input: &GetPropertyValueInput,
+    region: &str,
+    property_name: &str,
+) -> String {
     crate::state::encode_page_token(
         VALUE_TOKEN_PREFIX,
+        region,
         &[&input.workspace_id, &token_scope(input)],
         property_name,
     )
 }
 
 /// The property name inside a latest-value `nextToken`, or `None` when the
-/// token is not one this query minted.
-fn decode_value_token(input: &GetPropertyValueInput, token: &str) -> Option<String> {
+/// token is not one this query minted in this Region.
+fn decode_value_token(
+    input: &GetPropertyValueInput,
+    region: &str,
+    token: &str,
+) -> Option<String> {
     crate::state::decode_page_token(
         VALUE_TOKEN_PREFIX,
+        region,
         &[&input.workspace_id, &token_scope(input)],
         token,
     )
 }
 
 /// The opaque `nextToken` for a tabular page that resumes at the row `ordinal`.
-fn encode_row_token(input: &GetPropertyValueInput, ordinal: usize) -> String {
+fn encode_row_token(input: &GetPropertyValueInput, region: &str, ordinal: usize) -> String {
     crate::state::encode_ordinal_page_token(
         ROW_TOKEN_PREFIX,
+        region,
         &[&input.workspace_id, &token_scope(input)],
         ordinal,
     )
 }
 
 /// The row ordinal inside a tabular `nextToken`, or `None` when the token is not
-/// one this query minted.
+/// one this query minted in this Region.
 ///
 /// The ordinal is one of the positions [`encode_row_token`] writes
 /// ([`crate::state::decode_ordinal_page_token`]); whether the sequence this
 /// request selects still holds a row there is decided by
 /// [`crate::state::ordinal_resumes_a_selected_row`] where that sequence is in
 /// hand ([`table_response`]).
-fn decode_row_token(input: &GetPropertyValueInput, token: &str) -> Option<usize> {
+fn decode_row_token(
+    input: &GetPropertyValueInput,
+    region: &str,
+    token: &str,
+) -> Option<usize> {
     crate::state::decode_ordinal_page_token(
         ROW_TOKEN_PREFIX,
+        region,
         &[&input.workspace_id, &token_scope(input)],
         token,
     )

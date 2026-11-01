@@ -215,13 +215,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` carries the `sceneId` the page resumes AT (inclusive),
         // not an offset, so a page boundary survives a scene being created or
-        // deleted between two pages. It is bound to the workspace it was minted
-        // for, so a token from another listing — or from this listing taken over
-        // another workspace — is refused rather than silently resumed.
+        // deleted between two pages. It is bound to the Region and the workspace
+        // it was minted for, so a token from another listing — or from this
+        // listing taken over another workspace, or over the independent
+        // workspace another Region's endpoint holds under the same id — is
+        // refused rather than silently resumed.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                decode_next_token(token, &input.workspace_id)
+                decode_next_token(token, &region, &input.workspace_id)
                     .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
@@ -270,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // over. Absent on the last page, which is how a caller knows to stop.
         let next_token = remaining
             .next()
-            .map(|scene| encode_next_token(&input.workspace_id, &scene.scene_id));
+            .map(|scene| encode_next_token(&region, &input.workspace_id, &scene.scene_id));
 
         Ok(ListScenesOutput {
             // Present, not omitted, for a workspace holding no scene: the member
@@ -301,17 +303,19 @@ const _: () = assert!(crate::state::DEFAULT_PAGE_SIZE <= MODELLED_MAX_RESULTS);
 /// elsewhere — by another listing of this service, for another workspace, or by
 /// hand — is recognisably not one of ours. The token itself is the shape every
 /// paginated operation of this service mints
-/// ([`crate::state::encode_page_token`]), scoped to the workspace whose page it
-/// is.
+/// ([`crate::state::encode_page_token`]), scoped to the Region and the workspace
+/// whose page it is.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:scenes:1:";
 
-/// The opaque `nextToken` for a page of `workspace_id` starting at `scene_id`.
-fn encode_next_token(workspace_id: &str, scene_id: &str) -> String {
-    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], scene_id)
+/// The opaque `nextToken` for a page of `region`'s `workspace_id` starting at
+/// `scene_id`.
+fn encode_next_token(region: &str, workspace_id: &str, scene_id: &str) -> String {
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, region, &[workspace_id], scene_id)
 }
 
-/// The scene id inside a `nextToken` minted for `workspace_id`, or `None` when
-/// the token is not one this listing minted for that workspace.
-fn decode_next_token(token: &str, workspace_id: &str) -> Option<String> {
-    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], token)
+/// The scene id inside a `nextToken` minted in `region` for `workspace_id`, or
+/// `None` when the token is not one this listing minted for that Region's
+/// workspace.
+fn decode_next_token(token: &str, region: &str, workspace_id: &str) -> Option<String> {
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, region, &[workspace_id], token)
 }

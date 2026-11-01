@@ -247,16 +247,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // they are known here — and are reported whether or not it selected a row.
         let column_descriptions = plan.column_descriptions();
 
-        // A `nextToken` carries the row offset the page resumes at, and is bound to BOTH
-        // the workspace and the statement it was minted for: the row set is recomputed
-        // from state on every call, so resuming one query's paging inside another would
-        // report rows from a listing the caller never asked for. Only the offset's
-        // SPELLING can be judged here — whether it names a row this query selects is
-        // judged against the row set itself, below.
+        // A `nextToken` carries the row offset the page resumes at, and is bound to the
+        // Region, the workspace and the statement it was minted for: the row set is
+        // recomputed from state on every call — out of the store of the Region the request
+        // is signed for, each holding its own independent workspaces — so resuming one
+        // query's paging inside another would report rows from a listing the caller never
+        // asked for. Only the offset's SPELLING can be judged here — whether it names a
+        // row this query selects is judged against the row set itself, below.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                decode_next_token(token, &input.workspace_id, &input.query_statement)
+                decode_next_token(token, &region, &input.workspace_id, &input.query_statement)
                     .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
@@ -364,6 +365,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = (served_through < selected).then(|| {
             encode_next_token(
                 served_through,
+                &region,
                 &input.workspace_id,
                 &input.query_statement,
             )
@@ -2102,24 +2104,40 @@ fn unbind(binding: &mut Binding, slot: Option<usize>) {
 /// The envelope a `nextToken` of this operation carries, so a token minted elsewhere —
 /// by another listing, or by hand — is recognisably not one of ours. The token itself is
 /// the shape every paginated operation of this service mints
-/// ([`crate::state::encode_page_token`]), scoped to the workspace AND the statement the
-/// offset belongs to: the row set is recomputed per call, so an offset only means
-/// something for the same query. The statement goes last, where the envelope lets a scope
-/// part carry newlines of its own.
+/// ([`crate::state::encode_page_token`]), scoped to the Region, the workspace AND the
+/// statement the offset belongs to: the row set is recomputed per call, out of one
+/// Region's own store, so an offset only means something for the same query in the same
+/// Region. The statement goes last, where the envelope lets a scope part carry newlines of
+/// its own.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:query:1:";
 
 /// The opaque `nextToken` for the page of this query's rows starting at `offset`.
-fn encode_next_token(offset: usize, workspace_id: &str, statement: &str) -> String {
-    crate::state::encode_ordinal_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, statement], offset)
+fn encode_next_token(offset: usize, region: &str, workspace_id: &str, statement: &str) -> String {
+    crate::state::encode_ordinal_page_token(
+        NEXT_TOKEN_PREFIX,
+        region,
+        &[workspace_id, statement],
+        offset,
+    )
 }
 
-/// The row offset inside a `nextToken` minted for this workspace and statement, or
-/// `None` when the token is not one of ours or belongs to another query.
+/// The row offset inside a `nextToken` minted in this Region for this workspace and
+/// statement, or `None` when the token is not one of ours or belongs to another query.
 ///
 /// The offset is one of the positions [`encode_next_token`] writes
 /// ([`crate::state::decode_ordinal_page_token`]); whether it names a row this query
 /// still selects is decided against the recomputed row set
 /// ([`crate::state::ordinal_resumes_a_selected_row`]).
-fn decode_next_token(token: &str, workspace_id: &str, statement: &str) -> Option<usize> {
-    crate::state::decode_ordinal_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, statement], token)
+fn decode_next_token(
+    token: &str,
+    region: &str,
+    workspace_id: &str,
+    statement: &str,
+) -> Option<usize> {
+    crate::state::decode_ordinal_page_token(
+        NEXT_TOKEN_PREFIX,
+        region,
+        &[workspace_id, statement],
+        token,
+    )
 }

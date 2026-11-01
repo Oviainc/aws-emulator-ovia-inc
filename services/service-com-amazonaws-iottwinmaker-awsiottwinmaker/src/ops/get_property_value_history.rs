@@ -325,7 +325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        page(series, page_size, &input)
+        page(series, page_size, &region, &input)
     }
 }
 
@@ -1008,6 +1008,7 @@ fn selects(filters: &[ValueFilter], property_name: &str, value: &DataValue) -> b
 fn page(
     series: Vec<Series>,
     page_size: usize,
+    region: &str,
     input: &GetPropertyValueHistoryInput,
 ) -> Result<GetPropertyValueHistoryOutput, GetPropertyValueHistoryError> {
     let total: usize = series.iter().map(|one| one.values.len()).sum();
@@ -1016,7 +1017,7 @@ fn page(
     // ([`crate::state::ordinal_resumes_a_selected_row`]).
     let resume_at = match input.next_token.as_deref() {
         None | Some("") => 0,
-        Some(token) => decode_token(input, token)
+        Some(token) => decode_token(input, region, token)
             .filter(|resume_at| crate::state::ordinal_resumes_a_selected_row(*resume_at, total))
             .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
     };
@@ -1054,7 +1055,7 @@ fn page(
         });
     }
     let served = resume_at.saturating_add(taken);
-    let next_token = (served < total).then(|| encode_token(input, served));
+    let next_token = (served < total).then(|| encode_token(input, region, served));
 
     Ok(GetPropertyValueHistoryOutput {
         property_values,
@@ -1066,7 +1067,8 @@ fn page(
 /// elsewhere — for another query, or by hand — is recognisably not one of ours.
 const HISTORY_TOKEN_PREFIX: &str = "iottwinmaker:property-history:1:";
 
-/// What a `nextToken` is bound to besides its workspace: EVERY member that
+/// What a `nextToken` is bound to besides its Region and its workspace: EVERY
+/// member that
 /// decides which values of which components the page is of, so a token is only
 /// resumed by the query that minted it.
 ///
@@ -1143,25 +1145,31 @@ fn bound_key(time: Option<&str>, timestamp: Option<&::aws_smithy_types::DateTime
 }
 
 /// The opaque `nextToken` for a page that resumes at the value `ordinal`.
-fn encode_token(input: &GetPropertyValueHistoryInput, ordinal: usize) -> String {
+fn encode_token(input: &GetPropertyValueHistoryInput, region: &str, ordinal: usize) -> String {
     crate::state::encode_ordinal_page_token(
         HISTORY_TOKEN_PREFIX,
+        region,
         &[&input.workspace_id, &token_scope(input)],
         ordinal,
     )
 }
 
 /// The value ordinal inside a `nextToken`, or `None` when the token is not one
-/// this query minted.
+/// this query minted in this Region.
 ///
 /// The ordinal is one of the positions [`encode_token`] writes
 /// ([`crate::state::decode_ordinal_page_token`]); whether the sequence this
 /// request selects still holds a value there is decided by
 /// [`crate::state::ordinal_resumes_a_selected_row`] where that sequence is in
 /// hand ([`page`]).
-fn decode_token(input: &GetPropertyValueHistoryInput, token: &str) -> Option<usize> {
+fn decode_token(
+    input: &GetPropertyValueHistoryInput,
+    region: &str,
+    token: &str,
+) -> Option<usize> {
     crate::state::decode_ordinal_page_token(
         HISTORY_TOKEN_PREFIX,
+        region,
         &[&input.workspace_id, &token_scope(input)],
         token,
     )

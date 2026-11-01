@@ -194,13 +194,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` carries the tag key the page resumes AT (inclusive),
         // not an offset, so a page boundary survives a tag being added or
-        // removed between two pages. It is bound to the resource it was minted
-        // for, so a token from another listing is refused rather than silently
-        // resumed.
+        // removed between two pages. It is bound to the Region and the resource
+        // it was minted for, so a token from another listing — or from this
+        // listing taken at another Region's endpoint — is refused rather than
+        // silently resumed.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                decode_next_token(token, resource_arn)
+                decode_next_token(token, &region, resource_arn)
                     .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
@@ -230,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token the next call resumes at: the first tag this page left over.
         let next_token = remaining
             .next()
-            .map(|(key, _)| encode_next_token(resource_arn, key));
+            .map(|(key, _)| encode_next_token(&region, resource_arn, key));
 
         Ok(ListTagsForResourceOutput {
             // Present, not omitted, for a resource carrying no tags: the member
@@ -246,17 +247,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// elsewhere — for another resource, by another listing, or by hand — is
 /// recognisably not one of ours. The token itself is the shape every paginated
 /// operation of this service mints ([`crate::state::encode_page_token`]), scoped
-/// to the resource whose tags it pages.
+/// to the Region and the resource whose tags it pages.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:tags:1:";
 
-/// The opaque `nextToken` for a page of `resource_arn`'s tags starting at
-/// `tag_key`.
-fn encode_next_token(resource_arn: &str, tag_key: &str) -> String {
-    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[resource_arn], tag_key)
+/// The opaque `nextToken` for a page of `resource_arn`'s tags in `region`,
+/// starting at `tag_key`.
+fn encode_next_token(region: &str, resource_arn: &str, tag_key: &str) -> String {
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, region, &[resource_arn], tag_key)
 }
 
-/// The tag key inside a `nextToken` minted for `resource_arn`, or `None` when
-/// the token is not one this listing minted for that resource.
-fn decode_next_token(token: &str, resource_arn: &str) -> Option<String> {
-    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[resource_arn], token)
+/// The tag key inside a `nextToken` minted in `region` for `resource_arn`, or
+/// `None` when the token is not one this listing minted there for that
+/// resource.
+fn decode_next_token(token: &str, region: &str, resource_arn: &str) -> Option<String> {
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, region, &[resource_arn], token)
 }

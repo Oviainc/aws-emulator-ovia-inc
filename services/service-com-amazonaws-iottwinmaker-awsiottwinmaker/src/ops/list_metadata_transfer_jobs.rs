@@ -281,17 +281,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` carries the `metadataTransferJobId` the page resumes AT
         // (inclusive), not an offset, so a page boundary survives a job being
-        // created between two pages. It is bound to the ends the listing was
-        // taken over AND to the filters it was taken under, so a token from
-        // another listing — or from this listing taken over other ends or under
-        // other filters, whose sequence this one's resume key names no position
-        // in — is refused rather than silently resumed past the jobs the new
-        // filters select ahead of it.
+        // created between two pages. It is bound to the Region and the ends the
+        // listing was taken over AND to the filters it was taken under, so a
+        // token from another listing — or from this listing taken over other
+        // ends, over another Region's independent set of jobs, or under other
+        // filters, whose sequence this one's resume key names no position in —
+        // is refused rather than silently resumed past the jobs the new sequence
+        // holds ahead of it.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
                 decode_next_token(
                     token,
+                    &region,
                     &input.source_type,
                     &input.destination_type,
                     &filters_scope,
@@ -375,6 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Absent on the last page, which is how a caller knows to stop.
         let next_token = matching.next().map(|job| {
             encode_next_token(
+                &region,
                 &input.source_type,
                 &input.destination_type,
                 &filters_scope,
@@ -506,8 +509,8 @@ const _: () =
 /// elsewhere — by another listing of this service, over other ends of a
 /// transfer, or by hand — is recognisably not one of ours. The token itself is
 /// the shape every paginated operation of this service mints
-/// ([`crate::state::encode_page_token`]), scoped to the ends the page was taken
-/// over and to the filters that selected it.
+/// ([`crate::state::encode_page_token`]), scoped to the Region and the ends the
+/// page was taken over and to the filters that selected it.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:metadataTransferJobs:1:";
 
 /// What a request's `filters` bind a token to: each filter as the member it
@@ -532,10 +535,11 @@ fn filters_token_scope(filters: &[ListMetadataTransferJobsFilter]) -> String {
     }))
 }
 
-/// The opaque `nextToken` for a page of the jobs between `source_type` and
-/// `destination_type` taken under `filters_scope`, starting at
+/// The opaque `nextToken` for a page of `region`'s jobs between `source_type`
+/// and `destination_type` taken under `filters_scope`, starting at
 /// `metadata_transfer_job_id`.
 fn encode_next_token(
+    region: &str,
     source_type: &str,
     destination_type: &str,
     filters_scope: &str,
@@ -543,22 +547,25 @@ fn encode_next_token(
 ) -> String {
     crate::state::encode_page_token(
         NEXT_TOKEN_PREFIX,
+        region,
         &[source_type, destination_type, filters_scope],
         metadata_transfer_job_id,
     )
 }
 
-/// The job id inside a `nextToken` minted for these ends under `filters_scope`,
-/// or `None` when the token is not one this listing minted for them and those
-/// filters.
+/// The job id inside a `nextToken` minted in `region` for these ends under
+/// `filters_scope`, or `None` when the token is not one this listing minted for
+/// that Region, them and those filters.
 fn decode_next_token(
     token: &str,
+    region: &str,
     source_type: &str,
     destination_type: &str,
     filters_scope: &str,
 ) -> Option<String> {
     crate::state::decode_page_token(
         NEXT_TOKEN_PREFIX,
+        region,
         &[source_type, destination_type, filters_scope],
         token,
     )

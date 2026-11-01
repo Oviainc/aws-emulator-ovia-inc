@@ -5097,16 +5097,25 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// One shape, shared by all of them so a token means the same thing wherever it
 /// is read: hex (so the token is opaque to a caller and safe in a JSON body)
 /// over an `envelope` naming the LISTING it belongs to, the resume `key` it
-/// resumes at, and the `scope` the listing was taken in — the parent resource
-/// whose page it is, which makes a token minted for another resource, by another
-/// listing, or by hand recognisably not this listing's.
+/// resumes at, the `region` the page was taken in, and the `scope` the listing
+/// was taken in — the parent resource whose page it is, which makes a token
+/// minted for another resource, by another listing, or by hand recognisably not
+/// this listing's.
 ///
-/// The parts are separated by newlines, which the ids, ARNs and tag keys this
-/// service's listings resume at all exclude; the LAST scope part keeps any
+/// The `region` is part of what a token is bound to for the reason the scope is:
+/// this service is regional ([`request_region`]), so each Region answers out of
+/// its own store and the same id names an independent resource in each. A resume
+/// key only means something inside the ONE sequence it was taken from, and a
+/// Region's store is its own sequence, so a token carries the Region that minted
+/// it and no other Region's endpoint resumes it.
+///
+/// The parts are separated by newlines, which the Region segment
+/// ([`request_region`] admits only `[a-z0-9-]+`) and the ids, ARNs and tag keys
+/// this service's listings resume at all exclude; the LAST part keeps any
 /// newline it carries (see [`decode_page_token`]), so a scope part that is free
 /// text — a query statement — goes last.
-pub fn encode_page_token(envelope: &str, scope: &[&str], key: &str) -> String {
-    let mut body = format!("{envelope}{key}");
+pub fn encode_page_token(envelope: &str, region: &str, scope: &[&str], key: &str) -> String {
+    let mut body = format!("{envelope}{key}\n{region}");
     for part in scope {
         body.push('\n');
         body.push_str(part);
@@ -5115,18 +5124,28 @@ pub fn encode_page_token(envelope: &str, scope: &[&str], key: &str) -> String {
 }
 
 /// The resume key inside a `nextToken` [`encode_page_token`] minted for this
-/// `envelope` and `scope`, or `None` when the token is not one of them.
+/// `envelope`, `region` and `scope`, or `None` when the token is not one of
+/// them.
 ///
-/// The key is split off first and each scope part is compared in turn, so a
-/// token whose envelope, arity or scope disagrees is rejected rather than
-/// resumed; the final part absorbs the remainder, so the last scope part may
-/// itself contain newlines. A token carrying an EMPTY key is rejected too: a
-/// listing never mints one, since a page is only resumed at a row that exists.
-pub fn decode_page_token(envelope: &str, scope: &[&str], token: &str) -> Option<String> {
+/// The key is split off first, then the Region and each scope part are compared
+/// in turn, so a token whose envelope, Region, arity or scope disagrees is
+/// rejected rather than resumed; the final part absorbs the remainder, so the
+/// last scope part may itself contain newlines. A token carrying an EMPTY key is
+/// rejected too: a listing never mints one, since a page is only resumed at a
+/// row that exists.
+pub fn decode_page_token(
+    envelope: &str,
+    region: &str,
+    scope: &[&str],
+    token: &str,
+) -> Option<String> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
     let body = decoded.strip_prefix(envelope)?;
-    let mut parts = body.splitn(scope.len() + 1, '\n');
+    let mut parts = body.splitn(scope.len() + 2, '\n');
     let key = parts.next()?;
+    if parts.next()? != region {
+        return None;
+    }
     for expected in scope {
         if parts.next()? != *expected {
             return None;
@@ -5144,8 +5163,13 @@ pub fn decode_page_token(envelope: &str, scope: &[&str], token: &str) -> Option<
 /// written here in exactly one spelling (`usize::to_string`: a plain decimal,
 /// no sign and no leading zero), so [`decode_ordinal_page_token`] can tell a
 /// position this service wrote from any other spelling of the same number.
-pub fn encode_ordinal_page_token(envelope: &str, scope: &[&str], ordinal: usize) -> String {
-    encode_page_token(envelope, scope, &ordinal.to_string())
+pub fn encode_ordinal_page_token(
+    envelope: &str,
+    region: &str,
+    scope: &[&str],
+    ordinal: usize,
+) -> String {
+    encode_page_token(envelope, region, scope, &ordinal.to_string())
 }
 
 /// The row ORDINAL inside a `nextToken` [`encode_ordinal_page_token`] minted for
@@ -5161,8 +5185,13 @@ pub fn encode_ordinal_page_token(envelope: &str, scope: &[&str], ordinal: usize)
 ///
 /// The other half of the rule is [`ordinal_resumes_a_selected_row`], asked
 /// where the length of the sequence the position is read against is known.
-pub fn decode_ordinal_page_token(envelope: &str, scope: &[&str], token: &str) -> Option<usize> {
-    let key = decode_page_token(envelope, scope, token)?;
+pub fn decode_ordinal_page_token(
+    envelope: &str,
+    region: &str,
+    scope: &[&str],
+    token: &str,
+) -> Option<usize> {
+    let key = decode_page_token(envelope, region, scope, token)?;
     let ordinal: usize = key.parse().ok()?;
     (ordinal >= 1 && key == ordinal.to_string()).then_some(ordinal)
 }

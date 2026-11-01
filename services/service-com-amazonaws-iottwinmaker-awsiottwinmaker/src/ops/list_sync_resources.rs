@@ -303,18 +303,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` carries the `externalId` the page resumes AT
         // (inclusive), not an offset, so a page boundary survives the
-        // synchronised set changing between two pages. It is bound to the job it
-        // was minted over AND to the filters the page was taken under, so a
-        // token from another listing — or from this listing taken over another
-        // workspace or sync source, or under other filters, whose sequence this
-        // one's resume key names no position in — is refused rather than
-        // silently resumed past the resources the new filters select ahead of
-        // it.
+        // synchronised set changing between two pages. It is bound to the Region
+        // and the job it was minted over AND to the filters the page was taken
+        // under, so a token from another listing — or from this listing taken
+        // over another workspace or sync source, over the independent job
+        // another Region's endpoint holds under the same ids, or under other
+        // filters, whose sequence this one's resume key names no position in —
+        // is refused rather than silently resumed past the resources the new
+        // sequence holds ahead of it.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                decode_next_token(token, &input.workspace_id, &input.sync_source, &filters_scope)
-                    .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
+                decode_next_token(
+                    token,
+                    &region,
+                    &input.workspace_id,
+                    &input.sync_source,
+                    &filters_scope,
+                )
+                .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
 
@@ -371,6 +378,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // over. Absent on the last page, which is how a caller knows to stop.
         let next_token = matching.next().map(|resource| {
             encode_next_token(
+                &region,
                 &input.workspace_id,
                 &input.sync_source,
                 &filters_scope,
@@ -517,8 +525,8 @@ const _: () = assert!(DEFAULT_PAGE_SIZE <= crate::state::MAX_PAGE_SIZE);
 /// elsewhere — by another listing of this service, over another sync job, or by
 /// hand — is recognisably not one of ours. The token itself is the shape every
 /// paginated operation of this service mints
-/// ([`crate::state::encode_page_token`]), scoped to the job whose page it is and
-/// to the filters that selected it.
+/// ([`crate::state::encode_page_token`]), scoped to the Region and the job whose
+/// page it is and to the filters that selected it.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:syncResources:1:";
 
 /// What a request's `filters` bind a token to: each filter as the member it
@@ -544,9 +552,10 @@ fn filters_token_scope(filters: &[SyncResourceFilter]) -> String {
 }
 
 /// The opaque `nextToken` for a page of the resources the sync job
-/// `workspace_id`/`sync_source` holds, taken under `filters_scope` and starting
-/// at `external_id`.
+/// `workspace_id`/`sync_source` of `region` holds, taken under `filters_scope`
+/// and starting at `external_id`.
 fn encode_next_token(
+    region: &str,
     workspace_id: &str,
     sync_source: &str,
     filters_scope: &str,
@@ -554,22 +563,25 @@ fn encode_next_token(
 ) -> String {
     crate::state::encode_page_token(
         NEXT_TOKEN_PREFIX,
+        region,
         &[workspace_id, sync_source, filters_scope],
         external_id,
     )
 }
 
-/// The external id inside a `nextToken` minted over this sync job under
-/// `filters_scope`, or `None` when the token is not one this listing minted for
-/// that job and those filters.
+/// The external id inside a `nextToken` minted in `region` over this sync job
+/// under `filters_scope`, or `None` when the token is not one this listing
+/// minted for that Region's job and those filters.
 fn decode_next_token(
     token: &str,
+    region: &str,
     workspace_id: &str,
     sync_source: &str,
     filters_scope: &str,
 ) -> Option<String> {
     crate::state::decode_page_token(
         NEXT_TOKEN_PREFIX,
+        region,
         &[workspace_id, sync_source, filters_scope],
         token,
     )

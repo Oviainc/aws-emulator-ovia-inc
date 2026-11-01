@@ -224,16 +224,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` carries the id the page resumes AT (inclusive), not an
         // offset, so a page boundary survives an entity being created or
-        // deleted between two pages. It is bound to the workspace AND the filter
-        // the page was taken under, so a token from another listing — or from
-        // this listing taken over another workspace or under another filter,
-        // whose sequence this one's resume key names no position in — is refused
-        // rather than silently resumed past the entities the new filter selects
-        // ahead of it.
+        // deleted between two pages. It is bound to the Region, the workspace
+        // AND the filter the page was taken under, so a token from another
+        // listing — or from this listing taken over another workspace, over the
+        // independent workspace another Region's endpoint holds under the same
+        // id, or under another filter, whose sequence this one's resume key
+        // names no position in — is refused rather than silently resumed past
+        // every row the new sequence holds ahead of it.
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                decode_next_token(token, &input.workspace_id, &filters_scope)
+                decode_next_token(token, &region, &input.workspace_id, &filters_scope)
                     .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
@@ -287,7 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token the next call resumes at: the first entity this page left
         // over.
         let next_token = matching.next().map(|entity| {
-            encode_next_token(&input.workspace_id, &filters_scope, &entity.entity_id)
+            encode_next_token(&region, &input.workspace_id, &filters_scope, &entity.entity_id)
         });
 
         Ok(ListEntitiesOutput {
@@ -342,8 +343,8 @@ fn matches_filter(
 /// The envelope a `nextToken` of this service carries, so a token minted
 /// elsewhere — for another workspace, or by hand — is recognisably not one of
 /// ours. The token itself is the shape every paginated operation of this service
-/// mints ([`crate::state::encode_page_token`]), scoped to the workspace whose
-/// page it is and to the filter that selected it.
+/// mints ([`crate::state::encode_page_token`]), scoped to the Region and the
+/// workspace whose page it is and to the filter that selected it.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:entities:1:";
 
 /// What the single accepted filter binds a token to: the member it filters on
@@ -372,19 +373,35 @@ fn filters_token_scope(filter: Option<&ListEntitiesFilter>) -> String {
     }))
 }
 
-/// The opaque `nextToken` for a page of `workspace_id` taken under
+/// The opaque `nextToken` for a page of `region`'s `workspace_id` taken under
 /// `filters_scope`, starting at `entity_id`.
-fn encode_next_token(workspace_id: &str, filters_scope: &str, entity_id: &str) -> String {
+fn encode_next_token(
+    region: &str,
+    workspace_id: &str,
+    filters_scope: &str,
+    entity_id: &str,
+) -> String {
     crate::state::encode_page_token(
         NEXT_TOKEN_PREFIX,
+        region,
         &[workspace_id, filters_scope],
         entity_id,
     )
 }
 
-/// The entity id inside a `nextToken` minted for `workspace_id` under
-/// `filters_scope`, or `None` when the token is not one this service minted for
-/// that workspace and that filter.
-fn decode_next_token(token: &str, workspace_id: &str, filters_scope: &str) -> Option<String> {
-    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id, filters_scope], token)
+/// The entity id inside a `nextToken` minted in `region` for `workspace_id`
+/// under `filters_scope`, or `None` when the token is not one this service
+/// minted for that Region's workspace and that filter.
+fn decode_next_token(
+    token: &str,
+    region: &str,
+    workspace_id: &str,
+    filters_scope: &str,
+) -> Option<String> {
+    crate::state::decode_page_token(
+        NEXT_TOKEN_PREFIX,
+        region,
+        &[workspace_id, filters_scope],
+        token,
+    )
 }

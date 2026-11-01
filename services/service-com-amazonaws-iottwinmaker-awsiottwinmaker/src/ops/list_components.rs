@@ -279,16 +279,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `nextToken` carries the component NAME the page resumes AT
         // (inclusive), not an offset, so a page boundary survives a component
-        // being added or removed between two pages. It is bound to the
+        // being added or removed between two pages. It is bound to the Region,
         // workspace, entity and component path it was minted for, so a token
-        // from another listing — or from this listing taken over another scope —
-        // is refused rather than silently resumed.
+        // from another listing — or from this listing taken over another scope,
+        // including the independent resources another Region's endpoint holds
+        // under the same ids — is refused rather than silently resumed.
         let scope_path = input.component_path.as_deref().unwrap_or_default();
         let resume_at = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => Some(
-                decode_next_token(token, &input.workspace_id, &input.entity_id, scope_path)
-                    .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
+                decode_next_token(
+                    token,
+                    &region,
+                    &input.workspace_id,
+                    &input.entity_id,
+                    scope_path,
+                )
+                .ok_or_else(|| invalid(crate::state::invalid_next_token_message()))?,
             ),
         };
 
@@ -327,6 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // over. Absent on the last page, which is how a caller knows to stop.
         let next_token = remaining.next().map(|listed| {
             encode_next_token(
+                &region,
                 &input.workspace_id,
                 &input.entity_id,
                 scope_path,
@@ -456,15 +464,16 @@ const _: () = assert!(crate::state::DEFAULT_PAGE_SIZE <= MODELLED_MAX_RESULTS);
 /// elsewhere — by another listing of this service, for another entity or
 /// component path, or by hand — is recognisably not one of ours. The token
 /// itself is the shape every paginated operation of this service mints
-/// ([`crate::state::encode_page_token`]), scoped to the component-tree level
-/// whose page it is.
+/// ([`crate::state::encode_page_token`]), scoped to the Region and the
+/// component-tree level whose page it is.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:components:1:";
 
 /// The opaque `nextToken` for a page of one component-tree level, starting at
-/// `component_name`. The scope is the whole address of that level: the
-/// workspace, the entity and the `componentPath` the page was taken under (the
-/// empty string for the entity's top-level components).
+/// `component_name`. The scope is the whole address of that level: the Region,
+/// the workspace, the entity and the `componentPath` the page was taken under
+/// (the empty string for the entity's top-level components).
 fn encode_next_token(
+    region: &str,
     workspace_id: &str,
     entity_id: &str,
     component_path: &str,
@@ -472,6 +481,7 @@ fn encode_next_token(
 ) -> String {
     crate::state::encode_page_token(
         NEXT_TOKEN_PREFIX,
+        region,
         &[workspace_id, entity_id, component_path],
         component_name,
     )
@@ -481,12 +491,14 @@ fn encode_next_token(
 /// when the token is not one this listing minted for it.
 fn decode_next_token(
     token: &str,
+    region: &str,
     workspace_id: &str,
     entity_id: &str,
     component_path: &str,
 ) -> Option<String> {
     crate::state::decode_page_token(
         NEXT_TOKEN_PREFIX,
+        region,
         &[workspace_id, entity_id, component_path],
         token,
     )
