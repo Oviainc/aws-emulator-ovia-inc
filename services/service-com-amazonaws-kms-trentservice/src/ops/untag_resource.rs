@@ -193,13 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::KeyRefMut::UnauthorizedAccount => {
                 return Err(crate::state::unauthorized_account(Self::NAME));
             }
-            crate::state::KeyRefMut::MalformedArn => {
-                return Err(UntagResourceErrorModeled::InvalidArnException(InvalidArnException {
-                    message: Some(crate::state::invalid_arn_message(&input.key_id)),
-                })
-                .into());
-            }
-            crate::state::KeyRefMut::NotFound => {
+            // See `tag_resource`: the tagging surface reports an identifier it cannot act
+            // on — an unreadable ARN included — as the key it names not being found.
+            crate::state::KeyRefMut::MalformedArn | crate::state::KeyRefMut::NotFound => {
                 return Err(UntagResourceErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
                 })

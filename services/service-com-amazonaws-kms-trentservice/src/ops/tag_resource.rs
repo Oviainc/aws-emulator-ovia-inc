@@ -215,13 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::KeyRefMut::UnauthorizedAccount => {
                 return Err(crate::state::unauthorized_account(Self::NAME));
             }
-            crate::state::KeyRefMut::MalformedArn => {
-                return Err(TagResourceErrorModeled::InvalidArnException(InvalidArnException {
-                    message: Some(crate::state::invalid_arn_message(&input.key_id)),
-                })
-                .into());
-            }
-            crate::state::KeyRefMut::NotFound => {
+            // The tagging surface reports an identifier it cannot act on as the key it
+            // names not being found — an ARN it cannot read as a key or alias ARN
+            // included, which is why both arms answer the same refusal. The modelled
+            // `InvalidArnException` is for an ARN inside a key POLICY, not for a `KeyId`
+            // the service could not resolve.
+            crate::state::KeyRefMut::MalformedArn | crate::state::KeyRefMut::NotFound => {
                 return Err(TagResourceErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
                 })

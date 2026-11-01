@@ -123,6 +123,8 @@ mod signature_verification;
 mod signatures;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_refusal_wording.rs"]
+mod tagging_refusal_wording;
 #[path = "all/update_custom_key_store.rs"]
 mod update_custom_key_store;
 #[path = "all/via_service_confinement.rs"]

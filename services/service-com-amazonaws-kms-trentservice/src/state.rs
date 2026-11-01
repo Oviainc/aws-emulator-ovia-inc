@@ -1017,7 +1017,7 @@ fn parse_key_identifier(id: &str) -> Result<KeyIdentifier, IdentifierRefusal> {
 }
 
 /// How a failed `KeyId` lookup is reported: by the ARN of the resource the REQUEST
-/// named.
+/// named, or — for a value that is no key identifier at all — by that value itself.
 ///
 /// A `KeyId` member accepts two kinds of thing — a key (a key id or a key ARN) and an
 /// alias (`alias/<name>` or an alias ARN) — and KMS reports a lookup that found
@@ -1038,6 +1038,12 @@ fn parse_key_identifier(id: &str) -> Result<KeyIdentifier, IdentifierRefusal> {
 /// is the Region in the ARN, not the Region of the endpoint, which is the one case
 /// that tells the two apart.
 ///
+/// AND BEFORE the ARN is built, what the identifier names: a key id KMS could have
+/// issued ([`names_a_key_id`]) names a key this endpoint could have held, so it is
+/// reported by the key ARN it would have; a value in no key-id form names no key KMS
+/// ever issued, so there is no such ARN and none is synthesised
+/// ([`invalid_key_id_message`]).
+///
 /// `region` is the Region the request was signed for, and the Region of the ARN this
 /// builds, since a KMS key is a regional resource and the same key id in another
 /// Region is a different (absent) key. The exact sentences are examples of KMS's;
@@ -1046,8 +1052,9 @@ fn parse_key_identifier(id: &str) -> Result<KeyIdentifier, IdentifierRefusal> {
 /// An identifier that is an ARN but not a KMS key or alias ARN has no resource ARN to
 /// name, so the refusal names the identifier itself, with the same `Invalid arn …`
 /// wording the Region case carries. The operations that model `InvalidArnException`
-/// answer that instead and never reach this case; `Encrypt`, `Decrypt` and
-/// `GetKeyLastUsage`, which report such an identifier as not found, do.
+/// answer that instead and never reach this case; `Encrypt`, `Decrypt`,
+/// `GetKeyLastUsage` and the tagging operations, which report such an identifier as not
+/// found, do.
 pub fn key_not_found_message(region: &str, requested: &str) -> String {
     if let Some(arn_region) = arn_region(requested) {
         if arn_region != region {
@@ -1065,6 +1072,12 @@ pub fn key_not_found_message(region: &str, requested: &str) -> String {
             }
         }
         Ok(KeyIdentifier::KeyId { key_id, scope }) => {
+            // A value that is not a key id KMS could have issued names no key it ever
+            // had, so there is no key ARN to report it by: it is reported as an invalid
+            // key id instead, echoing the identifier the request gave.
+            if !names_a_key_id(&key_id) {
+                return invalid_key_id_message(requested);
+            }
             let resource = format!("key/{key_id}");
             format!(
                 "Key '{}' does not exist",
@@ -1079,6 +1092,21 @@ pub fn key_not_found_message(region: &str, requested: &str) -> String {
     }
 }
 
+/// How KMS reports a `KeyId` that is not a key identifier at all: `Invalid keyId '<the
+/// identifier>'`, with the identifier echoed exactly as the request supplied it.
+///
+/// It is the OTHER refusal a failed `KeyId` lookup answers, beside
+/// [`key_not_found_message`]'s "Key '<key ARN>' does not exist": a well-formed key id
+/// names a key this endpoint could have held and so is reported by the key ARN it would
+/// have, while a value that is no key id ([`names_a_key_id`]) names no key KMS ever
+/// issued — there is no such ARN to build, and none is invented, so the caller sees the
+/// value it sent and nothing synthesised from it.
+///
+/// One function for the whole service, so no two operations word it differently.
+pub fn invalid_key_id_message(requested: &str) -> String {
+    format!("Invalid keyId '{requested}'")
+}
+
 /// How KMS reports an identifier it could not read as the ARN the request needed:
 /// "Invalid arn <the identifier>".
 ///
@@ -1090,6 +1118,47 @@ pub fn key_not_found_message(region: &str, requested: &str) -> String {
 /// so no two operations word it differently.
 pub fn not_a_key_arn_message(requested: &str) -> String {
     format!("Invalid arn {requested}")
+}
+
+/// Whether `key_id` has the form of a key id KMS could have issued: the hyphenated
+/// 8-4-4-4-12 hexadecimal text of a UUID for a single-Region key, and
+/// [`MULTI_REGION_KEY_ID_PREFIX`] followed by 32 hexadecimal characters for a
+/// multi-Region one — the two forms [`mint_key_id`] produces, so a value in neither is
+/// one no key of this service was ever given.
+///
+/// It is what separates the two refusals a failed `KeyId` lookup answers: a well-formed
+/// id names a key this endpoint could have held ([`key_not_found_message`]), while a value
+/// that is no key id at all is reported as an invalid one
+/// ([`invalid_key_id_message`]). The version nibble of a UUID is deliberately NOT
+/// required: KMS reads the TEXT FORM of the identifier, not which UUID version produced
+/// it. That form is checked here rather than through `uuid`'s own parse, which also
+/// accepts the hyphen-less and `urn:` spellings of the same value — forms a `KeyId` of a
+/// key this service minted never takes.
+pub fn names_a_key_id(key_id: &str) -> bool {
+    if let Some(hex) = key_id.strip_prefix(MULTI_REGION_KEY_ID_PREFIX) {
+        return hex.len() == MULTI_REGION_KEY_ID_HEX_LEN && is_hex(hex);
+    }
+    let groups: Vec<&str> = key_id.split('-').collect();
+    groups.len() == UUID_GROUP_LENGTHS.len()
+        && groups
+            .iter()
+            .zip(UUID_GROUP_LENGTHS)
+            .all(|(group, len)| group.len() == len && is_hex(group))
+}
+
+/// The lengths of the hexadecimal groups of a UUID's hyphenated text form, which is the
+/// form of a single-Region key id ([`mint_key_id`]).
+const UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// How many hexadecimal characters follow [`MULTI_REGION_KEY_ID_PREFIX`] in a
+/// multi-Region key id ([`mint_key_id`]).
+const MULTI_REGION_KEY_ID_HEX_LEN: usize = 32;
+
+/// Whether every character of `text` is a hexadecimal digit, in either case: a key id is
+/// minted in lowercase, but which case a caller sends an identifier in is not what makes
+/// it a key id.
+fn is_hex(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Whether `identifier` is the KEY ARN of a KMS key:
@@ -1238,15 +1307,30 @@ pub fn foreign_key_material<E>() -> crate::scaffolded::Scaffolded<E> {
 /// Such an identifier addresses a resource of another Region's endpoint, which this one
 /// can never serve — the same reading [`key_not_found_message`] gives it, here as a
 /// question an operation can ask before it decides which refusal that is.
+///
+/// The Region comes from the ARN's own field ([`arn_region`]), so an ARN of another Region
+/// is judged foreign whatever its resource part says: which endpoint can serve an
+/// identifier is settled before what that identifier names is read at all. That is why
+/// `Decrypt` and `ReEncrypt`, which ask this of a `KeyId` naming the key a ciphertext was
+/// sealed under, answer the key-material authorization refusal for a malformed ARN of
+/// another Region too — the endpoint cannot authorize any key of that Region, so there is
+/// nothing to report as missing.
 pub fn names_another_region(region: &str, identifier: &str) -> bool {
     arn_region(identifier).is_some_and(|arn_region| arn_region != region)
 }
 
-/// The Region segment of `identifier`, when it is a KMS key or alias ARN.
+/// The Region segment of `identifier`, when it is an ARN in this service's namespace
+/// that names a Region at all.
+///
+/// Read from the ARN's six FIELDS ([`::service_common::arn::parse`]) rather than from a
+/// resolved key or alias identifier, because which Region an ARN addresses is settled by
+/// the field itself: an ARN whose resource part names no key or alias still pins the
+/// request to the Region it carries, and that Region is what the refusal reports. A
+/// value of another vendor addresses nothing of this service's, and an ARN written for a
+/// partition-global resource names no Region, so neither reports one.
 fn arn_region(identifier: &str) -> Option<String> {
-    let parsed = parse_key_identifier(identifier).ok()?;
-    let (arn_region, _account) = parsed.scope()?;
-    Some(arn_region.to_string())
+    let arn = ::service_common::arn::parse(identifier)?;
+    (arn.vendor == ARN_SERVICE && !arn.region.is_empty()).then(|| arn.region.to_string())
 }
 
 /// The ARN a resolved identifier names: the one the request gave when it gave an ARN
@@ -4097,16 +4181,23 @@ pub fn key_spec_profile(key_spec: &str) -> Option<&'static KeySpecProfile> {
 /// A freshly minted key id.
 ///
 /// A single-Region key id is a version-4 UUID. A multi-Region key id is the form
-/// KMS gives one so a client can recognise it on sight: `mrk-` followed by 32
-/// hexadecimal characters.
+/// KMS gives one so a client can recognise it on sight:
+/// [`MULTI_REGION_KEY_ID_PREFIX`] followed by 32 hexadecimal characters.
 pub fn mint_key_id(multi_region: bool) -> String {
     let id = ::uuid::Uuid::new_v4();
     if multi_region {
-        format!("mrk-{}", id.simple())
+        format!("{MULTI_REGION_KEY_ID_PREFIX}{}", id.simple())
     } else {
         id.to_string()
     }
 }
+
+/// What a multi-Region key id begins with, which the modelled examples of such an id
+/// show: `mrk-1234abcd12ab34cd56ef1234567890ab`
+/// (`smithy_query(query="doc",shape="ReplicateKeyRequest",member="KeyId")`). One constant
+/// for the whole service, so the form that is MINTED is the form that is RECOGNISED
+/// ([`names_a_key_id`]).
+pub const MULTI_REGION_KEY_ID_PREFIX: &str = "mrk-";
 
 /// The largest number of keys this emulator's store holds.
 ///
@@ -4131,6 +4222,19 @@ pub const MAX_TAGS_PER_KEY: usize = 50;
 /// cannot fall under it, so a request that carries one is refused and nothing is
 /// stored.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// How KMS refuses a `TagList` that names one tag key twice: entirely FIXED text, which
+/// names neither the repeated key nor the position it repeats at.
+///
+/// The list as a whole is what the request got wrong — "you cannot have more than one tag
+/// on a KMS key with the same tag key"
+/// (`smithy_query(query="doc",shape="TagResourceRequest",member="Tags")`) — so a caller
+/// matching the refusal text to tell a repeated key from the other `TagException` causes
+/// reads a constant, and no request value travels in it.
+///
+/// One constant for every operation that accepts tags, reached through
+/// [`requested_tags`].
+pub const DUPLICATE_TAG_KEYS_MESSAGE: &str = "Duplicate tag keys";
 
 /// Whether `tag_key` falls under [`RESERVED_TAG_KEY_PREFIX`].
 ///
@@ -4163,8 +4267,8 @@ pub fn is_reserved_tag_key(tag_key: &str) -> bool {
 /// (`TagValueType` is `@length(0..256)`), which is why nothing here treats an empty
 /// value as absent.
 ///
-/// The sentences are this emulator's wording; what this function pins is WHICH tag
-/// lists are refused.
+/// What this function pins is WHICH tag lists are refused, and
+/// [`DUPLICATE_TAG_KEYS_MESSAGE`] how the repeated-key half of that is worded.
 pub fn requested_tags(tags: &[Tag]) -> Result<BTreeMap<String, String>, String> {
     let mut requested = BTreeMap::new();
     for tag in tags {
@@ -4179,10 +4283,7 @@ pub fn requested_tags(tags: &[Tag]) -> Result<BTreeMap<String, String>, String> 
             .insert(tag.tag_key.clone(), tag.tag_value.clone())
             .is_some()
         {
-            return Err(format!(
-                "One or more tags are not valid: the tag key {} appears more than once.",
-                tag.tag_key
-            ));
+            return Err(DUPLICATE_TAG_KEYS_MESSAGE.to_string());
         }
     }
     Ok(requested)
@@ -5986,19 +6087,39 @@ pub fn decode_retirable_grant_marker(marker: &str) -> Option<String> {
 }
 
 /// How KMS words `InvalidMarkerException`, "the marker that specifies where pagination
-/// should next begin is not valid".
+/// should next begin is not valid", on the listings whose refusal of one is recorded
+/// carrying no message.
 ///
 /// KMS refuses a marker it never issued with the error CODE alone — the refusal is
 /// recorded on the wire with no `Message` member at all — so no explanatory text is
 /// manufactured for it. What was wrong with the marker is stated in a comment at the
 /// check that refuses it, not on the wire.
 ///
-/// One function for every paginated operation of this service, so no two of them answer
-/// the same refusal with different members — which is why it is a function returning
-/// `None` rather than `None` written out at each of the seven call sites.
+/// One function for every paginated operation that answers it that way, so no two of them
+/// answer the same refusal with different members — which is why it is a function
+/// returning `None` rather than `None` written out at each call site. The TAG listing is
+/// recorded naming the token instead ([`invalid_next_marker_message`]).
 #[must_use]
 pub fn invalid_marker_message() -> Option<String> {
     None
+}
+
+/// How the TAG listing refuses a `Marker` it did not issue: by naming the token it
+/// rejected, `Invalid NextMarker: <marker>`.
+///
+/// A `Marker` "specifies where pagination should next begin"
+/// (`smithy_query(query="doc",shape="ListResourceTagsRequest",member="Marker")`), and a
+/// token this reader never minted — or one naming a tag the key no longer carries —
+/// resumes nowhere; the token is the whole of what the request got wrong, so it is the
+/// refusal's one variable part and it travels back exactly as the request supplied it.
+///
+/// It is the tagging surface's own wording: the recorded refusal of a marker by the key,
+/// alias and grant listings carries no message at all ([`invalid_marker_message`]), so
+/// each surface keeps the wording its own refusal is recorded with rather than borrowing
+/// the other's.
+#[must_use]
+pub fn invalid_next_marker_message(marker: &str) -> String {
+    format!("Invalid NextMarker: {marker}")
 }
 
 /// [`MARKER_PREFIX`], for the custom key store list, which pages over custom key

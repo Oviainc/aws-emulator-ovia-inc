@@ -35,10 +35,12 @@ use super::harness::{
 /// the key that sealed it are what `InvalidCiphertextException` reports on, and a caller
 /// presenting a ciphertext this key cannot open is told none of the three; and a
 /// `ListRetirableGrants` call carrying a marker the service never issued is recorded
-/// answering `InvalidMarkerException` with an EMPTY `Error.Message`, which is a property
-/// of the refusal envelope rather than prose, so every paginated operation answers it
-/// that way. Recorded behavior; the exception shapes' own documentation is API-reference
-/// prose.
+/// answering `InvalidMarkerException` with an EMPTY `Error.Message`, which is how the
+/// grant listings — and the key and alias listings beside them — answer it. The TAG
+/// listing is recorded naming the token it rejected instead, which
+/// `super::tagging_refusal_wording` asserts, so the rows below drive this class through a
+/// listing that words it with no message. Recorded behavior; the exception shapes' own
+/// documentation is API-reference prose.
 const WORDLESS_REFUSALS: &[&str] = &[
     "InvalidCiphertextException",
     "InvalidImportTokenException",
@@ -366,24 +368,26 @@ async fn a_scaffolded_operation_still_answers_501() {
     }
 }
 
-/// A `KeyId` lookup that found nothing names the resource the request asked for, by
-/// its ARN: an alias that resolves to no key is reported AS an alias, and a key id or
-/// key ARN as a key. An ARN pinned to ANOTHER Region is reported by naming that
-/// Region, because no endpoint of this one can serve it.
+/// A `KeyId` lookup that found nothing names the resource the request asked for: an alias
+/// that resolves to no key is reported AS an alias and a key as a key, each by its ARN —
+/// while a value that is no key identifier at all has no ARN to be named by and is
+/// reported as the invalid key id it is. An ARN pinned to ANOTHER Region is reported by
+/// naming that Region, because no endpoint of this one can serve it.
 ///
 /// The rows differ in the form of the identifier (bare name and ARN), in the alias
 /// name (the characters `AliasNameType`'s `^[a-zA-Z0-9:/_-]+$` pattern allows:
 /// letters, digits, `/`, `_`, `-`, `:`), in the Region the request is signed for, and
 /// in the kind of identifier (alias versus key), and cover every operation that
-/// resolves a `KeyId` and models `NotFoundException`.
+/// resolves a `KeyId` and models `NotFoundException`. The key-id FORMS that are not key
+/// identifiers at all are `super::tagging_refusal_wording`'s table.
 #[tokio::test]
 async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
     let router = router();
     let account = engine::emulator_account_id();
 
-    // Rows: the case, the Region signed for, the identifier, and the message
-    // expected. An alias ARN in the request is reported verbatim; a bare
-    // `alias/<name>` is reported as the alias ARN of the endpoint it was sent to.
+    // Rows: the case, the Region signed for, the identifier, and the message expected. An
+    // alias ARN in the request is reported verbatim; a bare `alias/<name>` is reported as
+    // the alias ARN of the endpoint it was sent to.
     let mut cases: Vec<(String, &str, String, String)> = Vec::new();
     for (region, name) in [
         (REGION, "no-such-alias"),

@@ -434,13 +434,15 @@ async fn a_key_policy_must_reach_the_caller_whatever_the_identity_policy_says() 
             "case {case:?}: ListAliases is gated by the identity policy whatever the key \
              policy says, got {status} with {payload}"
         );
+        // The sentence travels in `Message`: an authorization failure is answered by
+        // AWS's authorization layer, not by a modelled KMS error, and that is the member
+        // name it uses.
         assert_eq!(
-            payload["message"],
-            json!(no_identity_policy(
-                &identity_arn,
-                "kms:ListAliases",
-                &service_wildcard(REGION)
-            )),
+            payload["Message"].as_str(),
+            Some(
+                no_identity_policy(&identity_arn, "kms:ListAliases", &service_wildcard(REGION))
+                    .as_str()
+            ),
             "case {case:?}: the listing refusal names the service wildcard ARN, got {payload}"
         );
     }

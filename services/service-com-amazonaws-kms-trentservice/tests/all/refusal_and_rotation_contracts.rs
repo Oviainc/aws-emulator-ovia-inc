@@ -11,7 +11,8 @@
 //!   anything else is refused `InvalidArnException` (HTTP 400) rather than answered, so a
 //!   malformed principal is never indistinguishable from one that holds nothing.
 //! * **R2** — a `Marker` the service never issued is refused `InvalidMarkerException`
-//!   (HTTP 400) carrying NO message member at all, on every paginated operation.
+//!   (HTTP 400) carrying NO message member at all on every paginated operation but the TAG
+//!   listing, whose recorded refusal names the token it rejected.
 //! * **R3** — an on-demand rotation is OBSERVABLE: `GetKeyRotationStatus` reports the
 //!   instant it was initiated while it is in progress and stops once it completes,
 //!   `ListKeyRotations` records it, and a ciphertext sealed before it still decrypts under
@@ -209,7 +210,9 @@ async fn create_grant_reads_the_same_principal_arn_grammar() {
 // ---------------------------------------------------------------------------
 
 /// R2: a `Marker` the service never issued is refused with the error code alone — the
-/// refusal carries no `Message` member — on every paginated operation of this service.
+/// refusal carries no `Message` member — on every paginated operation of this service
+/// except the TAG listing, which is recorded naming the token it rejected
+/// (`Invalid NextMarker: <marker>`, the tagging surface's own wording).
 ///
 /// The rows are each paginated operation (`smithy_query(query="digest")`: the operations
 /// whose input carries a `Marker` and whose errors list `InvalidMarkerException`), and the
@@ -261,10 +264,16 @@ async fn an_invalid_marker_is_refused_with_no_message_at_all() {
                 (400, "InvalidMarkerException"),
                 "case {case:?}: expected HTTP 400 InvalidMarkerException, got {status} {code}"
             );
-            assert!(
-                message.is_empty(),
-                "case {case:?}: AWS words this refusal with no message at all, got \
-                 {message:?}"
+            // The tag listing names the token it rejected; every other listing of this
+            // service answers the error code alone.
+            let expected = if operation == "ListResourceTags" {
+                format!("Invalid NextMarker: {marker}")
+            } else {
+                String::new()
+            };
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected the message {expected:?}, got {message:?}"
             );
         }
     }

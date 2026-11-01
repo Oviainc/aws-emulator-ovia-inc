@@ -178,14 +178,20 @@ impl SerializableStruct for ValidationException {
 }
 
 /// The `message` member of the synthetic `AccessDeniedException` error shape.
+///
+/// Named `Message` — unlike every modelled KMS error, whose member is the lowercase
+/// `message` — because an authorization failure is answered by AWS's own authorization
+/// layer rather than by this service: the awsJson protocols put the Smithy MEMBER name
+/// on the wire (`@jsonName` is a restJson trait), so the member name is what a client
+/// reads the denial sentence from, and it is capitalised there.
 static ACCESS_DENIED_EXCEPTION_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
-        "smithy.framework#AccessDeniedException$message",
+        "smithy.framework#AccessDeniedException$Message",
         "smithy.framework",
-        "message",
+        "Message",
     ),
     ShapeType::String,
-    "message",
+    "Message",
     0,
 )
 .with_xml_name("Message");
