@@ -234,38 +234,35 @@ async fn the_domain_field_template_case_lifecycle_round_trips_through_state() {
         "case \"CreateCase\": caseArn must address the stored case, got {case_created:?}"
     );
 
-    /// The value a read must answer for `field_id`: the one written against it,
-    /// else the union's `emptyValue` for a field the case never wrote.
-    fn expected_value(written: &[(String, Value)], field_id: &str) -> Value {
-        written
+    /// The entries a read must answer for `requested`: one per requested id the
+    /// case holds a value for, in the requested order and carrying the value
+    /// that was written. A field the case was never written against is reported
+    /// by its ABSENCE, so it contributes no entry.
+    fn expected_entries(written: &[(String, Value)], requested: &[String]) -> Vec<Value> {
+        requested
             .iter()
-            .find(|(id, _)| id == field_id)
-            .map_or(json!({ "emptyValue": {} }), |(_, value)| value.clone())
+            .filter_map(|field_id| {
+                written
+                    .iter()
+                    .find(|(id, _)| id == field_id)
+                    .map(|(_, value)| json!({ "id": field_id, "value": value }))
+            })
+            .collect()
     }
 
-    // 5. GetCase answers exactly the requested ids, in order: the stored value
-    //    where one was written, `emptyValue` where none was.
+    // 5. GetCase answers the requested ids the case holds a value for, in the
+    //    order they were asked for, and nothing for the ones it does not.
     let read = get_case_fields(&emulator, "GetCase", &domain_id, &case_id, &field_ids).await;
+    let expected = expected_entries(&written, &field_ids);
     assert_eq!(
-        read.len(),
-        field_ids.len(),
-        "case \"GetCase\": one entry per requested id, got {read:?}"
+        read, expected,
+        "case \"GetCase\": expected {expected:?}, got {read:?}"
     );
-    for (index, field_id) in field_ids.iter().enumerate() {
-        let case = format!("GetCase id #{index}");
-        assert_eq!(
-            string_at(&read[index], "id", &case),
-            *field_id,
-            "case {case:?}: the answer must keep the requested order, got {read:?}"
-        );
-        let expected = expected_value(&written, field_id);
-        assert_eq!(
-            read[index].get("value"),
-            Some(&expected),
-            "case {case:?}: expected {expected:?}, got {:?}",
-            read[index].get("value")
-        );
-    }
+    assert!(
+        read.len() < field_ids.len(),
+        "case \"GetCase\": the table must request at least one field the case never wrote, \
+         got {read:?}"
+    );
     let with_tags = emulator
         .ok(
             "GetCase tags",
@@ -313,17 +310,12 @@ async fn the_domain_field_template_case_lifecycle_round_trips_through_state() {
         .collect();
     let after =
         get_case_fields(&emulator, "GetCase after update", &domain_id, &case_id, &field_ids).await;
-    for (index, field_id) in field_ids.iter().enumerate() {
-        let case = format!("GetCase after update id #{index}");
-        let expected = expected_value(&merged, field_id);
-        assert_eq!(
-            after[index].get("value"),
-            Some(&expected),
-            "case {case:?}: the merge must overwrite only the supplied id; expected \
-             {expected:?}, got {:?}",
-            after[index].get("value")
-        );
-    }
+    let expected = expected_entries(&merged, &field_ids);
+    assert_eq!(
+        after, expected,
+        "case \"GetCase after update\": the merge must overwrite only the supplied id; \
+         expected {expected:?}, got {after:?}"
+    );
 
     // 7. DeleteCase removes the case, so the next read is the modeled 404.
     let deleted = emulator
@@ -1436,13 +1428,22 @@ async fn a_case_must_provide_a_value_for_every_field_its_template_requires() {
                 "case {case:?}: a missing required field is a 400 ValidationException, \
                  got {status} {code}: {message}"
             );
-            for id in &must_name {
-                assert!(
-                    message.contains(id.as_str()),
-                    "case {case:?}: the refusal must name the unprovided required field \
-                     {id:?}, got {message:?}"
-                );
-            }
+            // The refusal is the service's fixed sentence naming the FIRST
+            // required field the request provided no value for, in the order the
+            // template declares them, and nothing else: the template is
+            // addressed by the request, so its id is not part of the message.
+            let expected = format!(
+                "Field value is not provided for a required field: {}",
+                must_name[0]
+            );
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+            assert!(
+                !message.contains(template_id.as_str()),
+                "case {case:?}: the refusal must not carry the template id, got {message:?}"
+            );
         }
     }
 }

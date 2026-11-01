@@ -250,16 +250,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let unknown = domain.unknown_field_ids(referenced.iter().map(String::as_str));
             if !unknown.is_empty() {
-                return Err(
-                    UpdateLayoutErrorModeled::ValidationException(ValidationException {
-                        message: format!(
-                            "content names field ids that do not exist in domain {}: {}",
-                            input.domain_id,
-                            crate::state::name_ids(&unknown)
-                        ),
-                    })
-                    .into(),
-                );
+                return Err(UpdateLayoutErrorModeled::ValidationException(
+                    crate::state::unknown_fields(&unknown),
+                )
+                .into());
             }
         }
 

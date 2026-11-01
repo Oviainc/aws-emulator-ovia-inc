@@ -247,40 +247,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The same reference rule the other case operations apply, in the same
         // order they apply it (the addressed resource first, then the body): an
         // id the domain defines no field for cannot be projected, filtered on
-        // or sorted by, because the union's `emptyValue` would make a typo in a
-        // field id indistinguishable from a field that exists and was never
-        // written. Each member is resolved separately, so a refusal names the
-        // one a client has to fix.
-        for (member, ids) in [
-            (
-                "fields",
-                requested_fields
-                    .iter()
-                    .map(|field| field.id.clone())
-                    .collect::<Vec<String>>(),
-            ),
-            (
-                "sorts",
-                sorts.iter().map(|sort| sort.field_id.clone()).collect(),
-            ),
-            (
-                "filter",
-                input
-                    .filter
-                    .as_ref()
-                    .map(filter_field_ids)
-                    .unwrap_or_default(),
-            ),
+        // or sorted by, so it is refused in the service's own words for an
+        // unresolvable field reference. Each member is resolved separately, so
+        // the ids a refusal names are the ones a client has to fix.
+        for ids in [
+            requested_fields
+                .iter()
+                .map(|field| field.id.clone())
+                .collect::<Vec<String>>(),
+            sorts.iter().map(|sort| sort.field_id.clone()).collect(),
+            input
+                .filter
+                .as_ref()
+                .map(filter_field_ids)
+                .unwrap_or_default(),
         ] {
             let unknown = domain.unknown_field_ids(ids.iter().map(String::as_str));
             if !unknown.is_empty() {
-                return Err(SearchCasesErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "{member} names field ids that do not exist in domain {}: {}",
-                        input.domain_id,
-                        crate::state::name_ids(&unknown)
-                    ),
-                })
+                return Err(SearchCasesErrorModeled::ValidationException(
+                    crate::state::unknown_fields(&unknown),
+                )
                 .into());
             }
         }
@@ -366,19 +352,19 @@ fn response_item(
     SearchCasesResponseItem {
         case_id: case.case_id.clone(),
         template_id: case.template_id.clone(),
-        // Exactly the requested ids, in the order they were asked for, as
-        // `GetCase` reports them: a field the domain defines but the case holds
-        // no value for reads back as the union's `emptyValue`, and a request
-        // that names no `fields` projects none.
+        // Only the requested ids this case HOLDS a value for, in the order they
+        // were asked for, exactly as `GetCase` reports them: a field the domain
+        // defines but the case was never written against is reported by its
+        // absence, and a request that names no `fields` projects none.
         fields: requested
             .iter()
-            .map(|requested| FieldValue {
-                id: requested.id.clone(),
-                value: case
-                    .field_values
+            .filter_map(|requested| {
+                case.field_values
                     .get(&requested.id)
-                    .cloned()
-                    .unwrap_or(FieldValueUnion::emptyValue(EmptyFieldValue {})),
+                    .map(|value| FieldValue {
+                        id: requested.id.clone(),
+                        value: value.clone(),
+                    })
             })
             .collect(),
         tags: crate::state::tags_output(&case.tags),

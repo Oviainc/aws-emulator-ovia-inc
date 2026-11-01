@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLayouts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLayouts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLayouts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the layouts [`crate::state`] holds for the domain, one
+//! page at a time. It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +114,17 @@ impl From<ListLayoutsErrorModeled> for ListLayoutsError {
     }
 }
 
+/// The condensed summary the listing reports for one stored layout: the members
+/// `LayoutSummary` declares, each read off the stored record rather than off the
+/// request that asked for it.
+fn summary(layout: &crate::state::Layout) -> LayoutSummary {
+    LayoutSummary {
+        layout_id: layout.layout_id.clone(),
+        layout_arn: layout.layout_arn.clone(),
+        name: layout.name.clone(),
+    }
+}
+
 /// The `ListLayouts` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +161,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLayouts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLayoutsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLayouts"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListLayoutsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // A read: it resolves the domain, reports the layouts it holds, and
+        // writes nothing.
+        let store = state.lock();
+        let domain = store
+            .domain(&input.domain_id)
+            .map_err(ListLayoutsErrorModeled::ResourceNotFoundException)?;
+
+        // Every layout of the domain that has not been deleted, in creation
+        // order. A DELETED layout is left out of this listing in particular,
+        // which is what `DeleteLayout` documents — after a delete "You can still
+        // retrieve the layout by calling GetLayout", and nothing else does
+        // (`smithy_query(query="doc", shape="DeleteLayout")`) — so the record
+        // `GetLayout` still reports is not a layout this listing offers.
+        let listed: Vec<(String, LayoutSummary)> = domain
+            .live_layouts()
+            .into_iter()
+            .map(|(key, layout)| (key, summary(layout)))
+            .collect();
+
+        let page = crate::state::page(
+            &crate::state::page_scope("ListLayouts", &input.domain_id, &[]),
+            listed,
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .map_err(|error| {
+            ListLayoutsErrorModeled::ValidationException(crate::state::page_validation_exception(
+                &error,
+            ))
+        })?;
+
+        Ok(ListLayoutsOutput {
+            layouts: page.items,
+            next_token: page.next_token,
+        })
     }
 }

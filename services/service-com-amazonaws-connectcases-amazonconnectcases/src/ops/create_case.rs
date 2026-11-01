@@ -258,13 +258,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // declared type is refused rather than stored under the wrong type.
         let unknown = domain.unknown_field_ids(input.fields.iter().map(|f| f.id.as_str()));
         if !unknown.is_empty() {
-            return Err(CreateCaseErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "fields names field ids that do not exist in domain {}: {}",
-                    input.domain_id,
-                    crate::state::name_ids(&unknown)
-                ),
-            })
+            return Err(CreateCaseErrorModeled::ValidationException(
+                crate::state::unknown_fields(&unknown),
+            )
             .into());
         }
         let mismatched =
@@ -279,19 +275,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The template's `requiredFields` is the "List of fields that must have
         // a value provided to create a case"
         // (`smithy_query(query="doc",shape="RequiredField")`), so a create that
-        // names no value for one of them is refused before anything is stored.
+        // names no value for one of them is refused before anything is stored,
+        // naming the first such field in the order the template declares them.
         let missing = crate::state::ids_not_provided(
             &required_field_ids,
             input.fields.iter().map(|f| f.id.as_str()),
         );
-        if !missing.is_empty() {
-            return Err(CreateCaseErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "fields provides no value for field ids template {} requires: {}",
-                    input.template_id,
-                    crate::state::name_ids(&missing)
-                ),
-            })
+        if let Some(field_id) = missing.first() {
+            return Err(CreateCaseErrorModeled::ValidationException(
+                crate::state::required_field_not_provided(field_id),
+            )
             .into());
         }
 

@@ -199,13 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         if !unknown.is_empty() {
-            return Err(UpdateCaseErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "fields names field ids that do not exist in domain {}: {}",
-                    input.domain_id,
-                    crate::state::name_ids(&unknown)
-                ),
-            })
+            return Err(UpdateCaseErrorModeled::ValidationException(
+                crate::state::unknown_fields(&unknown),
+            )
             .into());
         }
         if !mismatched.is_empty() {

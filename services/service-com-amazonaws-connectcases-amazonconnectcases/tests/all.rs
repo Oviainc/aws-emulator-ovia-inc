@@ -33,6 +33,8 @@ mod layout_deletion;
 mod layout_lifecycle;
 #[path = "all/related_items.rs"]
 mod related_items;
+#[path = "all/response_and_refusal_fidelity.rs"]
+mod response_and_refusal_fidelity;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/system_fields.rs"]

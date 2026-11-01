@@ -586,9 +586,19 @@ async fn a_search_projects_exactly_the_requested_fields_as_get_case_reports_them
                 .iter()
                 .map(|field| string_at(field, "id", &row))
                 .collect();
+            // A projection reports only the requested ids the case HOLDS a
+            // value for, in the requested order: the `no-values` case was
+            // written with the text field alone, so a projection of any other
+            // field reports nothing for it.
+            let expected: Vec<String> = if label == "no-values" {
+                requested.iter().filter(|id| **id == text).cloned().collect()
+            } else {
+                requested.clone()
+            };
             assert_eq!(
-                ids, requested,
-                "case {row:?}: expected exactly the requested ids in order, got {ids:?}"
+                ids, expected,
+                "case {row:?}: expected exactly the requested ids the case holds, in order, \
+                 got {ids:?}"
             );
             // The projected values are the SAME values `GetCase` reports for
             // those ids, which is the round trip through stored state.

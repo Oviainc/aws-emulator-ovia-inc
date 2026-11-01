@@ -33,8 +33,8 @@ use crate::harness::{
 };
 
 /// The reserved id whose value every row below leaves unwritten, so a read can
-/// tell an in-schema field that was never written (the union's `emptyValue`)
-/// from one that is not in the schema at all (a refusal).
+/// tell an in-schema field that was never written (no entry at all) from one
+/// that is not in the schema at all (a refusal).
 const NEVER_WRITTEN_RESERVED_ID: &str = "reference_number";
 
 /// The value of a `GetCase` entry for `field_id`, which the handler answers in
@@ -59,11 +59,14 @@ async fn every_new_domain_is_provisioned_with_the_reserved_system_fields() {
 
     // Two entries of the catalog pinned as literals, so a wrong catalog entry
     // fails here rather than being carried into the expectations below.
-    for (field_id, field_type) in [("title", "Text"), ("created_datetime", "DateTime")] {
+    for (field_id, name, field_type) in [
+        ("title", "Title", "Text"),
+        ("created_datetime", "Date/time created", "DateTime"),
+    ] {
         assert!(
-            RESERVED_SYSTEM_FIELDS.contains(&(field_id, field_type)),
-            "case \"the reserved catalog\": {field_id} must be reserved as a {field_type} field, \
-             got {RESERVED_SYSTEM_FIELDS:?}"
+            RESERVED_SYSTEM_FIELDS.contains(&(field_id, name, field_type)),
+            "case \"the reserved catalog\": {field_id} must be reserved as a {field_type} field \
+             named {name:?}, got {RESERVED_SYSTEM_FIELDS:?}"
         );
     }
 
@@ -71,7 +74,7 @@ async fn every_new_domain_is_provisioned_with_the_reserved_system_fields() {
         let case = format!("BatchGetField every reserved id in {domain_id}");
         let requested: Vec<Value> = RESERVED_SYSTEM_FIELDS
             .iter()
-            .map(|(field_id, _)| json!({ "id": field_id }))
+            .map(|(field_id, _, _)| json!({ "id": field_id }))
             .collect();
         let response = emulator
             .ok(
@@ -104,7 +107,7 @@ async fn every_new_domain_is_provisioned_with_the_reserved_system_fields() {
             RESERVED_SYSTEM_FIELDS.len(),
             "case {case:?}: expected one entry per reserved id, got {read:?}"
         );
-        for (field_id, field_type) in RESERVED_SYSTEM_FIELDS {
+        for (field_id, name, field_type) in RESERVED_SYSTEM_FIELDS {
             let field = by_id
                 .get(*field_id)
                 .unwrap_or_else(|| panic!("case {case:?}: {field_id} missing from {read:?}"));
@@ -120,8 +123,9 @@ async fn every_new_domain_is_provisioned_with_the_reserved_system_fields() {
             );
             assert_eq!(
                 string_at(field, "name", &case),
-                *field_id,
-                "case {case:?}: a reserved field's name is its reserved id, got {field:?}"
+                *name,
+                "case {case:?}: a reserved field's name is the service's display name for it, \
+                 got {field:?}"
             );
             assert_eq!(
                 field.get("deleted").and_then(Value::as_bool),
@@ -148,7 +152,7 @@ async fn every_new_domain_is_provisioned_with_the_reserved_system_fields() {
 async fn a_case_is_written_and_read_through_the_reserved_system_fields() {
     // A reserved field is in the domain's schema, so a case writes and reads it
     // like any other field — including the type check its own `FieldType`
-    // carries — and one that was never written reads back as `emptyValue`.
+    // carries — and one that was never written is left out of the read.
     let emulator = Emulator::new();
     let domain_id = domain(&emulator, "case-on-system-fields").await;
     let custom = emulator
@@ -249,11 +253,12 @@ async fn a_case_is_written_and_read_through_the_reserved_system_fields() {
              written, got {read:?}"
         );
     }
-    assert_eq!(
-        value_of(&read, NEVER_WRITTEN_RESERVED_ID, "GetCase unwritten reserved field"),
-        json!({ "emptyValue": {} }),
-        "case \"GetCase unwritten reserved field\": a reserved field the case never wrote is \
-         in schema and empty, got {read:?}"
+    assert!(
+        !read
+            .iter()
+            .any(|entry| entry.get("id").and_then(Value::as_str) == Some(NEVER_WRITTEN_RESERVED_ID)),
+        "case \"GetCase unwritten reserved field\": a reserved field the case never wrote holds \
+         no value, so it must not be reported, got {read:?}"
     );
 
     // An update writes a reserved field the same way, and the read reports the
@@ -451,7 +456,7 @@ async fn a_field_name_already_taken_is_refused_with_the_services_message_templat
         ),
         (
             "a reserved System field's own name",
-            "title".to_string(),
+            "Title".to_string(),
             true,
         ),
     ];

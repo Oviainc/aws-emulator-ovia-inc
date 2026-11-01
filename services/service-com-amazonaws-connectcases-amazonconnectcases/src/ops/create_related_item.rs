@@ -185,16 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The content itself says which kind of item this is, so the request's
         // `type` has to name the union member the content carries: the two
         // describe ONE item, and a request where they disagree says two things
-        // at once rather than one.
+        // at once rather than one. The refusal is the service's fixed sentence
+        // for a mismatched pair, led by the type the REQUEST declared.
         let content_type = crate::state::related_item_content_type(&input.content);
         if input.r#type != content_type {
             return Err(
                 CreateRelatedItemErrorModeled::ValidationException(ValidationException {
                     message: format!(
-                        "type {} does not describe the content given, which is the content of a \
-                         {content_type} related item; the accepted values are {}",
-                        input.r#type,
-                        RELATED_ITEM_TYPE_VALUES.join(", ")
+                        "{} type was specified with a mismatched related-item content.",
+                        input.r#type.to_uppercase()
                     ),
                 })
                 .into(),
@@ -243,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly as it was. Taken here but reported after the case itself is
         // resolved, so a request naming a case the domain does not hold is told
         // about the case rather than about the content it carried for it.
-        let content_check = content_refusal(domain, &input.domain_id, &input.content);
+        let content_check = content_refusal(domain, &input.content);
         let Some(case) = domain.cases.get_mut(&input.case_id) else {
             return Err(CreateRelatedItemErrorModeled::ResourceNotFoundException(
                 crate::state::not_found("Case", &input.case_id),
@@ -329,7 +328,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// nothing beyond its own text.
 fn content_refusal(
     domain: &crate::state::Domain,
-    domain_id: &str,
     content: &RelatedItemInputContent,
 ) -> Result<(), CreateRelatedItemErrorModeled> {
     match content {
@@ -353,13 +351,7 @@ fn content_refusal(
                 domain.unknown_field_ids(custom.fields.iter().map(|field| field.id.as_str()));
             if !unknown.is_empty() {
                 return Err(CreateRelatedItemErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "content.custom.fields names field ids that do not exist in domain \
-                             {domain_id}: {}",
-                            crate::state::name_ids(&unknown)
-                        ),
-                    },
+                    crate::state::unknown_fields(&unknown),
                 ));
             }
             let mismatched = domain.mismatched_field_values(
@@ -389,12 +381,7 @@ fn content_refusal(
             };
             if !domain.unknown_field_ids([field_id]).is_empty() {
                 return Err(CreateRelatedItemErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "content.sla.slaInputConfiguration.fieldId names a field id that does \
-                             not exist in domain {domain_id}: {field_id}"
-                        ),
-                    },
+                    crate::state::unknown_fields(&[field_id.to_string()]),
                 ));
             }
             let targets = sla.target_field_values.as_deref().unwrap_or_default();

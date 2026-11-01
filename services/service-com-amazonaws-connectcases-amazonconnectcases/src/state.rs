@@ -86,7 +86,7 @@ pub const FIELD_NAMESPACE_CUSTOM: &str = "Custom";
 pub const FIELD_NAMESPACE_SYSTEM: &str = "System";
 
 /// The reserved `System`-namespace fields every Cases domain is provisioned
-/// with, as `(fieldId, FieldType)`. A domain's schema holds these from the
+/// with, as `(fieldId, name, FieldType)`. A domain's schema holds these from the
 /// moment it is created — no `CreateField` call makes them — so a case can be
 /// written against them straight away.
 ///
@@ -94,29 +94,37 @@ pub const FIELD_NAMESPACE_SYSTEM: &str = "System";
 /// (`smithy_query(query="shape",shape="FieldId")`, `@length 1..500`) and
 /// `FieldNamespace` only names the two namespaces
 /// (`smithy_query(query="shape",shape="FieldNamespace")` = `Custom | System`).
-/// The ids and types below are the service's own reserved vocabulary, as the
-/// Amazon Connect Administrator Guide's "Cases fields" tables list them and as
-/// the recorded traffic shows them: the ids are reserved words, verbatim, not
-/// minted per domain, and each one's `FieldType` is a value of
+/// The ids, display names and types below are the service's own reserved
+/// vocabulary, as the Amazon Connect Administrator Guide's "Cases fields" tables
+/// list them and as the recorded traffic shows them: the ids are reserved words,
+/// verbatim, not minted per domain, and each one's `FieldType` is a value of
 /// `FIELD_TYPE_VALUES` so a value written against it is type-checked like any
 /// other field's.
+///
+/// The second column is the field's NAME, which the model keeps distinct from
+/// its id: `FieldSummary.name` is its own required member, "Name of the field"
+/// (`smithy_query(query="shape",shape="FieldSummary")`), typed `FieldName`
+/// (`@length 1..100`, pattern `^.*[\S]$`). It is the service's display name for
+/// the field — the guide's own wording for it, which is how a client that only
+/// knows the display name resolves the id it has to send — so it is not the
+/// reserved word the id is.
 ///
 /// Two of them — `created_datetime` and `last_updated_datetime` — are instants
 /// the real service maintains itself. Neither the model nor the recorded traffic
 /// says whether it refuses, ignores or accepts a caller's write to them, so they
 /// are provisioned as the ordinary `DateTime` fields they are typed as and the
 /// question is left to a recording that settles it.
-pub const RESERVED_SYSTEM_FIELDS: &[(&str, &str)] = &[
-    ("assigned_queue", "Text"),
-    ("assigned_user", "User"),
-    ("case_reason", "SingleSelect"),
-    ("created_datetime", "DateTime"),
-    ("customer_id", "Text"),
-    ("last_updated_datetime", "DateTime"),
-    ("reference_number", "Text"),
-    ("status", "Text"),
-    ("summary", "Text"),
-    ("title", "Text"),
+pub const RESERVED_SYSTEM_FIELDS: &[(&str, &str, &str)] = &[
+    ("assigned_queue", "Assigned queue", "Text"),
+    ("assigned_user", "Assigned user", "User"),
+    ("case_reason", "Case reason", "SingleSelect"),
+    ("created_datetime", "Date/time created", "DateTime"),
+    ("customer_id", "Customer", "Text"),
+    ("last_updated_datetime", "Date/time last updated", "DateTime"),
+    ("reference_number", "Reference number", "Text"),
+    ("status", "Status", "Text"),
+    ("summary", "Summary", "Text"),
+    ("title", "Title", "Text"),
 ];
 
 /// Most domains this emulator's store holds. EMULATOR-OWNED ceiling on
@@ -688,6 +696,23 @@ impl Domain {
             .ok_or_else(|| not_found("Layout", layout_id))
     }
 
+    /// Every layout this domain still holds, in creation order and each paired
+    /// with the key [`order_key`] builds for it, with the deleted ones left out:
+    /// what a listing of layouts reports. A deleted layout is left out of the
+    /// LISTING only — [`Self::layout`] still reports the record, because
+    /// `DeleteLayout` says a deleted layout is still retrievable through
+    /// `GetLayout` and names no other read it survives in.
+    pub fn live_layouts(&self) -> Vec<(String, &Layout)> {
+        let mut layouts: Vec<(String, &Layout)> = self
+            .layouts
+            .values()
+            .filter(|layout| !layout.deleted)
+            .map(|layout| (order_key(layout.created_time, &layout.layout_id), layout))
+            .collect();
+        layouts.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        layouts
+    }
+
     /// Refuse a new layout once the domain holds [`MAX_LAYOUTS_PER_DOMAIN`].
     pub fn layout_capacity(&self) -> Result<(), ServiceQuotaExceededException> {
         capacity(
@@ -1010,6 +1035,34 @@ pub fn list_too_long(member: &str, len: usize, cap: usize) -> Option<String> {
     (len > cap).then(|| {
         format!("{member} carries {len} entries; at most {cap} are accepted in one request")
     })
+}
+
+/// The modelled 400 for a request that references field ids the domain's schema
+/// does not define, as [`Domain::unknown_field_ids`] reports them.
+///
+/// One wording for one rule: whichever member carried the references, the
+/// service names the ids it could not resolve after its own fixed text, so every
+/// operation that resolves a field id against a domain refuses in the same
+/// words. The ids come from the REQUEST, verbatim, and are rendered by
+/// [`name_ids`] so one request cannot make the refusal grow without bound.
+pub fn unknown_fields(ids: &[String]) -> ValidationException {
+    ValidationException {
+        message: format!("Unknown field Ids: {}", name_ids(ids)),
+    }
+}
+
+/// The modelled 400 for a create refused because the template it names requires
+/// a value for `field_id` and the request carried no entry for it, as
+/// [`ids_not_provided`] reports them.
+///
+/// The sentence names the one required field the request did not provide — the
+/// first of them, in the order the template declares its `requiredFields` — and
+/// nothing else: the template is addressed by the request, so its id is not
+/// interpolated into the refusal.
+pub fn required_field_not_provided(field_id: &str) -> ValidationException {
+    ValidationException {
+        message: format!("Field value is not provided for a required field: {field_id}"),
+    }
 }
 
 /// `ids` rendered for a refusal message, naming at most
@@ -1444,10 +1497,12 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// [`RESERVED_SYSTEM_FIELDS`] names, keyed by the reserved id each one is
 /// addressed by.
 ///
-/// A reserved field's `name` IS its reserved id: the id is the service's own
-/// word for the field, and nothing in the request names it. Its ARN is built
-/// like any other field's, so it is addressable in the domain's region, and it
-/// is created with the domain, so its instants are the domain's.
+/// A reserved field's `name` is the service's DISPLAY name for it, which the
+/// catalog states beside the reserved id it is addressed by: the id is the
+/// service's own word for the field and the name is what a human reads, and the
+/// model keeps the two apart. Its ARN is built like any other field's, so it is
+/// addressable in the domain's region, and it is created with the domain, so its
+/// instants are the domain's.
 pub fn reserved_system_fields(
     region: &str,
     domain_id: &str,
@@ -1455,13 +1510,13 @@ pub fn reserved_system_fields(
 ) -> HashMap<String, Field> {
     RESERVED_SYSTEM_FIELDS
         .iter()
-        .map(|(field_id, field_type)| {
+        .map(|(field_id, name, field_type)| {
             (
                 (*field_id).to_string(),
                 Field {
                     field_id: (*field_id).to_string(),
                     field_arn: field_arn(region, domain_id, field_id),
-                    name: (*field_id).to_string(),
+                    name: (*name).to_string(),
                     field_type: (*field_type).to_string(),
                     namespace: FIELD_NAMESPACE_SYSTEM.to_string(),
                     description: None,
@@ -1562,13 +1617,25 @@ pub fn name_conflict(resource_kind: ResourceKind, name: &str) -> ConflictExcepti
 }
 
 /// The modelled 404 for a resource this service does not hold.
+///
+/// The `message` of this error class is the service's FIXED sentence, with no
+/// variable part: the resource the call could not resolve is reported in the
+/// error's own `resourceId` and `resourceType` members, which the model makes
+/// required for exactly that
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so nothing
+/// from the request is interpolated into the sentence and a client matching on
+/// it reads the same text for every resource kind.
 pub fn not_found(resource_type: &str, resource_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("{resource_type} {resource_id} was not found"),
+        message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
         resource_id: resource_id.to_string(),
         resource_type: resource_type.to_string(),
     }
 }
+
+/// The `message` every [`not_found`] carries: the service's fixed sentence for
+/// the `ResourceNotFoundException` class.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Requested resource not found.";
 
 /// The modelled 500 for a request that reached a handler with no store behind
 /// it. Answered rather than papered over with a private engine: a handler that

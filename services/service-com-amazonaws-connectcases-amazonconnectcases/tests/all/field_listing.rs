@@ -142,7 +142,7 @@ async fn create_fields(emulator: &Emulator, domain_id: &str, count: usize) -> Ve
 fn reserved_summaries(domain_id: &str) -> Vec<(String, Value)> {
     let mut reserved: Vec<(String, Value)> = RESERVED_SYSTEM_FIELDS
         .iter()
-        .map(|(field_id, field_type)| {
+        .map(|(field_id, name, field_type)| {
             (
                 (*field_id).to_string(),
                 json!({
@@ -150,7 +150,7 @@ fn reserved_summaries(domain_id: &str) -> Vec<(String, Value)> {
                     "fieldArn": format!(
                         "arn:aws:cases:us-east-1:000000000000:domain/{domain_id}/field/{field_id}"
                     ),
-                    "name": field_id,
+                    "name": name,
                     "type": field_type,
                     "namespace": FIELD_NAMESPACE_SYSTEM,
                 }),

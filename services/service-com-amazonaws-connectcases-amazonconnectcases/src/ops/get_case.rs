@@ -200,37 +200,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same reference rule the write paths apply, in the same order they
         // apply it (the addressed resource first, then the body): an id the
-        // domain defines no field for cannot be answered, because `emptyValue`
-        // would make it indistinguishable from a field that exists and was
-        // never written. The model does not state this one — it is the
-        // emulator's reading of `FieldIdentifier`, chosen so a typo in a field
-        // id is reported rather than answered with a value the case does not
-        // have.
+        // domain defines no field for cannot be answered at all, so it is
+        // refused before the case's values are read, in the service's own words
+        // for an unresolvable field reference.
         let unknown = domain.unknown_field_ids(input.fields.iter().map(|f| f.id.as_str()));
         if !unknown.is_empty() {
-            return Err(GetCaseErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "fields names field ids that do not exist in domain {}: {}",
-                    input.domain_id,
-                    crate::state::name_ids(&unknown)
-                ),
-            })
-            .into());
+            return Err(
+                GetCaseErrorModeled::ValidationException(crate::state::unknown_fields(&unknown))
+                    .into(),
+            );
         }
 
-        // Exactly the requested ids, in the order they were asked for: a field
-        // the domain defines but the case holds no value for reads back as the
-        // union's `emptyValue`.
+        // Only the requested ids the case actually HOLDS a value for, in the
+        // order they were asked for: a field the domain defines but this case
+        // was never written against is reported by its absence from the list,
+        // not by a value invented for it. `emptyValue` is a value a caller
+        // writes ("An empty value",
+        // `smithy_query(query="shape",shape="FieldValueUnion")`), so a field
+        // explicitly written with it IS reported — which is what keeps "cleared"
+        // distinguishable from "never set".
         let fields = input
             .fields
             .iter()
-            .map(|requested| FieldValue {
-                id: requested.id.clone(),
-                value: case
-                    .field_values
+            .filter_map(|requested| {
+                case.field_values
                     .get(&requested.id)
-                    .cloned()
-                    .unwrap_or(FieldValueUnion::emptyValue(EmptyFieldValue {})),
+                    .map(|value| FieldValue {
+                        id: requested.id.clone(),
+                        value: value.clone(),
+                    })
             })
             .collect();
 

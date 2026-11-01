@@ -237,16 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // be followed.
         let unknown = domain.unknown_field_ids(required_fields.iter().map(|f| f.field_id.as_str()));
         if !unknown.is_empty() {
-            return Err(
-                CreateTemplateErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "requiredFields names field ids that do not exist in domain {}: {}",
-                        input.domain_id,
-                        crate::state::name_ids(&unknown)
-                    ),
-                })
-                .into(),
-            );
+            return Err(CreateTemplateErrorModeled::ValidationException(
+                crate::state::unknown_fields(&unknown),
+            )
+            .into());
         }
 
         // `rules` names case rules, which this emulator has no resource for yet
