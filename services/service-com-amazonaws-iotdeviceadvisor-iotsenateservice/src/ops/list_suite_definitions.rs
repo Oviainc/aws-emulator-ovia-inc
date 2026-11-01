@@ -4,7 +4,8 @@
 //!
 //! Projects `SuiteDefinitionInformation` from every stored definition, in the store's one
 //! deterministic (id) order, and pages it: at most `maxResults` entries per call, with
-//! `nextToken` carrying the id to resume at and absent on the last page.
+//! `nextToken` carrying the id to resume at and absent on the last page. A `nextToken`
+//! naming no stored definition is refused rather than used as the page's lower bound.
 //!
 //! ## Shape of an operation
 //!
@@ -142,28 +143,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        let store = state.lock();
+
         // The paging rule is the SERVICE's, decided once in `crate::state`: a token is a
-        // position this service handed out, never arbitrary caller text — here the
-        // suite-definition id the next page resumes AT — and an absent `maxResults` means
-        // one page holds every definition. A token this service cannot have issued is
-        // refused with the modelled client-input error this operation declares, carrying
-        // the message the rule names, instead of being read as "start from the beginning".
+        // position this listing handed out, never arbitrary caller text — here the
+        // suite-definition id the next page resumes AT, so it is checked against the ids
+        // the store actually holds — and an absent `maxResults` means one page holds every
+        // definition. A token that names no stored definition is one no page of this
+        // listing ever ended before, so it is refused with the modelled client-input error
+        // this operation declares, carrying the message the rule names, rather than being
+        // read as a lower bound (which would drop every definition below it) or as "start
+        // from the beginning".
         let crate::state::PageRequest {
             resume_at,
             page_size,
-        } = crate::state::page_request(input.next_token.as_deref(), input.max_results).map_err(
-            |message| {
-                ListSuiteDefinitionsErrorModeled::ValidationException(ValidationException {
-                    message: Some(message),
-                })
-            },
-        )?;
+        } = crate::state::page_request(
+            input.next_token.as_deref(),
+            input.max_results,
+            store.definitions.keys().map(String::as_str),
+        )
+        .map_err(|message| {
+            ListSuiteDefinitionsErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
 
-        let store = state.lock();
-
-        // The token is the id to resume AT, so paging is stable while definitions are
-        // created or deleted between pages. An absent token resumes at the empty string,
-        // which is the start of the map — the same iterator type, so no boxing.
+        // The token is the id to resume AT, and the store is keyed by id, so a page is
+        // stable while OTHER definitions are created or deleted between pages. An absent
+        // token resumes at the empty string, which is the start of the map — the same
+        // iterator type, so no boxing.
         let mut remaining = match resume_at {
             Some(token) => store.definitions.range(token..).peekable(),
             None => store.definitions.range(String::new()..).peekable(),

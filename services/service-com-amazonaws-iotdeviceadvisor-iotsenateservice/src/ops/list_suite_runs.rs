@@ -4,14 +4,14 @@
 //!
 //! Reports the suite runs the store holds, narrowed by the filters the caller named and
 //! paged by `maxResults`. A filter that matches nothing is an EMPTY list, not an error;
-//! only a `nextToken` this service cannot have issued is refused. The one write it does
+//! only a `nextToken` naming no run this call's own filters select is refused. The one write it does
 //! is materialising the status transitions the clock already made due for the runs the
 //! FILTERS select — the set this paginated listing is about, whichever page it answers —
 //! so a listing shows the same statuses a caller would have seen had nobody called at all.
 //!
 //! Runs are listed in suite-run id order — the order the store's `BTreeMap` holds them in
 //! — so one listing has one deterministic order and the `nextToken` (the id to resume at)
-//! stays valid while runs are started or aged out between pages. The model states no
+//! stays valid while OTHER runs are started or aged out between pages. The model states no
 //! ordering for `suiteRunsList`, so id order is NOT chronological order: nothing here
 //! promises newest-first.
 //!
@@ -171,23 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The paging rule is the SERVICE's, decided once in `crate::state`: a token is a
-        // position this service handed out, never arbitrary caller text — here the
-        // suite-run id the next page resumes AT — and an absent `maxResults` means one page
-        // holds every matching run. A token this service cannot have issued is refused with
-        // the modelled client-input error this operation declares, carrying the message the
-        // rule names, instead of being read as "start from the beginning".
-        let crate::state::PageRequest {
-            resume_at,
-            page_size,
-        } = crate::state::page_request(input.next_token.as_deref(), input.max_results).map_err(
-            |message| {
-                ListSuiteRunsErrorModeled::ValidationException(ValidationException {
-                    message: Some(message),
-                })
-            },
-        )?;
-
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -214,6 +197,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             run.materialize_due(now);
             matching.push(run.clone());
         }
+
+        // The paging rule is the SERVICE's, decided once in `crate::state`: a token is a
+        // position this listing handed out, never arbitrary caller text — here the
+        // suite-run id the next page resumes AT, so it is checked against the ids of the
+        // runs THIS call's filters select — and an absent `maxResults` means one page holds
+        // every matching run. A token that names none of them is one no page of this
+        // listing ever ended before, so it is refused with the modelled client-input error
+        // this operation declares, carrying the message the rule names, rather than being
+        // read as a lower bound (which would drop every matching run below it) or as "start
+        // from the beginning".
+        let crate::state::PageRequest {
+            resume_at,
+            page_size,
+        } = crate::state::page_request(
+            input.next_token.as_deref(),
+            input.max_results,
+            matching.iter().map(|run| run.id.as_str()),
+        )
+        .map_err(|message| {
+            ListSuiteRunsErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
 
         let mut remaining = matching
             .iter()

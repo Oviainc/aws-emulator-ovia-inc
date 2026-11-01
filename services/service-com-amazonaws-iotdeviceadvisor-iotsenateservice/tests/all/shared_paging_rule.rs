@@ -26,18 +26,18 @@ use super::suite_lifecycle::{thing_arn, Emulator, ROLE_ARN};
 const REGION: &str = "us-east-1";
 
 /// One paginated listing of this service, as a client addresses it.
-struct Listing {
+pub(crate) struct Listing {
     /// The request path the listing answers on.
-    path: &'static str,
+    pub(crate) path: &'static str,
     /// The output member the page of entries is carried in.
-    list: &'static str,
+    pub(crate) list: &'static str,
     /// The member each entry carries its id in — the same id a `nextToken` resumes at.
-    id: &'static str,
+    pub(crate) id: &'static str,
 }
 
 /// Both listings the shared paging rule serves: the two operations that each used to carry
 /// their own copy of it.
-const LISTINGS: [Listing; 2] = [
+pub(crate) const LISTINGS: [Listing; 2] = [
     Listing {
         path: "/suiteDefinitions",
         list: "suiteDefinitionInformationList",
@@ -52,14 +52,14 @@ const LISTINGS: [Listing; 2] = [
 
 /// How many entries each listing holds in the cases below: enough that every page size in
 /// the table pages more than once and the last page is a partial one for some of them.
-const SEEDED: usize = 4;
+pub(crate) const SEEDED: usize = 4;
 
 /// Create [`SEEDED`] suite definitions, each with one started suite run, so BOTH listings
 /// hold the same number of entries.
 ///
 /// Everything here goes over the wire: one definition per run, because the service
 /// serialises the runs of a single definition.
-async fn seed(emulator: &Emulator) {
+pub(crate) async fn seed(emulator: &Emulator) {
     for index in 0..SEEDED {
         let created = emulator
             .create_definition(
@@ -99,7 +99,7 @@ async fn seed(emulator: &Emulator) {
 }
 
 /// The ids one answer of `listing` carries, in the order it listed them.
-fn listed_ids(listing: &Listing, body: &Value) -> Vec<String> {
+pub(crate) fn listed_ids(listing: &Listing, body: &Value) -> Vec<String> {
     body[listing.list]
         .as_array()
         .cloned()
@@ -341,7 +341,7 @@ enum Decided<'a> {
     /// Start the page at this position (`None` = at the beginning), holding at most this
     /// many entries.
     Page(Option<&'a str>, usize),
-    /// The token is one no listing of this service could have issued.
+    /// The token names no position the listing holds, so no page of it ever ended there.
     Refused,
 }
 
@@ -358,10 +358,17 @@ struct Row<'a> {
 /// validator refuses before any handler sees them.
 #[test]
 fn the_shared_paging_decision_maps_every_input_class() {
-    let issued = iotdeviceadvisor::state::new_uuid();
+    // The positions the listing this decision is made for holds: the ids of its entries,
+    // which are exactly the values it hands a `nextToken` out for.
+    let held: Vec<String> = (0..3).map(|_| iotdeviceadvisor::state::new_uuid()).collect();
+    let positions: Vec<&str> = held.iter().map(String::as_str).collect();
+    let issued = held[1].clone();
+    // A value with the very shape of an id this service mints, naming no entry the listing
+    // holds — a forged, stale or cross-listing token.
+    let unissued = iotdeviceadvisor::state::new_uuid();
     let max = usize::try_from(iotdeviceadvisor::state::MAX_RESULTS_MAX).expect("a positive bound");
 
-    let rows: [Row; 8] = [
+    let rows: [Row; 9] = [
         Row {
             case: "no paging members at all",
             next_token: None,
@@ -375,7 +382,7 @@ fn the_shared_paging_decision_maps_every_input_class() {
             expected: Decided::Page(None, max),
         },
         Row {
-            case: "a token this service could have issued",
+            case: "a token this listing could have issued",
             next_token: Some(issued.as_str()),
             max_results: None,
             expected: Decided::Page(Some(issued.as_str()), max),
@@ -412,11 +419,21 @@ fn the_shared_paging_decision_maps_every_input_class() {
             max_results: Some(2),
             expected: Decided::Refused,
         },
+        Row {
+            case: "an id-shaped token naming no position the listing holds",
+            next_token: Some(unissued.as_str()),
+            max_results: Some(2),
+            expected: Decided::Refused,
+        },
     ];
 
     for row in rows {
         let case = row.case;
-        let decided = iotdeviceadvisor::state::page_request(row.next_token, row.max_results);
+        let decided = iotdeviceadvisor::state::page_request(
+            row.next_token,
+            row.max_results,
+            positions.iter().copied(),
+        );
         match (row.expected, &decided) {
             (Decided::Page(resume_at, page_size), Ok(actual)) => {
                 assert_eq!(

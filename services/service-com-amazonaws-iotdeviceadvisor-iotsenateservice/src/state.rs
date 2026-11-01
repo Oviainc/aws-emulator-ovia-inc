@@ -959,28 +959,6 @@ pub const EMPTY_ROOT_GROUP_MESSAGE: &str =
 /// then holds everything unless the caller asks for fewer.
 pub const MAX_RESULTS_MAX: i32 = 50;
 
-/// True when `token` could be a pagination token one of this service's listings issued.
-///
-/// Every listing here resumes AT a resource id, so the token it hands out is one of the
-/// ids this service mints — a hyphenated lowercase v4 UUID (see [`new_uuid`]). A token of
-/// any other shape is one this service cannot have issued, which is what lets a listing
-/// refuse a garbled or hand-written token with the modelled client-input error instead of
-/// silently answering from the start of the map.
-///
-/// The shape is checked here rather than with `uuid::Uuid::parse_str`, which also accepts
-/// upper-case, braced and urn forms this service never mints and would therefore let
-/// through a token no listing of ours ever issued.
-pub fn is_page_token_shape(token: &str) -> bool {
-    /// A lowercase hex digit, the only byte a UUID group holds.
-    fn is_lower_hex(byte: u8) -> bool {
-        byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
-    }
-
-    let groups: Vec<&str> = token.split('-').collect();
-    groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
-        && groups.iter().all(|group| group.bytes().all(is_lower_hex))
-}
-
 /// The message a listing refuses a `nextToken` it cannot have issued with.
 ///
 /// One definition for the whole service, so every listing words that refusal the same way,
@@ -990,8 +968,8 @@ pub const INVALID_PAGE_TOKEN_MESSAGE: &str = "Invalid nextToken";
 /// Where one listing call starts, and how many entries the page it answers may carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRequest {
-    /// The resource id the page resumes AT, or `None` to start from the beginning of the
-    /// listing's order.
+    /// The resource id the page resumes AT — one the listing holds — or `None` to start
+    /// from the beginning of the listing's order.
     pub resume_at: Option<String>,
     /// The greatest number of entries the page may carry. Never zero, so a paging loop
     /// always makes progress.
@@ -1003,21 +981,37 @@ pub struct PageRequest {
 /// The paging rule belongs to the SERVICE, not to one listing, so every paginated
 /// operation here asks this rather than restating it: an absent or empty `nextToken` starts
 /// from the beginning (`Token` is `len 0..2000`, and an empty token carries no position, so
-/// it is the same request as naming none), any other token must be one this service could
-/// have issued ([`is_page_token_shape`]), and an absent `maxResults` means one page holds
-/// everything, so it defaults to [`MAX_RESULTS_MAX`].
+/// it is the same request as naming none), any other token must name a position in the very
+/// set this call is listing, and an absent `maxResults` means one page holds everything, so
+/// it defaults to [`MAX_RESULTS_MAX`].
+///
+/// `positions` is that set: the ids of the entries this call's own filters select, in the
+/// listing's order — exactly the values this listing hands a `nextToken` out for. The token
+/// is checked AGAINST them rather than against the shape of an id, because the set of tokens
+/// a listing can issue is the set of positions it holds: a value of the right shape that
+/// names none of them is one no page of this listing ever ended before, so using it as the
+/// page's lower bound would answer a short, a truncated or an empty listing — a loss a
+/// caller cannot tell from "this is the last page" — instead of refusing the token. That is
+/// what refuses a forged, stale, hand-edited or cross-listing token (an id the SIBLING
+/// listing hands out, or one belonging to a differently filtered set, both of the same
+/// shape) rather than silently dropping records below it.
 ///
 /// `Err` carries the message for the refusal — the caller lifts it into the modelled
 /// client-input error its own operation declares, which is how one rule serves listings
 /// with different error enums.
-pub fn page_request(
+pub fn page_request<'a>(
     next_token: Option<&str>,
     max_results: Option<i32>,
+    positions: impl IntoIterator<Item = &'a str>,
 ) -> Result<PageRequest, String> {
     let resume_at = match next_token {
         None | Some("") => None,
-        Some(token) if is_page_token_shape(token) => Some(token.to_string()),
-        Some(_) => return Err(INVALID_PAGE_TOKEN_MESSAGE.to_string()),
+        Some(token) => {
+            if !positions.into_iter().any(|position| position == token) {
+                return Err(INVALID_PAGE_TOKEN_MESSAGE.to_string());
+            }
+            Some(token.to_string())
+        }
     };
 
     // The boundary validator has already refused a `maxResults` outside `range 1..50`;

@@ -32,6 +32,9 @@ mod device_identity_validation;
 #[path = "all/endpoint.rs"]
 mod endpoint;
 
+#[path = "all/page_token_positions.rs"]
+mod page_token_positions;
+
 #[path = "all/parallel_runs.rs"]
 mod parallel_runs;
 
