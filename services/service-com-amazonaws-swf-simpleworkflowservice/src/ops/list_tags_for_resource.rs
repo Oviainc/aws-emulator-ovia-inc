@@ -3,11 +3,13 @@
 //! @op ListTagsForResource
 //!
 //! A pure read: it reports the tags stored on the ONE domain record whose own ARN is
-//! the requested `resourceArn`, and writes nothing. `RegisterDomain` is the writer it
-//! round-trips (`TagResource`/`UntagResource` are still scaffold stubs with their own
-//! issues), and an ARN that resolves to no stored domain is an `UnknownResourceFault`
-//! — the modelled fault for a resource "not found with in the scope of this operation
-//! (region or domain)".
+//! the requested `resourceArn`, and writes nothing. `RegisterDomain`, `TagResource` and
+//! `UntagResource` are the writers it round-trips, and an ARN that resolves to no stored
+//! domain is an `UnknownResourceFault` — the modelled fault for a resource "not found
+//! with in the scope of this operation (region or domain)".
+//!
+//! Every element it reports carries the awsJson type discriminator naming the
+//! `ResourceTag` shape beside the stored key and value.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -134,7 +136,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(domain) = guard.domain_by_arn(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(unknown_resource_message(&input.resource_arn)),
+                    message: Some(crate::state::unknown_domain_resource_message(
+                        &input.resource_arn,
+                    )),
                 },
             )
             .into());
@@ -142,23 +146,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Straight out of the stored record, in the order it was written: a domain
         // registered with no tags answers an empty list rather than an absent one, so a
-        // caller never has to tell "no tags" from "not reported".
+        // caller never has to tell "no tags" from "not reported". Each element carries
+        // the awsJson type discriminator naming its own shape, which is fixed text about
+        // the shape rather than anything of the tag or the resource.
         Ok(ListTagsForResourceOutput {
-            tags: Some(domain.tags.clone()),
+            tags: Some(
+                domain
+                    .tags
+                    .iter()
+                    .map(|stored| ResourceTag {
+                        __type: Some(RESOURCE_TAG_SHAPE_ID.to_string()),
+                        key: stored.key.clone(),
+                        value: stored.value.clone(),
+                    })
+                    .collect(),
+            ),
         })
     }
 }
 
-/// The `UnknownResourceFault` message for an ARN that names no stored domain.
-///
-/// Built from the request: when the ARN is a well-formed SWF domain ARN it names the
-/// domain the caller asked about, in the same `Unknown domain: <name>` form
-/// `DescribeDomain` answers for a name that was never registered. A string that is not
-/// a domain ARN of this service names no domain at all, so the message reports what
-/// was asked for instead.
-fn unknown_resource_message(resource_arn: &str) -> String {
-    match crate::state::domain_name_from_arn(resource_arn) {
-        Some(name) => format!("Unknown domain: {name}"),
-        None => format!("Unknown resource: {resource_arn}"),
-    }
-}
+/// The awsJson type discriminator every `ResourceTag` of a response carries: the id of
+/// the shape the element IS, as the service reports it.
+const RESOURCE_TAG_SHAPE_ID: &str = "com.amazonaws.swf.base.model#ResourceTag";

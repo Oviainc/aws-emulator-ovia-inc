@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Remove a tag from a Amazon SWF domain": the keys the request names are deleted from
+//! the ONE domain record whose own ARN is the requested `resourceArn`, so the next
+//! `ListTagsForResource` reads back the reduced set. A key the domain does not carry is
+//! nothing to remove, which is why removing it is not an error, and an ARN that resolves
+//! to no stored domain is an `UnknownResourceFault`, the modelled fault for a resource
+//! "not found with in the scope of this operation (region or domain)".
+//!
+//! `TagResource` is the writer it undoes and `ListTagsForResource` the reader it is
+//! observed through.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +160,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // The model declares no server fault for this operation, and
+            // `OperationNotPermittedFault` is this service's common error: the request
+            // cannot be served, and saying so with a modelled code beats a 501, which
+            // would claim the operation is unwritten.
+            UntagResourceErrorModeled::OperationNotPermittedFault(OperationNotPermittedFault {
+                message: Some("the SWF domain store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut guard = state.lock();
+        // The resource is addressed by its WHOLE ARN, the same way `TagResource` and
+        // `ListTagsForResource` resolve one: that is what scopes the lookup to the
+        // domain's region and account, so one region's ARN never untags a same-named
+        // domain registered in another.
+        let named = crate::state::domain_name_from_arn(&input.resource_arn).map(str::to_string);
+        let stored = named.and_then(|name| guard.domains.get_mut(&name));
+        let Some(domain) = stored.filter(|domain| domain.arn == input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::UnknownResourceFault(
+                UnknownResourceFault {
+                    message: Some(crate::state::unknown_domain_resource_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A tag is identified by its key, so the removal is keyed by key: every stored
+        // tag whose key the request names goes, the rest stay exactly as they are, and a
+        // key the domain does not carry removes nothing. Removing every key a domain
+        // carries leaves it with no tags at all rather than with an unreported set.
+        let removed: ::std::collections::BTreeSet<&str> =
+            input.tag_keys.iter().map(String::as_str).collect();
+        domain
+            .tags
+            .retain(|stored| !removed.contains(stored.key.as_str()));
+
+        Ok(UntagResourceOutput)
     }
 }

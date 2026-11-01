@@ -223,10 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::RunClose::Terminated {
                 reason: input.reason.clone(),
                 details: input.details.clone(),
-                // `cause` is set only when SWF terminated the run itself: "If set,
-                // indicates that the workflow execution was automatically terminated".
-                // This call is the caller's own, so it stays absent.
-                cause: None,
+                // `cause` names what terminated the run: this call is an operator's own,
+                // which is exactly the cause `WorkflowExecutionTerminatedCause` models
+                // for it, beside the service's own `CHILD_POLICY_APPLIED` and
+                // `EVENT_LIMIT_EXCEEDED`.
+                cause: Some(crate::state::TERMINATED_CAUSE_OPERATOR_INITIATED.to_string()),
                 child_policy: Some(child_policy),
             },
             closed_at,

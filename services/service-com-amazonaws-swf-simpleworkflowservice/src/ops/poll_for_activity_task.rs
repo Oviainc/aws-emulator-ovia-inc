@@ -323,11 +323,21 @@ fn answer_poll(
     // started and carries the worker's identity, and its own id is the `startedEventId`
     // this answer reports. Recording it takes the task out of the list, so a second poll
     // of the same list cannot be handed the same task.
+    //
+    // The id the event is about to take is read first, so the handle the service puts on
+    // THIS start is derived from the start's own identity.
+    let next_event_id = execution.next_event_id;
     let started_event_id = execution.append_event(
         now,
         crate::state::EventAttributes::ActivityTaskStarted(ActivityTaskStartedEventAttributes {
             identity: crate::state::non_empty(&input.identity),
             scheduled_event_id: waiting.scheduled_event_id,
+            client_token: Some(crate::state::task_start_client_token(
+                &input.domain,
+                &execution.workflow_id,
+                &execution.run_id,
+                next_event_id,
+            )),
         }),
     );
     // `latestActivityTaskTimestamp` is "The time when the last activity task was

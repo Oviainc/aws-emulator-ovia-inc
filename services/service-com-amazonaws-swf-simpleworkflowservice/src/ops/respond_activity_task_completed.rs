@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RespondActivityTaskCompleted
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RespondActivityTaskCompleted`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RespondActivityTaskCompleted::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A worker's terminal report that "the ActivityTask identified by the taskToken
+//! completed successfully with a result (if provided)": the `ActivityTaskCompleted` event
+//! is appended to the task's own run, the task leaves the run's open-activity-task count,
+//! and the decider is given a decision task carrying the result.
+//!
+//! "A task is closed after it has been specified in a call to
+//! RespondActivityTaskCompleted, RespondActivityTaskCanceled, RespondActivityTaskFailed,
+//! or the task has timed out", so exactly one terminal report per task is recorded and a
+//! handle on a task that is already closed — or whose run is — answers the modelled
+//! `UnknownResourceFault`. The close itself lives in
+//! [`crate::state::ComAmazonawsSwfSimpleworkflowserviceState::close_activity_task`],
+//! shared with the failed and canceled responses.
 //!
 //! ## Shape of an operation
 //!
@@ -174,20 +178,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RespondActivityTaskCompleted` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RespondActivityTaskCompletedErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RespondActivityTaskCompleted"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // The model declares no server fault for this operation, and
+            // `OperationNotPermittedFault` is this service's common error: the request
+            // cannot be served, and saying so with a modelled code beats a 501, which
+            // would claim the operation is unwritten.
+            RespondActivityTaskCompletedErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let reported_at = crate::state::now();
+        let mut guard = state.lock();
+        // The one place a worker's terminal report closes an activity task, shared with
+        // the failed and canceled responses: it resolves the token against the stored
+        // history, refuses a handle on a task that is no longer open, and records the
+        // `ActivityTaskCompleted` event, the open-task count and the decision task the
+        // decider needs in one move.
+        guard
+            .close_activity_task(
+                &input.task_token,
+                crate::state::ActivityTaskClose::Completed {
+                    // "The result of the activity task", recorded on the event exactly as
+                    // the worker reported it.
+                    result: input.result.clone(),
+                },
+                reported_at,
+            )
+            .map_err(|message| {
+                RespondActivityTaskCompletedErrorModeled::UnknownResourceFault(
+                    UnknownResourceFault {
+                        message: Some(message),
+                    },
+                )
+            })?;
+
+        Ok(RespondActivityTaskCompletedOutput)
     }
 }

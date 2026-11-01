@@ -223,8 +223,18 @@ async fn an_unattended_run_is_closed_by_the_service_when_its_budget_is_spent() {
             case.name,
             case.budget
         );
+        // The run was closed by the clock with its first decision task still scheduled
+        // and never answered, so that one task is still outstanding at the instant the
+        // run closed and stays counted ("The count of decision tasks whose status is
+        // OPEN"); nothing else of the run was ever in flight.
+        assert_eq!(
+            i64_at(&described, "/openCounts/openDecisionTasks"),
+            1,
+            "case {:?}: the decision task the run was closed without answering is still \
+             counted, got {described:?}",
+            case.name
+        );
         for counter in [
-            "openDecisionTasks",
             "openActivityTasks",
             "openTimers",
             "openChildWorkflowExecutions",
@@ -233,7 +243,7 @@ async fn an_unattended_run_is_closed_by_the_service_when_its_budget_is_spent() {
             assert_eq!(
                 i64_at(&described, &format!("/openCounts/{counter}")),
                 0,
-                "case {:?}: a closed run has no {counter}, got {described:?}",
+                "case {:?}: this run never had any {counter}, got {described:?}",
                 case.name
             );
         }

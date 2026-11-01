@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/activity_task_terminal_responses.rs"]
+mod activity_task_terminal_responses;
 #[path = "all/activity_type_lifecycle.rs"]
 mod activity_type_lifecycle;
 #[path = "all/activity_type_registration.rs"]
@@ -35,6 +37,10 @@ mod domain_tag_resource;
 mod domain_tagging;
 #[path = "all/domain_undeprecation.rs"]
 mod domain_undeprecation;
+#[path = "all/domain_untagging.rs"]
+mod domain_untagging;
+#[path = "all/execution_record_projection.rs"]
+mod execution_record_projection;
 #[path = "all/execution_start_to_close_timeout.rs"]
 mod execution_start_to_close_timeout;
 #[path = "all/list_activity_types.rs"]
@@ -61,6 +67,8 @@ mod signal_workflow_execution;
 mod state_roundtrip;
 #[path = "all/tag_resource_value_fidelity.rs"]
 mod tag_resource_value_fidelity;
+#[path = "all/task_start_event_members.rs"]
+mod task_start_event_members;
 #[path = "all/unknown_resource_messages.rs"]
 mod unknown_resource_messages;
 #[path = "all/workflow_execution_lifecycle.rs"]

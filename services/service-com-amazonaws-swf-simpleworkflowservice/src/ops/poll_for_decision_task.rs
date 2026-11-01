@@ -417,12 +417,29 @@ fn answer_poll(
             // the `startedEventId` this answer reports. Recording it takes the task
             // out of the list, so a second poll of the same list cannot be handed
             // the same task.
+            // The id the `DecisionTaskStarted` event is about to take, read before it is
+            // appended so the token minted for this start is derived from the start's own
+            // identity.
+            let next_event_id = execution.next_event_id;
             let started_event_id = execution.append_event(
                 now,
                 crate::state::EventAttributes::DecisionTaskStarted(
                     DecisionTaskStartedEventAttributes {
                         identity: crate::state::non_empty(&input.identity),
                         scheduled_event_id: waiting.scheduled_event_id,
+                        // The handle the service puts on THIS start of the task, derived
+                        // from the start's own identity so that reading the event back
+                        // reports the same token every time.
+                        client_token: Some(crate::state::task_start_client_token(
+                            &input.domain,
+                            &waiting.workflow_id,
+                            &waiting.run_id,
+                            next_event_id,
+                        )),
+                        // The task is being started by this poll, not handed over as a
+                        // continuation of the previous decision task's completion, which
+                        // is the one thing this member reports.
+                        started_on_previous_task_completion: false,
                     },
                 ),
             );

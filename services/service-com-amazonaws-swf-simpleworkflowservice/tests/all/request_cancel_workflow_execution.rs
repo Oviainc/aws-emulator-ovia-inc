@@ -287,8 +287,26 @@ async fn a_cancel_request_is_recorded_on_the_open_run_and_leaves_it_open() {
                 string_at(&closed, "/executionInfo/executionStatus"),
                 cancel_requested(&closed)
             ),
-            ("CLOSED".to_string(), true),
-            "case {:?}: closing the run keeps the recorded cancel request, got {closed:?}",
+            ("CLOSED".to_string(), false),
+            "case {:?}: `cancelRequested` reports a cancellation still outstanding against \
+             a running execution, so a run that is no longer OPEN reports none, got \
+             {closed:?}",
+            case.name
+        );
+        // What the run was ASKED is history, and history does not change when the run
+        // closes: the cancel-requested event the request recorded is still there.
+        let events_closed = whole_history(&emulator, &domain, &case.workflow_id, &run_id).await;
+        assert_eq!(
+            events_closed
+                .iter()
+                .filter(|event| event
+                    .pointer("/eventType")
+                    .and_then(Value::as_str)
+                    .is_some_and(|event_type| event_type == "WorkflowExecutionCancelRequested"))
+                .count(),
+            1,
+            "case {:?}: the cancel-requested event stays in the closed run's history, \
+             got {events_closed:?}",
             case.name
         );
         // A closed run is no longer a "currently running workflow execution", by either

@@ -332,8 +332,9 @@ async fn the_count_is_the_number_of_decision_tasks_waiting_in_the_named_task_lis
          open seeded runs, got {total}"
     );
 
-    // Counting moved nothing: every seeded run keeps the status it had, and an open run
-    // still reports its one open decision task.
+    // Counting moved nothing: every seeded run keeps the status it had, and its one
+    // decision task — which no decider ever answered, not even on the runs that were
+    // terminated — is still outstanding.
     for (run, (_, run_id)) in SEEDED.iter().zip(&run_ids) {
         let described = emulator.describe("pending", run.workflow_id, run_id).await;
         let expected_status = if run.terminated { "CLOSED" } else { "OPEN" };
@@ -350,9 +351,8 @@ async fn the_count_is_the_number_of_decision_tasks_waiting_in_the_named_task_lis
             .pointer("/openCounts/openDecisionTasks")
             .and_then(Value::as_i64)
             .unwrap_or(-1);
-        let expected_open = i64::from(!run.terminated);
         assert_eq!(
-            open_decision_tasks, expected_open,
+            open_decision_tasks, 1,
             "case {:?}: counting must not consume a run's decision task, got {described:?}",
             run.workflow_id
         );

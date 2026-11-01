@@ -213,7 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(domain) = stored.filter(|domain| domain.arn == input.resource_arn) else {
             return Err(TagResourceErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(unknown_resource_message(&input.resource_arn)),
+                    message: Some(crate::state::unknown_domain_resource_message(
+                        &input.resource_arn,
+                    )),
                 },
             )
             .into());
@@ -260,17 +262,5 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         domain.tags = merged;
 
         Ok(TagResourceOutput)
-    }
-}
-
-/// The `UnknownResourceFault` message for an ARN that names no stored domain.
-///
-/// Built from the request, in the same form the sibling tag read answers with: a
-/// well-formed SWF domain ARN names the domain the caller asked about, and a string that
-/// is not one names no domain at all, so the message reports what was asked for.
-fn unknown_resource_message(resource_arn: &str) -> String {
-    match crate::state::domain_name_from_arn(resource_arn) {
-        Some(name) => format!("Unknown domain: {name}"),
-        None => format!("Unknown resource: {resource_arn}"),
     }
 }

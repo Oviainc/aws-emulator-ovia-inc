@@ -464,13 +464,10 @@ async fn the_count_is_the_number_of_activity_tasks_waiting_in_the_named_task_lis
             .pointer("/openCounts/openActivityTasks")
             .and_then(Value::as_i64)
             .unwrap_or(-1);
-        // Closing a run clears its open counts, so only a still-open run reports the
-        // tasks it scheduled.
-        let scheduled: usize = if run.terminated {
-            0
-        } else {
-            run.scheduled.iter().map(|(_, count)| *count).sum()
-        };
+        // The counter reports the tasks of this run whose own status is OPEN, and closing
+        // the run closed none of them: every task it scheduled and nobody closed is still
+        // counted, terminated run or not.
+        let scheduled: usize = run.scheduled.iter().map(|(_, count)| *count).sum();
         assert_eq!(
             open_activity_tasks,
             i64::try_from(scheduled).expect("a seeded count fits an i64"),

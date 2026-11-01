@@ -1013,6 +1013,10 @@ fn schedule_activity_task(
     execution.append_event(
         at,
         EventAttributes::ActivityTaskScheduled(Box::new(ActivityTaskScheduledEventAttributes {
+            // An ordinary `ScheduleActivityTask` decision schedules the task INTO its
+            // task list, where it waits for a worker to poll for it, so it is not one the
+            // service started immediately.
+            immediately_start: false,
             activity_type: attributes.activity_type.clone(),
             activity_id: attributes.activity_id.clone(),
             input: attributes.input.clone(),

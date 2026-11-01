@@ -1303,10 +1303,10 @@ async fn history_records_the_seeded_and_appended_events() {
          child policy, got {terminated:?}"
     );
     assert_eq!(
-        terminated.pointer("/cause"),
-        None,
-        "case \"history\": `cause` is set only when SWF terminated the run itself, \
-         got {terminated:?}"
+        terminated.pointer("/cause").and_then(Value::as_str),
+        Some("OPERATOR_INITIATED"),
+        "case \"history\": `cause` names what terminated the run, which for an operator's \
+         own TerminateWorkflowExecution call is OPERATOR_INITIATED, got {terminated:?}"
     );
 }
 
@@ -1703,8 +1703,9 @@ async fn terminate_closes_the_stored_run_and_is_not_repeatable() {
         );
         assert_eq!(
             i64_at(&described, "/openCounts/openDecisionTasks"),
-            0,
-            "case {:?}: terminating clears the open decision task, got {described:?}",
+            1,
+            "case {:?}: terminating does not answer the decision task the run was started \
+             with, so that task is still outstanding and still counted, got {described:?}",
             case.name
         );
 

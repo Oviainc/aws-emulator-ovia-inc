@@ -15,6 +15,7 @@ use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     ActivityTaskCancelRequestedEventAttributes, ActivityTaskCanceledEventAttributes,
+    ActivityTaskCompletedEventAttributes, ActivityTaskFailedEventAttributes,
     ActivityTaskScheduledEventAttributes, ActivityTaskStartedEventAttributes,
     ActivityTaskTimedOutEventAttributes, ActivityType, ActivityTypeConfiguration, ActivityTypeInfo,
     CancelTimerFailedEventAttributes, CancelWorkflowExecutionFailedEventAttributes,
@@ -145,6 +146,11 @@ pub const MIN_TASK_SPAN: Duration = MIN_OPEN_EXECUTION_SPAN;
 /// the run because its history reached [`MAX_HISTORY_EVENTS_PER_EXECUTION`]. One of
 /// [`crate::ops::types::WORKFLOW_EXECUTION_TERMINATED_CAUSE_VALUES`].
 pub const TERMINATED_CAUSE_EVENT_LIMIT_EXCEEDED: &str = "EVENT_LIMIT_EXCEEDED";
+
+/// The `cause` a `WorkflowExecutionTerminated` event carries when an operator's own
+/// `TerminateWorkflowExecution` call closed the run. One of
+/// [`crate::ops::types::WORKFLOW_EXECUTION_TERMINATED_CAUSE_VALUES`].
+pub const TERMINATED_CAUSE_OPERATOR_INITIATED: &str = "OPERATOR_INITIATED";
 
 /// How many history events one workflow execution holds. Amazon SWF Quotas records a
 /// maximum of 25,000 events per workflow execution history, and an execution that
@@ -281,6 +287,18 @@ pub const DURATION_NONE: &str = "NONE";
 /// (-2147483648) to Integer.MAX_VALUE (2147483647). Higher numbers indicate higher
 /// priority." Amazon SWF documents 0 as the default priority.
 pub const DEFAULT_TASK_PRIORITY: i64 = 0;
+
+/// The `reopenGenerationId` of a workflow execution that has never been reopened, and
+/// so of every run this service stores: no operation it models reopens a closed run.
+pub const FIRST_RUN_GENERATION: i64 = 0;
+
+/// What separates a task-start `clientToken`'s digest from the task tokens derived over
+/// the same identity ([`task_token`]), so the handle the service keeps on a start is
+/// never also the handle it hands the worker.
+const CLIENT_TOKEN_TAG: &str = "client-token";
+
+/// The lengths of the five hex groups of a canonical UUID, in order.
+const UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
 
 /// A registered workflow type, as `RegisterWorkflowType` left it. The `default_*`
 /// members are what `StartWorkflowExecution` falls back to when the start request
@@ -515,6 +533,8 @@ pub enum EventAttributes {
     ActivityTaskTimedOut(ActivityTaskTimedOutEventAttributes),
     ActivityTaskCancelRequested(ActivityTaskCancelRequestedEventAttributes),
     ActivityTaskCanceled(ActivityTaskCanceledEventAttributes),
+    ActivityTaskCompleted(ActivityTaskCompletedEventAttributes),
+    ActivityTaskFailed(ActivityTaskFailedEventAttributes),
     RequestCancelActivityTaskFailed(RequestCancelActivityTaskFailedEventAttributes),
     MarkerRecorded(MarkerRecordedEventAttributes),
     TimerStarted(TimerStartedEventAttributes),
@@ -578,6 +598,10 @@ pub struct EventEffect {
     pub activity_task_left_task_list: Option<i64>,
     /// The `scheduledEventId` of the activity task this event takes out of flight.
     pub activity_task_closed: Option<i64>,
+    /// Whether this event is the one that CLOSED the run: the single event each way of
+    /// closing records. It is what [`Execution::closing_event`] finds, and so what
+    /// `WorkflowExecutionInfo`'s `lastClosedEventId`/`lastClosedTimestamp` report.
+    pub closes_run: bool,
     /// The `startedEventId` of the timer this event takes out of flight: it fired or
     /// it was cancelled.
     pub timer_closed: Option<i64>,
@@ -605,6 +629,8 @@ impl EventAttributes {
             Self::ActivityTaskTimedOut(_) => "ActivityTaskTimedOut",
             Self::ActivityTaskCancelRequested(_) => "ActivityTaskCancelRequested",
             Self::ActivityTaskCanceled(_) => "ActivityTaskCanceled",
+            Self::ActivityTaskCompleted(_) => "ActivityTaskCompleted",
+            Self::ActivityTaskFailed(_) => "ActivityTaskFailed",
             Self::RequestCancelActivityTaskFailed(_) => "RequestCancelActivityTaskFailed",
             Self::MarkerRecorded(_) => "MarkerRecorded",
             Self::TimerStarted(_) => "TimerStarted",
@@ -702,6 +728,20 @@ impl EventAttributes {
                 needs_decision: true,
                 ..Default::default()
             },
+            // A worker's own terminal report closes the task it was handed, and the
+            // decider has to see the result it reported.
+            Self::ActivityTaskCompleted(completed) => EventEffect {
+                activity_task_left_task_list: Some(completed.scheduled_event_id),
+                activity_task_closed: Some(completed.scheduled_event_id),
+                needs_decision: true,
+                ..Default::default()
+            },
+            Self::ActivityTaskFailed(failed) => EventEffect {
+                activity_task_left_task_list: Some(failed.scheduled_event_id),
+                activity_task_closed: Some(failed.scheduled_event_id),
+                needs_decision: true,
+                ..Default::default()
+            },
             Self::TimerFired(fired) => EventEffect {
                 timer_closed: Some(fired.started_event_id),
                 needs_decision: true,
@@ -743,6 +783,17 @@ impl EventAttributes {
                 needs_decision: true,
                 ..Default::default()
             },
+            // The one event each way of closing a run records: nothing of the run is in
+            // flight afterwards, and there is no decider left to tell.
+            Self::WorkflowExecutionCompleted(_)
+            | Self::WorkflowExecutionFailed(_)
+            | Self::WorkflowExecutionCanceled(_)
+            | Self::WorkflowExecutionContinuedAsNew(_)
+            | Self::WorkflowExecutionTerminated(_)
+            | Self::WorkflowExecutionTimedOut(_) => EventEffect {
+                closes_run: true,
+                ..Default::default()
+            },
             // Everything else either starts work the decider is now waiting on, or
             // records what has already happened to the run as a whole.
             Self::WorkflowExecutionStarted(_)
@@ -751,12 +802,6 @@ impl EventAttributes {
             | Self::ActivityTaskCancelRequested(_)
             | Self::MarkerRecorded(_)
             | Self::TimerStarted(_)
-            | Self::WorkflowExecutionCompleted(_)
-            | Self::WorkflowExecutionFailed(_)
-            | Self::WorkflowExecutionCanceled(_)
-            | Self::WorkflowExecutionContinuedAsNew(_)
-            | Self::WorkflowExecutionTerminated(_)
-            | Self::WorkflowExecutionTimedOut(_)
             | Self::StartChildWorkflowExecutionInitiated(_)
             | Self::ChildWorkflowExecutionStarted(_)
             | Self::SignalExternalWorkflowExecutionInitiated(_)
@@ -835,6 +880,12 @@ impl HistoryEventRecord {
             }
             EventAttributes::ActivityTaskCanceled(attributes) => {
                 event.activity_task_canceled_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::ActivityTaskCompleted(attributes) => {
+                event.activity_task_completed_event_attributes = Some(attributes.clone());
+            }
+            EventAttributes::ActivityTaskFailed(attributes) => {
+                event.activity_task_failed_event_attributes = Some(attributes.clone());
             }
             EventAttributes::RequestCancelActivityTaskFailed(attributes) => {
                 event.request_cancel_activity_task_failed_event_attributes =
@@ -1326,6 +1377,7 @@ impl Execution {
     /// The `WorkflowExecutionInfo` every execution reader returns, built from what is
     /// stored.
     pub fn info(&self) -> WorkflowExecutionInfo {
+        let closed_by = self.closing_event();
         WorkflowExecutionInfo {
             execution: self.execution(),
             workflow_type: WorkflowType {
@@ -1340,12 +1392,49 @@ impl Execution {
             // `StartChildWorkflowExecution` decision did.
             parent: self.parent.clone(),
             tag_list: (!self.tag_list.is_empty()).then(|| self.tag_list.clone()),
-            cancel_requested: self.cancel_requested,
+            // "Set to true if a cancellation is REQUESTED for this workflow execution":
+            // the flag reports a request still outstanding against a running execution,
+            // so a run that is no longer OPEN has none outstanding whatever was asked of
+            // it while it ran.
+            cancel_requested: self.cancel_requested && self.is_open(),
+            // The event that closed the run and the instant that event was stamped at. A
+            // run that is still open has closed at no event, which the member's own
+            // modelled default of `0` reports, and at no instant at all.
+            last_closed_event_id: closed_by.map_or(0, |event| event.event_id),
+            last_closed_timestamp: closed_by.map(|event| event.event_timestamp),
+            // Reopening a closed run is not an operation this service models, so no
+            // stored run has ever been reopened: every one of them is on its first
+            // generation, and none of them is reopenable.
+            reopen_generation_id: FIRST_RUN_GENERATION,
+            reopenable: false,
         }
+    }
+
+    /// The history event that CLOSED this run — the one event the close recorded (see
+    /// [`EventEffect::closes_run`]) — when this run has closed at all.
+    ///
+    /// Read off the stored history rather than kept beside it, so the id and the instant
+    /// `WorkflowExecutionInfo` reports can never disagree with the event itself. A run
+    /// that is still OPEN has recorded no such event, and answers without walking its
+    /// history at all.
+    pub fn closing_event(&self) -> Option<&HistoryEventRecord> {
+        if self.is_open() {
+            return None;
+        }
+        self.history
+            .iter()
+            .rev()
+            .find(|event| event.attributes.effect().closes_run)
     }
 
     /// The `WorkflowExecutionOpenCounts` `DescribeWorkflowExecution` reports, counted
     /// from this run's live state.
+    ///
+    /// Each counter is the work of this run whose own status is OPEN —
+    /// `openActivityTasks` is "The count of activity tasks whose status is OPEN" — so the
+    /// event that closes one piece of work is what takes it out of its counter. Closing
+    /// the RUN takes nothing out: a decision task scheduled and never answered is still
+    /// outstanding at the instant the run closed, and is still reported.
     pub fn open_counts(&self) -> WorkflowExecutionOpenCounts {
         WorkflowExecutionOpenCounts {
             open_activity_tasks: self.open_activity_tasks,
@@ -1399,8 +1488,7 @@ impl Execution {
     }
 
     /// Close this run as `close` describes, as of `at`: the one close event that kind of
-    /// close records, `executionStatus=CLOSED` with the matching `closeStatus`, and
-    /// nothing left in flight.
+    /// close records, and `executionStatus=CLOSED` with the matching `closeStatus`.
     ///
     /// Reached only through [`Domain::close_run`], which is what also drops the run from
     /// its domain's open-run index and tells its parent run; closing it here alone would
@@ -1409,11 +1497,11 @@ impl Execution {
         self.status = EXECUTION_STATUS_CLOSED.to_string();
         self.close_status = Some(close.close_status().to_string());
         self.close_timestamp = Some(at);
-        self.open_decision_tasks = 0;
-        self.open_activity_tasks = 0;
-        self.open_timers = 0;
-        self.open_child_executions = 0;
-        self.open_lambda_functions = 0;
+        // The open counts are NOT cleared here: each of them counts the work of this run
+        // whose own status is OPEN (`openActivityTasks` is "The count of activity tasks
+        // whose status is OPEN"), and the event that closes one piece of work is what
+        // takes it out of its counter. A decision task scheduled and never answered is
+        // still outstanding at the instant the run closes, so it stays counted.
         let child_policy = self.effective_config.child_policy.clone();
         self.append_event(at, close.event(child_policy));
     }
@@ -1609,6 +1697,39 @@ impl Execution {
             .any(|(_, started, _)| *started == started_event_id)
     }
 
+    /// The `eventId` of the last `ActivityTaskCancelRequested` event recorded for the
+    /// activity task scheduled by `scheduled_event_id`, which is what
+    /// `ActivityTaskCanceled`'s own `latestCancelRequestedEventId` reports ("If set,
+    /// contains the ID of the last `ActivityTaskCancelRequested` event recorded for this
+    /// activity task"); `0` — the `EventId` member's own modelled default — when a worker
+    /// cancelled a task nobody had asked it to.
+    ///
+    /// Only the events of THIS task's lifetime count: a run may schedule the same
+    /// `activityId` again once the earlier task has closed, so the search stops at the
+    /// scheduling event of the task being closed and a request made against an earlier
+    /// task of the same id is not attributed to this one.
+    pub fn latest_cancel_requested_event_id(&self, scheduled_event_id: i64) -> i64 {
+        let Some(activity_id) = self
+            .scheduled_activity_task(scheduled_event_id)
+            .map(|scheduled| scheduled.activity_id.clone())
+        else {
+            return 0;
+        };
+        self.history
+            .iter()
+            .rev()
+            .take_while(|event| event.event_id > scheduled_event_id)
+            .find_map(|event| match &event.attributes {
+                EventAttributes::ActivityTaskCancelRequested(requested)
+                    if requested.activity_id == activity_id =>
+                {
+                    Some(event.event_id)
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
     /// The `ActivityTaskScheduled` attributes of the task scheduled by event
     /// `scheduled_event_id`, when this run's history holds one.
     pub fn scheduled_activity_task(
@@ -1801,13 +1922,18 @@ impl Execution {
             start_to_close_timeout: Some(
                 self.effective_config.task_start_to_close_timeout.clone(),
             ),
-            // A decision task carries a schedule-to-start timeout only while a
-            // temporary task-list override is in force; that timeout is the override's
-            // own (`taskListScheduleToStartTimeout`).
-            schedule_to_start_timeout: self
-                .task_list_override
-                .as_ref()
-                .map(|override_| override_.schedule_to_start_timeout.clone()),
+            // A decision task's schedule-to-start bound is the one a temporary task-list
+            // override carries (`taskListScheduleToStartTimeout`) while that override is
+            // in force. With no override in force the task waits for a decider for as
+            // long as it takes, which is what SWF's unlimited-duration sentinel says.
+            schedule_to_start_timeout: Some(
+                self.task_list_override
+                    .as_ref()
+                    .map_or_else(
+                        || DURATION_NONE.to_string(),
+                        |override_| override_.schedule_to_start_timeout.clone(),
+                    ),
+            ),
         };
         let event_id = self.append_event(at, EventAttributes::DecisionTaskScheduled(attributes));
         self.open_decision_tasks = 1;
@@ -2303,9 +2429,11 @@ impl Domain {
     /// so only this domain's runs contribute, and a list no decision task was ever
     /// scheduled in holds none.
     ///
-    /// Only an OPEN run has tasks in the list: closing a run drops whatever decision
-    /// tasks it had waiting, which is the same reason
-    /// `DescribeWorkflowExecution` reports no open decision task for a closed run.
+    /// Only an OPEN run has tasks in the list: a closed run hands nothing to a decider,
+    /// so whatever it had waiting is no longer PENDING in the list. That is a different
+    /// question from `DescribeWorkflowExecution`'s `openCounts`, which reports the work of
+    /// the run whose own status is open and so still counts a decision task the run was
+    /// closed without ever answering.
     pub fn pending_decision_tasks_on(&self, task_list: &str) -> usize {
         self.executions
             .values()
@@ -2891,6 +3019,133 @@ impl ComAmazonawsSwfSimpleworkflowserviceState {
             domain.materialise_due_timeouts(at);
         }
     }
+
+    /// Record a worker's TERMINAL report about the activity task `token` is the handle
+    /// on, as of `at`: the one event that report records, the task out of its run's
+    /// open-activity-task count, and a decision task for the decider that is waiting on
+    /// the result.
+    ///
+    /// The ONE place an activity task closes on a worker's own report, shared by
+    /// `RespondActivityTaskCompleted`, `RespondActivityTaskFailed` and
+    /// `RespondActivityTaskCanceled` — the three calls the task's own doc names: "A task
+    /// is closed after it has been specified in a call to RespondActivityTaskCompleted,
+    /// RespondActivityTaskCanceled, RespondActivityTaskFailed, or the task has timed
+    /// out." Exactly one of them can win, because the first one recorded closes the task
+    /// and a handle on a closed task addresses nothing.
+    ///
+    /// `Err` carries the `UnknownResourceFault` message for a token that addresses no
+    /// OPEN activity task — one already closed, timed out, belonging to a run that has
+    /// closed, or not an activity task token at all — which each caller reports as its
+    /// own modelled fault. Nothing is written in that case.
+    pub fn close_activity_task(
+        &mut self,
+        token: &str,
+        close: ActivityTaskClose,
+        at: DateTime,
+    ) -> Result<(), String> {
+        let Some(handle) = activity_task_by_token(self, token) else {
+            // The token names no `ActivityTaskStarted` event of any stored run, so there
+            // is no scheduling event of this service's state behind it either.
+            return Err(unknown_activity_message(0));
+        };
+        let unknown = unknown_activity_message(handle.scheduled_event_id);
+        // The service's own sweeps first: a task the clock timed out, or a run it closed,
+        // was over at its own instant whether or not this worker called, so a report that
+        // lost that race is refused instead of being recorded into a history that moved
+        // on.
+        self.materialise_due_timeouts_in(&handle.domain, at);
+        let Some(domain) = self.domains.get_mut(&handle.domain) else {
+            return Err(unknown);
+        };
+        let key = (handle.workflow_id.clone(), handle.run_id.clone());
+        let Some(execution) = domain.executions.get_mut(&key) else {
+            return Err(unknown);
+        };
+        if !execution.is_open() || !execution.activity_task_is_outstanding(handle.started_event_id)
+        {
+            return Err(unknown);
+        }
+        // The report and the decision task that tells the decider about it are two
+        // events, and a run with no room for them has reached the history quota: it is
+        // terminated by the service rather than grown past the bound, and the token it
+        // held is then a handle on a closed task.
+        if !execution.has_history_room_for(2) {
+            domain.close_run(&key, RunClose::event_limit_exceeded(), at);
+            return Err(unknown);
+        }
+        let latest_cancel_requested_event_id =
+            execution.latest_cancel_requested_event_id(handle.scheduled_event_id);
+        execution.append_event(
+            at,
+            close.event(
+                handle.scheduled_event_id,
+                handle.started_event_id,
+                latest_cancel_requested_event_id,
+            ),
+        );
+        // `openActivityTasks` is "The count of activity tasks whose status is OPEN", and
+        // this report is what took this one out of flight.
+        execution.open_activity_tasks = execution.open_activity_tasks.saturating_sub(1);
+        // The decider has to act on the result, and the decision task scheduled here is
+        // what carries it to one.
+        execution.schedule_decision_task_if_idle(at);
+        Ok(())
+    }
+}
+
+/// The terminal report a worker makes about ONE activity task it was handed: the three
+/// ways an activity task closes on its worker's own say-so, one per `Respond*` call.
+#[derive(Debug, Clone)]
+pub enum ActivityTaskClose {
+    /// `RespondActivityTaskCompleted`: "the ActivityTask identified by the taskToken
+    /// completed successfully with a result".
+    Completed { result: Option<String> },
+    /// `RespondActivityTaskFailed`: "the ActivityTask identified by the taskToken has
+    /// failed with reason (if specified)".
+    Failed {
+        reason: Option<String>,
+        details: Option<String>,
+    },
+    /// `RespondActivityTaskCanceled`: "the ActivityTask identified by the taskToken was
+    /// successfully canceled".
+    Canceled { details: Option<String> },
+}
+
+impl ActivityTaskClose {
+    /// The one history event this report records, naming the task it closes by the two
+    /// events that scheduled and started it.
+    fn event(
+        self,
+        scheduled_event_id: i64,
+        started_event_id: i64,
+        latest_cancel_requested_event_id: i64,
+    ) -> EventAttributes {
+        match self {
+            Self::Completed { result } => {
+                EventAttributes::ActivityTaskCompleted(ActivityTaskCompletedEventAttributes {
+                    result,
+                    scheduled_event_id,
+                    started_event_id,
+                })
+            }
+            Self::Failed { reason, details } => {
+                EventAttributes::ActivityTaskFailed(ActivityTaskFailedEventAttributes {
+                    reason,
+                    details,
+                    scheduled_event_id,
+                    started_event_id,
+                })
+            }
+            Self::Canceled { details } => {
+                EventAttributes::ActivityTaskCanceled(ActivityTaskCanceledEventAttributes {
+                    details,
+                    scheduled_event_id,
+                    started_event_id,
+                    latest_cancel_requested_event_id,
+                })
+            }
+        }
+    }
 }
 
 /// The resource portion of a domain ARN, before the domain's own name. SWF's domain
@@ -2983,6 +3238,87 @@ pub fn unknown_execution_message(workflow_id: &str, run_id: &str) -> String {
     format!("Unknown execution: WorkflowExecution=[workflowId={workflow_id}, runId={run_id}]")
 }
 
+/// The `UnknownResourceFault` message for an ARN that names no stored domain of this
+/// service, shared by the three tag operations that address a domain by its ARN.
+///
+/// Built from the request: when the ARN is a well-formed SWF domain ARN it names the
+/// domain the caller asked about, in the same `Unknown domain: <name>` form
+/// `DescribeDomain` answers for a name that was never registered. A string that is not a
+/// domain ARN of this service names no domain at all, so the message reports what was
+/// asked for instead.
+pub fn unknown_domain_resource_message(resource_arn: &str) -> String {
+    match domain_name_from_arn(resource_arn) {
+        Some(name) => format!("Unknown domain: {name}"),
+        None => format!("Unknown resource: {resource_arn}"),
+    }
+}
+
+/// The `UnknownResourceFault` message for an activity task a worker's terminal response
+/// addresses and that is no longer open: `Unknown activity, scheduledEventId = <id>`.
+///
+/// The id is the `scheduledEventId` of the task the token names, taken from the stored
+/// history; a token that names no activity task of any stored run names no scheduling
+/// event either, and reports the `EventId` member's own modelled default of `0`.
+pub fn unknown_activity_message(scheduled_event_id: i64) -> String {
+    format!("Unknown activity, scheduledEventId = {scheduled_event_id}")
+}
+
+/// One activity task an activity `taskToken` is the handle on, as the stored history
+/// records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityTaskHandle {
+    pub domain: String,
+    pub workflow_id: String,
+    pub run_id: String,
+    /// The `eventId` of the `ActivityTaskScheduled` event that put the task in its list.
+    pub scheduled_event_id: i64,
+    /// The `eventId` of the `ActivityTaskStarted` event that handed it to a worker, which
+    /// is the identity the token is derived from.
+    pub started_event_id: i64,
+}
+
+/// The activity task `token` is the handle on, whether or not that task is still open.
+///
+/// The token is derived from `(domain, workflowId, runId, startedEventId)`
+/// ([`activity_task_token`]), so the stored `ActivityTaskStarted` events ARE the record of
+/// which tokens were ever minted: a handle on a task that has since closed or timed out
+/// still resolves here, which is what lets a worker's late response be refused naming the
+/// task it was holding rather than nothing at all. Whether the task is still open is a
+/// separate question, answered by [`Execution::activity_task_is_outstanding`].
+pub fn activity_task_by_token(
+    guard: &ComAmazonawsSwfSimpleworkflowserviceState,
+    token: &str,
+) -> Option<ActivityTaskHandle> {
+    guard.domains.iter().find_map(|(name, domain)| {
+        domain.executions.values().find_map(|execution| {
+            execution
+                .history
+                .iter()
+                .filter_map(|event| match &event.attributes {
+                    EventAttributes::ActivityTaskStarted(started) => {
+                        Some((event.event_id, started.scheduled_event_id))
+                    }
+                    _ => None,
+                })
+                .find(|(started_event_id, _)| {
+                    activity_task_token(
+                        name,
+                        &execution.workflow_id,
+                        &execution.run_id,
+                        *started_event_id,
+                    ) == token
+                })
+                .map(|(started_event_id, scheduled_event_id)| ActivityTaskHandle {
+                    domain: name.clone(),
+                    workflow_id: execution.workflow_id.clone(),
+                    run_id: execution.run_id.clone(),
+                    scheduled_event_id,
+                    started_event_id,
+                })
+        })
+    })
+}
+
 /// The region this request was signed for, defaulting to [`DEFAULT_REGION`] when the
 /// request carries no SigV4 credential scope.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
@@ -3073,6 +3409,59 @@ fn task_token(
     digest.update([0u8]);
     digest.update(started_event_id.to_be_bytes());
     ::hex::encode(digest.finalize())
+}
+
+/// The `clientToken` a `DecisionTaskStarted` or `ActivityTaskStarted` event carries: the
+/// service's own handle on ONE start of one task, in the UUID form AWS reports it in.
+///
+/// Derived from the identity of that start — `(domain, workflowId, runId, the eventId the
+/// started event takes)` — so the token is minted once, stays with the stored event, and
+/// reads back the same however often the history is paged; two starts never share one,
+/// because no two events of a run share an `eventId`, whichever kind of task they handed
+/// over. Deriving it from a digest (the same `sha2` hash the run ids and task tokens are
+/// built from, and the hash RFC 4122's name-based form prescribes) is what makes it opaque
+/// to the caller: nothing of the request can be recovered from it.
+///
+/// The 16 digest bytes are laid out as a name-based UUID: the version nibble carries `5`
+/// and the variant bits `0b10`, as RFC 4122 §4.3 defines for a UUID derived from a name
+/// rather than from a clock or a random source.
+pub fn task_start_client_token(
+    domain: &str,
+    workflow_id: &str,
+    run_id: &str,
+    started_event_id: i64,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(CLIENT_TOKEN_TAG.as_bytes());
+    digest.update([0u8]);
+    digest.update(domain.as_bytes());
+    digest.update([0u8]);
+    digest.update(workflow_id.as_bytes());
+    digest.update([0u8]);
+    digest.update(run_id.as_bytes());
+    digest.update([0u8]);
+    digest.update(started_event_id.to_be_bytes());
+
+    let mut bytes = [0u8; 16];
+    for (slot, byte) in bytes.iter_mut().zip(digest.finalize()) {
+        *slot = byte;
+    }
+    if let Some(version) = bytes.get_mut(6) {
+        *version = (*version & 0x0f) | 0x50;
+    }
+    if let Some(variant) = bytes.get_mut(8) {
+        *variant = (*variant & 0x3f) | 0x80;
+    }
+
+    // The canonical 8-4-4-4-12 grouping of the 32 hex digits, taken off the encoder in
+    // order so no index can run past it.
+    let encoded = ::hex::encode(bytes);
+    let mut digits = encoded.chars();
+    let groups: Vec<String> = UUID_GROUP_LENGTHS
+        .iter()
+        .map(|length| digits.by_ref().take(*length).collect())
+        .collect();
+    groups.join("-")
 }
 
 /// Which page of which decision task's history a `PollForDecisionTask` `nextPageToken`

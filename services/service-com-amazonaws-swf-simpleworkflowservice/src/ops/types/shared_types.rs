@@ -130,6 +130,21 @@ pub struct WorkflowExecution {
 #[smithy_macros::smithy(shape = "com.amazonaws.swf#WorkflowExecutionInfo")]
 #[derive(Debug, Clone)]
 pub struct WorkflowExecutionInfo {
+    /// The `eventId` of the history event that closed the run, `0` while it is OPEN. The
+    /// member was added to this service's on-disk model from the recorded AWS responses —
+    /// the shipped model snapshot carries no such member on this shape, while AWS reports
+    /// it on every `WorkflowExecutionInfo` it returns — and its value is projected by
+    /// [`crate::state::Execution::info`], the one place a stored run becomes this shape.
+    pub last_closed_event_id: i64,
+    /// When the run closed, absent while it is OPEN. Added to the on-disk model for the
+    /// same reason as `last_closed_event_id`.
+    pub last_closed_timestamp: Option<::aws_smithy_types::DateTime>,
+    /// How many times the run has been reopened. Added to the on-disk model for the same
+    /// reason as `last_closed_event_id`.
+    pub reopen_generation_id: i64,
+    /// Whether the run may be reopened. Added to the on-disk model for the same reason as
+    /// `last_closed_event_id`.
+    pub reopenable: bool,
     pub execution: WorkflowExecution,
     pub workflow_type: WorkflowType,
     pub start_timestamp: ::aws_smithy_types::DateTime,
@@ -332,6 +347,16 @@ pub struct DecisionTaskScheduledEventAttributes {
 #[smithy_macros::smithy(shape = "com.amazonaws.swf#DecisionTaskStartedEventAttributes")]
 #[derive(Debug, Clone, Default)]
 pub struct DecisionTaskStartedEventAttributes {
+    /// The opaque, service-generated token identifying this start of the decision task.
+    /// The member was added to this service's on-disk model from the recorded AWS
+    /// responses — the shipped model snapshot carries no such member on this shape, while
+    /// AWS reports it on every `DecisionTaskStarted` event — and its value is minted once,
+    /// when the start is recorded, by the handler of `PollForDecisionTask`.
+    pub client_token: Option<String>,
+    /// Whether this decision task was started as a continuation of the previous decision
+    /// task's completion rather than in answer to a poll. Added to the on-disk model for
+    /// the same reason as `client_token`.
+    pub started_on_previous_task_completion: bool,
     pub identity: Option<String>,
     pub scheduled_event_id: i64,
 }
@@ -357,6 +382,11 @@ pub struct DecisionTaskTimedOutEventAttributes {
 #[smithy_macros::smithy(shape = "com.amazonaws.swf#ActivityTaskScheduledEventAttributes")]
 #[derive(Debug, Clone, Default)]
 pub struct ActivityTaskScheduledEventAttributes {
+    /// Whether this activity task was scheduled for immediate start rather than to wait in
+    /// its task list. The member was added to this service's on-disk model from the
+    /// recorded AWS responses — the shipped model snapshot carries no such member on this
+    /// shape, while AWS reports it on every `ActivityTaskScheduled` event.
+    pub immediately_start: bool,
     pub activity_type: ActivityType,
     pub activity_id: String,
     pub input: Option<String>,
@@ -373,6 +403,12 @@ pub struct ActivityTaskScheduledEventAttributes {
 #[smithy_macros::smithy(shape = "com.amazonaws.swf#ActivityTaskStartedEventAttributes")]
 #[derive(Debug, Clone, Default)]
 pub struct ActivityTaskStartedEventAttributes {
+    /// The opaque, service-generated token identifying this start of the activity task.
+    /// The member was added to this service's on-disk model from the recorded AWS
+    /// responses — the shipped model snapshot carries no such member on this shape, while
+    /// AWS reports it on every `ActivityTaskStarted` event — and its value is minted once,
+    /// when the start is recorded, by the handler of `PollForActivityTask`.
+    pub client_token: Option<String>,
     pub identity: Option<String>,
     pub scheduled_event_id: i64,
 }
@@ -712,6 +748,12 @@ pub struct ListClosedWorkflowExecutionsOutput {
 #[smithy_macros::smithy(shape = "com.amazonaws.swf#ResourceTag")]
 #[derive(Debug, Clone, Default)]
 pub struct ResourceTag {
+    /// The awsJson type discriminator naming this element's shape. The member was added to
+    /// this service's on-disk model from the recorded AWS responses — the shipped model
+    /// snapshot carries no such member on this shape, while AWS reports it on every tag
+    /// `ListTagsForResource` returns — and its value is set by that operation's handler,
+    /// the one place a stored tag is reported back.
+    pub __type: Option<String>,
     pub key: String,
     pub value: Option<String>,
 }
