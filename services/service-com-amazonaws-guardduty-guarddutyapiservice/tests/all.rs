@@ -21,6 +21,8 @@ mod batch_id_set_normalisation;
 mod client_rejections;
 #[path = "all/client_token_store.rs"]
 mod client_token_store;
+#[path = "all/coverage_addon_details.rs"]
+mod coverage_addon_details;
 #[path = "all/coverage_listing.rs"]
 mod coverage_listing;
 #[path = "all/coverage_statistics.rs"]

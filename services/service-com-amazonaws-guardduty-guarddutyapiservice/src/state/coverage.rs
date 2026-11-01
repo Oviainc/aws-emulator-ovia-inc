@@ -297,6 +297,28 @@ fn management_type(auto_managed: bool) -> &'static str {
     }
 }
 
+/// The `AddonDetails` of the GuardDuty security agent add-on, from the facts a coverage
+/// row holds about it.
+///
+/// `AddonVersion` and `AddonStatus` are two members of that structure, neither of them
+/// required (`smithy_query(shape="AddonDetails")`), carrying two facts the owning
+/// service answers for independently of one another. So each is reported from its OWN
+/// fact: the structure carries every member this emulator holds a fact for, and is
+/// absent only when it holds NEITHER — the one case in which there is nothing about the
+/// add-on to report. Gating either member on the other would discard a fact the row
+/// holds, and the row's own `CoverageStatus` and `Issue` are computed from the status,
+/// so a dropped status would leave the answer stating a verdict whose reason it does
+/// not report.
+pub fn agent_addon_details(
+    addon_version: Option<&str>,
+    addon_status: Option<&str>,
+) -> Option<AddonDetails> {
+    (addon_version.is_some() || addon_status.is_some()).then(|| AddonDetails {
+        addon_version: addon_version.map(str::to_string),
+        addon_status: addon_status.map(str::to_string),
+    })
+}
+
 /// One coverage row, as this service computes it before a request's criteria narrow it:
 /// the resource, the account and detector it belongs to, what its agent coverage is, and
 /// the instant the facts behind that coverage last changed.
@@ -363,10 +385,10 @@ impl CoverageRow {
                     cluster_name: self.cluster_name.clone(),
                     covered_nodes: None,
                     compatible_nodes: None,
-                    addon_details: self.addon_version.as_ref().map(|version| AddonDetails {
-                        addon_version: Some(version.clone()),
-                        addon_status: self.addon_status.clone(),
-                    }),
+                    addon_details: agent_addon_details(
+                        self.addon_version.as_deref(),
+                        self.addon_status.as_deref(),
+                    ),
                     management_type: Some(self.management_type.to_string()),
                 }),
                 ec2_instance_details: None,

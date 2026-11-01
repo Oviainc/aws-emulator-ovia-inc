@@ -1110,3 +1110,220 @@ fn guardduty_reports_the_runtime_coverage_of_the_accounts_own_resources() {
         .join()
         .expect("the coverage suite must not panic");
 }
+
+/// The fixed part of the reason an Amazon EKS row gives for not being covered, up to
+/// the state the agent add-on is in: the row's own words for the state its verdict was
+/// computed from.
+const ADDON_STATE_PREFIX: &str = " is ";
+/// See [`ADDON_STATE_PREFIX`]: what follows that state in the same sentence.
+const ADDON_STATE_SUFFIX: &str = " on cluster ";
+/// The state an Amazon EKS row words for a cluster carrying no agent add-on at all —
+/// the one case in which there is no add-on fact to report.
+const ADDON_NOT_INSTALLED: &str = "not installed";
+
+/// The state of the agent add-on an Amazon EKS row's verdict was computed from, as the
+/// row itself words it, or `None` for a row that reports no add-on state.
+fn addon_state_the_row_judged(row: &serde_json::Value) -> Option<String> {
+    let issue = text_at(row, &["issue"]);
+    let after = issue
+        .split_once(&format!("{GUARDDUTY_AGENT_ADDON}{ADDON_STATE_PREFIX}"))
+        .map(|(_, after)| after)?;
+    let state = after.split_once(ADDON_STATE_SUFFIX).map(|(state, _)| state)?;
+    (state != ADDON_NOT_INSTALLED).then(|| state.to_string())
+}
+
+/// Every fact an Amazon EKS row holds about the agent add-on is readable in its
+/// `addonDetails`, each member on its own fact.
+///
+/// A row is `HEALTHY` only where the add-on is running, and an unhealthy row words the
+/// state it judged, so the state behind the verdict is known from the row alone — and
+/// it must be reported in `addonDetails.addonStatus`, whether or not the add-on also
+/// reports a version. A row that judged no state (no add-on, or no answer about one)
+/// holds no add-on fact and so carries no `addonDetails` at all.
+fn assert_addon_facts_are_reported(row: &serde_json::Value, case: &str) {
+    let reported = text_at(
+        row,
+        &[
+            "resourceDetails",
+            "eksClusterDetails",
+            "addonDetails",
+            "addonStatus",
+        ],
+    );
+    let details = row
+        .get("resourceDetails")
+        .and_then(|details| details.get("eksClusterDetails"))
+        .and_then(|details| details.get("addonDetails"));
+    match (
+        text_at(row, &["coverageStatus"]).as_str(),
+        addon_state_the_row_judged(row),
+    ) {
+        ("HEALTHY", _) => assert_eq!(
+            reported, "ACTIVE",
+            "case {case:?}: a covered cluster's add-on is running, so the row must report \
+             that status, got {row:?}"
+        ),
+        (_, Some(state)) => assert_eq!(
+            reported, state,
+            "case {case:?}: the add-on state the row judged must be readable in \
+             addonDetails.addonStatus, got {row:?}"
+        ),
+        (_, None) => assert!(
+            details.is_none(),
+            "case {case:?}: a row holding no fact about the add-on reports no add-on \
+             details, got {row:?}"
+        ),
+    }
+}
+
+/// RULE: `AddonDetails.AddonVersion` and `AddonDetails.AddonStatus` are two members
+/// carrying two facts Amazon EKS answers for independently, neither of them required
+/// (`smithy_query(shape="AddonDetails")`), so a coverage row reports EACH of them from
+/// its own fact — the structure carries every member a fact is held for and is absent
+/// only when none is. The row's `coverageStatus` and `issue` are computed from the
+/// add-on's status, so a row that judged a state and reported no add-on detail would
+/// contradict itself.
+///
+/// Driven over an add-on read at both states its install passes through — the one it
+/// reports while the install is still settling, and the one it settles in — plus a
+/// cluster carrying no add-on at all.
+#[test]
+fn an_eks_coverage_row_reports_every_agent_addon_fact_it_holds() {
+    std::thread::Builder::new()
+        .name("guardduty-coverage-addon-details".to_string())
+        .stack_size(BOOT_STACK_SIZE)
+        .spawn(|| {
+            let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
+            let mut router = build_router(engine);
+            router.set_request_authentication(false);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a current-thread runtime");
+            let account_id = engine::emulator_account_id().to_string();
+
+            // The account's Amazon EKS clusters, created through the service that owns
+            // them: one that gets the agent add-on and one that does not.
+            let vpc = ec2(&router, &runtime, "CreateVpc", &[("CidrBlock", "10.9.0.0/16")]);
+            assert_eq!(vpc.status, 200, "setup: CreateVpc must succeed, got {vpc:?}");
+            let vpc_id = element(&vpc.text, "vpcId");
+            let mut subnets: Vec<String> = Vec::new();
+            for cidr_block in ["10.9.1.0/24", "10.9.2.0/24"] {
+                let answer = ec2(
+                    &router,
+                    &runtime,
+                    "CreateSubnet",
+                    &[("VpcId", vpc_id.as_str()), ("CidrBlock", cidr_block)],
+                );
+                assert_eq!(
+                    answer.status, 200,
+                    "setup: CreateSubnet {cidr_block} must succeed, got {answer:?}"
+                );
+                subnets.push(element(&answer.text, "subnetId"));
+            }
+
+            let with_addon = "addon-details-with-agent";
+            let without_addon = "addon-details-without-agent";
+            for name in [with_addon, without_addon] {
+                let answer = eks(
+                    &router,
+                    &runtime,
+                    "POST",
+                    "/clusters",
+                    Some(serde_json::json!({
+                        "name": name,
+                        "roleArn": format!("arn:aws:iam::{account_id}:role/eksClusterRole"),
+                        "resourcesVpcConfig": {"subnetIds": subnets.clone()},
+                    })),
+                );
+                assert_eq!(
+                    answer.status, 200,
+                    "setup: CreateCluster {name} must succeed, got {answer:?}"
+                );
+            }
+            settled("the cluster reaches ACTIVE", || {
+                let answer = eks(&router, &runtime, "GET", &format!("/clusters/{with_addon}"), None);
+                (text_at(&answer.body, &["cluster", "status"]) == "ACTIVE").then_some(())
+            });
+
+            let detector = guardduty(
+                &router,
+                &runtime,
+                "POST",
+                "/detector",
+                Some(serde_json::json!({
+                    "enable": true,
+                    "features": [feature("RUNTIME_MONITORING", "ENABLED", &[])],
+                })),
+            );
+            assert_eq!(
+                detector.status, 200,
+                "setup: CreateDetector must succeed, got {detector:?}"
+            );
+            let detector_id = text_at(&detector.body, &["detectorId"]);
+
+            let created = eks(
+                &router,
+                &runtime,
+                "POST",
+                &format!("/clusters/{with_addon}/addons"),
+                Some(serde_json::json!({"addonName": GUARDDUTY_AGENT_ADDON})),
+            );
+            assert_eq!(
+                created.status, 200,
+                "setup: CreateAddon must succeed, got {created:?}"
+            );
+            let addon_version = text_at(&created.body, &["addon", "addonVersion"]);
+
+            // Read while the install is still settling, so the row carries the state
+            // the add-on reports BEFORE it is running, and again once it has settled.
+            // Both are asserted against the same rule, so neither read depends on how
+            // far the clock has got.
+            for case in ["while the add-on is settling", "once the add-on has settled"] {
+                let rows = coverage_rows(
+                    &router,
+                    &runtime,
+                    &detector_id,
+                    serde_json::json!({}),
+                    case,
+                );
+                let row = row_of(&rows, with_addon, case);
+                assert_addon_facts_are_reported(row, case);
+                assert_eq!(
+                    text_at(
+                        row,
+                        &[
+                            "resourceDetails",
+                            "eksClusterDetails",
+                            "addonDetails",
+                            "addonVersion",
+                        ],
+                    ),
+                    addon_version,
+                    "case {case:?}: the add-on's own version must be reported beside its \
+                     status, got {row:?}"
+                );
+                let bare = row_of(&rows, without_addon, case);
+                assert_addon_facts_are_reported(bare, case);
+                assert!(
+                    addon_state_the_row_judged(bare).is_none(),
+                    "case {case:?}: a cluster carrying no add-on judges no add-on state, got {bare:?}"
+                );
+
+                if case == "while the add-on is settling" {
+                    settled("the add-on reaches ACTIVE", || {
+                        let answer = eks(
+                            &router,
+                            &runtime,
+                            "GET",
+                            &format!("/clusters/{with_addon}/addons/{GUARDDUTY_AGENT_ADDON}"),
+                            None,
+                        );
+                        (text_at(&answer.body, &["addon", "status"]) == "ACTIVE").then_some(())
+                    });
+                }
+            }
+        })
+        .expect("spawn the sized thread")
+        .join()
+        .expect("the add-on details suite must not panic");
+}
