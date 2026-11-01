@@ -309,6 +309,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // label through the shared `resolve_asset_id`, the property through the
         // shared `resolve_asset_property`, an alias through the shared
         // `resolve_alias_series` — so a stream is named one way across the service.
+        // The property resolver is the one definition of "the property that pair
+        // names", over EVERY property the asset carries: the ones materialised from
+        // its model's own definitions and the ones that model's composite models
+        // contribute, so a pair the listings and `DescribeAssetProperty` publish as
+        // a property of the asset reaches its windows here too.
         let stream = match (
             input.asset_id.as_deref(),
             input.property_id.as_deref(),
