@@ -55,6 +55,8 @@ mod bucket_metadata_annotation_table_update;
 mod bucket_metadata_configuration;
 #[path = "all/bucket_metadata_configuration_deletion.rs"]
 mod bucket_metadata_configuration_deletion;
+#[path = "all/bucket_metadata_inventory_table_namespace.rs"]
+mod bucket_metadata_inventory_table_namespace;
 #[path = "all/bucket_metadata_inventory_table_update.rs"]
 mod bucket_metadata_inventory_table_update;
 #[path = "all/bucket_metadata_journal_table_update.rs"]

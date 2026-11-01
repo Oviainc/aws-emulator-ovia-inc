@@ -4171,6 +4171,60 @@ pub fn metadata_record_expiration_refusal(
         })
 }
 
+/// The `ErrorDetails` an inventory table being provisioned NOW carries, or `None` when
+/// nothing stops it from being created: `name_taken` says the managed table bucket's
+/// namespace already holds the name it would be created under, and `journal_failed` that the
+/// journal table it reads from could not be created.
+///
+/// ONE rule for every request that provisions an inventory table — the create that names a
+/// whole configuration and the update that enables the table on one — so the two cannot
+/// drift apart on it. Its OWN name is judged first: that is what stops a second table being
+/// created under a name a table already holds ([`METADATA_INVENTORY_TABLE_EXISTS_CODE`]),
+/// and only a table whose name is free can then report the journal table it relies on —
+/// "the journal table that the inventory table relies on has a `FAILED` status. An inventory
+/// table requires a journal table with an `ACTIVE` status"
+/// ([`METADATA_JOURNAL_TABLE_UNAVAILABLE_CODE`], from
+/// `smithy_query(query="doc",shape="ErrorDetails",member="ErrorCode")`'s V2 list).
+pub fn metadata_inventory_table_failure(
+    name_taken: bool,
+    journal_failed: bool,
+) -> Option<MetadataTableFailure> {
+    if name_taken {
+        Some(MetadataTableFailure {
+            code: METADATA_INVENTORY_TABLE_EXISTS_CODE,
+            message: METADATA_INVENTORY_TABLE_EXISTS_MESSAGE,
+        })
+    } else if journal_failed {
+        Some(MetadataTableFailure {
+            code: METADATA_JOURNAL_TABLE_UNAVAILABLE_CODE,
+            message: METADATA_JOURNAL_TABLE_UNAVAILABLE_MESSAGE,
+        })
+    } else {
+        None
+    }
+}
+
+/// What enabling or disabling the inventory table of a bucket's metadata configuration did —
+/// the outcomes the caller of
+/// [`ComAmazonawsS3Amazons3State::update_metadata_inventory_table`] answers differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataInventoryTableUpdate {
+    /// Recorded: the state the request named is the configuration's and the table behind it
+    /// followed. A table provisioned under a name the namespace already holds is recorded
+    /// [`METADATA_TABLE_STATUS_FAILED`], which is a provisioning outcome a READER reports
+    /// rather than a refusal of this call.
+    Recorded,
+    /// This store holds no such general purpose bucket.
+    NoSuchBucket,
+    /// The bucket carries no metadata configuration, so there is no inventory table of one to
+    /// enable or disable and nothing is written.
+    NoConfiguration,
+    /// The enable would provision a table under a name the managed table bucket's namespace
+    /// has no room left for ([`MAX_METADATA_NAMESPACE_TABLES`]) — this emulator's own
+    /// ceiling, with nothing written.
+    NamespaceFull,
+}
+
 /// One table of a bucket's S3 Metadata configuration: its name, and when it falls due to
 /// be in service.
 ///
@@ -4268,16 +4322,19 @@ pub struct MetadataTableConfiguration {
 
 /// Record `configuration_state` as the state of the optional table configuration `slot`,
 /// with `table_name` the name a table this creates is created under, `role` the IAM role the
-/// call names for the table (`None` when it names none) and `now` the instant of the call
+/// call names for the table (`None` when it names none), `failure` why a table this creates
+/// could not be created (`None` when nothing stops it), and `now` the instant of the call
 /// asking for it.
 ///
 /// The shape of enabling or disabling one of a metadata configuration's optional tables: the
 /// state the request names becomes the table's state, and the table behind it follows —
 /// enabling a table the configuration has none of creates one, being created from `now`
-/// ([`METADATA_TABLE_ACTIVATION_DELAY`] later in service), and disabling one drops it, which
-/// is what leaves the reported result carrying a state with no table name, status or ARN.
-/// Enabling a table that is already there leaves that table exactly as it is, so a repeated
-/// enable neither restarts its creation nor renames it.
+/// ([`METADATA_TABLE_ACTIVATION_DELAY`] later in service) or reported `FAILED` with `failure`
+/// when provisioning it could not succeed, and disabling one drops it, which is what leaves
+/// the reported result carrying a state with no table name, status or ARN. Enabling a table
+/// that is already there leaves that table exactly as it is, so a repeated enable neither
+/// restarts its creation nor renames it — and `failure` is therefore about the table this
+/// call would CREATE, never about one already there.
 ///
 /// `role` is "the new IAM role ARN to apply" (`AnnotationTableConfigurationUpdates$Role`) —
 /// for the annotation table, the only optional table managed by one: a call that names one
@@ -4289,6 +4346,7 @@ fn set_optional_metadata_table_state(
     configuration_state: String,
     role: Option<String>,
     table_name: &str,
+    failure: Option<MetadataTableFailure>,
     now: SystemTime,
 ) {
     let enabled = configuration_state == METADATA_CONFIGURATION_STATE_ENABLED;
@@ -4297,7 +4355,10 @@ fn set_optional_metadata_table_state(
     *slot = Some(MetadataTableConfiguration {
         configuration_state,
         table: enabled.then(|| {
-            carried_table.unwrap_or_else(|| MetadataTable::creating(table_name.to_string(), now))
+            carried_table.unwrap_or_else(|| match failure {
+                Some(failure) => MetadataTable::failed(table_name.to_string(), now, failure),
+                None => MetadataTable::creating(table_name.to_string(), now),
+            })
         }),
         role: role.or_else(|| carried.and_then(|table| table.role)),
     });
@@ -5573,7 +5634,8 @@ impl Bucket {
 
     /// Record `configuration_state` as the inventory table state of the bucket's S3 Metadata
     /// configuration, with `table_name` the name an inventory table this creates is created
-    /// under — reporting whether the bucket carries a configuration to record it on.
+    /// under and `failure` why such a table could not be created — reporting whether the
+    /// bucket carries a configuration to record it on.
     ///
     /// What `UpdateBucketMetadataInventoryTableConfiguration` does: it "enables or disables a
     /// live inventory table for an S3 Metadata configuration on a general purpose bucket"
@@ -5586,10 +5648,16 @@ impl Bucket {
     /// `false` is a bucket carrying NO metadata configuration, in which case nothing is
     /// written: there is no configuration to enable a table for, and the caller answers
     /// [`NO_SUCH_CONFIGURATION_CODE`].
-    pub fn update_metadata_inventory_table(
+    ///
+    /// PRIVATE: a table this provisions is a table of the managed table bucket's namespace,
+    /// which the STORE holds, so [`ComAmazonawsS3Amazons3State::update_metadata_inventory_table`]
+    /// is the one way in — it is what decides the name, judges it against that namespace and
+    /// records it there, so the bucket's record and the namespace cannot be written apart.
+    fn update_metadata_inventory_table(
         &mut self,
         configuration_state: String,
         table_name: &str,
+        failure: Option<MetadataTableFailure>,
         now: SystemTime,
     ) -> bool {
         let Some(configuration) = self.metadata_configuration.as_mut() else {
@@ -5602,6 +5670,7 @@ impl Bucket {
             // table is managed by an IAM role.
             None,
             table_name,
+            failure,
             now,
         );
         true
@@ -5641,6 +5710,11 @@ impl Bucket {
             configuration_state,
             role,
             table_name,
+            // No provisioning failure is reportable for an ANNOTATION table: the published V2
+            // list of `ErrorDetails$ErrorCode` values names none for one, so there is no code
+            // or sentence to report it with — which is where the create that provisions the
+            // same table leaves it too.
+            None,
             now,
         );
         true
@@ -9359,6 +9433,73 @@ impl ComAmazonawsS3Amazons3State {
         };
         held.clear_metadata_configuration();
         true
+    }
+
+    /// Record `configuration_state` as the inventory table state of the S3 Metadata
+    /// configuration the general purpose bucket `bucket` carries, provisioning or dropping the
+    /// inventory table behind it and keeping the managed table bucket's namespace in step.
+    ///
+    /// The ONE way in, because an inventory table is a table of that namespace rather than of
+    /// the bucket: `UpdateBucketMetadataInventoryTableConfiguration` really does PROVISION one
+    /// — `s3tables:CreateTable` is among the permissions that operation requires, and none of
+    /// the permissions it lists deletes a table (its own documentation) — so the name an
+    /// enable creates a table under joins the namespace and stays there, exactly as the names
+    /// a create provisions do ([`Self::record_metadata_namespace_table`]). An enable whose
+    /// name the namespace ALREADY holds therefore provisions nothing: the table is recorded
+    /// [`METADATA_TABLE_STATUS_FAILED`] with the published failure for the name being taken,
+    /// the same verdict a create colliding with that name reports
+    /// ([`metadata_inventory_table_failure`], the one rule both paths read). Enabling the
+    /// table that is already there is not a provisioning at all, so it leaves both the table
+    /// and the namespace exactly as they are.
+    pub fn update_metadata_inventory_table(
+        &mut self,
+        bucket: &str,
+        configuration_state: String,
+        now: SystemTime,
+    ) -> MetadataInventoryTableUpdate {
+        let Some(held) = self.buckets.get(bucket) else {
+            return MetadataInventoryTableUpdate::NoSuchBucket;
+        };
+        let Some(configuration) = held.metadata_configuration() else {
+            return MetadataInventoryTableUpdate::NoConfiguration;
+        };
+        let table_name = metadata_table_name(bucket, METADATA_INVENTORY_TABLE_SUFFIX);
+        // Only an enable that finds the configuration carrying no table of its own provisions
+        // one; the journal table it would read from is the configuration's own.
+        let provisions = configuration_state == METADATA_CONFIGURATION_STATE_ENABLED
+            && configuration
+                .inventory
+                .as_ref()
+                .is_none_or(|inventory| inventory.table.is_none());
+        let failure = provisions
+            .then(|| {
+                metadata_inventory_table_failure(
+                    self.metadata_namespace_holds(&table_name),
+                    configuration.journal.failure.is_some(),
+                )
+            })
+            .flatten();
+        // A table that could not be provisioned adds nothing to the namespace: either the name
+        // is already held by the table that is there, or no table was created under it. Only a
+        // table this really creates takes room, measured against the ceiling under the guard
+        // the caller already holds — the way the create measures the names it would add — and
+        // an enable that would carry the namespace past the maximum writes NOTHING.
+        let takes_room = provisions && failure.is_none();
+        if takes_room && self.metadata_namespace_room() == 0 {
+            return MetadataInventoryTableUpdate::NamespaceFull;
+        }
+        let Some(held) = self.buckets.get_mut(bucket) else {
+            // Unreachable: the lookup above ran against this same map, under this same guard.
+            return MetadataInventoryTableUpdate::NoSuchBucket;
+        };
+        if !held.update_metadata_inventory_table(configuration_state, &table_name, failure, now) {
+            // Unreachable for the same reason: the configuration was read above.
+            return MetadataInventoryTableUpdate::NoConfiguration;
+        }
+        if takes_room {
+            self.record_metadata_namespace_table(&table_name);
+        }
+        MetadataInventoryTableUpdate::Recorded
     }
 
     /// Every bucket this account holds, as `(name, bucket)` in bucket-name order — the

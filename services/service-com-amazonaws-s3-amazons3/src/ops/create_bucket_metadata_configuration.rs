@@ -387,25 +387,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bucket's namespace"), and the journal table it reads from having failed — "The
         // journal table that the inventory table relies on has a `FAILED` status. An
         // inventory table requires a journal table with an `ACTIVE` status"
-        // (`JournalTableNotAvailable`, same list). Its own name is judged first: that is
-        // what stops a second table being created under it.
+        // (`JournalTableNotAvailable`, same list). Which of the two it reports is one rule,
+        // read here and by the update that enables the same table
+        // ([`crate::state::metadata_inventory_table_failure`]); on this create the journal
+        // table failed exactly when its own name was taken.
         //
         // The ANNOTATION table is left to be created: the published list of V2 provisioning
         // error codes names no failure for it, so there is no code or sentence to report one
         // with.
-        let inventory_failure = if inventory_taken {
-            Some(crate::state::MetadataTableFailure {
-                code: crate::state::METADATA_INVENTORY_TABLE_EXISTS_CODE,
-                message: crate::state::METADATA_INVENTORY_TABLE_EXISTS_MESSAGE,
-            })
-        } else if journal_taken {
-            Some(crate::state::MetadataTableFailure {
-                code: crate::state::METADATA_JOURNAL_TABLE_UNAVAILABLE_CODE,
-                message: crate::state::METADATA_JOURNAL_TABLE_UNAVAILABLE_MESSAGE,
-            })
-        } else {
-            None
-        };
+        let inventory_failure =
+            crate::state::metadata_inventory_table_failure(inventory_taken, journal_taken);
         let table = |suffix: &str| {
             crate::state::MetadataTable::creating(
                 crate::state::metadata_table_name(&input.bucket, suffix),

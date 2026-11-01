@@ -48,7 +48,11 @@ use super::bucket_metadata_configuration::{
 /// `PUT /<bucket>?metadataInventoryTable` — `UpdateBucketMetadataInventoryTableConfiguration`,
 /// with `payload` as the `InventoryTableConfiguration` container and whatever headers the
 /// case carries.
-async fn update_inventory_table(
+///
+/// `pub(crate)`, like [`updates`] below it: the managed-namespace suite
+/// ([`super::bucket_metadata_inventory_table_namespace`]) drives the same subresource through
+/// the same harness instead of standing up a second copy of it.
+pub(crate) async fn update_inventory_table(
     router: &MultiServiceRouter,
     bucket: &str,
     headers: &[(&str, &str)],
@@ -67,7 +71,7 @@ async fn update_inventory_table(
 /// The `InventoryTableConfigurationUpdates` document naming `state`, plus an encryption
 /// configuration naming `algorithm` when the case carries one — with the KMS key ARN beside
 /// it exactly when `with_key` asks for it.
-fn updates(state: &str, algorithm: Option<&str>, with_key: bool) -> String {
+pub(crate) fn updates(state: &str, algorithm: Option<&str>, with_key: bool) -> String {
     let mut body = format!("<InventoryTableConfiguration xmlns=\"{XMLNS}\">");
     body.push_str(&format!("<ConfigurationState>{state}</ConfigurationState>"));
     if let Some(algorithm) = algorithm {

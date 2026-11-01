@@ -250,43 +250,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // either. That is where every other bucket-subresource write in this crate leaves
         // them.
         let now = ::std::time::SystemTime::now();
-        let table_name = crate::state::metadata_table_name(
-            &input.bucket,
-            crate::state::METADATA_INVENTORY_TABLE_SUFFIX,
-        );
 
-        // The bucket is looked up FIRST, so a request naming a bucket this emulator does not
-        // hold answers that rather than reporting whatever is wrong with the state of a
-        // bucket that does not exist (the order every other bucket-subresource write in this
+        // "Enables or disables a live inventory table for an S3 Metadata configuration on a
+        // general purpose bucket" (this operation's own documentation). The table it enables
+        // is a table of the AWS-managed table bucket's namespace, which the STORE holds, so
+        // the state seam below is what records both halves — the configuration's inventory
+        // state and the name a table it provisions takes in that namespace — and what judges
+        // the name against the tables already there.
+        //
+        // The bucket is looked up FIRST inside it, so a request naming a bucket this emulator
+        // does not hold answers that rather than reporting whatever is wrong with the state of
+        // a bucket that does not exist (the order every other bucket-subresource write in this
         // crate keeps).
         let mut store = state.lock();
-        let Some(bucket) = store.bucket_mut(&input.bucket) else {
-            return Err(
-                UpdateBucketMetadataInventoryTableConfigurationErrorModeled::NoSuchBucket(
-                    NoSuchBucket {},
-                )
-                .into(),
-            );
-        };
-        // "Enables or disables a live inventory table for an S3 Metadata configuration on a
-        // general purpose bucket" (this operation's own documentation): the inventory table
-        // belongs to a metadata configuration, so a bucket carrying none has no table to
-        // enable or disable — the mutation is refused with the metadata configuration's own
-        // not-there condition, the same one a READ of it answers, and nothing is written
-        // (never a silent no-op that would look like a success).
-        if !bucket.update_metadata_inventory_table(
+        match store.update_metadata_inventory_table(
+            &input.bucket,
             input
                 .inventory_table_configuration
                 .configuration_state
                 .clone(),
-            &table_name,
             now,
         ) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
-                crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
-                crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
-            ));
+            // A table that could not be provisioned — its name already held by the table that
+            // is there, or the journal table it relies on having failed — is reported by a
+            // READER of the configuration: this call's own answer is the modelled 200, exactly
+            // as the create that provisions a colliding table is accepted.
+            crate::state::MetadataInventoryTableUpdate::Recorded => {}
+            crate::state::MetadataInventoryTableUpdate::NoSuchBucket => {
+                return Err(
+                    UpdateBucketMetadataInventoryTableConfigurationErrorModeled::NoSuchBucket(
+                        NoSuchBucket {},
+                    )
+                    .into(),
+                );
+            }
+            // The inventory table belongs to a metadata configuration, so a bucket carrying
+            // none has no table to enable or disable — the mutation is refused with the
+            // metadata configuration's own not-there condition, the same one a READ of it
+            // answers, and nothing is written (never a silent no-op that would look like a
+            // success).
+            crate::state::MetadataInventoryTableUpdate::NoConfiguration => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
+                    crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
+                    crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
+                ));
+            }
+            // The emulator's own ceiling on the managed namespace, so it goes out through the
+            // framework's 400 refusal channel rather than as an AWS error code — where the
+            // create that would carry the namespace past the same maximum leaves it.
+            crate::state::MetadataInventoryTableUpdate::NamespaceFull => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the managed table bucket's namespace holds as many metadata tables as \
+                     this emulator records ({})",
+                    crate::state::MAX_METADATA_NAMESPACE_TABLES
+                )));
+            }
         }
 
         // `Unit` output: success is the modelled 200 and an empty body.
