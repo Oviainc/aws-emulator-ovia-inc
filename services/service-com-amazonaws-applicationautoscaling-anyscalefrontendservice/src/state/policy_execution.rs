@@ -63,6 +63,13 @@
 //!   suspension is in effect, all scale-out activities that are triggered by a scaling policy
 //!   are suspended"), so lifting the suspension delivers the withheld movement with no new
 //!   metric movement of its own.
+//!
+//! And of the policies of ONE scalable target triggered together, only ONE is performed:
+//! "Application Auto Scaling gives precedence to the policy that provides the largest capacity
+//! for both scale out and scale in", so the movements asked for inside one window
+//! ([`ARBITRATION_WINDOW`]) are compared and the largest resulting capacity is the one the
+//! target is moved to — the others are suppressed, each consumed without a movement and without
+//! an activity of its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -101,6 +108,18 @@ const MAX_EXECUTIONS_PER_PASS: usize = 32;
 /// transition is forgotten, which at worst performs one extra execution for an alarm nothing
 /// has fired in that long.
 const MAX_REMEMBERED_ALARMS_PER_POLICY: usize = 32;
+
+/// How long the breaches of one scalable target are collected over before the policies they
+/// trigger are arbitrated against each other ([`arbitration_windows`]).
+///
+/// The window is what makes "triggered at the same time" decidable here. The alarms a client
+/// drives into `ALARM` together transition one after another, so a pass that read the stores
+/// between two of them would perform the first policy before it had seen the second at all, and
+/// the precedence the service gives the largest resulting capacity could never be applied. The
+/// span is this emulator's own — nothing in a stored alarm state says how wide the service's is
+/// — and it is only ever waited out by a target that has more than one policy an alarm can
+/// fire.
+const ARBITRATION_WINDOW: Duration = Duration::from_secs(3);
 
 /// How long one scaling-clock wake-up waits before looking for breaches again.
 ///
@@ -573,136 +592,309 @@ fn breaches_above(comparison_operator: &str) -> Option<bool> {
 ///
 /// Everything here is read UNDER this service's lock at the instant the execution happens, so
 /// the window a movement is clamped into is the one the target carries now.
+///
+/// The movements the policies of ONE scalable target ask for are ARBITRATED before any of them
+/// is performed: "Multiple scaling policies can be in force at the same time for the same
+/// scalable target […] there is a chance that multiple policies could conflict, instructing the
+/// scalable target to scale out or in at the same time. Application Auto Scaling gives
+/// precedence to the policy that provides the largest capacity for both scale out and scale
+/// in." So of the movements asked for together, the one that yields the LARGEST resulting
+/// capacity is performed and every other is fully suppressed — its transition is consumed, and
+/// it moves no capacity and records no activity, because one scalable target was moved once, by
+/// one policy.
 fn apply_breaches(
     store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
     fired: &[(FiringPolicy, Breach)],
     resolved: &BTreeMap<TargetKey, i32>,
     now: SystemTime,
 ) {
-    for (policy, breach) in fired {
-        // The policy may have been deleted, and the target deregistered, since the snapshot.
-        let Some(record) = store.policies.get(&policy.key) else {
-            continue;
-        };
-        // What this policy has been executed for is read AGAIN under this lock: a pass that
-        // overlapped this one may have performed the same breach between the snapshot and
-        // here, and one transition is ONE execution.
-        if record
-            .executed_transitions
-            .get(&breach.alarm_name)
-            .is_some_and(|executed| *executed >= breach.transitioned_secs)
-        {
-            continue;
-        }
-        // Which of a target-tracking policy's own alarms this breach is of, which is what
-        // names the direction it drives before any arithmetic: that policy is executed by
-        // the pair it minted on the metric it tracks, one alarm per direction.
-        let tracked_kind = match &policy.config {
-            FiringConfig::Step(_) => None,
-            FiringConfig::TargetTracking(_) => {
-                match super::policy_alarm_kind(&policy.key, &breach.alarm_name) {
-                    Some(kind) if !kind.watches_capacity() => Some(kind),
-                    // The pair that watches the provisioned capacity reports a stale
-                    // threshold rather than drive a direction, and an alarm this policy did
-                    // not mint states no target for a metric at all: neither moves capacity.
-                    _ => {
-                        remember_transition(
-                            store,
-                            &policy.key,
-                            &breach.alarm_name,
-                            breach.transitioned_secs,
-                        );
-                        continue;
-                    }
-                }
-            }
-        };
-        // "The amount of time, in seconds, to wait for a previous scaling activity to take
-        // effect": a breach inside that span of this policy's own last execution WAITS — the
-        // alarm is still breaching, so the breach is left unperformed rather than consumed,
-        // and the first pass after the wait is over performs it.
-        let waiting = record
-            .last_executed
-            .and_then(|last| last.checked_add(cooldown_of(record, tracked_kind)))
-            .is_some_and(|due| now < due);
-        if waiting {
-            continue;
-        }
-        let Some(target) = store.targets.get(&policy.key.target) else {
-            continue;
-        };
-        // The window as a WINDOW, whichever order the two bounds are stored in: the capacity
-        // is placed "inside of this range", and a floor above the ceiling is no range at all,
-        // so it is read as the point the two meet at rather than asserted against. Nothing in
-        // this pass may depend on a stored invariant it did not establish itself.
-        let (min_capacity, max_capacity) = (
-            target.min_capacity.min(target.max_capacity),
-            target.max_capacity.max(target.min_capacity),
-        );
-        let current = resolved
-            .get(&policy.key.target)
-            .copied()
-            .unwrap_or(target.current_capacity);
-        let suspended = target.suspended_state.clone();
-
-        // The capacity the policy asks for, as its OWN configuration states it.
-        let wanted = match &policy.config {
-            FiringConfig::Step(config) => adjusted_capacity(config, breach, current),
-            FiringConfig::TargetTracking(config) => {
-                super::target_tracking_capacity(&policy.key, config, breach.measured(), current)
-            }
-        };
-        let Some(wanted) = wanted else {
-            // The configuration names no capacity for this breach, so the transition is
-            // evaluated and done with.
-            remember_transition(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
-            continue;
-        };
-        let capacity = wanted.max(min_capacity).min(max_capacity);
-        if capacity == current {
-            // Nothing moved, so there is no capacity movement to record: the policy asked for
-            // the capacity the resource already holds, or for one past a bound it already
-            // sits at.
+    // Until a target's arbitration window has closed there is nothing of it to perform: a
+    // policy triggered inside that window has to be decided against its siblings, not before
+    // them.
+    let windows = arbitration_windows(store, fired);
+    // What each breach WOULD do, decided before this pass has performed anything: movements are
+    // comparable only when each is computed from the capacity the resource holds at ONE
+    // instant.
+    let planned: Vec<Disposition> = fired
+        .iter()
+        .map(|(policy, breach)| plan_breach(store, policy, breach, resolved, now, &windows))
+        .collect();
+    let winners = arbitrate(fired, &planned);
+    for (index, ((policy, breach), planned_here)) in fired.iter().zip(&planned).enumerate() {
+        // Only a breach that ASKED for a movement can lose the arbitration. One that is being
+        // withheld — by a cooldown, by a suspended direction, by a window that is still open —
+        // has asked for nothing yet, so it keeps its transition and the first pass that may
+        // perform it still does.
+        let suppressed = matches!(planned_here, Disposition::Move { .. })
+            && winners
+                .get(&policy.key.target)
+                .is_some_and(|winner| *winner != index);
+        if suppressed {
+            // Suppressed by the policy that provides the larger capacity: the transition is
+            // consumed, so no later pass performs it, and the breach reaches neither the
+            // resource nor the activity log.
             remember_transition(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
             continue;
         }
-        // "DynamicScalingInSuspended […] Whether scale in by a target tracking scaling policy
-        // or a step scaling policy is suspended" — and the same for scale out: a suspended
-        // direction performs no movement at all. The breach is WITHHELD, not consumed: the
-        // alarm is still breaching, so the first pass after the suspension is lifted delivers
-        // the movement it was owed, with no new metric movement of its own.
-        let scaling_out = capacity > current;
-        let direction_suspended = suspended.is_some_and(|suspended| {
-            if scaling_out {
-                suspended.dynamic_scaling_out_suspended == Some(true)
-            } else {
-                suspended.dynamic_scaling_in_suspended == Some(true)
+        // Decided again under this lock, against what the movements already performed in this
+        // pass have changed — exactly as a pass that found this breach alone would decide it.
+        match plan_breach(store, policy, breach, resolved, now, &windows) {
+            // Left unconsumed: the alarm is still breaching, so the first later pass that may
+            // perform this breach does.
+            Disposition::Hold => {}
+            Disposition::Consume => {
+                remember_transition(
+                    store,
+                    &policy.key,
+                    &breach.alarm_name,
+                    breach.transitioned_secs,
+                );
             }
-        });
-        if direction_suspended {
-            continue;
-        }
-        // This transition has now been performed, so no later pass performs it again.
-        remember_transition(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
-        let cause = format!(
-            "monitor alarm {} in state ALARM triggered policy {}",
-            breach.alarm_name, policy.key.policy_name
-        );
-        // The instant THIS movement is made at, which is not the instant the pass started:
-        // the pass performs the breaches it found one after another, and two movements that
-        // share an instant have no order in time at all — so the one a later movement
-        // displaces could not be told from the one that displaced it. Never earlier than the
-        // instant the pass read, so the order the pass performs movements in is the order
-        // their instants are in.
-        let moved_at = SystemTime::now().max(now);
-        store.record_capacity_change(&policy.key.target, capacity, cause, moved_at);
-        if let Some(target) = store.targets.get_mut(&policy.key.target) {
-            target.current_capacity = capacity;
-        }
-        if let Some(record) = store.policies.get_mut(&policy.key) {
-            record.last_executed = Some(moved_at);
+            Disposition::Move { capacity } => {
+                perform_movement(store, policy, breach, capacity, now);
+            }
         }
     }
+}
+
+/// What a pass does with one breach it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// Not now, and NOT consumed: the breach waits for a cooldown to run out, for a suspended
+    /// direction to be resumed, for its target's arbitration window to close, or for the policy
+    /// or target that went missing under it.
+    Hold,
+    /// Evaluated and done with: there is no capacity movement in it, so the transition is
+    /// remembered and no later pass looks at it again.
+    Consume,
+    /// Move the target's capacity to this value.
+    Move { capacity: i32 },
+}
+
+/// What this pass would do with one breach, from the store as it stands.
+///
+/// Read-only, so the same decision can be taken twice: once to arbitrate the movements the
+/// policies of one target ask for against each other, and once to perform the one that won.
+fn plan_breach(
+    store: &ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    policy: &FiringPolicy,
+    breach: &Breach,
+    resolved: &BTreeMap<TargetKey, i32>,
+    now: SystemTime,
+    windows: &BTreeMap<TargetKey, SystemTime>,
+) -> Disposition {
+    // The policy may have been deleted, and the target deregistered, since the snapshot.
+    let Some(record) = store.policies.get(&policy.key) else {
+        return Disposition::Hold;
+    };
+    // What this policy has been executed for is read AGAIN under this lock: a pass that
+    // overlapped this one may have performed the same breach between the snapshot and
+    // here, and one transition is ONE execution.
+    if record
+        .executed_transitions
+        .get(&breach.alarm_name)
+        .is_some_and(|executed| *executed >= breach.transitioned_secs)
+    {
+        return Disposition::Hold;
+    }
+    // Which of a target-tracking policy's own alarms this breach is of, which is what
+    // names the direction it drives before any arithmetic: that policy is executed by
+    // the pair it minted on the metric it tracks, one alarm per direction.
+    let tracked_kind = match &policy.config {
+        FiringConfig::Step(_) => None,
+        FiringConfig::TargetTracking(_) => {
+            match super::policy_alarm_kind(&policy.key, &breach.alarm_name) {
+                Some(kind) if !kind.watches_capacity() => Some(kind),
+                // The pair that watches the provisioned capacity reports a stale
+                // threshold rather than drive a direction, and an alarm this policy did
+                // not mint states no target for a metric at all: neither moves capacity.
+                _ => return Disposition::Consume,
+            }
+        }
+    };
+    // A target whose policies are arbitrated against each other performs nothing while the
+    // window they are collected over is still open.
+    if windows
+        .get(&policy.key.target)
+        .is_some_and(|closes| now < *closes)
+    {
+        return Disposition::Hold;
+    }
+    // "The amount of time, in seconds, to wait for a previous scaling activity to take
+    // effect": a breach inside that span of this policy's own last execution WAITS — the
+    // alarm is still breaching, so the breach is left unperformed rather than consumed,
+    // and the first pass after the wait is over performs it.
+    let waiting = record
+        .last_executed
+        .and_then(|last| last.checked_add(cooldown_of(record, tracked_kind)))
+        .is_some_and(|due| now < due);
+    if waiting {
+        return Disposition::Hold;
+    }
+    let Some(target) = store.targets.get(&policy.key.target) else {
+        return Disposition::Hold;
+    };
+    // The window as a WINDOW, whichever order the two bounds are stored in: the capacity
+    // is placed "inside of this range", and a floor above the ceiling is no range at all,
+    // so it is read as the point the two meet at rather than asserted against. Nothing in
+    // this pass may depend on a stored invariant it did not establish itself.
+    let (min_capacity, max_capacity) = (
+        target.min_capacity.min(target.max_capacity),
+        target.max_capacity.max(target.min_capacity),
+    );
+    let current = resolved
+        .get(&policy.key.target)
+        .copied()
+        .unwrap_or(target.current_capacity);
+
+    // The capacity the policy asks for, as its OWN configuration states it.
+    let wanted = match &policy.config {
+        FiringConfig::Step(config) => adjusted_capacity(config, breach, current),
+        FiringConfig::TargetTracking(config) => {
+            super::target_tracking_capacity(&policy.key, config, breach.measured(), current)
+        }
+    };
+    let Some(wanted) = wanted else {
+        // The configuration names no capacity for this breach, so the transition is
+        // evaluated and done with.
+        return Disposition::Consume;
+    };
+    let capacity = wanted.max(min_capacity).min(max_capacity);
+    if capacity == current {
+        // Nothing moved, so there is no capacity movement to record: the policy asked for
+        // the capacity the resource already holds, or for one past a bound it already
+        // sits at.
+        return Disposition::Consume;
+    }
+    // "DynamicScalingInSuspended […] Whether scale in by a target tracking scaling policy
+    // or a step scaling policy is suspended" — and the same for scale out: a suspended
+    // direction performs no movement at all. The breach is WITHHELD, not consumed: the
+    // alarm is still breaching, so the first pass after the suspension is lifted delivers
+    // the movement it was owed, with no new metric movement of its own.
+    let scaling_out = capacity > current;
+    let direction_suspended = target.suspended_state.as_ref().is_some_and(|suspended| {
+        if scaling_out {
+            suspended.dynamic_scaling_out_suspended == Some(true)
+        } else {
+            suspended.dynamic_scaling_in_suspended == Some(true)
+        }
+    });
+    if direction_suspended {
+        return Disposition::Hold;
+    }
+    Disposition::Move { capacity }
+}
+
+/// Perform one movement: consume the transition, set the capacity, record the activity — which
+/// is what queues the capacity the resource is owed — and start this policy's cooldown.
+fn perform_movement(
+    store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    policy: &FiringPolicy,
+    breach: &Breach,
+    capacity: i32,
+    now: SystemTime,
+) {
+    // This transition has now been performed, so no later pass performs it again.
+    remember_transition(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
+    let cause = format!(
+        "monitor alarm {} in state ALARM triggered policy {}",
+        breach.alarm_name, policy.key.policy_name
+    );
+    // The instant THIS movement is made at, which is not the instant the pass started:
+    // the pass performs the breaches it found one after another, and two movements that
+    // share an instant have no order in time at all — so the one a later movement
+    // displaces could not be told from the one that displaced it. Never earlier than the
+    // instant the pass read, so the order the pass performs movements in is the order
+    // their instants are in.
+    let moved_at = SystemTime::now().max(now);
+    store.record_capacity_change(&policy.key.target, capacity, cause, moved_at);
+    if let Some(target) = store.targets.get_mut(&policy.key.target) {
+        target.current_capacity = capacity;
+    }
+    if let Some(record) = store.policies.get_mut(&policy.key) {
+        record.last_executed = Some(moved_at);
+    }
+}
+
+/// When each target's arbitration window closes, for the targets whose breaches are arbitrated
+/// at all.
+///
+/// Two policies are triggered "at the same time" when the alarms that trigger them move into
+/// `ALARM` inside one window, so the window is measured from the OLDEST transition this pass
+/// found for the target: every policy triggered inside it is then decided in one pass against
+/// the others, rather than one policy per pass as the alarms happen to be read.
+///
+/// Only a target with more than one policy an alarm can fire has a window: with a single policy
+/// there is no second movement to give precedence to, so its breach is performed as soon as a
+/// pass finds it.
+fn arbitration_windows(
+    store: &ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    fired: &[(FiringPolicy, Breach)],
+) -> BTreeMap<TargetKey, SystemTime> {
+    let mut windows: BTreeMap<TargetKey, SystemTime> = BTreeMap::new();
+    for (policy, breach) in fired {
+        if alarm_driven_policies(store, &policy.key.target) < 2 {
+            continue;
+        }
+        let Some(closes) =
+            super::instant_of_epoch_secs(breach.transitioned_secs).checked_add(ARBITRATION_WINDOW)
+        else {
+            continue;
+        };
+        windows
+            .entry(policy.key.target.clone())
+            .and_modify(|held| *held = (*held).min(closes))
+            .or_insert(closes);
+    }
+    windows
+}
+
+/// How many policies of `target` an alarm breach can be executed on at all, which is how many
+/// movements of it could conflict.
+fn alarm_driven_policies(
+    store: &ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    target: &TargetKey,
+) -> usize {
+    store
+        .policies
+        .iter()
+        .filter(|(key, record)| &key.target == target && is_alarm_driven(&record.policy_type))
+        .count()
+}
+
+/// The breach of each target to perform: the index into `fired` of the movement that yields the
+/// largest resulting capacity, for a target more than one POLICY asks a movement of.
+///
+/// A target only one policy asks a movement of gets no entry — there is nothing to give
+/// precedence over, so nothing is suppressed. Ties keep the first of the pass's own total order
+/// over (policy, alarm), so the arbitration is deterministic rather than decided by how the
+/// alarm store happens to enumerate.
+fn arbitrate(
+    fired: &[(FiringPolicy, Breach)],
+    planned: &[Disposition],
+) -> BTreeMap<TargetKey, usize> {
+    let mut best: BTreeMap<TargetKey, (i32, usize)> = BTreeMap::new();
+    let mut asking: BTreeMap<TargetKey, BTreeSet<PolicyKey>> = BTreeMap::new();
+    for (index, ((policy, _), disposition)) in fired.iter().zip(planned).enumerate() {
+        let Disposition::Move { capacity } = *disposition else {
+            continue;
+        };
+        asking
+            .entry(policy.key.target.clone())
+            .or_default()
+            .insert(policy.key.clone());
+        best.entry(policy.key.target.clone())
+            .and_modify(|held| {
+                if capacity > held.0 {
+                    *held = (capacity, index);
+                }
+            })
+            .or_insert((capacity, index));
+    }
+    best.into_iter()
+        .filter(|(target, _)| asking.get(target).is_some_and(|keys| keys.len() > 1))
+        .map(|(target, (_, index))| (target, index))
+        .collect()
 }
 
 /// The wait a policy's own configuration gives a breach after this policy's last execution.

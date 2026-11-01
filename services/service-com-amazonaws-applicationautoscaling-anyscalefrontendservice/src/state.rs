@@ -950,6 +950,10 @@ pub fn reported_suspended_state(stored: Option<&SuspendedState>) -> SuspendedSta
 }
 
 /// The `ScalingPolicy` a `Describe` returns for a stored record.
+///
+/// `Alarms` is left for the READER to fill in: the alarms associated with a policy are the ones
+/// CloudWatch holds that name it ([`alarms_invoking_policies`]), not a value this record keeps,
+/// and that read happens with this service's lock released.
 pub fn scaling_policy_of(key: &PolicyKey, record: &ScalingPolicyRecord) -> ScalingPolicy {
     ScalingPolicy {
         policy_arn: record.policy_arn.clone(),
@@ -961,7 +965,7 @@ pub fn scaling_policy_of(key: &PolicyKey, record: &ScalingPolicyRecord) -> Scali
         step_scaling_policy_configuration: record.step_config.clone(),
         target_tracking_scaling_policy_configuration: record.target_tracking_config.clone(),
         predictive_scaling_policy_configuration: record.predictive_config.clone(),
-        alarms: Some(record.alarms.clone()),
+        alarms: None,
         creation_time: timestamp_of(record.creation_time),
     }
 }
@@ -2876,12 +2880,26 @@ pub fn record_minted_alarms(
     orphaned
 }
 
-/// Retire every alarm one policy owns, for a policy that is going away.
+/// Retire what a policy that is going away owns in CloudWatch, and UN-WIRE it from every alarm
+/// that invokes it.
 ///
-/// Call it with NO store lock held. Only a TARGET-TRACKING policy's alarms are its own:
-/// "deleting a step scaling policy deletes the underlying alarm action, but does not delete
-/// the CloudWatch alarm", so a step policy's alarms are the CALLER's and survive it — which
-/// is why the caller passes the deleted policy's type.
+/// Call it with NO store lock held. A deleted policy leaves two different things behind, and
+/// each goes on its own terms:
+///
+/// * the alarms the policy MINTED exist only because the policy does — "deleting a target
+///   tracking scaling policy deletes the CloudWatch alarms that it created" — and only a
+///   target-tracking policy mints any, which is why the caller passes the deleted policy's
+///   type;
+/// * every other alarm that invokes it is the CALLER's and survives — "deleting a step scaling
+///   policy deletes the underlying alarm ACTION, but does not delete the CloudWatch alarm" — so
+///   what goes from it is the wiring: the deleted policy's ARN is removed from the action lists
+///   that name it, and the alarm keeps its metric, its statistic, its threshold, its comparison
+///   operator and its other actions. An alarm left naming a policy that no longer exists would
+///   carry an action that can never fire, which a client cannot tell from a live wiring.
+///
+/// The policy's ARN is derived from its identity ([`scaling_policy_arn`]), which is the ARN its
+/// record carried, and an action names its policy whether or not it carries the suffix saying
+/// the policy minted the alarm ([`policy_arn_in_action`]).
 pub fn retire_policy_alarms<Eng: Send + Sync + 'static>(
     engine: &Eng,
     key: &PolicyKey,
@@ -2889,16 +2907,85 @@ pub fn retire_policy_alarms<Eng: Send + Sync + 'static>(
 ) {
     use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
 
-    if policy_type != "TargetTrackingScaling" {
-        return;
-    }
     let Some(store) = cloudwatch::state::service_state(engine) else {
         return;
     };
+    let policy_arn = scaling_policy_arn(key);
     let mut store = store.lock();
-    for kind in AlarmKind::ALL {
-        store.alarms.remove(&policy_alarm_name(key, kind));
+    if policy_type == TARGET_TRACKING_POLICY_TYPE {
+        for kind in AlarmKind::ALL {
+            store.alarms.remove(&policy_alarm_name(key, kind));
+        }
     }
+    for stored in store.alarms.values_mut() {
+        let alarm = &mut stored.alarm;
+        for actions in [
+            alarm.alarm_actions.as_mut(),
+            alarm.ok_actions.as_mut(),
+            alarm.insufficient_data_actions.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            actions.retain(|action| policy_arn_in_action(action) != policy_arn.as_str());
+        }
+    }
+}
+
+/// The CloudWatch alarms that INVOKE each scaling policy, by the policy ARN they name.
+///
+/// A policy's `Alarms` are "the CloudWatch alarms associated with the scaling policy"
+/// (`ScalingPolicy$Alarms`), and what associates an alarm with a policy is the alarm's own
+/// action list: "the actions to execute when this alarm transitions to the ALARM state […]
+/// specified as an Amazon Resource Name (ARN)" (`PutMetricAlarmInput$AlarmActions`). So the
+/// association is CloudWatch's state and is read from there rather than from what was sent to
+/// this service — which is also why reporting it can fail on a CloudWatch read at all
+/// (`FailedResourceAccessException`: "unable to retrieve the alarms associated with a scaling
+/// policy"). It covers both the alarms a target-tracking policy minted for itself and an alarm
+/// a client wired to a policy of its own.
+///
+/// Call it with NO store lock held. The ARN each action names is read with the minting suffix
+/// stripped ([`policy_arn_in_action`]), and every policy's alarms are ordered by name so a read
+/// reports them in a stable order. `region` names an alarm that carries no ARN of its own.
+pub fn alarms_invoking_policies<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+) -> BTreeMap<String, Vec<Alarm>> {
+    use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
+
+    let mut invoking: BTreeMap<String, Vec<Alarm>> = BTreeMap::new();
+    let Some(store) = cloudwatch::state::service_state(engine) else {
+        return invoking;
+    };
+    let store = store.lock();
+    for stored in store.alarms.values() {
+        let Some(alarm_name) = stored.alarm.alarm_name.clone() else {
+            continue;
+        };
+        let alarm_arn = stored
+            .alarm
+            .alarm_arn
+            .clone()
+            .unwrap_or_else(|| cloudwatch::state::alarm_arn(region, &alarm_name));
+        for action in stored.alarm.alarm_actions.iter().flatten() {
+            let listed = invoking
+                .entry(policy_arn_in_action(action).to_string())
+                .or_default();
+            // One alarm is one entry, however many of its actions name the same policy.
+            if listed.iter().any(|held| held.alarm_name == alarm_name) {
+                continue;
+            }
+            listed.push(Alarm {
+                alarm_name: alarm_name.clone(),
+                alarm_arn: alarm_arn.clone(),
+            });
+        }
+    }
+    drop(store);
+    for listed in invoking.values_mut() {
+        listed.sort_by(|left, right| left.alarm_name.cmp(&right.alarm_name));
+    }
+    invoking
 }
 
 /// Create or update every alarm in `wanted` in the CloudWatch store, delete the ones this
@@ -3726,13 +3813,13 @@ fn instant_of<Tz: ::chrono::TimeZone>(at: ::chrono::DateTime<Tz>) -> Option<Syst
         .flatten()
 }
 
-/// A modelled timestamp as a `SystemTime`, clamped to the range this service computes in.
+/// The instant `seconds` epoch seconds names, clamped to the range this service computes in.
 ///
-/// A timestamp arrives from a request, so neither end of it is trusted: a value below the
-/// epoch reads as the epoch and one past [`MAX_TIMESTAMP_SECS`] (or not a finite number at
-/// all) as that bound, rather than reaching a conversion that cannot represent it.
-pub fn system_time_of(stamp: &::aws_smithy_types::DateTime) -> SystemTime {
-    let seconds = stamp.as_secs_f64();
+/// A second count reaches this service from a request, and from the state another service
+/// stored, so neither end of it is trusted: a value below the epoch reads as the epoch and one
+/// past [`MAX_TIMESTAMP_SECS`] (or not a finite number at all) as that bound, rather than
+/// reaching a conversion that cannot represent it.
+pub fn instant_of_epoch_secs(seconds: f64) -> SystemTime {
     if !seconds.is_finite() || seconds <= 0.0 {
         return SystemTime::UNIX_EPOCH;
     }
@@ -3741,7 +3828,13 @@ pub fn system_time_of(stamp: &::aws_smithy_types::DateTime) -> SystemTime {
     } else {
         seconds as u64
     };
-    SystemTime::UNIX_EPOCH + ::std::time::Duration::from_secs(seconds)
+    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+}
+
+/// A modelled timestamp as a `SystemTime`, clamped the same way
+/// ([`instant_of_epoch_secs`]).
+pub fn system_time_of(stamp: &::aws_smithy_types::DateTime) -> SystemTime {
+    instant_of_epoch_secs(stamp.as_secs_f64())
 }
 
 // ---------------------------------------------------------------------------

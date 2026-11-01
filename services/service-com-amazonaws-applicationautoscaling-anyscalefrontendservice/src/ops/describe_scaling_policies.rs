@@ -245,45 +245,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let state = state.lock();
-        let matching: Vec<ScalingPolicy> = state
-            .policies
-            .iter()
-            .filter(|(key, _)| key.target.region == region)
-            .filter(|(key, _)| key.target.service_namespace == input.service_namespace)
-            .filter(|(key, _)| {
-                input
-                    .resource_id
-                    .as_ref()
-                    .is_none_or(|resource_id| &key.target.resource_id == resource_id)
-            })
-            .filter(|(key, _)| {
-                input
-                    .scalable_dimension
-                    .as_ref()
-                    .is_none_or(|dimension| &key.target.scalable_dimension == dimension)
-            })
-            .filter(|(key, _)| match input.policy_names.as_deref() {
-                // The model bounds `PolicyNames` at 0..50, so an empty list is legal and
-                // narrows nothing.
-                None | Some([]) => true,
-                Some(names) => names.contains(&key.policy_name),
-            })
-            .filter(|(key, _)| resume_after.as_ref().is_none_or(|after| *key > after))
-            .map(|(key, record)| scaling_policy_of(key, record))
-            .collect();
+        let (scaling_policies, next_token) = {
+            let state = state.lock();
+            let matching: Vec<ScalingPolicy> = state
+                .policies
+                .iter()
+                .filter(|(key, _)| key.target.region == region)
+                .filter(|(key, _)| key.target.service_namespace == input.service_namespace)
+                .filter(|(key, _)| {
+                    input
+                        .resource_id
+                        .as_ref()
+                        .is_none_or(|resource_id| &key.target.resource_id == resource_id)
+                })
+                .filter(|(key, _)| {
+                    input
+                        .scalable_dimension
+                        .as_ref()
+                        .is_none_or(|dimension| &key.target.scalable_dimension == dimension)
+                })
+                .filter(|(key, _)| match input.policy_names.as_deref() {
+                    // The model bounds `PolicyNames` at 0..50, so an empty list is legal and
+                    // narrows nothing.
+                    None | Some([]) => true,
+                    Some(names) => names.contains(&key.policy_name),
+                })
+                .filter(|(key, _)| resume_after.as_ref().is_none_or(|after| *key > after))
+                .map(|(key, record)| scaling_policy_of(key, record))
+                .collect();
 
-        let (scaling_policies, next_token) = take_page(matching, page_size, |policy| {
-            encode_next_token(
-                &region,
-                &[
-                    &policy.service_namespace,
-                    &policy.resource_id,
-                    &policy.scalable_dimension,
-                    &policy.policy_name,
-                ],
-            )
-        });
+            take_page(matching, page_size, |policy| {
+                encode_next_token(
+                    &region,
+                    &[
+                        &policy.service_namespace,
+                        &policy.resource_id,
+                        &policy.scalable_dimension,
+                        &policy.policy_name,
+                    ],
+                )
+            })
+        };
+
+        // A policy's `Alarms` are "the CloudWatch alarms associated with the scaling policy",
+        // and what associates one is the alarm's own action list — so they are derived from
+        // CloudWatch's state rather than from what was sent to this service: a policy that
+        // minted its own alarms reports those, and one a client wired its OWN alarm to reports
+        // that alarm. Read with this service's lock RELEASED, so no request holds two service
+        // stores at once, and in one read however many policies this page carries.
+        let invoking = crate::state::alarms_invoking_policies(&*self.engine, &region);
+        let scaling_policies: Vec<ScalingPolicy> = scaling_policies
+            .into_iter()
+            .map(|mut policy| {
+                policy.alarms = Some(
+                    invoking
+                        .get(&policy.policy_arn)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                policy
+            })
+            .collect();
 
         Ok(DescribeScalingPoliciesOutput {
             scaling_policies: Some(scaling_policies),

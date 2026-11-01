@@ -19,6 +19,10 @@ mod control_plane_rules;
 mod customized_metric_alarms;
 #[path = "all/emulator.rs"]
 mod emulator;
+#[path = "all/policy_alarm_association.rs"]
+mod policy_alarm_association;
+#[path = "all/policy_refusal_sentences.rs"]
+mod policy_refusal_sentences;
 #[path = "all/predictive_scaling_forecast.rs"]
 mod predictive_scaling_forecast;
 #[path = "all/recorded_refusal_wording.rs"]

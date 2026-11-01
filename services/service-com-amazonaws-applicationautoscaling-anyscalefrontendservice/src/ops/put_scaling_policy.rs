@@ -294,18 +294,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `PolicyType` "is required if you are creating a scaling policy"; re-putting an
         // existing policy without one keeps the type it was created with — and a Put that
-        // names an EXISTING policy with a DIFFERENT type is refused: a policy's type is
+        // names an EXISTING policy with a DIFFERENT type is refused with the service's one
+        // sentence for that rule ([`POLICY_TYPE_IS_NOT_CHANGEABLE`]): a policy's type is
         // what its configuration, its alarms and its whole evaluation are, so changing it
         // under the same name is not an update of that policy but a different policy
         // wearing its name.
         let policy_type = match (input.policy_type.clone(), stored.as_ref()) {
             (Some(policy_type), Some(existing)) if policy_type != existing.policy_type => {
-                return Err(validation(format!(
-                    "You can't change the policy type of an existing scaling policy: the policy \
-                     {} already exists with the policy type {}. Delete the policy and create a \
-                     new one with the policy type you want",
-                    key.policy_name, existing.policy_type
-                )))
+                return Err(validation(POLICY_TYPE_IS_NOT_CHANGEABLE))
             }
             (Some(policy_type), _) => policy_type,
             (None, Some(existing)) => existing.policy_type.clone(),
@@ -728,30 +724,17 @@ fn check_step_ranges(adjustments: &[StepAdjustment]) -> Result<(), PutScalingPol
         .collect();
     for (lower, upper) in &ranges {
         if lower >= upper {
-            return Err(validation(format!(
-                "A step adjustment's lower bound must be less than its upper bound, and \
-                 [{lower}, {upper}) holds no metric value"
-            )));
+            return Err(validation(STEP_BOUNDS_OUT_OF_ORDER));
         }
     }
     ranges.sort_by(|left, right| left.0.total_cmp(&right.0));
     for pair in ranges.windows(2) {
-        let ((lower, upper), (next_lower, next_upper)) = (pair[0], pair[1]);
+        let ((_, upper), (next_lower, _)) = (pair[0], pair[1]);
         // Compared by `total_cmp` rather than by `==`/`<`, so the two unbounded ends are
         // ordered against a finite bound without a float-equality comparison.
         match next_lower.total_cmp(&upper) {
-            ::std::cmp::Ordering::Less => {
-                return Err(validation(format!(
-                    "The ranges of your step adjustments can't overlap, and [{lower}, {upper}) \
-                     overlaps [{next_lower}, {next_upper})"
-                )))
-            }
-            ::std::cmp::Ordering::Greater => {
-                return Err(validation(format!(
-                    "The ranges of your step adjustments can't have a gap, and [{lower}, \
-                     {upper}) leaves one before [{next_lower}, {next_upper})"
-                )))
-            }
+            ::std::cmp::Ordering::Less => return Err(validation(STEP_INTERVALS_OVERLAP)),
+            ::std::cmp::Ordering::Greater => return Err(validation(STEP_INTERVALS_HAVE_A_GAP)),
             ::std::cmp::Ordering::Equal => {}
         }
     }
@@ -805,6 +788,29 @@ fn check_predictive_config(
 /// neither.
 const ONE_POLICY_PER_METRIC: &str =
     "Only one TargetTrackingScaling policy for a given metric specification is allowed.";
+
+/// Re-putting an existing policy name under another `PolicyType`.
+///
+/// The service states the rule in ONE fixed sentence, with no variable part: neither the policy
+/// it is about nor the type it already carries is interpolated, so a client that matches the
+/// refusal matches the same text whichever policy it put.
+const POLICY_TYPE_IS_NOT_CHANGEABLE: &str =
+    "You cannot change a StepScaling policy to a non StepScaling policy, or vice versa.";
+
+/// Two step adjustments whose ranges share a metric-to-threshold difference, which names two
+/// adjustments for one breach. One fixed sentence: the offending ranges are the caller's own
+/// request and are not rendered back into it.
+const STEP_INTERVALS_OVERLAP: &str = "Step adjustment intervals cannot overlap";
+
+/// Two step adjustments that leave a metric-to-threshold difference between them, which names
+/// no adjustment for a breach inside it — the other half of "the ranges of your step
+/// adjustments can't overlap or have a gap" (`StepAdjustment`), stated the same way.
+const STEP_INTERVALS_HAVE_A_GAP: &str = "The ranges of your step adjustments can't have a gap";
+
+/// One step adjustment whose lower bound is not below its upper bound, so its range holds no
+/// metric-to-threshold difference at all and the adjustment selects no breach.
+const STEP_BOUNDS_OUT_OF_ORDER: &str =
+    "A step adjustment's lower bound must be less than its upper bound";
 
 /// This operation's modelled `ValidationException`, carrying `message`.
 fn validation(message: impl Into<String>) -> PutScalingPolicyError {
