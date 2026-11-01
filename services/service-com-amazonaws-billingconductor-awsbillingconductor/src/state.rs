@@ -1840,6 +1840,26 @@ pub enum PeriodsRemoval {
     AtSpanLimit,
 }
 
+/// What taking a range of billing periods out of a custom line item did to the store —
+/// see
+/// [`remove_custom_line_item_periods`](ComAmazonawsBillingconductorAwsbillingconductorState::remove_custom_line_item_periods).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundedRemoval {
+    /// The item, and every resource association keyed on it, lost the named billing
+    /// periods, and the item still applies in some period the range did not name.
+    Narrowed,
+    /// The named periods were the last the item applied in, so nothing of it is left:
+    /// the record and everything that only existed because of it are gone.
+    Emptied,
+    /// The range names no billing period the item applied in, so nothing was written —
+    /// which is also how a retry of a call that already applied answers.
+    Unchanged,
+    /// REFUSED: the removal would carve the item, or an association keyed on it, into
+    /// more separate stretches of billing periods than [`MAX_BILLING_PERIOD_SPANS`], so
+    /// nothing was written.
+    AtSpanLimit,
+}
+
 /// What putting a range of billing periods INTO a resource association did — see
 /// [`ResourceAssociationRecord::add_periods`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1923,6 +1943,47 @@ impl ResourceAssociationRecord {
     pub fn is_empty(&self) -> bool {
         self.spans.is_empty()
     }
+}
+
+/// Take the billing periods `removed` names out of the associations of `associations`
+/// that `narrowed` picks out, and report what that did to them as a whole.
+///
+/// Each picked association keeps whatever of itself lies outside the removal and is
+/// DROPPED once it is in effect in no billing period at all
+/// ([`ResourceAssociationRecord::remove_periods`]), the way the disassociation that ends
+/// an association over a range drops it — so an association nothing is left of is not a
+/// record a read can report. The associations `narrowed` does not pick are left exactly
+/// as they are.
+///
+/// The whole narrowing is refused at the [`MAX_BILLING_PERIOD_SPANS`] bound, since a
+/// call that narrows several associations writes all of them or none: nothing of the list
+/// is written until every picked association's removal is through.
+pub fn remove_association_periods(
+    associations: &mut Vec<ResourceAssociationRecord>,
+    removed: &BillingPeriodSpan,
+    narrowed: impl Fn(&ResourceAssociationRecord) -> bool,
+) -> PeriodsRemoval {
+    let mut outcome = PeriodsRemoval::Unchanged;
+    let mut kept: Vec<ResourceAssociationRecord> = Vec::with_capacity(associations.len());
+    for association in associations.iter() {
+        if !narrowed(association) {
+            kept.push(association.clone());
+            continue;
+        }
+        let mut association = association.clone();
+        match association.remove_periods(removed) {
+            PeriodsRemoval::Changed => outcome = PeriodsRemoval::Changed,
+            PeriodsRemoval::Unchanged => {}
+            PeriodsRemoval::AtSpanLimit => return PeriodsRemoval::AtSpanLimit,
+        }
+        // An association in effect in no billing period at all is a record with nothing
+        // left for a read to report, so it is not kept.
+        if !association.is_empty() {
+            kept.push(association);
+        }
+    }
+    *associations = kept;
+    outcome
 }
 
 /// How many of `associations` are in effect in `billing_period`: the `AssociationSize` a
@@ -3317,6 +3378,93 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .retain(|key| remaining.contains_key(key));
 
         Some(removed)
+    }
+
+    /// Take the billing periods `removed` names out of the custom line item `item_arn`:
+    /// out of every generation of it, and out of every resource association keyed on it.
+    /// `None` when no such item is stored.
+    ///
+    /// A resource association is in effect only in billing periods the resource it names
+    /// is there to be associated in, so narrowing the periods a resource applies in
+    /// narrows by the same periods every association keyed on that resource — the ones
+    /// the resource itself holds and the ones other resources hold TO it — and an
+    /// association left in effect in no period at all goes
+    /// ([`remove_association_periods`]). It is the bounded form of the rule a delete that
+    /// names no range enforces by removing the record outright
+    /// ([`Self::remove_custom_line_item`]): a period the item applies in in no generation
+    /// of it holds no association of it either, so no read of that period can report an
+    /// association to an item it reports no version of. A narrowing that leaves nothing
+    /// of the item removes it through that same method, so it leaves exactly as little
+    /// behind as the unbounded delete.
+    ///
+    /// Nothing is written unless the WHOLE narrowing stays inside
+    /// [`MAX_BILLING_PERIOD_SPANS`] — every generation of the item and every association
+    /// it narrows — so a refused narrowing leaves the store exactly as it was. `now` is
+    /// the instant the narrowed item reports as its most recent modification; the items
+    /// that merely held an association to it are not modified by it, exactly as they are
+    /// not by the unbounded delete.
+    pub fn remove_custom_line_item_periods(
+        &mut self,
+        item_arn: &str,
+        removed: &BillingPeriodSpan,
+        now: i64,
+    ) -> Option<BoundedRemoval> {
+        // Every write below lands on a COPY of a stored record, so a removal refused at
+        // the span bound — of the item, or of any association keyed on it — can be
+        // answered without having written a thing.
+        let mut item = self.custom_line_items.get(item_arn)?.clone();
+        match item.remove_periods(removed) {
+            PeriodsRemoval::Changed => {}
+            // The range names no billing period the item applied in, so there is nothing
+            // of the item to take out of the associations keyed on it either.
+            PeriodsRemoval::Unchanged => return Some(BoundedRemoval::Unchanged),
+            PeriodsRemoval::AtSpanLimit => return Some(BoundedRemoval::AtSpanLimit),
+        }
+        // The associations the item itself holds: in a period the item applies in in no
+        // generation, the item is not there to hold a resource associated at all.
+        if remove_association_periods(&mut item.associated_resources, removed, |_| true)
+            == PeriodsRemoval::AtSpanLimit
+        {
+            return Some(BoundedRemoval::AtSpanLimit);
+        }
+        // The associations OTHER percentage items hold to this one.
+        let mut holders: Vec<(String, CustomLineItemRecord)> = Vec::new();
+        for (arn, holder) in &self.custom_line_items {
+            if arn == item_arn
+                || !holder
+                    .associated_resources
+                    .iter()
+                    .any(|association| association.arn == item_arn)
+            {
+                continue;
+            }
+            let mut holder = holder.clone();
+            let outcome = remove_association_periods(
+                &mut holder.associated_resources,
+                removed,
+                |association| association.arn == item_arn,
+            );
+            if outcome == PeriodsRemoval::AtSpanLimit {
+                return Some(BoundedRemoval::AtSpanLimit);
+            }
+            holders.push((arn.clone(), holder));
+        }
+
+        for (arn, holder) in holders {
+            self.custom_line_items.insert(arn, holder);
+        }
+        if item.is_empty() {
+            // Nothing of the item is left for a read to report, so the stored record
+            // goes — and with it everything that only existed because of it, including
+            // the rest of the associations just narrowed.
+            self.remove_custom_line_item(item_arn);
+            return Some(BoundedRemoval::Emptied);
+        }
+        // The record changed, so the instant a read reports as its most recent
+        // modification advances with it.
+        item.last_modified_time_millis = now;
+        self.custom_line_items.insert(item_arn.to_string(), item);
+        Some(BoundedRemoval::Narrowed)
     }
 
     /// Write `updated` over the stored custom line item it names as the generation that

@@ -51,6 +51,8 @@ mod billing_transfer_identity;
 mod billing_transfer_preference;
 #[path = "all/billing_transfer_preference_unchanged_update.rs"]
 mod billing_transfer_preference_unchanged_update;
+#[path = "all/bounded_delete_narrows_resource_associations.rs"]
+mod bounded_delete_narrows_resource_associations;
 #[path = "all/cost_report_charges_of_the_generation_in_effect.rs"]
 mod cost_report_charges_of_the_generation_in_effect;
 #[path = "all/cost_report_mutual_percentage_associations.rs"]

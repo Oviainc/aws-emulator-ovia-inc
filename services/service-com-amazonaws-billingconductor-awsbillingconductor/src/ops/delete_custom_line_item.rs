@@ -6,7 +6,9 @@
 //! `BillingPeriodRange` deletes the item outright; one that names a range deletes it
 //! only from the periods that range covers, so the item keeps the periods on either
 //! side of it — including the ones from the range's exclusive end on — and the record
-//! goes only once nothing is left of it. A range that starts outside the current or
+//! goes only once nothing is left of it. Either way the resource associations keyed on
+//! the item lose the periods it was deleted from, since a period the item applies in in
+//! no generation holds no association of it. A range that starts outside the current or
 //! previous billing period is refused.
 //!
 //! ## Shape of an operation
@@ -170,23 +172,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This operation models no `ResourceNotFoundException`, so an `Arn` that names
         // no stored item is refused with the modelled `ValidationException` and the
         // reason `ValidationExceptionReason` enumerates for exactly that
-        // (`MISSING_CUSTOMLINEITEM`). The record this resolves to is the one every
-        // branch below writes, so the store is reached exactly once.
-        let Some(item) = state.custom_line_items.get_mut(&item_arn) else {
+        // (`MISSING_CUSTOMLINEITEM`).
+        if !state.custom_line_items.contains_key(&item_arn) {
             return Err(validation(
                 "MISSING_CUSTOMLINEITEM",
                 "Arn",
                 format!("the custom line item {item_arn} does not exist"),
             ));
-        };
+        }
 
-        // What the delete did, and whether nothing of the item is left for the record
-        // itself to hold.
-        let (outcome, gone) = match input.billing_period_range.as_ref() {
+        // What the delete did to the store.
+        let outcome = match input.billing_period_range.as_ref() {
             // "Deletes the custom line item identified by the given ARN": a request
             // that names no billing periods deletes the item itself, so no read of any
-            // billing period reports it again.
-            None => ("deleted", true),
+            // billing period reports it again. One state method removes the item and
+            // everything that only existed because of it: the associations other
+            // percentage items held to it, and the idempotency entries that named it.
+            None => {
+                state.remove_custom_line_item(&item_arn);
+                "deleted"
+            }
             Some(range) => {
                 // The range is half-open, as its member names say, so an end at or
                 // before the start would name no billing period to delete the item
@@ -214,27 +219,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(range.inclusive_start_billing_period.clone()),
                     range.exclusive_end_billing_period.clone(),
                 );
-                match item.remove_periods(&removed) {
-                    crate::state::PeriodsRemoval::Changed => {
-                        // The record changed, so the instant a read reports as its most
-                        // recent modification advances with it.
-                        item.last_modified_time_millis = crate::state::now_millis();
-                        // An item left applying in no billing period at all has nothing
-                        // for a read to report, so its record goes.
-                        if item.is_empty() {
-                            ("deleted", true)
-                        } else {
-                            ("narrowed", false)
-                        }
-                    }
+                // One state method takes those periods out of every generation of the
+                // item AND out of every resource association keyed on it — the ones the
+                // item holds and the ones other percentage items hold to it — because a
+                // period no generation of the item applies in holds no association of it
+                // either; an item nothing is left of is removed outright, exactly as the
+                // delete that names no range removes it.
+                match state.remove_custom_line_item_periods(
+                    &item_arn,
+                    &removed,
+                    crate::state::now_millis(),
+                ) {
+                    Some(crate::state::BoundedRemoval::Narrowed) => "narrowed",
+                    // The periods the request named were the last the item applied in,
+                    // so nothing of it is left for a read to report.
+                    Some(crate::state::BoundedRemoval::Emptied) => "deleted",
                     // The request named only billing periods the item never applied in,
                     // so there is nothing of it to delete from them and no stored value
-                    // changes.
-                    crate::state::PeriodsRemoval::Unchanged => ("unchanged", false),
-                    // One stretch of billing periods more than a stored item may apply
-                    // over is a limit the request cannot get around, and nothing of it
-                    // was written.
-                    crate::state::PeriodsRemoval::AtSpanLimit => {
+                    // changes. The lookup above proved the item is stored, so the removal
+                    // cannot miss it — and an item the store does not hold has no billing
+                    // period to lose either way.
+                    Some(crate::state::BoundedRemoval::Unchanged) | None => "unchanged",
+                    // One stretch of billing periods more than a stored item, or an
+                    // association keyed on it, may apply over is a limit the request
+                    // cannot get around, and nothing of it was written.
+                    Some(crate::state::BoundedRemoval::AtSpanLimit) => {
                         return Err(validation(
                             "ILLEGAL_CUSTOMLINEITEM_MODIFICATION",
                             "BillingPeriodRange",
@@ -248,13 +257,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         };
-
-        if gone {
-            // One state method removes the item and everything that only existed
-            // because of it: the associations other percentage items held to it, and
-            // the idempotency entries that named it.
-            state.remove_custom_line_item(&item_arn);
-        }
 
         // The audit record for a state-changing call: who asked, what it addressed and
         // what it did. Never a `@sensitive` member — the item's name and its
