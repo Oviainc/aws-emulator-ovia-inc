@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableFastSnapshotRestores
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableFastSnapshotRestores`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers each (snapshot, Availability Zone) pair the request names on its
+//! own — the pair's fast snapshot restore in `Successful`, or that pair's error under its
+//! snapshot id in `Unsuccessful` — so one snapshot this service cannot resolve never
+//! refuses the snapshots beside it. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableFastSnapshotRestores::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What an enable stores
+//!
+//! A fast snapshot restore is a property of a (snapshot, zone) PAIR, so every pair this
+//! call names is resolved against the snapshots the ACCOUNT holds
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::snapshots`]): a snapshot id that does
+//! not resolve comes back in the per-pair channel carrying that id's own cause
+//! ([`crate::state::unresolvable_snapshot_id_error`]), and every pair that does resolve is
+//! stored as a [`crate::state::FastSnapshotRestoreRecord`] in `enabling`, which the clock
+//! carries to `optimizing` and then `enabled` — "you get the full benefit of fast snapshot
+//! restores AFTER THEY ENTER THE ENABLED STATE". `DescribeFastSnapshotRestores` reports the
+//! same stored record, so the two operations cannot describe one pair differently.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +154,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableFastSnapshotRestores` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableFastSnapshotRestoresErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableFastSnapshotRestores"))
+        use crate::state::{
+            dry_run_operation, fast_snapshot_restore_request, request_region, require_service_state,
+            unresolvable_snapshot_id_error,
+        };
+
+        // The members an enable and a disable share, read the one way both read them: the
+        // snapshots, the zones of the SIGNED Region, and which identifier the request named
+        // those zones by — which is the identifier every item of the answer mirrors.
+        let region = request_region(ctx.parts());
+        let requested = fast_snapshot_restore_request(
+            &input.source_snapshot_ids,
+            input.availability_zones.as_deref(),
+            input.availability_zone_ids.as_deref(),
+            &region,
+        )?;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation" (`DryRun`): it sits
+        // after every parameter has been validated and BEFORE the first write, so a request
+        // that would have been refused is refused with that reason instead and one that
+        // would have succeeded leaves the store untouched. Every caller of this emulator is
+        // permitted.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        // One item per pair: the snapshots in request order with repeats dropped, each
+        // crossed with every requested zone. A snapshot the account holds no record of
+        // cannot have a fast snapshot restore enabled for it, and the cause belongs to the
+        // SNAPSHOT, so every pair it is named in reports it — under that snapshot's id, in
+        // the per-pair channel, which leaves the snapshots beside it unaffected.
+        let now = ::std::time::SystemTime::now();
+        // ONE instant for the whole answer, so a call that straddles a transition's due
+        // instant cannot report two of its own pairs at different phases.
+        let observed = ::std::time::Instant::now();
+        let owner_id = ::engine::emulator_account_id().to_string();
+        let mut successful = Vec::new();
+        let mut unsuccessful = Vec::new();
+        for snapshot_id in &requested.snapshot_ids {
+            if !store.snapshots.contains_key(snapshot_id) {
+                let (code, message) = unresolvable_snapshot_id_error(snapshot_id);
+                unsuccessful.push(EnableFastSnapshotRestoreErrorItem {
+                    fast_snapshot_restore_state_errors: Some(
+                        requested
+                            .zones
+                            .iter()
+                            .map(|zone| EnableFastSnapshotRestoreStateErrorItem {
+                                availability_zone: requested
+                                    .zone_form
+                                    .reported_zone_name(&zone.zone_name),
+                                availability_zone_id: requested
+                                    .zone_form
+                                    .reported_zone_id(&zone.zone_id),
+                                error: Some(EnableFastSnapshotRestoreStateError {
+                                    code: Some(code.to_string()),
+                                    message: Some(message.clone()),
+                                }),
+                            })
+                            .collect(),
+                    ),
+                    snapshot_id: Some(snapshot_id.clone()),
+                });
+                continue;
+            }
+            for zone in &requested.zones {
+                // Read the answer back OUT of the record the store now holds, so the caller
+                // sees what a later `DescribeFastSnapshotRestores` will see rather than the
+                // request object.
+                let item = store
+                    .enable_fast_snapshot_restore(snapshot_id, zone, &owner_id, now)
+                    .enable_item_at(observed, requested.zone_form);
+                successful.push(item);
+            }
+        }
+
+        // Both sets are reported EMPTY rather than omitted when nothing landed in them: the
+        // call did run, and an absent member would say instead that the service has nothing
+        // to say about that channel.
+        Ok(EnableFastSnapshotRestoresOutput {
+            successful: Some(successful),
+            unsuccessful: Some(unsuccessful),
+        })
     }
 }

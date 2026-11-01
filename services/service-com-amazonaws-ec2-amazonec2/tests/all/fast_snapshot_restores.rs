@@ -13,10 +13,11 @@
 //!   request names is answered on its own: the pair's new state in `Successful`, or that
 //!   pair's error under its snapshot id in `Unsuccessful`. A snapshot the call cannot
 //!   resolve therefore never refuses the snapshots beside it — the whole call still answers
-//!   HTTP 200, with the per-pair channel carrying the cause. This emulator stores no EBS
-//!   snapshots (every snapshot operation is still a stub, which is why `CreateVolume`
-//!   refuses a `SnapshotId` too), so every pair lands in `Unsuccessful` and `Successful`
-//!   comes back EMPTY.
+//!   HTTP 200, with the per-pair channel carrying the cause. Every pair of this suite names
+//!   a snapshot the account does NOT hold (which is why `CreateVolume` refuses the same id
+//!   too), so every pair lands in `Unsuccessful` and `Successful` comes back EMPTY; what a
+//!   pair naming a STORED snapshot answers is covered by
+//!   [`super::fast_snapshot_restore_lifecycle`].
 //! * ONE classification of an unresolvable snapshot id, whichever channel carries it:
 //!   `InvalidSnapshotID.Malformed` for a value that is not a snapshot id EC2 could have
 //!   ISSUED — including the all-zero placeholder, which the recorded

@@ -7,23 +7,25 @@
 //! never refuses the snapshots beside it. This is the ONLY file to touch for this
 //! operation.
 //!
-//! ## Why every pair of this emulator is `Unsuccessful`
+//! ## What a disable takes off a pair
 //!
 //! Fast snapshot restores are a property of a (snapshot, zone) pair, so every pair this
-//! call names is resolved against the snapshots the ACCOUNT holds. This emulator stores
-//! none — every EBS snapshot operation is still a stub, which is the same position
-//! `CreateVolume` and `ImportImage` already take on a `SnapshotId`
-//! ([`crate::state::unresolvable_snapshot_id`]) — so no snapshot id a caller names here
-//! resolves, and each one comes back in the per-pair channel carrying that id's own cause:
+//! call names is resolved against the snapshots the ACCOUNT holds
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::snapshots`]): a snapshot id that does
+//! not resolve comes back in the per-pair channel carrying that id's own cause —
 //! `InvalidSnapshotID.Malformed` for a value that is not a snapshot id EC2 could have
-//! issued, `InvalidSnapshot.NotFound` for one that is. Nothing is written, because no fast
-//! snapshot restore was disabled. Once a snapshot store lands, the ONE classification in
-//! [`crate::state::unresolvable_snapshot_id_error`] is what changes.
+//! issued, `InvalidSnapshot.NotFound` for one that is — which is the same classification
+//! `CreateVolume` and `ImportImage` answer a `SnapshotId` with
+//! ([`crate::state::unresolvable_snapshot_id_error`]), so no two operations report one id
+//! differently. A snapshot id this crate MINTED onto an AMI's block device mapping or an
+//! `ImportImage` task's snapshot details names no stored snapshot either, so it is answered
+//! `InvalidSnapshot.NotFound` like any other id the store does not hold.
 //!
-//! A snapshot id this crate MINTED is answered `InvalidSnapshot.NotFound` too — the ids on
-//! an AMI's block device mapping and on an `ImportImage` task's snapshot details name
-//! snapshots no store holds a record of — which is the same answer `CreateVolume` gives for
-//! them, so the two operations cannot report one id differently.
+//! A pair that DOES resolve is put in `disabling`, from which the clock owes it `disabled`
+//! ([`crate::state::FastSnapshotRestoreRecord`]), and the record is kept rather than
+//! dropped so `DescribeFastSnapshotRestores` still reports the pair in the state this call
+//! left it in. A pair the account never enabled is already `disabled`, so it is reported as
+//! that state with no lifecycle at all: there is nothing to turn off and nothing to store.
 //!
 //! ## Shape of an operation
 //!
@@ -159,122 +161,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            AvailabilityZoneRecord, MAX_RESOURCE_IDS, availability_zone_of_region,
-            availability_zones_in_region, deduplicate_ids, dry_run_operation,
-            invalid_parameter_combination, invalid_parameter_value, missing_parameter,
-            request_region, unresolvable_snapshot_id_error,
+            disabled_fast_snapshot_restore_item, dry_run_operation, fast_snapshot_restore_request,
+            request_region, require_service_state, unresolvable_snapshot_id_error,
         };
 
-        // No fast snapshot restore of this store can be disabled (see the module header),
-        // so nothing is read from or written to the engine on `self`.
-        let _ = &self.engine;
-
-        // "The IDs of one or more snapshots" (`SourceSnapshotIds`, `@required`): the model
-        // refuses a request that omits the member, and one carrying an EMPTY list names no
-        // snapshot to disable restores for, which is the same missing parameter. ec2Query
-        // cannot express an empty list (an omitted member is what one reaches the wire as),
-        // so over that protocol the boundary's own refusal is what a caller sees; this arm is
-        // what answers the same request from any other reader of this handler.
-        if input.source_snapshot_ids.is_empty() {
-            return Err(missing_parameter(
-                "The request must contain at least one SourceSnapshotId",
-            ));
-        }
-        // The model publishes no bound on the list, and every id named adds one item per
-        // zone to the answer, so the number one request may name is capped here — the same
-        // ceiling the rest of this crate puts on a caller-chosen id list — before any
-        // per-pair work is done.
-        if input.source_snapshot_ids.len() > MAX_RESOURCE_IDS {
-            return Err(invalid_parameter_value(format!(
-                "SourceSnapshotIds carries {supplied} ids, above the maximum of {maximum}",
-                supplied = input.source_snapshot_ids.len(),
-                maximum = MAX_RESOURCE_IDS,
-            )));
-        }
-
-        // "Either AvailabilityZone or AvailabilityZoneId must be specified in the request,
-        // but not both" (`AvailabilityZones` / `AvailabilityZoneIds`). The form the request
-        // chose is also the form the answer reports each pair in, so a caller reads back the
-        // identifier it asked with.
-        let named = input.availability_zones.as_deref().unwrap_or_default();
-        let identified = input.availability_zone_ids.as_deref().unwrap_or_default();
-        let (zone_form, requested_zones) = match (named.is_empty(), identified.is_empty()) {
-            (false, false) => {
-                return Err(invalid_parameter_combination(
-                    "Either availabilityZone or availabilityZoneId may be specified, not both",
-                ));
-            }
-            (true, true) => {
-                return Err(missing_parameter(
-                    "Either availabilityZone or availabilityZoneId must be specified",
-                ));
-            }
-            (false, true) => (ZoneForm::Name, named),
-            (true, false) => (ZoneForm::Id, identified),
-        };
-        if requested_zones.len() > MAX_RESOURCE_IDS {
-            return Err(invalid_parameter_value(format!(
-                "{member} carries {supplied} zones, above the maximum of {maximum}",
-                member = zone_form.request_member(),
-                supplied = requested_zones.len(),
-                maximum = MAX_RESOURCE_IDS,
-            )));
-        }
-
-        // Each zone must be one the Region the caller SIGNED for has: EC2 is a regional
-        // service reached through a regional endpoint, and the naming rule for a Region's
-        // zones lives in one place, `availability_zones_in_region`. A zone that Region does
-        // not have is the caller's mistake about the request rather than a per-pair failure,
-        // so it refuses the whole call — through `availability_zone_of_region`, the crate's
-        // ONE lookup for both spellings of a zone, so this operation and the ones beside it
-        // cannot answer an unknown zone two ways.
+        // The members an enable and a disable share, read the one way both read them: the
+        // snapshots, the zones of the SIGNED Region, and which identifier the request named
+        // those zones by — which is the identifier every item of the answer mirrors.
         let region = request_region(ctx.parts());
-        let zones = availability_zones_in_region(&region);
-        // One zone gets one answer however many times the request names it, the same reason
-        // `deduplicate_ids` gives for an id list: a repeat would report the same pair twice.
-        let requested_zones = deduplicate_ids(requested_zones);
-        let select: fn(&AvailabilityZoneRecord) -> &str = match zone_form {
-            ZoneForm::Name => |zone| zone.zone_name.as_str(),
-            ZoneForm::Id => |zone| zone.zone_id.as_str(),
-        };
-        for zone in &requested_zones {
-            availability_zone_of_region(
-                &zones,
-                &region,
-                zone_form.request_member(),
-                zone,
-                select,
-            )?;
-        }
+        let requested = fast_snapshot_restore_request(
+            &input.source_snapshot_ids,
+            input.availability_zones.as_deref(),
+            input.availability_zone_ids.as_deref(),
+            &region,
+        )?;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
 
         // "Checks whether you have the required permissions for the action, WITHOUT
         // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
         // required permissions, the error response is DryRunOperation" (`DryRun`): it sits
-        // after every parameter has been validated and before the first change, so a request
-        // that would have been refused is refused with that reason instead. Every caller of
-        // this emulator is permitted.
-        if input.dry_run.unwrap_or(false) {
+        // after every parameter has been validated and BEFORE the first write, so a request
+        // that would have been refused is refused with that reason instead and one that
+        // would have succeeded leaves the store untouched. Every caller of this emulator is
+        // permitted.
+        if input.dry_run == Some(true) {
             return Err(dry_run_operation());
         }
 
-        // One item per snapshot, in request order with repeats dropped, each carrying one
-        // error per requested zone: the cause is the snapshot's, so every pair it is named
-        // in reports it. The answer is bounded well below the two caps multiplied together:
-        // every zone left here is a distinct zone of the signed Region, of which there are
-        // `AVAILABILITY_ZONES_PER_REGION`, so a request can ask for at most
-        // `MAX_RESOURCE_IDS * AVAILABILITY_ZONES_PER_REGION` pairs — the zone list's own cap
-        // is the looser of the two, so the Region's zone count is what binds this dimension.
-        let unsuccessful = deduplicate_ids(&input.source_snapshot_ids)
-            .into_iter()
-            .map(|snapshot_id| {
-                let (code, message) = unresolvable_snapshot_id_error(&snapshot_id);
-                DisableFastSnapshotRestoreErrorItem {
+        // One item per pair: the snapshots in request order with repeats dropped, each
+        // crossed with every requested zone. The cause of an unresolvable snapshot is the
+        // SNAPSHOT's, so every pair it is named in reports it, under that snapshot's id in
+        // the per-pair channel. The answer is bounded well below the two caps multiplied
+        // together: every zone left here is a distinct zone of the signed Region, of which
+        // there are `AVAILABILITY_ZONES_PER_REGION`, so a request can ask for at most
+        // `MAX_RESOURCE_IDS * AVAILABILITY_ZONES_PER_REGION` pairs.
+        let now = ::std::time::SystemTime::now();
+        // ONE instant for the whole answer, so a call that straddles a transition's due
+        // instant cannot report two of its own pairs at different phases.
+        let observed = ::std::time::Instant::now();
+        let mut successful = Vec::new();
+        let mut unsuccessful = Vec::new();
+        for snapshot_id in &requested.snapshot_ids {
+            if !store.snapshots.contains_key(snapshot_id) {
+                let (code, message) = unresolvable_snapshot_id_error(snapshot_id);
+                unsuccessful.push(DisableFastSnapshotRestoreErrorItem {
                     fast_snapshot_restore_state_errors: Some(
-                        requested_zones
+                        requested
+                            .zones
                             .iter()
                             .map(|zone| DisableFastSnapshotRestoreStateErrorItem {
-                                availability_zone: zone_form.zone_name(zone),
-                                availability_zone_id: zone_form.zone_id(zone),
+                                availability_zone: requested
+                                    .zone_form
+                                    .reported_zone_name(&zone.zone_name),
+                                availability_zone_id: requested
+                                    .zone_form
+                                    .reported_zone_id(&zone.zone_id),
                                 error: Some(DisableFastSnapshotRestoreStateError {
                                     code: Some(code.to_string()),
                                     message: Some(message.clone()),
@@ -282,55 +225,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             })
                             .collect(),
                     ),
-                    snapshot_id: Some(snapshot_id),
-                }
-            })
-            .collect();
+                    snapshot_id: Some(snapshot_id.clone()),
+                });
+                continue;
+            }
+            for zone in &requested.zones {
+                // Read the answer back OUT of the record the store now holds, so the caller
+                // sees what a later `DescribeFastSnapshotRestores` will see rather than the
+                // request object. A pair the account never enabled has no record to read,
+                // and is already in the state this call asks for.
+                let item = match store.disable_fast_snapshot_restore(
+                    snapshot_id,
+                    &zone.zone_name,
+                    now,
+                ) {
+                    Some(record) => record.disable_item_at(observed, requested.zone_form),
+                    None => disabled_fast_snapshot_restore_item(
+                        snapshot_id,
+                        zone,
+                        requested.zone_form,
+                    ),
+                };
+                successful.push(item);
+            }
+        }
 
-        // "Information about the snapshots for which fast snapshot restores were
-        // successfully disabled" (`Successful`): the set is reported EMPTY rather than
-        // omitted, because the call did run and disabled nothing — an absent member would
-        // say instead that the service has nothing to say about it.
+        // Both sets are reported EMPTY rather than omitted when nothing landed in them: the
+        // call did run, and an absent member would say instead that the service has nothing
+        // to say about that channel.
         Ok(DisableFastSnapshotRestoresOutput {
-            successful: Some(Vec::new()),
+            successful: Some(successful),
             unsuccessful: Some(unsuccessful),
         })
-    }
-}
-
-/// Which of the two identifiers of an Availability Zone the request named its zones by.
-///
-/// "Either AvailabilityZone or AvailabilityZoneId must be specified in the request, but not
-/// both" (`DisableFastSnapshotRestoresRequest$AvailabilityZones`), and the answer reports
-/// each pair by the SAME identifier: a client that asked by zone name reads
-/// `availabilityZone` back, and one that asked by zone id reads `availabilityZoneId`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ZoneForm {
-    /// `AvailabilityZones`: "One or more Availability Zones. For example, us-east-2a."
-    Name,
-    /// `AvailabilityZoneIds`: "One or more Availability Zone IDs. For example, use2-az1."
-    Id,
-}
-
-impl ZoneForm {
-    /// The request member this form reads, for a refusal that names the parameter it is
-    /// about.
-    fn request_member(self) -> &'static str {
-        match self {
-            Self::Name => "AvailabilityZones",
-            Self::Id => "AvailabilityZoneIds",
-        }
-    }
-
-    /// The `AvailabilityZone` an answer reports for `zone`: the zone's name when that is
-    /// what the request named it by, and nothing when it asked by zone id.
-    fn zone_name(self, zone: &str) -> Option<String> {
-        matches!(self, Self::Name).then(|| zone.to_string())
-    }
-
-    /// The `AvailabilityZoneId` an answer reports for `zone`, the mirror of
-    /// [`Self::zone_name`].
-    fn zone_id(self, zone: &str) -> Option<String> {
-        matches!(self, Self::Id).then(|| zone.to_string())
     }
 }

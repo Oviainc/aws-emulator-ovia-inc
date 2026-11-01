@@ -71,6 +71,14 @@ mod instance_id_forms;
 // lines.
 #[path = "all/create_image_usage_report.rs"]
 mod create_image_usage_report;
+// What `EnableFastSnapshotRestores` stores for each (snapshot, Availability Zone) pair, the
+// lifecycle the clock carries that pair through, what `DescribeFastSnapshotRestores` reports,
+// narrows, pages and refuses, and what `DisableFastSnapshotRestores` leaves behind. Declared
+// HERE rather than in sorted position or beside `prefix_lists`: both of those are the
+// contended regions the note at the top of this file describes, and this fix lost three
+// serialized squash merges to the lines just below `prefix_lists`.
+#[path = "all/fast_snapshot_restore_lifecycle.rs"]
+mod fast_snapshot_restore_lifecycle;
 // What `CopySnapshot` mints from a stored snapshot, which members it reads off the source and
 // which off the request, and what it refuses. Declared beside `prefix_lists` for the reason
 // the note above gives: the sorted neighbourhood and the tail of this file are where every new

@@ -221,6 +221,16 @@
 //! retains is either a word the service chose or an id read back out of another store —
 //! nothing caller-sized — so no byte charge is made for one.
 //!
+//! ## Fast snapshot restores
+//!
+//! [`ComAmazonawsEc2Amazonec2State::fast_snapshot_restores`] holds the fast snapshot
+//! restore of each (snapshot, Availability Zone) pair that has one, keyed by both halves of
+//! that pair ([`fast_snapshot_restore_key`]) as [`FastSnapshotRestoreRecord`]s: the pair,
+//! the account that enabled it and the instants its lifecycle moves fall due on, from which
+//! [`FastSnapshotRestoreRecord::view_at`] derives the state, the state transition reason and
+//! the phase timestamps every operation that reports one answers with. See
+//! [`fast_snapshot_restores`] for that slice's own documentation.
+//!
 //! ## Carrier gateways
 //!
 //! [`ComAmazonawsEc2Amazonec2State::carrier_gateways`] holds the account's carrier
@@ -1821,6 +1831,13 @@ pub use scheduled_instances::*;
 /// `crate::state::<item>` like every other primitive here.
 pub mod snapshots;
 pub use snapshots::*;
+
+/// The fast snapshot restores the account holds — what one (snapshot, Availability Zone)
+/// pair is stored as, the lifecycle the clock owes it and the one reading of the request
+/// members an enable and a disable share — in a module of its own, re-exported so a handler
+/// reaches them as `crate::state::<item>` like every other primitive here.
+pub mod fast_snapshot_restores;
+pub use fast_snapshot_restores::*;
 
 /// The EBS root volume a LAUNCH creates for the instance it stores, restored from the AMI's
 /// root block device mapping — one method on the state, in a module of its own.
@@ -3797,6 +3814,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// see the module docs. Ordered by id, which is the order
     /// `DescribeFastLaunchImages` reports and pages over.
     pub fast_launch_images: BTreeMap<String, FastLaunchRecord>,
+    /// The fast snapshot restore of every (snapshot, Availability Zone) pair that has one,
+    /// by the pair's own key ([`fast_snapshot_restore_key`]) — see
+    /// [`fast_snapshot_restores`], the submodule that owns this slice. Ordered by that key,
+    /// which is the order `DescribeFastSnapshotRestores` reports and pages over.
+    pub fast_snapshot_restores: BTreeMap<String, FastSnapshotRestoreRecord>,
     /// Every AMI store task of the account, by the minted internal key the task was
     /// stored under — see the module docs. The keys increase with time, so the map's
     /// order is the task order, and its REVERSE is the "reverse chronological order"
@@ -4750,6 +4772,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             application_status_checks: BTreeMap::new(),
             application_status_check_client_tokens: HashMap::new(),
             fast_launch_images: BTreeMap::new(),
+            fast_snapshot_restores: BTreeMap::new(),
             store_image_tasks: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
