@@ -3376,69 +3376,32 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "events",
             "Amazon EventBridge (CloudWatch Events)",
-            vec![
-                quota("Event buses per account", 100.0),
-                quota("Rules per event bus", 300.0),
-                quota("PutEvents throttle limit in transactions per second", 10000.0).fixed(),
-            ],
+            events_quotas(),
         ),
         service(
             "firehose",
-            "Amazon Data Firehose",
-            vec![quota("Delivery streams per Region", 5000.0)],
+            // The display name AWS's own Service Quotas data reports for this code,
+            // which is still the service's former product name.
+            "Amazon Kinesis Data Firehose",
+            firehose_quotas(),
         ),
-        service(
-            "fms",
-            "AWS Firewall Manager",
-            vec![quota("Policies per Region", 50.0)],
-        ),
+        service("fms", "AWS Firewall Manager", fms_quotas()),
         service(
             "forecast",
             "Amazon Forecast",
             vec![quota("Datasets per account", 100.0)],
         ),
-        service(
-            "fsx",
-            "Amazon FSx",
-            vec![quota("File systems per account", 100.0)],
-        ),
-        service(
-            "gamelift",
-            "Amazon GameLift",
-            vec![quota("Fleets", 100.0)],
-        ),
-        service(
-            "glacier",
-            "Amazon S3 Glacier",
-            vec![quota("Vaults per Region", 1000.0).fixed()],
-        ),
+        service("fsx", "Amazon FSx", fsx_quotas()),
+        service("gamelift", "Amazon GameLift Servers", gamelift_quotas()),
+        service("glacier", "Amazon Glacier", glacier_quotas()),
         service(
             "globalaccelerator",
             "AWS Global Accelerator",
             vec![quota("Accelerators per account", 20.0).global()],
         ),
-        service(
-            "glue",
-            "AWS Glue",
-            vec![
-                quota("Databases per account", 10000.0),
-                quota("Tables per database", 200000.0),
-                quota("Concurrent job runs per account", 200.0),
-            ],
-        ),
-        service(
-            "groundstation",
-            "AWS Ground Station",
-            vec![quota("Mission profiles per account", 500.0)],
-        ),
-        service(
-            "guardduty",
-            "Amazon GuardDuty",
-            vec![
-                quota("Detectors per Region", 1.0).fixed(),
-                quota("Threat intel sets per detector", 6.0),
-            ],
-        ),
+        service("glue", "AWS Glue", glue_quotas()),
+        service("groundstation", "AWS Ground Station", groundstation_quotas()),
+        service("guardduty", "Amazon GuardDuty", guardduty_quotas()),
         service(
             "iam",
             "AWS Identity and Access Management (IAM)",
@@ -3450,11 +3413,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Users per account", 5000.0).global(),
             ],
         ),
-        service(
-            "imagebuilder",
-            "EC2 Image Builder",
-            vec![quota("Image pipelines", 1000.0)],
-        ),
+        service("imagebuilder", "EC2 Image Builder", imagebuilder_quotas()),
         service(
             "iot",
             "AWS IoT Core",
@@ -4338,18 +4297,20 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("emr-serverless", "Amazon EMR Serverless"),
     ("entityresolution", "AWS Entity Resolution"),
     ("es", "Amazon OpenSearch Service"),
-    ("events", "Amazon EventBridge"),
+    // The display name AWS's own Service Quotas data reports for this code, which
+    // still carries the service's former product name beside its current one.
+    ("events", "Amazon EventBridge (CloudWatch Events)"),
     ("evidently", "Amazon CloudWatch Evidently"),
     ("evs", "Amazon Elastic VMware Service"),
     ("fargate", "AWS Fargate"),
-    ("firehose", "Amazon Data Firehose"),
+    ("firehose", "Amazon Kinesis Data Firehose"),
     ("fms", "AWS Firewall Manager"),
     ("forecast", "Amazon Forecast"),
     ("frauddetector", "Amazon Fraud Detector"),
     ("fsx", "Amazon FSx"),
-    ("gamelift", "Amazon GameLift"),
+    ("gamelift", "Amazon GameLift Servers"),
     ("gameliftstreams", "Amazon GameLift Streams"),
-    ("glacier", "Amazon S3 Glacier"),
+    ("glacier", "Amazon Glacier"),
     ("globalaccelerator", "AWS Global Accelerator"),
     ("glue", "AWS Glue"),
     ("grafana", "Amazon Managed Grafana"),
@@ -5012,6 +4973,445 @@ fn vpc_quotas() -> Vec<QuotaRow> {
         quota("Gateway VPC endpoints per Region", 20.0).code("L-1B52E74A"),
         quota("Interface VPC endpoints per VPC", 50.0).code("L-29B6F2EB"),
         quota("Prefix lists per Region", 100.0),
+    ]
+}
+
+/// Amazon EventBridge's published default-quota catalog, under the `ServiceCode` its
+/// API endpoint uses.
+///
+/// SOURCE: AWS's published Service Quotas data for the `events` service code (the
+/// "Amazon EventBridge quotas" page of the Amazon EventBridge User Guide, which is
+/// what `aws service-quotas list-aws-default-service-quotas --service-code events`
+/// reports). EventBridge publishes its resource planes beside a per-API REQUEST RATE
+/// for each throttled API, which it names "<Api> throttle limit in transactions per
+/// second": a rate quota, so each carries the one-second window AWS publishes it over
+/// and the `AWS/Usage` `CallCount` metric of the API it throttles.
+fn events_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("API destinations", 3000.0).code("L-244521F2"),
+        quota("Connections", 3000.0).code("L-388D1D08").fixed(),
+        quota("Invocation rate limit per API destination", 300.0)
+            .code("L-39263BDC")
+            .period(1, "SECOND"),
+        quota("Archives", 100.0).code("L-3C47459F"),
+        quota("Replays", 100.0).code("L-5425B7E9"),
+        quota("Event buses", 100.0).code("L-5540C5E3"),
+        quota("Rules per event bus", 300.0).code("L-595D6D42"),
+        // The target plane of a rule, which AWS publishes as fixed.
+        quota("Targets per rule", 5.0).code("L-5D1D13E3").fixed(),
+        events_request_rate("L-658A4FD9", "PutEvents", 10_000.0),
+        quota("Invocations throttle limit in transactions per second", 18_750.0)
+            .code("L-664C5505")
+            .period(1, "SECOND"),
+        events_request_rate("L-755FD01C", "PutRule", 50.0),
+        events_request_rate("L-8331B29E", "PutTargets", 50.0),
+        events_request_rate("L-9B653E91", "RemoveTargets", 50.0),
+        events_request_rate("L-A8AFA624", "DeleteRule", 50.0),
+        events_request_rate("L-CB72B930", "DescribeRule", 50.0),
+        events_request_rate("L-D082A4F6", "DisableRule", 50.0),
+        events_request_rate("L-DF788473", "EnableRule", 50.0),
+        events_request_rate("L-E2110C81", "ListRules", 50.0),
+        quota("Endpoints", 100.0)
+            .code("L-EAC9A2AC")
+            .describe("The maximum number of endpoints per account per Region."),
+        events_request_rate("L-FB1C3A6D", "ListTargetsByRule", 50.0),
+        events_request_rate("L-FC354966", "TestEventPattern", 50.0),
+    ]
+}
+
+/// One EventBridge per-API request-rate quota: the transactions per second EventBridge
+/// serves calls of that one API at, metered by the API's own `AWS/Usage` `CallCount`
+/// metric under the service's `AWS/Usage` display name.
+fn events_request_rate(code: &str, api_name: &str, transactions_per_second: f64) -> QuotaRow {
+    quota(
+        format!("{api_name} throttle limit in transactions per second"),
+        transactions_per_second,
+    )
+    .code(code)
+    .period(1, "SECOND")
+    .metric(call_count_metric("EventBridge", api_name))
+}
+
+/// One per-API REQUEST-RATE quota of a service that publishes its API throttles under
+/// the name `Rate of <Api> requests`: a rate, so it carries the one-second window AWS
+/// publishes such a quota over and the `AWS/Usage` `CallCount` metric of the API it
+/// throttles ([`call_count_metric`]), beside the sentence AWS publishes for the class
+/// with the operation named in it.
+///
+/// `usage_service_name` is the service's `AWS/Usage` display name, never its
+/// `ServiceCode` (see [`aws_usage_metric`]).
+fn request_rate(
+    code: &str,
+    usage_service_name: &str,
+    api_name: &str,
+    requests_per_second: f64,
+) -> QuotaRow {
+    quota(
+        format!("Rate of {api_name} requests"),
+        requests_per_second,
+    )
+    .code(code)
+    .period(1, "SECOND")
+    .metric(call_count_metric(usage_service_name, api_name))
+    .describe(&format!(
+        "The maximum number of {api_name} requests that can be made in this account in \
+         the current Region each second."
+    ))
+}
+
+/// Amazon Data Firehose's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `firehose` service code (the
+/// "Amazon Data Firehose quotas" page of its developer guide): the delivery-stream
+/// planes beside the control-plane API rates that page publishes as so many
+/// transactions per second.
+fn firehose_quotas() -> Vec<QuotaRow> {
+    let rate = |code: &str, api: &str, per_second: f64| {
+        // The service's `AWS/Usage` display name, which is its former product name.
+        request_rate(code, "Kinesis Data Firehose", api, per_second)
+    };
+    vec![
+        // The ingest-request rate of a delivery stream, which AWS publishes as not
+        // adjustable.
+        request_rate("L-040D05FF", "Kinesis Data Firehose", "PutRecordBatch", 5000.0).fixed(),
+        rate("L-09E8B729", "CreateDeliveryStream", 5.0),
+        rate("L-0D32C2BC", "DeleteDeliveryStream", 5.0),
+        rate("L-14BB0BE7", "DescribeDeliveryStream", 5.0),
+        rate("L-17D4EADE", "ListDeliveryStreams", 5.0),
+        rate("L-23F03908", "ListTagsForDeliveryStream", 5.0),
+        rate("L-36A7E04C", "StartDeliveryStreamEncryption", 5.0),
+        rate("L-3A800C3A", "StopDeliveryStreamEncryption", 5.0),
+        rate("L-47C73A38", "TagDeliveryStream", 5.0),
+        rate("L-61E2CA1D", "UntagDeliveryStream", 5.0),
+        rate("L-7681C790", "UpdateDestination", 5.0),
+        rate("L-937C879B", "PutRecord", 1000.0),
+        quota("Delivery streams per Region", 5000.0).code("L-CC1FDDAA"),
+        quota("Dynamic partitions per delivery stream", 500.0).code("L-ED7DA7FC"),
+        // The ingest rate of one delivery stream, which AWS publishes as a volume of
+        // data per second rather than a count.
+        quota("Throughput per delivery stream", 5.0)
+            .code("L-FDED3C5B")
+            .unit("Megabytes/Second")
+            .period(1, "SECOND"),
+    ]
+}
+
+/// AWS Firewall Manager's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `fms` service code (the "AWS
+/// Firewall Manager quotas" page of its developer guide): the organization-wide
+/// policy, list and resource-set planes, beside the per-API request rates the service
+/// publishes for its control plane.
+fn fms_quotas() -> Vec<QuotaRow> {
+    let rate =
+        |code: &str, api: &str, per_second: f64| request_rate(code, "Firewall Manager", api, per_second);
+    vec![
+        quota("Firewall Manager policies per organization per Region", 50.0).code("L-0745D646"),
+        quota("Applications lists per organization", 20.0).code("L-07FCB28B"),
+        quota("Protocols lists per organization", 20.0).code("L-0B28E140"),
+        quota("Resource sets per organization", 100.0).code("L-0E131699"),
+        rate("L-1608788B", "AssociateAdminAccount", 5.0),
+        rate("L-1E778CA5", "AssociateThirdPartyFirewall", 5.0),
+        rate("L-25F99602", "BatchAssociateResource", 5.0),
+        rate("L-3BC4947E", "BatchDisassociateResource", 5.0),
+        rate("L-3DCEAE01", "DeleteAppsList", 5.0),
+        rate("L-3F3557EB", "DeleteNotificationChannel", 5.0),
+        rate("L-450C679C", "DeletePolicy", 5.0),
+        rate("L-49265FF2", "DeleteProtocolsList", 5.0),
+        rate("L-4E3D82C8", "DeleteResourceSet", 5.0),
+        rate("L-573ADF04", "DisassociateAdminAccount", 5.0),
+        rate("L-5AB0AC42", "GetAdminAccount", 20.0),
+        rate("L-72AC804F", "GetAppsList", 20.0),
+        rate("L-742188BD", "GetComplianceDetail", 20.0),
+        rate("L-743D9B7E", "GetNotificationChannel", 20.0),
+        rate("L-74591874", "GetPolicy", 20.0),
+        rate("L-7AB3A351", "GetProtectionStatus", 20.0),
+        rate("L-7F63BF51", "GetProtocolsList", 20.0),
+        rate("L-941CF907", "GetResourceSet", 20.0),
+        rate("L-98694ACE", "GetViolationDetails", 20.0),
+        rate("L-9E030C62", "ListAppsLists", 20.0),
+        rate("L-BCA8AD34", "ListComplianceStatus", 20.0),
+        rate("L-C6CF2DBB", "ListMemberAccounts", 20.0),
+        rate("L-C80E7B9E", "ListPolicies", 20.0),
+        rate("L-CA0A307F", "ListProtocolsLists", 20.0),
+        rate("L-DE1D154D", "PutNotificationChannel", 5.0),
+        rate("L-F4032167", "PutPolicy", 5.0),
+    ]
+}
+
+/// Amazon FSx's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `fsx` service code (the "Quotas"
+/// page of the Amazon FSx user guides). FSx publishes its resource planes PER FILE
+/// SYSTEM TYPE — the file systems, the storage capacity, the IOPS and the throughput
+/// capacity of each of the four file-system types it serves — which is why the rows are
+/// named for the type rather than for FSx as a whole. A throughput row carries the unit
+/// AWS publishes it in rather than being a count.
+fn fsx_quotas() -> Vec<QuotaRow> {
+    let rate = |code: &str, api: &str, per_second: f64| request_rate(code, "FSx", api, per_second);
+    vec![
+        quota("Windows File Server file systems", 100.0).code("L-0CD18A5D"),
+        quota("Windows File Server total SSD storage capacity", 524_288.0).code("L-15D9FE87"),
+        quota("Windows File Server total SSD IOPS", 400_000.0).code("L-4E6C2FB3"),
+        quota("Windows File Server total throughput capacity", 10_240.0)
+            .code("L-4EDE4065")
+            .unit("Megabytes/Second"),
+        quota("Windows File Server backups per file system", 500.0).code("L-57578687"),
+        quota("Lustre file systems", 100.0).code("L-59D0763F"),
+        quota("Lustre total storage capacity", 1_048_576.0).code("L-5B89F9CE"),
+        // The data-repository plane of a Lustre file system, which AWS publishes as
+        // fixed.
+        quota("Lustre data repository associations per file system", 8.0)
+            .code("L-60836D3E")
+            .fixed(),
+        quota("Lustre backups per file system", 500.0).code("L-736F3D6F"),
+        quota("ONTAP file systems", 100.0).code("L-7D5FDD38"),
+        quota("ONTAP total SSD storage capacity", 524_288.0).code("L-84EAF187"),
+        quota("ONTAP total SSD IOPS", 400_000.0).code("L-88479C21"),
+        quota("ONTAP total throughput capacity", 10_240.0)
+            .code("L-8F1B9C74")
+            .unit("Megabytes/Second"),
+        quota("ONTAP storage virtual machines per file system", 24.0)
+            .code("L-901C77F5")
+            .fixed(),
+        quota("ONTAP volumes per file system", 500.0).code("L-9AFA1F09"),
+        quota("ONTAP backups per volume", 500.0).code("L-AD2FC696"),
+        quota("OpenZFS file systems", 100.0).code("L-B7391FCE"),
+        quota("OpenZFS total SSD storage capacity", 524_288.0).code("L-C28C1403"),
+        quota("OpenZFS total SSD IOPS", 400_000.0).code("L-C431DBA3"),
+        quota("OpenZFS total throughput capacity", 10_240.0)
+            .code("L-C48231E5")
+            .unit("Megabytes/Second"),
+        quota("OpenZFS volumes per file system", 500.0).code("L-C5F860DD"),
+        quota("OpenZFS snapshots per volume", 1000.0).code("L-C8640C82"),
+        quota("OpenZFS backups per volume", 500.0).code("L-CD5E0524"),
+        quota("File caches", 10.0).code("L-DD0F7417"),
+        quota("File cache total storage capacity", 24_576.0).code("L-E24B4DE4"),
+        quota("Tags per resource", 50.0).code("L-E2C89679").fixed(),
+        quota("Data repository tasks per file system", 20.0).code("L-E43BDB2E"),
+        rate("L-E94C1C19", "DescribeFileSystems", 10.0),
+        rate("L-FD6F2F22", "CreateFileSystem", 5.0),
+        rate("L-FD89CA8A", "CreateBackup", 5.0),
+    ]
+}
+
+/// Amazon GameLift's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `gamelift` service code (the
+/// "Amazon GameLift quotas" page of its developer guide): the hosting resource planes
+/// beside the per-API request rates GameLift publishes for its game-session,
+/// matchmaking and fleet APIs.
+fn gamelift_quotas() -> Vec<QuotaRow> {
+    let rate =
+        |code: &str, api: &str, per_second: f64| request_rate(code, "GameLift", api, per_second);
+    vec![
+        quota("Fleets", 100.0).code("L-0536A98D"),
+        quota("Aliases", 100.0)
+            .code("L-11948650")
+            .unit("Count")
+            .fixed(),
+        quota("Builds", 1000.0).code("L-22451070"),
+        quota("Scripts", 50.0).code("L-24BE0A39"),
+        quota("Game session queues", 25.0).code("L-293B0017"),
+        quota("Matchmaking configurations", 100.0).code("L-3A43EF3C"),
+        quota("Matchmaking rule sets", 100.0).code("L-51AF299A"),
+        quota("Game server groups", 100.0).code("L-55650DB7"),
+        quota("Fleet locations per fleet", 100.0).code("L-593688D9"),
+        quota("Instances per fleet", 5000.0).code("L-67477D57"),
+        quota("Instances per location", 5000.0).code("L-73F6E300"),
+        // The per-instance and per-session planes AWS publishes as fixed.
+        quota("Concurrent game session activations per instance", 2.0)
+            .code("L-8AE49BBD")
+            .fixed(),
+        quota("Player sessions per game session", 200.0)
+            .code("L-8D885299")
+            .fixed(),
+        rate("L-8EBC4E87", "CreateGameSession", 10.0),
+        rate("L-90D24F1B", "DescribeGameSessions", 10.0),
+        rate("L-9F9DE0B2", "StartGameSessionPlacement", 10.0),
+        rate("L-A8C1B434", "StartMatchmaking", 10.0),
+        rate("L-AED4A06A", "DescribeMatchmaking", 10.0),
+        rate("L-BB62CF1D", "CreatePlayerSession", 50.0),
+        rate("L-BFEEB817", "DescribeGameSessionDetails", 10.0),
+        rate("L-C30AA854", "SearchGameSessions", 10.0),
+        rate("L-C6F4238C", "CreateFleet", 5.0),
+        rate("L-CCBBB4DA", "UpdateFleetCapacity", 10.0),
+        rate("L-E8D8BD94", "DescribeFleetAttributes", 10.0),
+        rate("L-EC03D793", "DescribeFleetCapacity", 10.0),
+        rate("L-ED58E8F8", "ListFleets", 10.0),
+        rate("L-FDDD1260", "CreateGameSessionQueue", 5.0),
+    ]
+}
+
+/// Amazon S3 Glacier's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `glacier` service code (the
+/// "Amazon S3 Glacier quotas" page of its developer guide): the vault plane, which AWS
+/// publishes as not adjustable, beside the per-API request rates of its archive and
+/// job APIs.
+fn glacier_quotas() -> Vec<QuotaRow> {
+    // Glacier publishes its per-API rates as NOT adjustable, unlike the services whose
+    // request rates an increase can be requested for.
+    let rate = |code: &str, api: &str, per_second: f64| {
+        request_rate(code, "Glacier", api, per_second).fixed()
+    };
+    vec![
+        rate("L-0D9D2530", "DescribeJob", 10.0),
+        rate("L-153F5D45", "GetJobOutput", 10.0),
+        rate("L-4BF4C362", "InitiateJob", 10.0),
+        rate("L-982DEA76", "InitiateMultipartUpload", 10.0),
+        // The vault plane of an account, which AWS publishes as not adjustable.
+        quota("Vaults per account", 1000.0).code("L-D1C67346").fixed(),
+        rate("L-E0D19AD1", "ListJobs", 10.0),
+        rate("L-E96017CA", "UploadArchive", 10.0),
+        rate("L-F127DF29", "UploadMultipartPart", 10.0),
+    ]
+}
+
+/// AWS Glue's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `glue` service code (the "AWS
+/// Glue endpoints and quotas" page of the AWS General Reference): the Data Catalog and
+/// job planes beside the per-API request rates Glue publishes for its catalog and job
+/// APIs.
+fn glue_quotas() -> Vec<QuotaRow> {
+    let rate = |code: &str, api: &str, per_second: f64| request_rate(code, "Glue", api, per_second);
+    vec![
+        quota("Databases per account", 10_000.0).code("L-04CEE988"),
+        quota("Tables per database", 200_000.0).code("L-071ABE08"),
+        quota("Partitions per table", 10_000_000.0).code("L-08F3B322"),
+        quota("Table versions per table", 100_000.0).code("L-096DBB95"),
+        quota("Concurrent job runs per account", 200.0).code("L-11FA2C1A"),
+        quota("Concurrent job runs per job", 1000.0).code("L-1DD415D5"),
+        quota("Jobs per account", 25_000.0).code("L-2C3F5401"),
+        quota("Triggers per account", 25_000.0).code("L-2E9FB93F"),
+        quota("Crawlers per account", 1000.0).code("L-337244C9"),
+        quota("Connections per account", 1000.0).code("L-3890A802"),
+        quota("Security configurations per account", 200.0).code("L-4071B0E3"),
+        quota("Workflows per account", 250.0).code("L-4256D6D2"),
+        quota("Blueprints per account", 50.0).code("L-4F4B522D"),
+        quota("Machine learning transforms per account", 100.0).code("L-5E4153CA"),
+        quota("Development endpoints per account", 5.0).code("L-611FDDE4"),
+        quota("Schema registries per account", 100.0).code("L-64A88F0A"),
+        quota("Schemas per account", 1000.0).code("L-76EC689B"),
+        quota("Schema versions per account", 10_000.0).code("L-785C1F39"),
+        quota("Interactive sessions per account", 100.0).code("L-7DD7C33A"),
+        quota("Data quality rulesets per account", 1000.0).code("L-83192DBF"),
+        rate("L-83A59AA6", "BatchCreatePartition", 50.0),
+        rate("L-87F5991C", "BatchDeletePartition", 50.0),
+        rate("L-94D025B7", "BatchGetPartition", 50.0),
+        rate("L-958728D1", "CreateDatabase", 10.0),
+        rate("L-A457CBAB", "CreateTable", 10.0),
+        rate("L-A57B5BCE", "CreateJob", 10.0),
+        rate("L-ACAC12B6", "CreateCrawler", 10.0),
+        rate("L-AD871090", "DeleteDatabase", 10.0),
+        rate("L-B4840D4D", "DeleteTable", 10.0),
+        rate("L-B78896B9", "GetDatabase", 100.0),
+        rate("L-B8497671", "GetDatabases", 50.0),
+        rate("L-C3952F6C", "GetJob", 50.0),
+        rate("L-CB69DFA0", "GetJobRun", 100.0),
+        rate("L-D90AC94B", "GetJobRuns", 50.0),
+        rate("L-D987EC31", "GetPartition", 100.0),
+        rate("L-DBA56E2F", "GetPartitions", 100.0),
+        rate("L-E15CE20A", "GetTable", 100.0),
+        rate("L-E6C807E7", "GetTables", 50.0),
+        rate("L-EAC30D24", "GetTableVersions", 50.0),
+        rate("L-EEC98450", "GetUserDefinedFunction", 50.0),
+        rate("L-F1653A6D", "StartCrawler", 10.0),
+        rate("L-F1AAB534", "StartJobRun", 50.0),
+        rate("L-F545C262", "StartWorkflowRun", 10.0),
+        rate("L-F574AED9", "UpdateDatabase", 10.0),
+        rate("L-F953935E", "UpdateTable", 10.0),
+        rate("L-FB210BD9", "UpdatePartition", 50.0),
+        rate("L-FEBBFA7A", "UpdateJob", 10.0),
+    ]
+}
+
+/// AWS Ground Station's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `groundstation` service code
+/// (the "Ground Station quotas" page of its user guide): the mission-profile, config
+/// and dataflow planes a contact is scheduled out of, plus the contact planes
+/// themselves. Ground Station publishes one quota per CONFIG TYPE, which is why the
+/// rows are named for the config rather than for configs as a whole.
+fn groundstation_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Mission profiles per account", 500.0).code("L-09DEC198"),
+        quota("Dataflow endpoint groups per account", 500.0).code("L-5342B9BF"),
+        quota("Antenna downlink configs per account", 500.0).code("L-5CCF0BC2"),
+        quota("Antenna uplink configs per account", 500.0).code("L-98A63A85"),
+        quota("Tracking configs per account", 500.0).code("L-BD84767C"),
+        quota("Dataflow endpoint configs per account", 500.0).code("L-CCFDE387"),
+        quota("Ephemerides per satellite", 50.0).code("L-D6A1915B"),
+        quota("Scheduled contacts per account", 500.0).code("L-DE376FC5"),
+        quota("Uplink echo configs per account", 500.0).code("L-DF7B6DEC"),
+        quota("Concurrent contacts per account", 50.0).code("L-FED20749"),
+    ]
+}
+
+/// Amazon GuardDuty's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `guardduty` service code (the
+/// "Quotas" page of its user guide): the detector plane of an account and the filter,
+/// list and destination planes of a detector, which AWS publishes as not adjustable.
+fn guardduty_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Detectors", 1.0).code("L-2C0E14B9").fixed(),
+        quota("Filters per detector", 100.0)
+            .code("L-373487E5")
+            .fixed(),
+        quota("Member accounts per administrator account", 5000.0)
+            .code("L-8B0D7135")
+            .fixed(),
+        quota("Publishing destinations per detector", 1.0)
+            .code("L-9ABF7A23")
+            .fixed(),
+        quota("Threat intel sets per detector", 6.0)
+            .code("L-AFBA2260")
+            .fixed(),
+        quota("Trusted IP sets per detector", 1.0)
+            .code("L-F51A2830")
+            .fixed(),
+        quota("IP addresses per trusted IP set or threat list", 250_000.0)
+            .code("L-FA6D6E3D")
+            .fixed(),
+    ]
+}
+
+/// EC2 Image Builder's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `imagebuilder` service code (the
+/// "Service quotas" page of the EC2 Image Builder user guide): the pipeline, recipe,
+/// component and configuration planes beside the per-API request rates it publishes for
+/// its image APIs.
+fn imagebuilder_quotas() -> Vec<QuotaRow> {
+    let rate = |code: &str, api: &str, per_second: f64| {
+        request_rate(code, "EC2 Image Builder", api, per_second)
+    };
+    vec![
+        quota("Image pipelines", 1000.0).code("L-0DF2752F"),
+        quota("Image recipes", 1000.0).code("L-10D22E0D"),
+        quota("Container recipes", 1000.0).code("L-1DF98342"),
+        quota("Components", 1000.0).code("L-22EAF8F8"),
+        quota("Infrastructure configurations", 1000.0).code("L-28A502FD"),
+        quota("Distribution configurations", 1000.0).code("L-2BAA05D8"),
+        quota("Images", 10_000.0).code("L-31E5726E"),
+        quota("Concurrent image builds", 10.0).code("L-59EC76F6"),
+        quota("Lifecycle policies", 100.0).code("L-5E848392"),
+        quota("Workflows", 1000.0).code("L-6105A4EE"),
+        quota("Component versions", 1000.0).code("L-69312229"),
+        rate("L-7A0E01E3", "CreateImage", 5.0),
+        rate("L-84F5AB81", "CreateImagePipeline", 5.0),
+        rate("L-9B183655", "CreateImageRecipe", 5.0),
+        rate("L-A26B27A7", "CreateComponent", 5.0),
+        rate("L-A58CFBED", "GetImage", 10.0),
+        rate("L-B588F8CA", "GetImagePipeline", 10.0),
+        rate("L-BA4D191B", "ListImages", 10.0),
+        rate("L-D5665818", "ListImagePipelines", 10.0),
+        rate("L-D5DC1FB3", "StartImagePipelineExecution", 5.0),
+        rate("L-D9E1BB3C", "ListComponents", 10.0),
+        rate("L-D9EF98D9", "ListImageRecipes", 10.0),
+        rate("L-E49825CC", "ListInfrastructureConfigurations", 10.0),
     ]
 }
 

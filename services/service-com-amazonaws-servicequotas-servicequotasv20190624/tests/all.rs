@@ -27,6 +27,8 @@ mod auto_management_exclusions;
 mod auto_management_opt_in_type;
 #[path = "all/auto_management_stop.rs"]
 mod auto_management_stop;
+#[path = "all/aws_minted_catalog_coverage.rs"]
+mod aws_minted_catalog_coverage;
 #[path = "all/catalog_identity.rs"]
 mod catalog_identity;
 #[path = "all/catalog_pagination.rs"]
