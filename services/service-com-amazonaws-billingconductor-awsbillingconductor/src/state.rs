@@ -3581,16 +3581,53 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         Some(removed)
     }
 
-    /// The ARNs of every stored billing group whose
-    /// `ComputationPreference.PricingPlanArn` names this pricing plan — the
-    /// association "the pricing plan must not be associated with any billing groups
-    /// to delete successfully" is decided from. A group may have been created naming
-    /// the plan in either spelling the `PricingPlanArn` pattern allows, so both sides
-    /// are normalised.
+    /// The ARNs of every stored billing group that computes with this pricing plan in
+    /// ANY billing period — the association "the pricing plan must not be associated
+    /// with any billing groups to delete successfully" is decided from.
+    ///
+    /// A group's `ComputationPreference.PricingPlanArn` is a member a write can change,
+    /// so each GENERATION of a group carries the plan that generation computes with
+    /// ([`BillingGroupVersion::pricing_plan_arn`]) and a period-scoped read reports the
+    /// plan of the generation in force then ([`VersionedResource::effective_in`]).
+    /// Every generation of a stored group is therefore an association the store can
+    /// still report, and a plan one of them names is in use whether or not the LIVE
+    /// generation still names it — otherwise the plan could be deleted out from under a
+    /// closed period that goes on reporting it, leaving an ARN that resolves to no plan.
+    /// A group may name the plan in either spelling the `PricingPlanArn` pattern allows,
+    /// so both sides are normalised.
     pub fn billing_groups_referencing_pricing_plan(&self, plan_arn: &str) -> Vec<String> {
         self.billing_groups
             .iter()
-            .filter(|(_, group)| normalize_pricing_plan_arn(&group.pricing_plan_arn) == plan_arn)
+            .filter(|(_, group)| {
+                group
+                    .versions()
+                    .iter()
+                    .any(|version| normalize_pricing_plan_arn(&version.pricing_plan_arn) == plan_arn)
+            })
+            .map(|(arn, _)| arn.clone())
+            .collect()
+    }
+
+    /// The ARNs of every stored pricing plan that associates this pricing rule in ANY
+    /// billing period — the association that holds a rule back from being deleted.
+    ///
+    /// An association carries the billing periods it is in force over
+    /// ([`PricingRuleAssociationRecord`]), and a read scoped to one of those periods
+    /// reports it even after a later call ended it, so an ended association is still an
+    /// association the store can report — and a rule deleted under one would leave that
+    /// period reporting a rule ARN that resolves to nothing. An association that was in
+    /// force in no period at all holds nothing back
+    /// ([`PricingRuleAssociationRecord::covers_any_period`]), which is also every
+    /// association this store drops rather than keeps.
+    pub fn pricing_plans_referencing_rule_in_any_period(&self, rule_arn: &str) -> Vec<String> {
+        self.pricing_plans
+            .iter()
+            .filter(|(_, plan)| {
+                plan.pricing_rule_associations.iter().any(|association| {
+                    association.covers_any_period()
+                        && normalize_pricing_rule_arn(&association.arn) == rule_arn
+                })
+            })
             .map(|(arn, _)| arn.clone())
             .collect()
     }

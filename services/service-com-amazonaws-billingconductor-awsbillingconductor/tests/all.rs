@@ -23,6 +23,8 @@ mod account_exclusivity_refusal;
 mod associate_accounts_generation_history;
 #[path = "all/associate_pricing_rules.rs"]
 mod associate_pricing_rules;
+#[path = "all/association_delete_gate_spans_billing_periods.rs"]
+mod association_delete_gate_spans_billing_periods;
 #[path = "all/association_size_is_billing_period_scoped.rs"]
 mod association_size_is_billing_period_scoped;
 #[path = "all/auto_associate_billing_group_cap.rs"]
