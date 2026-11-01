@@ -1233,3 +1233,10 @@ mod transit_gateway_metering_policy_entries;
 // a purchase stored is what the report answers with.
 #[path = "all/describe_reserved_instances.rs"]
 mod describe_reserved_instances;
+// Appended at the END of this file, for the reason the header gives: the sorted region of this
+// file is where every new ec2 suite inserts its lines. What `DeleteVerifiedAccessInstance`
+// removes — the Verified Access instance the request names and the logging configuration kept
+// beside it — what it answers, what still naming the instance refuses it, and how one
+// `ClientToken` bounds it to one delete.
+#[path = "all/delete_verified_access_instance.rs"]
+mod delete_verified_access_instance;

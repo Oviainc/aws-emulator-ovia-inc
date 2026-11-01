@@ -1097,10 +1097,12 @@ async fn the_describe_narrows_by_id_and_by_every_answered_filter() {
             "case {instance_id:?}: expected the instance's own NotFound code, got {body}"
         );
         // The message is built from the request, so the caller can tell WHICH of the ids it
-        // named is unknown.
+        // named is unknown. The sentence is this operation's own — a report of the instances
+        // words the refusal differently from a mutation of one, which answers `The
+        // verified-access-instance ID '<id>' does not exist`.
         assert_eq!(
             unescaped(&error_message(&body)),
-            format!("The verified-access-instance ID '{instance_id}' does not exist"),
+            format!("VerifiedAccessInstance {instance_id} does not exist"),
             "case {instance_id:?}: expected the refusal to name the id the request gave, got {}",
             error_message(&body)
         );

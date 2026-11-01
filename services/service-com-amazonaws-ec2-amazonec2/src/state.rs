@@ -355,6 +355,16 @@
 //! instance CHANGES: it applies the members a `ModifyVerifiedAccessInstance` request carried,
 //! leaves the ones it did not alone, and stamps the instance's `LastUpdatedTime`, so the
 //! modify and a later describe cannot report one instance differently.
+//! [`ComAmazonawsEc2Amazonec2State::remove_verified_access_instance`] is the one way an
+//! instance LEAVES that store, on the same terms a group leaves its own: the create token
+//! that minted it goes with it, the logging configuration kept beside it goes with it, the
+//! bytes both held go back to the byte budget, and a delete that named an idempotency token
+//! keeps the removed record under it
+//! ([`ComAmazonawsEc2Amazonec2State::verified_access_instance_deletion`]) so a retried delete
+//! answers what the first one answered. A group or an endpoint that still names the instance
+//! is a dependency ([`ComAmazonawsEc2Amazonec2State::verified_access_instance_dependencies`]),
+//! so the delete is refused while one is stored rather than leaving a record naming an
+//! instance the account no longer holds.
 //!
 //! An instance's LOGGING configuration is a fact of the instance the modelled
 //! `VerifiedAccessInstance` shape carries no member for, so it is kept beside the instance in
@@ -3475,6 +3485,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// given with.
     pub verified_access_instance_logging_client_tokens:
         HashMap<String, VerifiedAccessInstanceLoggingConfigurationUpdate>,
+    /// A `DeleteVerifiedAccessInstance` `ClientToken` and the instance that call removed,
+    /// newest LAST, so a retry of the same delete answers what the first one answered instead
+    /// of an id that names nothing. The record itself is kept, because the instance is gone
+    /// from [`Self::verified_access_instances`] and the answer reports it; the history holds
+    /// at most [`MAX_REMEMBERED_VERIFIED_ACCESS_INSTANCE_DELETIONS`] of them, the arrangement
+    /// [`Self::verified_access_group_deletions`] holds for that resource.
+    pub verified_access_instance_deletions:
+        VecDeque<(String, crate::ops::types::VerifiedAccessInstance)>,
     /// Every Verified Access group the account holds, by `VerifiedAccessGroupId`, as
     /// [`VerifiedAccessGroupRecord`]s — see the module docs. Ordered by id, the order a
     /// describe of the groups reports and pages over.
@@ -4639,6 +4657,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // instance reads back with `default_verified_access_logs`.
             verified_access_instance_logging_configurations: BTreeMap::new(),
             verified_access_instance_logging_client_tokens: HashMap::new(),
+            verified_access_instance_deletions: VecDeque::new(),
             verified_access_groups: BTreeMap::new(),
             verified_access_group_client_tokens: HashMap::new(),
             verified_access_group_deletions: VecDeque::new(),
@@ -17010,6 +17029,16 @@ pub const MAX_VERIFIED_ACCESS_INSTANCES: usize = 1_000;
 /// `VerifiedAccessEndpointLimitExceeded`).
 pub const VERIFIED_ACCESS_INSTANCE_LIMIT_EXCEEDED: &str = "VerifiedAccessInstanceLimitExceeded";
 
+/// How many answered `DeleteVerifiedAccessInstance` calls this store remembers for their
+/// idempotency tokens.
+///
+/// The same terms as [`MAX_REMEMBERED_VERIFIED_ACCESS_GROUP_DELETIONS`], and for the same
+/// reason: a delete FREES a live record's slot, so [`MAX_VERIFIED_ACCESS_INSTANCES`] does not
+/// bound a history that outlives the resource. The newest deletes are kept and the oldest
+/// dropped, so a create-and-delete loop cannot grow the history without end and a delete is
+/// never refused because it is full.
+pub const MAX_REMEMBERED_VERIFIED_ACCESS_INSTANCE_DELETIONS: usize = 200;
+
 /// The id prefix a Verified Access group is minted under: EC2 names a group's ids
 /// `vagr-<hex>`, the same `<prefix>-<hex>` form every other EC2 resource id takes, so
 /// [`ComAmazonawsEc2Amazonec2State::next_id`] mints them.
@@ -17678,6 +17707,13 @@ pub fn invalid_verified_access_endpoint_id_not_found<E>(
 /// Refuse a request that named a Verified Access instance id this account holds no instance
 /// for: HTTP 400 [`INVALID_VERIFIED_ACCESS_INSTANCE_ID_NOT_FOUND`], worded like
 /// [`invalid_verified_access_group_id_not_found`].
+///
+/// This is the wording the operations that MUTATE an instance — or that take one as a
+/// reference — answer, which is the wording recorded for them. A REPORT of the instances
+/// words the same refusal as its own sentence
+/// ([`verified_access_instance_id_not_found_in_report`]): what a refusal says is a fact of
+/// the operation that answers it (see `crate::scaffolded`), not of the resource, so the two
+/// wordings live side by side rather than one being made to stand for both.
 pub fn invalid_verified_access_instance_id_not_found<E>(
     instance_id: &str,
 ) -> crate::scaffolded::Scaffolded<E> {
@@ -17685,6 +17721,26 @@ pub fn invalid_verified_access_instance_id_not_found<E>(
         INVALID_VERIFIED_ACCESS_INSTANCE_ID_NOT_FOUND,
         400,
         format!("The verified-access-instance ID '{instance_id}' does not exist"),
+    )
+}
+
+/// Refuse a REPORT of the Verified Access instances that named an instance id this account
+/// holds no instance for: HTTP 400 [`INVALID_VERIFIED_ACCESS_INSTANCE_ID_NOT_FOUND`] — the
+/// same code the mutating paths answer — worded as the sentence the real service answers a
+/// report with: `VerifiedAccessInstance <id> does not exist`, built from the id the REQUEST
+/// gave.
+///
+/// The sentence form is this resource family's own on that path — the same shape
+/// [`invalid_verified_access_trust_provider_id_not_found`] answers for a trust provider —
+/// rather than the quoted `The <resource> ID '<id>' does not exist` wording
+/// [`invalid_verified_access_instance_id_not_found`] answers for a mutation of an instance.
+pub fn verified_access_instance_id_not_found_in_report<E>(
+    instance_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VERIFIED_ACCESS_INSTANCE_ID_NOT_FOUND,
+        400,
+        format!("VerifiedAccessInstance {instance_id} does not exist"),
     )
 }
 
@@ -17888,6 +17944,131 @@ impl ComAmazonawsEc2Amazonec2State {
                 .insert(token.to_string(), update.clone());
         }
         Some(applied)
+    }
+
+    /// What still depends on the Verified Access instance `instance_id`, as the ids of the
+    /// depending resources.
+    ///
+    /// A Verified Access group is created ON an instance and an endpoint reports the instance
+    /// its group belongs to, so either one still stored is a reference the instance cannot
+    /// leave behind: removing the instance under it would leave a stored record naming an
+    /// instance the account no longer holds. A trust provider ATTACHED to the instance is not
+    /// one of these — it is a resource of its own that outlives the attachment, so the
+    /// attachment simply ends with the instance.
+    pub fn verified_access_instance_dependencies(&self, instance_id: &str) -> Vec<String> {
+        let mut found: Vec<String> = self
+            .verified_access_groups
+            .iter()
+            .filter(|(_, record)| {
+                record.view.verified_access_instance_id.as_deref() == Some(instance_id)
+            })
+            .map(|(group_id, _)| group_id.clone())
+            .collect();
+        found.extend(
+            self.verified_access_endpoints
+                .iter()
+                .filter(|(_, record)| {
+                    record.view.verified_access_instance_id.as_deref() == Some(instance_id)
+                })
+                .map(|(endpoint_id, _)| endpoint_id.clone()),
+        );
+        found.sort();
+        found
+    }
+
+    /// Remove the Verified Access instance `instance_id` and answer the record it was held
+    /// as, or `None` when the store holds no such instance.
+    ///
+    /// The one way an instance leaves the store, so the delete's answer and what a later read
+    /// of the account reports cannot disagree. The `CreateVerifiedAccessInstance` token that
+    /// minted it goes with it — a token must never answer with an instance that is no longer
+    /// stored — the logging configuration kept BESIDE the instance goes with it too, since
+    /// that configuration is a fact of the instance and nothing else names it, and the bytes
+    /// both held go back to the store's budget on the terms
+    /// [`verified_access_instance_payload_bytes`] and [`verified_access_logs_payload_bytes`]
+    /// took them on.
+    ///
+    /// `client_token` is the DELETE's own token: when the caller gave one, the removed record
+    /// is kept under it ([`Self::verified_access_instance_deletions`]) so a retry of that
+    /// delete answers what the first one answered, and the bytes it keeps are charged again
+    /// under that token. That history is bounded by
+    /// [`MAX_REMEMBERED_VERIFIED_ACCESS_INSTANCE_DELETIONS`] entries, the oldest dropped (and
+    /// its bytes given back) to make room; a delete that names no token frees the record
+    /// outright.
+    pub fn remove_verified_access_instance(
+        &mut self,
+        instance_id: &str,
+        client_token: Option<&str>,
+    ) -> Option<crate::ops::types::VerifiedAccessInstance> {
+        let instance = self.verified_access_instances.remove(instance_id)?;
+        let minting_token = self
+            .verified_access_instance_client_tokens
+            .iter()
+            .find(|(_, minted)| minted.as_str() == instance_id)
+            .map(|(token, _)| token.clone());
+        if let Some(token) = &minting_token {
+            self.verified_access_instance_client_tokens.remove(token);
+        }
+        self.release_stored_bytes(verified_access_instance_payload_bytes(
+            &instance,
+            minting_token.as_deref(),
+        ));
+        if let Some(logs) = self
+            .verified_access_instance_logging_configurations
+            .remove(instance_id)
+        {
+            self.release_stored_bytes(verified_access_logs_payload_bytes(&logs, None));
+        }
+        if let Some(token) = client_token {
+            // One token names ONE delete, so a token used again replaces what it named
+            // rather than leaving the history two entries to answer with.
+            if let Some(position) = self
+                .verified_access_instance_deletions
+                .iter()
+                .position(|(remembered, _)| remembered == token)
+            {
+                self.forget_verified_access_instance_deletion(position);
+            }
+            self.add_stored_bytes(verified_access_instance_payload_bytes(
+                &instance,
+                Some(token),
+            ));
+            self.verified_access_instance_deletions
+                .push_back((token.to_string(), instance.clone()));
+            while self.verified_access_instance_deletions.len()
+                > MAX_REMEMBERED_VERIFIED_ACCESS_INSTANCE_DELETIONS
+            {
+                self.forget_verified_access_instance_deletion(0);
+            }
+        }
+        Some(instance)
+    }
+
+    /// The instance the delete that carried `client_token` removed, while this store still
+    /// remembers that delete.
+    ///
+    /// The history is bounded ([`MAX_REMEMBERED_VERIFIED_ACCESS_INSTANCE_DELETIONS`]), so a
+    /// token whose delete has been dropped answers `None` — the same answer as a token no
+    /// delete of this store ever carried.
+    pub fn verified_access_instance_deletion(
+        &self,
+        client_token: &str,
+    ) -> Option<&crate::ops::types::VerifiedAccessInstance> {
+        self.verified_access_instance_deletions
+            .iter()
+            .find(|(remembered, _)| remembered == client_token)
+            .map(|(_, instance)| instance)
+    }
+
+    /// Drop the remembered deletion at `position`, giving the bytes it held back to the
+    /// store's budget: the record leaves the history on the same terms it entered it on.
+    fn forget_verified_access_instance_deletion(&mut self, position: usize) {
+        if let Some((token, instance)) = self.verified_access_instance_deletions.remove(position) {
+            self.release_stored_bytes(verified_access_instance_payload_bytes(
+                &instance,
+                Some(&token),
+            ));
+        }
     }
 
     /// Whether another Verified Access group fits inside the store's ceiling

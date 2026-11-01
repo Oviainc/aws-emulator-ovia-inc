@@ -155,10 +155,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            decode_page_token, encode_page_token, invalid_pagination_token,
-            invalid_verified_access_instance_id_not_found, matches_every_filter,
-            require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS,
-            MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS,
+            decode_page_token, encode_page_token, invalid_pagination_token, matches_every_filter,
+            require_service_state, verified_access_instance_id_not_found_in_report,
+            CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
+            MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it — the modelled
@@ -238,10 +238,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // "Describes the specified Amazon Web Services Verified Access instances": an id that
-        // names no instance of the account is an error, not an absent row.
+        // names no instance of the account is an error, not an absent row — including the id
+        // of an instance a delete has removed, which from here on names no instance of the
+        // account like any other. The refusal is worded as THIS operation's own sentence
+        // rather than as the one a mutation of an instance answers, because what a refusal
+        // says is a fact of the operation that answers it.
         for instance_id in requested_ids {
             if !store.verified_access_instances.contains_key(instance_id) {
-                return Err(invalid_verified_access_instance_id_not_found(instance_id));
+                return Err(verified_access_instance_id_not_found_in_report(instance_id));
             }
         }
 
