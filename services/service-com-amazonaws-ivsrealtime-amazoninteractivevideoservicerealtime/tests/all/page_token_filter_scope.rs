@@ -241,6 +241,10 @@ struct Fixture {
     first_encoder: String,
     second_encoder: String,
     composition_stage: String,
+    /// The stage holding TWO compositions of its own, started LAST (and so holding the
+    /// HIGHER store positions) — the stage whose own filtered page can issue a token
+    /// naming a position past every composition the other stages hold.
+    late_composition_stage: String,
     /// The stage session whose participants the last rows page over.
     participant_stage: String,
     participant_session: String,
@@ -290,7 +294,7 @@ impl Fixture {
         // Three compositions: two through the FIRST encoder configuration (so a page
         // filtered by it has a record left over), one through the second.
         let mut encoders = Vec::new();
-        for name in ["encoder-first", "encoder-second"] {
+        for name in ["encoder-first", "encoder-second", "encoder-late"] {
             encoders.push(
                 service
                     .created(
@@ -319,6 +323,30 @@ impl Fixture {
                 )
                 .await;
             composition_stages.push(stage);
+        }
+
+        // One more stage with TWO compositions of its own, started LAST so both lie past
+        // every composition above: the arrangement under which a token issued under this
+        // stage's filter, offered under another stage's filter (or under none), names a
+        // position past every composition that call pages — the empty page the rule
+        // forbids. They broadcast through an encoder configuration of their own, so the
+        // encoder-filter rows above select exactly what they did without them.
+        let late_composition_stage = service.stage("composed-late").await;
+        for _ in 0..2 {
+            service
+                .served(
+                    "StartComposition",
+                    &json!({
+                        "stageArn": late_composition_stage,
+                        "destinations": [{
+                            "channel": {
+                                "channelArn": format!("arn:aws:ivs:{REGION}:{ACCOUNT}:channel/composed"),
+                                "encoderConfigurationArn": encoders[2],
+                            },
+                        }],
+                    }),
+                )
+                .await;
         }
 
         // One session holding participants that differ in every member a
@@ -354,6 +382,7 @@ impl Fixture {
             first_encoder: encoders[0].clone(),
             second_encoder: encoders[1].clone(),
             composition_stage: composition_stages[0].clone(),
+            late_composition_stage,
             participant_stage,
             participant_session,
         }
@@ -443,6 +472,25 @@ impl Fixture {
                 "one stage's compositions, resumed from the whole account",
                 json!({}),
                 json!({ "filterByStageArn": self.composition_stage }),
+            ),
+            // `filterByStageArn`: the stage whose compositions the page holds. The issuing
+            // stage's compositions were started LAST, so the position its page ends at
+            // lies past every composition the resuming selection holds — the empty page
+            // the rule forbids.
+            compositions(
+                "another stage's compositions",
+                json!({ "filterByStageArn": self.late_composition_stage }),
+                json!({ "filterByStageArn": self.composition_stage }),
+            ),
+            compositions(
+                "every composition of the account, resumed from one stage's",
+                json!({ "filterByStageArn": self.late_composition_stage }),
+                json!({}),
+            ),
+            compositions(
+                "another filter member entirely",
+                json!({ "filterByStageArn": self.late_composition_stage }),
+                json!({ "filterByEncoderConfigurationArn": self.first_encoder }),
             ),
             // The four filter members of the participant listing.
             participants(
