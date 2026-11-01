@@ -5,10 +5,11 @@
 //! `@readonly`: the principal of every request in the batch comes from the presented
 //! TOKEN, read and verified by [`crate::state::token`] exactly as
 //! [`crate::ops::is_authorized_with_token`] verifies it — a compact JWS whose issuer is an
-//! identity source of the policy store, signed by that issuer, of the kind the member it
-//! arrived in takes, issued to a client the source accepts and still inside its validity
-//! window — and the principal it names, that principal's groups and its attributes all
-//! come from its claims. Each of the batch's requests supplies only the other two members
+//! identity source of the policy store, signed by that issuer wherever that issuer's key
+//! set is readable in this process, of the kind the member it arrived in takes, issued to a
+//! client the source accepts and still inside its validity window — and the principal it
+//! names, that principal's groups and its attributes all come from its claims. Each of the
+//! batch's requests supplies only the other two members
 //! of the Cedar triple (and its own `context`), so the batch is a series of decisions for
 //! ONE principal and the "identical principal or resource" rule
 //! [`crate::ops::batch_is_authorized`] enforces is satisfied by construction, with nothing
@@ -36,8 +37,9 @@
 //! and denied"; an audience none of the source's clients match is that same exception
 //! worded as the one fixed sentence AWS answers for it ([`AUDIENCE_NOT_ACCEPTED`]). A
 //! token whose ISSUER is no identity source of the store is the modelled
-//! `ResourceNotFoundException`, and a signature this service cannot CHECK at all is the
-//! modelled `InternalServerException`, because nothing was decided about the token. A
+//! `ResourceNotFoundException`, and a signature of an issuer this emulator HOSTS that it
+//! cannot check is the modelled `InternalServerException`, because nothing was decided
+//! about the token. A
 //! failure raised while EVALUATING one request is reported in that request's own `errors`
 //! on the 200, for the reason [`crate::ops::batch_is_authorized`] states. The policy store
 //! the request names is resolved BEFORE any of the request's own payload — the presented

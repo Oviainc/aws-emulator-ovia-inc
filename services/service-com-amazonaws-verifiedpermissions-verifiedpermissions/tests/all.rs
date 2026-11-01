@@ -73,6 +73,8 @@ mod list_policy_templates;
 mod name_conflict_precedes_capacity;
 #[path = "all/not_found_precedes_payload_refusal.rs"]
 mod not_found_precedes_payload_refusal;
+#[path = "all/oidc_identity_source_authorization.rs"]
+mod oidc_identity_source_authorization;
 #[path = "all/policy_store_alias.rs"]
 mod policy_store_alias;
 #[path = "all/policy_store_authorization.rs"]

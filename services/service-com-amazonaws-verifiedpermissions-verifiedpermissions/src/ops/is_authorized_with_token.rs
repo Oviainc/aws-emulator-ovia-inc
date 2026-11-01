@@ -4,8 +4,9 @@
 //!
 //! `@readonly`: the principal comes from the TOKEN, not from the request. The token is
 //! read and verified by [`crate::state::token`] — it is a compact JWS, its issuer is one
-//! of the policy store's identity sources, that issuer signed it, it is the kind of token
-//! the member it arrived in takes, it was issued to a client the source accepts and the
+//! of the policy store's identity sources, that issuer signed it wherever the key set that
+//! issuer publishes is readable in this process, it is the kind of token the member it
+//! arrived in takes, it was issued to a client the source accepts and the
 //! clock has not run out on it — and the principal it names, that principal's groups and
 //! its attributes all come from its claims. Those entities join the request's own
 //! `entities` slice, which carries only resource and action entities for that reason: an
@@ -25,9 +26,12 @@
 //! nor the value it held.
 //! A token whose ISSUER is no identity source of the store is the modelled
 //! `ResourceNotFoundException` instead: the call references an identity source the store
-//! does not hold. A signature this service cannot CHECK at all — an issuer whose key set
-//! it cannot read, a key it cannot check a signature under — is the modelled
-//! `InternalServerException`, because nothing was decided about the token. A failure
+//! does not hold. A signature of an issuer this emulator HOSTS that it cannot CHECK — a
+//! key set it cannot read in this process, a key it cannot check a signature under — is
+//! the modelled `InternalServerException`, because nothing was decided about the token.
+//! A provider an `openIdConnectConfiguration` names is not that case: it publishes its key
+//! set outside the emulator, so there is no signature to check here and the decision
+//! follows the rules the token's own value settles. A failure
 //! raised while EVALUATING is reported in-band on the 200, in `errors`, for the reason
 //! [`crate::ops::is_authorized`] states. The policy store the request names is resolved
 //! BEFORE any of the request's own payload — the presented tokens included — is read, so

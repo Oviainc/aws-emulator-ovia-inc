@@ -18,7 +18,13 @@
 //!   only from the next token it issues; and
 //! * a claim is worth nothing unless the issuer signed it, so the signature is checked
 //!   against the key set the issuer PUBLISHES ([`published_key_set`]) before a single
-//!   claim is used for anything but finding that key set.
+//!   claim is used for anything but finding that key set — wherever that set can be read
+//!   at all, which is for the issuers this emulator itself hosts. A provider an
+//!   `openIdConnectConfiguration` names publishes its key set at a URL outside the
+//!   emulator, which makes no outbound connection to fetch one, so no key exists here to
+//!   check such a token's signature against and what decides it is every rule its own
+//!   value settles: the form (nothing unsecured), the issuer it claims, the member it
+//!   arrived in, the client it was issued to and its validity window.
 //!
 //! Everything here is a READ: no token is recorded, consumed or counted, so two calls
 //! presenting one token are answered alike.
@@ -254,13 +260,14 @@ pub enum TokenRefusal {
     /// `ResourceNotFoundException` rather than a bad request. Carries the issuer the token
     /// claimed, which is how the request referenced that identity source.
     NoIdentitySource(String),
-    /// The signature could not be CHECKED at all: the key set the token's issuer publishes
-    /// cannot be read in this process, or it holds no key this service can check a
-    /// signature under. That is not something the caller sent — the token may be perfectly
-    /// good and this service simply cannot say — so it is answered as a service fault
-    /// rather than as a token that failed to verify. Every issuer this emulator serves
-    /// publishes its key set in-process, so the first case is an issuer outside it, whose
-    /// key set lives at a URL the emulator does not fetch. Carries the issuer and why.
+    /// The signature could not be CHECKED at all for an issuer this emulator itself HOSTS:
+    /// the key set that issuer publishes in-process cannot be read, or it holds no key this
+    /// service can check a signature under. That is not something the caller sent — the
+    /// token may be perfectly good and this service simply cannot say — so it is answered
+    /// as a service fault rather than as a token that failed to verify. An issuer OUTSIDE
+    /// the emulator is not this case: nothing in this process ever publishes a key set for
+    /// it, so there is no check to make and the token is judged by what its own value
+    /// decides ([`verify`]). Carries the issuer and why.
     NotCheckable { issuer: String, reason: String },
 }
 
@@ -278,9 +285,20 @@ impl TokenRefusal {
 /// identity it names.
 ///
 /// The order is the one a verifier has to apply: the value is a token at all, it names an
-/// issuer this store trusts, the issuer SIGNED it — and only then are its remaining claims
-/// read, because a claim on an unverified token is evidence of nothing. `engine` is the
-/// shared engine the issuer's published key set is read from.
+/// issuer this store trusts, the issuer SIGNED it where that signature can be checked at
+/// all — and only then are its remaining claims read. `engine` is the shared engine the
+/// issuer's published key set is read from.
+///
+/// A signature is checked against the key set the token's ISSUER publishes, and the key
+/// sets readable at all are the ones issuers this emulator HOSTS publish in this same
+/// process ([`published_key_set`]). An identity source may name a provider the emulator
+/// does not host, which publishes its key set at a URL outside the emulator — and the
+/// emulator makes no outbound connection to fetch one — so for such an issuer there is no
+/// key here to check any signature against, and the token is judged by every rule its own
+/// value decides instead: it is a compact JWS, nothing unsecured (`alg` `none` or an empty
+/// signature segment, which [`::service_common::jwt::read`] refuses), it names that issuer,
+/// it arrived in the member the source processes, it was issued to a client the source
+/// accepts and the clock has not run out on it.
 pub fn verify<Eng: Send + Sync + 'static>(
     engine: &Eng,
     store: &PolicyStore,
@@ -301,33 +319,51 @@ pub fn verify<Eng: Send + Sync + 'static>(
     let source = matching_source(store, &issuer, kind)
         .ok_or_else(|| TokenRefusal::NoIdentitySource(issuer.clone()))?;
 
-    let key_set = published_key_set(engine, &issuer).ok_or_else(|| {
-        TokenRefusal::NotCheckable {
-            issuer: issuer.clone(),
-            reason: "it publishes no key set this service can read".to_string(),
+    match published_key_set(engine, &issuer) {
+        Some(key_set) => {
+            ::service_common::jwt::verify(presented.value, &key_set).map_err(|defect| {
+                match defect {
+                    // Both say the same thing to a caller: no key of this issuer signed
+                    // this token.
+                    ::service_common::jwt::SignatureDefect::Invalid
+                    | ::service_common::jwt::SignatureDefect::UnknownKey => {
+                        refuse(SIGNATURE_INVALID.to_string())
+                    }
+                    // The check could not be MADE under the algorithm the token names or
+                    // the key the issuer published for it, so nothing was decided about the
+                    // token: reported as the service fault it is, never as the caller's
+                    // token being bad.
+                    defect @ (::service_common::jwt::SignatureDefect::UnsupportedAlgorithm(_)
+                    | ::service_common::jwt::SignatureDefect::UnsupportedKey) => {
+                        TokenRefusal::NotCheckable {
+                            issuer: issuer.clone(),
+                            reason: defect.to_string(),
+                        }
+                    }
+                    // The form rules, which are decided from the token alone.
+                    defect @ ::service_common::jwt::SignatureDefect::Form(_) => {
+                        refuse(defect.to_string())
+                    }
+                }
+            })?;
         }
-    })?;
-    ::service_common::jwt::verify(presented.value, &key_set).map_err(|defect| match defect {
-        // Both say the same thing to a caller: no key of this issuer signed this token.
-        ::service_common::jwt::SignatureDefect::Invalid
-        | ::service_common::jwt::SignatureDefect::UnknownKey => {
-            refuse(SIGNATURE_INVALID.to_string())
+        // An issuer this emulator HOSTS has its key set in this same process, so failing to
+        // read it is this service's own fault and nothing was decided about the token.
+        None if emulator_hosts_issuer(source) => {
+            return Err(TokenRefusal::NotCheckable {
+                issuer,
+                reason: "it publishes no key set this service can read".to_string(),
+            });
         }
-        // The check could not be MADE under the algorithm the token names or the key the
-        // issuer published for it, so nothing was decided about the token: reported as the
-        // service fault it is, never as the caller's token being bad.
-        defect @ (::service_common::jwt::SignatureDefect::UnsupportedAlgorithm(_)
-        | ::service_common::jwt::SignatureDefect::UnsupportedKey) => {
-            TokenRefusal::NotCheckable {
-                issuer: issuer.clone(),
-                reason: defect.to_string(),
-            }
-        }
-        // The form rules, which are decided from the token alone.
-        defect @ ::service_common::jwt::SignatureDefect::Form(_) => refuse(defect.to_string()),
-    })?;
+        // An issuer outside the emulator publishes its key set where the emulator never
+        // reaches, so there is no signature check to make: the rules the token's own value
+        // decides are the ones that apply, and they continue below.
+        None => {}
+    }
 
-    // Past here every claim read has been signed by the issuer the store trusts.
+    // Past here the token has met every check this service could make of it: the claims of
+    // a token an issuer whose key set is readable here signed, and otherwise the claims of
+    // a well-formed token naming an issuer the store's own identity source trusts.
     if let Some(expected) = expected_token_use(source, kind) {
         let claimed = read.claim_str(TOKEN_USE_CLAIM).unwrap_or_default();
         if claimed != expected {
@@ -336,7 +372,7 @@ pub fn verify<Eng: Send + Sync + 'static>(
             )));
         }
     }
-    if !audience_accepted(source, &read, kind) {
+    if !audience_accepted(source, &read) {
         return Err(TokenRefusal::AudienceNotAccepted { kind });
     }
     check_window(&read, now).map_err(refuse)?;
@@ -411,17 +447,13 @@ fn expected_token_use(source: &IdentitySource, kind: TokenKind) -> Option<&'stat
 ///
 /// A source names the clients whose tokens the policy store accepts — `clientIds` for an
 /// Amazon Cognito user pool, and for the two arms of an OpenID Connect token selection the
-/// `audiences` / `clientIds` the model calls "the `aud` claim values that you want to
-/// accept" and "the ID token audience, or client ID, claim values that you want to accept"
-/// — and a token names the client it was issued to: the `aud` claim of an ID token, the
-/// `client_id` claim of an access token. All three configurations are therefore the one
-/// rule: the token's audience must be one the source lists. A source that lists none
-/// accepts any client of its issuer, which is what an empty list means on the wire.
-fn audience_accepted(
-    source: &IdentitySource,
-    read: &::service_common::jwt::CompactJws,
-    kind: TokenKind,
-) -> bool {
+/// `audiences` / `clientIds` the model calls "the access token `aud` claim values that you
+/// want to accept" and "the ID token audience, or client ID, claim values that you want to
+/// accept" — and a token names who it was issued FOR in its own audience claims
+/// ([`token_audiences`]). All three configurations are therefore the one rule: one of the
+/// token's audiences must be one the source lists. A source that lists none accepts any
+/// client of its issuer, which is what an empty list means on the wire.
+fn audience_accepted(source: &IdentitySource, read: &::service_common::jwt::CompactJws) -> bool {
     let allowed: &[String] = match &source.configuration {
         IdentitySourceConfiguration::CognitoUserPool(cognito) => &cognito.client_ids,
         IdentitySourceConfiguration::OpenIdConnect(OpenIdConnectSource {
@@ -436,12 +468,42 @@ fn audience_accepted(
     if allowed.is_empty() {
         return true;
     }
-    let claim = match kind {
-        TokenKind::Access => CLIENT_ID_CLAIM,
-        TokenKind::Identity => AUDIENCE_CLAIM,
+    let claimed = token_audiences(read);
+    claimed
+        .iter()
+        .any(|claimed| allowed.iter().any(|allowed| allowed == claimed))
+}
+
+/// Who a token was issued FOR, as its own claims name them.
+///
+/// [`AUDIENCE_CLAIM`] is "either a single case-sensitive string or an array of strings"
+/// (RFC 7519 §4.1.3), so a token naming several audiences names each of them; and a token
+/// carrying no `aud` at all names its client in [`CLIENT_ID_CLAIM`] instead — the audience
+/// of an access token by another name (RFC 9068 §2.2's `client_id`, which is the claim an
+/// Amazon Cognito access token carries). Empty for a token that names neither, which no
+/// non-empty list of accepted audiences matches.
+///
+/// Each value is the claim's own string, taken as the issuer wrote it: §4.1.3 makes an
+/// audience a case-sensitive string compared as a `StringOrURI`, so nothing here is
+/// trimmed or folded — only a value that is empty, and so names nobody, is dropped.
+fn token_audiences(read: &::service_common::jwt::CompactJws) -> Vec<&str> {
+    let claimed: Vec<&str> = match read.claims.get(AUDIENCE_CLAIM) {
+        Some(Value::String(single)) => vec![single.as_str()],
+        Some(Value::Array(many)) => many.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
     };
-    let claimed = read.claim_str(claim).unwrap_or_default();
-    allowed.iter().any(|allowed| allowed == claimed)
+    let claimed: Vec<&str> = claimed
+        .into_iter()
+        .filter(|audience| !audience.is_empty())
+        .collect();
+    if claimed.is_empty() {
+        return read
+            .claim_str(CLIENT_ID_CLAIM)
+            .filter(|client| !client.is_empty())
+            .into_iter()
+            .collect();
+    }
+    claimed
 }
 
 /// Refuse a token the clock has run out on, or one that is not yet valid.
@@ -650,7 +712,8 @@ fn prefixed_id(prefix: Option<&str>, value: &str) -> String {
 /// this seam.
 ///
 /// `None` when nothing in this process publishes a key set for `issuer`, which is every
-/// issuer outside the emulator.
+/// issuer outside the emulator — the case [`emulator_hosts_issuer`] tells apart from an
+/// issuer the emulator does host whose key set went missing.
 ///
 /// LOCK ORDER: this takes the user-pool service's state lock, and its caller holds this
 /// service's. Nothing in the user-pool service reads this service's state, so that order
@@ -665,4 +728,22 @@ pub fn published_key_set<Eng: Send + Sync + 'static>(engine: &Eng, issuer: &str)
     let pools = pools.lock();
     let pool = pools.pool(&user_pool_id)?;
     (pool.issuer() == issuer).then(|| pool.jwks())
+}
+
+/// Whether the provider `source` points at is one this EMULATOR hosts, so that the key set
+/// its issuer publishes is held in this same process and
+/// [`published_key_set`] answering `None` for it is this service's own failure rather than
+/// the issuer being unreachable.
+///
+/// The emulated provider is the Amazon Cognito user pool: a source pointing at one names a
+/// pool that had to exist in this engine for the source to be written
+/// ([`super::resolve_user_pool_arn`]), and the pool publishes its key set in the user-pool
+/// service's state. An `openIdConnectConfiguration` names its provider by an `issuer` URL
+/// the write accepts as given — "the issuer URL of an OIDC identity provider" the policy
+/// store trusts — and that provider lives wherever that URL points, outside the emulator.
+fn emulator_hosts_issuer(source: &IdentitySource) -> bool {
+    match &source.configuration {
+        IdentitySourceConfiguration::CognitoUserPool(_) => true,
+        IdentitySourceConfiguration::OpenIdConnect(_) => false,
+    }
 }
