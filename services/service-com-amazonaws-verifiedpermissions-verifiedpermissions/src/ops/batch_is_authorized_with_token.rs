@@ -205,21 +205,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // The model bounds `requests` below (`@length min 1`) but not above, so the
-        // published batch size is refused here rather than at the boundary. It is checked
-        // ahead of the store lookup: the list's own size is a property of the request, not
-        // of any store, so it costs a length check rather than a state read.
-        if input.requests.len() > crate::state::cedar::MAX_BATCH_REQUESTS {
-            return Err(invalid(crate::ops::InvalidInput::new(
-                crate::ops::paths::REQUESTS,
-                format!(
-                    "it carries {} authorization requests, more than the {} a batch may carry",
-                    input.requests.len(),
-                    crate::state::cedar::MAX_BATCH_REQUESTS
-                ),
-            )));
-        }
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             BatchIsAuthorizedWithTokenErrorModeled::InternalServerException(
                 InternalServerException {
@@ -239,6 +224,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .ok_or_else(not_found)?;
         let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
+
+        // The model bounds `requests` below (`@length min 1`) but not above, so the
+        // published batch size is refused here rather than at the boundary. The list's size
+        // is a member of the request's own payload, so it is read AFTER the store the
+        // request references has been resolved, like every other refusal below.
+        if input.requests.len() > crate::state::cedar::MAX_BATCH_REQUESTS {
+            return Err(invalid(crate::ops::InvalidInput::new(
+                crate::ops::paths::REQUESTS,
+                format!(
+                    "it carries {} authorization requests, more than the {} a batch may carry",
+                    input.requests.len(),
+                    crate::state::cedar::MAX_BATCH_REQUESTS
+                ),
+            )));
+        }
 
         // "You must specify either an accessToken, an identityToken, or both": the model
         // declares both members optional, so the boundary validator cannot require one of

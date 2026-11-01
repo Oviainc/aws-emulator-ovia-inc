@@ -36,6 +36,12 @@ const UNKNOWN_ALIAS_NAME: &str = "not-an-alias";
 /// An identity source id no store holds.
 const UNKNOWN_IDENTITY_SOURCE: &str = "ISdoesnotexist11111111";
 
+/// How many requests one batch may carry, from `BatchIsAuthorized`'s own model
+/// documentation: "The requests of a BatchIsAuthorized API request can contain up
+/// to 30 requests." A list longer than this is a payload fault of the `requests`
+/// member, just like a request inside it that is missing a member.
+const MAX_BATCH_REQUESTS: usize = 30;
+
 /// A value shaped like a compact JWS: three `.`-separated base64url segments, so
 /// it satisfies `Token`'s modelled pattern
 /// (`^[A-Za-z0-9-_=]+.[A-Za-z0-9-_=]+.[A-Za-z0-9-_=]+$`) and the boundary
@@ -77,6 +83,39 @@ async fn reachable_pool_arn(router: &MultiServiceRouter) -> String {
     )
 }
 
+/// A `requests` list of `count` well-formed authorization requests, all sharing
+/// their principal so they satisfy the batch's "identical principal or resource"
+/// rule: when `count` is past [`MAX_BATCH_REQUESTS`] the only thing wrong with
+/// the batch is its SIZE.
+fn batch_requests(count: usize) -> Value {
+    Value::Array(
+        (0..count)
+            .map(|n| {
+                json!({
+                    "principal": principal(),
+                    "action": action(),
+                    "resource": { "entityType": "Photo", "entityId": format!("p{n}") },
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The same list for the token-based batch, whose principal is the TOKEN's: each
+/// item carries only the other two members of the Cedar triple.
+fn token_batch_requests(count: usize) -> Value {
+    Value::Array(
+        (0..count)
+            .map(|n| {
+                json!({
+                    "action": action(),
+                    "resource": { "entityType": "Photo", "entityId": format!("p{n}") },
+                })
+            })
+            .collect(),
+    )
+}
+
 /// One request whose PAYLOAD this service refuses on its own checks.
 struct Fault {
     /// The operation to call.
@@ -93,11 +132,12 @@ struct Fault {
 
 /// Every payload refusal this suite pairs with a reference that names nothing.
 ///
-/// The rows differ along the OPERATION (single, token-based and batch
-/// authorization, and the two identity-source writers) and along the KIND of
-/// payload fault (an absent member of the Cedar triple, an absent token, a
-/// payload that is no Cedar JSON, a provider reference that resolves to nothing,
-/// a member whose value cannot be defaulted).
+/// The rows differ along the OPERATION (single and token-based authorization,
+/// both batch authorizations, and the two identity-source writers) and along the
+/// KIND of payload fault (an absent member of the Cedar triple, an absent token,
+/// a payload that is no Cedar JSON, a list longer than the batch bound, a
+/// provider reference that resolves to nothing, a member whose value cannot be
+/// defaulted).
 const FAULTS: &[Fault] = &[
     Fault {
         operation: "IsAuthorized",
@@ -213,6 +253,51 @@ const FAULTS: &[Fault] = &[
                     "resource": resource(),
                     "context": { "cedarJson": "not-json" },
                 }],
+            })
+        },
+    },
+    Fault {
+        operation: "BatchIsAuthorized",
+        fault: "one request more than a batch may carry",
+        field: "/requests",
+        body: |store, _| {
+            json!({
+                "policyStoreId": store,
+                "requests": batch_requests(MAX_BATCH_REQUESTS + 1),
+            })
+        },
+    },
+    Fault {
+        operation: "BatchIsAuthorized",
+        fault: "a batch far longer than one may carry",
+        field: "/requests",
+        body: |store, _| {
+            json!({
+                "policyStoreId": store,
+                "requests": batch_requests(MAX_BATCH_REQUESTS * 3),
+            })
+        },
+    },
+    Fault {
+        operation: "BatchIsAuthorizedWithToken",
+        fault: "one request more than a batch may carry, beside a token",
+        field: "/requests",
+        body: |store, _| {
+            json!({
+                "policyStoreId": store,
+                "identityToken": TOKEN_SHAPED,
+                "requests": token_batch_requests(MAX_BATCH_REQUESTS + 1),
+            })
+        },
+    },
+    Fault {
+        operation: "BatchIsAuthorizedWithToken",
+        fault: "one request more than a batch may carry, with no token presented",
+        field: "/requests",
+        body: |store, _| {
+            json!({
+                "policyStoreId": store,
+                "requests": token_batch_requests(MAX_BATCH_REQUESTS + 1),
             })
         },
     },

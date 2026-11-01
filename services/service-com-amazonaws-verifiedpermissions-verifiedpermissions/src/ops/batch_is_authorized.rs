@@ -172,11 +172,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchIsAuthorizedErrorModeled::InternalServerException(InternalServerException {
+                message: "the service state store is unavailable".to_string(),
+            })
+        })?;
+        let state = state.lock();
+        // The store is resolved BEFORE any member of the request's own payload is
+        // read — its `requests` list, that list's size included — so a reference
+        // to a store that does not exist answers `ResourceNotFoundException`
+        // rather than a refusal about the payload.
+        let store_id = state
+            .resolve_store_id(
+                &crate::state::request_region(ctx.parts()),
+                &input.policy_store_id,
+            )
+            .ok_or_else(not_found)?;
+        let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
+
         // The model bounds `requests` below (`@length min 1`) but not above, so the
-        // published batch size is refused here rather than at the boundary. It is
-        // checked ahead of the store lookup: the list's own size is a property of
-        // the request, not of any store, so it costs a length check rather than a
-        // state read.
+        // published batch size is refused here rather than at the boundary. The
+        // list's size is a member of the request's own payload, so it is read
+        // AFTER the store the request references has been resolved, like every
+        // other refusal below — including this operation's other `/requests`-level
+        // rule, `shares_principal_or_resource`.
         if input.requests.len() > crate::state::cedar::MAX_BATCH_REQUESTS {
             return Err(invalid(crate::ops::InvalidInput::new(
                 crate::ops::paths::REQUESTS,
@@ -187,24 +206,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )));
         }
-
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            BatchIsAuthorizedErrorModeled::InternalServerException(InternalServerException {
-                message: "the service state store is unavailable".to_string(),
-            })
-        })?;
-        let state = state.lock();
-        // The store is resolved BEFORE any of the request's payloads is turned
-        // into a Cedar value, so a reference to a store that does not exist
-        // answers `ResourceNotFoundException` rather than a refusal about the
-        // payload.
-        let store_id = state
-            .resolve_store_id(
-                &crate::state::request_region(ctx.parts()),
-                &input.policy_store_id,
-            )
-            .ok_or_else(not_found)?;
-        let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
 
         // Each request is evaluated as a complete Cedar triple, so every member of
         // every request must be present; an absent one is refused by naming the
