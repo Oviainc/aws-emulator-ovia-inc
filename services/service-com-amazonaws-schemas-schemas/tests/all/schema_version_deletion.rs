@@ -6,15 +6,17 @@
 //! nothing else — the schema, its metadata and every other version it holds stay
 //! readable with the bytes they were written with; a read of "the latest" answers the
 //! newest version that survives; a version number a delete frees is never minted
-//! again; and a request naming a version the schema does not hold (or a schema or
-//! registry that does not exist) is refused as not found, having deleted nothing. A
-//! service-owned registry's content is AWS's, so a delete inside one is refused as
-//! forbidden.
+//! again; a request that would leave the schema with NO version is refused 409
+//! `ConflictException`, so only `DeleteSchema` takes a schema's final definition; and a
+//! request naming a version the schema does not hold (or a schema or registry that does
+//! not exist) is refused as not found, having deleted nothing. A service-owned
+//! registry's content is AWS's, so a delete inside one is refused as forbidden.
 //!
 //! The rows below vary along what that rule generalises over — the NUMBER of versions
-//! a schema holds, WHICH of them is deleted (the first, a middle one, the newest, the
-//! only one), how many are deleted in turn, and the FORM of a `SchemaVersion` that
-//! names no stored version — rather than along the name of any one schema.
+//! a schema holds, WHICH of them is deleted (the first, a middle one, the newest), how
+//! many are deleted in turn, how the schema came to hold just one, and the FORM of a
+//! `SchemaVersion` that names no stored version — rather than along the name of any one
+//! schema.
 //!
 //! Every case drives the real wire path: a signed `restJson1` request through
 //! `MultiServiceRouter::dispatch`, exactly as the production router serves it. Nothing
@@ -25,7 +27,8 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::state::{
-    aws_managed_schemas, AWS_MANAGED_REGISTRY, CODE_FORBIDDEN, CODE_RESOURCE_NOT_FOUND,
+    aws_managed_schemas, AWS_MANAGED_REGISTRY, CODE_CONFLICT, CODE_FORBIDDEN,
+    CODE_RESOURCE_NOT_FOUND,
 };
 
 use crate::registry_schema_lifecycle::{
@@ -157,15 +160,42 @@ fn assert_not_found(case: &str, answer: &Answer) {
     );
 }
 
+/// Assert `answer` is the modelled 409 for a delete that would leave the schema with no
+/// version at all.
+fn assert_last_version_refused(case: &str, answer: &Answer) {
+    assert_eq!(
+        answer.status, 409,
+        "case {case}: expected 409, got {} {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error_type(),
+        "ConflictException",
+        "case {case}: expected ConflictException, got {:?}",
+        answer.error_type()
+    );
+    assert_eq!(
+        answer.str_at("Code"),
+        CODE_CONFLICT,
+        "case {case}: expected {CODE_CONFLICT}, got {:?}",
+        answer.str_at("Code")
+    );
+    assert_eq!(
+        answer.str_at("Message"),
+        "Cannot delete all versions of a Schema. To delete a Schema use the DeleteSchema API.",
+        "case {case}: wrong sentence for a delete of the schema's last version, got {:?}",
+        answer.body
+    );
+}
+
 /// RULE: a delete takes exactly the named version. Every other version of the schema
 /// is still readable with the bytes it was written with, the schema itself survives,
 /// and a read of the latest version answers the newest one that remains.
 #[tokio::test]
 async fn deleting_a_version_leaves_the_schema_and_its_other_versions() {
-    // Rows: the count of stored versions crossed with WHICH of them goes — the only
-    // one, the first, a middle one, the newest, and one of a longer run.
-    let cases: [(&str, u32, u32); 6] = [
-        ("the only version", 1, 1),
+    // Rows: the count of stored versions crossed with WHICH of them goes — the first, a
+    // middle one, the newest, and one of a longer run.
+    let cases: [(&str, u32, u32); 5] = [
         ("the first of two", 2, 1),
         ("the newest of two", 2, 2),
         ("the first of three", 3, 1),
@@ -219,26 +249,24 @@ async fn deleting_a_version_leaves_the_schema_and_its_other_versions() {
             );
         }
 
-        // A read of "the latest" answers the newest version that survives; a schema
-        // every version of which is gone has none to answer with, while the schema
-        // itself is still there — `ListSchemaVersions` serves it.
+        // A read of "the latest" answers the newest version that survives; the schema
+        // always holds one, because the delete of its last definition is refused.
         let latest = emulator.call("GET", &schema_uri(registry, schema), None).await;
-        match survivors.iter().next_back() {
-            Some(newest) => {
-                assert_eq!(
-                    latest.status, 200,
-                    "case {case}: expected 200 from DescribeSchema, got {} {:?}",
-                    latest.status, latest.body
-                );
-                assert_eq!(
-                    latest.str_at("SchemaVersion"),
-                    *newest,
-                    "case {case}: the latest version is the newest that survives, got {:?}",
-                    latest.str_at("SchemaVersion")
-                );
-            }
-            None => assert_not_found(&format!("{case}/DescribeSchema of the latest"), &latest),
-        }
+        let newest = survivors
+            .iter()
+            .next_back()
+            .unwrap_or_else(|| panic!("case {case}: the schema must still hold a version"));
+        assert_eq!(
+            latest.status, 200,
+            "case {case}: expected 200 from DescribeSchema, got {} {:?}",
+            latest.status, latest.body
+        );
+        assert_eq!(
+            latest.str_at("SchemaVersion"),
+            *newest,
+            "case {case}: the latest version is the newest that survives, got {:?}",
+            latest.str_at("SchemaVersion")
+        );
 
         // Deleting the same version again finds nothing to delete.
         let again = emulator
@@ -253,12 +281,13 @@ async fn deleting_a_version_leaves_the_schema_and_its_other_versions() {
 #[tokio::test]
 async fn a_freed_version_number_is_never_minted_again() {
     // Rows: which of three stored versions are deleted before the next definition is
-    // written — the newest, the oldest, a pair, and all of them.
+    // written — the newest, the oldest, a pair, and every one but the last (which a
+    // delete cannot take).
     let cases: [(&str, &[u32]); 4] = [
         ("the newest", &[3]),
         ("the oldest", &[1]),
         ("the newest and the oldest", &[3, 1]),
-        ("every version", &[1, 2, 3]),
+        ("every version but the last", &[1, 2]),
     ];
 
     for (case, deleted) in cases {
@@ -434,8 +463,10 @@ async fn the_delete_answers_with_no_body_and_states_its_length() {
     let emulator = Emulator::new();
     let registry = "version-framing";
     let schema = "order.returned";
-    let minted = schema_with_versions(&emulator, registry, schema, 2).await;
-    for version in &minted {
+    let minted = schema_with_versions(&emulator, registry, schema, 3).await;
+    // Every version but the last the schema holds: a delete that would empty it is
+    // refused, and a refusal is not what this row is about.
+    for version in &minted[..minted.len() - 1] {
         let answer = emulator
             .call("DELETE", &version_uri(registry, schema, version), None)
             .await;
@@ -447,12 +478,11 @@ async fn the_delete_answers_with_no_body_and_states_its_length() {
             answer.header("content-length")
         );
     }
-    // Both deletes landed: the schema holds no version any more, and still exists.
-    assert!(
-        stored_versions(&emulator, registry, schema)
-            .await
-            .is_empty(),
-        "every version was deleted"
+    // Every delete landed: the schema holds only the version no delete may take.
+    assert_eq!(
+        stored_versions(&emulator, registry, schema).await,
+        BTreeSet::from([minted[minted.len() - 1].clone()]),
+        "every delete above landed"
     );
 }
 
@@ -470,8 +500,13 @@ async fn the_schema_listing_counts_only_the_versions_that_remain() {
         let answer = emulator
             .call("DELETE", &version_uri(registry, schema, version), None)
             .await;
-        assert_deleted(&format!("v{version}"), &answer);
-        expected -= 1;
+        if expected == 1 {
+            // The last definition the schema holds: refused, so the count does not move.
+            assert_last_version_refused(&format!("v{version}"), &answer);
+        } else {
+            assert_deleted(&format!("v{version}"), &answer);
+            expected -= 1;
+        }
         let listed = emulator
             .call(
                 "GET",
@@ -594,87 +629,108 @@ async fn a_delete_takes_the_idempotency_record_of_the_version_it_removes() {
         }
     }
 }
-/// metadata — so a metadata-only update of one succeeds and reports the schema's
-/// members, while the members that describe a definition (`SchemaVersion`,
-/// `VersionCreatedDate`) are absent because there is no definition to describe. The
-/// next definition written to it is minted past every version it ever held.
+/// RULE: a schema always holds at least one definition, so a `DeleteSchemaVersion` of
+/// the only version a schema still holds is refused 409 `ConflictException` and removes
+/// nothing — whichever version that is and however the schema came to hold just one.
+/// `DeleteSchema` is the one call that takes a schema's final definition, and it takes
+/// the schema with it.
 #[tokio::test]
-async fn a_schema_holding_no_version_still_takes_a_metadata_update() {
-    // Rows: how many versions the schema held before every one of them was deleted —
-    // the rule is about the EMPTY version set, whatever it was emptied from.
-    for (case, count) in [("one version", 1_u32), ("three versions", 3)] {
+async fn the_only_version_a_schema_holds_cannot_be_deleted() {
+    // Rows: how the schema came to hold exactly one version, and WHICH version number
+    // that one is — the first one minted, a middle one, the newest of a run — so the
+    // refusal is not keyed to a version number or to a freshly created schema.
+    let cases: [(&str, u32, &[u32]); 5] = [
+        ("created with one version", 1, &[]),
+        ("two versions, the newest deleted", 2, &[2]),
+        ("two versions, the first deleted", 2, &[1]),
+        ("four versions, all but the second deleted", 4, &[1, 3, 4]),
+        ("four versions, all but the newest deleted", 4, &[1, 2, 3]),
+    ];
+
+    for (case, count, deleted) in cases {
         let emulator = Emulator::new();
-        let registry = "versionless-schemas";
+        let registry = "last-version-guard";
         let schema = "order.archived";
         let minted = schema_with_versions(&emulator, registry, schema, count).await;
-        for version in &minted {
-            let deleted = emulator
-                .call("DELETE", &version_uri(registry, schema, version), None)
+        for version in deleted {
+            let removed = emulator
+                .call(
+                    "DELETE",
+                    &version_uri(registry, schema, &version.to_string()),
+                    None,
+                )
                 .await;
-            assert_deleted(&format!("{case}/v{version}"), &deleted);
+            assert_deleted(&format!("{case}/v{version}"), &removed);
         }
+        let held = stored_versions(&emulator, registry, schema).await;
+        assert_eq!(
+            held.len(),
+            1,
+            "case {case}: the schema must be left holding exactly one version, got {held:?}"
+        );
+        let last = held
+            .iter()
+            .next()
+            .unwrap_or_else(|| panic!("case {case}: one version is held"))
+            .clone();
 
-        let described = "the schema outlives its definitions";
-        let updated = emulator
-            .call(
-                "PUT",
-                &schema_uri(registry, schema),
-                Some(json!({"Description": described})),
-            )
-            .await;
-        assert_eq!(
-            updated.status, 200,
-            "case {case}: expected 200 from a metadata-only UpdateSchema, got {} {:?}",
-            updated.status, updated.body
-        );
-        assert_eq!(
-            updated.str_at("Description"),
-            described,
-            "case {case}: the description the request sent is what the schema now carries"
-        );
-        assert_eq!(
-            updated.str_at("SchemaName"),
-            schema,
-            "case {case}: the response names the schema it updated"
-        );
-        // `Type` is the schema's own stored member, so it survives its definitions.
-        assert_eq!(
-            updated.str_at("Type"),
-            "OpenApi3",
-            "case {case}: the schema keeps the type its definitions were written with"
-        );
-        for member in ["SchemaVersion", "VersionCreatedDate"] {
-            assert!(
-                updated.body.get(member).is_none_or(Value::is_null),
-                "case {case}: {member} describes a definition the schema no longer holds, \
-                 got {:?}",
-                updated.body.get(member)
+        // The refusal, twice over: it is the state of the schema that refuses, not the
+        // first attempt.
+        for attempt in 1..=2 {
+            let refused = emulator
+                .call("DELETE", &version_uri(registry, schema, &last), None)
+                .await;
+            assert_last_version_refused(&format!("{case}/attempt {attempt}"), &refused);
+            assert_eq!(
+                stored_versions(&emulator, registry, schema).await,
+                BTreeSet::from([last.clone()]),
+                "case {case}: the refused delete must remove nothing"
             );
         }
 
-        // And the next definition is minted past every version the schema ever held.
-        let next = emulator
-            .call(
-                "PUT",
-                &schema_uri(registry, schema),
-                Some(json!({"Content": content_of(count + 1), "Type": "OpenApi3"})),
-            )
+        // The definition is still readable, and still the one the latest read answers.
+        let described = emulator
+            .call("GET", &describe_uri(registry, schema, &last), None)
             .await;
         assert_eq!(
-            next.status, 200,
-            "case {case}: expected 200 from UpdateSchema, got {} {:?}",
-            next.status, next.body
+            described.status, 200,
+            "case {case}: v{last} must still be readable, got {} {:?}",
+            described.status, described.body
+        );
+        let index: usize = last
+            .parse::<usize>()
+            .unwrap_or_else(|_| panic!("case {case}: a version label renders in decimal"));
+        assert_eq!(
+            described.str_at("Content"),
+            content_of(index as u32),
+            "case {case}: v{last} keeps the bytes it was written with"
         );
         assert_eq!(
-            next.str_at("SchemaVersion"),
-            (count + 1).to_string(),
-            "case {case}: the next version follows every version ever minted, got {:?}",
-            next.str_at("SchemaVersion")
+            emulator
+                .call("GET", &schema_uri(registry, schema), None)
+                .await
+                .str_at("SchemaVersion"),
+            last,
+            "case {case}: the surviving version is what a read of the latest answers"
         );
         assert_eq!(
-            stored_versions(&emulator, registry, schema).await,
-            BTreeSet::from([(count + 1).to_string()]),
-            "case {case}: the schema holds exactly the newly minted version"
+            minted.len(),
+            count as usize,
+            "case {case}: the seeding minted {count} versions"
         );
+
+        // `DeleteSchema` is the call that does remove it, schema and all.
+        let deleted_schema = emulator
+            .call("DELETE", &schema_uri(registry, schema), None)
+            .await;
+        assert_eq!(
+            deleted_schema.status, 204,
+            "case {case}: expected 204 from DeleteSchema, got {} {:?}",
+            deleted_schema.status, deleted_schema.body
+        );
+        let gone = emulator
+            .call("GET", &schema_uri(registry, schema), None)
+            .await;
+        assert_not_found(&format!("{case}/after DeleteSchema"), &gone);
     }
 }

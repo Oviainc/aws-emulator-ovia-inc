@@ -254,6 +254,22 @@ pub(crate) async fn create_registry(emulator: &Emulator, registry: &str) {
     );
 }
 
+/// Wait until the registry's keyword index has caught up with every definition written
+/// so far, so a `SearchSchemas` case can assert what the index holds rather than when it
+/// caught up.
+///
+/// The span is the service's own
+/// (`service_com_amazonaws_schemas_schemas::state::SCHEMA_INDEXING_DELAY`), read rather
+/// than written out here, plus a small margin for the clock readings either side of it.
+/// This blocks the calling test's thread, which is what a suite wants: what a search
+/// answers BEFORE the catch-up is asserted by the cases that drive the transient absence.
+pub(crate) fn wait_for_keyword_index() {
+    std::thread::sleep(
+        service_com_amazonaws_schemas_schemas::state::SCHEMA_INDEXING_DELAY
+            + std::time::Duration::from_millis(250),
+    );
+}
+
 /// One schema the table below creates and reads back.
 #[derive(Debug)]
 struct SchemaCase {

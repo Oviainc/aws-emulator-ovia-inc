@@ -213,17 +213,18 @@ async fn every_catalogue_member_is_described_from_the_seeded_document() {
     }
 }
 
-/// RULE: every member of the catalogue exports — as the `OpenApi3` it is stored as
-/// (the stored document itself) and as the `JSONSchemaDraft4` the service converts it
-/// to (draft-04 named at the root, the document's components as its definitions).
+/// RULE: every member of the catalogue exports as the `JSONSchemaDraft4` the service
+/// converts it to (draft-04 named at the root, the document's components as its
+/// definitions), and the language it is STORED as is no export target, so asking for
+/// that is refused on the request.
 #[tokio::test]
-async fn every_catalogue_member_exports_in_both_schema_languages() {
+async fn every_catalogue_member_exports_to_the_draft_4_target() {
     let emulator = Emulator::new();
 
     for name in readable_rows() {
         let seeded = entry(&name);
 
-        let exported = emulator
+        let refused = emulator
             .call(
                 "GET",
                 &export_uri(AWS_MANAGED_REGISTRY, &name, AWS_MANAGED_SCHEMA_TYPE),
@@ -231,14 +232,18 @@ async fn every_catalogue_member_exports_in_both_schema_languages() {
             )
             .await;
         assert_eq!(
-            exported.status, 200,
-            "case {name:?}: expected 200, got {} {:?}",
-            exported.status, exported.body
+            refused.status, 400,
+            "case {name:?}: the stored language is no export target, got {} {:?}",
+            refused.status, refused.body
         );
+        // The document is still served as it is stored — by the reader, not the export.
+        let described = emulator
+            .call("GET", &schema_uri(AWS_MANAGED_REGISTRY, &name), None)
+            .await;
         assert_eq!(
-            exported.str_at("Content"),
+            described.str_at("Content"),
             seeded.content,
-            "case {name:?}: exporting the stored language is the stored document"
+            "case {name:?}: the stored document is what a read of it answers"
         );
 
         let converted = emulator

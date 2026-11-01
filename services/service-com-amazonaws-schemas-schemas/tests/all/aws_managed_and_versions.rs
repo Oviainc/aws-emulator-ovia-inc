@@ -403,18 +403,17 @@ async fn exporting_an_aws_managed_schema_converts_it_to_draft_4() {
     }
 }
 
-/// RULE: `ExportSchema` refuses what it cannot render, and nothing else — a version
-/// whose STORED schema language is not one the service exports from is refused 403,
-/// a `Type` that is not a modelled schema language is refused 400, and a resource
-/// nothing holds is refused 404. Who owns the registry is never consulted (the
-/// caller-owned documents that DO export are the subject of
-/// `tests/all/export_reads_the_stored_schema.rs`).
+/// RULE: `ExportSchema` refuses what it cannot serve — a `Type` that is not the one
+/// export target the service renders is refused 400 on the request, a schema the service
+/// did not itself write is refused 403, and a resource nothing holds is refused 404.
+/// (The exports that ARE served are the subject of
+/// `tests/all/export_reads_the_stored_schema.rs`.)
 #[tokio::test]
 async fn exporting_what_cannot_be_exported_is_refused() {
     let emulator = Emulator::new();
     create_registry(&emulator, "mine").await;
-    // A schema stored in the language the conversion PRODUCES: there is no rendering
-    // of it for the export to serve.
+    // A schema a caller wrote, in the language the conversion PRODUCES: the service did
+    // not write it, so it has no export whichever language is asked for.
     let stored_as_draft4 = emulator
         .call(
             "POST",
@@ -441,21 +440,27 @@ async fn exporting_what_cannot_be_exported_is_refused() {
         .clone();
     let managed_schema = managed_schema_name.as_str();
 
-    // Rows: a schema whose stored language the service does not export from (403
-    // whichever language is asked for), a `Type` outside the modelled enum (400), and
-    // a resource that does not exist (404).
+    // Rows: a `Type` that is no export target (400 on the request, whichever schema is
+    // named), a schema the service did not write (403), and a resource that does not
+    // exist (404).
     let cases: Vec<(&str, String, u16, &str)> = vec![
         (
-            "a schema stored in the language the export produces",
+            "a schema a caller wrote, asked for as the one export target",
             export_uri("mine", "already-draft4", "JSONSchemaDraft4"),
             403,
             "ForbiddenException",
         ),
         (
-            "a schema stored as draft 4, asked for as OpenAPI 3",
+            "a schema a caller wrote, asked for as a language that is no target",
             export_uri("mine", "already-draft4", "OpenApi3"),
-            403,
-            "ForbiddenException",
+            400,
+            "BadRequestException",
+        ),
+        (
+            "the language the named schema is stored in, which is no export target",
+            export_uri(managed_registry, managed_schema, "OpenApi3"),
+            400,
+            "BadRequestException",
         ),
         (
             "a type that is not a schema language",

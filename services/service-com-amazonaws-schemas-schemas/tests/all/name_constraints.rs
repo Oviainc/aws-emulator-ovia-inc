@@ -27,8 +27,8 @@ use service_com_amazonaws_schemas_schemas::state::{
 };
 
 use crate::registry_schema_lifecycle::{
-    create_registry, registry_names, registry_uri, schema_names, schema_uri, versions_uri, walk,
-    Answer, Emulator,
+    create_registry, registry_names, registry_uri, schema_names, schema_uri, versions_uri,
+    wait_for_keyword_index, walk, Answer, Emulator,
 };
 
 /// The listing of one registry's schemas.
@@ -517,8 +517,10 @@ async fn a_refused_schema_name_reaches_no_reader_and_mints_no_arn() {
     let expected = vec![control.to_string()];
     // The keyword the control schema's declared event source indexes it under, so what
     // the search reports turns on the registry's contents rather than on how a search
-    // naming no keyword behaves.
+    // naming no keyword behaves. The index catches up with a write a short span after it,
+    // so the rows below start from a search that does report the control schema.
     let search = format!("{}/search?keywords=svc.control", listing_uri(registry));
+    wait_for_keyword_index();
 
     for row in schema_rows() {
         let Some(broken) = row.broken else { continue };

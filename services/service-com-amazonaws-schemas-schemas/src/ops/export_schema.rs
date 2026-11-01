@@ -2,8 +2,9 @@
 
 //! @op ExportSchema
 //!
-//! Renders a stored schema in another schema language: the JSON Schema draft-4 form
-//! of an OpenAPI 3 schema document, in whichever registry that schema lives.
+//! Renders a stored schema in the one language this service exports to: the JSON Schema
+//! draft-4 form of an OpenAPI 3 schema document — and only for a schema the SERVICE
+//! itself wrote, one AWS publishes or one schema discovery produced.
 //!
 //! ## Shape of an operation
 //!
@@ -162,11 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Type` is modelled `__string` on this operation, not the `Type` enum, so the
         // boundary validator admits anything: the handler is what refuses a value that
-        // is not a schema language this service knows. The admitted set and the
-        // refusal that names it are the service's, not this operation's — see
-        // `crate::state::SchemaType::from_modeled`, which `GetDiscoveredSchema` reads
-        // the same rule from.
-        let requested = SchemaType::from_modeled(&input.r#type).map_err(|refusal| {
+        // is no EXPORT TARGET. The admitted set here is narrower than the service-wide
+        // set of schema languages (`crate::state::SchemaType::from_modeled`, which
+        // `GetDiscoveredSchema` reads its own rule from): this member names the language
+        // the export is rendered INTO, and the service renders one
+        // (`crate::state::EXPORT_TARGETS`). Decided on the REQUEST, before any resource
+        // it names is resolved.
+        let requested = crate::state::export_target(&input.r#type).map_err(|refusal| {
             ExportSchemaError::from(ExportSchemaErrorModeled::BadRequestException(refusal))
         })?;
 
@@ -210,15 +213,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
-        // WHAT IS STORED decides whether a schema can be exported — never who owns the
-        // registry holding it. A schema a caller created, one schema discovery wrote
-        // into a registry of the caller's, and one AWS publishes are all read the same
-        // way: the export renders the document this version stores, and the only source
-        // language it can render is OpenAPI 3. A version stored as JSON Schema draft 4
-        // is already the language the conversion produces and carries nothing an
-        // OpenAPI document needs around it, so there is no rendering of it to serve —
-        // the refusal the modelled `ForbiddenException` covers, named by the stored
-        // type rather than by the registry it sits in.
+        // WHO WROTE the definition decides whether there is an export to serve. An
+        // export is the service's own rendering of a document the SERVICE authored —
+        // one AWS publishes, and one schema discovery wrote from sampled events, both of
+        // which live in a registry whose contents are the service's rather than the
+        // caller's. A definition a caller wrote is served back as the caller wrote it
+        // (`DescribeSchema`) and has no export, so asking for one is refused.
+        if !registry.scope.is_managed() {
+            return Err(ExportSchemaErrorModeled::ForbiddenException(
+                crate::state::schema_is_not_exportable(),
+            )
+            .into());
+        }
+
+        // The only source language the conversion can read is OpenAPI 3. A version
+        // stored as JSON Schema draft 4 is already the language the conversion produces
+        // and carries nothing an OpenAPI document needs around it, so there is no
+        // rendering of it to serve — the refusal the modelled `ForbiddenException`
+        // covers, named by the stored type.
         if version.r#type != SchemaType::OpenApi3.as_wire() {
             return Err(ExportSchemaErrorModeled::ForbiddenException(
                 crate::state::forbidden(format!(
@@ -229,6 +241,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // One export target, so one rendering: the draft-4 document computed from the
+        // stored OpenAPI 3 one.
         let content = match requested {
             SchemaType::JsonSchemaDraft4 => to_json_schema_draft4(&version.content).ok_or_else(
                 || {
@@ -243,9 +257,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ))
                 },
             )?,
-            // The OpenAPI 3 language this version is already stored in: the export is
-            // the stored document.
-            SchemaType::OpenApi3 => version.content.clone(),
+            // `crate::state::export_target` admits no other target, so no other
+            // rendering can be asked for.
+            other => {
+                return Err(ExportSchemaErrorModeled::BadRequestException(
+                    crate::state::not_an_export_target(other.as_wire()),
+                )
+                .into())
+            }
         };
 
         Ok(ExportSchemaOutput {
@@ -630,6 +649,75 @@ mod tests {
                 r#"{"components":{"schemas":{"AWSEvent":{"type":"object"}}}}"#,
                 r#"{"$schema":"http://json-schema.org/draft-04/schema#","type":"object"}"#,
             ),
+            (
+                "rooted at the envelope, with a required list and a nullable member",
+                concat!(
+                    r#"{"openapi":"3.0.0","info":{"title":"Order Placed published by my.orders"},"#,
+                    r#""paths":{},"components":{"schemas":{"#,
+                    r#""AWSEvent":{"type":"object","required":["detail","id"],"properties":{"#,
+                    r##""detail":{"$ref":"#/components/schemas/Detail"},"id":{"type":"string"}}},"##,
+                    r#""Detail":{"type":"object","properties":{"#,
+                    r#""extra":{"type":"object","nullable":true}}}}}}"#
+                ),
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r#""title":"Order Placed published by my.orders","#,
+                    r##""properties":{"detail":{"$ref":"#/definitions/Detail"},"##,
+                    r#""id":{"type":"string"}},"required":["detail","id"],"type":"object","#,
+                    r#""definitions":{"Detail":{"properties":{"#,
+                    r#""extra":{"type":["object","null"]}},"type":"object"}}}"#
+                ),
+            ),
+            (
+                "a definition referring back to the promoted component, and one leaving \
+                 the document",
+                concat!(
+                    r#"{"openapi":"3.0.0","components":{"schemas":{"#,
+                    r##""AWSEvent":{"type":"object","properties":{"detail":{"$ref":"#/components/schemas/Detail"}}},"##,
+                    r#""Detail":{"type":"object","properties":{"#,
+                    r##""replaces":{"$ref":"#/components/schemas/AWSEvent"},"##,
+                    r##""elsewhere":{"$ref":"https://example.invalid/other#/Thing"}}}}}}"##
+                ),
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r##""properties":{"detail":{"$ref":"#/definitions/Detail"}},"type":"object","##,
+                    r#""definitions":{"Detail":{"properties":{"#,
+                    r##""elsewhere":{"$ref":"https://example.invalid/other#/Thing"},"##,
+                    r##""replaces":{"$ref":"#"}},"type":"object"}}}"##
+                ),
+            ),
+            (
+                "an envelope carrying an EventBridge extension and an array of references",
+                concat!(
+                    r#"{"openapi":"3.0.0","#,
+                    r#""info":{"title":"Shipment Delayed published by my.shipping"},"#,
+                    r#""components":{"schemas":{"AWSEvent":{"type":"object","#,
+                    r#""x-amazon-events-source":"my.shipping","properties":{"#,
+                    r##""resources":{"type":"array","items":{"$ref":"#/components/schemas/Resource"}}}},"##,
+                    r#""Resource":{"type":"string"}}}}"#
+                ),
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r#""title":"Shipment Delayed published by my.shipping","properties":{"#,
+                    r##""resources":{"items":{"$ref":"#/definitions/Resource"},"type":"array"}},"##,
+                    r#""type":"object","x-amazon-events-source":"my.shipping","#,
+                    r#""definitions":{"Resource":{"type":"string"}}}"#
+                ),
+            ),
+            (
+                "a promoted component carrying a title of its own",
+                concat!(
+                    r#"{"openapi":"3.0.0","info":{"title":"Order Returned published by my.orders"},"#,
+                    r#""components":{"schemas":{"#,
+                    r#""AWSEvent":{"title":"The envelope","type":"object"}}}}"#
+                ),
+                // A JSON object carries one member per name: the document's own title is
+                // the one the translation states.
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r#""title":"Order Returned published by my.orders","type":"object"}"#
+                ),
+            ),
         ];
 
         for (case, openapi, expected) in cases {
@@ -696,6 +784,172 @@ mod tests {
             assert!(
                 to_json_schema_draft4(case).is_none(),
                 "case {case:?}: a document with nothing to convert must report so"
+            );
+        }
+    }
+
+    /// RULE: none of OpenAPI 3.0's own keywords survives the conversion, wherever in the
+    /// document it sits and whether it is written as a schema keyword or as a member of a
+    /// `properties` map; `nullable` is re-stated as draft-04's type union first.
+    ///
+    /// Rows differ along what the rule generalises over: WHICH keyword, WHERE it sits (a
+    /// component's own keywords, a member's, an array's items, a nested object, the
+    /// component the document roots at), whether it is a keyword or a member NAME, and
+    /// whether the position it marks declares a type for `nullable` to widen at all. The
+    /// expected `Content` is asserted byte for byte: the rendered member ORDER is part of
+    /// the document a client caches, diffs and hashes.
+    #[test]
+    fn no_openapi_only_keyword_survives_the_conversion() {
+        let rows = [
+            (
+                "a keyword on a component and on one of its members",
+                concat!(
+                    r#"{"openapi":"3.0.0","info":{"title":"Order Placed published by my.orders"},"#,
+                    r#""components":{"schemas":{"Order":{"type":"object","readOnly":true,"#,
+                    r#""properties":{"id":{"type":"string","example":"abc"}}}}}}"#
+                ),
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r#""title":"Order Placed published by my.orders","#,
+                    r#""definitions":{"Order":{"properties":{"id":{"type":"string"}},"#,
+                    r#""type":"object"}}}"#
+                ),
+            ),
+            (
+                "members named for the keywords, beside one that is not",
+                concat!(
+                    r#"{"openapi":"3.0.0","info":{"title":"Record published by my.audit"},"#,
+                    r#""components":{"schemas":{"Record":{"type":"object","properties":{"#,
+                    r#""readOnly":{"type":"boolean"},"writeOnly":{"type":"boolean"},"#,
+                    r#""when":{"type":"string","format":"date-time"}}}}}}"#
+                ),
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r#""title":"Record published by my.audit","#,
+                    r#""definitions":{"Record":{"properties":{"when":{"format":"date-time","#,
+                    r#""type":"string"}},"type":"object"}}}"#
+                ),
+            ),
+            (
+                "nullable and a keyword on an array's items and on a nested member",
+                concat!(
+                    r#"{"openapi":"3.0.0","info":{"title":"Batch published by my.jobs"},"#,
+                    r#""components":{"schemas":{"Batch":{"type":"object","properties":{"#,
+                    r#""items":{"type":"array","items":{"type":"object","nullable":true,"#,
+                    r#""deprecated":true,"properties":{"note":{"type":"string","#,
+                    r#""nullable":true}}}}}}}}}"#
+                ),
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r#""title":"Batch published by my.jobs","#,
+                    r#""definitions":{"Batch":{"properties":{"items":{"items":{"#,
+                    r#""properties":{"note":{"type":["string","null"]}},"#,
+                    r#""type":["object","null"]},"type":"array"}},"type":"object"}}}"#
+                ),
+            ),
+            (
+                "keywords on the component the document roots at, and a discriminator",
+                concat!(
+                    r#"{"openapi":"3.0.0","info":{"title":"Shipment published by my.shipping"},"#,
+                    r##""components":{"schemas":{"AWSEvent":{"type":"object","deprecated":true,"##,
+                    r##""xml":{"name":"event"},"properties":{"detail":"##,
+                    r##"{"$ref":"#/components/schemas/Shipment"}}},"##,
+                    r#""Shipment":{"type":"object","discriminator":{"propertyName":"kind"},"#,
+                    r#""properties":{"kind":{"type":"string"},"example":{"type":"string"}}}}}}"#
+                ),
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r#""title":"Shipment published by my.shipping","#,
+                    r##""properties":{"detail":{"$ref":"#/definitions/Shipment"}},"##,
+                    r#""type":"object","definitions":{"Shipment":{"properties":{"#,
+                    r#""kind":{"type":"string"}},"type":"object"}}}"#
+                ),
+            ),
+            (
+                "a nullable position that declares no type, beside externalDocs",
+                concat!(
+                    r#"{"openapi":"3.0.0","info":{"title":"Loose published by my.loose"},"#,
+                    r#""components":{"schemas":{"Loose":{"type":"object","#,
+                    r#""externalDocs":{"url":"https://example.invalid"},"properties":{"#,
+                    r##""any":{"nullable":true},"self":{"$ref":"#/components/schemas/Loose"}"##,
+                    r#"}}}}}"#
+                ),
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r#""title":"Loose published by my.loose","#,
+                    r##""definitions":{"Loose":{"properties":{"any":{},"##,
+                    r##""self":{"$ref":"#/definitions/Loose"}},"type":"object"}}}"##
+                ),
+            ),
+        ];
+
+        // Every keyword the rule names is exercised by some row, so no row can be
+        // dropped without losing one.
+        for keyword in OPENAPI_ONLY_KEYWORDS {
+            assert!(
+                rows.iter()
+                    .any(|(_, document, _)| document.contains(&format!("\"{keyword}\""))),
+                "case {keyword:?}: a row must carry a document declaring it"
+            );
+        }
+
+        for (case, document, expected) in rows {
+            let converted = to_json_schema_draft4(document)
+                .unwrap_or_else(|| panic!("case {case:?}: the document converts"));
+            assert_eq!(
+                converted, expected,
+                "case {case:?}: expected {expected}, got {converted}"
+            );
+            for keyword in OPENAPI_ONLY_KEYWORDS {
+                assert!(
+                    !converted.contains(&format!("\"{keyword}\"")),
+                    "case {case:?}: draft-04 defines no {keyword:?}, got {converted}"
+                );
+            }
+            // The conversion is a function of the document: converting it again renders
+            // the same bytes.
+            assert_eq!(
+                to_json_schema_draft4(document).as_deref(),
+                Some(converted.as_str()),
+                "case {case:?}: two conversions must render one document"
+            );
+        }
+    }
+
+    /// RULE (the invariant behind the rows above, over a position of every JSON type):
+    /// `nullable: true` widens the declared type to the union of it with `"null"`, and a
+    /// position the document did not mark keeps its type.
+    ///
+    /// Rows: every type name JSON Schema draft-04 defines for an instance (section
+    /// 5.5.2), so the widening is asserted over the whole set rather than the one a cited
+    /// document happened to carry.
+    #[test]
+    fn nullable_widens_the_declared_type_whatever_the_type_is() {
+        for declared in ["array", "boolean", "integer", "number", "object", "string"] {
+            let document = format!(
+                concat!(
+                    r#"{{"openapi":"3.0.0","info":{{"title":"Widened published by my.types"}},"#,
+                    r#""components":{{"schemas":{{"Widened":{{"type":"object","properties":{{"#,
+                    r#""marked":{{"type":"{declared}","nullable":true}},"#,
+                    r#""plain":{{"type":"{declared}"}}}}}}}}}}}}"#
+                ),
+                declared = declared
+            );
+            let converted = to_json_schema_draft4(&document)
+                .unwrap_or_else(|| panic!("case {declared:?}: the document converts"));
+            let converted: ::serde_json::Value = ::serde_json::from_str(&converted)
+                .unwrap_or_else(|e| panic!("case {declared:?}: the conversion is JSON ({e})"));
+            let properties = &converted["definitions"]["Widened"]["properties"];
+            assert_eq!(
+                properties["marked"]["type"],
+                ::serde_json::json!([declared, "null"]),
+                "case {declared:?}: a nullable position widens to the union, got {properties:?}"
+            );
+            assert_eq!(
+                properties["plain"]["type"],
+                ::serde_json::json!(declared),
+                "case {declared:?}: a position the document did not mark keeps its type, \
+                 got {properties:?}"
             );
         }
     }

@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::state::{
     aws_managed_schemas, managed_schema_title, managed_version_count, ManagedSchema,
-    AWS_MANAGED_REGISTRY, AWS_MANAGED_SCHEMA_TYPE, AWS_SERVICE_EVENT_TYPES,
+    AWS_MANAGED_REGISTRY, AWS_SERVICE_EVENT_TYPES,
     CLOUD_TRAIL_EVENT_FAMILY, EVENT_ENVELOPE_COMPONENT,
 };
 
@@ -391,7 +391,7 @@ async fn a_schema_aws_publishes_carries_no_arn() {
         let exported = emulator
             .call(
                 "GET",
-                &export_uri(AWS_MANAGED_REGISTRY, name, AWS_MANAGED_SCHEMA_TYPE),
+                &export_uri(AWS_MANAGED_REGISTRY, name, "JSONSchemaDraft4"),
                 None,
             )
             .await;

@@ -3,7 +3,8 @@
 //! @op DeleteSchemaVersion
 //!
 //! Removes ONE stored version of a schema, leaving the schema itself and every other
-//! version of it in place.
+//! version of it in place — and never the LAST version it holds: a schema always has a
+//! definition, so emptying one is `DeleteSchema`'s job and is refused here.
 //!
 //! ## Shape of an operation
 //!
@@ -59,6 +60,10 @@
 //! * `NotFoundException` (HTTP 404)
 //! * `ServiceUnavailableException` (HTTP 503)
 //! * `UnauthorizedException` (HTTP 401)
+//!
+//! Beyond the model: `ConflictException` (HTTP 409), for a request that would leave
+//! the schema with no definition at all — the shape `CreateSchema` already widens its
+//! own error set with, modelled by this service at `httpError` 409.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -98,10 +103,14 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteSchemaVersionOutpu
 // here — hence the `DeleteSchemaVersionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.schemas#DeleteSchemaVersion")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.schemas#DeleteSchemaVersion",
+    extra_errors = ["ConflictException"]
+)]
 #[derive(Debug)]
 pub enum DeleteSchemaVersionErrorModeled {
     BadRequestException(BadRequestException),
+    ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
     NotFoundException(NotFoundException),
@@ -221,19 +230,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // decimal version number matches no stored version and is as absent as a
         // version already deleted. Only that version goes — the schema, its metadata
         // and its other versions survive, and the freed number is never minted again.
-        // `DeleteSchema` is what removes a schema with all of its versions.
+        // `DeleteSchema` is what removes a schema with all of its versions, and so is
+        // also the only path that takes a schema's LAST definition.
         //
         // Taking a definition away is a write TO the schema, so the removal records it
         // as the schema's `LastModified` (`Schema::remove_version`, the one recorder
         // every write to a schema goes through): what a version-less read resolves to
         // and how many versions the schema holds both change, and the member reports
         // when the schema was last modified. A request that removes nothing writes
-        // nothing, so the member does not move for the refusal below.
+        // nothing, so the member does not move for either refusal below.
         let now = ::std::time::SystemTime::now();
+        // A label naming no stored version names nothing to delete, and is as absent as
+        // a version already deleted — refused before the guard below, which is about the
+        // definitions the schema HOLDS and not about the label's form.
+        if !schema.holds_version_named(&input.schema_version) {
+            return Err(DeleteSchemaVersionErrorModeled::NotFoundException(
+                crate::state::schema_version_not_found(
+                    &input.schema_name,
+                    Some(&input.schema_version),
+                ),
+            )
+            .into());
+        }
+        // A schema always holds at least one definition, so a request that would empty
+        // its version set is refused as a conflict with the stored schema rather than
+        // served: removing a schema's final definition is what `DeleteSchema` does, and
+        // it takes the schema with it. Checked BEFORE anything is removed, so the
+        // refused request writes nothing.
+        if schema.stored_version_count() == 1 {
+            return Err(DeleteSchemaVersionErrorModeled::ConflictException(
+                crate::state::cannot_delete_every_version(),
+            )
+            .into());
+        }
+        // The version resolved above is still the one this schema holds — both checks
+        // read the store under the one lock this request holds — so the removal lands;
+        // the refusal is kept for the resolution, not as a second rule.
         if !schema.remove_version_named(&input.schema_version, now) {
             return Err(DeleteSchemaVersionErrorModeled::NotFoundException(
                 crate::state::schema_version_not_found(
-                    &input.registry_name,
                     &input.schema_name,
                     Some(&input.schema_version),
                 ),

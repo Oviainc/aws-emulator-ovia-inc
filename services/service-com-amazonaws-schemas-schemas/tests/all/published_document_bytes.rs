@@ -622,8 +622,9 @@ async fn the_draft_4_export_is_rendered_as_it_is_published() {
             }
         }
 
-        // Exporting the language the document is already stored in is the document
-        // itself, byte for byte.
+        // The language the document is already stored in is no export target, so asking
+        // for it is refused on the request; the stored document itself is what the
+        // reader answers, byte for byte.
         let same = emulator
             .call(
                 "GET",
@@ -632,9 +633,9 @@ async fn the_draft_4_export_is_rendered_as_it_is_published() {
             )
             .await;
         assert_eq!(
-            same.str_at("Content"),
-            described.str_at("Content"),
-            "case {name:?}: an export in the stored language is the stored document"
+            same.status, 400,
+            "case {name:?}: the stored language is no export target, got {} {:?}",
+            same.status, same.body
         );
     }
 }

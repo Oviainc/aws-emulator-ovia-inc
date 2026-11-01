@@ -97,6 +97,8 @@ mod schema_read_resolution;
 mod schema_type_admission;
 #[path = "all/schema_type_after_version_deletion.rs"]
 mod schema_type_after_version_deletion;
+#[path = "all/schema_version_and_export_sequences.rs"]
+mod schema_version_and_export_sequences;
 #[path = "all/schema_version_deletion.rs"]
 mod schema_version_deletion;
 #[path = "all/schema_version_label_spellings.rs"]

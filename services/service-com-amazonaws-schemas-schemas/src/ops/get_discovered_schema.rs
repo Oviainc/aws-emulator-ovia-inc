@@ -753,10 +753,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = (ctx, &self.engine);
 
         // The `Type` this handler reads is a raw string, so the schema language it
-        // names is admitted — or refused — by the service's one rule for that, the
-        // same one `ExportSchema` reads: `crate::state::SchemaType::from_modeled`.
-        // What this operation adds is the mapping from that language to the document
-        // it writes.
+        // names is admitted — or refused — by the service's one rule for that:
+        // `crate::state::SchemaType::from_modeled`, the set of languages this service
+        // stores a document in. What this operation adds is the mapping from that
+        // language to the document it writes.
         let dialect = crate::state::SchemaType::from_modeled(&input.r#type)
             .map(Dialect::of)
             .map_err(|refusal| {

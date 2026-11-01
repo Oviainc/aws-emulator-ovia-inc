@@ -2,15 +2,11 @@
 
 //! End-to-end HTTP tests for WHAT `SearchSchemas` keyword-indexes a schema under.
 //!
-//! RULE under test: a keyword selects a schema only through the event the schema's
-//! document DECLARES — the event source and detail type an EventBridge document records
-//! in its `x-amazon-events-source` / `x-amazon-events-detail-type` extensions, wherever
-//! in the document they sit and in any stored version — matched case-insensitively as a
-//! substring. A schema's NAME is how every other operation addresses it, not an index
-//! entry, and the rest of a document's text is not indexed either: a schema whose
-//! document declares no event is indexed under nothing, so no keyword selects it, even
-//! one that occurs in its name. It is still reported by a search that names no keyword
-//! (which limits nothing), still listed, and still readable under its name.
+//! RULE under test: a keyword narrows a registry's schemas to those it OCCURS IN —
+//! matched case-insensitively as a substring of the schema's name or of the text of any
+//! definition the service holds for it (a published schema also carries the event
+//! identity its document does not state) — and every keyword a request names must occur,
+//! while a value carrying no keyword limits nothing and reports the whole registry.
 //!
 //! Every case drives the real wire path: a signed `restJson1` request through
 //! `MultiServiceRouter::dispatch`. The schemas are created through `CreateSchema` and
@@ -22,26 +18,25 @@
 
 use serde_json::{json, Value};
 
-use super::registry_schema_lifecycle::{create_registry, schema_names, schema_uri, Emulator};
+use super::registry_schema_lifecycle::{
+    create_registry, schema_names, schema_uri, wait_for_keyword_index, Emulator,
+};
 
 /// The registry the table below creates its schemas in and searches.
 const REGISTRY: &str = "keyword-index";
 
 /// One schema the table stores.
 ///
-/// Rows differ along everything the index rule generalises over: whether the document
-/// declares both event extensions, one of them or neither; the schema `Type`; WHERE the
-/// extensions sit (a document's own root, the conventional `AWSEvent` component, a
-/// component nested several levels down); and whether a token of the schema's name also
-/// occurs in what the document declares.
+/// Rows differ along everything the index rule generalises over: WHERE the keyword that
+/// selects a row occurs (its name, its document's title, a component name, a property
+/// name, an EventBridge extension value at the document root, on the conventional
+/// `AWSEvent` component or several levels down), the schema `Type`, the letter case of
+/// the stored text, and whether the document declares an event at all.
 struct Row {
     name: &'static str,
     /// A member of `TYPE_VALUES`.
     schema_type: &'static str,
     content: &'static str,
-    /// The event values this row's document declares, as it carries them — the whole of
-    /// what the row is indexed under. Empty for a document that declares no event.
-    declared: &'static [&'static str],
 }
 
 const ROWS: &[Row] = &[
@@ -51,54 +46,45 @@ const ROWS: &[Row] = &[
         name: "catalog-orders-v3",
         schema_type: "OpenApi3",
         content: r##"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Basket"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-source":"my.store","x-amazon-events-detail-type":"Basket Checked Out","properties":{"detail":{"$ref":"#/components/schemas/Basket"}}},"Basket":{"type":"object","properties":{"id":{"type":"string"}}}}}}"##,
-        declared: &["my.store", "Basket Checked Out"],
     },
-    // Declares both at a draft-04 document's own root, and one of its name's tokens
-    // (`root`) occurs in what it declares while the whole hyphenated name does not.
+    // Declares both at a draft-04 document's own root.
     Row {
         name: "root-declared",
         schema_type: "JSONSchemaDraft4",
         content: r##"{"$schema":"http://json-schema.org/draft-04/schema#","title":"Rooted","x-amazon-events-source":"my.root","x-amazon-events-detail-type":"Root Declared","type":"object"}"##,
-        declared: &["my.root", "Root Declared"],
     },
     // Declares a source only.
     Row {
         name: "source-only",
         schema_type: "OpenApi3",
         content: r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Sourced"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-source":"my.sourceonly","properties":{}}}}}"#,
-        declared: &["my.sourceonly"],
     },
     // Declares a detail type only.
     Row {
         name: "detail-only",
         schema_type: "OpenApi3",
         content: r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Detailed"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-detail-type":"Detail Only Here","properties":{}}}}}"#,
-        declared: &["Detail Only Here"],
     },
     // Declares both several levels down, on the component that describes the event
-    // rather than on an envelope: the extensions are a property of a component, wherever
-    // it sits.
+    // rather than on an envelope.
     Row {
         name: "deeply-nested",
         schema_type: "OpenApi3",
         content: r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Nested"},"paths":{},"components":{"schemas":{"Outer":{"type":"object","properties":{"inner":{"type":"object","properties":{"event":{"type":"object","x-amazon-events-source":"my.nestedsource","x-amazon-events-detail-type":"Buried Event"}}}}}}}}"#,
-        declared: &["my.nestedsource", "Buried Event"],
     },
     // Declares NO event: a document a caller wrote by hand, under a generated name —
-    // the shape the recorded search was answered empty for.
+    // the recorded shape, whose unique property name is what the caller searches for.
     Row {
         name: "fruit-apple-7f3a1c",
         schema_type: "OpenApi3",
         content: r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Fruit apple"},"paths":{},"components":{"schemas":{"Fruit":{"type":"object","properties":{"apple":{"type":"string"}}}}}}"#,
-        declared: &[],
     },
-    // A draft-04 document that declares no event either, whose text carries words no
-    // keyword may reach.
+    // A draft-04 document that declares no event either, whose title and property name
+    // are words no other row carries.
     Row {
         name: "plain-draft4",
         schema_type: "JSONSchemaDraft4",
         content: r##"{"$schema":"http://json-schema.org/draft-04/schema#","title":"Widget Ledger","type":"object","properties":{"total":{"type":"number"}}}"##,
-        declared: &[],
     },
 ];
 
@@ -139,12 +125,16 @@ async fn create(emulator: &Emulator, registry: &str, name: &str, schema_type: &s
     );
 }
 
-/// Create `REGISTRY` and every row of [`ROWS`] in it.
+/// Create `REGISTRY` and every row of [`ROWS`] in it, and wait until the registry's
+/// keyword index has caught up with them — what these cases assert is WHAT the index
+/// holds; the catch-up itself is
+/// `tests/all/schema_version_and_export_sequences.rs`'s case.
 async fn seed(emulator: &Emulator) {
     create_registry(emulator, REGISTRY).await;
     for row in ROWS {
         create(emulator, REGISTRY, row.name, row.schema_type, row.content).await;
     }
+    wait_for_keyword_index();
 }
 
 /// The schema names a search for `keywords` reports, asserting it answered 200.
@@ -165,11 +155,12 @@ async fn searched(emulator: &Emulator, keywords: &str) -> Vec<String> {
     schema_names(&answer)
 }
 
-/// RULE: a keyword selects a schema only through the event its document declares; a
-/// keyword that occurs only in a schema's name, or only elsewhere in its document's
-/// text, selects nothing.
+/// RULE: a keyword selects exactly the schemas it occurs in — in the name, anywhere in
+/// the stored document's text (an EventBridge extension value, a title, a component or
+/// property name, the document's own vocabulary) — and a keyword occurring in none of
+/// them selects nothing.
 #[tokio::test]
-async fn only_a_declared_event_is_keyword_indexed() {
+async fn a_keyword_selects_the_schemas_it_occurs_in() {
     let emulator = Emulator::new();
     seed(&emulator).await;
 
@@ -195,8 +186,8 @@ async fn only_a_declared_event_is_keyword_indexed() {
         // Case is folded on both sides.
         ("MY.STORE", vec!["catalog-orders-v3"]),
         ("BaSkEt", vec!["catalog-orders-v3"]),
-        // A keyword two rows declare reaches both; adding one only the first declares
-        // narrows it to that row.
+        // A keyword several rows carry reaches each of them; adding one only the first
+        // carries narrows it to that row.
         (
             "my.",
             vec![
@@ -207,36 +198,52 @@ async fn only_a_declared_event_is_keyword_indexed() {
             ],
         ),
         ("my. store", vec!["catalog-orders-v3"]),
-        // A keyword nothing declares selects nothing, even where it is a whole stored
-        // NAME or one of its tokens.
-        ("catalog-orders-v3", vec![]),
-        ("catalog", vec![]),
-        ("orders", vec![]),
-        ("v3", vec![]),
-        ("fruit-apple-7f3a1c", vec![]),
-        ("fruit", vec![]),
-        ("apple", vec![]),
-        ("7f3a1c", vec![]),
-        ("plain-draft4", vec![]),
-        ("source-only", vec![]),
-        ("detail-only", vec![]),
-        ("deeply-nested", vec![]),
-        ("root-declared", vec![]),
-        // Nor when it occurs only elsewhere in a document's text: a title, a component
-        // name, a property name, the document's own vocabulary.
-        ("widget", vec![]),
-        ("ledger", vec![]),
-        ("detailed", vec![]),
-        ("openapi", vec![]),
-        ("3.0.0", vec![]),
-        ("properties", vec![]),
-        ("outer", vec![]),
-        ("total", vec![]),
-        ("json-schema.org", vec![]),
+        // A schema's NAME, whole and in part: a caller knows the schema by it, so a
+        // keyword drawn from it selects the schema.
+        ("catalog-orders-v3", vec!["catalog-orders-v3"]),
+        ("catalog", vec!["catalog-orders-v3"]),
+        ("orders", vec!["catalog-orders-v3"]),
+        ("v3", vec!["catalog-orders-v3"]),
+        ("fruit-apple-7f3a1c", vec!["fruit-apple-7f3a1c"]),
+        ("7f3a1c", vec!["fruit-apple-7f3a1c"]),
+        ("plain-draft4", vec!["plain-draft4"]),
+        ("source-only", vec!["source-only"]),
+        ("deeply-nested", vec!["deeply-nested"]),
+        ("root-declared", vec!["root-declared"]),
+        // Anything else the document's text states: a property name (the recorded
+        // case), a component name, a title, the document's own vocabulary.
+        ("apple", vec!["fruit-apple-7f3a1c"]),
+        ("fruit", vec!["fruit-apple-7f3a1c"]),
+        ("widget", vec!["plain-draft4"]),
+        ("ledger", vec!["plain-draft4"]),
+        ("total", vec!["plain-draft4"]),
+        ("detailed", vec!["detail-only"]),
+        ("outer", vec!["deeply-nested"]),
+        ("json-schema.org", vec!["plain-draft4", "root-declared"]),
+        (
+            "openapi",
+            vec![
+                "catalog-orders-v3",
+                "deeply-nested",
+                "detail-only",
+                "fruit-apple-7f3a1c",
+                "source-only",
+            ],
+        ),
+        (
+            "3.0.0",
+            vec![
+                "catalog-orders-v3",
+                "deeply-nested",
+                "detail-only",
+                "fruit-apple-7f3a1c",
+                "source-only",
+            ],
+        ),
         // And a keyword that appears nowhere at all.
-        ("nothing-declares-this", vec![]),
-        // A value carrying no keyword limits nothing, so it reports the registry — the
-        // rows no keyword selects included.
+        ("nothing-carries-this", vec![]),
+        ("my.store widget", vec![]),
+        // A value carrying no keyword limits nothing, so it reports the registry.
         ("", everything.clone()),
         ("  ", everything.clone()),
         (",, ,", everything.clone()),
@@ -251,9 +258,9 @@ async fn only_a_declared_event_is_keyword_indexed() {
 
 /// RULE (the same rule as a property of every stored row): a keyword drawn from a
 /// schema's NAME — the whole name, or any of the words punctuation splits it into —
-/// selects that schema only when the word also occurs in what its document declares.
+/// selects that schema.
 #[tokio::test]
-async fn a_name_is_not_an_index_entry() {
+async fn a_name_is_an_index_entry() {
     let emulator = Emulator::new();
     seed(&emulator).await;
 
@@ -266,48 +273,41 @@ async fn a_name_is_not_an_index_entry() {
                 .map(str::to_string),
         );
         for keyword in candidates {
-            let folded = keyword.to_lowercase();
-            // The word may legitimately select the row by occurring in a value the
-            // document DECLARES (`root-declared` declares `my.root`, so `root` does).
-            let declared = row
-                .declared
-                .iter()
-                .any(|value| value.to_lowercase().contains(&folded));
             let found = searched(&emulator, &keyword).await;
-            assert_eq!(
+            assert!(
                 found.contains(&row.name.to_string()),
-                declared,
-                "case {:?} keyword {keyword:?}: a name is not an index entry, so it may \
-                 select the schema only through its declared {:?}, got {found:?}",
-                row.name,
-                row.declared
+                "case {:?} keyword {keyword:?}: a word of a schema's name must select it, \
+                 got {found:?}",
+                row.name
             );
         }
     }
 }
 
-/// RULE: a schema no keyword selects is still THERE — a search naming no keyword
-/// reports it and `DescribeSchema` serves it under its name. This is the recorded
-/// shape: a hand-written document created in a caller's own registry, searched for by
-/// words of its own name, is answered with an EMPTY result set.
+/// RULE (the recorded shape): a document a caller wrote by hand, created in a registry
+/// of their own, is found by a word of its content and by its own name — and is read
+/// back under that name with the bytes the create stored.
 #[tokio::test]
-async fn a_schema_declaring_no_event_is_searchable_by_nothing_but_still_readable() {
+async fn a_schema_a_caller_wrote_is_searchable_by_its_content_and_its_name() {
     let emulator = Emulator::new();
     let registry = "probe-registry-8c21";
     let schema = "probe-schemas-apple-8c21";
-    let content = r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Probe"},"paths":{},"components":{"schemas":{"Probe":{"type":"object","properties":{"apple":{"type":"string"}}}}}}"#;
+    let content = r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Probe"},"paths":{},"components":{"schemas":{"Probe":{"type":"object","properties":{"quokka":{"type":"string"}}}}}}"#;
     create_registry(&emulator, registry).await;
     create(&emulator, registry, schema, "OpenApi3", content).await;
+    wait_for_keyword_index();
 
-    // Every word of the names the request names, and the names themselves: none of
-    // them is something the registry indexes this schema under.
+    // Rows: a property name only the document carries, its title, the schema's own
+    // name, words of that name, and two of them at once.
     for keywords in [
-        "apple",
+        "quokka",
+        "QUOKKA",
         "probe",
-        "schemas",
+        "apple",
         "8c21",
         "probe-schemas-apple-8c21",
         "probe schemas apple",
+        "quokka probe",
     ] {
         let answer = emulator
             .call("GET", &search_uri(registry, keywords), None)
@@ -318,23 +318,28 @@ async fn a_schema_declaring_no_event_is_searchable_by_nothing_but_still_readable
             answer.status, answer.body
         );
         let found = schema_names(&answer);
+        assert_eq!(
+            found,
+            vec![schema.to_string()],
+            "case {keywords:?}: expected the stored schema, got {found:?}"
+        );
+    }
+
+    // A keyword nothing about it carries selects nothing, so the search still
+    // discriminates.
+    for keywords in ["wombat", "quokka wombat"] {
+        let found = schema_names(
+            &emulator
+                .call("GET", &search_uri(registry, keywords), None)
+                .await,
+        );
         assert!(
             found.is_empty(),
             "case {keywords:?}: expected an empty result set, got {found:?}"
         );
     }
 
-    // It is in the registry all the same: the search that limits nothing reports it,
-    // and the reader serves the document the create stored.
-    let unlimited = emulator
-        .call("GET", &search_uri(registry, ""), None)
-        .await;
-    assert_eq!(
-        schema_names(&unlimited),
-        vec![schema.to_string()],
-        "a search naming no keyword must report the stored schema, got {:?}",
-        unlimited.body
-    );
+    // And the reader serves the document the create stored.
     let described = emulator
         .call("GET", &schema_uri(registry, schema), None)
         .await;
@@ -352,9 +357,9 @@ async fn a_schema_declaring_no_event_is_searchable_by_nothing_but_still_readable
 }
 
 /// RULE: the index covers every version this service holds for a schema, so a version
-/// that declares another event adds that event's keywords without dropping the first's.
+/// whose document states something new adds those words without dropping the first's.
 #[tokio::test]
-async fn a_later_version_adds_its_declared_event_to_the_index() {
+async fn a_later_version_adds_its_text_to_the_index() {
     let emulator = Emulator::new();
     let registry = "versioned-index";
     let schema = "evolving";
@@ -367,6 +372,7 @@ async fn a_later_version_adds_its_declared_event_to_the_index() {
         r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"First"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-source":"my.firstsource","x-amazon-events-detail-type":"First Event","properties":{}}}}}"#,
     )
     .await;
+    wait_for_keyword_index();
 
     assert_eq!(
         searched_in(&emulator, registry, "my.firstsource").await,
@@ -377,7 +383,7 @@ async fn a_later_version_adds_its_declared_event_to_the_index() {
         searched_in(&emulator, registry, "my.secondsource")
             .await
             .is_empty(),
-        "nothing declares the second source yet"
+        "nothing states the second source yet"
     );
 
     let updated = emulator
@@ -395,14 +401,15 @@ async fn a_later_version_adds_its_declared_event_to_the_index() {
         "expected 200 from UpdateSchema, got {} {:?}",
         updated.status, updated.body
     );
+    wait_for_keyword_index();
 
-    // Both versions are held, so the schema is found under either event.
+    // Both versions are held, so the schema is found under either one's text.
     for keywords in ["my.firstsource", "first event", "my.secondsource", "second"] {
         let found = searched_in(&emulator, registry, keywords).await;
         assert_eq!(
             found,
             vec![schema.to_string()],
-            "case {keywords:?}: every stored version's declared event is indexed, got {found:?}"
+            "case {keywords:?}: every stored version's text is indexed, got {found:?}"
         );
     }
 }

@@ -22,7 +22,9 @@ use service_com_amazonaws_schemas_schemas::state::{
     AWS_MANAGED_REGISTRY, CLOUD_TRAIL_EVENT_FAMILY,
 };
 
-use crate::registry_schema_lifecycle::{create_registry, schema_names, schema_uri, walk, Emulator};
+use crate::registry_schema_lifecycle::{
+    create_registry, schema_names, schema_uri, wait_for_keyword_index, walk, Emulator,
+};
 
 /// The listing of one registry's schemas.
 fn listing_uri(registry: &str) -> String {
@@ -227,7 +229,9 @@ async fn a_search_reports_its_matches_in_the_collated_order() {
     }
 
     // Every created schema declares the same event, so the keyword selects all of them
-    // and what the case observes is the ORDER alone.
+    // and what the case observes is the ORDER alone — once the registry's keyword index
+    // has caught up with the writes, which is what makes the keyword select at all.
+    wait_for_keyword_index();
     let search = format!("{}/search?keywords=my.events", listing_uri(registry));
     for limit in [None, Some(1), Some(3)] {
         let walked = walk(&emulator, &search, limit, schema_names).await;

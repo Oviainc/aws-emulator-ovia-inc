@@ -19,6 +19,9 @@
 //! schema's versions it names and how many digits it has. Every label is sent
 //! percent-encoded byte by byte, so what the handler reads is the spelling the row names
 //! rather than whatever a path segment or a form-decoded query would make of it.
+//! (`ExportSchema` reads the member through the same definition; it is driven over these
+//! spellings in `tests/all/export_reads_the_stored_schema.rs`, against the schemas it can
+//! serve.)
 //!
 //! Every case drives the real wire path: a signed `restJson1` request through
 //! `MultiServiceRouter::dispatch`, exactly as the production router serves it. The HTTP
@@ -84,8 +87,6 @@ const NAMES_A_VERSION: [&str; 3] = ["1", "5", "10"];
 enum VersionedCall {
     /// `DescribeSchema`: the version in the `schemaVersion` query member.
     DescribeSchema,
-    /// `ExportSchema`: the version in the `schemaVersion` query member.
-    ExportSchema,
     /// `PutCodeBinding`: the version in the `schemaVersion` query member.
     PutCodeBinding,
     /// `DescribeCodeBinding`: the version in the `schemaVersion` query member.
@@ -97,10 +98,9 @@ enum VersionedCall {
 
 impl VersionedCall {
     /// Every row of the table.
-    fn all() -> [Self; 5] {
+    fn all() -> [Self; 4] {
         [
             Self::DescribeSchema,
-            Self::ExportSchema,
             Self::PutCodeBinding,
             Self::DescribeCodeBinding,
             Self::DeleteSchemaVersion,
@@ -111,7 +111,6 @@ impl VersionedCall {
     fn case(self) -> &'static str {
         match self {
             Self::DescribeSchema => "DescribeSchema",
-            Self::ExportSchema => "ExportSchema",
             Self::PutCodeBinding => "PutCodeBinding",
             Self::DescribeCodeBinding => "DescribeCodeBinding",
             Self::DeleteSchemaVersion => "DeleteSchemaVersion",
@@ -121,7 +120,7 @@ impl VersionedCall {
     /// The status this call answers once the version its label names is there.
     fn served_status(self) -> u16 {
         match self {
-            Self::DescribeSchema | Self::ExportSchema | Self::DescribeCodeBinding => 200,
+            Self::DescribeSchema | Self::DescribeCodeBinding => 200,
             // The put ACCEPTS the generation; it does not finish it.
             Self::PutCodeBinding => 202,
             Self::DeleteSchemaVersion => 204,
@@ -140,15 +139,6 @@ impl VersionedCall {
             Self::DescribeSchema => {
                 emulator
                     .call("GET", &format!("{schema}?schemaVersion={encoded}"), None)
-                    .await
-            }
-            Self::ExportSchema => {
-                emulator
-                    .call(
-                        "GET",
-                        &format!("{schema}/export?type=JSONSchemaDraft4&schemaVersion={encoded}"),
-                        None,
-                    )
                     .await
             }
             Self::PutCodeBinding => {
@@ -179,8 +169,8 @@ impl VersionedCall {
 }
 
 /// The document the `n`th version of the seeded schema is written with: an OpenAPI 3
-/// document with component schemas, so the export row has something to render, titled
-/// per version so each version's content is its own.
+/// document with component schemas, titled per version so each version's content is its
+/// own.
 fn content_of(version: u32) -> String {
     json!({
         "openapi": "3.0.0",
@@ -227,9 +217,9 @@ async fn seed(emulator: &Emulator) -> Vec<String> {
 }
 
 /// The service's one sentence for a version the named schema does not hold, worded with
-/// the label the request sent.
+/// the schema the request named and the label it sent.
 fn no_such_version_sentence(label: &str) -> String {
-    format!("Schema {SCHEMA} in registry {REGISTRY} has no version {label}.")
+    format!("Schema with name {SCHEMA} and version {label} does not exist.")
 }
 
 /// Assert one answer is the 404 `NotFoundException` the version step answers for

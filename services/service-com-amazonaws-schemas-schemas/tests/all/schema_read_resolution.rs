@@ -18,9 +18,10 @@
 //! version is named in the URI path, in a query parameter or not at all, and the status
 //! a served call answers. Every row drives both its refusals and its success, so no row
 //! can pass by refusing everything or by serving everything — and the version step is
-//! driven with a label the schema never minted, with a label that is no version number
-//! at all, and against a schema left holding no version, so a row cannot pass by
-//! resolving the steps out of order either.
+//! driven with a label the schema never minted and with a label that is no version
+//! number at all, so a row cannot pass by resolving the steps out of order either.
+//! (`ExportSchema` makes the same resolution and is driven through it in
+//! `tests/all/export_reads_the_stored_schema.rs`, where the schemas it can serve live.)
 //!
 //! Every case drives the real wire path: a signed `restJson1` request through
 //! `MultiServiceRouter::dispatch`, exactly as the production router serves it. The HTTP
@@ -108,8 +109,6 @@ enum Call {
     ListSchemaVersions,
     /// `DescribeSchema`: all three steps, the version in a query member.
     DescribeSchema,
-    /// `ExportSchema`: all three steps, the version in a query member.
-    ExportSchema,
     /// `DescribeCodeBinding`: all three steps before the binding it reports.
     DescribeCodeBinding,
     /// `PutCodeBinding`: all three steps before the binding it attaches.
@@ -128,7 +127,6 @@ impl Call {
             Self::GetResourcePolicy,
             Self::ListSchemaVersions,
             Self::DescribeSchema,
-            Self::ExportSchema,
             Self::DescribeCodeBinding,
             Self::PutCodeBinding,
             Self::DeleteSchemaVersion,
@@ -144,7 +142,6 @@ impl Call {
             Self::GetResourcePolicy => "GetResourcePolicy",
             Self::ListSchemaVersions => "ListSchemaVersions",
             Self::DescribeSchema => "DescribeSchema",
-            Self::ExportSchema => "ExportSchema",
             Self::DescribeCodeBinding => "DescribeCodeBinding",
             Self::PutCodeBinding => "PutCodeBinding",
             Self::DeleteSchemaVersion => "DeleteSchemaVersion",
@@ -160,7 +157,6 @@ impl Call {
             | Self::GetResourcePolicy => Depth::Registry,
             Self::ListSchemaVersions => Depth::Schema,
             Self::DescribeSchema
-            | Self::ExportSchema
             | Self::DescribeCodeBinding
             | Self::PutCodeBinding
             | Self::DeleteSchemaVersion => Depth::Version,
@@ -173,6 +169,25 @@ impl Call {
         matches!(self, Self::DeleteSchemaVersion)
     }
 
+    /// How many versions this row's schema is seeded with.
+    ///
+    /// One is enough for every read. The DELETE needs two: a schema always holds at
+    /// least one definition, so a delete of the only version a schema holds is refused
+    /// as a conflict and would never reach the resolution this suite is about.
+    fn seeded_versions(self) -> u32 {
+        match self {
+            Self::DeleteSchemaVersion => 2,
+            _ => 1,
+        }
+    }
+
+    /// The version labels this row's seed leaves the schema holding.
+    fn seeded_version_labels(self) -> BTreeSet<String> {
+        (1..=self.seeded_versions())
+            .map(|version| version.to_string())
+            .collect()
+    }
+
     /// The status this row's call answers once the registry, schema and version it
     /// names are all there — the success status of the operation.
     fn served_status(self) -> u16 {
@@ -183,7 +198,6 @@ impl Call {
             | Self::GetResourcePolicy
             | Self::ListSchemaVersions
             | Self::DescribeSchema
-            | Self::ExportSchema
             | Self::DescribeCodeBinding => 200,
             // The put ACCEPTS the generation; it does not finish it.
             Self::PutCodeBinding => 202,
@@ -231,18 +245,6 @@ impl Call {
             Self::DescribeSchema => {
                 emulator
                     .call("GET", &versioned(schema_uri(registry, schema), '?'), None)
-                    .await
-            }
-            Self::ExportSchema => {
-                emulator
-                    .call(
-                        "GET",
-                        &versioned(
-                            format!("{}/export?type=JSONSchemaDraft4", schema_uri(registry, schema)),
-                            '&',
-                        ),
-                        None,
-                    )
                     .await
             }
             Self::DescribeCodeBinding => {
@@ -293,6 +295,23 @@ impl Call {
         create_registry(emulator, REGISTRY).await;
         if self.depth() > Depth::Registry {
             create_schema(emulator, REGISTRY, SCHEMA).await;
+            for round in 2..=self.seeded_versions() {
+                let updated = emulator
+                    .call(
+                        "PUT",
+                        &schema_uri(REGISTRY, SCHEMA),
+                        Some(json!({"Content": schema_document(), "Type": "OpenApi3"})),
+                    )
+                    .await;
+                assert_eq!(
+                    updated.status,
+                    200,
+                    "case {:?}: seeding version {round} must succeed, got {} {:?}",
+                    self.case(),
+                    updated.status,
+                    updated.body
+                );
+            }
         }
         match self {
             Self::GetResourcePolicy => {
@@ -357,11 +376,13 @@ fn no_such_schema_sentence(schema: &str) -> String {
 }
 
 /// The service's one sentence for a version the named schema does not hold: the
-/// request's label when it named one, and the schema holding none when it did not.
-fn no_such_version_sentence(registry: &str, schema: &str, requested: Option<&str>) -> String {
+/// request's `SchemaName` and the label it named, and the sentence for the schema itself
+/// where it named no version at all (a schema holding none is a resource no request can
+/// produce, so no case below reaches that branch).
+fn no_such_version_sentence(schema: &str, requested: Option<&str>) -> String {
     match requested {
-        Some(version) => format!("Schema {schema} in registry {registry} has no version {version}."),
-        None => format!("Schema {schema} in registry {registry} has no versions."),
+        Some(version) => format!("Schema with name {schema} and version {version} does not exist."),
+        None => no_such_schema_sentence(schema),
     }
 }
 
@@ -465,38 +486,42 @@ async fn every_read_that_names_a_schema_resolves_the_path_the_same_way() {
                 assert_not_found(
                     &missing_version,
                     &label,
-                    &no_such_version_sentence(REGISTRY, SCHEMA, Some(unheld)),
+                    &no_such_version_sentence(SCHEMA, Some(unheld)),
                 );
-                // The refusal changed nothing: the schema still holds the version it
+                // The refusal changed nothing: the schema still holds the versions it
                 // was seeded with.
                 let held = held_versions(&emulator, &label).await;
                 assert_eq!(
                     held,
-                    BTreeSet::from([FIRST_VERSION.to_string()]),
+                    call.seeded_version_labels(),
                     "case {label:?}: the refused call must leave the schema's versions \
                      alone, got {held:?}"
                 );
             }
 
             if !call.version_required() {
-                // The same step, reached with NO version named: a schema left holding
-                // none has no latest version to answer with either.
+                // The same step, reached with NO version named: there is no such case to
+                // reach, because a schema always holds a definition — the delete of the
+                // only version a schema holds is refused rather than leaving one behind.
                 let emulator = Emulator::new();
                 call.seed(&emulator).await;
-                let label = format!("{case}/schema-left-with-no-version");
-                let deleted = Call::DeleteSchemaVersion
+                let label = format!("{case}/schema-cannot-be-left-with-no-version");
+                let refused = Call::DeleteSchemaVersion
                     .send(&emulator, REGISTRY, SCHEMA, Some(FIRST_VERSION))
                     .await;
                 assert_eq!(
-                    deleted.status, 204,
-                    "case {label:?}: deleting the only version must succeed, got {} {:?}",
-                    deleted.status, deleted.body
+                    refused.status, 409,
+                    "case {label:?}: deleting the only version must be refused, got {} {:?}",
+                    refused.status, refused.body
                 );
-                let no_versions = call.send(&emulator, REGISTRY, SCHEMA, None).await;
-                assert_not_found(
-                    &no_versions,
-                    &label,
-                    &no_such_version_sentence(REGISTRY, SCHEMA, None),
+                let still_served = call.send(&emulator, REGISTRY, SCHEMA, None).await;
+                assert_eq!(
+                    still_served.status,
+                    call.served_status(),
+                    "case {label:?}: the schema still holds its definition, so the call is \
+                     served; got {} {:?}",
+                    still_served.status,
+                    still_served.body
                 );
             }
         }

@@ -21,7 +21,8 @@
 use serde_json::{json, Value};
 
 use super::registry_schema_lifecycle::{
-    create_registry, registry_names, schema_names, schema_uri, walk, Answer, Emulator,
+    create_registry, registry_names, schema_names, schema_uri, wait_for_keyword_index, walk,
+    Answer, Emulator,
 };
 
 /// The registry the search cases below page over.
@@ -108,7 +109,9 @@ fn search_uri(registry: &str, keywords: &str) -> String {
     )
 }
 
-/// Create `REGISTRY` and every row of [`STORED`] in it.
+/// Create `REGISTRY` and every row of [`STORED`] in it, and wait until the registry's
+/// keyword index has caught up with them: these cases are about the TOKENS a search
+/// mints, so they start from a search that has a selection to page.
 async fn seed(emulator: &Emulator) {
     create_registry(emulator, REGISTRY).await;
     for (name, source, detail_type) in STORED {
@@ -137,6 +140,7 @@ async fn seed(emulator: &Emulator) {
             created.status, created.body
         );
     }
+    wait_for_keyword_index();
 }
 
 /// The `NextToken` a first page of one item hands back.

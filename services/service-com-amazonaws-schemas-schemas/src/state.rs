@@ -257,7 +257,6 @@ impl ComAmazonawsSchemasSchemasState {
         let (registry, schema) = self.readable_schema(registry_name, schema_name)?;
         let version = schema.version_for(requested).ok_or_else(|| {
             ReadResolutionError::NoSuchSchemaVersion {
-                registry: registry_name.to_string(),
                 schema: schema_name.to_string(),
                 requested: requested.map(str::to_string),
             }
@@ -1512,6 +1511,26 @@ impl Schema {
         self.minted_by_token.retain(|_, minted| *minted != version);
         self.modified_at(now);
         true
+    }
+
+    /// Whether `requested` NAMES a version this schema still holds, resolving the label
+    /// exactly as [`Schema::version_for`] resolves it for a read — so a value that is no
+    /// rendering of a version number names none.
+    ///
+    /// What a delete asks before it removes anything: a label naming no stored version
+    /// is refused as not found, and only a label that does name one can be the schema's
+    /// last definition.
+    pub fn holds_version_named(&self, requested: &str) -> bool {
+        Self::version_number(requested).is_some_and(|version| self.versions.contains_key(&version))
+    }
+
+    /// How many definitions this schema still holds.
+    ///
+    /// A schema holds at least one at every instant a request can observe it: the delete
+    /// of a schema's last version is refused ([`cannot_delete_every_version`]), so only
+    /// deleting the schema itself takes its final definition.
+    pub fn stored_version_count(&self) -> usize {
+        self.versions.len()
     }
 
     /// Remove the version a request's `SchemaVersion` label NAMES, resolving the
@@ -2814,8 +2833,8 @@ pub struct ManagedSchema {
 ///
 /// A published document describes the event's `detail` and states the event's identity
 /// nowhere in its text (see [`event_schema_document`]), so the identity is held beside
-/// the document — it is what `SearchSchemas` indexes a published schema under, the same
-/// two values a document a caller wrote declares as its own event keywords.
+/// the document — it is what `SearchSchemas` indexes a published schema under beside its
+/// name and the text of its definitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedEvent {
     /// The event source that publishes it: `aws.<service>`.
@@ -3287,6 +3306,64 @@ pub fn unsupported_schema_type() -> BadRequestException {
     bad_request(format!("Type must be one of {}.", TYPE_VALUES.join(", ")))
 }
 
+/// The request parameter an export's target language arrives in, as the service's own
+/// refusal of a bad value names it.
+///
+/// Source: the model binds `ExportSchema`'s `Type` to `@httpQuery("type")`
+/// (`smithy_query(query="operation",operation="ExportSchema")`), and a value constraint
+/// is reported against the member as the request spells it.
+pub const EXPORT_TYPE_PARAMETER: &str = "type";
+
+/// The languages an export can be rendered INTO: JSON Schema draft 4 and nothing else.
+///
+/// Narrower than [`SchemaType::ALL`], which is the set of languages a schema may be
+/// STORED as: `ExportSchema`'s `Type` names the export TARGET, and the service produces
+/// one kind of export — a schema asked for in the language it is already stored in is
+/// not an export of it, it is a read.
+pub const EXPORT_TARGETS: &[SchemaType] = &[SchemaType::JsonSchemaDraft4];
+
+/// The export target a request's `Type` names, or the refusal of a value that names
+/// none.
+///
+/// Separate from [`SchemaType::from_modeled`], the service-wide set of schema
+/// languages: a value that is a language this service stores is still refused here
+/// unless it is also a language an export is rendered into.
+pub fn export_target(requested: &str) -> Result<SchemaType, BadRequestException> {
+    EXPORT_TARGETS
+        .iter()
+        .copied()
+        .find(|target| target.as_wire() == requested)
+        .ok_or_else(|| not_an_export_target(requested))
+}
+
+/// Refuse a `Type` that names no export target ([`EXPORT_TARGETS`]).
+///
+/// Worded the way this service reports a member whose value is outside the set the
+/// member admits: the number of values that failed, the value itself as the request
+/// sent it, the member it was checked at, and the set it must come from.
+pub fn not_an_export_target(requested: &str) -> BadRequestException {
+    let admitted: Vec<&str> = EXPORT_TARGETS
+        .iter()
+        .map(|target| target.as_wire())
+        .collect();
+    bad_request(format!(
+        "1 validation error detected: Value '{requested}' at '{EXPORT_TYPE_PARAMETER}' failed \
+         to satisfy constraint: Member must satisfy enum value set: [{}]",
+        admitted.join(", ")
+    ))
+}
+
+/// Refuse an `ExportSchema` of a schema the service did not write itself.
+///
+/// An export is served only for a schema whose definition the SERVICE authored — one
+/// AWS publishes, or one schema discovery wrote — because the export is the service's
+/// own rendering of its own document; a definition a caller wrote is served back as the
+/// caller wrote it ([`crate::ops::describe_schema`]) and is not exported. The sentence
+/// is entirely fixed text: it names no request member.
+pub fn schema_is_not_exportable() -> ForbiddenException {
+    forbidden("You cannot export non discovered or non aws managed schemas.")
+}
+
 /// The constraint this service holds one of its caller-supplied resource NAMES to:
 /// the parameter a refusal names it by, the characters an acceptable name is built
 /// from, and the longest name the service accepts.
@@ -3623,7 +3700,6 @@ pub enum ReadResolutionError {
     /// The schema the request named holds no such version — including a `SchemaVersion`
     /// that names no version at all, and a schema left holding none.
     NoSuchSchemaVersion {
-        registry: String,
         schema: String,
         /// The request's `SchemaVersion`, absent where the request named none and the
         /// schema holds no version to answer as its latest.
@@ -3642,11 +3718,9 @@ impl ReadResolutionError {
         match self {
             Self::NoSuchRegistry(registry) => registry_not_found(registry),
             Self::NoSuchSchema(schema) => schema_not_found(schema),
-            Self::NoSuchSchemaVersion {
-                registry,
-                schema,
-                requested,
-            } => schema_version_not_found(registry, schema, requested.as_deref()),
+            Self::NoSuchSchemaVersion { schema, requested } => {
+                schema_version_not_found(schema, requested.as_deref())
+            }
         }
     }
 }
@@ -4041,6 +4115,33 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// published AWS limit, and is set high enough that no ordinary search meets it.
 pub const MAX_KEYWORDS_PER_SEARCH: usize = 10;
 
+/// How long after a definition is written it is reachable through the registry's
+/// KEYWORD INDEX.
+///
+/// `SearchSchemas` searches an index, and an index catches up with a write rather than
+/// being part of it: a search made straight after a `CreateSchema` reports nothing for
+/// the schema it just stored, and a later search reports it — which is why a client
+/// polls. AWS publishes no duration for that catch-up, so this span is the emulator's
+/// own choice. It is deliberately NOT zero, so a caller searching immediately after a
+/// write observes the same transient absence the real service shows, and it is short
+/// enough that a client polling for its schema finds it on an early poll.
+///
+/// Nothing waits for it and nothing writes it: a definition carries the instant it was
+/// written ([`SchemaVersion::created_date`]), so whether it is in the index is DERIVED
+/// at search time ([`is_keyword_indexed`]).
+pub const SCHEMA_INDEXING_DELAY: Duration = Duration::from_secs(3);
+
+/// Whether a definition written at `written` is in the registry's keyword index as of
+/// `now` — [`SCHEMA_INDEXING_DELAY`] after it was written.
+///
+/// An instant so far in the future that the span cannot be added to it is one no clock
+/// reading can be past, so such a definition is not indexed yet.
+pub fn is_keyword_indexed(written: SystemTime, now: SystemTime) -> bool {
+    written
+        .checked_add(SCHEMA_INDEXING_DELAY)
+        .is_some_and(|due| now >= due)
+}
+
 /// The most named schemas one inferred document may carry — one per object position
 /// the sample shows, plus the root.
 ///
@@ -4424,15 +4525,37 @@ pub fn managed_registry_is_read_only(registry: &str) -> ForbiddenException {
 
 /// Message for a version the named schema does not hold — including a `SchemaVersion`
 /// that is not a version number at all.
-pub fn schema_version_not_found(registry: &str, schema: &str, requested: Option<&str>) -> NotFoundException {
+///
+/// The template is the service's own for a missing schema version, built from the
+/// request's `SchemaName` and `SchemaVersion` and from those two members ALONE: the
+/// registry holding the schema is no part of the sentence, the way
+/// [`schema_not_found`] and [`schema_already_exists`] keep it out of theirs.
+///
+/// `requested` is absent only where the request named no version AND the schema holds
+/// none to answer as its latest — a schema with no definition at all, which no request
+/// can produce (a delete of a schema's last version is refused:
+/// [`cannot_delete_every_version`]) — so that case answers the sentence for the schema
+/// itself rather than inventing a second template for a resource this service cannot
+/// hold.
+pub fn schema_version_not_found(schema: &str, requested: Option<&str>) -> NotFoundException {
     match requested {
         Some(version) => not_found(format!(
-            "Schema {schema} in registry {registry} has no version {version}."
+            "Schema with name {schema} and version {version} does not exist."
         )),
-        None => not_found(format!(
-            "Schema {schema} in registry {registry} has no versions."
-        )),
+        None => schema_not_found(schema),
     }
+}
+
+/// Refuse a `DeleteSchemaVersion` that would take a schema's LAST definition.
+///
+/// A schema always holds at least one definition, so the operation that removes one
+/// version cannot be the one that empties it; the sentence names no request member —
+/// the service's wording for this refusal is entirely fixed text — and points the
+/// caller at the operation that does remove a schema with all of its versions.
+pub fn cannot_delete_every_version() -> ConflictException {
+    conflict(
+        "Cannot delete all versions of a Schema. To delete a Schema use the DeleteSchema API.",
+    )
 }
 
 /// Message for a code binding nobody has started for this schema version and

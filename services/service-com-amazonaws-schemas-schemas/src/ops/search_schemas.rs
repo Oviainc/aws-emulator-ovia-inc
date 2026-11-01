@@ -9,26 +9,24 @@
 //!
 //! `Keywords` LIMITS the registry's schemas — "specifying this limits the results to
 //! only schemas that include the provided keywords" — so the base set a search reports
-//! is every schema of the named registry, and each keyword only narrows it. What a
-//! schema is indexed under is the EVENT IT DESCRIBES: the event `source` and
-//! `detail-type`. A document a caller wrote declares them itself, which an EventBridge
-//! schema records in the `x-amazon-events-source` / `x-amazon-events-detail-type`
-//! extensions of its event component; a schema the service PUBLISHES states them
-//! nowhere in its document (that document describes the event's `detail` and nothing
-//! around it), so the identity the catalogue publishes it under is read from the store
-//! instead (see [`crate::state::Schema::published_event`]).
+//! is every schema of the named registry, and each keyword only narrows it. A keyword
+//! narrows it by OCCURRING IN the schema: its name, and the text of every definition the
+//! service holds for it. A schema the service PUBLISHES also carries the event identity
+//! the catalogue indexes it under, which its document states nowhere (that document
+//! describes the event's `detail` and nothing around it), so that identity is read from
+//! the store too (see [`crate::state::Schema::published_event`]).
 //!
-//! A schema's NAME is not an index entry, and neither is the rest of its document text:
-//! a search is a search of the registry's EVENT index, not a lookup by name and not a
-//! grep of the stored documents. So a schema that declares no event — a document a
-//! caller wrote by hand and created in a registry of their own — is indexed under
-//! NOTHING, and no keyword selects it, however much of its name a keyword happens to
-//! occur in. Such a schema is still reported by a search that names no keyword, still
-//! listed by `ListSchemas`, and still read by `DescribeSchema` under its name: it is
-//! addressable, just not keyword-searchable.
+//! A keyword is matched against an INDEX, and an index catches up with a write rather
+//! than being part of it: a definition is reachable by keyword a short span after it was
+//! written ([`crate::state::SCHEMA_INDEXING_DELAY`]), so a search made straight after a
+//! create reports nothing for the schema it just stored, and nothing of a schema is
+//! indexed until its first definition is. The catch-up is DERIVED from the instant each
+//! definition was written, so no request waits for it and this read writes nothing.
 //!
-//! A `Keywords` value that carries no keyword at all limits nothing, so the search
-//! reports the whole registry.
+//! Matching is case-insensitive and by substring, because a search is not a lookup by
+//! exact value and adding a keyword only ever narrows the result. A `Keywords` value that
+//! carries no keyword at all limits nothing, so the search reports the whole registry —
+//! it consults no index, and so waits for none.
 //!
 //! ## Shape of an operation
 //!
@@ -252,8 +250,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // ONE clock reading for the whole call: the instant this search is served, so
-        // the token this page mints says when it was issued and the one this request
-        // presented is aged against the same instant.
+        // the token this page mints says when it was issued, the one this request
+        // presented is aged against the same instant, and every schema's index entries
+        // are decided as of one moment.
         let now = ::std::time::SystemTime::now();
 
         // The schemas are COLLATED first — a search of a registry reports its matches
@@ -265,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let collated = crate::state::in_schema_name_order(registry.schemas.iter());
         let matching = collated
             .into_iter()
-            .filter(|(_, schema)| matches_every_keyword(schema, &keywords));
+            .filter(|(_, schema)| matches_every_keyword(schema, &keywords, now));
         let page = crate::state::page_by_key(
             matching,
             &selection,
@@ -343,98 +342,75 @@ fn canonical_keywords(keywords: &[String]) -> String {
     canonical.join(",")
 }
 
-/// Whether `keywords` match a schema.
+/// Whether `keywords` match a schema as of `now`.
 ///
 /// A schema is selected when EVERY requested keyword occurs in one of the values the
-/// schema is INDEXED under — the event keywords it carries
-/// ([`declared_event_keywords`]), and nothing else — matched case-insensitively as a
-/// substring, because a search is not a lookup by exact value and adding a keyword only
-/// ever narrows the result.
-///
-/// The schema's NAME is deliberately not one of those values. A name is how every OTHER
-/// operation of this service addresses a schema — `DescribeSchema` takes it, a listing
-/// reports it, `ListSchemas`'s `SchemaNamePrefix` filters on it — not a term the
-/// registry's keyword index holds, so a keyword occurring in a name selects nothing by
-/// itself, and a schema whose document declares no event is indexed under no value at
-/// all, so every keyword fails against it. A request that names NO keyword limits
+/// schema is INDEXED under as of that instant ([`indexed_values`]), matched
+/// case-insensitively as a substring, because a search is not a lookup by exact value and
+/// adding a keyword only ever narrows the result. A request that names NO keyword limits
 /// nothing, so it selects every schema, which is also what folding over an empty keyword
 /// list says.
-fn matches_every_keyword(schema: &crate::state::Schema, keywords: &[String]) -> bool {
+fn matches_every_keyword(
+    schema: &crate::state::Schema,
+    keywords: &[String],
+    now: ::std::time::SystemTime,
+) -> bool {
     // Answering "no keyword narrows nothing" before the index is built keeps an
-    // unlimited search from parsing any stored document.
+    // unlimited search from reading any stored document — and such a search consults no
+    // index, so it does not wait for one either.
     if keywords.is_empty() {
         return true;
     }
-    let indexed = declared_event_keywords(schema);
+    let indexed = indexed_values(schema, now);
     keywords
         .iter()
         .all(|keyword| indexed.iter().any(|value| value.contains(keyword.as_str())))
 }
 
-/// The event keywords a schema is indexed under, folded to lower case: the event
-/// `source` and `detail-type` the schema records, which is what the registry indexes a
-/// schema under.
+/// The values a keyword can occur in for a schema to match as of `now`, folded to lower
+/// case: what the registry indexes the schema under.
 ///
-/// A document a caller wrote records them as the `x-amazon-events-source` and
-/// `x-amazon-events-detail-type` extensions of its event component. They are read from
-/// the stored document of EVERY version this service holds for the schema and wherever
-/// in the document they sit — the extensions are a property of a component, and which
-/// component is the event one differs between a discovered document and a converted one
-/// — so a schema whose later version declares another source is found under both.
-/// A PUBLISHED schema states its event nowhere in its document's text (the catalogue
-/// publishes the event's `detail` and nothing about the envelope it arrives in), so its
-/// identity is read from where the store holds it:
-/// [`crate::state::Schema::published_event`]. Folded ONCE per schema here rather than
-/// once per keyword at the match. A document that is not JSON declares nothing: the
-/// content of a stored version is whatever `CreateSchema` accepted for the type it was
-/// created as.
-fn declared_event_keywords(schema: &crate::state::Schema) -> Vec<String> {
-    let mut declared: Vec<String> = Vec::new();
+/// * the TEXT of every definition the index has caught up with
+///   ([`crate::state::is_keyword_indexed`], read from the instant that definition was
+///   written), so a keyword naming anything the document states — the event source and
+///   detail type an EventBridge document records in its `x-amazon-events-*` extensions, a
+///   title, a component, a property — finds it, and a schema whose later version states
+///   something new is found under that too once that version is indexed;
+/// * the schema's NAME — the text a caller knows it by, so a keyword drawn from it finds
+///   the schema it names;
+/// * the event identity of a PUBLISHED schema, which its document's text does not state
+///   (the catalogue publishes the event's `detail` and nothing about the envelope it
+///   arrives in), read from where the store holds it:
+///   [`crate::state::Schema::published_event`].
+///
+/// EMPTY until the index has caught up with a definition of this schema: the schema's own
+/// name and identity are index entries of the same index, so a schema nothing of which is
+/// indexed yet is selected by no keyword at all. Folded ONCE per schema here rather than
+/// once per keyword at the match.
+fn indexed_values(
+    schema: &crate::state::Schema,
+    now: ::std::time::SystemTime,
+) -> Vec<String> {
+    let documents: Vec<&String> = schema
+        .versions
+        .values()
+        .filter(|version| crate::state::is_keyword_indexed(version.created_date, now))
+        .map(|version| &version.content)
+        .collect();
+    if documents.is_empty() {
+        return Vec::new();
+    }
+    let mut indexed: Vec<String> = Vec::with_capacity(documents.len() + 3);
+    indexed.push(schema.name.to_lowercase());
     if let Some(published) = &schema.published_event {
-        declared.push(published.source.to_lowercase());
-        declared.push(published.detail_type.to_lowercase());
+        indexed.push(published.source.to_lowercase());
+        indexed.push(published.detail_type.to_lowercase());
     }
-    for version in schema.versions.values() {
-        let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(&version.content) else {
-            continue;
-        };
-        collect_event_keywords(&document, &mut declared);
+    for document in documents {
+        indexed.push(document.to_lowercase());
     }
-    declared
+    indexed
 }
-
-/// Collect every event keyword `document` declares, at any depth, folded to lower case.
-///
-/// Depth is bounded by `serde_json`'s own nesting limit, which refused the document
-/// before `CreateSchema` stored it, and breadth by
-/// [`crate::state::MAX_STORED_CONTENT_BYTES`].
-fn collect_event_keywords(document: &::serde_json::Value, declared: &mut Vec<String>) {
-    match document {
-        ::serde_json::Value::Object(members) => {
-            for (name, value) in members {
-                if EVENT_KEYWORD_EXTENSIONS.contains(&name.as_str()) {
-                    if let Some(value) = value.as_str() {
-                        declared.push(value.to_lowercase());
-                    }
-                }
-                collect_event_keywords(value, declared);
-            }
-        }
-        ::serde_json::Value::Array(items) => {
-            for item in items {
-                collect_event_keywords(item, declared);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// The document members that carry a schema's event keywords: the EventBridge
-/// extensions naming the event's source and detail type.
-const EVENT_KEYWORD_EXTENSIONS: &[&str] = &[
-    "x-amazon-events-source",
-    "x-amazon-events-detail-type",
-];
 
 #[cfg(test)]
 mod tests {
@@ -497,58 +473,98 @@ mod tests {
         }
     }
 
-    /// Every schema AWS publishes declares the event it describes, and that declaration
-    /// — the event's source and detail type — is the WHOLE of what the registry indexes
-    /// the schema under: its name is not an index entry.
+    /// Every schema AWS publishes carries the event it describes, and a keyword of that
+    /// event's source or detail type selects it — as does one of its own name, which a
+    /// caller knows it by. The catalogue was published before any request, so the index
+    /// has long since caught up with it.
     #[test]
-    fn a_published_schema_declares_the_event_it_describes() {
+    fn a_published_schema_is_indexed_under_its_event_and_its_name() {
         let state = crate::state::ComAmazonawsSchemasSchemasState::default();
+        let now = ::std::time::SystemTime::now();
         let registry = &state.registries[crate::state::AWS_MANAGED_REGISTRY];
         assert!(
             !registry.schemas.is_empty(),
             "the published registry must hold schemas to search over"
         );
         for (schema_name, schema) in &registry.schemas {
-            // A document records the event on every component that is ABOUT the event
-            // (its envelope and the component the envelope's `detail` references), and
-            // the keywords are read from every version, so what a schema is indexed
-            // under is the SET of values declared: the event's source and its detail
-            // type, twice.
-            let declared: ::std::collections::BTreeSet<String> =
-                declared_event_keywords(schema).into_iter().collect();
-            assert_eq!(
-                declared.len(),
-                2,
-                "case {schema_name:?}: a published schema declares its event's source \
-                 and detail type, got {declared:?}"
-            );
+            let indexed = indexed_values(schema, now);
+            // The catalogue holds the event identity its document does not state.
+            let published = schema
+                .published_event
+                .as_ref()
+                .unwrap_or_else(|| panic!("case {schema_name:?}: a published schema carries its event"));
+            for declared in [&published.source, &published.detail_type] {
+                assert!(
+                    matches_every_keyword(schema, &keywords_of(declared), now),
+                    "case {schema_name:?}: a keyword of its event {declared:?} must select it, \
+                     indexed under {indexed:?}"
+                );
+            }
+            // Its name is what a caller knows it by, so a keyword of it selects it too.
             assert!(
-                declared.iter().all(|value| value != schema_name),
-                "case {schema_name:?}: a declared event keyword is the event's, not the \
-                 schema's name, got {declared:?}"
-            );
-            // The index holds the declared event keywords and nothing else, so a
-            // keyword that is the schema's own name selects nothing: a search is not a
-            // lookup by name.
-            assert!(
-                !matches_every_keyword(schema, &keywords_of(schema_name)),
-                "case {schema_name:?}: its name is not an index entry, indexed under {declared:?}"
+                matches_every_keyword(schema, &keywords_of(schema_name), now),
+                "case {schema_name:?}: its own name must select it"
             );
             // Every published source is under the `aws.` prefix, so this one keyword
             // selects each of them.
             assert!(
-                matches_every_keyword(schema, &keywords_of("AWS.")),
+                matches_every_keyword(schema, &keywords_of("AWS."), now),
                 "case {schema_name:?}: a keyword of its source must select it, \
-                 declared {declared:?}"
+                 indexed under {indexed:?}"
             );
             assert!(
-                !matches_every_keyword(schema, &keywords_of("no-event-says-this")),
-                "case {schema_name:?}: a keyword nothing declares must not select it"
+                !matches_every_keyword(schema, &keywords_of("no-event-says-this"), now),
+                "case {schema_name:?}: a keyword nothing about it carries must not select it"
             );
             // A value carrying no keyword limits nothing, so it selects every schema.
             assert!(
-                matches_every_keyword(schema, &keywords_of(" , ")),
+                matches_every_keyword(schema, &keywords_of(" , "), now),
                 "case {schema_name:?}: a value carrying no keyword must limit nothing"
+            );
+        }
+    }
+
+    /// RULE (the index's catch-up, as a property of the stored instants): nothing of a
+    /// schema is reachable by keyword until the index has caught up with a definition of
+    /// it, and from that instant on its name, its identity and that definition's text all
+    /// are — while a value carrying no keyword consults no index and reports the schema
+    /// throughout.
+    #[test]
+    fn no_keyword_reaches_a_schema_before_the_index_catches_up() {
+        let state = crate::state::ComAmazonawsSchemasSchemasState::default();
+        let registry = &state.registries[crate::state::AWS_MANAGED_REGISTRY];
+        let (schema_name, schema) = registry
+            .schemas
+            .iter()
+            .next()
+            .expect("the published registry holds a schema");
+        let written = schema
+            .versions
+            .values()
+            .next_back()
+            .expect("a published schema holds a definition")
+            .created_date;
+        let delay = crate::state::SCHEMA_INDEXING_DELAY;
+        // Rows: instants either side of the catch-up for the NEWEST definition, named
+        // relative to when it was written rather than as a wall-clock value.
+        for (case, at, indexed) in [
+            ("the instant it was written", written, false),
+            (
+                "a moment after it was written",
+                written + delay / 2,
+                false,
+            ),
+            ("one span after it was written", written + delay, true),
+            ("long after it was written", written + delay * 100, true),
+        ] {
+            assert_eq!(
+                matches_every_keyword(schema, &keywords_of(schema_name), at),
+                indexed,
+                "case {case}: expected indexed={indexed} for {schema_name:?} at {at:?}"
+            );
+            assert!(
+                matches_every_keyword(schema, &keywords_of(""), at),
+                "case {case}: a value carrying no keyword must report the schema"
             );
         }
     }

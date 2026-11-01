@@ -27,7 +27,8 @@ use serde_json::{json, Value};
 use crate::discoverer_state::create_discoverer;
 use crate::next_token_lifetime::discoverer_ids;
 use crate::registry_schema_lifecycle::{
-    create_registry, registry_names, schema_names, schema_uri, versions_uri, Answer, Emulator,
+    create_registry, registry_names, schema_names, schema_uri, versions_uri,
+    wait_for_keyword_index, Answer, Emulator,
 };
 
 /// The registry the schema, version and search rows below page over.
@@ -167,6 +168,10 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
         discoverers.push(create_discoverer(emulator, "empty token", bus).await);
     }
     discoverers.sort();
+
+    // The search rows select by keyword, so the table starts once the registry's keyword
+    // index has caught up with the schemas written above.
+    wait_for_keyword_index();
 
     let schemas_uri = format!("/v1/registries/name/{REGISTRY}/schemas");
     vec![

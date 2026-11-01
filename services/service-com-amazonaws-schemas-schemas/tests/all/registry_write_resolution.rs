@@ -203,6 +203,21 @@ impl Write {
                     created.status,
                     created.body
                 );
+                // The version delete needs a SECOND definition: a schema always holds
+                // at least one, so removing the only version a schema has is refused as
+                // a conflict and would never reach the registry resolution this suite is
+                // about.
+                if matches!(self, Self::DeleteSchemaVersion) {
+                    let updated = Self::UpdateSchema.send(emulator, registry).await;
+                    assert_eq!(
+                        updated.status,
+                        200,
+                        "case {:?}: seeding a second version must succeed, got {} {:?}",
+                        self.case(),
+                        updated.status,
+                        updated.body
+                    );
+                }
             }
             Self::DeleteResourcePolicy => {
                 let attached = Self::PutResourcePolicy.send(emulator, registry).await;

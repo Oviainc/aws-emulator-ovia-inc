@@ -50,8 +50,8 @@ fn version_uri(registry: &str, schema: &str, version: &str) -> String {
 }
 
 /// A JSON schema document, titled so each version's content is its own. It declares
-/// the event it describes and carries component schemas, so the version it is stored as
-/// is one `ExportSchema` can convert — the read the table drives below.
+/// the event it describes and carries component schemas, so what the keyword index and a
+/// conversion read is all there.
 fn content_of(version: u32) -> String {
     json!({
         "openapi": "3.0.0",
@@ -197,11 +197,11 @@ async fn every_write_to_a_schema_moves_last_modified_and_nothing_else_does() {
             writes: false,
         },
         Step {
-            case: "ExportSchema reads",
+            case: "a refused ExportSchema (the caller wrote this schema)",
             method: "GET",
             uri: export_uri(REGISTRY, SCHEMA, "JSONSchemaDraft4"),
             body: None,
-            status: 200,
+            status: 403,
             writes: false,
         },
         Step {
@@ -277,15 +277,15 @@ async fn every_write_to_a_schema_moves_last_modified_and_nothing_else_does() {
             writes: true,
         },
         Step {
-            case: "DeleteSchemaVersion takes the last definition the schema holds",
+            case: "a refused DeleteSchemaVersion (the schema's last definition)",
             method: "DELETE",
             uri: version_uri(REGISTRY, SCHEMA, "2"),
             body: None,
-            status: 204,
-            writes: true,
+            status: 409,
+            writes: false,
         },
         Step {
-            case: "ListSchemas reads a schema holding no definition",
+            case: "ListSchemas reads the schema",
             method: "GET",
             uri: listing_uri(REGISTRY),
             body: None,
@@ -293,7 +293,7 @@ async fn every_write_to_a_schema_moves_last_modified_and_nothing_else_does() {
             writes: false,
         },
         Step {
-            case: "UpdateSchema mints a definition for a schema holding none",
+            case: "UpdateSchema mints a further definition",
             method: "PUT",
             uri: schema_uri(REGISTRY, SCHEMA),
             body: Some(json!({"Content": content_of(4), "Type": "OpenApi3"})),
@@ -347,13 +347,14 @@ async fn every_write_to_a_schema_moves_last_modified_and_nothing_else_does() {
 /// RULE (the delete's own row of the rule above, over a SET of schemas): removing a
 /// definition is a write to the schema, so it sets `LastModified` to the instant of the
 /// delete — however many versions the schema holds and whichever of them goes — and every
-/// reader of the member answers the new instant.
+/// reader of the member answers the new instant. (A delete that would take the schema's
+/// LAST definition is refused and so writes nothing; that refusal is pinned in
+/// `tests/all/schema_version_deletion.rs`.)
 #[tokio::test]
 async fn deleting_a_version_moves_last_modified_whichever_version_goes() {
-    // Rows: the count of stored versions crossed with WHICH of them is deleted — the only
-    // one, the first, a middle one, the newest, and one of a longer run.
-    let cases: [(&str, u32, u32); 6] = [
-        ("the only version", 1, 1),
+    // Rows: the count of stored versions crossed with WHICH of them is deleted — the
+    // first, a middle one, the newest, and one of a longer run.
+    let cases: [(&str, u32, u32); 5] = [
         ("the first of two", 2, 1),
         ("the newest of two", 2, 2),
         ("the first of three", 3, 1),

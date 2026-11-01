@@ -2,16 +2,16 @@
 
 //! End-to-end HTTP tests for the schema LANGUAGE a request names.
 //!
-//! RULE under test: a request's `Type` is admitted exactly when it is one of the
-//! modelled `Type` values, and any other value is answered by no operation — one rule
-//! for the whole service, so `ExportSchema` (where `Type` arrives as a query-string
-//! `__string` the boundary validator cannot check) and `GetDiscoveredSchema` (whose
-//! handler reads it as a raw string) take the same set and map it to their own
-//! branches. Where the handler is what refuses, the refusal is 400
-//! `BadRequestException` naming that set, and it is decided on the REQUEST — before
-//! any resource it names is resolved and before any event it carries is read; where
-//! the member is modelled as the enum itself, the boundary validator refuses the
-//! value first, against the same set.
+//! RULE under test: a request's `Type` is admitted exactly when it names a value the
+//! operation's own set admits — the modelled `Type` values for `GetDiscoveredSchema`,
+//! which infers a document IN that language, and the narrower set of EXPORT TARGETS for
+//! `ExportSchema`, which renders a stored document INTO one (that narrower set, and the
+//! sentence a value outside it is refused with, are pinned in
+//! `tests/all/export_reads_the_stored_schema.rs`). Where the handler is what refuses, the
+//! refusal is 400 `BadRequestException` naming the admitted set, and it is decided on the
+//! REQUEST — before any resource it names is resolved and before any event it carries is
+//! read; where the member is modelled as the enum itself, the boundary validator refuses
+//! the value first, against the same modelled set.
 //!
 //! Every case drives the real wire path through the harness in
 //! `registry_schema_lifecycle.rs`: a signed `restJson1` request through
@@ -19,7 +19,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::ops::types::TYPE_VALUES;
-use service_com_amazonaws_schemas_schemas::state::{SchemaType, JSON_SCHEMA_DRAFT4_URI};
+use service_com_amazonaws_schemas_schemas::state::{
+    aws_managed_schemas, SchemaType, AWS_MANAGED_REGISTRY, JSON_SCHEMA_DRAFT4_URI,
+};
 
 use crate::registry_schema_lifecycle::{
     create_registry, export_uri, schema_uri, Answer, Emulator,
@@ -48,11 +50,15 @@ fn sampled_event() -> Value {
     json!({"id": "a1", "detail": {"total": 3}})
 }
 
-/// The refusal both operations answer a `Type` outside the modelled set with, built
-/// from the modelled set itself. Source: `com.amazonaws.schemas#Type`, re-exported as
-/// [`TYPE_VALUES`].
-fn refusal() -> String {
-    format!("Type must be one of {}.", TYPE_VALUES.join(", "))
+/// The refusal a `Type` outside the EXPORT TARGET set is answered with, built from that
+/// set. Source: `crate::state::EXPORT_TARGETS`, the languages an export is rendered
+/// into.
+fn export_refusal(value: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at 'type' failed to satisfy \
+         constraint: Member must satisfy enum value set: [{}]",
+        SchemaType::JsonSchemaDraft4.as_wire()
+    )
 }
 
 /// One `Type` a case sends, in both spellings a request needs: as a JSON body member
@@ -108,8 +114,8 @@ const REFUSED: &[Row] = &[
     },
 ];
 
-/// Assert `answer` is the service's refusal of a `Type` it does not admit.
-fn assert_refused(case: &str, answer: &Answer) {
+/// Assert `answer` is the service's refusal of a `Type` that names no export target.
+fn assert_refused(case: &str, value: &str, answer: &Answer) {
     assert_eq!(
         answer.status, 400,
         "case {case:?}: expected 400, got {} {:?}",
@@ -129,8 +135,8 @@ fn assert_refused(case: &str, answer: &Answer) {
     );
     assert_eq!(
         answer.str_at("Message"),
-        refusal(),
-        "case {case:?}: the refusal must name the member and the admitted values, got {:?}",
+        export_refusal(value),
+        "case {case:?}: the refusal must name the value and the admitted set, got {:?}",
         answer.body
     );
 }
@@ -211,11 +217,11 @@ async fn the_admitted_set_is_the_modelled_set() {
     }
 }
 
-/// RULE: every modelled `Type` is answered by both operations that admit one
-/// themselves — the export renders the stored document in the language asked for, and
-/// discovery writes the document that language defines.
+/// RULE: every modelled `Type` is answered by the operation whose set is the modelled
+/// one — discovery infers the document that language defines — while the export answers
+/// only the language it renders into, refusing the other modelled value on the request.
 #[tokio::test]
-async fn every_modelled_type_is_answered_by_both_operations() {
+async fn every_modelled_type_is_answered_by_the_operation_whose_set_admits_it() {
     let emulator = Emulator::new();
     create_registry(&emulator, REGISTRY).await;
     let created = emulator
@@ -230,6 +236,13 @@ async fn every_modelled_type_is_answered_by_both_operations() {
         "expected 201 from CreateSchema, got {} {:?}",
         created.status, created.body
     );
+    // A schema the SERVICE wrote, which is what an export serves; read from the seeded
+    // catalogue rather than written out here.
+    let published = aws_managed_schemas()
+        .first()
+        .expect("the catalogue publishes schemas")
+        .name
+        .clone();
 
     // Rows: every value the model's `Type` enum holds, asked of both operations.
     for modelled in TYPE_VALUES {
@@ -238,16 +251,13 @@ async fn every_modelled_type_is_answered_by_both_operations() {
         });
 
         let exported = emulator
-            .call("GET", &export_uri(REGISTRY, SCHEMA, modelled), None)
+            .call(
+                "GET",
+                &export_uri(AWS_MANAGED_REGISTRY, &published, modelled),
+                None,
+            )
             .await;
         let case = format!("ExportSchema as {modelled}");
-        let document = content(&case, &exported);
-        assert_eq!(
-            exported.str_at("Type"),
-            *modelled,
-            "case {case:?}: the export must report the language asked for, got {:?}",
-            exported.body
-        );
 
         let discovered = emulator
             .call(
@@ -263,6 +273,8 @@ async fn every_modelled_type_is_answered_by_both_operations() {
         // draft it is written in at its root, an OpenAPI document names its version.
         match language {
             SchemaType::JsonSchemaDraft4 => {
+                // The one export target: the export is served and renders that language.
+                let document = content(&case, &exported);
                 for (case, document) in [(&case, &document), (&discovered_case, &inferred)] {
                     assert_eq!(
                         document["$schema"], JSON_SCHEMA_DRAFT4_URI,
@@ -272,12 +284,8 @@ async fn every_modelled_type_is_answered_by_both_operations() {
                 }
             }
             SchemaType::OpenApi3 => {
-                assert_eq!(
-                    exported.str_at("Content"),
-                    STORED,
-                    "case {case:?}: the stored OpenAPI 3 document is its own export, got {:?}",
-                    exported.str_at("Content")
-                );
+                // A language a schema is STORED as, and no export target.
+                assert_refused(&case, modelled, &exported);
                 assert!(
                     inferred["openapi"].is_string(),
                     "case {discovered_case:?}: an OpenAPI document names its version, \
@@ -288,15 +296,15 @@ async fn every_modelled_type_is_answered_by_both_operations() {
     }
 }
 
-/// RULE: a `Type` outside the modelled set is answered by neither operation. Where the
-/// handler is what admits the value (`ExportSchema`, whose `Type` is a query-string
-/// `__string`), it is refused on the REQUEST — before the resource the request names is
-/// resolved and before the events it carries are read — so the refusal does not turn on
-/// what else the request happens to be wrong about; where the member is modelled as the
-/// `Type` enum (`GetDiscoveredSchema`), the boundary validator refuses it against the
-/// same set before the handler runs at all.
+/// RULE: a `Type` outside the set the operation admits is answered by neither operation.
+/// Where the handler is what admits the value (`ExportSchema`, whose `Type` is a
+/// query-string `__string`), it is refused on the REQUEST — before the resource the
+/// request names is resolved and before the events it carries are read — so the refusal
+/// does not turn on what else the request happens to be wrong about; where the member is
+/// modelled as the `Type` enum (`GetDiscoveredSchema`), the boundary validator refuses it
+/// against the modelled set before the handler runs at all.
 #[tokio::test]
-async fn a_type_outside_the_modelled_set_is_answered_by_neither_operation() {
+async fn a_type_outside_the_admitted_set_is_answered_by_neither_operation() {
     let emulator = Emulator::new();
     create_registry(&emulator, REGISTRY).await;
     let created = emulator
@@ -311,14 +319,23 @@ async fn a_type_outside_the_modelled_set_is_answered_by_neither_operation() {
         "expected 201 from CreateSchema, got {} {:?}",
         created.status, created.body
     );
+    let published = aws_managed_schemas()
+        .first()
+        .expect("the catalogue publishes schemas")
+        .name
+        .clone();
 
     for row in REFUSED {
         // The export of a schema that EXISTS, and of one in a registry that was never
         // created: the value is refused on the request either way.
         let exported = emulator
-            .call("GET", &export_uri(REGISTRY, SCHEMA, row.encoded), None)
+            .call(
+                "GET",
+                &export_uri(AWS_MANAGED_REGISTRY, &published, row.encoded),
+                None,
+            )
             .await;
-        assert_refused(&format!("{}/ExportSchema", row.case), &exported);
+        assert_refused(&format!("{}/ExportSchema", row.case), row.value, &exported);
 
         let missing = emulator
             .call(
@@ -329,6 +346,7 @@ async fn a_type_outside_the_modelled_set_is_answered_by_neither_operation() {
             .await;
         assert_refused(
             &format!("{}/ExportSchema of a schema that does not exist", row.case),
+            row.value,
             &missing,
         );
 
@@ -353,16 +371,31 @@ async fn a_type_outside_the_modelled_set_is_answered_by_neither_operation() {
         }
     }
 
-    // The refusals changed nothing: the schema still exports in every language the
-    // model names.
-    for modelled in TYPE_VALUES {
-        let exported = emulator
-            .call("GET", &export_uri(REGISTRY, SCHEMA, modelled), None)
-            .await;
-        assert_eq!(
-            exported.status, 200,
-            "case {modelled:?}: the schema must still export, got {} {:?}",
-            exported.status, exported.body
-        );
-    }
+    // The refusals changed nothing: the published schema still exports to the one target,
+    // and the schema the caller stored still reads back.
+    let exported = emulator
+        .call(
+            "GET",
+            &export_uri(
+                AWS_MANAGED_REGISTRY,
+                &published,
+                SchemaType::JsonSchemaDraft4.as_wire(),
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(
+        exported.status, 200,
+        "the published schema must still export, got {} {:?}",
+        exported.status, exported.body
+    );
+    let described = emulator
+        .call("GET", &schema_uri(REGISTRY, SCHEMA), None)
+        .await;
+    assert_eq!(
+        described.str_at("Content"),
+        STORED,
+        "the stored document must still read back, got {:?}",
+        described.str_at("Content")
+    );
 }

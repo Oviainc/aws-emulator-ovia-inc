@@ -28,9 +28,9 @@
 
 use std::collections::BTreeSet;
 
-use serde_json::{json, Value};
+use serde_json::json;
 use service_com_amazonaws_schemas_schemas::state::{
-    aws_managed_schemas, AWS_MANAGED_REGISTRY, CODE_BINDING_LANGUAGES, CODE_RESOURCE_NOT_FOUND,
+    aws_managed_schemas, AWS_MANAGED_REGISTRY, CODE_BINDING_LANGUAGES,
 };
 
 use crate::registry_schema_lifecycle::{create_registry, schema_uri, Answer, Emulator};
@@ -75,6 +75,18 @@ impl SelectingCall {
         [
             Self::DescribeSchema,
             Self::ExportSchema,
+            Self::PutCodeBinding,
+            Self::DescribeCodeBinding,
+        ]
+    }
+
+    /// The rows that can be SERVED for a schema the caller wrote: all but the export,
+    /// which serves only a schema the service itself wrote (its own reading of the
+    /// member is driven over the published catalogue below, and over its version
+    /// resolution in `tests/all/export_reads_the_stored_schema.rs`).
+    fn caller_owned() -> [Self; 3] {
+        [
+            Self::DescribeSchema,
             Self::PutCodeBinding,
             Self::DescribeCodeBinding,
         ]
@@ -273,7 +285,7 @@ async fn an_empty_schema_version_resolves_the_latest_stored_version() {
         ("three versions, all but the first deleted", 3, &[2, 3]),
     ];
 
-    for call in SelectingCall::all() {
+    for call in SelectingCall::caller_owned() {
         for (topology, count, deleted) in topologies {
             let case = format!("{}/{topology}", call.case());
             let emulator = Emulator::new();
@@ -333,49 +345,69 @@ async fn an_empty_schema_version_resolves_the_latest_stored_version() {
     }
 }
 
-/// RULE (the same sentence where there is nothing to resolve): a schema that holds no
-/// version has no latest version to answer with, so a request sending `schemaVersion`
-/// empty takes the refusal the request that omits the member takes — the 404 worded for
-/// a request that named no version, not one naming an empty version.
+/// RULE (where there is nothing more to resolve): a schema always holds a definition —
+/// the delete of the only version a schema holds is refused — so an empty `schemaVersion`
+/// always has the schema's latest version to resolve, and the refused delete leaves that
+/// version to answer with.
 #[tokio::test]
-async fn an_empty_schema_version_on_a_versionless_schema_is_refused_as_absent_is() {
-    // Rows: how many versions the schema held before every one of them was deleted — the
-    // case is about the empty version set, whatever it was emptied from.
-    for (topology, count) in [("one version deleted", 1_u32), ("three versions deleted", 3)] {
-        for call in SelectingCall::all() {
+async fn a_schema_always_has_a_latest_version_for_an_empty_schema_version_to_resolve() {
+    // Rows: how many versions the schema held before every one a delete may take was
+    // taken — the case is about the one definition a schema cannot be emptied of.
+    for (topology, count) in [("one version", 1_u32), ("three versions", 3)] {
+        for call in SelectingCall::caller_owned() {
             let case = format!("{}/{topology}", call.case());
             let emulator = Emulator::new();
-            let deleted: Vec<u32> = (1..=count).collect();
+            let deleted: Vec<u32> = (1..count).collect();
             let held = seed(&emulator, count, &deleted).await;
-            assert!(
-                held.is_empty(),
-                "case {case}: the schema must hold no version, got {held:?}"
+            assert_eq!(
+                held,
+                vec![count.to_string()],
+                "case {case}: the schema must be left holding its newest version, got {held:?}"
             );
+
+            // The delete of that last definition is refused, so it is still there.
+            let refused = emulator
+                .call(
+                    "DELETE",
+                    &version_uri(REGISTRY, SCHEMA, &count.to_string()),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                refused.status, 409,
+                "case {case}: deleting the last version must be refused, got {} {:?}",
+                refused.status, refused.body
+            );
+
+            if matches!(call, SelectingCall::DescribeCodeBinding) {
+                let started = SelectingCall::PutCodeBinding
+                    .send(&emulator, REGISTRY, SCHEMA, Some(&count.to_string()))
+                    .await;
+                assert_eq!(
+                    started.status,
+                    SelectingCall::PutCodeBinding.served_status(),
+                    "case {case}: seeding a code binding must succeed, got {} {:?}",
+                    started.status,
+                    started.body
+                );
+            }
 
             let omitted = call.send(&emulator, REGISTRY, SCHEMA, None).await;
             let empty = call.send(&emulator, REGISTRY, SCHEMA, Some("")).await;
             assert_eq!(
-                omitted.status, 404,
-                "case {case}: a schema holding no version has none to answer with, got {} {:?}",
-                omitted.status, omitted.body
+                omitted.status,
+                call.served_status(),
+                "case {case}: expected {} with no schemaVersion member, got {} {:?}",
+                call.served_status(),
+                omitted.status,
+                omitted.body
             );
             assert_served_alike(&case, call, &omitted, &empty);
             assert_eq!(
-                empty.error_type(),
-                "NotFoundException",
-                "case {case}: expected the NotFoundException shape, got {:?}",
-                empty.header("x-amzn-errortype")
-            );
-            assert_eq!(
-                empty.str_at("Code"),
-                CODE_RESOURCE_NOT_FOUND,
-                "case {case}: expected the {CODE_RESOURCE_NOT_FOUND} condition code, got {:?}",
-                empty.body
-            );
-            assert_eq!(
-                empty.str_at("Message"),
-                format!("Schema {SCHEMA} in registry {REGISTRY} has no versions."),
-                "case {case}: the refusal must word a request that named no version, got {:?}",
+                empty.str_at("SchemaVersion"),
+                count.to_string(),
+                "case {case}: an empty schemaVersion resolves the version the schema still \
+                 holds, got {:?}",
                 empty.body
             );
         }
@@ -388,7 +420,7 @@ async fn an_empty_schema_version_on_a_versionless_schema_is_refused_as_absent_is
 /// rather than nothing — is still refused as not found.
 #[tokio::test]
 async fn a_schema_version_that_carries_characters_still_selects_strictly() {
-    for call in SelectingCall::all() {
+    for call in SelectingCall::caller_owned() {
         let case_prefix = call.case();
         let emulator = Emulator::new();
         let held = seed(&emulator, 3, &[]).await;
@@ -561,23 +593,12 @@ async fn the_content_an_empty_schema_version_answers_is_the_latest_versions_own(
             described.body
         );
 
-        // The export renders the SAME version's definition, so the title that version was
-        // written with is in the document it answers.
-        let exported = SelectingCall::ExportSchema
-            .send(&emulator, REGISTRY, SCHEMA, Some(""))
-            .await;
-        let rendered: Value =
-            serde_json::from_str(&exported.str_at("Content")).unwrap_or_else(|e| {
-                panic!(
-                    "case {topology}: the export must answer a JSON document ({e}), got {:?}",
-                    exported.body
-                )
-            });
+        // And the version the member resolved to is the one the schema still holds.
         assert_eq!(
-            rendered["title"].as_str(),
-            Some(format!("version-{latest}").as_str()),
-            "case {topology}: ExportSchema renders the latest version's own definition, got \
-             {rendered:?}"
+            described.str_at("SchemaVersion"),
+            *latest,
+            "case {topology}: the member resolves the latest stored version, got {:?}",
+            described.body
         );
     }
 }
