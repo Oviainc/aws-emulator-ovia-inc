@@ -66,7 +66,10 @@ const OTHER_REGION: &str = "eu-central-1";
 
 /// The vendor whose tenant holds the seeded inventory under test: the first
 /// value of the model's `ThirdPartyFirewall` enum (see [`vendors`]).
-fn primary_vendor() -> &'static str {
+///
+/// `pub(crate)` so a sibling suite in this test target names the same vendor as
+/// this one rather than spelling a second copy of the catalog lookup.
+pub(crate) fn primary_vendor() -> &'static str {
     vendors()
         .first()
         .expect("the model declares at least one ThirdPartyFirewall vendor")
@@ -165,7 +168,10 @@ fn seed_policy(
 
 /// An emulator with an administrator associated, both vendors onboarded, and the
 /// two tables above seeded into their tenants.
-async fn seeded() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` so a sibling suite in this test target stands this vendor
+/// inventory up through this one seeder rather than a second copy of it.
+pub(crate) async fn seeded() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = emulator_with_engine();
     associate_admin(&router).await;
     with_store(&engine, |store| {
@@ -551,6 +557,16 @@ async fn refuses_a_next_token_it_did_not_mint_for_this_vendor() {
         ),
         ("not hexadecimal", "zzzz".to_string()),
         ("hexadecimal that is not UTF-8", "abcd".to_string()),
+        (
+            // A spelling of one of THIS vendor's own keys that the minter never
+            // emits, so it is a token this service never issued.
+            "a case-variant spelling of a key of this vendor",
+            state::encode_key_token(&state::third_party_firewall_policy_key(
+                primary_vendor(),
+                "global-1",
+            ))
+            .to_uppercase(),
+        ),
         (
             "a bare policy id rather than a store key",
             state::encode_key_token("global-1"),

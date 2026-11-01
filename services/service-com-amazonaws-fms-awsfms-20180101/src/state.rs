@@ -3691,9 +3691,19 @@ pub fn encode_key_token(key: &str) -> String {
 /// Decode a `PaginationToken` produced by [`encode_key_token`]. `None` when the
 /// token was not produced by this service: a value that is not hex, not UTF-8,
 /// empty, or carries a control character is no store key of ours.
+///
+/// Nor is a value whose SPELLING is not the one [`encode_key_token`] mints: hex
+/// decoding admits both cases of the digits `a`-`f`, while the minter emits one
+/// of them, so a case-variant of a token this service issued is a token it never
+/// issued. The check is that re-encoding the decoded key reproduces the token
+/// exactly — the only spelling a page boundary of this service has — which keeps
+/// the accepted set equal to the minted set whatever the encoding is, rather
+/// than restating the minter's alphabet here.
 pub fn decode_key_token(token: &str) -> Option<String> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let is_key = !decoded.is_empty() && !decoded.chars().any(char::is_control);
+    let is_key = !decoded.is_empty()
+        && !decoded.chars().any(char::is_control)
+        && encode_key_token(&decoded) == token;
     is_key.then_some(decoded)
 }
 

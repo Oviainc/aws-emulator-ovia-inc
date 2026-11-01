@@ -216,6 +216,12 @@ mod admin_scope_in_force_after_onboarding;
 #[path = "all/admin_slot_write_clock_reading.rs"]
 mod admin_slot_write_clock_reading;
 
+// Declared beside them, for the same reason: this suite's name sorts right into
+// the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/page_token_canonical_spelling.rs"]
+mod page_token_canonical_spelling;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]
