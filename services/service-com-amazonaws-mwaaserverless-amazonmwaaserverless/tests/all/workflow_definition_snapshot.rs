@@ -227,7 +227,15 @@ async fn create_workflow_at(
 }
 
 /// `GetWorkflow` for `arn`, at `version` when one is named.
-async fn get_workflow(router: &MultiServiceRouter, arn: &str, version: Option<&str>) -> Value {
+///
+/// `pub(crate)` with [`reported_cron`] below, so a suite whose rule is about WHAT a read
+/// reports for a declared schedule reads it back through this same wire path rather than
+/// keeping a second copy of it.
+pub(crate) async fn get_workflow(
+    router: &MultiServiceRouter,
+    arn: &str,
+    version: Option<&str>,
+) -> Value {
     let mut body = json!({"WorkflowArn": arn});
     if let Some(version) = version {
         body["WorkflowVersion"] = Value::String(version.to_string());
@@ -241,7 +249,7 @@ async fn get_workflow(router: &MultiServiceRouter, arn: &str, version: Option<&s
 }
 
 /// The `CronExpression` a read reports, or `None` when it reports no schedule at all.
-fn reported_cron(reported: &Value) -> Option<&str> {
+pub(crate) fn reported_cron(reported: &Value) -> Option<&str> {
     reported["ScheduleConfiguration"]["CronExpression"].as_str()
 }
 

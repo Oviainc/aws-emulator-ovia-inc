@@ -27,6 +27,8 @@ mod clock_sampled_under_the_store_lock;
 mod code_snapshot_instant;
 #[path = "all/create_replay_after_later_calls.rs"]
 mod create_replay_after_later_calls;
+#[path = "all/cron_field_values.rs"]
+mod cron_field_values;
 #[path = "all/definition_declared_schedule_trigger.rs"]
 mod definition_declared_schedule_trigger;
 #[path = "all/deleted_workflow_run_cleanup.rs"]

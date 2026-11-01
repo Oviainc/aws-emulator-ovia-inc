@@ -122,10 +122,21 @@ const CRON_PRESETS: &[(&str, &str)] = &[
 /// sixth, year, field.
 const CRON_FIELD_COUNTS: &[usize] = &[5, 6];
 
-/// The characters that give a cron FIELD its structure, beside the values in it: the two
-/// wildcards (`*`, `?`), the list, range and step separators (`,`, `-`, `/`) and the
-/// nth-weekday qualifier (`#`) of standard cron and of EventBridge Scheduler's dialect.
-const CRON_FIELD_PUNCTUATION: &[char] = &['*', '?', ',', '-', '/', '#'];
+/// The characters that give a cron FIELD its structure, between the values in it: the
+/// list, range and step separators (`,`, `-`, `/`) and the nth-weekday qualifier (`#`) of
+/// standard cron and of EventBridge Scheduler's dialect.
+///
+/// They only SEPARATE values; each position they mark out still carries a value of its
+/// own ([`is_cron_field_value`]), so punctuation on its own is not a field.
+const CRON_FIELD_SEPARATORS: &[char] = &[',', '-', '/', '#'];
+
+/// The wildcards a cron field may carry where a value stands: every value of the field
+/// (`*`) and no particular value (`?`, which EventBridge Scheduler takes in the day
+/// fields).
+///
+/// A wildcard is a VALUE a position carries, like a number or a name, not structure: `*`
+/// is a whole field on its own and `*/2` is a step over it.
+const CRON_FIELD_WILDCARDS: &[&str] = &["*", "?"];
 
 /// The names a cron month or day-of-week field may carry instead of a number: the twelve
 /// three-letter month abbreviations and the seven day-of-week ones, as cron spells them.
@@ -267,20 +278,33 @@ fn cron_expression(declared: &str) -> Option<String> {
 }
 
 /// Whether `field` is written as ONE cron field: taking its structure
-/// ([`CRON_FIELD_PUNCTUATION`]) apart leaves only numbers, wildcards, the day-of-month
-/// qualifiers ([`CRON_FIELD_QUALIFIERS`]) and the month and day-of-week names
-/// ([`CRON_FIELD_NAMES`]) a cron field is allowed to carry.
+/// ([`CRON_FIELD_SEPARATORS`]) apart leaves one value ([`is_cron_field_value`]) in every
+/// position that structure marks out.
+///
+/// So a field made only of separators is not one: it marks out positions and leaves every
+/// one of them empty, which is no value the field could be read as.
 fn is_cron_field(field: &str) -> bool {
     field
-        .split(|character| CRON_FIELD_PUNCTUATION.contains(&character))
-        .all(|token| {
-            token.is_empty()
-                || token.chars().all(|character| character.is_ascii_digit())
-                || CRON_FIELD_QUALIFIERS
-                    .iter()
-                    .chain(CRON_FIELD_NAMES)
-                    .any(|name| token.eq_ignore_ascii_case(name))
-        })
+        .split(|character| CRON_FIELD_SEPARATORS.contains(&character))
+        .all(is_cron_field_value)
+}
+
+/// Whether `token` is ONE value a cron field position may carry: a number, a wildcard
+/// ([`CRON_FIELD_WILDCARDS`]), one of the day-of-month qualifiers
+/// ([`CRON_FIELD_QUALIFIERS`]) or one of the month and day-of-week names
+/// ([`CRON_FIELD_NAMES`]).
+///
+/// A position carrying nothing at all carries no value, so an empty token is not one.
+fn is_cron_field_value(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    token.chars().all(|character| character.is_ascii_digit())
+        || CRON_FIELD_WILDCARDS
+            .iter()
+            .chain(CRON_FIELD_QUALIFIERS)
+            .chain(CRON_FIELD_NAMES)
+            .any(|name| token.eq_ignore_ascii_case(name))
 }
 
 /// The raw value the definition's DAG-level schedule key carries, read out of the FIRST

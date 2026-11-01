@@ -132,7 +132,11 @@ const TRIGGER_MODES: &[Option<&str>] = &[
 
 /// The instant the store says this workflow's trigger fires next, and `None` for a
 /// workflow the service does not execute on its own.
-fn trigger(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Option<SystemTime> {
+///
+/// `pub(crate)` with the two helpers below, so a suite whose rule is about WHICH
+/// declarations arm the trigger drives the same store and the same wire path rather than
+/// building a second harness.
+pub(crate) fn trigger(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Option<SystemTime> {
     with_stored_workflow(engine, arn, |workflow: &mut Workflow| {
         workflow.next_scheduled_run_at
     })
@@ -141,7 +145,7 @@ fn trigger(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Option<SystemTime
 /// Put the workflow's next firing half a period in the past, so exactly one firing is
 /// owed at the moment of the call that follows, and answer that firing's instant. A
 /// workflow with no trigger has nothing to owe.
-fn owe_one_firing(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Option<SystemTime> {
+pub(crate) fn owe_one_firing(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Option<SystemTime> {
     let owed = SystemTime::now() - SCHEDULED_RUN_EVERY / 2;
     with_stored_workflow(engine, arn, |workflow: &mut Workflow| {
         workflow.next_scheduled_run_at = workflow.next_scheduled_run_at.map(|_| owed);
@@ -150,7 +154,7 @@ fn owe_one_firing(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Option<Sys
 }
 
 /// The `WorkflowRuns` a listing reports for a workflow, over the wire.
-async fn listed_runs(router: &MultiServiceRouter, arn: &str, case: &str) -> Vec<Value> {
+pub(crate) async fn listed_runs(router: &MultiServiceRouter, arn: &str, case: &str) -> Vec<Value> {
     let (status, listed) = call(router, "ListWorkflowRuns", json!({"WorkflowArn": arn})).await;
     assert_eq!(
         status, 200,
