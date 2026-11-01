@@ -1,15 +1,50 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Get information about several parameters at once by naming each of them — the batch
+//! read of Parameter Store. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every answer is computed from the parameters `PutParameter` persisted (see
+//! [`crate::state`]), resolved one requested name at a time exactly as the single read
+//! resolves its one name ([`crate::ops::get_parameter`]): a bare name or a full ARN,
+//! the newest version by default and the version or label a `name:selector` suffix
+//! names. Nothing here mutates the store — a read must not change what a later caller
+//! sees.
+//!
+//! ## A name this read cannot resolve is reported, not refused
+//!
+//! The batch read models no not-found refusal at all (its only errors are
+//! `InternalServerError` and `InvalidKeyId`): it reports the names it resolved in
+//! `Parameters` and names it could not in `InvalidParameters`, "a list of parameters that
+//! aren't formatted correctly or don't run during an execution"
+//! (`smithy_query(query="doc",shape="GetParametersResult",member="InvalidParameters")`).
+//! So one unresolvable name among ten still answers 200 with the other nine: a name no
+//! parameter of this Region and account is held for, a version or label the parameter
+//! does not carry, an ARN naming another account or Region, and a name that is not
+//! shaped like one a parameter could be asked for are all reported there, under the name
+//! the request asked for them by.
+//!
+//! The one refusal a batch read makes is the spaces rule this operation's own doc states:
+//! the service trims each name, and a trimmed name that still carries spaces between
+//! characters fails the request with a `ValidationException`.
+//!
+//! The parameters are reported in alphabetical order of their names ("The results for
+//! GetParameters requests are listed in alphabetical order in query responses",
+//! `GetParametersRequest$Names`), whatever order they were asked in, and the unresolvable
+//! names keep the order they were asked in.
+//!
+//! ## `WithDecryption` and `SecureString`
+//!
+//! As for the single read: a `SecureString`'s value is stored as the KMS ciphertext
+//! `PutParameter` sealed it into, so this flag selects which of the two forms each
+//! reported value takes — absent or false the stored ciphertext, base64-encoded, true the
+//! plaintext, and only for a caller the parameter's own key permits `kms:Decrypt` under
+//! the encryption context binding the value to that parameter. Every value a read reports
+//! is opened before the answer is served, so the first refusal is the whole read's:
+//! `AccessDeniedException` (HTTP 400) when a key denies the caller, `InvalidKeyId` when a
+//! value no key of this endpoint opens any more is reported. See
+//! [`crate::state::secure_string`]. For `String` and `StringList` the flag selects
+//! nothing ("This flag is ignored for String and StringList parameter types").
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +125,10 @@
 //!
 //! * `InternalServerError` (HTTP 500) — An error occurred on the server side.
 //! * `InvalidKeyId` (HTTP 400) — The query key ID isn't valid.
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   "The requester doesn't have permissions to perform the requested operation", which is
+//!   what a `WithDecryption` read of a parameter whose KMS key does not permit the caller
+//!   `kms:Decrypt` is refused with (see [`crate::state::secure_string`]).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -105,9 +144,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `GetParametersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#GetParameters")]
+//
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models it
+// ("The requester doesn't have permissions to perform the requested operation") and other
+// operations declare it, and it is the refusal a decrypt the parameter's KMS key does not
+// permit this caller answers with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#GetParameters",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetParametersErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerError(InternalServerError),
     InvalidKeyId(InvalidKeyId),
 }
@@ -163,18 +211,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetParametersErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the parameter store is unavailable".to_string()),
+            })
+        })?;
+
+        // The spaces rule is the one refusal a read makes, and it is made for the whole
+        // request before any name is resolved: the service trims each name and fails a
+        // name with spaces between characters with a `ValidationException`, which this
+        // operation models no error for.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetParameters"))
+        // The names one call carries are a set: a name asked for twice names the one
+        // parameter, so it is answered once. The order they were asked in is kept, which
+        // is the order the unresolvable ones among them are reported in.
+        let mut asked: Vec<&str> = Vec::with_capacity(input.names.len());
+        for name in &input.names {
+            let trimmed = crate::state::trimmed_name(name)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+            if !asked.contains(&trimmed) {
+                asked.push(trimmed);
+            }
+        }
+
+        // A full ARN names the account and the Region its parameter lives in, and a
+        // parameter is resolved through the endpoint it is asked for, so the Region never
+        // comes from the request body — only from the signed credential scope, which
+        // [`request_region`] constrains.
+        let region = crate::state::request_region(ctx.parts());
+        let account = ::engine::emulator_account_id();
+
+        // The store guard is released before the keys are asked, so no state of this
+        // service is held while KMS's decision is made.
+        let (mut parameters, invalid_parameters, to_open) = {
+            let store = state.lock();
+            let mut parameters = Vec::new();
+            let mut invalid = Vec::new();
+            let mut to_open = Vec::new();
+            for name in asked {
+                // Each arm below is a name this read cannot resolve, which the batch read
+                // REPORTS rather than refuses: a name an ARN of another service or a
+                // dangling `name:` makes no parameter query at all, an ARN naming another
+                // account or Region names nothing reachable at this endpoint, a name this
+                // Region holds no parameter for names none, and a selector the parameter
+                // does not carry names no version of it.
+                let Some(query) = crate::state::parse_parameter_query(name) else {
+                    invalid.push(name.to_string());
+                    continue;
+                };
+                if query.selector == Some("")
+                    || query.account.is_some_and(|named| named != account)
+                    || query.region.is_some_and(|named| named != region)
+                {
+                    invalid.push(name.to_string());
+                    continue;
+                }
+                let Some(record) = store.parameter(&region, query.name) else {
+                    invalid.push(name.to_string());
+                    continue;
+                };
+                let Some(version) = record.select(query.selector) else {
+                    invalid.push(name.to_string());
+                    continue;
+                };
+                parameters.push(version.to_parameter(record, query.selector));
+                to_open.extend(
+                    crate::state::secure_string::value_to_open(
+                        input.with_decryption,
+                        record,
+                        version,
+                    )
+                    .map(|sealed| (parameters.len() - 1, sealed)),
+                );
+            }
+            (parameters, invalid, to_open)
+        };
+
+        // A `WithDecryption` read has each reported `SecureString` opened under that
+        // parameter's own KMS key, so every one of those keys decides the read before any
+        // value is reported; a read that asks for none reports the stored ciphertexts.
+        for (at, plaintext) in
+            crate::state::secure_string::open(&*self.engine, ctx, &region, &to_open).map_err(
+                |refusal| match refusal {
+                    crate::state::secure_string::OpenRefusal::Denied(message) => {
+                        GetParametersErrorModeled::AccessDeniedException(AccessDeniedException {
+                            message,
+                        })
+                    }
+                    crate::state::secure_string::OpenRefusal::Key(message) => {
+                        GetParametersErrorModeled::InvalidKeyId(InvalidKeyId {
+                            message: Some(message),
+                        })
+                    }
+                },
+            )?
+        {
+            if let Some(reported) = parameters.get_mut(at) {
+                reported.value = Some(plaintext);
+            }
+        }
+
+        // "The results for GetParameters requests are listed in alphabetical order in
+        // query responses" (`GetParametersRequest$Names`), so the answer is ordered by the
+        // name each parameter is reported under rather than by the order they were asked
+        // in; two selectors of one parameter report the one name, so the version a
+        // selector resolved to orders them. Sorted AFTER the values are opened, because
+        // what a decrypt reports is placed by the position it was collected at.
+        parameters.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.version.cmp(&right.version))
+        });
+
+        Ok(GetParametersOutput {
+            parameters: Some(parameters),
+            // Both lists are reported even when empty: `InvalidParameters` targets the
+            // same `ParameterNameList` the input's `Names` does, and that shape's 1..10
+            // length bounds how many names ONE CALL carries, so it says nothing about a
+            // batch read that resolved every name it was given.
+            invalid_parameters: Some(invalid_parameters),
+        })
     }
 }

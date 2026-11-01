@@ -31,6 +31,8 @@ mod parameter_metadata;
 mod parameter_not_found_payload;
 #[path = "all/parameter_store.rs"]
 mod parameter_store;
+#[path = "all/parameters_batch.rs"]
+mod parameters_batch;
 #[path = "all/parameters_by_path.rs"]
 mod parameters_by_path;
 #[path = "all/published_documents.rs"]
