@@ -1908,19 +1908,80 @@ pub fn parse_workflow_listing_page_token(kind: &str, token: &str, region: &str) 
     parse_scoped_page_token(kind, token, region).filter(|position| !position.is_empty())
 }
 
-/// The cursor key for a position in ONE workflow's run listing: the two
-/// components of a [`RunListingKey`], zero-padded so the key a cursor carries is
-/// fixed-width and orders the same way the tuple does, scoped to the workflow the
-/// walk is over.
-pub fn format_run_listing_key(workflow_arn: &str, key: RunListingKey) -> String {
+/// What separates the workflow from the version filter in the scope a run listing's
+/// cursor is bound to. A `WorkflowArn` carries exactly one `/`, before a resource id
+/// of `[a-zA-Z0-9][a-zA-Z0-9.\-_]{0,254}-[a-zA-Z0-9]{10}` (`smithy_query(query="shape",
+/// shape="WorkflowArn")`), so this infix cannot be part of the workflow it follows;
+/// it spells the selector the way the operation's own URI spells a version.
+const VERSION_FILTER_SCOPE_INFIX: &str = "/versions/";
+
+/// The scope suffix for the walk over EVERY version's runs — the one a request that
+/// names no version filter asks for.
+const UNFILTERED_VERSION_SCOPE: &str = "-";
+
+/// What a scope narrowed to ONE version writes before the version itself. A version
+/// selector is `^.+$`, i.e. any non-empty text, so the filtered and unfiltered forms
+/// are told apart by this leading marker rather than by the version's own characters:
+/// no filtered scope can read as the unfiltered one, whatever version is named.
+const NAMED_VERSION_SCOPE_MARKER: char = '=';
+
+/// The walk a run-listing cursor belongs to: the workflow whose runs it pages, AND the
+/// version filter that selects WHICH of that workflow's runs the walk reports.
+///
+/// A run listing's set is narrowed by a request member as well as by its parent — "If
+/// not specified, runs for all versions are returned"
+/// (`smithy_query(query="operation", operation="ListWorkflowRuns")`,
+/// `WorkflowVersion`) — so that filter is part of the scope: a cursor minted under one
+/// filter is then recognisable as not a position in the walk a request under another
+/// filter asks for, instead of being applied as a position in a sequence it says
+/// nothing about and silently dropping the runs that sort before it.
+fn run_listing_scope(workflow_arn: &str, workflow_version: Option<&str>) -> String {
+    let filter = match workflow_version {
+        None => UNFILTERED_VERSION_SCOPE.to_string(),
+        Some(version) => format!("{NAMED_VERSION_SCOPE_MARKER}{version}"),
+    };
+    format!("{workflow_arn}{VERSION_FILTER_SCOPE_INFIX}{filter}")
+}
+
+/// The cursor key for a position in ONE workflow's run listing under ONE version
+/// filter: the two components of a [`RunListingKey`], zero-padded so the key a cursor
+/// carries is fixed-width and orders the same way the tuple does, scoped to the walk
+/// it was issued for ([`run_listing_scope`]).
+pub fn format_run_listing_key(
+    workflow_arn: &str,
+    workflow_version: Option<&str>,
+    key: RunListingKey,
+) -> String {
     let (nanos, sequence) = key;
-    format_scoped_listing_key(workflow_arn, &format!("{nanos:039}.{sequence:020}"))
+    format_scoped_listing_key(
+        &run_listing_scope(workflow_arn, workflow_version),
+        &format!("{nanos:039}.{sequence:020}"),
+    )
+}
+
+/// The POSITION a cursor of `kind` carries for the walk over ONE workflow's runs under
+/// ONE version filter, as [`format_run_listing_key`] wrote it.
+///
+/// `None` when the token is not one this service issued, when it was issued for
+/// another of its lists, when it was issued on another workflow's runs or under
+/// another version filter, or when its key is malformed — each of which the listing
+/// refuses with [`invalid_page_token`], because none of them is a position in the walk
+/// being asked for.
+pub fn parse_run_listing_page_token(
+    kind: &str,
+    token: &str,
+    workflow_arn: &str,
+    workflow_version: Option<&str>,
+) -> Option<RunListingKey> {
+    let position =
+        parse_scoped_page_token(kind, token, &run_listing_scope(workflow_arn, workflow_version))?;
+    parse_run_listing_key(&position)
 }
 
 /// Read back the position part of a key [`format_run_listing_key`] wrote, as
 /// [`parse_scoped_page_token`] hands it over. `None` for anything else, which a
 /// listing refuses as a `ValidationException` just like a token it did not issue.
-pub fn parse_run_listing_key(position: &str) -> Option<RunListingKey> {
+fn parse_run_listing_key(position: &str) -> Option<RunListingKey> {
     let (nanos, sequence) = position.split_once('.')?;
     Some((nanos.parse().ok()?, sequence.parse().ok()?))
 }

@@ -10,9 +10,11 @@
 //! clock already owed — the teardown of a workflow past its `DELETING` span, the
 //! automated run of a workflow whose trigger has fired, and each run's own status
 //! schedule — so a read never changes what a later caller sees. The
-//! `NextToken` this operation returns for THIS workflow's run history is the only one it
-//! accepts back; anything else — a cursor of another list, of another workflow's runs, or
-//! one this service never issued — is refused as a `ValidationException`.
+//! `NextToken` this operation returns for THIS walk — this workflow's run history, under
+//! the `WorkflowVersion` filter that selects which of its runs the walk reports — is the
+//! only one it accepts back; anything else — a cursor of another list, of another
+//! workflow's runs, of the same runs under a different version filter, or one this
+//! service never issued — is refused as a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -214,28 +216,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the instant the store itself samples while held.
         let now = store.advance_clock();
 
+        // `WorkflowVersion` is a FILTER, not a resolution: "If not specified, runs for
+        // all versions are returned" (`smithy_query(query="operation",
+        // operation="ListWorkflowRuns")`, `WorkflowVersion`). A version no run carries
+        // therefore yields an empty page rather than a refusal. It also SELECTS the set
+        // this walk covers, so it is part of the walk a cursor belongs to, below.
+        let wanted_version = input.workflow_version.as_deref();
+
         // The cursor is the POSITION IN CREATION ORDER of the last item on the previous
         // page (`crate::state::WorkflowRun::listing_key`), not the identifier that run
         // is stored under: a run created between pages therefore sorts after the cursor
         // and is still reached by a later page, and a run removed between pages cannot
-        // restart the walk. It is also SCOPED to the workflow whose run history it was
-        // issued on: a cursor minted while walking another workflow's runs is not a
-        // position in this history, so honouring it would silently truncate or restart
-        // the listing — it is refused, exactly like a cursor issued for another of this
-        // service's lists or one this service never issued. Decoded BEFORE the workflow
-        // lookup so a cursor that is not this walk's is one refusal whatever the ARN
-        // resolves to.
+        // restart the walk. It is also SCOPED to the walk it was issued for — the
+        // workflow whose run history it pages AND the version filter that selects which
+        // of that workflow's runs the walk reports: a cursor minted while walking
+        // another workflow's runs, or the same workflow's runs under another filter, is
+        // not a position in the set being asked for, so honouring it would silently
+        // truncate or restart the listing — it is refused, exactly like a cursor issued
+        // for another of this service's lists or one this service never issued. Decoded
+        // BEFORE the workflow lookup so a cursor that is not this walk's is one refusal
+        // whatever the ARN resolves to.
         let after: Option<crate::state::RunListingKey> = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                crate::state::parse_scoped_page_token(PAGE_KIND, token, &input.workflow_arn)
-                    .as_deref()
-                    .and_then(crate::state::parse_run_listing_key)
-                    .ok_or_else(|| {
-                        ListWorkflowRunsErrorModeled::ValidationException(
-                            crate::state::invalid_page_token("ListWorkflowRuns"),
-                        )
-                    })?,
+                crate::state::parse_run_listing_page_token(
+                    PAGE_KIND,
+                    token,
+                    &input.workflow_arn,
+                    wanted_version,
+                )
+                .ok_or_else(|| {
+                    ListWorkflowRunsErrorModeled::ValidationException(
+                        crate::state::invalid_page_token("ListWorkflowRuns"),
+                    )
+                })?,
             ),
         };
 
@@ -262,12 +276,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // listing of this service shares (`crate::state::page_size`).
         let page_size = crate::state::page_size(input.max_results);
 
-        // `WorkflowVersion` is a FILTER, not a resolution: "If not specified, runs for
-        // all versions are returned" (`smithy_query(query="operation",
-        // operation="ListWorkflowRuns")`, `WorkflowVersion`). A version no run carries
-        // therefore yields an empty page rather than a refusal.
-        let wanted_version = input.workflow_version.as_deref();
-
         // The listing is a CHRONOLOGICAL view of the workflow's runs: oldest first by
         // the instant each run was created — the instant the summary itself reports as
         // `CreatedOn`/`StartedAt` — with the creation sequence separating two runs the
@@ -288,12 +296,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A token only when a further MATCHING page exists, so a client stops without an
         // extra empty round trip. It carries the position of the last run on this page
-        // and the workflow this walk is over, so the next page resumes immediately after
-        // it and only on this workflow's runs.
+        // and the walk that position is in — this workflow, under this version filter —
+        // so the next page resumes immediately after it, and only on the runs this same
+        // walk selects.
         let next_token = match page.last() {
             Some(last) if remaining.len() > page.len() => Some(crate::state::encode_page_token(
                 PAGE_KIND,
-                &crate::state::format_run_listing_key(&input.workflow_arn, last.listing_key()),
+                &crate::state::format_run_listing_key(
+                    &input.workflow_arn,
+                    wanted_version,
+                    last.listing_key(),
+                ),
             )),
             _ => None,
         };
