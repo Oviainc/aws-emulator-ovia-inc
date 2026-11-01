@@ -69,6 +69,8 @@ mod list_operation_events;
 mod list_operations;
 #[path = "all/operation_event_resources.rs"]
 mod operation_event_resources;
+#[path = "all/page_token_scope.rs"]
+mod page_token_scope;
 #[path = "all/pattern_violation_messages.rs"]
 mod pattern_violation_messages;
 #[path = "all/register_application_conditional_requirements.rs"]

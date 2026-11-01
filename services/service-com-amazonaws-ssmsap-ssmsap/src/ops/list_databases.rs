@@ -200,7 +200,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             matching,
             input.max_results,
             input.next_token.as_deref(),
-            crate::state::Listing::Databases,
+            crate::state::Listing::Databases {
+                region: &region,
+                application_id: input.application_id.as_deref(),
+                component_id: input.component_id.as_deref(),
+            },
         )
         .map_err(|error| {
             ListDatabasesErrorModeled::ValidationException(

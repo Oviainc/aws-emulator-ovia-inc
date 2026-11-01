@@ -222,7 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             matching,
             input.max_results,
             input.next_token.as_deref(),
-            crate::state::Listing::Operations,
+            crate::state::Listing::Operations {
+                region: &region,
+                application_id: &input.application_id,
+            },
         )
         .map_err(|error| {
             ListOperationsErrorModeled::ValidationException(

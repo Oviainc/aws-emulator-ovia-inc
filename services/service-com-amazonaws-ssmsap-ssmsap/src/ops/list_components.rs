@@ -225,7 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             candidates,
             input.max_results,
             input.next_token.as_deref(),
-            crate::state::Listing::Components,
+            crate::state::Listing::Components {
+                region: &region,
+                application_id: input.application_id.as_deref(),
+            },
         )
         .map_err(|error| {
             ListComponentsErrorModeled::ValidationException(

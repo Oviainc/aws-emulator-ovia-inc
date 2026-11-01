@@ -4738,56 +4738,163 @@ pub struct Page<T> {
 /// Why a listing refused its paging arguments.
 #[derive(Debug)]
 pub enum PageError {
-    /// `NextToken` was not a token this service issued.
+    /// `NextToken` was not a token this listing, over the scope the request named,
+    /// handed out.
     InvalidToken(String),
 }
 
-/// Which listing a continuation token belongs to.
+/// Which listing, taken over which scope, a continuation token belongs to.
 ///
-/// A token is opaque to a client, but it still names a position in ONE listing: a token
-/// handed out by one must not resume another, whose keys mean something else. So the
-/// listing is part of what the token marks ([`Listing::token_prefix`]).
+/// A token is opaque to a client, but it still names a position in ONE listing taken over
+/// ONE scope: its key is an item key of that listing, and it locates an item only among
+/// the items that scope reports. A token handed out by another listing, whose keys mean
+/// something else, or by the same listing over another scope, where the same key names a
+/// position among other items, must therefore be refused rather than resumed from — so
+/// the listing AND the values that narrow it are both part of what the token marks
+/// ([`Listing::token_prefix`]).
+///
+/// What narrows a listing is the regional endpoint it was taken at, since every record of
+/// this service belongs to one Region, plus the parent record or records the request
+/// named. A `Filters` member is NOT part of it: filtering drops items from a listing
+/// without changing the key order of the ones it keeps, so a key still names the same
+/// position and a walk that keeps its filters still reports every matching item exactly
+/// once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Listing {
-    /// `ListApplications`, whose keys are `ApplicationId`s.
-    Applications,
+pub enum Listing<'a> {
+    /// `ListApplications`, whose keys are `ApplicationId`s, over one Region.
+    Applications { region: &'a str },
     /// `ListComponents`, whose keys are (`ApplicationId`, `ComponentId`) pairs
-    /// ([`StoredComponent::page_key`]).
-    Components,
+    /// ([`StoredComponent::page_key`]), over one Region and the one application the
+    /// request named, if any.
+    Components {
+        region: &'a str,
+        application_id: Option<&'a str>,
+    },
     /// `ListDatabases`, whose keys are (`ApplicationId`, `DatabaseId`) pairs
-    /// ([`ApplicationDatabase::page_key`]).
-    Databases,
-    /// `ListOperations`, whose keys are `OperationId`s.
-    Operations,
-    /// `ListConfigurationCheckOperations`, whose keys are `OperationId`s.
-    ConfigurationCheckOperations,
+    /// ([`ApplicationDatabase::page_key`]), over one Region and the application and
+    /// component the request named, if any.
+    Databases {
+        region: &'a str,
+        application_id: Option<&'a str>,
+        component_id: Option<&'a str>,
+    },
+    /// `ListOperations`, whose keys are `OperationId`s, over the one application of one
+    /// Region the request named.
+    Operations {
+        region: &'a str,
+        application_id: &'a str,
+    },
+    /// `ListConfigurationCheckOperations`, whose keys are `OperationId`s, over the one
+    /// application of one Region the request named.
+    ConfigurationCheckOperations {
+        region: &'a str,
+        application_id: &'a str,
+    },
     /// `ListConfigurationCheckDefinitions`, whose keys are `ConfigurationCheckType`s.
+    /// The catalogue is the service's own, which neither a Region nor a record narrows,
+    /// so this listing has one scope.
     ConfigurationCheckDefinitions,
-    /// `ListOperationEvents`, whose keys are [`OperationEventRecord::page_key`]s.
-    OperationEvents,
-    /// `ListSubCheckResults`, whose keys are `SubCheckResultId`s.
-    SubCheckResults,
-    /// `ListSubCheckRuleResults`, whose keys are `RuleResultId`s.
-    SubCheckRuleResults,
+    /// `ListOperationEvents`, whose keys are [`OperationEventRecord::page_key`]s, over
+    /// the one operation record of one Region the request named.
+    OperationEvents {
+        region: &'a str,
+        operation_id: &'a str,
+    },
+    /// `ListSubCheckResults`, whose keys are `SubCheckResultId`s, over the one
+    /// configuration check operation of one Region the request named.
+    SubCheckResults {
+        region: &'a str,
+        operation_id: &'a str,
+    },
+    /// `ListSubCheckRuleResults`, whose keys are `RuleResultId`s, over the one sub-check
+    /// result of one Region the request named.
+    SubCheckRuleResults {
+        region: &'a str,
+        sub_check_result_id: &'a str,
+    },
 }
 
-impl Listing {
-    /// Marks a continuation token as this listing's, and at which version it was issued.
+/// How [`Listing::token_prefix`] writes a narrowing value a request did NOT carry — an
+/// optional `ApplicationId` or `ComponentId` left out, which widens the listing to every
+/// record of its Region. It is distinct from every present value, which is written with
+/// its length first, because no id the model admits is empty.
+const ABSENT_SCOPE_VALUE: &str = "-";
+
+impl<'a> Listing<'a> {
+    /// Marks a continuation token as this listing KIND's, and at which version it was
+    /// issued.
     ///
     /// Long enough on its own that the hex rendering of any token always satisfies the
     /// model's `NextToken` pattern (`^.{16,2048}$`, so at least 16 characters).
-    const fn token_prefix(self) -> &'static str {
+    const fn kind_marker(self) -> &'static str {
         match self {
-            Self::Applications => "ssmsap:applications:v1:",
-            Self::Components => "ssmsap:components:v1:",
-            Self::Databases => "ssmsap:databases:v1:",
-            Self::Operations => "ssmsap:operations:v1:",
-            Self::ConfigurationCheckOperations => "ssmsap:check-operations:v1:",
+            Self::Applications { .. } => "ssmsap:applications:v1:",
+            Self::Components { .. } => "ssmsap:components:v1:",
+            Self::Databases { .. } => "ssmsap:databases:v1:",
+            Self::Operations { .. } => "ssmsap:operations:v1:",
+            Self::ConfigurationCheckOperations { .. } => "ssmsap:check-operations:v1:",
             Self::ConfigurationCheckDefinitions => "ssmsap:check-definitions:v1:",
-            Self::OperationEvents => "ssmsap:operation-events:v1:",
-            Self::SubCheckResults => "ssmsap:sub-check-results:v1:",
-            Self::SubCheckRuleResults => "ssmsap:rule-results:v1:",
+            Self::OperationEvents { .. } => "ssmsap:operation-events:v1:",
+            Self::SubCheckResults { .. } => "ssmsap:sub-check-results:v1:",
+            Self::SubCheckRuleResults { .. } => "ssmsap:rule-results:v1:",
         }
+    }
+
+    /// The values that narrow what this listing reports, in a fixed order per kind: the
+    /// Region the request was signed for and the parent record or records it named, each
+    /// `None` when the request carried none.
+    fn scope(self) -> Vec<Option<&'a str>> {
+        match self {
+            Self::Applications { region } => ::std::vec![Some(region)],
+            Self::Components {
+                region,
+                application_id,
+            } => ::std::vec![Some(region), application_id],
+            Self::Databases {
+                region,
+                application_id,
+                component_id,
+            } => ::std::vec![Some(region), application_id, component_id],
+            Self::Operations {
+                region,
+                application_id,
+            }
+            | Self::ConfigurationCheckOperations {
+                region,
+                application_id,
+            } => ::std::vec![Some(region), Some(application_id)],
+            Self::ConfigurationCheckDefinitions => Vec::new(),
+            Self::OperationEvents {
+                region,
+                operation_id,
+            }
+            | Self::SubCheckResults {
+                region,
+                operation_id,
+            } => ::std::vec![Some(region), Some(operation_id)],
+            Self::SubCheckRuleResults {
+                region,
+                sub_check_result_id,
+            } => ::std::vec![Some(region), Some(sub_check_result_id)],
+        }
+    }
+
+    /// What every token of this listing, over this scope, begins with: the kind's own
+    /// marker and then each of its narrowing values ([`Listing::scope`]).
+    ///
+    /// Each present value is written with its byte length first, so the sequence is
+    /// self-delimiting and two different scopes cannot spell the same prefix however
+    /// their values read — the Region comes from the request's own credential scope, so
+    /// it is a value a caller chooses.
+    fn token_prefix(self) -> String {
+        let mut prefix = self.kind_marker().to_string();
+        for value in self.scope() {
+            match value {
+                Some(value) => prefix.push_str(&format!("{}:{value}", value.len())),
+                None => prefix.push_str(ABSENT_SCOPE_VALUE),
+            }
+        }
+        prefix
     }
 }
 
@@ -4819,13 +4926,15 @@ pub fn composite_page_key(outer: &str, inner: &str) -> String {
 /// `all` is every item that matches the request, paired with the key it is ordered by.
 /// The page holds at most `max_results` items starting at `next_token`, and carries a
 /// token only when further items remain — so a caller that follows tokens to exhaustion
-/// sees every item exactly once and the paging terminates. `listing` is which listing
-/// the token belongs to, so one listing's token is not resumed from by another.
+/// sees every item exactly once and the paging terminates. `listing` is which listing,
+/// over which scope, the token belongs to, so a token one listing issued is not resumed
+/// from by another, nor by the same listing over another scope, where its key would name
+/// a position among other items and silently drop every item sorting below it.
 pub fn page<T>(
     all: Vec<(String, T)>,
     max_results: Option<i32>,
     next_token: Option<&str>,
-    listing: Listing,
+    listing: Listing<'_>,
 ) -> Result<Page<T>, PageError> {
     let start = match next_token {
         None => None,
@@ -4862,19 +4971,21 @@ pub fn page_validation_exception(error: &PageError) -> ValidationException {
 
 /// Encode a listing key as the opaque `NextToken` that listing hands out.
 ///
-/// The key is prefixed with the listing's own version marker before hex-encoding, so
-/// the token is opaque to a client (it is not the resource id it was built from) AND a
-/// value this listing did not issue is refused rather than resumed from. It stays a pure
-/// function of the key, so the token is stable and carries no server-side cursor state.
-fn encode_page_token(key: &str, listing: Listing) -> String {
+/// The key is prefixed with the listing's own version marker and the scope the listing
+/// was taken over before hex-encoding, so the token is opaque to a client (it is not the
+/// resource id it was built from) AND a value this listing over this scope did not issue
+/// is refused rather than resumed from. It stays a pure function of the key and the
+/// scope, so the token is stable and carries no server-side cursor state.
+fn encode_page_token(key: &str, listing: Listing<'_>) -> String {
     ::hex::encode(format!("{}{key}", listing.token_prefix()))
 }
 
-/// The inverse of [`encode_page_token`]; `None` for anything this listing did not issue.
-fn decode_page_token(token: &str, listing: Listing) -> Option<String> {
+/// The inverse of [`encode_page_token`]; `None` for anything this listing, over this
+/// scope, did not issue.
+fn decode_page_token(token: &str, listing: Listing<'_>) -> Option<String> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
     decoded
-        .strip_prefix(listing.token_prefix())
+        .strip_prefix(&listing.token_prefix())
         .map(str::to_string)
 }
 

@@ -186,11 +186,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|sub_check_result| (sub_check_result.id.clone(), sub_check_result.view()))
             .collect();
 
+        // The page the request asked for, taken by the pager every listing of this
+        // service shares. The token it hands out is bound to this listing AND to the one
+        // run of the one Region it was taken over, so a token issued for another run is
+        // refused as the `ValidationException` this operation models rather than resumed
+        // from a key that names a position among another run's results.
         let page = crate::state::page(
             all,
             input.max_results,
             input.next_token.as_deref(),
-            crate::state::Listing::SubCheckResults,
+            crate::state::Listing::SubCheckResults {
+                region: &region,
+                operation_id: &input.operation_id,
+            },
         )
         .map_err(|error| {
             ListSubCheckResultsErrorModeled::ValidationException(

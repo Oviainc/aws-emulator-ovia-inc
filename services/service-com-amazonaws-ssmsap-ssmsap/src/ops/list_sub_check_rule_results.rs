@@ -186,7 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             all,
             input.max_results,
             input.next_token.as_deref(),
-            crate::state::Listing::SubCheckRuleResults,
+            crate::state::Listing::SubCheckRuleResults {
+                region: &region,
+                sub_check_result_id: &input.sub_check_result_id,
+            },
         )
         .map_err(|error| {
             ListSubCheckRuleResultsErrorModeled::ValidationException(
