@@ -216,6 +216,59 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Walk EVERY page of one paginated list projection and answer the elements it served,
+    /// in the order they were served.
+    async fn drain_list(
+        &self,
+        case: &str,
+        path: &str,
+        member: &str,
+        page_size: Option<i32>,
+    ) -> Vec<Value> {
+        let mut elements: Vec<Value> = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let mut query: Vec<String> = Vec::new();
+            if let Some(size) = page_size {
+                query.push(format!("pageSize={size}"));
+            }
+            if let Some(token) = &next_token {
+                query.push(format!("nextToken={token}"));
+            }
+            let uri = if query.is_empty() {
+                path.to_string()
+            } else {
+                format!("{path}?{}", query.join("&"))
+            };
+            let body = ok(case, 200, self.send("GET", &uri, None).await);
+            let page = body
+                .get(member)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_else(|| panic!("case {case:?}: expected a {member} list, got {body:?}"));
+            elements.extend(page);
+            next_token = body
+                .get("nextToken")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            if next_token.is_none() {
+                break;
+            }
+            assert!(
+                elements.len() <= PAGING_ELEMENT_CEILING,
+                "case {case:?}: paging must terminate, but it has already served {} elements",
+                elements.len()
+            );
+        }
+        elements
+    }
+}
+
+/// A bound on a paging walk in this suite, so a cursor that never ends fails the test
+/// instead of hanging: every row below creates far fewer resources than this.
+const PAGING_ELEMENT_CEILING: usize = 64;
+
 /// The id at `pointer` in a create response.
 fn id_at(case: &str, body: &Value, pointer: &str) -> String {
     at(case, body, pointer)
@@ -450,6 +503,151 @@ async fn timestamps_come_from_the_clock_not_from_the_request() {
              {created} after {previous}"
         );
         previous = *created;
+    }
+}
+
+/// The resource one paginated list projection enumerates: how to create it, where its
+/// detail object and its id live in the create response, and the projection that lists it.
+/// The `@pattern` on `ResourceName` (`^[ a-zA-Z0-9-_]*$`) is why every row's label below is
+/// free of punctuation: the labels become resource names.
+#[derive(Clone, Copy, Debug)]
+enum Resource {
+    Crl,
+    TrustAnchor,
+    Profile,
+}
+
+impl Resource {
+    /// The URI of the paginated list projection that enumerates this resource, and the
+    /// member of its response that carries the elements.
+    fn list(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Crl => ("/crls", "crls"),
+            Self::TrustAnchor => ("/trustanchors", "trustAnchors"),
+            Self::Profile => ("/profiles", "profiles"),
+        }
+    }
+
+    /// The JSON pointer to the detail object in a create response, and the member of that
+    /// object carrying the resource's id.
+    fn detail(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Crl => ("/crl", "crlId"),
+            Self::TrustAnchor => ("/trustAnchor", "trustAnchorId"),
+            Self::Profile => ("/profile", "profileId"),
+        }
+    }
+}
+
+/// Create `count` resources of one kind and answer them keyed by id, each with the detail
+/// object its create response carried.
+async fn seed(
+    client: &Client,
+    case: &str,
+    resource: Resource,
+    count: usize,
+) -> std::collections::BTreeMap<String, Value> {
+    // A CRL is imported against a trust anchor, so that one row needs an anchor first.
+    let anchor_arn = match resource {
+        Resource::Crl => {
+            let anchor = client.create_trust_anchor(&format!("{case} anchor")).await;
+            Some(id_at(case, &anchor, "/trustAnchor/trustAnchorArn"))
+        }
+        Resource::TrustAnchor | Resource::Profile => None,
+    };
+
+    let (pointer, id_member) = resource.detail();
+    let mut created = std::collections::BTreeMap::new();
+    for index in 0..count {
+        let name = format!("{case} {index}");
+        let body = match resource {
+            Resource::Crl => {
+                client
+                    .import_crl(
+                        &name,
+                        anchor_arn.as_deref().expect("a CRL row creates an anchor"),
+                    )
+                    .await
+            }
+            Resource::TrustAnchor => client.create_trust_anchor(&name).await,
+            Resource::Profile => client.create_profile(&name).await,
+        };
+        let id = id_at(case, &body, &format!("{pointer}/{id_member}"));
+        let detail = at(case, &body, pointer);
+        assert!(
+            created.insert(id.clone(), detail).is_none(),
+            "case {case:?}: every create must mint a distinct id, saw {id:?} twice"
+        );
+    }
+    created
+}
+
+/// EVERY element of EVERY page of a list projection carries its `date-time` members as
+/// ISO-8601 strings, and reports the instants the create stored — not only the first
+/// element of the first page, and not only for the operation a divergence was first seen
+/// on.
+///
+/// The rows vary what the rule generalises over: the list operation (so the element shape
+/// and its items member), the store size, and the page size — absent, one entry per page,
+/// several entries per page, and a page wider than the store — so an element served on a
+/// second and a later page is checked as well as the first.
+#[tokio::test]
+async fn every_element_of_every_list_page_carries_iso8601_timestamps() {
+    // (case, resource kind, store size, pageSize)
+    let rows: [(&str, Resource, usize, Option<i32>); 7] = [
+        ("ListCrls one per page", Resource::Crl, 3, Some(1)),
+        ("ListCrls two per page", Resource::Crl, 5, Some(2)),
+        ("ListCrls one page", Resource::Crl, 4, None),
+        ("ListCrls page wider than the store", Resource::Crl, 2, Some(100)),
+        ("ListTrustAnchors one per page", Resource::TrustAnchor, 3, Some(1)),
+        ("ListTrustAnchors one page", Resource::TrustAnchor, 2, None),
+        ("ListProfiles two per page", Resource::Profile, 5, Some(2)),
+    ];
+
+    for (case, resource, count, page_size) in rows {
+        // One emulator per row, so the store holds exactly what this row created.
+        let client = Client::new();
+        let created = seed(&client, case, resource, count).await;
+        let (path, member) = resource.list();
+        let id_member = resource.detail().1;
+
+        let elements = client.drain_list(case, path, member, page_size).await;
+        assert_eq!(
+            elements.len(),
+            created.len(),
+            "case {case:?}: the walk must serve every created resource once, expected {} \
+             elements, got {}",
+            created.len(),
+            elements.len()
+        );
+
+        for element in &elements {
+            let id = element
+                .get(id_member)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: a listed element carries no {id_member}: {element:?}")
+                })
+                .to_string();
+            let written = created
+                .get(&id)
+                .unwrap_or_else(|| panic!("case {case:?}: {id:?} was never created"));
+            let instants = iso8601_instants(case, element, &LIFECYCLE_TIMESTAMPS);
+            assert!(
+                instants[1].as_nanos() >= instants[0].as_nanos(),
+                "case {case:?}: {id:?} must not report an updatedAt before its createdAt, got \
+                 {instants:?}"
+            );
+            for stamp in LIFECYCLE_TIMESTAMPS {
+                let actual = element.get(stamp).cloned().unwrap_or(Value::Null);
+                let expected = written.get(stamp).cloned().unwrap_or(Value::Null);
+                assert_eq!(
+                    actual, expected,
+                    "case {case:?}: the listed element for {id:?} must report the {stamp} the \
+                     create wrote, got {actual:?}"
+                );
+            }
+        }
     }
 }
 
