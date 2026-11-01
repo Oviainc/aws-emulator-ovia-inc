@@ -33,6 +33,8 @@ mod approval_rules_and_commits;
 mod aws_error_message_text;
 #[path = "all/batch_associate_approval_rule_template.rs"]
 mod batch_associate_approval_rule_template;
+#[path = "all/batch_disassociate_approval_rule_template.rs"]
+mod batch_disassociate_approval_rule_template;
 #[path = "all/batch_get_repositories.rs"]
 mod batch_get_repositories;
 #[path = "all/batch_merge_conflict_descriptions.rs"]

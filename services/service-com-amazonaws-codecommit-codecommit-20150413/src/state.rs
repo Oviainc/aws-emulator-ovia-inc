@@ -611,6 +611,21 @@ pub fn repository_does_not_exist_message(name: &str) -> String {
     format!("{name} for {}", ::engine::emulator_account_id())
 }
 
+/// The per-entry `errorMessage` a batch operation reports for a repository name the
+/// account holds no repository for.
+///
+/// A batch call serves the request and reports each name that failed only through
+/// its own entry, so the entry carries the sentence CodeCommit words this cause
+/// with: fixed text whose one slot is the name the entry asked for, telling the
+/// caller what to do about it. The ONE place this crate words it, so the batch
+/// operations on either side of an association cannot word it differently. The
+/// top-level `RepositoryDoesNotExistException` a single-resource call answers is
+/// worded by [`repository_does_not_exist_message`] instead, so neither form can be
+/// mistaken for the other.
+pub fn batch_repository_not_found_message(name: &str) -> String {
+    format!("No repository with the name {name} was found. Please specify a valid repository name")
+}
+
 /// `ApprovalRuleTemplateDoesNotExistException`'s message, built from the requested
 /// template name — the one place this crate words that code, for the same reason
 /// [`repository_does_not_exist_message`] is the one place it words its own.

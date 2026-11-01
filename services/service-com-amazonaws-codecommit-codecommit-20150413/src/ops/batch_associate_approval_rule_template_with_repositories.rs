@@ -257,7 +257,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 errors.push(BatchAssociateApprovalRuleTemplateWithRepositoriesError2 {
                     repository_name: Some(name.clone()),
                     error_code: Some(ERROR_CODE_REPOSITORY_DOES_NOT_EXIST.to_string()),
-                    error_message: Some(crate::state::repository_does_not_exist_message(name)),
+                    // A per-entry failure is reported only through this message, so it
+                    // carries the sentence CodeCommit words this cause with, worded
+                    // for every batch operation in one place
+                    // (`crate::state::batch_repository_not_found_message`) — not the
+                    // top-level `RepositoryDoesNotExistException` wording, which is a
+                    // different form for a call that failed outright.
+                    error_message: Some(crate::state::batch_repository_not_found_message(name)),
                 });
                 continue;
             };

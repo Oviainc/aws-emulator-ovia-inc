@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDisassociateApprovalRuleTemplateFromRepositories
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDisassociateApprovalRuleTemplateFromRepositories`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: releases, for each DISTINCT repository name the request lists, the
+//! stored association between that repository and the named template — the same one
+//! record `AssociateApprovalRuleTemplateWithRepository` writes and
+//! `DisassociateApprovalRuleTemplateFromRepository` releases — and reports the name
+//! in `disassociatedRepositoryNames`, or, for a name the account holds no repository
+//! for, one `errors` entry naming it and its cause. The template is the whole call's
+//! precondition, so a name no template holds refuses the request and releases
+//! nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDisassociateApprovalRuleTemplateFromRepositories::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +95,25 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How many repository names one call may carry.
+///
+/// `MaximumRepositoryNamesExceededException` documents the limit itself: "The
+/// maximum number of allowed repository names was exceeded. Currently, this number
+/// is 100."
+/// (`smithy_query(query="shape",shape="MaximumRepositoryNamesExceededException")`).
+const MAX_REPOSITORY_NAMES: usize = 100;
+
+/// The `errorCode` this operation reports for a repository name the store holds no
+/// repository for.
+///
+/// `errorCode` is a plain string in this operation's error shape, but this model
+/// words the same per-entry codes of its sibling batch read as the EXCEPTION SHAPE
+/// NAME for the cause (`BatchGetRepositoriesErrorCodeEnum` declares
+/// `RepositoryDoesNotExistException` beside the encryption-key exceptions —
+/// `smithy_query(query="shape",shape="BatchGetRepositoriesErrorCodeEnum")`), so a
+/// per-entry code here is worded the same way.
+const ERROR_CODE_REPOSITORY_DOES_NOT_EXIST: &str = "RepositoryDoesNotExistException";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -171,18 +191,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDisassociateApprovalRuleTemplateFromRepositories` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDisassociateApprovalRuleTemplateFromRepositoriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing about releasing an association depends on WHO asked: the
+        // association is a membership of the repository's set, and neither side
+        // records a last-modified user for it.
+        let _ = ctx;
+
+        // Each name's length and pattern are modeled on `RepositoryNameList`'s
+        // member, so the boundary validator already refused anything outside them.
+        // The limit on the NUMBER of names is not modeled, and the service answers
+        // its own error for it — before any association is released, so an over-long
+        // request changes nothing.
+        if input.repository_names.len() > MAX_REPOSITORY_NAMES {
+            return Err(
+                BatchDisassociateApprovalRuleTemplateFromRepositoriesErrorModeled::MaximumRepositoryNamesExceededException(
+                    MaximumRepositoryNamesExceededException {
+                        message: Some(format!(
+                            "the maximum number of allowed repository names was exceeded: {} names were specified and the maximum is {MAX_REPOSITORY_NAMES}",
+                            input.repository_names.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `approvalRuleTemplateName` is `@required` and `@length` 1..100, so a
+        // missing, empty or over-long name is already refused at the request boundary
+        // (`crate::service::refusal_for`). What is left is the part of "template names
+        // must be between 1 and 100 valid characters in length" the model cannot
+        // express, decided in the one place this crate decides it.
+        if !crate::state::is_approval_rule_template_name(&input.approval_rule_template_name) {
+            return Err(
+                BatchDisassociateApprovalRuleTemplateFromRepositoriesErrorModeled::InvalidApprovalRuleTemplateNameException(
+                    InvalidApprovalRuleTemplateNameException {
+                        message: Some(crate::state::invalid_approval_rule_template_name_message(
+                            &input.approval_rule_template_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        // The TEMPLATE is the one side of the association the whole call stands on: a
+        // template the store does not hold fails the request outright, so nothing is
+        // released for any of the names. A repository name, by contrast, fails only
+        // its own entry — which is what makes this a batch operation and why the
+        // output carries a per-entry `errors` list beside the names it released.
+        if !store
+            .approval_rule_templates
+            .contains_key(&input.approval_rule_template_name)
+        {
+            return Err(
+                BatchDisassociateApprovalRuleTemplateFromRepositoriesErrorModeled::ApprovalRuleTemplateDoesNotExistException(
+                    ApprovalRuleTemplateDoesNotExistException {
+                        message: Some(
+                            crate::state::approval_rule_template_does_not_exist_message(
+                                &input.approval_rule_template_name,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One entry per name, in the order the request listed them. A repeated name
+        // names one repository, so it is released — and reported — once.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDisassociateApprovalRuleTemplateFromRepositories"))
+        // An EMPTY list is served, not refused: `repositoryNames`'s own documentation
+        // says "The array itself can be empty", and the modeled
+        // `RepositoryNamesRequiredException` covers the `@required` member being
+        // absent, which the boundary validator refuses before this handler runs.
+        let mut disassociated_repository_names: Vec<String> = Vec::new();
+        let mut errors: Vec<BatchDisassociateApprovalRuleTemplateFromRepositoriesError2> =
+            Vec::new();
+        let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+        for name in &input.repository_names {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            let Some(repository) = store.repositories.get_mut(name) else {
+                errors.push(BatchDisassociateApprovalRuleTemplateFromRepositoriesError2 {
+                    repository_name: Some(name.clone()),
+                    error_code: Some(ERROR_CODE_REPOSITORY_DOES_NOT_EXIST.to_string()),
+                    error_message: Some(crate::state::batch_repository_not_found_message(name)),
+                });
+                continue;
+            };
+
+            // "Removes the association between an approval rule template and one or
+            // more specified repositories": the ONE stored record of the association
+            // is dropped, exactly as the single-resource
+            // `DisassociateApprovalRuleTemplateFromRepository` drops it, which is what
+            // takes the template out of both listings and what stops
+            // `DeleteApprovalRuleTemplate` refusing it as in use. The model declares
+            // no error for a template this repository was never associated with, so
+            // releasing an association that is not there is the no-op the set makes
+            // it, and the name is still reported as released.
+            repository
+                .associated_templates
+                .remove(&input.approval_rule_template_name);
+            disassociated_repository_names.push(name.clone());
+        }
+
+        Ok(BatchDisassociateApprovalRuleTemplateFromRepositoriesOutput {
+            disassociated_repository_names,
+            errors,
+        })
     }
 }
