@@ -98,7 +98,9 @@
 //! until that change is approved and activated
 //! ([`ApprovalTeam::activate_pending_update`]). A team whose configuration has never been
 //! activated takes the change in place ([`ApprovalTeam::bump_version`]): it has no
-//! approved configuration to protect.
+//! approved configuration to protect. The handshake protects the CONFIGURATION, so a
+//! request that asks for no configuration member to change is served while a version
+//! waits: it asks the team's approvers nothing.
 //!
 //! # A deletion an active team has to approve
 //!
@@ -116,8 +118,8 @@
 //! ([`Approver::mfa_methods`]), which is what `GetApprovalTeam` reports per approver.
 //! A device is `OUT_OF_SYNC` until it is read back off the identity source
 //! ([`Approver::synchronize_mfa_devices`]), and `UpdateApprovalTeam`'s
-//! [`SYNCHRONIZE_MFA_DEVICES_ACTION`] is what asks for that, for every approver on the
-//! team ([`ApprovalTeam::synchronize_mfa_devices`]). No read synchronizes one.
+//! [`SYNCHRONIZE_MFA_DEVICES_ACTION`] is what asks for that, for every approver record
+//! the team holds ([`ApprovalTeam::synchronize_mfa_devices`]). No read synchronizes one.
 //!
 //! # Identity sources
 //!
@@ -1667,10 +1669,16 @@ impl ApprovalTeam {
         }
     }
 
-    /// Synchronize the MFA devices of EVERY approver on the team — the effect the
+    /// Synchronize the MFA devices of EVERY approver record on the team — the effect the
     /// `SYNCHRONIZE_MFA_DEVICES` update action asks for.
+    ///
+    /// A device belongs to the approver's IDENTITY, not to one version of the team, so the
+    /// records of both sets the team holds ([`ApprovalTeam::approver_records_mut`]) are
+    /// synchronized: an approver the team carries live and in the version it has been
+    /// asked to approve cannot be reported in sync under one and out of sync under the
+    /// other.
     pub fn synchronize_mfa_devices(&mut self) {
-        for approver in &mut self.approvers {
+        for approver in self.approver_records_mut() {
             approver.synchronize_mfa_devices();
         }
     }

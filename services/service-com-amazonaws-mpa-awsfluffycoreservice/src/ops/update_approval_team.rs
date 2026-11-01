@@ -27,9 +27,11 @@
 //! * An ARN outside the caller's own account is refused with `AccessDeniedException`
 //!   (403) BEFORE the lookup ([`crate::state::authorize_resource_arn`]); an ARN inside
 //!   it that no stored team carries earns `ResourceNotFoundException` (404).
-//! * A team already in `DELETING` cannot be changed: `ConflictException` (409). Neither
-//!   can a team that already has a version awaiting its approvers' approval — one change
-//!   at a time.
+//! * A team already in `DELETING` cannot be changed: `ConflictException` (409). So is a
+//!   second CHANGE to a team that already has a version awaiting its approvers' approval
+//!   — one change at a time. A request that names no configuration member asks those
+//!   approvers nothing, so it is not a second change and is served whatever version is
+//!   outstanding.
 //! * An `MofN` strategy asking for more approvals (M) than the team will have approvers
 //!   (N) earns `ValidationException` (400) — the same unsatisfiable combination
 //!   `CreateApprovalTeam` refuses, checked against the approver set the update produces.
@@ -55,8 +57,11 @@
 //! MFA devices of every approver on the team, which `GetApprovalTeam` reports per
 //! approver in `MfaMethods`. It changes no member of the configuration the team approved
 //! — it reads each approver's devices back off the identity source — so it takes effect
-//! where it is asked for rather than waiting on an approval. A request that carries no
-//! field and no action to apply leaves the team — and therefore its version — as it was.
+//! where it is asked for rather than waiting on an approval, including while a version is
+//! awaiting the team's approval: a device belongs to the approver's identity, so the
+//! records the live set and that version hold are synchronized alike. A request that
+//! carries no field and no action to apply leaves the team — and therefore its version —
+//! as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -259,9 +264,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Whether this request asks for the team's CONFIGURATION to change. An update
+        // action asks for no configuration member to change: it reads each approver's MFA
+        // devices back off the identity source, which is not a change the team's approvers
+        // have anything to approve.
+        let changes_configuration = input.description.is_some()
+            || input.approval_strategy.is_some()
+            || input.approvers.is_some();
+
         // One change at a time: a team already waiting on its approvers has a version it
-        // is moving to, and a second request would ask them to approve two.
-        if let Some(version_id) = outstanding_update {
+        // is moving to, and a second CHANGE would ask them to approve two. A request that
+        // asks for no configuration member to change asks them nothing, so it is not a
+        // second change — it is served, and what it does ask for takes effect where it was
+        // asked for.
+        if let Some(version_id) = outstanding_update.filter(|_| changes_configuration) {
             return Err(UpdateApprovalTeamErrorModeled::ConflictException(ConflictException {
                 message: crate::state::bounded_message(format!(
                     "Approval team '{}' already has version '{version_id}' awaiting the team's \
@@ -336,13 +352,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .any(|action| action == crate::state::SYNCHRONIZE_MFA_DEVICES_ACTION)
         });
-
-        // Whether this request asks for the team's CONFIGURATION to change. An update
-        // action asks for no configuration member to change: it reads each approver's MFA
-        // devices back off the identity source, which is not a change the team's approvers
-        // have anything to approve.
-        let changes_configuration =
-            input.description.is_some() || new_strategy.is_some() || input.approvers.is_some();
 
         // A change to the configuration an ACTIVE team's approvers approved has to be
         // approved by them too, so it is REQUESTED here rather than applied: the team
@@ -444,7 +453,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let team = state.team_mut(&input.arn).ok_or_else(not_found)?;
             // An update action is applied where it was asked for, to the team as it
-            // stands: it changes no member the team's approvers approved.
+            // stands: it changes no member the team's approvers approved. The set the
+            // change produces is synchronized above, because it is not on the team yet.
             if synchronize_mfa_devices {
                 team.synchronize_mfa_devices();
                 team.bump_version(now);
@@ -490,6 +500,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             team.approvers = approvers;
             applied = true;
         }
+        // An update action is applied where it was asked for, to every approver record the
+        // team holds — a device belongs to the approver's identity, so a version this team
+        // is still waiting on carries the same synchronized record its live set does.
         if synchronize_mfa_devices {
             team.synchronize_mfa_devices();
             applied = true;

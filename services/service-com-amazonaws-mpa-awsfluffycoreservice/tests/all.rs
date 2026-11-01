@@ -113,6 +113,8 @@ mod session_store_ceiling;
 mod state_roundtrip;
 #[path = "all/tag_write_rule_order.rs"]
 mod tag_write_rule_order;
+#[path = "all/update_while_a_version_is_outstanding.rs"]
+mod update_while_a_version_is_outstanding;
 #[path = "all/version_delete_refusal_statuses.rs"]
 mod version_delete_refusal_statuses;
 #[path = "all/write_path_input_validation.rs"]
