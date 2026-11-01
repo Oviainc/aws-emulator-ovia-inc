@@ -198,20 +198,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        let Some(inquiry) = store.inquiries.get_mut(&input.compliance_inquiry_id) else {
-            // Authorization of the targeted inquiry precedes the state lookup as far as a
-            // caller can tell: a well-formed id this account holds no inquiry for names no
-            // inquiry it may read, so the front door's refusal is what it sees — not the
-            // modelled 404, which would confirm the resource's absence. The same answer
-            // `GetComplianceInquiryMetadata` gives for the same id.
-            return Err(crate::scaffolded::Scaffolded::unauthorized());
-        };
-
-        // The only write a read may make: the transition the clock had already made due.
-        // It is what moves this inquiry's queries out of their non-terminal status, so a
-        // listing after the due instant reports the same terminal records every other
-        // reader of the inquiry sees.
-        inquiry.materialise(now);
+        // The one rule every inquiry-targeting operation of this service resolves its
+        // target by, decided in `crate::state`: a well-formed id this account holds no
+        // inquiry for is the front door's refusal — the same answer
+        // `GetComplianceInquiryMetadata` gives for the same id, and not the modelled 404,
+        // which would confirm the resource's absence — and the inquiry it does hold comes
+        // back with the transition the clock had already made due applied, which is what
+        // moves this inquiry's queries out of their non-terminal status, so a listing
+        // after the due instant reports the same records every other reader sees.
+        let inquiry = store
+            .targeted_inquiry_mut(&input.compliance_inquiry_id, now)
+            .map_err(crate::scaffolded::Scaffolded::FrontDoor)?;
 
         // The service's one page-walk rule: resume at the cursor's position in this
         // operation's own order — so a page is still served when the query it was cut

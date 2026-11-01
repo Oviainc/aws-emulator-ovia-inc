@@ -172,16 +172,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let Some(inquiry) = store.inquiries.get_mut(&input.compliance_inquiry_id) else {
-            // Authorization of the targeted inquiry precedes the state lookup as far as a
-            // caller can tell: a well-formed id this account holds no inquiry for names no
-            // inquiry it may read, so the front door's refusal is what it sees — not the
-            // modelled not-found, which would confirm the resource's absence.
-            return Err(crate::scaffolded::Scaffolded::unauthorized());
-        };
-
-        // The only write a read may make: the transition the clock had already made due.
-        inquiry.materialise(now);
+        // The one rule every inquiry-targeting operation of this service resolves its
+        // target by, decided in `crate::state`: a well-formed id this account holds no
+        // inquiry for names no inquiry it may read, so the front door's refusal is what it
+        // sees — not the modelled not-found, which would confirm the resource's absence —
+        // and the inquiry it does hold is handed back with the one write a read may make
+        // applied, the transition the clock had already made due.
+        let inquiry = store
+            .targeted_inquiry_mut(&input.compliance_inquiry_id, now)
+            .map_err(crate::scaffolded::Scaffolded::FrontDoor)?;
 
         Ok(GetComplianceInquiryMetadataOutput {
             compliance_inquiry_detail: Some(inquiry.to_detail()),

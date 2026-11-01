@@ -213,29 +213,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        let Some(inquiry) = store.inquiries.get_mut(&input.compliance_inquiry_id) else {
-            // Authorization of the targeted inquiry precedes the state lookup as far as a
-            // caller can tell: a well-formed id this account holds no inquiry for names no
-            // inquiry it may export, so the front door's refusal is what it sees — not the
-            // modelled 404, which would confirm the resource's absence. The same answer
-            // `GetComplianceInquiryMetadata` and `ListComplianceInquiryQueries` give for
-            // the same id.
-            ::tracing::info!(
-                target: "emulator::audit",
-                operation = "ExportComplianceInquiry",
-                akid = %akid,
-                region = %region,
-                compliance_inquiry_id = %input.compliance_inquiry_id,
-                outcome = "refused",
-                reason = "complianceInquiryId names no inquiry this account holds",
-                "state-changing operation"
-            );
-            return Err(crate::scaffolded::Scaffolded::unauthorized());
+        // The one rule every inquiry-targeting operation of this service resolves its
+        // target by, decided in `crate::state`: a well-formed id this account holds no
+        // inquiry for is the front door's refusal — the same answer
+        // `GetComplianceInquiryMetadata` and `ListComplianceInquiryQueries` give for the
+        // same id, and not the modelled 404, which would confirm the resource's absence —
+        // and the inquiry it does hold comes back with the only write this operation makes
+        // to the INQUIRY applied, the transition the clock had already made due. The
+        // export below is a new resource, not a change to it. The refusal is handed back
+        // rather than stated by the rule, which is what lets this attributable call record
+        // its outcome before answering.
+        let inquiry = match store.targeted_inquiry_mut(&input.compliance_inquiry_id, now) {
+            Ok(inquiry) => inquiry,
+            Err(refusal) => {
+                ::tracing::info!(
+                    target: "emulator::audit",
+                    operation = "ExportComplianceInquiry",
+                    akid = %akid,
+                    region = %region,
+                    compliance_inquiry_id = %input.compliance_inquiry_id,
+                    outcome = "refused",
+                    reason = "complianceInquiryId names no inquiry this account holds",
+                    "state-changing operation"
+                );
+                return Err(crate::scaffolded::Scaffolded::FrontDoor(refusal));
+            }
         };
-
-        // The only write this operation makes to the INQUIRY: the transition the clock
-        // had already made due. The export below is a new resource, not a change to it.
-        inquiry.materialise(now);
 
         // Read off the one stored record through the one tags projection every inquiry
         // operation answers with ([`crate::state::ComplianceInquiry::reported_tags`]), so

@@ -82,7 +82,7 @@
 //! reads it. Unlike a report, a customer-agreement belongs to the calling identity's
 //! ACCOUNT, which is what its ARN and its `awsAccountId` name.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -264,6 +264,18 @@ pub const INQUIRY_IDEMPOTENCY_CAPACITY: usize = 1_000;
 /// evicted: a record that was forgotten would let a response revision be rated a second
 /// time, which is exactly what a feedback record exists to prevent.
 pub const FEEDBACK_PER_INQUIRY_CAPACITY: usize = 1_000;
+
+/// How many units of work ONE submission can name — the bound the API itself states:
+/// `InquiryFileContent$fileSections` is `@length(min: 0, max: 30)`
+/// (`smithy_query(query="shape",shape="InquiryFileContent")`), and a text submission is
+/// one unit, so this is the most queries any inquiry owns.
+///
+/// Unlike [`INQUIRY_CAPACITY`] this is not an emulator-owned bound: the boundary validator
+/// already refuses a request naming more sections, which is why no handler has to. It is
+/// stated here, and applied where the records are built ([`InquiryContentRecord::work_units`]),
+/// so the set one request can materialise is bounded at its source rather than by the
+/// request shape alone.
+pub const QUERIES_PER_INQUIRY_CEILING: usize = 30;
 
 /// How many compliance-inquiry EXPORTS the store holds before the oldest is released.
 ///
@@ -869,7 +881,16 @@ impl InquiryContentRecord {
                 if sections.is_empty() {
                     vec![title.to_string()]
                 } else {
-                    sections.clone()
+                    // Held to the bound the API states ([`QUERIES_PER_INQUIRY_CEILING`]),
+                    // so what one request body can materialise here is bounded whatever
+                    // reaches this record: a request naming more sections than the member
+                    // admits is refused at the boundary and never gets here, so this
+                    // takes nothing away from any request the service serves.
+                    sections
+                        .iter()
+                        .take(QUERIES_PER_INQUIRY_CEILING)
+                        .cloned()
+                        .collect()
                 }
             }
         }
@@ -1263,10 +1284,13 @@ impl ComplianceInquiry {
     /// nothing else. In particular a query carries the `response` it has, which is null
     /// while nothing has generated one, rather than text no model wrote.
     pub fn export_document(&self, covered: &[i32], include_citations: bool) -> Vec<u8> {
+        // Which queries the export covers is asked once per query and once per feedback
+        // record, so the set is INDEXED once here rather than scanned for each question.
+        let covers: BTreeSet<i32> = covered.iter().copied().collect();
         let queries: Vec<::serde_json::Value> = self
             .queries
             .iter()
-            .filter(|query| covered.contains(&query.identifier))
+            .filter(|query| covers.contains(&query.identifier))
             .map(|query| {
                 let mut entry = ::serde_json::json!({
                     "queryIdentifier": query.identifier,
@@ -1300,7 +1324,7 @@ impl ComplianceInquiry {
             "includeCitations": include_citations,
             "queryIdentifiers": covered,
             "queries": queries,
-            "feedback": self.feedback_entries(covered),
+            "feedback": self.feedback_entries(&covers),
             "tags": self.tags,
         });
         // Pretty-printed: the document is what a caller downloads and reads, not a wire
@@ -1309,12 +1333,12 @@ impl ComplianceInquiry {
         ::serde_json::to_vec_pretty(&document).unwrap_or_default()
     }
 
-    /// The feedback this inquiry holds for the queries `covered` names, as the exported
+    /// The feedback this inquiry holds for the queries `covers` names, as the exported
     /// document reports it — read off the stored [`InquiryFeedback`] records, in the key
     /// order the store holds them in (the inquiry-wide entries first, then by ascending
     /// query identifier and response revision).
     ///
-    /// Filtered to `covered` for the same reason the `queries` list is: the document is a
+    /// Filtered to `covers` for the same reason the `queries` list is: the document is a
     /// report on the queries the export covers, so feedback on a query it does not cover
     /// is not part of it.
     ///
@@ -1322,13 +1346,13 @@ impl ComplianceInquiry {
     /// rather than a modelled shape — AWS states no format for the exported object — and
     /// it is the only place a caller can read the stored feedback back, because the model
     /// declares no operation that reports it.
-    fn feedback_entries(&self, covered: &[i32]) -> Vec<::serde_json::Value> {
+    fn feedback_entries(&self, covers: &BTreeSet<i32>) -> Vec<::serde_json::Value> {
         self.feedback
             .values()
             .filter(|entry| {
                 entry
                     .query_identifier
-                    .is_none_or(|identifier| covered.contains(&identifier))
+                    .is_none_or(|identifier| covers.contains(&identifier))
             })
             .map(|entry| {
                 ::serde_json::json!({
@@ -1755,6 +1779,40 @@ impl ComAmazonawsArtifactArtifactState {
             ReportRefusal::VersionNotFound(report_version_not_found(report_id, requested))
         })?;
         Ok((report, version))
+    }
+
+    /// The compliance inquiry a request TARGETS, brought up to date with the clock, when
+    /// the account holds it.
+    ///
+    /// The one rule every inquiry-targeting operation of this service resolves its target
+    /// by, in the two parts a caller can observe:
+    ///
+    /// 1. the stored inquiry set IS the account's entitlement, so an `InquiryId` it does
+    ///    not hold names no inquiry this account may reach and the answer is the front
+    ///    door's authorization refusal rather than a modelled not-found — exactly as a
+    ///    `reportId` the catalog does not publish is ([`Self::catalog_report`]), because
+    ///    this service never confirms whether a resource the caller cannot reach exists;
+    /// 2. the inquiry it DOES hold is materialised ([`ComplianceInquiry::materialise`])
+    ///    before it is handed back: the transition the clock already owed it was due at
+    ///    the stored instant whether or not anybody called, so every operation that
+    ///    resolves this target sees the same record.
+    ///
+    /// Decided here so the operations that only report the inquiry and the ones that go on
+    /// to record against it cannot disagree about the same `complianceInquiryId`. The
+    /// refusal is handed back for the caller to lift into its own error channel, exactly as
+    /// [`Self::catalog_report`] hands back its own — which is what lets an operation that
+    /// attributes its calls record the refusal before stating it.
+    pub fn targeted_inquiry_mut(
+        &mut self,
+        inquiry_id: &str,
+        now: SystemTime,
+    ) -> Result<&mut ComplianceInquiry, crate::scaffolded::FrontDoorRefusal> {
+        let inquiry = self
+            .inquiries
+            .get_mut(inquiry_id)
+            .ok_or_else(crate::scaffolded::FrontDoorRefusal::unauthorized)?;
+        inquiry.materialise(now);
+        Ok(inquiry)
     }
 
     /// The taggable resource `arn` names, for a WRITE to its tag set, or `None` when this
@@ -2506,7 +2564,9 @@ pub fn inquiry_arn(region: &str, inquiry_id: &str) -> String {
 // `UnauthorizedException` (`crate::scaffolded::Scaffolded::unauthorized`) rather than the
 // modelled 404, exactly as a `reportId` the catalog does not publish is — the gateway
 // authorizes the target before the state is consulted, so the absence of a resource the
-// caller may not read is never confirmed.
+// caller may not read is never confirmed. That judgement is made in ONE place
+// ([`ComAmazonawsArtifactArtifactState::targeted_inquiry_mut`]), so no operation targeting
+// an inquiry can answer it differently.
 
 /// The modelled `ConflictException` for a `clientToken` replayed on a request that is
 /// not the one it created an inquiry for.

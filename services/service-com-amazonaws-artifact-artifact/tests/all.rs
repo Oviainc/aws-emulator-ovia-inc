@@ -55,6 +55,8 @@ mod inquiry_last_modified;
 mod inquiry_query_identifier_rules;
 #[path = "all/inquiry_tags_reporting.rs"]
 mod inquiry_tags_reporting;
+#[path = "all/inquiry_target_resolution_rule.rs"]
+mod inquiry_target_resolution_rule;
 #[path = "all/inquiry_terminal_status_rule.rs"]
 mod inquiry_terminal_status_rule;
 #[path = "all/inquiry_write_audit.rs"]
