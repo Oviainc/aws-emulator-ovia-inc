@@ -216,12 +216,15 @@ async fn a_created_trusted_entity_set_is_read_back_from_stored_state() {
             "case {case:?}: expected tags {expected_tags:?}, got {:?}",
             got["tags"]
         );
-        // An absent `expectedBucketOwner` is reported as absent, not as an empty
-        // string.
+        // A create that named no `expectedBucketOwner` still reports one: the member is
+        // "the Amazon Web Services account ID that owns the Amazon S3 bucket specified
+        // in the location parameter", and a request that names none is uploading from a
+        // bucket of its own account — the account this emulator serves.
         if body.get("expectedBucketOwner").is_none() {
-            assert!(
-                got["expectedBucketOwner"].is_null(),
-                "case {case:?}: expected no expectedBucketOwner, got {:?}",
+            assert_eq!(
+                got["expectedBucketOwner"],
+                json!(engine::emulator_account_id()),
+                "case {case:?}: expected the owning account to be reported, got {:?}",
                 got["expectedBucketOwner"]
             );
         }

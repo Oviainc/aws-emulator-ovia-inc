@@ -197,11 +197,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // investigation" — nothing produced one, so there is none to
                 // report.
                 metadata: None,
-                cloud: Some(CloudDetails {
-                    provider: crate::state::CLOUD_PROVIDER.to_string(),
-                    region: investigation.region.clone(),
-                    account: investigation.triggered_by.clone(),
-                }),
+                // "Details about the cloud environment in which the investigation
+                // was performed"
+                // (`smithy_query(query="doc",shape="Investigation",member="Cloud")`):
+                // the member carries a DETAIL the investigation itself resolved,
+                // and this one has resolved none — nothing analysed the
+                // environment (see `crate::state::INVESTIGATION_ENGINE_UNAVAILABLE`)
+                // — so it stays absent rather than being rebuilt from the request's
+                // own endpoint context, which would assert a finding of the
+                // investigation that no investigation made.
+                cloud: None,
                 // The assessment members stay absent while no analysis produced
                 // one: see `crate::state::INVESTIGATION_ENGINE_UNAVAILABLE`.
                 risk_level: None,

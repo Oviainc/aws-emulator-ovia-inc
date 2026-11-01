@@ -230,17 +230,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         Ok(ListCoverageOutput {
-            // Present and empty when the account holds no covered resource: an empty
-            // list is the answer, and a client reads it the same way as a full one.
-            // The window `paginate_window` returned is within the row count it was
-            // given, and it is taken with a CHECKED read so that this report cannot
-            // panic even if that contract ever changes.
-            resources: rows
-                .get(window)
-                .unwrap_or_default()
-                .iter()
-                .map(crate::state::coverage::CoverageRow::reported)
-                .collect(),
+            // The rows of this page, and NO `resources` member at all on a page that
+            // carries none: a client that distinguishes an absent member from an empty
+            // list reads "no coverage row matched" from the absence. The window
+            // `paginate_window` returned is within the row count it was given, and it
+            // is taken with a CHECKED read so that this report cannot panic even if
+            // that contract ever changes.
+            resources: Some(
+                rows.get(window)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(crate::state::coverage::CoverageRow::reported)
+                    .collect::<Vec<_>>(),
+            )
+            .filter(|reported: &Vec<CoverageResource>| !reported.is_empty()),
             next_token,
         })
     }

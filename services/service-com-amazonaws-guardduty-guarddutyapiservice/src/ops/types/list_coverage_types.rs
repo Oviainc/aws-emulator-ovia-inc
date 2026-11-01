@@ -28,11 +28,90 @@ pub struct CoverageSortCriteria {
     pub order_by: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.guardduty#ListCoverageResponse")]
+/// `ListCoverageResponse`, with its schema and serializer written out rather than
+/// derived.
+///
+/// WHY: `Resources` is modelled `@required`, which the derive reads as "always on the
+/// wire" — it refuses an `Option<T>` field for such a member and writes the member
+/// unconditionally, so an empty page went out as `{"resources": []}`. The recorded AWS
+/// answer for a page that matches no coverage row carries no `resources` member at all,
+/// and the difference is observable: a client distinguishing "member absent" from
+/// "empty list" — to decide whether coverage has ever been computed — reads the wrong
+/// answer. So the list is held as an `Option` here and written only when the page
+/// carries a row.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape
+/// is an operation OUTPUT, which the server only ever serializes
+/// (`Operation::Output` requires `SerializableStruct`; only `Input` is deserialized).
 #[derive(Debug, Clone, Default)]
 pub struct ListCoverageOutput {
-    pub resources: Vec<CoverageResource>,
+    /// The rows this page carries, or `None` when it carries none.
+    pub resources: Option<Vec<CoverageResource>>,
     pub next_token: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl ListCoverageOutput {
+    /// The two members' own schemas, exactly as the derive emits them: each member's
+    /// shape id, wire kind, model name and position, plus the `@jsonName` the restJson1
+    /// codec resolves the key from (`smithy_query(operation="ListCoverage")`).
+    const M_RESOURCES: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.guardduty#ListCoverageResponse$Resources",
+            "com.amazonaws.guardduty",
+            "Resources",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "Resources",
+        0,
+    )
+    .with_json_name("resources");
+
+    const M_NEXT_TOKEN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.guardduty#ListCoverageResponse$NextToken",
+            "com.amazonaws.guardduty",
+            "NextToken",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "NextToken",
+        1,
+    )
+    .with_json_name("nextToken");
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.guardduty#ListCoverageResponse",
+            "com.amazonaws.guardduty",
+            "ListCoverageResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_RESOURCES, &Self::M_NEXT_TOKEN],
+    );
+}
+
+pub static LIST_COVERAGE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &ListCoverageOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ListCoverageOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(resources) = self.resources.as_ref() {
+            // A list of structures writes each element against the ELEMENT shape's own
+            // schema, as the derive does.
+            serializer.write_list(&Self::M_RESOURCES, &|elements| {
+                for resource in resources.iter() {
+                    elements.write_struct(&CoverageResource::SCHEMA, resource)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(next_token) = self.next_token.as_ref() {
+            serializer.write_string(&Self::M_NEXT_TOKEN, next_token.as_str())?;
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.guardduty#CoverageResource")]

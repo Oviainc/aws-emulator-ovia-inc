@@ -340,12 +340,15 @@ async fn an_update_replaces_only_the_members_it_carries() {
                     "case {case:?}: expected {member} {expected:?}, got {:?}",
                     got[member]
                 ),
-                // An `ExpectedBucketOwner` neither the create nor the update
-                // carried is reported as absent, not as an empty string.
-                None => assert!(
-                    got.get(member).is_none_or(Value::is_null),
-                    "case {case:?}: {member} must stay absent when neither the create nor the \
-                     update carried it, got {:?}",
+                // An `ExpectedBucketOwner` neither the create nor the update carried is
+                // still reported: the set knows which account owns the bucket its
+                // location names, and with no request naming one that is the account
+                // this emulator serves.
+                None => assert_eq!(
+                    got[member],
+                    json!(engine::emulator_account_id()),
+                    "case {case:?}: expected {member} to report the owning account when \
+                     neither the create nor the update carried it, got {:?}",
                     got[member]
                 ),
             }

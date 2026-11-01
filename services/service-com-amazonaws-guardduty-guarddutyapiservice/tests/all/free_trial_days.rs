@@ -100,15 +100,10 @@ const MODELLED_FEATURES: [&str; 12] = [
 /// The reported features whose trial has NOT begun for an account that enabled
 /// GuardDuty without naming any features.
 ///
-/// `RUNTIME_MONITORING` and `RDS_LOGIN_EVENTS` are the opt-in features such a create
-/// leaves DISABLED, and the Runtime Monitoring switch is the one that covers the EC2
-/// and Fargate runtime reports — so those three reports have their whole trial ahead
-/// of them while every other one's has started.
-const NOT_STARTED_AT_CREATE: [&str; 3] = [
-    "RDS_LOGIN_EVENTS",
-    "EC2_RUNTIME_MONITORING",
-    "FARGATE_RUNTIME_MONITORING",
-];
+/// `RUNTIME_MONITORING` is the one opt-in feature such a create leaves DISABLED, and
+/// its switch is the one that covers the EC2 and Fargate runtime reports — so those two
+/// reports have their whole trial ahead of them while every other one's has started.
+const NOT_STARTED_AT_CREATE: [&str; 2] = ["EC2_RUNTIME_MONITORING", "FARGATE_RUNTIME_MONITORING"];
 
 /// The `dataSources` nodes a report fills, paired with the reported feature whose
 /// trial governs each. The node paths are the `jsonName`s of `DataSourcesFreeTrial`
@@ -363,50 +358,48 @@ async fn days_remaining_is_the_whole_days_left_of_the_free_trial_window() {
 #[tokio::test]
 async fn a_feature_enabled_later_starts_its_own_free_trial() {
     const AGED_DAYS: i64 = 20;
-    // The opt-in features a bare create leaves DISABLED, and the reports each governs.
-    const ENABLED_LATER: [(&str, &[&str]); 2] = [
-        ("RDS_LOGIN_EVENTS", &["RDS_LOGIN_EVENTS"]),
-        (
-            "RUNTIME_MONITORING",
-            &["EC2_RUNTIME_MONITORING", "FARGATE_RUNTIME_MONITORING"],
-        ),
-    ];
+    // Runtime Monitoring is the ONE feature a bare create leaves off ("with an
+    // exception to RUNTIME_MONITORING, all the optional features are enabled by
+    // default"), so it is the switch whose window a later call starts; it governs the
+    // EC2 and Fargate runtime reports, and every other report's window is already
+    // running.
+    const SWITCH: &str = "RUNTIME_MONITORING";
+    const REPORTS: [&str; 2] = ["EC2_RUNTIME_MONITORING", "FARGATE_RUNTIME_MONITORING"];
 
-    for (switch, reports) in ENABLED_LATER {
-        let (router, engine, detector_id) = detector_over_engine().await;
-        let administrator = administrator();
-        age_trials(&engine, DEFAULT_REGION, &detector_id, None, AGED_DAYS);
-        // Runtime Monitoring already covers Amazon EKS, so the switch a bare create
-        // left ENABLED for EKS Runtime Monitoring goes off in the same call that
-        // enables it: the two cannot both end up enabled.
-        let mut switches = vec![(switch, "ENABLED")];
-        if switch == "RUNTIME_MONITORING" {
-            switches.push(("EKS_RUNTIME_MONITORING", "DISABLED"));
-        }
-        configure(&router, &detector_id, &switches).await;
+    let (router, engine, detector_id) = detector_over_engine().await;
+    let administrator = administrator();
+    age_trials(&engine, DEFAULT_REGION, &detector_id, None, AGED_DAYS);
+    // Runtime Monitoring already covers Amazon EKS, so the switch a bare create left
+    // ENABLED for EKS Runtime Monitoring goes off in the same call that enables it: the
+    // two cannot both end up enabled.
+    configure(
+        &router,
+        &detector_id,
+        &[(SWITCH, "ENABLED"), ("EKS_RUNTIME_MONITORING", "DISABLED")],
+    )
+    .await;
 
-        let body = free_trial_of(&router, &detector_id, &[&administrator]).await;
-        let account = account_of(&body, &administrator)
-            .unwrap_or_else(|| panic!("case {switch}: expected an account, got {body:?}"));
-        for report in reports {
-            assert_eq!(
-                days_for(&account, report),
-                FREE_TRIAL_DAYS,
-                "case {report}: a trial that began just now must report the whole window, got \
-                 {account:?}"
-            );
+    let body = free_trial_of(&router, &detector_id, &[&administrator]).await;
+    let account = account_of(&body, &administrator)
+        .unwrap_or_else(|| panic!("case {SWITCH}: expected an account, got {body:?}"));
+    for report in REPORTS {
+        assert_eq!(
+            days_for(&account, report),
+            FREE_TRIAL_DAYS,
+            "case {report}: a trial that began just now must report the whole window, got \
+             {account:?}"
+        );
+    }
+    for feature in REPORTED_FEATURES {
+        if REPORTS.contains(&feature) || NOT_STARTED_AT_CREATE.contains(&feature) {
+            continue;
         }
-        for feature in REPORTED_FEATURES {
-            if NOT_STARTED_AT_CREATE.contains(&feature) {
-                continue;
-            }
-            assert_eq!(
-                days_for(&account, feature),
-                FREE_TRIAL_DAYS - AGED_DAYS,
-                "case {feature}: enabling {switch} must not move a window already running, got \
-                 {account:?}"
-            );
-        }
+        assert_eq!(
+            days_for(&account, feature),
+            FREE_TRIAL_DAYS - AGED_DAYS,
+            "case {feature}: enabling {SWITCH} must not move a window already running, got \
+             {account:?}"
+        );
     }
 }
 

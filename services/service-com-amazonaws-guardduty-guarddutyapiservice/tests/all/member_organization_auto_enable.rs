@@ -65,8 +65,10 @@ pub(crate) const ORG_FEATURE_STATUSES: [(&str, bool); 3] =
 /// The features a member account starts DISABLED, before any organization setting or
 /// `UpdateMemberDetectors` moves them; every other reported feature starts
 /// `ENABLED`. These are the rows that DISCRIMINATE: an auto-enablement that lands
-/// changes what the member reports only for a feature whose default is off.
-pub(crate) const OPT_IN_FEATURES: [&str; 2] = ["RUNTIME_MONITORING", "RDS_LOGIN_EVENTS"];
+/// changes what the member reports only for a feature whose default is off. Runtime
+/// Monitoring is the one exception `CreateDetector` documents to "all the optional
+/// features are enabled by default".
+pub(crate) const OPT_IN_FEATURES: [&str; 1] = ["RUNTIME_MONITORING"];
 
 /// Every `OrgFeatureAdditionalConfiguration` member
 /// (`smithy_query(shape="OrgFeatureAdditionalConfiguration")`), each paired with a

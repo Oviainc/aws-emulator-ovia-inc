@@ -176,7 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CreateInvestigation";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_INVESTIGATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_INVESTIGATION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 202u16;
+    /// The status GuardDuty answers an accepted investigation with. The model's
+    /// `@http` trait for this operation declares `202`
+    /// (`smithy_query(operation="CreateInvestigation")`), but the recorded AWS
+    /// answer is a plain `200`, and the status a client sees is a wire
+    /// requirement: the recording is what this emulator reproduces.
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,

@@ -272,7 +272,13 @@ impl Listed {
             status, 200,
             "case {case:?}: expected 200 from {self:?}, got {status} {body:?}"
         );
-        let next = body["nextToken"].as_str().map(str::to_string);
+        // A listing reports no token once its last page is reached; `GetUsageStatistics`
+        // reports the terminal one as the EMPTY string instead, which names no page
+        // either, so both read as "there is no page after this one".
+        let next = body["nextToken"]
+            .as_str()
+            .filter(|next| !next.is_empty())
+            .map(str::to_string);
         (self.entries(&body, case), next)
     }
 }

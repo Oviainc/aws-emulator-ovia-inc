@@ -1426,14 +1426,13 @@ pub const RESERVED_TAG_PREFIX: &str = "aws:";
 /// The optional features a bare `CreateDetector` leaves DISABLED — the ones a
 /// detector reports only once a request asks for them.
 ///
-/// Runtime Monitoring is the exception `CreateDetector` documents: "When you don't
-/// specify any features, with an exception to RUNTIME_MONITORING, all the optional
-/// features are enabled by default"
-/// (`smithy_query(query="doc",shape="CreateDetector")`). RDS Protection is opt-in
-/// the same way: the recorded wire for a freshly created detector reports
-/// `dataSources.database.rds.databaseEvents` DISABLED while every other data source
-/// reports ENABLED.
-pub const OPT_IN_FEATURES: [&str; 2] = [FEATURE_RUNTIME_MONITORING, FEATURE_RDS_LOGIN_EVENTS];
+/// Runtime Monitoring is the ONE exception `CreateDetector` documents: "When you
+/// don't specify any features, with an exception to RUNTIME_MONITORING, all the
+/// optional features are enabled by default"
+/// (`smithy_query(query="doc",shape="CreateDetector")`). Every other configurable
+/// feature — RDS Protection included — is therefore enabled on a detector created
+/// without a `Features` list, and reports so under both views of its switch.
+pub const OPT_IN_FEATURES: [&str; 1] = [FEATURE_RUNTIME_MONITORING];
 
 /// The three data sources GuardDuty always consumes for a detector — CloudTrail
 /// management events, VPC flow logs and DNS logs.
@@ -1898,6 +1897,28 @@ pub fn expected_bucket_owner_rejection(owner: Option<&str>) -> Option<String> {
     owner
         .is_some_and(|owner| !is_account_id(owner))
         .then(|| invalid_parameter_message(LIST_EXPECTED_BUCKET_OWNER_MEMBER))
+}
+
+/// The account that owns the S3 bucket an ENTITY SET's location names: the one the
+/// request supplied, or the account that owns the location when it supplied none.
+///
+/// `GetThreatEntitySet` and `GetTrustedEntitySet` report `ExpectedBucketOwner` as
+/// "the Amazon Web Services account ID that owns the Amazon S3 bucket specified in
+/// the location parameter"
+/// (`smithy_query(query="doc",shape="GetThreatEntitySetResponse",member="ExpectedBucketOwner")`)
+/// with no qualification on how the set was created — unlike `GetIPSet` and
+/// `GetThreatIntelSet`, whose own documentation for the same member adds "this
+/// field appears in the response only if it was provided during … creation or
+/// update". So an entity set always KNOWS its bucket owner: a request that names
+/// none is uploading from a bucket of its own account, which is the single account
+/// this emulator serves ([`administrator_account_id`]), and that is what a read
+/// reports and an update round-trips.
+pub fn entity_set_bucket_owner(requested: Option<&str>) -> Option<String> {
+    Some(
+        requested
+            .map(str::to_string)
+            .unwrap_or_else(administrator_account_id),
+    )
 }
 
 /// The DISTINCT entries of an id list a request carried, in the order the request
@@ -4227,10 +4248,6 @@ pub fn investigations_available_in(region: &str) -> bool {
 pub const INVESTIGATION_REGION_MESSAGE: &str =
     "The request is rejected because GuardDuty Investigation is not available in the current Region.";
 
-/// `CloudProvider`, the only value the enum carries: "The cloud provider.
-/// Currently, only AWS is supported" (`smithy_query(shape="CloudDetails")`).
-pub const CLOUD_PROVIDER: &str = "AWS";
-
 /// The message `GetInvestigation` answers an `InvestigationId` this detector does
 /// not hold with. GuardDuty does not echo the caller's id back, so this names the
 /// resource class only.
@@ -4668,6 +4685,10 @@ impl EntitySetRecord {
     /// which is settled, so nothing is owed on it until an update activates it.
     ///
     /// Nothing failed, so a created set carries no [`Self::error_details`].
+    ///
+    /// The bucket owner the record keeps is resolved through
+    /// [`entity_set_bucket_owner`], so a set created without one still knows which
+    /// account owns the location it was uploaded from.
     #[allow(clippy::too_many_arguments)]
     pub fn created(
         id: String,
@@ -4693,7 +4714,7 @@ impl EntitySetRecord {
             name,
             format,
             location,
-            expected_bucket_owner,
+            expected_bucket_owner: entity_set_bucket_owner(expected_bucket_owner.as_deref()),
             tags,
             client_token,
             status: status.to_string(),
@@ -8422,15 +8443,16 @@ pub fn scan_criterion_record(
         .unwrap_or_default()
 }
 
-/// Project one stored `ScanCriterion` back onto the wire shape, or `None` when the
-/// detector carries no criterion of that kind: `Include` and `Exclude` are both
-/// optional, so an absent one is reported as absent rather than as an empty map.
+/// Project one stored `ScanCriterion` back onto the wire shape.
+///
+/// `ScanResourceCriteria` carries BOTH its criteria on every read: a detector with
+/// no criterion of that kind reports the criterion as an empty map rather than
+/// leaving the member out, so a client that reads one to add a condition — and
+/// round-trips the read into `UpdateMalwareScanSettings` — finds the map it is
+/// about to write into already there.
 pub fn scan_criterion_shape(
     record: &ScanCriterionRecord,
 ) -> Option<std::collections::HashMap<String, crate::ops::types::ScanCondition>> {
-    if record.is_empty() {
-        return None;
-    }
     Some(
         record
             .iter()

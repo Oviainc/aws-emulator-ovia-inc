@@ -256,7 +256,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetUsageStatisticsOutput {
             usage_statistics: Some(usage_statistics),
-            next_token,
+            // The token is reported on EVERY page of this report, the terminal page
+            // included, where it is the empty string: `NextToken` is this
+            // operation's `@paginated` outputToken
+            // (`smithy_query(operation="GetUsageStatistics")`) and GuardDuty answers
+            // it with a position while one remains and with an empty position once
+            // none does, so a caller that reads the member unconditionally finds it
+            // and one that loops while it is non-empty terminates.
+            next_token: Some(next_token.unwrap_or_default()),
         })
     }
 }

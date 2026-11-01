@@ -158,11 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetMasterAccountOutput {
-            // `Master` is `@required` but every one of its members is optional, so
-            // an account no administrator monitors reports the shape with nothing
-            // in it. That is the observable difference a caller switches on —
-            // `Master.AccountId` absent means "no administrator" — and it is why
-            // nothing here is defaulted to a value.
+            // Reported as the relationship when there is one and as `null` when there
+            // is none: that VALUE is what tells a caller whether this account is
+            // monitored, where an empty object would read as "there is an
+            // administrator".
             master: detector
                 .administrator
                 .as_ref()
@@ -174,8 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // (`smithy_query(shape="Master")`), rendered the way every
                     // other instant this service reports as text is.
                     invited_at: Some(crate::state::iso8601(administrator.invited_at_millis)),
-                })
-                .unwrap_or_default(),
+                }),
         })
     }
 }

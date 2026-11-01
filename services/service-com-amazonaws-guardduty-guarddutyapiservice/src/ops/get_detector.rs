@@ -205,26 +205,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         updated_at: Some(::aws_smithy_types::DateTime::from_millis(
                             feature.updated_at_millis,
                         )),
-                        additional_configuration: if feature.additional_configuration.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                feature
-                                    .additional_configuration
-                                    .iter()
-                                    .map(|cfg| DetectorAdditionalConfigurationResult {
-                                        name: Some(cfg.name.clone()),
-                                        status: Some(cfg.status.clone()),
-                                        updated_at: Some(
-                                            ::aws_smithy_types::DateTime::from_millis(
-                                                cfg.updated_at_millis,
-                                            ),
-                                        ),
-                                        managed_by: None,
-                                    })
-                                    .collect(),
-                            )
-                        },
+                        // Every reported feature carries the member: a feature
+                        // GuardDuty holds no additional configuration for carries
+                        // it EMPTY, so feature-configuration code that reads it
+                        // never faces a missing key and can round-trip the read
+                        // into `UpdateDetector`.
+                        additional_configuration: Some(
+                            feature
+                                .additional_configuration
+                                .iter()
+                                .map(|cfg| DetectorAdditionalConfigurationResult {
+                                    name: Some(cfg.name.clone()),
+                                    status: Some(cfg.status.clone()),
+                                    updated_at: Some(::aws_smithy_types::DateTime::from_millis(
+                                        cfg.updated_at_millis,
+                                    )),
+                                    managed_by: None,
+                                })
+                                .collect(),
+                        ),
                         managed_by: None,
                     })
                     .collect(),

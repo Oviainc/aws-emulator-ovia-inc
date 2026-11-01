@@ -12,7 +12,9 @@
 //! [`crate::state::coverage`], shared with the operation that lists them, so the count
 //! and the list cannot disagree about one resource. This file turns them into this
 //! operation's own `CoverageStatistics` answer: one map per `CoverageStatisticsType`
-//! the request names, and no map it did not name.
+//! the request names, and no map it did not name. Each map it does name carries one
+//! entry per group of its dimension, counting zero for a group no covered resource
+//! falls into.
 //!
 //! An unknown detector id is refused with `BadRequestException`, and so is a
 //! `statisticsType` or criterion key this service's model does not carry — silently
@@ -206,6 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .contains(&COUNT_BY_RESOURCE_TYPE)
                     .then(|| {
                         counted(
+                            crate::ops::types::shared_types::RESOURCE_TYPE_VALUES,
                             rows.iter()
                                 .map(crate::state::coverage::CoverageRow::resource_type),
                         )
@@ -214,6 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .contains(&COUNT_BY_COVERAGE_STATUS)
                     .then(|| {
                         counted(
+                            crate::ops::types::shared_types::COVERAGE_STATUS_VALUES,
                             rows.iter()
                                 .map(crate::state::coverage::CoverageRow::coverage_status),
                         )
@@ -270,17 +274,25 @@ fn requested_statistics(requested: &[String]) -> Result<Vec<&str>, GetCoverageSt
     Ok(kinds)
 }
 
-/// How many covered resources fall into each group, keyed by the group.
+/// How many covered resources fall into each group of one DIMENSION, keyed by the
+/// group.
 ///
-/// A group no covered resource falls into is NOT an entry: the map counts the resources
-/// the account holds, so a key with no resource behind it would claim this service
-/// observed something it did not. An account whose covered resources are all filtered
-/// out therefore gets the empty map — present, because the statistic was asked for.
+/// The map carries one entry per group the dimension HAS — `dimension` is the member
+/// list of the enum the map is keyed by (`CountByResourceType` is keyed by
+/// `ResourceType` and `CountByCoverageStatus` by `CoverageStatus`,
+/// `smithy_query(shape="CountByResourceType")`) — so a group no covered resource falls
+/// into counts zero rather than being left out: the statistic is a count over the whole
+/// dimension, and a client that indexes one group reads a number whatever the account
+/// holds. A group outside the dimension is still counted, so a row this service learns
+/// to report is never dropped silently.
 fn counted<'rows>(
+    dimension: &[&str],
     groups: impl Iterator<Item = &'rows str>,
 ) -> ::std::collections::HashMap<String, i64> {
-    let mut counts: ::std::collections::HashMap<String, i64> =
-        ::std::collections::HashMap::new();
+    let mut counts: ::std::collections::HashMap<String, i64> = dimension
+        .iter()
+        .map(|group| ((*group).to_string(), 0))
+        .collect();
     for group in groups {
         let count = counts.entry(group.to_string()).or_insert(0);
         *count = count.saturating_add(1);

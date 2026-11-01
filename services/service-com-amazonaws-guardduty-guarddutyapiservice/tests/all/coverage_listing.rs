@@ -11,10 +11,11 @@
 //!
 //! 1. A `detectorId` this account/Region does not hold is refused with the modelled
 //!    `BadRequestException` envelope, never answered with a hollow 200.
-//! 2. A detector the account DOES hold is answered 200 with the `resources` member
-//!    PRESENT — empty when no covered resource is reachable — and no `nextToken`, for
-//!    every criterion key, sort key and order the model carries, and whatever the
-//!    detector's Runtime Monitoring configuration is.
+//! 2. A detector the account DOES hold is answered 200 with the rows it can reach and
+//!    no `nextToken`, for every criterion key, sort key and order the model carries,
+//!    and whatever the detector's Runtime Monitoring configuration is. A page that
+//!    matches no coverage row carries NO `resources` member at all, so a client can
+//!    tell "nothing matched" from "coverage has rows".
 //! 3. A `criterionKey`, `attributeName` or `orderBy` the model does not carry is
 //!    REFUSED, naming the member at fault: silently ignoring one would answer with
 //!    resources the caller asked to exclude. So is a criterion that names no key at
@@ -95,16 +96,28 @@ async fn coverage_ok(router: &Router, detector_id: &str, body: Value, case: &str
     response
 }
 
-/// The `resources` list an answer carries, failing the test when the member is absent:
-/// `Resources` is `@required` (`smithy_query(operation="ListCoverage")`), so an empty
-/// report still carries the list.
+/// The `resources` rows an answer carries.
+///
+/// The member is reported only on a page that carries a row: a page matching no
+/// coverage row carries no `resources` member at all, so an absent member IS the empty
+/// page, and a member that is present must carry at least one row.
 fn resources(response: &Value, case: &str) -> Vec<Value> {
-    response["resources"]
-        .as_array()
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: expected a resources list, got {response:?}")
-        })
-        .clone()
+    match response.get("resources") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => {
+            let rows = value
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: expected a resources list, got {response:?}")
+                })
+                .clone();
+            assert!(
+                !rows.is_empty(),
+                "case {case:?}: an empty page carries no resources member at all, got {response:?}"
+            );
+            rows
+        }
+    }
 }
 
 /// Assert one refusal: HTTP 400 under the modelled envelope, with a message stating

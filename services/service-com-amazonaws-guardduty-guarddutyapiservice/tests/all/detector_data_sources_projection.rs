@@ -34,8 +34,8 @@ use super::detector_lifecycle::{call, create_detector, new_router, Router};
 /// nested result shapes (`smithy_query(shape="DataSourceConfigurationsResult")`);
 /// the feature names are `DetectorFeature` members
 /// (`smithy_query(shape="DetectorFeature")`). `database.rds.databaseEvents` is the
-/// data-source view of RDS Protection, which watches Amazon RDS login activity and
-/// is opt-in, so a bare create leaves it DISABLED.
+/// data-source view of RDS Protection, which watches Amazon RDS login activity; it is
+/// one of the optional features a bare create enables, so it starts ENABLED.
 const GOVERNED_NODES: [(&str, &[&str], &str); 4] = [
     ("S3_DATA_EVENTS", &["s3Logs"], "ENABLED"),
     ("EKS_AUDIT_LOGS", &["kubernetes", "auditLogs"], "ENABLED"),
@@ -47,13 +47,14 @@ const GOVERNED_NODES: [(&str, &[&str], &str); 4] = [
     (
         "RDS_LOGIN_EVENTS",
         &["database", "rds", "databaseEvents"],
-        "DISABLED",
+        "ENABLED",
     ),
 ];
 
 /// The optional features a bare create leaves DISABLED; every other reported
-/// feature starts ENABLED.
-const OPT_IN_FEATURES: [&str; 2] = ["RUNTIME_MONITORING", "RDS_LOGIN_EVENTS"];
+/// feature starts ENABLED. Runtime Monitoring is the one exception `CreateDetector`
+/// documents to "all the optional features are enabled by default".
+const OPT_IN_FEATURES: [&str; 1] = ["RUNTIME_MONITORING"];
 
 /// The data sources GuardDuty always consumes: no `DetectorFeature` member and no
 /// `DataSourceConfigurations` member names them, so nothing can switch them off.

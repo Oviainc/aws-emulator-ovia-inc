@@ -166,7 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetAdministratorAccountOutput {
             // The same facts `GetMasterAccount` reports under `Master`, off the one
-            // stored relationship, so the two reads cannot disagree.
+            // stored relationship, so the two reads cannot disagree — the member
+            // included, which is reported as the relationship when there is one and as
+            // `null` when there is none: that VALUE is what tells a caller whether this
+            // account has an administrator.
             administrator: detector
                 .administrator
                 .as_ref()
@@ -178,8 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // (`smithy_query(shape="Administrator")`), rendered the way
                     // every other instant this service reports as text is.
                     invited_at: Some(crate::state::iso8601(administrator.invited_at_millis)),
-                })
-                .unwrap_or_default(),
+                }),
         })
     }
 }

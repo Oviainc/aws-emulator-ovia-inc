@@ -205,6 +205,8 @@ mod publishing_destination_lifecycle;
 mod publishing_destination_listing;
 #[path = "all/publishing_destination_update.rs"]
 mod publishing_destination_update;
+#[path = "all/read_response_member_sets.rs"]
+mod read_response_member_sets;
 #[path = "all/refusal_message_texts.rs"]
 mod refusal_message_texts;
 #[path = "all/refused_create_clock.rs"]

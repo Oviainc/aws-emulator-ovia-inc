@@ -15,9 +15,10 @@
 //!    map it does not name: both members of `CoverageStatistics` are optional, so a
 //!    statistic nobody asked for is absent rather than reported.
 //! 3. Each map counts the covered resources the request's `filterCriteria` admit, with
-//!    one entry per group at least one of them falls into — so where no covered
-//!    resource is reachable the map is present and EMPTY rather than carrying invented
-//!    or zero-filled keys.
+//!    one entry per group of the map's own DIMENSION — the members of the enum it is
+//!    keyed by — so a group no covered resource falls into counts 0 rather than being
+//!    left out: a dashboard that indexes one group reads a number whatever the account
+//!    holds.
 //! 4. A `statisticsType` or `criterionKey` this service's model does not carry is
 //!    REFUSED, naming the member at fault: silently ignoring one would answer with a
 //!    count over resources the caller asked to exclude, or with a missing map a client
@@ -115,19 +116,40 @@ fn assert_refusal(case: &str, status: u16, response: &Value, expected: &str) {
     );
 }
 
+/// Every `ResourceType` member (`smithy_query(shape="ResourceType")`) and every
+/// `CoverageStatus` member (`smithy_query(shape="CoverageStatus")`): the groups of the
+/// dimension each statistic is keyed by, so each map carries exactly these keys.
+const DIMENSIONS: [(&str, &[&str]); 2] = [
+    ("countByResourceType", &["EC2", "ECS", "EKS"]),
+    ("countByCoverageStatus", &["HEALTHY", "UNHEALTHY"]),
+];
+
 /// Assert that `reported` carries exactly the maps `named` asks for, each of them
-/// present and counting nothing (this router can reach no inventory), and that every
-/// other map is absent.
+/// carrying its whole dimension and counting 0 in every group (this router can reach no
+/// inventory), and that every other map is absent.
 fn assert_maps(case: &str, reported: &Value, named: &[&str]) {
     for (kind, member) in STATISTICS {
         if named.contains(&kind) {
             let map = reported[member].as_object().unwrap_or_else(|| {
                 panic!("case {case:?}: expected the map {member} to be present, got {reported:?}")
             });
-            assert!(
-                map.is_empty(),
-                "case {case:?}: no covered resource is reachable, so {member} counts none, got {reported:?}"
+            let groups = DIMENSIONS
+                .iter()
+                .find(|(name, _)| *name == member)
+                .map(|(_, groups)| *groups)
+                .unwrap_or_else(|| panic!("case {case:?}: {member} has no dimension here"));
+            assert_eq!(
+                map.len(),
+                groups.len(),
+                "case {case:?}: expected one {member} entry per group of its dimension {groups:?}, got {reported:?}"
             );
+            for group in groups {
+                assert_eq!(
+                    map.get(*group).and_then(Value::as_i64),
+                    Some(0),
+                    "case {case:?}: no covered resource is reachable, so {member}.{group} counts 0, got {reported:?}"
+                );
+            }
         } else {
             assert_eq!(
                 reported[member],

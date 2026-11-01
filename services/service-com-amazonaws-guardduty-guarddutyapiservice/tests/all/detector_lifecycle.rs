@@ -571,21 +571,19 @@ async fn a_feature_list_the_service_cannot_accept_is_refused() {
     );
 
     // "When you don't specify any features, with an exception to RUNTIME_MONITORING,
-    // all the optional features are enabled by default." RDS Protection
-    // (RDS_LOGIN_EVENTS) is opt-in the same way RUNTIME_MONITORING is — see
-    // `crate::detector_data_sources_projection` for the default feature set as a
-    // whole.
-    for feature in ["RUNTIME_MONITORING", "RDS_LOGIN_EVENTS"] {
-        assert_eq!(
-            feature_status(&before, feature),
-            "DISABLED",
-            "feature {feature} is opt-in, so a bare create leaves it off: got {before:?}"
-        );
-    }
+    // all the optional features are enabled by default." Runtime Monitoring is that
+    // ONE exception — see `crate::detector_data_sources_projection` for the default
+    // feature set as a whole.
+    assert_eq!(
+        feature_status(&before, "RUNTIME_MONITORING"),
+        "DISABLED",
+        "RUNTIME_MONITORING is opt-in, so a bare create leaves it off: got {before:?}"
+    );
     for feature in [
         "S3_DATA_EVENTS",
         "EKS_AUDIT_LOGS",
         "EBS_MALWARE_PROTECTION",
+        "RDS_LOGIN_EVENTS",
         "LAMBDA_NETWORK_LOGS",
         "EKS_RUNTIME_MONITORING",
         "AI_PROTECTION",

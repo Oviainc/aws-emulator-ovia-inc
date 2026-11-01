@@ -11,8 +11,9 @@
 //! call:
 //!
 //! 1. `CreateInvestigation` PERSISTS an investigation whose every reported member is
-//!    read back by `GetInvestigation`: the prompt verbatim, the account that
-//!    initiated it, and the cloud environment it was initiated in.
+//!    read back by `GetInvestigation`: the prompt verbatim and the account that
+//!    initiated it. `Investigation.Cloud` is NOT among them — it carries a detail the
+//!    investigation itself resolved, and nothing analysed this one's environment.
 //! 2. A created investigation starts `RUNNING` and reaches its terminal status only
 //!    when the CLOCK owes it (`state::INVESTIGATION_TRANSITION_MILLIS`), after which
 //!    it never moves again; a read never moves it early and never changes what a
@@ -77,14 +78,14 @@ async fn get_investigation(
 }
 
 /// Initiate an investigation and return its id, failing the test if the call did not
-/// succeed. `CreateInvestigation`'s success status is 202
-/// (`smithy_query(operation="CreateInvestigation")`).
+/// succeed. `CreateInvestigation` answers the recorded `200` (see that operation's
+/// `SUCCESS_STATUS`, which states why it is not the model's `202`).
 async fn initiated(router: &Router, detector_id: &str, prompt: &str) -> String {
     let (status, body) =
         create_investigation(router, detector_id, json!({"triggerPrompt": prompt})).await;
     assert_eq!(
-        status, 202,
-        "create-investigation {prompt:?}: expected 202, got {status} {body:?}"
+        status, 200,
+        "create-investigation {prompt:?}: expected 200, got {status} {body:?}"
     );
     body["investigationId"]
         .as_str()
@@ -180,20 +181,13 @@ async fn an_investigation_reports_back_everything_the_create_stored() {
             json!(account),
             "case {case}: expected the initiating account, got {got:?}"
         );
+        // `Investigation.Cloud` carries a detail the investigation itself resolved, and
+        // nothing analysed this one's environment, so the member is absent rather than
+        // rebuilt from the request's endpoint context.
         assert_eq!(
-            got["cloud"]["provider"],
-            json!("AWS"),
-            "case {case}: expected the only CloudProvider the enum carries, got {got:?}"
-        );
-        assert_eq!(
-            got["cloud"]["region"],
-            json!("us-east-1"),
-            "case {case}: expected the Region the request was signed for, got {got:?}"
-        );
-        assert_eq!(
-            got["cloud"]["account"],
-            json!(account),
-            "case {case}: expected the investigated account, got {got:?}"
+            got["cloud"],
+            Value::Null,
+            "case {case}: expected no cloud block on an investigation that resolved none, got {got:?}"
         );
         assert!(
             got["startTime"].as_f64().unwrap_or_default() > 0.0,
@@ -304,8 +298,8 @@ async fn a_replayed_client_token_returns_the_first_investigation() {
         )
         .await;
         assert_eq!(
-            status, 202,
-            "case {case}: expected 202, got {status} {first:?}"
+            status, 200,
+            "case {case}: expected 200, got {status} {first:?}"
         );
         let (status, replayed) = create_investigation(
             &router,
@@ -314,7 +308,7 @@ async fn a_replayed_client_token_returns_the_first_investigation() {
         )
         .await;
         assert_eq!(
-            status, 202,
+            status, 200,
             "case {case}: expected the replay to be accepted, got {status} {replayed:?}"
         );
         assert_eq!(
@@ -583,8 +577,8 @@ async fn investigations_are_served_exactly_through_the_documented_regions() {
         )
         .await;
         assert_eq!(
-            status, 202,
-            "create-investigation in {region}: expected 202, got {status} {body:?}"
+            status, 200,
+            "create-investigation in {region}: expected 200, got {status} {body:?}"
         );
         let id = body["investigationId"].as_str().unwrap_or_default().to_string();
         let (status, got) = call_in(
@@ -600,9 +594,9 @@ async fn investigations_are_served_exactly_through_the_documented_regions() {
             "get-investigation in {region}: expected 200, got {status} {got:?}"
         );
         assert_eq!(
-            got["investigation"]["cloud"]["region"],
-            json!(region),
-            "get-investigation in {region}: expected the Region it was initiated in, got {got:?}"
+            got["investigation"]["investigationId"],
+            json!(id),
+            "get-investigation in {region}: expected the investigation it initiated, got {got:?}"
         );
     }
 

@@ -73,8 +73,9 @@ const MEMBER_FEATURES: [&str; 8] = [
 ];
 
 /// The optional features a member account starts with DISABLED; every other
-/// reported feature starts ENABLED.
-const OPT_IN_FEATURES: [&str; 2] = ["RUNTIME_MONITORING", "RDS_LOGIN_EVENTS"];
+/// reported feature starts ENABLED. Runtime Monitoring is the one exception
+/// `CreateDetector` documents to "all the optional features are enabled by default".
+const OPT_IN_FEATURES: [&str; 1] = ["RUNTIME_MONITORING"];
 
 /// Every additional configuration a member-account request may name: the
 /// `OrgFeatureAdditionalConfiguration` members

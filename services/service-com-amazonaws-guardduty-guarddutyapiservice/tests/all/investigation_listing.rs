@@ -82,8 +82,8 @@ async fn listed(router: &Router, detector_id: &str, body: Value) -> Vec<Value> {
         .clone()
 }
 
-/// Initiate an investigation and return its id. `CreateInvestigation`'s success status
-/// is 202 (`smithy_query(operation="CreateInvestigation")`).
+/// Initiate an investigation and return its id. `CreateInvestigation` answers the
+/// recorded `200` (see that operation's `SUCCESS_STATUS`).
 async fn initiated(router: &Router, detector_id: &str, prompt: &str) -> String {
     let (status, body) = call(
         router,
@@ -93,8 +93,8 @@ async fn initiated(router: &Router, detector_id: &str, prompt: &str) -> String {
     )
     .await;
     assert_eq!(
-        status, 202,
-        "create-investigation {prompt:?}: expected 202, got {status} {body:?}"
+        status, 200,
+        "create-investigation {prompt:?}: expected 200, got {status} {body:?}"
     );
     body["investigationId"]
         .as_str()
@@ -560,8 +560,8 @@ async fn the_list_is_served_exactly_through_the_documented_regions() {
         )
         .await;
         assert_eq!(
-            status, 202,
-            "create-investigation in {region}: expected 202, got {status} {body:?}"
+            status, 200,
+            "create-investigation in {region}: expected 200, got {status} {body:?}"
         );
         let id = body["investigationId"].as_str().unwrap_or_default().to_string();
 

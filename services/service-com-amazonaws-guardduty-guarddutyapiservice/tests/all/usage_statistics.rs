@@ -757,7 +757,9 @@ async fn paging_the_statistics_yields_each_row_exactly_once() {
                 pages <= unpaginated.len() + 1,
                 "case {case:?}: paging did not terminate, collected {collected:?}"
             );
-            match response["nextToken"].as_str() {
+            // The terminal page reports the token as the EMPTY string rather than
+            // leaving the member out, so "no page after this one" is an empty token.
+            match response["nextToken"].as_str().filter(|next| !next.is_empty()) {
                 Some(next) => token = Some(next.to_string()),
                 None => break,
             }
@@ -827,7 +829,8 @@ async fn paged_rows(
         }
         let response = usage_ok(router, detector_id, body, case).await;
         collected.extend(reported_rows(&response, member, key_member, "USD", case));
-        match response["nextToken"].as_str() {
+        // As above: the last page's token is the empty string.
+        match response["nextToken"].as_str().filter(|next| !next.is_empty()) {
             Some(next) => token = Some(next.to_string()),
             None => break,
         }

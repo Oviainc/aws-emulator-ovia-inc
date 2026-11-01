@@ -17,8 +17,7 @@
 //! changed nothing at all (a read). `detector_sub_resource_creates` and
 //! `filter_detector_timestamp` assert the same rule over the detector's other
 //! sub-resource families; this suite covers the investigation family, whose create
-//! answers 202 with a minted `InvestigationId`
-//! (`smithy_query(operation="CreateInvestigation")`) and which has no delete.
+//! answers the recorded 200 with a minted `InvestigationId` and which has no delete.
 //!
 //! The rows differ along what the rule generalises over — the SIZE and ALPHABET of the
 //! `TriggerPrompt` (`len 1..2048`, no pattern), whether a `ClientToken` (`len 0..64`,
@@ -112,11 +111,11 @@ async fn read_detector(router: &Router, detector_id: &str, case: &str) -> Value 
 }
 
 /// The minted `InvestigationId` a create returned, failing the test if the create did
-/// not succeed or did not name one. The success status is 202.
+/// not succeed or did not name one. The recorded success status is 200.
 fn minted_id(case: &str, status: u16, got: &Value) -> String {
     assert_eq!(
-        status, 202,
-        "case {case:?}: expected the create to answer 202, got {status} {got:?}"
+        status, 200,
+        "case {case:?}: expected the create to answer 200, got {status} {got:?}"
     );
     let id = got["investigationId"]
         .as_str()

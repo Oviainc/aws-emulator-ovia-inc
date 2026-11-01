@@ -28,9 +28,10 @@
 //!   `sortCriteria` orders it by any of the sort keys in either direction, and
 //!   `maxResults`/`nextToken` page it with every row appearing exactly once.
 //! * THE COUNTS. `GetCoverageStatistics` aggregates those same rows: each map the
-//!   request names carries one entry per group at least one of the admitted resources
-//!   falls into, and the entries sum to the number of rows the list reports for the
-//!   same criteria — so the count and the list cannot disagree about one resource.
+//!   request names carries one entry per group of its own dimension — counting zero
+//!   where no admitted resource falls into that group — and the entries sum to the
+//!   number of rows the list reports for the same criteria, so the count and the list
+//!   cannot disagree about one resource.
 //!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built — and
 //! the requests driven — on a sized thread.
@@ -206,8 +207,10 @@ fn coverage_rows(
         .body
         .get("resources")
         .and_then(serde_json::Value::as_array)
-        .unwrap_or_else(|| panic!("case {case:?}: expected a resources list, got {answer:?}"))
-        .clone()
+        .cloned()
+        // A page that matches no coverage row carries no `resources` member at all, so
+        // an absent member IS the empty page.
+        .unwrap_or_default()
 }
 
 /// The `resourceId` of each row, in the order the report carried them.
@@ -282,17 +285,30 @@ fn histogram(rows: &[serde_json::Value], path: &[&str]) -> BTreeMap<String, u64>
     counts
 }
 
-/// One reported count map, as a comparable histogram. The member must be PRESENT: a
-/// statistic the request named is answered even when it counts nothing.
+/// One reported count map, as a comparable histogram of the groups that counted
+/// something.
+///
+/// The member must be PRESENT: a statistic the request named is answered even when it
+/// counts nothing. The map carries one entry per group of its own DIMENSION, counting
+/// zero where no admitted resource falls into that group, so `groups` is asserted to be
+/// covered and the zero entries are then dropped — what is left is the histogram of the
+/// rows, which is what the caller compares against.
 fn reported_histogram(
     statistics: &serde_json::Value,
     member: &str,
+    groups: &[&str],
     case: &str,
 ) -> BTreeMap<String, u64> {
     let map = statistics
         .get(member)
         .and_then(serde_json::Value::as_object)
         .unwrap_or_else(|| panic!("case {case:?}: expected the map {member}, got {statistics:?}"));
+    for group in groups {
+        assert!(
+            map.contains_key(*group),
+            "case {case:?}: expected {member} to carry its whole dimension, missing {group:?} in {statistics:?}"
+        );
+    }
     map.iter()
         .map(|(key, value)| {
             let count = value.as_u64().unwrap_or_else(|| {
@@ -300,23 +316,27 @@ fn reported_histogram(
             });
             (key.clone(), count)
         })
+        .filter(|(_, count)| *count > 0)
         .collect()
 }
 
 /// The `CoverageStatisticsType` members, with the `CoverageStatistics` member each one
-/// fills and the row attribute it groups by
+/// fills, the row attribute it groups by and the groups of its dimension
 /// (`smithy_query(shape="CoverageStatisticsType")`,
-/// `smithy_query(shape="CoverageStatistics")`).
-const STATISTICS: [(&str, &str, &[&str]); 2] = [
+/// `smithy_query(shape="CoverageStatistics")`, `smithy_query(shape="ResourceType")`,
+/// `smithy_query(shape="CoverageStatus")`).
+const STATISTICS: [(&str, &str, &[&str], &[&str]); 2] = [
     (
         "COUNT_BY_RESOURCE_TYPE",
         "countByResourceType",
         &["resourceDetails", "resourceType"],
+        &["EC2", "ECS", "EKS"],
     ),
     (
         "COUNT_BY_COVERAGE_STATUS",
         "countByCoverageStatus",
         &["coverageStatus"],
+        &["HEALTHY", "UNHEALTHY"],
     ),
 ];
 
@@ -749,13 +769,13 @@ fn guardduty_reports_the_runtime_coverage_of_the_accounts_own_resources() {
                 // ---------------------------------------------------------------
                 let mut body = filter.clone();
                 body["statisticsType"] = serde_json::json!(
-                    STATISTICS.map(|(kind, _, _)| kind)
+                    STATISTICS.map(|(kind, _, _, _)| kind)
                 );
                 let statistics =
                     coverage_statistics(&router, &runtime, &detector_id, body, &case);
-                for (_, member, path) in STATISTICS {
+                for (_, member, path, groups) in STATISTICS {
                     let expected_counts = histogram(&rows, path);
-                    let reported = reported_histogram(&statistics, member, &case);
+                    let reported = reported_histogram(&statistics, member, groups, &case);
                     assert_eq!(
                         reported, expected_counts,
                         "case {case:?}: {member} must count the rows the same criteria select, got {statistics:?}"
@@ -769,18 +789,18 @@ fn guardduty_reports_the_runtime_coverage_of_the_accounts_own_resources() {
 
                 // Only the statistic the request names is answered: a client reading a
                 // map it did not ask for would read an absence as "no resources".
-                for (kind, member, path) in STATISTICS {
+                for (kind, member, path, groups) in STATISTICS {
                     let case = format!("{case}, {kind} alone");
                     let mut body = filter.clone();
                     body["statisticsType"] = serde_json::json!([kind]);
                     let statistics =
                         coverage_statistics(&router, &runtime, &detector_id, body, &case);
                     assert_eq!(
-                        reported_histogram(&statistics, member, &case),
+                        reported_histogram(&statistics, member, groups, &case),
                         histogram(&rows, path),
                         "case {case:?}: got {statistics:?}"
                     );
-                    for (_, other, _) in STATISTICS {
+                    for (_, other, _, _) in STATISTICS {
                         if other != member {
                             assert!(
                                 statistics.get(other).is_none_or(serde_json::Value::is_null),
@@ -948,8 +968,9 @@ fn guardduty_reports_the_runtime_coverage_of_the_accounts_own_resources() {
                         .body
                         .get("resources")
                         .and_then(serde_json::Value::as_array)
-                        .unwrap_or_else(|| panic!("case {case:?}: no resources in {answer:?}"))
-                        .clone();
+                        .cloned()
+                        // As `coverage_rows`: a page with no row carries no member.
+                        .unwrap_or_default();
                     assert!(
                         rows.len() <= page_size,
                         "case {case:?}: a page carried {} rows, more than asked for",

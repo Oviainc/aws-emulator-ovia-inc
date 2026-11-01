@@ -17,10 +17,73 @@ pub struct GetMasterAccountInput {
     pub detector_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.guardduty#GetMasterAccountResponse")]
+/// `GetMasterAccountResponse`, with its schema and serializer written out rather than
+/// derived.
+///
+/// WHY: `Master` is modelled `@required` and `@clientOptional`, which the derive reads
+/// as "always on the wire" — it refuses an `Option<T>` field for such a member and
+/// writes the member unconditionally, as a structure. The recorded AWS answer for an
+/// account no administrator monitors carries the member with the JSON value `null`, not
+/// an empty object, and the difference is observable: a client switches on the member's
+/// VALUE to decide whether the account is a member of an organization, and an empty
+/// object reads as "there is an administrator" whose `accountId` it then dereferences.
+/// So the member is held as an `Option` here, written as the relationship when there is
+/// one and as `null` when there is none.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape
+/// is an operation OUTPUT, which the server only ever serializes
+/// (`Operation::Output` requires `SerializableStruct`; only `Input` is deserialized).
 #[derive(Debug, Clone, Default)]
 pub struct GetMasterAccountOutput {
-    pub master: Master,
+    /// The administrator relationship this detector has, or `None` when it has none.
+    pub master: Option<Master>,
+}
+
+#[allow(non_upper_case_globals)]
+impl GetMasterAccountOutput {
+    /// The `Master` member's own schema, exactly as the derive emits one for a
+    /// structure member: the member's shape id, its wire kind, its model name and its
+    /// position, plus the `@jsonName` the restJson1 codec resolves the key from
+    /// (`smithy_query(operation="GetMasterAccount")`).
+    const M_MASTER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.guardduty#GetMasterAccountResponse$Master",
+            "com.amazonaws.guardduty",
+            "Master",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        "Master",
+        0,
+    )
+    .with_json_name("master");
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.guardduty#GetMasterAccountResponse",
+            "com.amazonaws.guardduty",
+            "GetMasterAccountResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_MASTER],
+    );
+}
+
+pub static GET_MASTER_ACCOUNT_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetMasterAccountOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetMasterAccountOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self.master.as_ref() {
+            Some(master) => serializer.write_struct(&Self::M_MASTER, master)?,
+            // The member is always on the wire; `null` is how GuardDuty says there is
+            // no administrator relationship to report.
+            None => serializer.write_null(&Self::M_MASTER)?,
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.guardduty#Master")]
