@@ -142,3 +142,5 @@ mod origin_endpoint_encryption_settings;
 mod manifest_name_uniqueness;
 #[path = "all/endpoint_settings_by_input_type.rs"]
 mod endpoint_settings_by_input_type;
+#[path = "all/tag_key_character_bound.rs"]
+mod tag_key_character_bound;

@@ -175,10 +175,12 @@ impl Fault {
         }
     }
 
-    /// Whether `UntagResource` can carry this fault: it names tag KEYS and stores none of
-    /// them, so only the rule about a key's namespace reaches it.
+    /// Whether `UntagResource` can carry this fault: it names tag KEYS and no values, so
+    /// the rules about a key — its namespace and how long it may be — reach it, while the
+    /// per-resource ceiling and the value bound judge the map a resource is left HOLDING,
+    /// which a removal only ever shrinks.
     fn reaches_a_remover(self) -> bool {
-        matches!(self, Self::ReservedTagKey)
+        matches!(self, Self::ReservedTagKey | Self::OverLongTagKey)
     }
 }
 

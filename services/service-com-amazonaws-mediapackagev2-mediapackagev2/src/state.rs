@@ -430,6 +430,46 @@ pub fn submitted_tag_bounds_rejection(
     })
 }
 
+/// Refuse a request whose tag KEYS are past the bound a key carries, judged on the keys
+/// ALONE — the whole of the tag bounds for a path that names keys without values.
+///
+/// A tag key is as long as the request made it whatever the request asks to be done with
+/// that key, so the character bound on a key is one rule across the whole tagging surface:
+/// every path that takes caller-supplied tag keys judges it, whether the keys arrive in a
+/// map to be written or in a list to be removed. The other two clauses of
+/// [`tag_bounds_rejection`] have nothing to judge where no values arrive and nothing is
+/// added: the value bound is about a value the request did not send, and the entry-count
+/// bound is about the map a resource is left HOLDING, which removing keys only shrinks.
+///
+/// `member_path` is the wire name of the member the keys arrived in, which differs per
+/// operation exactly as it does for [`reserved_tag_key_rejection`], so the sentence points
+/// the caller at the member it sent. Called before anything is written, so a refused
+/// request leaves the resource's tags exactly as they were.
+pub fn tag_key_bounds_rejection<'a, I>(member_path: &str, keys: I) -> Option<ValidationException>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    keys.into_iter()
+        .find_map(|key| over_long_tag_key_rejection(member_path, key))
+}
+
+/// The tag-key character bound as ONE key's rejection: the single place this service
+/// judges how long a tag key may be, so a key of a given length earns the same refusal
+/// wherever it arrives.
+fn over_long_tag_key_rejection(member_path: &str, key: &str) -> Option<ValidationException> {
+    let characters = key.chars().count();
+    (characters > MAX_TAG_KEY_CHARS).then(|| ValidationException {
+        message: Some(validation_message(
+            Some(member_path),
+            &format!(
+                "A tag key carries at most {MAX_TAG_KEY_CHARS} characters; one in the \
+                 request carries {characters}"
+            ),
+        )),
+        validation_exception_type: None,
+    })
+}
+
 /// The bounds themselves, shared by the two readings above: `count_detail` words the
 /// entry-count clause for the map being judged, while the per-entry clauses are the same
 /// either way, because a key and a value are as long as the request made them.
@@ -448,12 +488,10 @@ fn tag_bounds_rejection_counted(
         return refuse(count_detail(tags.len()));
     }
     for (key, value) in tags {
-        if key.chars().count() > MAX_TAG_KEY_CHARS {
-            return refuse(format!(
-                "A tag key carries at most {MAX_TAG_KEY_CHARS} characters; one in the \
-                 request carries {}",
-                key.chars().count()
-            ));
+        // The key half is the shared builder above, so this path and the key-only path
+        // cannot drift in either the bound or the sentence.
+        if let Some(rejection) = over_long_tag_key_rejection(member_path, key) {
+            return Some(rejection);
         }
         if value.chars().count() > MAX_TAG_VALUE_CHARS {
             return refuse(format!(

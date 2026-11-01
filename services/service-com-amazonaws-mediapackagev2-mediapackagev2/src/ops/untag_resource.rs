@@ -9,7 +9,10 @@
 //!
 //! A key in the reserved [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace is refused
 //! `ValidationException` (400): that namespace belongs to AWS, and a caller can no more
-//! delete a tag in it than create one.
+//! delete a tag in it than create one. A key past
+//! [`crate::state::MAX_TAG_KEY_CHARS`] is refused the same way: a tag key is as long as
+//! the request made it whatever the request asks to be done with it, so this path judges
+//! the key bound exactly as every path that writes tag keys does.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken".
@@ -186,6 +189,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolves. `tagKeys` is the wire name of the member (`@httpQuery("tagKeys")` on
         // `UntagResourceRequest$TagKeys`).
         if let Some(rejection) = crate::state::reserved_tag_key_rejection(
+            "tagKeys",
+            input.tag_keys.iter().map(String::as_str),
+        ) {
+            return Err(UntagResourceErrorModeled::ValidationException(rejection).into());
+        }
+
+        // The bound on a tag KEY, in the same place and for the same reason: how many
+        // characters a key carries is a property of the request alone, so a key past the
+        // bound is refused before the store is consulted, in the same words the writing
+        // paths refuse it with. The other clauses of the shared tag bounds have nothing to
+        // judge here: no values arrive, and the per-resource tag ceiling is about the map
+        // the resource is left HOLDING, which removing keys only ever shrinks.
+        if let Some(rejection) = crate::state::tag_key_bounds_rejection(
             "tagKeys",
             input.tag_keys.iter().map(String::as_str),
         ) {
