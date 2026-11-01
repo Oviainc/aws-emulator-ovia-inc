@@ -1,15 +1,54 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPreviewRotationShifts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPreviewRotationShifts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPreviewRotationShifts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers the shifts a rotation WOULD have, computed from the rotation the request
+//! describes rather than from any stored one: the preview is how Incident Manager fills its
+//! preview calendar, so the request carries the whole rotation — its `Members`, its
+//! `Recurrence`, its `TimeZoneId` and the instant it would begin — and the response reports
+//! the shifts that rotation would put in the requested range.
+//!
+//! WHEN those shifts fall and WHO is on call during each is one rule for every operation of
+//! this service that reports shifts, so it lives in [`crate::state::rotation_shifts`] rather
+//! than here; this handler reads the request into the schedule that module computes from,
+//! and pages the answer.
+//!
+//! Nothing is written. The previewed rotation is not created — the operation mints no ARN and
+//! the model gives it no idempotency token — so a preview changes nothing a later caller
+//! sees, and two identical previews of the same schedule answer identically.
+//!
+//! Nothing is resolved, either: the model declares no `ResourceNotFoundException` for this
+//! operation (`smithy_query(query="operation",operation="ListPreviewRotationShifts")`), while
+//! it declares one for every operation of this service that addresses a stored resource, so
+//! the previewed `Members` are the shift team as the request spells it rather than contacts
+//! looked up in the store — which is what lets the preview calendar be drawn for a rotation
+//! nobody has created.
+//!
+//! The order of the checks is the order of the refusals:
+//!
+//! 1. The ACCOUNT-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]):
+//!    an on-call rotation is reached through the account's replication set, so while the
+//!    account holds none the call is refused with the modelled `ValidationException` (HTTP
+//!    400), exactly as this service's other rotation operations are.
+//! 2. The recurrence must describe a schedule, and each `DayOfWeek` it carries must be a
+//!    modelled value ([`crate::state::check_recurrence`]) — the same reading `CreateRotation`
+//!    gives the recurrence it installs.
+//! 3. `TimeZoneId` must name a zone of the IANA time zone database, resolved through
+//!    [`crate::state::resolve_time_zone_id`]: the shifts are computed IN that zone.
+//! 4. `Recurrence.NumberOfOnCalls` must be met by the previewed team
+//!    ([`crate::state::check_number_of_on_calls`]): the contacts on call concurrently are
+//!    members of that team, so the preview cannot put more of them on call at once than it
+//!    names.
+//! 5. A window whose end precedes its start names no range of time, so a `StartTime` after
+//!    `EndTime`, and an override of the same shape, are refused with the modelled
+//!    `ValidationException` rather than answered with the empty page they would select.
+//!
+//! `RotationStartTime` is optional, and a request naming none previews a rotation that goes
+//! into effect now — the reading `CreateRotation` gives its own optional `StartTime`.
+//! `StartTime` only filters: it is "used to filter the range of calculated shifts", so it
+//! moves no hand-off, and a shift is reported whenever it covers an instant of the requested
+//! range, with its own times rather than times clipped to that range.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +205,283 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPreviewRotationShifts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPreviewRotationShiftsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPreviewRotationShifts"))
+        use crate::state::rotation_shifts::{
+            shifts_in_range, ShiftOverride, ShiftSchedule, MAX_SHIFTS,
+        };
+        use crate::state::{
+            check_number_of_on_calls, check_recurrence, instant, invalid_next_token_message,
+            page_size, plan_too_large_message, resolve_time_zone_id, take_page,
+            MAX_ROTATION_OVERRIDES_PER_ROTATION, TOKEN_SCOPE_PREVIEW_ROTATION_SHIFTS,
+        };
+
+        // A preview is computed from the rotation the request describes, so nothing of the
+        // request envelope decides it.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal());
+        };
+
+        // The account gate comes FIRST: before the recurrence is read and before a single
+        // hand-off is computed. The request names no ARN, so the refusal is about the
+        // account. The lock is released here — the computation below touches no state, which
+        // is what lets a preview describe a rotation this store does not hold.
+        {
+            let state = state.lock();
+            state
+                .require_active_replication_set()
+                .map_err(account_precondition_failed)?;
+        }
+
+        // Which recurrences describe a schedule is the rule `CreateRotation`/`UpdateRotation`
+        // read their own `Recurrence` through, so a schedule this operation previews is one
+        // those operations would install.
+        check_recurrence(&input.recurrence).map_err(validation)?;
+
+        // The zone the hand-offs are read in, resolved against the IANA zone database — the
+        // same resolution, and the same refusal, a rotation's stored zone gets.
+        let time_zone = resolve_time_zone_id(&input.time_zone_id).map_err(validation)?;
+
+        // How many of the previewed team can be on call at once is bounded by that team.
+        check_number_of_on_calls(&input.recurrence, input.members.len()).map_err(validation)?;
+
+        // A range whose end precedes its start names no range of time, so it is refused
+        // rather than answered with the empty page it would select — the reading
+        // `ListRotationOverrides` gives its own window. `StartTime` is optional here, so
+        // there is a range to compare only when the request names one.
+        if let Some(start_time) = input.start_time.as_ref() {
+            if instant(&input.end_time) < instant(start_time) {
+                return Err(validation(format!(
+                    "Value at 'endTime' failed to satisfy constraint: Member must not be \
+                     earlier than 'startTime' ({})",
+                    start_time.as_secs_f64()
+                )));
+            }
+        }
+
+        // The resume point the previous page's token carries: how many shifts of this
+        // schedule it already reported, and the instant that computation was anchored on — so
+        // a later page is a page of the SAME computation even for a request that named no
+        // `RotationStartTime`. A token this operation did not issue, or one naming a position
+        // past the computation's own ceiling, is refused rather than allowed to size any work.
+        let resumed: Option<(usize, i64)> =
+            match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+                Some(token) => Some(
+                    decode_resume_point(token)
+                        .ok_or_else(|| validation(invalid_next_token_message(token)))?,
+                ),
+                None => None,
+            };
+        let after = resumed.map(|(position, _)| position);
+
+        // The rotation the preview describes: the instant it would go into effect, which the
+        // request names, else the one the token resumes, else now — as `CreateRotation` reads
+        // its own optional `StartTime`.
+        let rotation_start = input
+            .rotation_start_time
+            .as_ref()
+            .map(::aws_smithy_types::DateTime::secs)
+            .or_else(|| resumed.map(|(_, anchor)| anchor))
+            .unwrap_or_else(now_epoch_seconds);
+
+        // `Overrides` carries no modelled length, and each one splits every shift it reaches,
+        // so the list this handler walks is bounded by the ceiling a rotation's stored
+        // overrides already have, refused with the crate's one wording for a list longer than
+        // a handler walks.
+        let previewed_overrides = input.overrides.as_deref().unwrap_or_default();
+        if previewed_overrides.len() > MAX_ROTATION_OVERRIDES_PER_ROTATION {
+            return Err(validation(plan_too_large_message(
+                OVERRIDES_MEMBER,
+                previewed_overrides.len(),
+                MAX_ROTATION_OVERRIDES_PER_ROTATION,
+            )));
+        }
+        let mut overrides: Vec<ShiftOverride> = Vec::with_capacity(previewed_overrides.len());
+        for (position, previewed) in previewed_overrides.iter().enumerate() {
+            // An override's own window is optional on both ends: an end the request does not
+            // name leaves that side of the window open.
+            let start = previewed.start_time.as_ref().map(::aws_smithy_types::DateTime::secs);
+            let end = previewed.end_time.as_ref().map(::aws_smithy_types::DateTime::secs);
+            if start.zip(end).is_some_and(|(start, end)| end < start) {
+                return Err(validation(format!(
+                    "Value at '{OVERRIDES_MEMBER}.{position}.endTime' failed to satisfy \
+                     constraint: Member must not be earlier than \
+                     '{OVERRIDES_MEMBER}.{position}.startTime'"
+                )));
+            }
+            overrides.push(ShiftOverride {
+                new_members: previewed.new_members.clone().unwrap_or_default(),
+                start,
+                end,
+            });
+        }
+
+        let wanted = page_size(input.max_results);
+        // One shift more than the page can carry, so a `NextToken` is issued only when a
+        // shift really does follow the page — and never more than the computation's own
+        // ceiling, so no value taken from the request decides how much work is done.
+        let computed_at_most = after
+            .map_or(0, |last| last.saturating_add(1))
+            .saturating_add(wanted)
+            .saturating_add(1)
+            .min(MAX_SHIFTS.saturating_add(1));
+
+        // `StartTime` filters the calculated shifts; absent, the range begins where the
+        // previewed rotation does, since no shift precedes it.
+        let range_start = input
+            .start_time
+            .as_ref()
+            .map_or(rotation_start, ::aws_smithy_types::DateTime::secs);
+        let range_end = input.end_time.secs();
+        let members = input.members.clone();
+        let recurrence = input.recurrence.clone();
+        // The walk is CPU-bound and takes no lock, so it runs on tokio's BLOCKING pool rather
+        // than on the async worker serving this request — and `spawn_blocking(..).await` is a
+        // real await point, so a health check, a timeout or a shutdown can land while a
+        // preview is being computed. A `spawn_blocking` closure cannot be cancelled, so the
+        // walk carries its own step budget AND this outer wall clock: whichever runs out
+        // first, the request answers.
+        let computed = ::tokio::time::timeout(
+            PREVIEW_TIME_BUDGET,
+            ::tokio::task::spawn_blocking(move || {
+                let schedule = ShiftSchedule {
+                    members: &members,
+                    recurrence: &recurrence,
+                    time_zone,
+                    rotation_start,
+                };
+                shifts_in_range(
+                    &schedule,
+                    &overrides,
+                    range_start,
+                    range_end,
+                    computed_at_most,
+                )
+            }),
+        )
+        .await;
+        let shifts = match computed {
+            Ok(Ok(shifts)) => shifts,
+            // The task failed, or the walk outlived the wall clock.
+            Ok(Err(_)) | Err(_) => return Err(computation_did_not_complete()),
+        };
+
+        let numbered: Vec<(usize, RotationShift)> = shifts
+            .into_iter()
+            .enumerate()
+            .filter(|(position, _)| after.is_none_or(|last| *position > last))
+            .collect();
+        let (page, next_token) = take_page(
+            numbered,
+            wanted,
+            TOKEN_SCOPE_PREVIEW_ROTATION_SHIFTS,
+            |(position, _)| encode_resume_point(*position, rotation_start),
+        );
+
+        Ok(ListPreviewRotationShiftsOutput {
+            next_token,
+            rotation_shifts: Some(page.into_iter().map(|(_, shift)| shift).collect()),
+        })
     }
+}
+
+/// How long one preview may take to compute, as a wall clock over the blocking walk.
+///
+/// The walk's own step budget ([`crate::state::rotation_shifts`]) is what normally stops it,
+/// and that budget is a few milliseconds of work, so this ceiling is the EMULATOR's outer
+/// guard for the time that is not the walk's — waiting for a blocking thread, on a host busy
+/// with something else — rather than a duration AWS publishes.
+const PREVIEW_TIME_BUDGET: ::std::time::Duration = ::std::time::Duration::from_secs(5);
+
+/// The member path this operation's override refusals name, spelled the way the other member
+/// paths of this service's constraint messages are (lower camel case, from the input's root).
+const OVERRIDES_MEMBER: &str = "overrides";
+
+/// What separates the two fields a resume point carries inside a `NextToken`'s payload.
+///
+/// Neither field can contain it: both are decimal integers.
+const RESUME_FIELD_SEPARATOR: char = ':';
+
+/// The payload of the `NextToken` that resumes after the shift at `position` of a computation
+/// anchored on `rotation_start`.
+///
+/// The anchor travels with the position because the position means nothing without it: a
+/// request that names no `RotationStartTime` is anchored when it is served, so a later page
+/// would otherwise index into a different computation.
+fn encode_resume_point(position: usize, rotation_start: i64) -> String {
+    format!("{position}{RESUME_FIELD_SEPARATOR}{rotation_start}")
+}
+
+/// The `(position, anchor)` a `NextToken` names, or `None` when it is not one this operation
+/// issued for this list.
+///
+/// A position at or past [`MAX_SHIFTS`] names no page this operation can ever have issued —
+/// the computation reports at most that many shifts of one schedule — so it is read as a token
+/// this service did not issue instead of being allowed to size a computation.
+fn decode_resume_point(token: &str) -> Option<(usize, i64)> {
+    let decoded = crate::state::decode_next_token(
+        crate::state::TOKEN_SCOPE_PREVIEW_ROTATION_SHIFTS,
+        token,
+    )?;
+    let (position, anchor) = decoded.split_once(RESUME_FIELD_SEPARATOR)?;
+    let position = position
+        .parse::<usize>()
+        .ok()
+        .filter(|position| *position < crate::state::rotation_shifts::MAX_SHIFTS)?;
+    Some((position, anchor.parse::<i64>().ok()?))
+}
+
+/// Now, as the epoch seconds the shift computation reads instants in.
+///
+/// Only a request that names no `RotationStartTime`, and resumes no earlier page, reaches
+/// this: such a preview describes a rotation that goes into effect when it is asked for.
+fn now_epoch_seconds() -> i64 {
+    ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()).secs()
+}
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY, exactly as every gated
+/// operation in this service answers: the failure is account level, so no field of the
+/// request is at fault.
+fn account_precondition_failed(message: String) -> ListPreviewRotationShiftsError {
+    ListPreviewRotationShiftsErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: the same modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> ListPreviewRotationShiftsError {
+    ListPreviewRotationShiftsErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
+}
+
+/// The modelled server fault for a shift computation that did not finish: the blocking task
+/// the walk runs on failed, or it outlived [`PREVIEW_TIME_BUDGET`]. Either is this emulator's
+/// own failure rather than anything about the request.
+fn computation_did_not_complete() -> ListPreviewRotationShiftsError {
+    ListPreviewRotationShiftsErrorModeled::InternalServerException(InternalServerException {
+        message: "the shift computation did not complete".to_string(),
+        retry_after_seconds: 0,
+    })
+    .into()
+}
+
+/// The modelled server fault for an engine that holds no state at all: without a store there
+/// is no account record to read the Incident Manager precondition from, and that is this
+/// emulator's own failure rather than anything about the request.
+fn internal() -> ListPreviewRotationShiftsError {
+    ListPreviewRotationShiftsErrorModeled::InternalServerException(InternalServerException {
+        message: "this service is mounted on an engine that holds no state".to_string(),
+        retry_after_seconds: 0,
+    })
+    .into()
 }

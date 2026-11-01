@@ -16,7 +16,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -35,6 +35,10 @@ service-common = { path = "../common" }
 # Resolves a rotation's `TimeZoneId` against the IANA time zone database it compiles in, so a
 # zone name the service cannot resolve is refused instead of stored.
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
+# The calendar and daylight-saving arithmetic a rotation's hand-off times are computed with:
+# days, weeks and months of the recurrence, and the instant a local hand-off time falls on in
+# the rotation's zone.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

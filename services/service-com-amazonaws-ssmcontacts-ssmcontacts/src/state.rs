@@ -1499,6 +1499,9 @@ pub const TOKEN_SCOPE_PAGE_RECEIPTS: &str = "page-receipts";
 /// The `NextToken` scope `ListPageResolutions` issues and accepts.
 pub const TOKEN_SCOPE_PAGE_RESOLUTIONS: &str = "page-resolutions";
 
+/// The `NextToken` scope `ListPreviewRotationShifts` issues and accepts.
+pub const TOKEN_SCOPE_PREVIEW_ROTATION_SHIFTS: &str = "preview-rotation-shifts";
+
 /// Cut `items` (already filtered, in key order, and already positioned past any
 /// `NextToken`) down to one page.
 ///
@@ -1549,6 +1552,10 @@ pub mod account_gate;
 pub use account_gate::{
     closed_gate_message, invalid_resource_arn_message, ACCOUNT_NOT_FOUND_MESSAGE,
 };
+
+/// WHEN a rotation's shifts fall and WHO is on call during each, which every operation that
+/// reports shifts computes the same way: see [`rotation_shifts`].
+pub mod rotation_shifts;
 
 /// The message a plan is refused with when one of its lists is longer than the resolver
 /// walks: it names the member, the length the request carried and the ceiling.
@@ -1711,7 +1718,9 @@ fn is_international_phone_number(address: &str) -> bool {
 /// saying why it does not.
 ///
 /// Every operation that installs a whole `RecurrenceSettings` on a rotation admits the same
-/// recurrences, so the rule is written once: each `DayOfWeek` the recurrence carries — a
+/// recurrences, so the rule is written once: no settings list may be longer than the hand-offs
+/// its period can hold (the model gives those lists no `length` trait, and reading one is work
+/// a request chose the size of); each `DayOfWeek` the recurrence carries — a
 /// `WeeklySettings` day and a `ShiftCoverages` key, both of which reach a handler as plain
 /// strings because the boundary validator enforces `length`/`pattern`/`range` rather than an
 /// enum's value set — must be one of [`DAY_OF_WEEK_VALUES`], and at least one of the daily,
@@ -1721,6 +1730,34 @@ fn is_international_phone_number(address: &str) -> bool {
 /// The order of the checks is the order of the refusals, and every caller refuses with the
 /// member-level `ValidationException` its own model declares.
 pub fn check_recurrence(recurrence: &RecurrenceSettings) -> Result<(), String> {
+    // How long a settings list may be, before anything is read OUT of it: a hand-off is a
+    // minute of the period the list names, so a list longer than that period has minutes
+    // cannot name distinct hand-offs, and reading it is work a request chose the size of.
+    check_settings_length(
+        "recurrence.dailySettings",
+        &recurrence.daily_settings,
+        MINUTES_IN_A_DAY,
+    )?;
+    check_settings_length(
+        "recurrence.weeklySettings",
+        &recurrence.weekly_settings,
+        MINUTES_IN_A_WEEK,
+    )?;
+    check_settings_length(
+        "recurrence.monthlySettings",
+        &recurrence.monthly_settings,
+        MINUTES_IN_THE_LONGEST_MONTH,
+    )?;
+    for (day, times) in recurrence.shift_coverages.iter().flatten() {
+        if times.len() > MINUTES_IN_A_DAY {
+            return Err(plan_too_large_message(
+                &format!("recurrence.shiftCoverages.{day}"),
+                times.len(),
+                MINUTES_IN_A_DAY,
+            ));
+        }
+    }
+
     for setting in recurrence.weekly_settings.iter().flatten() {
         check_enum(
             "recurrence.weeklySettings.dayOfWeek",
@@ -1742,6 +1779,32 @@ pub fn check_recurrence(recurrence: &RecurrenceSettings) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Minutes in a day, a week and in the longest month: the number of distinct hand-off times a
+/// daily, weekly and monthly settings list can name.
+///
+/// The model gives those lists, and `ShiftCoverages`' `CoverageTimes`, no `length` trait while
+/// `HandOffTime` is a minute of the day, so these are the ceilings the VALUES imply rather
+/// than ones AWS publishes — and the ceilings that keep the length of a request's list from
+/// multiplying the work of computing a rotation's shifts.
+const MINUTES_IN_A_DAY: usize = 24 * 60;
+const MINUTES_IN_A_WEEK: usize = 7 * MINUTES_IN_A_DAY;
+const MINUTES_IN_THE_LONGEST_MONTH: usize = 31 * MINUTES_IN_A_DAY;
+
+/// `Ok` when a recurrence settings list is no longer than the hand-offs its period can hold,
+/// else the refusal naming the member, the length the request carried and the ceiling.
+fn check_settings_length<T>(
+    member: &str,
+    settings: &Option<Vec<T>>,
+    ceiling: usize,
+) -> Result<(), String> {
+    match settings.as_ref().map(Vec::len) {
+        Some(carried) if carried > ceiling => {
+            Err(plan_too_large_message(member, carried, ceiling))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The member path a `TimeZoneId` refusal names, spelled the way AWS spells a member path
@@ -1786,13 +1849,24 @@ pub fn contact_type_not_a_rotation_member_message(arn: &str, contact_type: &str)
 /// Every operation that WRITES a time zone onto a rotation reads its request through here, so
 /// the set of zones the service admits cannot drift between them.
 pub fn check_time_zone_id(time_zone_id: &str) -> Result<(), String> {
-    if time_zone_id.parse::<::chrono_tz::Tz>().is_ok() {
-        return Ok(());
-    }
-    Err(format!(
-        "Value '{time_zone_id}' at '{TIME_ZONE_ID_MEMBER}' failed to satisfy constraint: \
-         Member must be a time zone name in Internet Assigned Numbers Authority (IANA) format"
-    ))
+    resolve_time_zone_id(time_zone_id).map(|_| ())
+}
+
+/// The zone `time_zone_id` names, or the same `ValidationException` message
+/// [`check_time_zone_id`] refuses it with.
+///
+/// An operation that only WRITES the zone needs the reading; one that computes a rotation's
+/// shifts needs the zone itself, so the resolution lives here once and the check above is the
+/// same call with the zone dropped — the set of zones the service admits and the wording it
+/// refuses the rest with cannot then differ between them.
+pub fn resolve_time_zone_id(time_zone_id: &str) -> Result<::chrono_tz::Tz, String> {
+    time_zone_id.parse::<::chrono_tz::Tz>().map_err(|_| {
+        format!(
+            "Value '{time_zone_id}' at '{TIME_ZONE_ID_MEMBER}' failed to satisfy constraint: \
+             Member must be a time zone name in Internet Assigned Numbers Authority (IANA) \
+             format"
+        )
+    })
 }
 
 /// `Ok` when the recurrence's `NumberOfOnCalls` can be met by a shift team of `team_size`
