@@ -190,8 +190,12 @@ pub(crate) async fn given_staged_media(emulator: &MultiServiceRouter) {
 
 /// Which family a row drives, which is what decides the start request's own members and
 /// the operation that reads the job back.
+///
+/// `pub(crate)`, like the harness around it: the suite over the format a finished job
+/// determined (`crate::transcription_job_media_format`) drives these same families
+/// through the same start requests rather than spelling a second copy of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Family {
+pub(crate) enum Family {
     /// `StartTranscriptionJob` -> `GetTranscriptionJob`.
     Transcription,
     /// `StartMedicalTranscriptionJob` -> `GetMedicalTranscriptionJob`.
@@ -204,7 +208,7 @@ enum Family {
 
 impl Family {
     /// The operation that starts a job of this family.
-    fn start(self) -> &'static str {
+    pub(crate) fn start(self) -> &'static str {
         match self {
             Self::Transcription => "StartTranscriptionJob",
             Self::Medical => "StartMedicalTranscriptionJob",
@@ -214,7 +218,7 @@ impl Family {
     }
 
     /// The operation that reads one job of this family back.
-    fn get(self) -> &'static str {
+    pub(crate) fn get(self) -> &'static str {
         match self {
             Self::Transcription => "GetTranscriptionJob",
             Self::Medical => "GetMedicalTranscriptionJob",
@@ -224,7 +228,7 @@ impl Family {
     }
 
     /// The member both the start request and the read name the job by.
-    fn name_member(self) -> &'static str {
+    pub(crate) fn name_member(self) -> &'static str {
         match self {
             Self::Transcription => "TranscriptionJobName",
             Self::Medical => "MedicalTranscriptionJobName",
@@ -234,7 +238,7 @@ impl Family {
     }
 
     /// The member of a successful read that carries the job.
-    fn job_member(self) -> &'static str {
+    pub(crate) fn job_member(self) -> &'static str {
         match self {
             Self::Transcription => "TranscriptionJob",
             Self::Medical => "MedicalTranscriptionJob",
@@ -244,7 +248,7 @@ impl Family {
     }
 
     /// The smallest valid start request of this family naming `name` and `media`.
-    fn start_request(self, name: &str, media: Value) -> Value {
+    pub(crate) fn start_request(self, name: &str, media: Value) -> Value {
         match self {
             Self::Transcription => json!({
                 "TranscriptionJobName": name,

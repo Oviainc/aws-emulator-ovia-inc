@@ -62,7 +62,14 @@
 //! options allowed, because narrowing them to a subset would take the audio
 //! ([`identified_languages`]) — and the Call Analytics family determines its language,
 //! media format and sample rate the same way, from the request and this family's own
-//! constants (see [`CallAnalyticsJobRecord`]). `LanguageCodeItem.DurationInSeconds` is
+//! constants (see [`CallAnalyticsJobRecord`]). The FORMAT of the media a job processed
+//! is of the first kind in EVERY family that reports one: the name the media is stored
+//! under evidences it ([`media_format_of`]) and the request states that name, so a job
+//! that FINISHES reports that determination wherever the request stated no format of
+//! its own, and the format a request did state stands as the service accepted it — a
+//! completed job's media cannot contradict it, because a job whose media does ends
+//! `FAILED` instead ([`determined_media_format`], [`media_failure_reason`]).
+//! `LanguageCodeItem.DurationInSeconds` is
 //! of the second kind and stays absent: how long each language is SPOKEN is a
 //! measurement of media nothing reads.
 //! A custom vocabulary is NOT the same in one respect: its terms are held in this
@@ -4096,6 +4103,10 @@ pub struct TranscriptionJobRecord {
     pub status: String,
     pub language_code: Option<String>,
     pub media: Media,
+    /// `MediaFormat`, the format of this job's input media. What the start request
+    /// declared it to be, if anything, until the job FINISHES, when the service's own
+    /// determination fills it in where the request declared nothing
+    /// ([`determined_media_format`]).
     pub media_format: Option<String>,
     pub media_sample_rate_hertz: Option<i32>,
     pub output_bucket_name: Option<String>,
@@ -4168,6 +4179,12 @@ impl TranscriptionJobRecord {
     /// document at those locations is the one step this cannot take — it is a call into
     /// object storage, which only an operation can make — so the operation that finds
     /// the job finished makes it ([`due_output_objects`], [`store_job_outputs`]).
+    ///
+    /// It also records what the service determined while it processed the media: the
+    /// language identification the request asked for
+    /// ([`Self::materialise_identified_languages`]) and the format of the input audio
+    /// ([`determined_media_format`]). Both are a function of the stored record, so a job
+    /// reports the same ones at every later read.
     pub fn advance_clock(&mut self, now: SystemTime) {
         if self.status == STATUS_QUEUED {
             match self.queued_until {
@@ -4189,6 +4206,7 @@ impl TranscriptionJobRecord {
             }
             self.status = STATUS_COMPLETED.to_string();
             self.materialise_identified_languages();
+            self.media_format = determined_media_format(self.media_format.take(), &self.media);
             let transcript_uri = self.output_uri("json");
             // Which transcripts the request asked the service to produce decides
             // which of the two locations the job reports ([`transcript_outputs`]).
@@ -4345,6 +4363,10 @@ pub struct MedicalTranscriptionJobRecord {
     /// ([`MEDICAL_LANGUAGE_CODE`]).
     pub language_code: String,
     pub media: Media,
+    /// `MediaFormat`, the format of this job's input media, determined as
+    /// [`TranscriptionJobRecord::media_format`] is: the two families' start requests
+    /// carry the member alike, so one determination answers for both
+    /// ([`determined_media_format`]).
     pub media_format: Option<String>,
     pub media_sample_rate_hertz: Option<i32>,
     /// `OutputBucketName`, a REQUIRED member of the start request: the bucket the
@@ -4395,7 +4417,9 @@ impl MedicalTranscriptionJobRecord {
     ///
     /// Completing a job records WHERE its transcript is written; the operation that
     /// finds the job finished stores the document there, for the reason
-    /// [`TranscriptionJobRecord::advance_clock`] gives.
+    /// [`TranscriptionJobRecord::advance_clock`] gives. It records the format of the
+    /// input audio the service determined too, exactly as that family's does
+    /// ([`determined_media_format`]).
     pub fn advance_clock(&mut self, now: SystemTime) {
         if self.status != STATUS_IN_PROGRESS || now < self.completion_due {
             return;
@@ -4409,6 +4433,7 @@ impl MedicalTranscriptionJobRecord {
             return;
         }
         self.status = STATUS_COMPLETED.to_string();
+        self.media_format = determined_media_format(self.media_format.take(), &self.media);
         self.transcript = Some(MedicalTranscript {
             // The same `OutputKey` rule the non-medical family applies, which this
             // operation documents in the same words — so one implementation
@@ -4720,6 +4745,29 @@ pub fn media_format_of(media: &Media) -> Option<String> {
         .iter()
         .find(|format| **format == extension)
         .map(|format| (*format).to_string())
+}
+
+/// The `MediaFormat` a job that has just FINISHED reports for the media it processed:
+/// the format the request declared, or — where it declared none — the one the service
+/// determined from the media it was given ([`media_format_of`]).
+///
+/// `MediaFormat` is "The format of the input media file" on every job shape that reports
+/// one (`smithy_query(query="doc", shape="TranscriptionJob", member="MediaFormat")`, and
+/// the same sentence on `MedicalTranscriptionJob` and `CallAnalyticsJob`), so it is the
+/// format of the FILE rather than an echo of what a request guessed: a finished job
+/// reports what the service established about its input audio whether or not the request
+/// said anything about it. The two can never disagree on a job that FINISHED — a declared
+/// format the stored media contradicts ends the job `FAILED` instead
+/// ([`media_failure_reason`]) — so a declared format is kept as the start reported it and
+/// the determination fills the member in only where the request left it blank. Media that
+/// evidences no modelled format leaves it absent rather than guessed, as
+/// [`media_format_of`] does.
+///
+/// One determination for all three families that report the member: the two
+/// transcription families, whose start request carries a `MediaFormat` of its own, and
+/// the Call Analytics family, whose start carries none at all.
+pub fn determined_media_format(declared: Option<String>, media: &Media) -> Option<String> {
+    declared.or_else(|| media_format_of(media))
 }
 
 /// The Amazon S3 bucket an `s3://` URI addresses, together with everything after it —
@@ -5127,7 +5175,8 @@ pub struct CallAnalyticsJobRecord {
     pub identified_language_score: Option<f32>,
     /// `MediaFormat`, the format the service determined the input audio is in; `None`
     /// until the job completes, and for a media URI that evidences no modelled format
-    /// ([`media_format_of`]).
+    /// ([`determined_media_format`], which this family reaches with nothing declared:
+    /// its start request carries no `MediaFormat` member at all).
     pub media_format: Option<String>,
     /// `MediaSampleRateHertz`, the rate the service determined the input audio is
     /// sampled at; `None` until the job completes
@@ -5187,7 +5236,7 @@ impl CallAnalyticsJobRecord {
             settings.and_then(|settings| settings.language_options.as_deref()),
         ));
         self.identified_language_score = Some(IDENTIFIED_LANGUAGE_SCORE);
-        self.media_format = media_format_of(&self.media);
+        self.media_format = determined_media_format(self.media_format.take(), &self.media);
         self.media_sample_rate_hertz = Some(CALL_AUDIO_SAMPLE_RATE_HERTZ);
         let transcript_uri =
             call_analytics_output_uri(self.output_location.as_deref(), &self.name, &self.region);
