@@ -185,24 +185,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `assetVersion` asks for the file as of one specific revision of the asset;
-        // omitted, the latest is reported. A version the asset never had names no
-        // revision, so it is reported as missing rather than answered with a different
-        // one.
-        if let Some(asset_version) = input.asset_version {
-            if asset_version != asset.version {
-                return Err(GetAssetFileErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::asset_version_not_found_message(
-                            &input.asset_id,
-                            asset_version,
-                        ),
-                    },
-                )
-                .into());
-            }
-        }
+        // omitted, the latest is reported. A revision of an asset is a snapshot of its
+        // content, so an earlier revision reports the content it was read with. A
+        // version the asset does not have — one it never reached, or one no longer
+        // retained — names no revision, so it is reported as missing rather than
+        // answered with a different one.
+        let files = match input.asset_version {
+            Some(asset_version) => asset.files_at(asset_version).ok_or_else(|| {
+                GetAssetFileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::asset_version_not_found_message(
+                        &input.asset_id,
+                        asset_version,
+                    ),
+                })
+            })?,
+            None => &asset.files,
+        };
 
-        let file = asset.files.get(&input.path).ok_or_else(|| {
+        let file = files.get(&input.path).ok_or_else(|| {
             GetAssetFileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: crate::state::asset_file_not_found_message(&input.path),
             })

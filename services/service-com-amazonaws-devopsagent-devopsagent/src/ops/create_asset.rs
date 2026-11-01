@@ -243,6 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             updated_at: now,
             files,
+            prior_versions: ::std::collections::BTreeMap::new(),
             source_url,
             content_is_one_file,
         };
@@ -303,7 +304,7 @@ fn asset_metadata(
         None | Some(::aws_smithy_types::Document::Null) => crate::state::empty_metadata(),
         Some(document @ ::aws_smithy_types::Document::Object(_)) => document,
         Some(other) => {
-            let kind = document_kind(&other);
+            let kind = crate::state::document_kind(&other);
             return Err(
                 CreateAssetErrorModeled::ValidationException(ValidationException {
                     message: format!(
@@ -344,19 +345,6 @@ fn asset_metadata(
         }
     }
     Ok(metadata)
-}
-
-/// What a document node IS, for a refusal that has to tell the caller what they
-/// sent instead of a set of members.
-fn document_kind(document: &::aws_smithy_types::Document) -> &'static str {
-    match document {
-        ::aws_smithy_types::Document::Object(_) => "a set of members",
-        ::aws_smithy_types::Document::Array(_) => "a list",
-        ::aws_smithy_types::Document::Number(_) => "a number",
-        ::aws_smithy_types::Document::String(_) => "a string",
-        ::aws_smithy_types::Document::Bool(_) => "a boolean",
-        ::aws_smithy_types::Document::Null => "nothing",
-    }
 }
 
 /// The files one `AssetContent` materialises into, by the path each is stored at.

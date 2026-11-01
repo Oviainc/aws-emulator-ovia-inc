@@ -62,6 +62,16 @@ pub const MAX_ASSET_CONTENT_BYTES: usize = 6_291_456;
 /// the first stored revision is 1 and an update mints the next one.
 pub const INITIAL_ASSET_VERSION: i32 = 1;
 
+/// How many revisions of one asset's content this service keeps readable behind the
+/// revision the asset is at.
+///
+/// CHOSEN: the model reports an asset's revisions (`AssetVersionMetadata`) and lets a
+/// read name one (`assetVersion`), but bounds neither how many an asset has nor how
+/// many are kept, so this is how far back this emulator serves. Once a further
+/// revision is minted the oldest retained one is dropped, which is what keeps one
+/// asset's history bounded however many updates arrive.
+pub const MAX_ASSET_VERSIONS_RETAINED: usize = 10;
+
 /// What one asset type requires of an asset, and how a refusal names items of it.
 ///
 /// `AssetType` is an open string in the model, so the metadata an asset must carry
@@ -324,6 +334,22 @@ pub fn asset_content_size_exceeded_message() -> String {
 /// more than [`MAX_ASSET_FILES`] files.
 pub fn asset_file_quota_message() -> String {
     format!("The request would exceed the maximum number of files ({MAX_ASSET_FILES}) for one asset")
+}
+
+/// The most metadata fields one stored asset file holds.
+///
+/// CHOSEN: the model types a file's `metadata` as an open `Document` and bounds
+/// neither its fields nor its size, while an update MERGES the fields it names into
+/// the ones the file already carries — so this is what keeps the metadata of one
+/// file from growing across updates without end.
+pub const MAX_ASSET_FILE_METADATA_FIELDS: usize = 100;
+
+/// The refusal message a file operation answers with when one file's metadata would
+/// hold more than [`MAX_ASSET_FILE_METADATA_FIELDS`] fields.
+pub fn asset_file_metadata_quota_message() -> String {
+    format!(
+        "The request would exceed the maximum number of metadata fields ({MAX_ASSET_FILE_METADATA_FIELDS}) for one asset file"
+    )
 }
 
 /// The longest `AssetFilePath` this service stores, from the model's own
@@ -679,8 +705,16 @@ pub struct AssetRecord {
     pub version: i32,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    /// The files this asset holds, by path.
+    /// The files this asset holds, by path: the content of the revision
+    /// [`Self::version`] names.
     pub files: BTreeMap<String, AssetFileRecord>,
+    /// The content this asset held as of each earlier revision, by that revision's
+    /// version number.
+    ///
+    /// A revision of an asset is a snapshot of its content, so the content a
+    /// revision was read with stays readable at that version once a later one
+    /// supersedes it. Bounded by [`MAX_ASSET_VERSIONS_RETAINED`].
+    pub prior_versions: BTreeMap<i32, BTreeMap<String, AssetFileRecord>>,
     /// The external source the asset's content is imported from, when the create
     /// named one instead of supplying the content inline. Held so a read reports
     /// where the content comes from; nothing is fetched, because this emulator
@@ -716,6 +750,44 @@ impl AssetRecord {
             .map(AssetFileRecord::content_bytes)
             .fold(0usize, |total, size| total.saturating_add(size))
     }
+
+    /// The files this asset's content held as of `version`, or `None` when that is
+    /// no revision this asset has (one it never reached, or one no longer retained
+    /// — [`MAX_ASSET_VERSIONS_RETAINED`]).
+    pub fn files_at(&self, version: i32) -> Option<&BTreeMap<String, AssetFileRecord>> {
+        if version == self.version {
+            Some(&self.files)
+        } else {
+            self.prior_versions.get(&version)
+        }
+    }
+
+    /// Move this asset to its next revision, freezing the content it holds now as
+    /// the revision it is leaving, and answer the version the asset is now at.
+    ///
+    /// Every file of the content belongs to the revision the asset is at —
+    /// `AssetFile$version` is "the asset version this file belongs to" — so the
+    /// files carried into the new revision report it, while the frozen snapshot
+    /// keeps reporting the one it was read with. The oldest retained revision is
+    /// dropped once the history is longer than [`MAX_ASSET_VERSIONS_RETAINED`].
+    pub fn begin_next_version(&mut self, now: SystemTime) -> i32 {
+        self.prior_versions.insert(self.version, self.files.clone());
+        while self.prior_versions.len() > MAX_ASSET_VERSIONS_RETAINED {
+            let oldest = self.prior_versions.keys().next().copied();
+            match oldest {
+                Some(version) => {
+                    self.prior_versions.remove(&version);
+                }
+                None => break,
+            }
+        }
+        self.version = self.version.saturating_add(1);
+        self.updated_at = now;
+        for file in self.files.values_mut() {
+            file.version = self.version;
+        }
+        self.version
+    }
 }
 
 /// One persisted file of an asset's content.
@@ -745,10 +817,32 @@ impl AssetFileRecord {
     /// The size of this file's content, in bytes: the bytes themselves, or the
     /// encoded length of the text.
     pub fn content_bytes(&self) -> usize {
-        match &self.body {
-            AssetFileBody::Bytes(bytes) => bytes.len(),
-            AssetFileBody::Text(text) => text.len(),
-        }
+        body_bytes(&self.body)
+    }
+}
+
+/// The size of one file body, in bytes: the bytes themselves, or the encoded length
+/// of the text.
+///
+/// Taken off the body rather than off a stored record, so the content a request
+/// carries is measured against what an asset holds before anything is persisted.
+pub fn body_bytes(body: &AssetFileBody) -> usize {
+    match body {
+        AssetFileBody::Bytes(bytes) => bytes.len(),
+        AssetFileBody::Text(text) => text.len(),
+    }
+}
+
+/// What a document node IS, for a refusal that has to tell the caller what they
+/// sent instead of a set of members.
+pub fn document_kind(document: &::aws_smithy_types::Document) -> &'static str {
+    match document {
+        ::aws_smithy_types::Document::Object(_) => "a set of members",
+        ::aws_smithy_types::Document::Array(_) => "a list",
+        ::aws_smithy_types::Document::Number(_) => "a number",
+        ::aws_smithy_types::Document::String(_) => "a string",
+        ::aws_smithy_types::Document::Bool(_) => "a boolean",
+        ::aws_smithy_types::Document::Null => "nothing",
     }
 }
 

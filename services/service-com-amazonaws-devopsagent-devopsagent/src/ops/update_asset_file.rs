@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAssetFile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAssetFile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAssetFile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updating a stored file changes the asset's content, and a revision of an asset is
+//! a snapshot of its content: the update moves the asset to its next revision and
+//! the content the previous revision was read with stays readable at that version.
 //!
 //! ## Shape of an operation
 //!
@@ -100,7 +95,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-devopsagent-devopsagent
 // here — hence the `UpdateAssetFileError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.devopsagent#UpdateAssetFile")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.devopsagent#UpdateAssetFile",
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum UpdateAssetFileErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -108,6 +106,10 @@ pub enum UpdateAssetFileErrorModeled {
     ContentSizeExceededException(ContentSizeExceededException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    // Widened in through `extra_errors`: the SERVICE declares this shape as a
+    // common error (HTTP 402), which is what the metadata a stored file carries has
+    // to answer with when an update would take it past what one file holds.
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -163,18 +165,241 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAssetFile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAssetFileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAssetFile"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAssetFileErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The asset plane authorises the caller against the named Agent Space before it
+        // can know whether anything inside it exists, so an `agentSpaceId` that names
+        // no space is an authorization failure; only inside a space the caller reaches
+        // is a missing asset or file reported as one.
+        if !store.agent_spaces.contains_key(&input.agent_space_id) {
+            return Err(UpdateAssetFileErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotencyToken`: a repeat with the same token reports what the update
+        // that first used it stored and applies nothing a second time, so one token
+        // mints one revision however often the request arrives. The record names the
+        // revision that update produced, so a replay answers that revision's file even
+        // once later updates have moved the asset on; once that revision is no longer
+        // retained the file as it stands is reported, which still applies nothing.
+        let token_scope = token_scope(&input.agent_space_id, &input.asset_id);
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = store
+                .replayed_id(&token_scope, token, now)
+                .and_then(|record| {
+                    let (path, version) = split_token_record(&record)?;
+                    let asset = store
+                        .agent_spaces
+                        .get(&input.agent_space_id)
+                        .and_then(|space| space.assets.get(&input.asset_id))?;
+                    asset
+                        .files_at(version)
+                        .unwrap_or(&asset.files)
+                        .get(path)
+                        .map(crate::state::AssetFileRecord::to_api)
+                });
+            if let Some(file) = replayed {
+                return Ok(UpdateAssetFileOutput { file });
+            }
+        }
+
+        // The greedy `{path+}` label carries every character after the asset's files
+        // prefix, so a value the modelled pattern admits can still walk out of the
+        // asset or start at a root: such a path names no file of this asset.
+        if !crate::state::names_a_file_of_the_asset(&input.path) {
+            let message = crate::state::not_a_file_of_the_asset_message(&input.path);
+            return Err(invalid_member("path", message));
+        }
+
+        // `metadata` names the members to update, so a document that is not a set of
+        // members names none: it is refused rather than replacing the file's metadata
+        // with something that describes no field.
+        let metadata_update = metadata_members(input.metadata)?;
+
+        let asset = store
+            .agent_spaces
+            .get_mut(&input.agent_space_id)
+            .and_then(|space| space.assets.get_mut(&input.asset_id))
+            .ok_or_else(|| {
+                UpdateAssetFileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::asset_not_found_message(&input.asset_id),
+                })
+            })?;
+
+        // An update changes a file the asset already holds, so a path it holds no file
+        // at names nothing to update: the file plane's own create is what adds one.
+        let current = asset.files.get(&input.path).ok_or_else(|| {
+            UpdateAssetFileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::asset_file_not_found_message(&input.path),
+            })
+        })?;
+
+        // "If omitted, the existing content is unchanged" and "omitted fields retain
+        // their current values": a request that names neither changes nothing, so it
+        // reports the stored file and mints no revision.
+        if input.content.is_none() && metadata_update.is_none() {
+            return Ok(UpdateAssetFileOutput {
+                file: current.to_api(),
+            });
+        }
+
+        // The content of one asset is bounded however it arrived, so content that
+        // would take the asset past what this service stores for one is refused rather
+        // than persisted. What this file holds now makes room for what replaces it.
+        if let Some(content) = &input.content {
+            let others = asset.content_bytes().saturating_sub(current.content_bytes());
+            if others.saturating_add(crate::state::body_bytes(content))
+                > crate::state::MAX_ASSET_CONTENT_BYTES
+            {
+                return Err(UpdateAssetFileErrorModeled::ContentSizeExceededException(
+                    ContentSizeExceededException {
+                        message: crate::state::asset_content_size_exceeded_message(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // An update MERGES the fields it names into the ones the file carries, so the
+        // merged document is what the bound on one file's metadata applies to. It is
+        // built before anything is written, so a refusal persists nothing.
+        let updated_metadata = match metadata_update {
+            Some(members) => {
+                let metadata = merged_metadata(current.metadata.as_ref(), members);
+                if let ::aws_smithy_types::Document::Object(fields) = &metadata {
+                    if fields.len() > crate::state::MAX_ASSET_FILE_METADATA_FIELDS {
+                        return Err(UpdateAssetFileErrorModeled::ServiceQuotaExceededException(
+                            ServiceQuotaExceededException {
+                                message: crate::state::asset_file_metadata_quota_message(),
+                            },
+                        )
+                        .into());
+                    }
+                }
+                Some(metadata)
+            }
+            None => None,
+        };
+
+        // A revision of an asset is a snapshot of its content, so changing a stored
+        // file moves the asset to its next revision and freezes the content the
+        // previous one was read with.
+        let version = asset.begin_next_version(now);
+        let file = asset.files.get_mut(&input.path).ok_or_else(|| {
+            UpdateAssetFileErrorModeled::InternalServerException(InternalServerException {
+                message: format!("asset file {} was not persisted", input.path),
+            })
+        })?;
+        if let Some(content) = input.content {
+            file.body = content;
+        }
+        if let Some(metadata) = updated_metadata {
+            file.metadata = Some(metadata);
+        }
+        file.updated_at = now;
+
+        // Read the response back out of the store, so what the caller sees is what was
+        // persisted.
+        let stored = file.to_api();
+
+        // The token is recorded only once the update IS stored, so a recorded token
+        // never names a revision a later replay cannot read.
+        if let Some(token) = input.client_token.as_deref() {
+            store.record_client_token(&token_scope, token, &token_record(&input.path, version), now);
+        }
+        Ok(UpdateAssetFileOutput { file: stored })
     }
+}
+
+/// The scope one `UpdateAssetFile` idempotency-token record belongs to: this
+/// operation on one asset, because the file it names lives in that asset and is
+/// reachable nowhere else.
+fn token_scope(agent_space_id: &str, asset_id: &str) -> String {
+    format!("UpdateAssetFile@{agent_space_id}/{asset_id}")
+}
+
+/// What one recorded token remembers: the file an update stored, and the revision of
+/// the asset it was stored as.
+///
+/// `AssetFilePath`'s own pattern (`^[a-zA-Z0-9_./ ()-]+$`) admits no `@`, so the
+/// separator can never occur inside the path part of a record.
+fn token_record(path: &str, version: i32) -> String {
+    format!("{path}@{version}")
+}
+
+/// The path and revision a [`token_record`] names, or `None` when the record is not
+/// one this operation wrote.
+fn split_token_record(record: &str) -> Option<(&str, i32)> {
+    let (path, version) = record.rsplit_once('@')?;
+    Some((path, version.parse().ok()?))
+}
+
+/// The members an update names, or `None` when it names no metadata update at all.
+///
+/// `UpdateAssetFileInput$metadata` is "metadata fields to update. Only the fields
+/// present in this document are updated. Omitted fields retain their current
+/// values", so what matters is which MEMBERS the document carries: a document that
+/// is not a set of members carries none, and no document at all leaves the file's
+/// metadata as it is.
+type MetadataMembers = ::std::collections::HashMap<String, ::aws_smithy_types::Document>;
+
+fn metadata_members(
+    metadata: Option<::aws_smithy_types::Document>,
+) -> Result<Option<MetadataMembers>, UpdateAssetFileError> {
+    match metadata {
+        None | Some(::aws_smithy_types::Document::Null) => Ok(None),
+        Some(::aws_smithy_types::Document::Object(members)) => Ok(Some(members)),
+        Some(other) => {
+            let kind = crate::state::document_kind(&other);
+            Err(invalid_member(
+                "metadata",
+                format!(
+                    "metadata must name the fields to update as a set of members, but {kind} was provided"
+                ),
+            ))
+        }
+    }
+}
+
+/// The metadata a stored file carries once the fields an update names are merged
+/// into it.
+///
+/// "Only the fields present in this document are updated. Omitted fields retain
+/// their current values": a field the update names takes the value it names, and
+/// every other field the file carries is kept.
+fn merged_metadata(
+    stored: Option<&::aws_smithy_types::Document>,
+    members: MetadataMembers,
+) -> ::aws_smithy_types::Document {
+    let mut merged = match stored {
+        Some(::aws_smithy_types::Document::Object(stored)) => stored.clone(),
+        Some(_) | None => MetadataMembers::new(),
+    };
+    merged.extend(members);
+    ::aws_smithy_types::Document::Object(merged)
+}
+
+/// Refuse the request as invalid: a 400 `ValidationException` naming the member at
+/// fault, so the caller can fix the request from the message alone.
+fn invalid_member(member: &str, message: String) -> UpdateAssetFileError {
+    UpdateAssetFileErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        field_list: Some(vec![ValidationExceptionField {
+            path: member.to_string(),
+            message,
+        }]),
+    })
+    .into()
 }
