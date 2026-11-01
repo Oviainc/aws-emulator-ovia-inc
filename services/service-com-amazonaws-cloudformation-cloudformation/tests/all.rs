@@ -19,8 +19,12 @@ mod agentcore_stack_outputs;
 mod appconfig_resource_types;
 #[path = "all/bucket_analytics_configurations.rs"]
 mod bucket_analytics_configurations;
+#[path = "all/bucket_intelligent_tiering_configurations.rs"]
+mod bucket_intelligent_tiering_configurations;
 #[path = "all/bucket_inventory_configurations.rs"]
 mod bucket_inventory_configurations;
+#[path = "all/bucket_metrics_and_lifecycle_configurations.rs"]
+mod bucket_metrics_and_lifecycle_configurations;
 #[path = "all/bucket_notification_configuration.rs"]
 mod bucket_notification_configuration;
 #[path = "all/callback_signature.rs"]

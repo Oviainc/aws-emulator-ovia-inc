@@ -291,9 +291,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 //   bucket; either may be one this emulator does not hold.
 // * `NoSuchKey` — the copy source names a key the source bucket may not hold.
 // * `InvalidRequest` — "A parameter or header in your request isn't valid", which is what
-//   S3 answers a copy of an object onto itself that changes nothing about it, and the
-//   over-long key and over-large metadata a destination write is refused for (the same
-//   two cases `PutObject` answers through it).
+//   S3 answers the over-long key and over-large metadata a destination write is refused for
+//   (the same two cases `PutObject` answers through it). The illegal self-copy answers the
+//   same CODE with the sentence S3 publishes for that condition, so it goes out through the
+//   unmodelled channel instead — the shape carries only the generic sentence.
 //
 // Each shape is this SERVICE's own (`com.amazonaws.s3#NoSuchBucket`, …); only this
 // operation's error list omits it.
@@ -694,9 +695,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // S3 refuses a copy of an object onto ITSELF that would change nothing about it:
         // the request names no new metadata, no new tag set, no storage class, no website
         // redirect location and no encryption, so the write would replace the object with
-        // itself. "A parameter or header in your request isn't valid" is what the modelled
-        // `InvalidRequest` (400) reports; a self-copy that DOES change one of them is the
-        // documented way to change that attribute in place, and is served.
+        // itself. `InvalidRequest` (400) is the code, and the `<Message>` is the sentence S3
+        // publishes for THIS condition
+        // ([`crate::state::SELF_COPY_WITHOUT_CHANGE_MESSAGE`]) rather than the generic one
+        // the shape carries for any invalid parameter — the condition is computed here, so
+        // the refusal states it, and a client can tell an illegal self-copy from a malformed
+        // request. It therefore travels through the unmodelled channel, which is what carries
+        // a message of the handler's own. A self-copy that DOES change one of those
+        // attributes is the documented way to change it in place, and is served.
         let onto_itself =
             source.bucket == input.bucket && source.key == input.key && source.version_id.is_none();
         let changes_nothing = !replaces_metadata
@@ -708,7 +714,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             && input.website_redirect_location.is_none()
             && requested.names_no_member();
         if onto_itself && changes_nothing {
-            return Err(CopyObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::SELF_COPY_WITHOUT_CHANGE_MESSAGE,
+            ));
         }
 
         // `REPLACE` takes the tag set from the request's `x-amz-tagging` header — "the

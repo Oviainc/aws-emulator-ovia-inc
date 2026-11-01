@@ -4191,7 +4191,8 @@ const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 
 /// Create the bucket an `AWS::S3::Bucket` declares, and apply the
 /// `VersioningConfiguration`, the `NotificationConfiguration`, the
-/// `AnalyticsConfigurations`, the `InventoryConfigurations` and the tags it carries.
+/// `AnalyticsConfigurations`, the `InventoryConfigurations`, the
+/// `IntelligentTieringConfigurations` and the tags it carries.
 ///
 /// "Ref returns the bucket name" for this type, so the physical resource id the stack
 /// reports IS the bucket a client addresses, and it is the bucket created here.
@@ -4208,7 +4209,9 @@ const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 /// one `PutBucketAnalyticsConfiguration` ([`declared_analytics_configurations`]) — the call
 /// Amazon S3 publishes for ONE analytics configuration, since the property is a list keyed
 /// by `Id` and the API takes one id per call. `InventoryConfigurations` is the same story
-/// with `PutBucketInventoryConfiguration` ([`declared_inventory_configurations`]).
+/// with `PutBucketInventoryConfiguration` ([`declared_inventory_configurations`]), and
+/// `IntelligentTieringConfigurations` with `PutBucketIntelligentTieringConfiguration`
+/// ([`declared_intelligent_tiering_configurations`]).
 ///
 /// `CreateBucket` takes no tag set at all, so the bucket's tags are a `PutBucketTagging` of
 /// its own — "sets the tags for a bucket", the one call S3 publishes for them — carrying
@@ -4308,6 +4311,50 @@ async fn create_bucket(
             .bucket(bucket)
             .id(id)
             .inventory_configuration(configuration)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    // "IntelligentTieringConfigurations — defines how Amazon S3 handles Intelligent-Tiering
+    // storage" (this type's own property): the property is a LIST keyed by `Id` and
+    // `PutBucketIntelligentTieringConfiguration` "puts a S3 Intelligent-Tiering
+    // configuration to the specified bucket" one id at a time, so each declared entry is
+    // installed by its own call under the id it names.
+    for (id, configuration) in declared_intelligent_tiering_configurations(resource)? {
+        client
+            .put_bucket_intelligent_tiering_configuration()
+            .bucket(bucket)
+            .id(id)
+            .intelligent_tiering_configuration(configuration)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    // "MetricsConfigurations — specifies a metrics configuration" for the CloudWatch request
+    // metrics of a subset of the bucket's objects (this type's own property): the property is
+    // a LIST keyed by `Id` and `PutBucketMetricsConfiguration` sets the configuration
+    // "specified by the metrics configuration ID", so each declared entry is installed by its
+    // own call under the id it names.
+    for (id, configuration) in declared_metrics_configurations(resource)? {
+        client
+            .put_bucket_metrics_configuration()
+            .bucket(bucket)
+            .id(id)
+            .metrics_configuration(configuration)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    // "LifecycleConfiguration — specifies the lifecycle configuration for objects in an
+    // Amazon S3 bucket" (this type's own property): the whole configuration is ONE
+    // `PutBucketLifecycleConfiguration`, the call Amazon S3 publishes for it, since the API
+    // takes the rule set as a single container.
+    if let Some(lifecycle) = declared_lifecycle_configuration(resource)? {
+        client
+            .put_bucket_lifecycle_configuration()
+            .bucket(bucket)
+            .lifecycle_configuration(lifecycle.configuration)
+            .set_transition_default_minimum_object_size(lifecycle.minimum_object_size)
             .send()
             .await
             .map_err(|error| refusal_of(&error))?;
@@ -4611,16 +4658,27 @@ fn declared_analytics_configurations(
     Ok(configurations)
 }
 
-/// The refusal for a declared analytics configuration the SDK will not build into the
-/// request shape: the entry is named, so the failing declaration can be found.
-fn analytics_not_sendable(id: &str, error: &dyn ::std::fmt::Display) -> Refusal {
+/// The refusal for an entry of one of a bucket's id-keyed configuration LISTS that the SDK
+/// will not build into the request shape: the property and the entry are both named, so the
+/// failing declaration can be found. One wording for every such list, since what went wrong
+/// is the same in each — the entry, not the list it is in.
+fn configuration_not_sendable(
+    property: &str,
+    id: &str,
+    error: &dyn ::std::fmt::Display,
+) -> Refusal {
     Refusal {
         code: UNIDENTIFIED_FAILURE.to_string(),
         message: format!(
-            "the {ANALYTICS_CONFIGURATIONS} entry {id} of {S3_BUCKET} cannot be sent to Amazon \
-             S3: {error}"
+            "the {property} entry {id} of {S3_BUCKET} cannot be sent to Amazon S3: {error}"
         ),
     }
+}
+
+/// The refusal for a declared analytics configuration the SDK will not build into the
+/// request shape: the entry is named, so the failing declaration can be found.
+fn analytics_not_sendable(id: &str, error: &dyn ::std::fmt::Display) -> Refusal {
+    configuration_not_sendable(ANALYTICS_CONFIGURATIONS, id, error)
 }
 
 /// The `AnalyticsFilter` one declared configuration's object scope amounts to, or `None` for
@@ -4639,11 +4697,8 @@ fn analytics_filter(
 ) -> Result<Option<::aws_sdk_s3::types::AnalyticsFilter>, Refusal> {
     use ::aws_sdk_s3::types::{AnalyticsAndOperator, AnalyticsFilter};
 
-    let prefix = declared
-        .get("Prefix")
-        .and_then(scalar_text)
-        .filter(|text| !text.is_empty());
-    let tags = analytics_tag_filters(declared, id)?;
+    let prefix = declared_text(declared, "Prefix");
+    let tags = declared_tag_filters(declared, ANALYTICS_CONFIGURATIONS, id)?;
     Ok(match (prefix, tags.len()) {
         (None, 0) => None,
         (Some(prefix), 0) => Some(AnalyticsFilter::Prefix(prefix)),
@@ -4657,14 +4712,16 @@ fn analytics_filter(
     })
 }
 
-/// The tags one declared configuration's `TagFilters` narrows the analysis by, as the API's
-/// own `Tag` list, in the declared order.
+/// The tags one declared entry of `property` narrows its scope by, as the API's own `Tag`
+/// list, in the declared order. `TagFilters` is how EVERY id-keyed configuration list of this
+/// type spells the tag half of an object scope, so one reading serves them all.
 ///
 /// A filter stating neither half of the tag is refused rather than sent as a tag on nothing:
 /// `Tag` REQUIRES both `Key` and `Value`, so an incomplete one narrows by a predicate the
 /// service cannot evaluate.
-fn analytics_tag_filters(
+fn declared_tag_filters(
     declared: &Value,
+    property: &str,
     id: &str,
 ) -> Result<Vec<::aws_sdk_s3::types::Tag>, Refusal> {
     use ::aws_sdk_s3::types::Tag;
@@ -4679,15 +4736,11 @@ fn analytics_tag_filters(
         let missing = |member: &str| Refusal {
             code: MISSING_PROPERTY_CODE.to_string(),
             message: format!(
-                "a TagFilters entry of the {ANALYTICS_CONFIGURATIONS} entry {id} of \
-                 {S3_BUCKET} declares no {member}"
+                "a TagFilters entry of the {property} entry {id} of {S3_BUCKET} declares no \
+                 {member}"
             ),
         };
-        let key = filter
-            .get("Key")
-            .and_then(scalar_text)
-            .filter(|text| !text.is_empty())
-            .ok_or_else(|| missing("Key"))?;
+        let key = declared_text(filter, "Key").ok_or_else(|| missing("Key"))?;
         let value = filter
             .get("Value")
             .and_then(scalar_text)
@@ -4697,7 +4750,7 @@ fn analytics_tag_filters(
                 .key(key)
                 .value(value)
                 .build()
-                .map_err(|error| analytics_not_sendable(id, &error))?,
+                .map_err(|error| configuration_not_sendable(property, id, &error))?,
         );
     }
     Ok(tags)
@@ -4890,13 +4943,7 @@ fn declared_inventory_configurations(
 /// The refusal for a declared inventory configuration the SDK will not build into the request
 /// shape: the entry is named, so the failing declaration can be found.
 fn inventory_not_sendable(id: &str, error: &dyn ::std::fmt::Display) -> Refusal {
-    Refusal {
-        code: UNIDENTIFIED_FAILURE.to_string(),
-        message: format!(
-            "the {INVENTORY_CONFIGURATIONS} entry {id} of {S3_BUCKET} cannot be sent to Amazon \
-             S3: {error}"
-        ),
-    }
+    configuration_not_sendable(INVENTORY_CONFIGURATIONS, id, error)
 }
 
 /// The `InventoryDestination` one declared entry states, as Amazon S3 takes it.
@@ -4945,6 +4992,563 @@ fn declared_inventory_destination(
     Ok(InventoryDestination::builder()
         .s3_bucket_destination(s3_bucket_destination)
         .build())
+}
+
+/// The property an `AWS::S3::Bucket` declares its S3 Intelligent-Tiering configurations
+/// under.
+const INTELLIGENT_TIERING_CONFIGURATIONS: &str = "IntelligentTieringConfigurations";
+
+/// Every S3 Intelligent-Tiering configuration a bucket's declaration states, each paired with
+/// the `Id` that identifies it — the `(Id, IntelligentTieringConfiguration)` pair one
+/// `PutBucketIntelligentTieringConfiguration` takes. A declaration stating none yields none,
+/// which is the state a bucket is created in.
+///
+/// The template's spelling is FLAT where the API nests, and this is the one place the two are
+/// reconciled. An entry states the object scope as `Prefix` and `TagFilters` where the API
+/// takes the single `Filter` container ([`intelligent_tiering_filter`]); `Status` and
+/// `Tierings` are spelled the same on both sides and pass through, each `Tiering` carrying
+/// the `Days` and `AccessTier` the API REQUIRES of it. The values are the template's: Amazon
+/// S3's own deserializer and handler are what judge them against
+/// `IntelligentTieringStatus`, `IntelligentTieringAccessTier` and the day range each tier
+/// publishes.
+///
+/// An entry missing a member the API REQUIRES — the `Id` it is addressable by, the `Status`,
+/// the `Tierings` the configuration transitions by, or either half of one tiering — is
+/// refused rather than installed under a value of this module's invention: the stack must not
+/// complete with a tiering policy a client cannot address or one the service never agreed to.
+fn declared_intelligent_tiering_configurations(
+    resource: &StoredResource,
+) -> Result<Vec<(String, ::aws_sdk_s3::types::IntelligentTieringConfiguration)>, Refusal> {
+    use ::aws_sdk_s3::types::{
+        IntelligentTieringAccessTier, IntelligentTieringConfiguration, IntelligentTieringStatus,
+        Tiering,
+    };
+
+    let listed = resource
+        .properties
+        .get(INTELLIGENT_TIERING_CONFIGURATIONS)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut configurations = Vec::with_capacity(listed.len());
+    for declared in listed {
+        let id = declared_text(declared, "Id").ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "an {INTELLIGENT_TIERING_CONFIGURATIONS} entry of {S3_BUCKET} declares no Id"
+            ),
+        })?;
+        let missing = |member: &str| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "the {INTELLIGENT_TIERING_CONFIGURATIONS} entry {id} of {S3_BUCKET} declares no \
+                 {member}"
+            ),
+        };
+        let status = declared_text(declared, "Status").ok_or_else(|| missing("Status"))?;
+        let declared_tierings = declared
+            .get("Tierings")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if declared_tierings.is_empty() {
+            return Err(missing("Tierings"));
+        }
+        let mut tierings = Vec::with_capacity(declared_tierings.len());
+        for tiering in declared_tierings {
+            let days =
+                whole_number(tiering.get("Days")).ok_or_else(|| missing("Tierings.Days"))?;
+            let access_tier = declared_text(tiering, "AccessTier")
+                .ok_or_else(|| missing("Tierings.AccessTier"))?;
+            tierings.push(
+                Tiering::builder()
+                    .days(days)
+                    .access_tier(IntelligentTieringAccessTier::from(access_tier.as_str()))
+                    .build()
+                    .map_err(|error| {
+                        configuration_not_sendable(
+                            INTELLIGENT_TIERING_CONFIGURATIONS,
+                            &id,
+                            &error,
+                        )
+                    })?,
+            );
+        }
+        let configuration = IntelligentTieringConfiguration::builder()
+            .id(&id)
+            .status(IntelligentTieringStatus::from(status.as_str()))
+            .set_filter(intelligent_tiering_filter(declared, &id)?)
+            .set_tierings(Some(tierings))
+            .build()
+            .map_err(|error| {
+                configuration_not_sendable(INTELLIGENT_TIERING_CONFIGURATIONS, &id, &error)
+            })?;
+        configurations.push((id, configuration));
+    }
+    Ok(configurations)
+}
+
+/// The `IntelligentTieringFilter` one declared configuration's object scope amounts to, or
+/// `None` for a configuration that narrows nothing — the filter "is used to identify objects
+/// that the S3 Intelligent-Tiering configuration applies to", so a configuration stating no
+/// scope applies to every object.
+///
+/// The template narrows with the two flat properties `Prefix` and `TagFilters`, while the
+/// API's container carries a `Prefix`, a single `Tag` or an `And` conjunction whose "operator
+/// must have at least two predicates"
+/// (`smithy_query(query="shape",shape="IntelligentTieringFilter")`). So a scope naming ONE
+/// predicate is that predicate's own member, and a scope naming several is the conjunction of
+/// them — the prefix and each tag counting as one predicate each, exactly as
+/// [`analytics_filter`] folds the same flat pair for its own list.
+fn intelligent_tiering_filter(
+    declared: &Value,
+    id: &str,
+) -> Result<Option<::aws_sdk_s3::types::IntelligentTieringFilter>, Refusal> {
+    use ::aws_sdk_s3::types::{IntelligentTieringAndOperator, IntelligentTieringFilter};
+
+    let prefix = declared_text(declared, "Prefix");
+    let tags = declared_tag_filters(declared, INTELLIGENT_TIERING_CONFIGURATIONS, id)?;
+    Ok(match (prefix, tags.len()) {
+        (None, 0) => None,
+        (Some(prefix), 0) => Some(IntelligentTieringFilter::builder().prefix(prefix).build()),
+        (None, 1) => tags
+            .into_iter()
+            .next()
+            .map(|tag| IntelligentTieringFilter::builder().tag(tag).build()),
+        (prefix, _) => Some(
+            IntelligentTieringFilter::builder()
+                .and(
+                    IntelligentTieringAndOperator::builder()
+                        .set_prefix(prefix)
+                        // Every scope that reaches the conjunction carries at least one tag:
+                        // a prefix is this filter's only other predicate, and a prefix alone
+                        // is the single-predicate arm above.
+                        .set_tags(Some(tags))
+                        .build(),
+                )
+                .build(),
+        ),
+    })
+}
+
+/// The property an `AWS::S3::Bucket` declares its CloudWatch request metrics under.
+const METRICS_CONFIGURATIONS: &str = "MetricsConfigurations";
+
+/// Every metrics configuration a bucket's declaration states, each paired with the `Id` that
+/// identifies it — the `(Id, MetricsConfiguration)` pair one `PutBucketMetricsConfiguration`
+/// takes. A declaration stating none yields none, which is the state a bucket is created in.
+///
+/// The object scope is what the template spells FLAT: an `AccessPointArn`, a `Prefix` and a
+/// `TagFilters` list, where the API takes the single `Filter` union
+/// ([`metrics_filter`]). An entry declaring no `Id` is refused rather than installed under an
+/// id of this module's invention: the stack must not complete with a metrics configuration a
+/// client cannot address.
+fn declared_metrics_configurations(
+    resource: &StoredResource,
+) -> Result<Vec<(String, ::aws_sdk_s3::types::MetricsConfiguration)>, Refusal> {
+    use ::aws_sdk_s3::types::MetricsConfiguration;
+
+    let listed = resource
+        .properties
+        .get(METRICS_CONFIGURATIONS)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut configurations = Vec::with_capacity(listed.len());
+    for declared in listed {
+        let id = declared_text(declared, "Id").ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!("a {METRICS_CONFIGURATIONS} entry of {S3_BUCKET} declares no Id"),
+        })?;
+        let configuration = MetricsConfiguration::builder()
+            .id(&id)
+            .set_filter(metrics_filter(declared, &id)?)
+            .build()
+            .map_err(|error| configuration_not_sendable(METRICS_CONFIGURATIONS, &id, &error))?;
+        configurations.push((id, configuration));
+    }
+    Ok(configurations)
+}
+
+/// The `MetricsFilter` one declared configuration's object scope amounts to, or `None` for a
+/// configuration that narrows nothing — the filter is what makes the configuration cover "a
+/// subset of objects", so a configuration stating no scope covers the whole bucket.
+///
+/// The template narrows with the three flat properties `AccessPointArn`, `Prefix` and
+/// `TagFilters`, while "a filter must have exactly one prefix, one tag, one access point ARN,
+/// or one conjunction (MetricsAndOperator)" whose operator "must have at least two
+/// predicates" (`smithy_query(query="shape",shape="MetricsFilter")`). So a scope naming ONE
+/// predicate is that predicate's own member, and a scope naming several is the conjunction of
+/// them — the access point ARN, the prefix and each tag counting as one predicate each,
+/// exactly as [`analytics_filter`] folds the same flat spelling for its own list.
+fn metrics_filter(
+    declared: &Value,
+    id: &str,
+) -> Result<Option<::aws_sdk_s3::types::MetricsFilter>, Refusal> {
+    use ::aws_sdk_s3::types::{MetricsAndOperator, MetricsFilter};
+
+    let access_point_arn = declared_text(declared, "AccessPointArn");
+    let prefix = declared_text(declared, "Prefix");
+    let tags = declared_tag_filters(declared, METRICS_CONFIGURATIONS, id)?;
+    let predicates = usize::from(access_point_arn.is_some()) + usize::from(prefix.is_some())
+        + tags.len();
+    Ok(match predicates {
+        0 => None,
+        1 => match (access_point_arn, prefix, tags.into_iter().next()) {
+            (Some(arn), _, _) => Some(MetricsFilter::AccessPointArn(arn)),
+            (_, Some(prefix), _) => Some(MetricsFilter::Prefix(prefix)),
+            (_, _, tag) => tag.map(MetricsFilter::Tag),
+        },
+        _ => Some(MetricsFilter::And(
+            MetricsAndOperator::builder()
+                .set_access_point_arn(access_point_arn)
+                .set_prefix(prefix)
+                // A conjunction of the prefix and the access point ARN alone carries no tag
+                // at all, which is not the same as an empty tag list.
+                .set_tags((!tags.is_empty()).then_some(tags))
+                .build(),
+        )),
+    })
+}
+
+/// The property an `AWS::S3::Bucket` declares its object lifecycle under.
+const LIFECYCLE_CONFIGURATION: &str = "LifecycleConfiguration";
+
+/// The lifecycle configuration one `PutBucketLifecycleConfiguration` carries: the rule set
+/// and the default minimum object size the transitions are measured against, which is a
+/// member of the REQUEST rather than of the container.
+struct DeclaredLifecycle {
+    configuration: ::aws_sdk_s3::types::BucketLifecycleConfiguration,
+    minimum_object_size: Option<::aws_sdk_s3::types::TransitionDefaultMinimumObjectSize>,
+}
+
+/// The lifecycle configuration a bucket's declaration states, as the one
+/// `PutBucketLifecycleConfiguration` request Amazon S3 takes — `None` for a declaration that
+/// states none, which is the state a bucket is created in.
+///
+/// The template's spelling is FLAT where the API nests, and this is the one place the two are
+/// reconciled. A rule states its object scope as `Prefix`, `TagFilters`,
+/// `ObjectSizeGreaterThan` and `ObjectSizeLessThan` where the API takes the single `Filter`
+/// container ([`lifecycle_rule_filter`]); its expiry as `ExpirationDate`,
+/// `ExpirationInDays` and `ExpiredObjectDeleteMarker` where the API takes the one
+/// `Expiration` container ([`lifecycle_expiration`]); and each transition with
+/// `TransitionDate`/`TransitionInDays` where the API spells the same two `Date`/`Days`.
+/// `Status`, `Id`, `AbortIncompleteMultipartUpload` and the noncurrent-version members are
+/// spelled the same on both sides. The values are the template's: Amazon S3's own
+/// deserializer and handler are what judge them against `ExpirationStatus`, the transition
+/// storage classes and the published rules a rule set has to satisfy.
+///
+/// A rule missing the `Status` the API REQUIRES, or naming a date that is no instant, is
+/// refused rather than sent incomplete: the stack must not complete with a lifecycle the
+/// bucket never carried.
+fn declared_lifecycle_configuration(
+    resource: &StoredResource,
+) -> Result<Option<DeclaredLifecycle>, Refusal> {
+    use ::aws_sdk_s3::types::{BucketLifecycleConfiguration, TransitionDefaultMinimumObjectSize};
+
+    let Some(declared) = resource.properties.get(LIFECYCLE_CONFIGURATION) else {
+        return Ok(None);
+    };
+    let listed = declared
+        .get("Rules")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut rules = Vec::with_capacity(listed.len());
+    for (index, rule) in listed.iter().enumerate() {
+        // Counted from 1, the way the declaration orders the rules, because `Id` is optional:
+        // a rule that states none is still identified in a refusal.
+        rules.push(declared_lifecycle_rule(rule, index + 1)?);
+    }
+    let configuration = BucketLifecycleConfiguration::builder()
+        .set_rules(Some(rules))
+        .build()
+        .map_err(|error| lifecycle_not_sendable("the rule set", &error))?;
+    Ok(Some(DeclaredLifecycle {
+        configuration,
+        minimum_object_size: declared_text(declared, "TransitionDefaultMinimumObjectSize")
+            .map(|size| TransitionDefaultMinimumObjectSize::from(size.as_str())),
+    }))
+}
+
+/// One declared lifecycle rule, as the API's own `LifecycleRule`.
+fn declared_lifecycle_rule(
+    declared: &Value,
+    position: usize,
+) -> Result<::aws_sdk_s3::types::LifecycleRule, Refusal> {
+    use ::aws_sdk_s3::types::{ExpirationStatus, LifecycleRule};
+
+    let named = format!("rule {position}");
+    let status = declared_text(declared, "Status").ok_or_else(|| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!(
+            "{named} of the {LIFECYCLE_CONFIGURATION} of {S3_BUCKET} declares no Status"
+        ),
+    })?;
+    let transitions = declared_transitions(declared, &named)?;
+    let noncurrent_transitions = declared_noncurrent_version_transitions(declared, &named)?;
+    LifecycleRule::builder()
+        .status(ExpirationStatus::from(status.as_str()))
+        .set_id(declared_text(declared, "Id"))
+        // The scope travels as a `Filter` whatever the rule narrows by, including nothing at
+        // all: "if the Filter element is left empty, the lifecycle rule applies to all
+        // objects in the bucket" (`LifecycleRuleFilter`), where the rule's own deprecated
+        // `Prefix` member is the older spelling a configuration cannot mix with a `Filter`.
+        .filter(lifecycle_rule_filter(declared, &named)?)
+        .set_expiration(lifecycle_expiration(declared, &named)?)
+        .set_transitions((!transitions.is_empty()).then_some(transitions))
+        .set_noncurrent_version_transitions(
+            (!noncurrent_transitions.is_empty()).then_some(noncurrent_transitions),
+        )
+        .set_noncurrent_version_expiration(declared_noncurrent_version_expiration(declared))
+        .set_abort_incomplete_multipart_upload(declared_abort_incomplete_multipart_upload(
+            declared,
+        ))
+        .build()
+        .map_err(|error| lifecycle_not_sendable(&named, &error))
+}
+
+/// The refusal for a declared lifecycle the SDK will not build into the request shape: the
+/// rule is named, so the failing declaration can be found.
+fn lifecycle_not_sendable(named: &str, error: &dyn ::std::fmt::Display) -> Refusal {
+    Refusal {
+        code: UNIDENTIFIED_FAILURE.to_string(),
+        message: format!(
+            "{named} of the {LIFECYCLE_CONFIGURATION} of {S3_BUCKET} cannot be sent to Amazon \
+             S3: {error}"
+        ),
+    }
+}
+
+/// The `LifecycleRuleFilter` one declared rule's object scope amounts to.
+///
+/// The template narrows with four flat properties — a `Prefix`, a `TagFilters` list and the
+/// two object-size bounds — while the API's container carries exactly one of them or an `And`
+/// conjunction of several (`smithy_query(query="shape",shape="LifecycleRuleFilter")`). So a
+/// scope naming ONE predicate is that predicate's own member, a scope naming several is the
+/// conjunction of them, and a scope naming none is the EMPTY filter, which is the rule that
+/// applies to every object in the bucket.
+fn lifecycle_rule_filter(
+    declared: &Value,
+    named: &str,
+) -> Result<::aws_sdk_s3::types::LifecycleRuleFilter, Refusal> {
+    use ::aws_sdk_s3::types::{LifecycleRuleAndOperator, LifecycleRuleFilter};
+
+    let prefix = declared_text(declared, "Prefix");
+    let greater_than = declared_object_size(declared, "ObjectSizeGreaterThan");
+    let less_than = declared_object_size(declared, "ObjectSizeLessThan");
+    let tags = declared_tag_filters(declared, LIFECYCLE_CONFIGURATION, named)?;
+    let predicates = usize::from(prefix.is_some())
+        + usize::from(greater_than.is_some())
+        + usize::from(less_than.is_some())
+        + tags.len();
+    if predicates > 1 {
+        return Ok(LifecycleRuleFilter::builder()
+            .and(
+                LifecycleRuleAndOperator::builder()
+                    .set_prefix(prefix)
+                    // A conjunction of the two object-size bounds alone carries no tag at
+                    // all, which is not the same as an empty tag list.
+                    .set_tags((!tags.is_empty()).then_some(tags))
+                    .set_object_size_greater_than(greater_than)
+                    .set_object_size_less_than(less_than)
+                    .build(),
+            )
+            .build());
+    }
+    Ok(LifecycleRuleFilter::builder()
+        .set_prefix(prefix)
+        .set_tag(tags.into_iter().next())
+        .set_object_size_greater_than(greater_than)
+        .set_object_size_less_than(less_than)
+        .build())
+}
+
+/// The `Expiration` one declared rule asks for, or `None` for a rule that expires nothing.
+///
+/// The three members the template spells flat are the three the API's container carries, with
+/// `ExpirationInDays` spelled `Days` and `ExpirationDate` spelled `Date`: whichever the rule
+/// states travel through, and S3's own validation is what judges a rule stating more than one
+/// of them.
+fn lifecycle_expiration(
+    declared: &Value,
+    named: &str,
+) -> Result<Option<::aws_sdk_s3::types::LifecycleExpiration>, Refusal> {
+    use ::aws_sdk_s3::types::LifecycleExpiration;
+
+    let date = declared_instant(declared, "ExpirationDate", named)?;
+    let days = whole_number(declared.get("ExpirationInDays"));
+    let delete_marker = declared
+        .as_object()
+        .and_then(|rule| declared_flag(rule, "ExpiredObjectDeleteMarker"));
+    if date.is_none() && days.is_none() && delete_marker.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(
+        LifecycleExpiration::builder()
+            .set_date(date)
+            .set_days(days)
+            .set_expired_object_delete_marker(delete_marker)
+            .build(),
+    ))
+}
+
+/// Every transition one declared rule asks for, in declared order.
+///
+/// The property is a `Transitions` LIST, beside the singular `Transition` the type still
+/// publishes for one transition alone; a rule stating both asks for all of them, so both are
+/// read. `TransitionInDays` and `TransitionDate` are the API's `Days` and `Date`.
+fn declared_transitions(
+    declared: &Value,
+    named: &str,
+) -> Result<Vec<::aws_sdk_s3::types::Transition>, Refusal> {
+    use ::aws_sdk_s3::types::{Transition, TransitionStorageClass};
+
+    let mut transitions = Vec::new();
+    for transition in declared_entries(declared, "Transitions", "Transition") {
+        let storage_class = declared_text(transition, "StorageClass").ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "a Transition of {named} of the {LIFECYCLE_CONFIGURATION} of {S3_BUCKET} \
+                 declares no StorageClass"
+            ),
+        })?;
+        transitions.push(
+            Transition::builder()
+                .storage_class(TransitionStorageClass::from(storage_class.as_str()))
+                .set_days(whole_number(transition.get("TransitionInDays")))
+                .set_date(declared_instant(transition, "TransitionDate", named)?)
+                .build(),
+        );
+    }
+    Ok(transitions)
+}
+
+/// Every noncurrent-version transition one declared rule asks for, in declared order — the
+/// list and the singular property alike, as [`declared_transitions`] reads the current-version
+/// ones. `TransitionInDays` is the API's `NoncurrentDays`.
+fn declared_noncurrent_version_transitions(
+    declared: &Value,
+    named: &str,
+) -> Result<Vec<::aws_sdk_s3::types::NoncurrentVersionTransition>, Refusal> {
+    use ::aws_sdk_s3::types::{NoncurrentVersionTransition, TransitionStorageClass};
+
+    let mut transitions = Vec::new();
+    for transition in declared_entries(
+        declared,
+        "NoncurrentVersionTransitions",
+        "NoncurrentVersionTransition",
+    ) {
+        let storage_class = declared_text(transition, "StorageClass").ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "a NoncurrentVersionTransition of {named} of the {LIFECYCLE_CONFIGURATION} of \
+                 {S3_BUCKET} declares no StorageClass"
+            ),
+        })?;
+        transitions.push(
+            NoncurrentVersionTransition::builder()
+                .storage_class(TransitionStorageClass::from(storage_class.as_str()))
+                .set_noncurrent_days(whole_number(transition.get("TransitionInDays")))
+                .set_newer_noncurrent_versions(whole_number(
+                    transition.get("NewerNoncurrentVersions"),
+                ))
+                .build(),
+        );
+    }
+    Ok(transitions)
+}
+
+/// The `NoncurrentVersionExpiration` one declared rule asks for, or `None` for a rule that
+/// expires no noncurrent version.
+///
+/// The type publishes the container beside the older `NoncurrentVersionExpirationInDays`,
+/// which states the same day count on its own, so either spelling yields the one member the
+/// API's container REQUIRES.
+fn declared_noncurrent_version_expiration(
+    declared: &Value,
+) -> Option<::aws_sdk_s3::types::NoncurrentVersionExpiration> {
+    use ::aws_sdk_s3::types::NoncurrentVersionExpiration;
+
+    let container = declared.get("NoncurrentVersionExpiration");
+    let days = container
+        .and_then(|expiration| whole_number(expiration.get("NoncurrentDays")))
+        .or_else(|| whole_number(declared.get("NoncurrentVersionExpirationInDays")))?;
+    Some(
+        NoncurrentVersionExpiration::builder()
+            .noncurrent_days(days)
+            .set_newer_noncurrent_versions(
+                container.and_then(|expiration| {
+                    whole_number(expiration.get("NewerNoncurrentVersions"))
+                }),
+            )
+            .build(),
+    )
+}
+
+/// The `AbortIncompleteMultipartUpload` one declared rule asks for, or `None` for a rule that
+/// aborts none. Both sides spell the container and its one member the same way.
+fn declared_abort_incomplete_multipart_upload(
+    declared: &Value,
+) -> Option<::aws_sdk_s3::types::AbortIncompleteMultipartUpload> {
+    use ::aws_sdk_s3::types::AbortIncompleteMultipartUpload;
+
+    let days = whole_number(
+        declared
+            .get("AbortIncompleteMultipartUpload")?
+            .get("DaysAfterInitiation"),
+    )?;
+    Some(
+        AbortIncompleteMultipartUpload::builder()
+            .days_after_initiation(days)
+            .build(),
+    )
+}
+
+/// The entries a declaration states under `list`, followed by the one it states under the
+/// singular `single` — the shape a resource type takes where it publishes both spellings for
+/// the same thing.
+fn declared_entries<'a>(declared: &'a Value, list: &str, single: &str) -> Vec<&'a Value> {
+    let mut entries: Vec<&Value> = declared
+        .get(list)
+        .and_then(Value::as_array)
+        .map(|listed| listed.iter().collect())
+        .unwrap_or_default();
+    entries.extend(declared.get(single));
+    entries
+}
+
+/// One declared property as the instant an API timestamp member takes, or `None` where the
+/// declaration states none. Text that is no ISO-8601 instant is a refusal rather than a
+/// silently dropped action.
+fn declared_instant(
+    declared: &Value,
+    property: &str,
+    named: &str,
+) -> Result<Option<::aws_smithy_types::DateTime>, Refusal> {
+    let Some(text) = declared_text(declared, property) else {
+        return Ok(None);
+    };
+    ::aws_smithy_types::DateTime::from_str(&text, ::aws_smithy_types::date_time::Format::DateTime)
+        .map(Some)
+        .map_err(|error| Refusal {
+            code: INVALID_PROPERTY_CODE.to_string(),
+            message: format!(
+                "the {property} of {named} of the {LIFECYCLE_CONFIGURATION} of {S3_BUCKET} is no \
+                 instant: {error}"
+            ),
+        })
+}
+
+/// One declared property as the object size in BYTES an API long member takes, in either
+/// spelling a template gives a whole number ([`whole_number`] reads the same two for the
+/// members the API takes as an integer).
+fn declared_object_size(declared: &Value, property: &str) -> Option<i64> {
+    match declared.get(property)? {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
 }
 
 /// One property of a declaration as the text an API member takes, or `None` where the
@@ -7610,6 +8214,14 @@ const MISSING_PROPERTY_CODE: &str = "ValidationError";
 /// The error code that stands in for one an answer did not carry: the call did not
 /// succeed, and nothing on the other end identified the problem.
 const UNIDENTIFIED_FAILURE: &str = "InternalFailure";
+
+/// The error code this module reports for a declared property whose VALUE the resource type
+/// cannot take — text where an instant is called for, say. CloudFormation answers a property
+/// fault with its template-validation code whether the property is absent or malformed, so
+/// this carries [`MISSING_PROPERTY_CODE`]'s value under the name the malformed case reads by;
+/// what tells the two apart is the message, which names the property and what is wrong with
+/// it.
+const INVALID_PROPERTY_CODE: &str = MISSING_PROPERTY_CODE;
 
 /// An SDK error as the [`Refusal`] the stack reports: the error code the owning service
 /// NAMED and the message it worded, kept apart so the caller branches on the code.

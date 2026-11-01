@@ -1305,6 +1305,159 @@ async fn a_copy_of_an_object_onto_itself_is_refused_unless_it_changes_something(
     }
 }
 
+/// The sentence Amazon S3 publishes for the illegal self-copy, spelled out here rather than
+/// read from the crate, so this suite pins the WORDING a client branches on and not merely
+/// that the handler and the test agree: "This copy request is illegal because it is trying to
+/// copy an object to itself without changing the object's metadata, storage class, website
+/// redirect location or encryption attributes." It states the condition itself and
+/// interpolates nothing of the request, so it is the same sentence for every such copy.
+const SELF_COPY_REFUSAL_MESSAGE: &str =
+    "This copy request is illegal because it is trying to copy an object to itself without \
+     changing the object's metadata, storage class, website redirect location or encryption \
+     attributes.";
+
+/// The generic sentence the `InvalidRequest` SHAPE carries for any parameter or header that
+/// is not valid (`smithy_query(query="shape",shape="com.amazonaws.s3#InvalidRequest")`) — the
+/// refusal a client cannot act on, which this condition must NOT answer with.
+const GENERIC_INVALID_REQUEST_MESSAGE: &str =
+    "A parameter or header in your request isn't valid. For details, see the description of \
+     this API operation.";
+
+#[tokio::test]
+async fn the_illegal_self_copy_states_the_rule_it_was_refused_by() {
+    // The refusal of a copy onto itself that changes nothing is a condition S3 COMPUTES from
+    // the request, so the `<Message>` beside the `InvalidRequest` code is the sentence S3
+    // publishes for that condition — the one naming the attributes such a copy has to change
+    // — and never the generic "a parameter isn't valid" of the shape: a client that retries
+    // with `MetadataDirective=REPLACE` has to be able to tell the two apart.
+    //
+    // The rows differ along everything the rule generalises over and nothing it is keyed to:
+    // which bucket and key the copy addresses, the FORM of the key (a bare name, a nested
+    // path, one carrying a space in its percent-encoded wire spelling), whether the copy
+    // source carries the leading slash the member allows, what the object itself carries (a
+    // content type and user metadata, or neither, or a tag set), and whether the request
+    // restates the directives as `COPY`, which is their default and so changes nothing.
+    let router = router();
+    bucket(&router, "copy-self-message").await;
+    bucket(&router, "copy-self-message-two").await;
+
+    struct Row {
+        case: &'static str,
+        bucket: &'static str,
+        key: &'static str,
+        /// The headers the SOURCE object was written with.
+        written_with: &'static [(&'static str, &'static str)],
+        /// Whether `x-amz-copy-source` carries the optional leading slash.
+        leading_slash: bool,
+        /// The headers the self-copy carries, none of which changes the object.
+        headers: &'static [(&'static str, &'static str)],
+    }
+
+    let rows: &[Row] = &[
+        Row {
+            case: "a bare key, a content type and user metadata, no header on the copy",
+            bucket: "copy-self-message",
+            key: "report.csv",
+            written_with: &[("content-type", "text/csv"), ("x-amz-meta-stage", "raw")],
+            leading_slash: false,
+            headers: &[],
+        },
+        Row {
+            case: "the copy source spelled with the leading slash the member allows",
+            bucket: "copy-self-message",
+            key: "report.csv",
+            written_with: &[("content-type", "text/csv")],
+            leading_slash: true,
+            headers: &[],
+        },
+        Row {
+            case: "a nested path, with both directives restated as their COPY default",
+            bucket: "copy-self-message",
+            key: "reports/2026/q1.csv",
+            written_with: &[],
+            leading_slash: false,
+            headers: &[
+                ("x-amz-metadata-directive", "COPY"),
+                ("x-amz-tagging-directive", "COPY"),
+            ],
+        },
+        Row {
+            case: "a key carrying a space, and an object written with a tag set",
+            bucket: "copy-self-message",
+            key: "quarterly%20report.csv",
+            written_with: &[("x-amz-tagging", "stage=raw")],
+            leading_slash: true,
+            headers: &[],
+        },
+        Row {
+            case: "another bucket entirely, so the rule is not about one bucket",
+            bucket: "copy-self-message-two",
+            key: "report.csv",
+            written_with: &[("content-type", "application/xml")],
+            leading_slash: false,
+            headers: &[("x-amz-metadata-directive", "COPY")],
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        source_object(
+            &router,
+            row.bucket,
+            row.key,
+            b"sepal,petal\n7,8\n",
+            row.written_with,
+        )
+        .await;
+        // The key travels in `x-amz-copy-source` as it is addressed: these rows spell it in
+        // the percent-encoded form a client puts on the wire, which is the form the path
+        // carries too, so both sides name the same stored key.
+        let copy_source = if row.leading_slash {
+            format!("/{}/{}", row.bucket, row.key)
+        } else {
+            format!("{}/{}", row.bucket, row.key)
+        };
+        let refused = copy_object(&router, row.bucket, row.key, &copy_source, row.headers).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: an illegal self-copy is refused with HTTP 400, got {} with body \
+             {:?}",
+            refused.status,
+            text(&refused)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "InvalidRequest",
+            "case {case:?}: expected the InvalidRequest code, got {:?}",
+            refused.error_code()
+        );
+        assert_eq!(
+            refused.error_message(),
+            SELF_COPY_REFUSAL_MESSAGE,
+            "case {case:?}: the refusal must state the rule it was refused by, got {:?}",
+            refused.error_message()
+        );
+        assert_ne!(
+            refused.error_message(),
+            GENERIC_INVALID_REQUEST_MESSAGE,
+            "case {case:?}: the generic shape message tells a client nothing about the rule"
+        );
+        // Refused, so the object is exactly as it was: a refusal states a rule and writes
+        // nothing.
+        let intact = get_object(&router, row.bucket, row.key, "", &[]).await;
+        assert_eq!(
+            intact.status, 200,
+            "case {case:?}: the refused self-copy must leave the object readable, got {}",
+            intact.status
+        );
+        assert_eq!(
+            intact.body.as_ref(),
+            b"sepal,petal\n7,8\n".as_slice(),
+            "case {case:?}: the refused self-copy must leave the object's bytes alone"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_copy_names_the_source_version_it_read_and_the_version_it_created() {
     // "If your source bucket versioning is enabled, the x-amz-copy-source header by

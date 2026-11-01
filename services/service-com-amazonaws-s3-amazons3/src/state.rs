@@ -11708,6 +11708,22 @@ pub fn is_valid_inventory_id(value: &str) -> bool {
 /// under: a replication configuration applies only to a bucket whose versioning is enabled.
 pub const INVALID_REQUEST_STATUS: u16 = 400;
 
+/// The `<Message>` S3 sends beside the 400 [`INVALID_REQUEST_CODE`] of a copy whose source
+/// and destination name the same object and which would change nothing about it: "This copy
+/// request is illegal because it is trying to copy an object to itself without changing the
+/// object's metadata, storage class, website redirect location or encryption attributes."
+///
+/// The sentence S3 publishes for that one condition, and it states the condition itself: the
+/// attributes a self-copy has to change to be served. Nothing of the request is interpolated
+/// into it — it names neither the bucket nor the key — which is why it lives here beside the
+/// other code/message pairs rather than being worded in the handler, and why the generic
+/// sentence the `InvalidRequest` SHAPE carries ([`INVALID_REQUEST_MESSAGE`]) is not what this
+/// condition answers with.
+pub const SELF_COPY_WITHOUT_CHANGE_MESSAGE: &str =
+    "This copy request is illegal because it is trying to copy an object to itself without \
+     changing the object's metadata, storage class, website redirect location or encryption \
+     attributes.";
+
 /// "The bucket policy does not exist."
 pub const NO_SUCH_BUCKET_POLICY_CODE: &str = "NoSuchBucketPolicy";
 /// See [`NO_SUCH_BUCKET_POLICY_CODE`].
