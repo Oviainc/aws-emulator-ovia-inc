@@ -1195,3 +1195,10 @@ mod create_transit_gateway_vpc_attachment;
 // `GetTransitGatewayMeteringPolicyEntries` reports, filters and pages out of that store.
 #[path = "all/transit_gateway_metering_policy_entries.rs"]
 mod transit_gateway_metering_policy_entries;
+// Appended at the END of this file, for the reason the header gives: the sorted region of this
+// file is where every new ec2 suite inserts its lines. What `DescribeReservedInstances` reports
+// out of the Reserved Instances store — every member of a stored purchase, and how the id list,
+// the offering class and type, and the documented filters narrow it — and that what a writer of
+// a purchase stored is what the report answers with.
+#[path = "all/describe_reserved_instances.rs"]
+mod describe_reserved_instances;

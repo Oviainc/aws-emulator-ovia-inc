@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservedInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservedInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReservedInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the Reserved Instances this account holds, read from
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::reserved_instances`] — the one store every
+//! writer of a purchase inserts into — narrowed by the ids, the offering class and type, and
+//! the filters the request names. This is the ONLY file to touch for this operation.
+//!
+//! The report WRITES nothing of its own: the only state change it applies is
+//! `materialize_due_transitions`, the moves the clock already owed (a fulfilled
+//! `ModifyReservedInstances` minting the purchases that replace the ones it retired), so two
+//! calls with nothing in between report the same purchases.
+//!
+//! What this file holds is this operation's own selection: the ceilings on the
+//! request-controlled factors of the match, the refusal of an id that is not a Reserved
+//! Instances id or that this account holds nothing under, and WHERE each documented filter
+//! reads its values from. Everything about a Reserved Instance that more than one operation
+//! needs lives in [`crate::state::reserved_instances`].
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +92,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::borrow::Cow;
+use ::std::collections::BTreeSet;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES, MAX_FILTERS,
+    MAX_RESOURCE_IDS, MatchBudget, TAG_FILTER_PREFIX,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -152,18 +167,291 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservedInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservedInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservedInstances"))
+        // `ctx` carries request metadata only; this operation reads none of it — a Reserved
+        // Instance is named by an id that is unique across this store, and every member of the
+        // report comes from the stored purchase itself.
+        let _ = ctx;
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // Matching cost is filters x values x held values x stored purchases, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so every
+        // request-controlled factor is capped HERE, before any work proportional to it is done
+        // and before the store is locked — and their PRODUCT is charged to one [`MatchBudget`]
+        // below, which is the bound the per-factor caps cannot give. The same ceilings every
+        // sibling describe of this crate applies.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied} filters, above the maximum of {MAX_FILTERS}",
+                supplied = filters.len(),
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any purchase
+        // would have matched it, so an unsupported filter can never read as "no results". Each
+        // value is compiled into its pattern ONCE here, rather than recompiled per candidate.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {supplied} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    supplied = values.len(),
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is bounded
+            // too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {supplied} bytes, above the \
+                     maximum of {MAX_FILTER_VALUE_BYTES}",
+                    supplied = oversize.len(),
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "One or more Reserved Instance IDs" (`$ReservedInstancesIds`): the model bounds the
+        // list at nothing, and every entry is resolved against the store, so the number of ids
+        // one request may name is capped the way every other EC2 describe of this crate caps a
+        // resource-id list.
+        let requested: &[String] = input.reserved_instances_ids.as_deref().unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "ReservedInstancesIds carries {supplied} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                supplied = requested.len(),
+            )));
+        }
+        // A Reserved Instances id is the hyphenated form of a UUID
+        // ([`crate::state::reserved_instances_id_is_well_formed`]), so a value of any other form
+        // names nothing and is refused before there is anything to look up — which is what lets
+        // a client tell "not an id of this kind" from "no such purchase" below.
+        for reserved_instances_id in requested {
+            if !state::reserved_instances_id_is_well_formed(reserved_instances_id) {
+                return Err(state::reported_reserved_instances_id_unreadable(
+                    reserved_instances_id,
+                ));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation" (`$DryRun`): the flag asks about
+        // PERMISSION, so it is answered once the request's own form has been checked and before
+        // anything is resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this read is allowed to apply — the same call every sibling
+        // describe makes: the purchases a fulfilled `ModifyReservedInstances` mints, and the
+        // `retired` it leaves the purchases it named in, were owed at the instant that
+        // fulfilment fell due whether or not anybody called, so applying them here changes
+        // nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // An id that names no Reserved Instance of this account is an error, not an absent row.
+        // The whole list is resolved before anything is reported, so a request naming one id it
+        // cannot answer for reports nothing at all.
+        for reserved_instances_id in requested {
+            if !store
+                .reserved_instances
+                .contains_key(reserved_instances_id.as_str())
+            {
+                return Err(state::reserved_instances_id_does_not_exist(
+                    reserved_instances_id,
+                ));
+            }
+        }
+        // Held as an ordered SET, so the per-purchase selection below costs one lookup rather
+        // than a walk of the asked-for list, and a repeated id cannot multiply the work either.
+        let named: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+
+        // "Default: Describes all your Reserved Instances, or only those otherwise specified"
+        // (`$ReservedInstancesIds`): the ids narrow the store, the offering class and type
+        // narrow it further, and every filter must then hold ("If you specify multiple filters,
+        // the filters are joined with an AND" — `Filter`). Every comparison is charged to ONE
+        // budget — one step per candidate even when no filter was given, so an unfiltered scan
+        // is counted too — which bounds the PRODUCT of stored purchases, filters, values, held
+        // values and value length however the caller combines them, and with it how long this
+        // holds the store's lock. The store is keyed by `ReservedInstancesId`, so the report
+        // comes back in id order; this operation models no pagination at all — its request
+        // carries neither `MaxResults` nor `NextToken` — so every selected purchase is
+        // reported.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut reported: Vec<ReservedInstances> = Vec::new();
+        for purchase in store.reserved_instances.values() {
+            if budget.exhausted() {
+                break;
+            }
+            if !named.is_empty()
+                && !named.contains(purchase.reserved_instances_id.as_deref().unwrap_or_default())
+            {
+                continue;
+            }
+            // "Describes whether the Reserved Instance is Standard or Convertible"
+            // (`$OfferingClass`) and "The Reserved Instance offering type" (`$OfferingType`):
+            // each names ONE member of its enum, so it selects the purchases carrying that
+            // value. Both are already refused outside their catalogs by the boundary
+            // validator, so reaching here means the value is a member of the enum.
+            if !selects(
+                input.offering_class.as_deref(),
+                purchase.offering_class.as_deref(),
+            ) || !selects(
+                input.offering_type.as_deref(),
+                purchase.offering_type.as_deref(),
+            ) {
+                continue;
+            }
+            if state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(purchase, name)
+            }) {
+                reported.push(purchase.clone());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as a
+        // result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated report.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them"
+            )));
+        }
+
+        Ok(DescribeReservedInstancesOutput {
+            reserved_instances: Some(reported),
+        })
+    }
+}
+
+/// The filter names this operation documents, from `DescribeReservedInstancesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeReservedInstancesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here. Every entry must be answered by [`filter_values`].
+const RESERVED_INSTANCES_FILTERS: [&str; 13] = [
+    "availability-zone",
+    "availability-zone-id",
+    "duration",
+    "end",
+    "fixed-price",
+    "instance-type",
+    "product-description",
+    "reserved-instances-id",
+    "scope",
+    "start",
+    "state",
+    "tag-key",
+    "usage-price",
+];
+
+/// Is `name` a filter this operation documents? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no tag,
+/// so it is as undocumented as any other misspelling. The tag prefix is the crate's own
+/// [`TAG_FILTER_PREFIX`], so this operation holds no second copy of it.
+fn is_documented_filter(name: &str) -> bool {
+    name.strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || RESERVED_INSTANCES_FILTERS.contains(&name)
+}
+
+/// Does a request member that names ONE value of an enum select a purchase carrying `held`?
+///
+/// A member the request omits selects every purchase, which is what makes the three narrowing
+/// members of this request independent of each other; a purchase that carries no value for a
+/// member the request did name is not one of the purchases that member asked for.
+fn selects(asked: Option<&str>, held: Option<&str>) -> bool {
+    asked.is_none_or(|asked| held == Some(asked))
+}
+
+/// A price as a filter value compares against it.
+///
+/// The wire carries a `Float` as Rust renders it, so a whole number of dollars reaches the
+/// client as `9800` — while the values AWS's own documentation writes for these two filters are
+/// `9800.0` and `0.84`, the same amount with its fractional part spelled out. Both are the same
+/// price, and a caller may write either, so a purchase holds both as values of the filter;
+/// anything else would refuse to match a price the way it is documented or the way it is
+/// reported.
+fn price_filter_values(price: Option<f32>) -> Vec<Cow<'static, str>> {
+    let Some(price) = price else {
+        return Vec::new();
+    };
+    let reported = price.to_string();
+    let with_fraction = if reported.contains('.') {
+        None
+    } else {
+        Some(format!("{reported}.0"))
+    };
+    ::std::iter::once(Cow::Owned(reported))
+        .chain(with_fraction.map(Cow::Owned))
+        .collect()
+}
+
+/// The values the EC2 filter `name` compares against this Reserved Instance.
+///
+/// A filter naming an attribute the purchase does not carry compares against NO values, so it
+/// selects nothing — which is the answer `availability-zone` gives for a purchase of Regional
+/// scope, and any absent member gives for its own filter.
+fn filter_values<'a>(purchase: &'a ReservedInstances, name: &str) -> Vec<Cow<'a, str>> {
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return purchase
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "availability-zone" => text(purchase.availability_zone.as_deref()),
+        "availability-zone-id" => text(purchase.availability_zone_id.as_deref()),
+        // "The duration of the Reserved Instance … in seconds" — the units the member itself is
+        // reported in, so the filter compares against the same number the client is shown.
+        "duration" => purchase
+            .duration
+            .map(|duration| Cow::Owned(duration.to_string()))
+            .into_iter()
+            .collect(),
+        "end" => crate::state::filter_timestamp_values(purchase.end),
+        "fixed-price" => price_filter_values(purchase.fixed_price),
+        "instance-type" => text(purchase.instance_type.as_deref()),
+        "product-description" => text(purchase.product_description.as_deref()),
+        "reserved-instances-id" => text(purchase.reserved_instances_id.as_deref()),
+        "scope" => text(purchase.scope.as_deref()),
+        "start" => crate::state::filter_timestamp_values(purchase.start),
+        "state" => text(purchase.state.as_deref()),
+        "tag-key" => purchase
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "usage-price" => price_filter_values(purchase.usage_price),
+        // Unreachable: [`is_documented_filter`] has already refused every other name. An
+        // attribute nothing is stored for compares against nothing, so it could never widen a
+        // result even if that check were bypassed.
+        _ => Vec::new(),
     }
 }

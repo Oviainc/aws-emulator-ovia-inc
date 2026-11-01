@@ -180,6 +180,22 @@ pub fn invalid_reserved_instances_id<E>(reserved_instances_id: &str) -> Scaffold
     ))
 }
 
+/// Refuse a `ReservedInstancesIds` entry of the REPORT of this account's purchases that is not
+/// a Reserved Instances id: HTTP 400 `InvalidParameterValue`, naming the member as the request
+/// spells it and the value it could not read, and nothing after it.
+///
+/// Deliberately not [`invalid_reserved_instances_id`]: that is the sentence
+/// `DeleteQueuedReservedInstances` was recorded answering for its own `reservedInstancesId`
+/// member, and `DescribeReservedInstances` was recorded wording its member's refusal this way
+/// instead. Only the first [`MAX_ECHOED_RESOURCE_ID_CHARS`] characters of the value are quoted
+/// ([`echoed_resource_id`]).
+pub fn reported_reserved_instances_id_unreadable<E>(reserved_instances_id: &str) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Invalid value '{id}' for ReservedInstancesId.",
+        id = echoed_resource_id(reserved_instances_id)
+    ))
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another `count` Reserved Instances fit inside the store's ceiling
     /// ([`MAX_STORED_RESERVED_INSTANCES`]).
