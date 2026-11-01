@@ -31,6 +31,8 @@ mod error_message_wording;
 mod forecast_data;
 #[path = "all/forecast_datapoints.rs"]
 mod forecast_datapoints;
+#[path = "all/forecast_resource_triple_consistency.rs"]
+mod forecast_resource_triple_consistency;
 #[path = "all/forecast_window_point_membership.rs"]
 mod forecast_window_point_membership;
 #[path = "all/forecast_window_precision.rs"]

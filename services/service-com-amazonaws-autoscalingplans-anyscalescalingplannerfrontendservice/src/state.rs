@@ -1276,17 +1276,11 @@ fn validate_scaling_instruction(
         &instruction.scalable_dimension,
         SCALABLE_DIMENSION_VALUES,
     )?;
-    // Every `ScalableDimension` value is prefixed with the namespace of the service
-    // that owns it, so a dimension from another service names no scalable resource.
-    let dimension_namespace = instruction
-        .scalable_dimension
-        .split(':')
-        .next()
-        .unwrap_or_default();
-    if dimension_namespace != instruction.service_namespace {
-        return Err(UNSUPPORTED_RESOURCE.to_string());
-    }
-    validate_resource_id(&instruction.resource_id, &instruction.scalable_dimension)?;
+    validate_resource_triple(
+        &instruction.service_namespace,
+        &instruction.resource_id,
+        &instruction.scalable_dimension,
+    )?;
 
     // "The minimum capacity of the resource" / "The maximum capacity of the resource":
     // a capacity is a count of units, and the maximum bounds the minimum. The refusals
@@ -1337,6 +1331,37 @@ fn validate_scaling_instruction(
 
     validate_target_tracking_configurations(index, instruction)?;
     validate_predictive_scaling(index, instruction)
+}
+
+/// A `(ServiceNamespace, ResourceId, ScalableDimension)` triple has to describe ONE
+/// scalable resource, whichever member carries it.
+///
+/// Two relations make the triple describe a resource, and nothing else about it is a
+/// request error:
+///
+/// 1. every `ScalableDimension` value is prefixed with the namespace of the service that
+///    owns it (`smithy_query(query="shape",shape="ScalableDimension")`), so a dimension
+///    from another service than the `ServiceNamespace` beside it names no resource;
+/// 2. the `ResourceId` identifies a resource of the kind that dimension scales
+///    ([`validate_resource_id`]).
+///
+/// `pub` because every operation that names a scalable resource asks this same question:
+/// the two write paths through [`validate_scaling_instructions`] about a scaling
+/// instruction's triple, and the forecast read in
+/// `crate::ops::get_scaling_plan_resource_forecast_data` about its own — so one triple is
+/// admitted, and refused, the same way wherever it is carried. WHICH resources this
+/// service actually holds a forecast or a policy for is decided by the stored plan, not
+/// here.
+pub fn validate_resource_triple(
+    service_namespace: &str,
+    resource_id: &str,
+    scalable_dimension: &str,
+) -> Result<(), String> {
+    let dimension_namespace = scalable_dimension.split(':').next().unwrap_or_default();
+    if dimension_namespace != service_namespace {
+        return Err(UNSUPPORTED_RESOURCE.to_string());
+    }
+    validate_resource_id(resource_id, scalable_dimension)
 }
 
 /// A resource id has to identify a resource of the kind its scalable dimension scales.

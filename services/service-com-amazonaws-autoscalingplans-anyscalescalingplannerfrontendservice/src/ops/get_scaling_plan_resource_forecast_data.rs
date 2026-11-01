@@ -11,9 +11,11 @@
 //!    56-day limit on how far before the current date and time the start may sit, both
 //!    measured in whole hourly forecast periods, the granularity forecast data exists
 //!    at), the scaling plan version (the model documents a
-//!    single valid value), the resource coordinates (forecasts are issued for an Auto
-//!    Scaling group's desired capacity and nothing else) and the `ForecastDataType` enum —
-//!    so a bad request is refused whether or not the named plan exists;
+//!    single valid value), and the resource coordinates — refused only where the
+//!    `(ServiceNamespace, ResourceId, ScalableDimension)` triple describes no one scalable
+//!    resource ([`crate::state::validate_resource_triple`]), the same question the write
+//!    paths ask of a scaling instruction's triple — and the `ForecastDataType` enum — so a
+//!    bad request is refused whether or not the named plan exists;
 //! 2. the clock-owed plan transitions are settled and the data points are computed from
 //!    the stored plan.
 //!
@@ -213,7 +215,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(validation)?;
         crate::state::validate_plan_version(input.scaling_plan_version).map_err(validation)?;
         validate_forecast_window(input.start_time, input.end_time, now).map_err(validation)?;
-        validate_forecast_resource(&input).map_err(validation)?;
+        // A triple that describes one scalable resource is a request this service answers,
+        // whichever resource it describes: WHICH resources it holds a forecast for is
+        // decided below, by the stored plan, and a resource nothing instructs has no
+        // forecast — the empty `Datapoints` list, not a refusal.
+        crate::state::validate_resource_triple(
+            &input.service_namespace,
+            &input.resource_id,
+            &input.scalable_dimension,
+        )
+        .map_err(validation)?;
 
         let mut state = state.lock();
         // Clock-owed work first, so this read reports the state the clock already made
@@ -247,17 +258,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The only `ServiceNamespace` this operation forecasts for.
+/// The `ServiceNamespace` of the resource this operation's own documentation works
+/// through.
 ///
 /// `GetScalingPlanResourceForecastDataRequest$ServiceNamespace`: "The namespace of the
-/// AWS service. The only valid value is autoscaling."
+/// AWS service. The only valid value is autoscaling." That prose says which resources AWS
+/// issues forecast data FOR, not which requests it admits: the member is modelled as the
+/// plain `ServiceNamespace` enum, and a triple naming another of its values is answered
+/// like any other resource the named plan holds no instruction for. So this is the pair a
+/// forecast of an Auto Scaling group's desired capacity is addressed by, NOT a gate on the
+/// request.
 pub const FORECAST_SERVICE_NAMESPACE: &str = "autoscaling";
 
-/// The only `ScalableDimension` this operation forecasts for.
+/// The `ScalableDimension` of that same resource.
 ///
 /// `GetScalingPlanResourceForecastDataRequest$ScalableDimension`: "The scalable
 /// dimension for the resource. The only valid value is
-/// autoscaling:autoScalingGroup:DesiredCapacity."
+/// autoscaling:autoScalingGroup:DesiredCapacity." Read the same way as
+/// [`FORECAST_SERVICE_NAMESPACE`].
 pub const FORECAST_SCALABLE_DIMENSION: &str = "autoscaling:autoScalingGroup:DesiredCapacity";
 
 /// The widest forecast window a caller may ask for, in days.
@@ -364,25 +382,6 @@ fn whole_periods(span: i128) -> i128 {
 /// `days` as a count of whole forecast periods.
 fn days_in_periods(days: i64) -> i128 {
     days_in_nanos(days) / period_nanos()
-}
-
-/// The scalable resource a caller asked a forecast for.
-///
-/// Capacity forecasts are issued for one kind of scalable resource — an Auto Scaling
-/// group's desired capacity, the only value either enum member documents — and the
-/// resource id has to identify a resource of that kind, which is the same rule a scaling
-/// instruction's own `ResourceId` satisfies (`crate::state::validate_resource_id`). A
-/// triple that describes no such resource is refused with the sentence this service uses
-/// for every such triple.
-fn validate_forecast_resource(
-    input: &GetScalingPlanResourceForecastDataInput,
-) -> Result<(), String> {
-    if input.service_namespace != FORECAST_SERVICE_NAMESPACE
-        || input.scalable_dimension != FORECAST_SCALABLE_DIMENSION
-    {
-        return Err(crate::state::UNSUPPORTED_RESOURCE.to_string());
-    }
-    crate::state::validate_resource_id(&input.resource_id, &input.scalable_dimension)
 }
 
 // ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::get_scaling_plan_resource_forecast_data::{
-    FORECAST_INTERVAL_SECONDS, FORECAST_SCALABLE_DIMENSION, FORECAST_SERVICE_NAMESPACE,
+    FORECAST_INTERVAL_SECONDS, FORECAST_SCALABLE_DIMENSION,
 };
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::state::UNSUPPORTED_RESOURCE;
 
@@ -458,12 +458,10 @@ async fn the_forecast_read_applies_the_same_rule_to_its_own_resource_id() {
 
     for row in rows() {
         let label = row.label;
-        // Forecast data is issued for an Auto Scaling group's desired capacity and
-        // nothing else, so a row naming another kind of resource is refused on its
-        // coordinates — with the same sentence — however its id is spelled.
-        let forecast_served = row.identifies
-            && row.namespace == FORECAST_SERVICE_NAMESPACE
-            && row.dimension == FORECAST_SCALABLE_DIMENSION;
+        // The read refuses a triple that describes no scalable resource and nothing else,
+        // so the verdict turns on the resource id alone — whatever kind of resource the
+        // row's dimension scales. Every row's namespace already owns its dimension.
+        let forecast_served = row.identifies;
         let start = now_secs();
         let (status, body) = emulator
             .call(
@@ -494,8 +492,9 @@ async fn the_forecast_read_applies_the_same_rule_to_its_own_resource_id() {
 
         assert_eq!(
             status, 200,
-            "case {label:?} on GetScalingPlanResourceForecastData: the id names an Auto \
-             Scaling group, so the read must be served, got {status} with {body}"
+            "case {label:?} on GetScalingPlanResourceForecastData: the id names a \
+             resource of the kind its dimension scales, so the read must be served, got \
+             {status} with {body}"
         );
         assert!(
             body["Datapoints"].is_array(),

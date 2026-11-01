@@ -19,10 +19,13 @@
 //!   not-found error (`crate::absent_plan_reads` pins that rule across both reads);
 //! * `ScalingPlanVersion` has exactly one documented valid value, so every other version
 //!   is refused with the modelled `ValidationException` (HTTP 400) rather than served;
-//! * forecast data is issued for ONE kind of scalable resource — an Auto Scaling group's
-//!   desired capacity — so any other `(ServiceNamespace, ScalableDimension)` pair, and a
-//!   resource id that does not identify a resource of that kind, is refused with the
-//!   modelled `ValidationException` (HTTP 400);
+//! * the resource coordinates are refused only where the `(ServiceNamespace, ResourceId,
+//!   ScalableDimension)` triple describes no one scalable resource — a dimension owned by
+//!   another service namespace, or a resource id that identifies no resource of the kind
+//!   its dimension scales — which earns the modelled `ValidationException` (HTTP 400);
+//!   which resources this service holds a forecast FOR is decided by the stored plan, and
+//!   the served side of that rule is pinned in
+//!   [`crate::forecast_resource_triple_consistency`];
 //! * an accepted request answers HTTP 200 with the required `Datapoints` member.
 //!
 //! Every plan these tests store configures DYNAMIC scaling only — its instruction carries
@@ -724,62 +727,32 @@ async fn only_the_documented_scaling_plan_version_is_accepted() {
 }
 
 #[tokio::test]
-async fn only_an_auto_scaling_group_desired_capacity_is_forecast() {
-    // Every other `ScalableDimension` the model lists, each with a resource id of the
-    // kind that dimension scales (source: `smithy_query(query="shape",
-    // shape="ScalableDimension")`, mirrored as `SCALABLE_DIMENSION_VALUES`, and the
-    // worked resource-id examples in `ScalingInstruction$ResourceId`'s documentation) —
-    // none of which this operation forecasts for. The last three rows probe the other
-    // halves of the rule: the right dimension under another namespace, an off-enum
-    // dimension, and an Auto Scaling group id without the documented prefix.
-    let cases: [(&str, &str, &str, &str); 10] = [
+async fn a_triple_that_describes_no_scalable_resource_is_refused() {
+    // The coordinates are refused for being INCONSISTENT, never for naming a resource
+    // kind other than an Auto Scaling group: rows differ in which half of the triple
+    // contradicts the other — a listed dimension under a namespace that does not own it
+    // (in both directions), a dimension the model's enum does not list at all, and a
+    // resource id carrying no resource type of the dimension beside it. Source of the
+    // namespace prefix of each dimension: `smithy_query(query="shape",
+    // shape="ScalableDimension")`, mirrored as `SCALABLE_DIMENSION_VALUES`.
+    let cases: [(&str, &str, &str, &str); 6] = [
         (
-            "an ECS service's desired count",
-            "ecs",
-            "service/default/sample-webapp",
-            "ecs:service:DesiredCount",
-        ),
-        (
-            "a Spot Fleet request's target capacity",
-            "ec2",
-            "spot-fleet-request/sfr-73fbd2ce-aa30-494c-8788-1cee4ea7606d",
-            "ec2:spot-fleet-request:TargetCapacity",
-        ),
-        (
-            "an Aurora replica count",
-            "rds",
-            "cluster:my-db-cluster",
-            "rds:cluster:ReadReplicaCount",
-        ),
-        (
-            "a DynamoDB table's read capacity",
+            "the Auto Scaling dimension under the DynamoDB namespace",
             "dynamodb",
+            COVERED_RESOURCE,
+            FORECAST_SCALABLE_DIMENSION,
+        ),
+        (
+            "a DynamoDB dimension under the Auto Scaling namespace",
+            FORECAST_SERVICE_NAMESPACE,
             "table/my-table",
             "dynamodb:table:ReadCapacityUnits",
         ),
         (
-            "a DynamoDB table's write capacity",
-            "dynamodb",
-            "table/my-table",
-            "dynamodb:table:WriteCapacityUnits",
-        ),
-        (
-            "a DynamoDB index's read capacity",
-            "dynamodb",
-            "table/my-table/index/my-table-index",
-            "dynamodb:index:ReadCapacityUnits",
-        ),
-        (
-            "a DynamoDB index's write capacity",
-            "dynamodb",
-            "table/my-table/index/my-table-index",
-            "dynamodb:index:WriteCapacityUnits",
-        ),
-        (
-            "the Auto Scaling dimension under another service namespace",
-            "dynamodb",
-            COVERED_RESOURCE,
-            FORECAST_SCALABLE_DIMENSION,
+            "an ECS dimension under the EC2 namespace",
+            "ec2",
+            "service/default/sample-webapp",
+            "ecs:service:DesiredCount",
         ),
         (
             "a scalable dimension outside the modelled enum",
@@ -792,6 +765,12 @@ async fn only_an_auto_scaling_group_desired_capacity_is_forecast() {
             FORECAST_SERVICE_NAMESPACE,
             "my-asg",
             FORECAST_SCALABLE_DIMENSION,
+        ),
+        (
+            "a DynamoDB table id under a DynamoDB index dimension",
+            "dynamodb",
+            "table/my-table",
+            "dynamodb:index:ReadCapacityUnits",
         ),
     ];
 

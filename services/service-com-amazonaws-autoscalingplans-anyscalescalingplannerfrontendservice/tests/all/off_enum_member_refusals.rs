@@ -10,11 +10,11 @@
 //! '<member path>' failed to satisfy constraint: Member must satisfy enum value set:
 //! [<the values the model lists>]` — whichever operation received it, at whatever depth
 //! the member sits, and whatever ELSE the same request gets wrong about that member. A
-//! narrower rule about one of those members (this operation forecasts one kind of scalable
-//! resource only; a customized load metric's statistic has a single valid value) speaks
-//! about a value the enum DOES list, so it can never answer for a value the enum does not
-//! list: otherwise one and the same off-enum value would be refused with two different
-//! sentences depending on which operation received it.
+//! narrower rule about one of those members (a triple whose dimension is owned by another
+//! service namespace describes no scalable resource; a customized load metric's statistic
+//! has a single valid value) speaks about a value the enum DOES list, so it can never
+//! answer for a value the enum does not list: otherwise one and the same off-enum value
+//! would be refused with two different sentences depending on which operation received it.
 //!
 //! The rows differ along what the rule generalises over: the FORM of the miss (nothing at
 //! all, a plausible unmodelled name, a listed value with a character added, with trailing
@@ -24,7 +24,7 @@
 //!
 //! The second test pins the other side of the same rule: values the enums DO list keep the
 //! narrower sentences those rules own — the unsupported-resource sentence for a triple
-//! this service issues no forecast for, and the single-valid-value sentence for a load
+//! that describes no one scalable resource, and the single-valid-value sentence for a load
 //! metric statistic — so the enum-set sentence is reported for an off-enum value and for
 //! nothing else.
 //!
@@ -496,24 +496,26 @@ async fn the_enum_set_refusal_outranks_the_narrower_rules_about_the_same_member(
         .await;
     }
 
-    // The other side of the rule: a pair built from values the enums DO list, which this
-    // operation simply issues no forecast for, keeps the unsupported-resource sentence —
-    // as does a listed pair whose resource id names no resource of that kind. Rows differ
-    // in which half of the pair is unsupported and in the resource id's form.
+    // The other side of the same rule: values the enums DO list keep the narrower
+    // sentences those rules own — the unsupported-resource sentence for a triple that
+    // describes no one scalable resource (a dimension under a namespace that does not own
+    // it, or a resource id naming no resource of the dimension's kind) — so the enum-set
+    // sentence is reported for an off-enum value and for nothing else. Rows differ in
+    // which half of the triple contradicts the other and in the resource id's form.
     let unsupported: [(&str, Value); 4] = [
         (
-            "a listed pair for a DynamoDB table",
+            "a DynamoDB dimension under the ECS namespace",
             forecast_request_for(
-                "dynamodb",
+                "ecs",
                 "table/my-table",
                 "dynamodb:table:ReadCapacityUnits",
                 "CapacityForecast",
             ),
         ),
         (
-            "a listed pair for an ECS service",
+            "an ECS dimension under the DynamoDB namespace",
             forecast_request_for(
-                "ecs",
+                "dynamodb",
                 "service/default/sample-webapp",
                 "ecs:service:DesiredCount",
                 "CapacityForecast",

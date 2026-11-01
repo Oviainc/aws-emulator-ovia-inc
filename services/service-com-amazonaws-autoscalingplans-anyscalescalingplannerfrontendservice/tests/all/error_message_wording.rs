@@ -61,8 +61,8 @@ fn expected_not_found(name: &str, version: i64) -> String {
     format!("No scaling plan found for scaling plan name: {name}, version: {version}")
 }
 
-/// A `GetScalingPlanResourceForecastData` request for the one resource kind that
-/// operation forecasts, with every member the model marks required.
+/// A `GetScalingPlanResourceForecastData` request for the Auto Scaling group resource the
+/// stored plan instructs, with every member the model marks required.
 ///
 /// The window is a valid one (an hour starting now, well inside the documented limits
 /// `crate::forecast_data` pins), so nothing but the plan lookup can refuse it.
