@@ -149,18 +149,20 @@ const COMPLETION_STATUS_SET: [&str; 2] = ["ready", "failed"];
 
 /// The refusal for a `Status` outside the modelled `CompletionStatus` enum.
 ///
-/// The clause is built by the framework's own constraint renderer
-/// (`aws_smithy_schema_server::envelope` over a `ViolationKind::EnumValue`), so an enum
-/// value the model declines is worded exactly as every other constraint violation this
+/// The clause is built by the framework's own constraint renderer, reached through the ONE
+/// wording this service states a refusal with (`crate::service::refusal_message`), so an
+/// enum value the model declines is worded exactly as every other constraint violation this
 /// emulator refuses — `1 validation error detected: Value '<value>' at 'status' failed
-/// to satisfy constraint: Member must satisfy enum value set: [...]`.
+/// to satisfy constraint: Member must satisfy enum value set: [...]` — and is held to the
+/// same bound: the maximum the model declares for the member a refusal is CARRIED in
+/// (`Message` on every error shape of this service, targeting `FailureReason`, `@length` max
+/// 1024).
 ///
-/// The echo carries the SAME per-clause ceiling as every refusal this service words from
-/// the framework's own violations ([`service_common::validation::quoted_echo`], the
-/// ceiling `service.rs::refused_by` holds those to): `Status` targets an enum and declares
-/// no `@length`, so the value a caller can put here is unbounded, and a clause that
-/// interpolated it whole would answer a request-sized message. The CHECK below is still
-/// made against the value as submitted; only the quoting is bounded.
+/// The echo is quoted to the same per-value ceiling the collected violations carry
+/// (`crate::service::LARGEST_QUOTED_VALUE_BYTES`): `Status` targets an enum and declares no
+/// `@length`, so the value a caller can put here is unbounded, and a clause that
+/// interpolated it whole would answer a message the model's own error shape cannot hold. The
+/// CHECK below is still made against the value as submitted; only the quoting is bounded.
 ///
 /// This is the operation's OWN enforcement of the value set: a request whose `Status` the
 /// model does not declare is refused by the validating walk over the input schema before
@@ -172,9 +174,15 @@ fn enum_violation(value: &str) -> CompleteRolloutError {
         kind: ::aws_smithy_schema_server::ViolationKind::EnumValue(
             COMPLETION_STATUS_SET.iter().map(|v| (*v).to_string()).collect(),
         ),
-        value: Some(service_common::validation::quoted_echo(value).into_owned()),
+        value: Some(
+            service_common::validation::quoted_echo_up_to(
+                value,
+                crate::service::LARGEST_QUOTED_VALUE_BYTES,
+            )
+            .into_owned(),
+        ),
     };
-    let message = ::aws_smithy_schema_server::envelope(std::slice::from_ref(&violation))
+    let message = crate::service::refusal_message(std::slice::from_ref(&violation))
         .unwrap_or_else(|| violation.message());
     validation(message)
 }
@@ -287,11 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 mod tests {
     use super::{enum_violation, COMPLETION_STATUS_SET};
     use crate::ops::types::COMPLETION_STATUS_VALUES;
-
-    /// The per-clause ceiling the shared quoting step holds every clause of this emulator
-    /// to. Source: `quoted_echo` in `services/common/src/validation.rs`, which states it
-    /// with its rationale.
-    const MAX_RESTORED_ECHO: usize = 16 * 1024;
+    use crate::service::LARGEST_QUOTED_VALUE_BYTES;
 
     /// The value the refusal's message quotes, read by stripping the clause's fixed halves
     /// (never by splitting on a quote, so a value carrying the delimiter is read whole).
@@ -349,8 +353,9 @@ mod tests {
     }
 
     /// RULE: the clause this operation words itself quotes the submitted value up to the
-    /// ONE per-clause ceiling this emulator states, and no further — `Status` declares no
-    /// `@length`, so an unquoted-in-full clause would be sized by the request.
+    /// ceiling this service states from its model — the declared maximum of the member a
+    /// refusal is carried in, less what the clause states around the value — and no
+    /// further, so the refusal fits the member that has to hold it.
     ///
     /// Rows differ along the value's size (within, exactly at, and past the ceiling) and
     /// its encoding (ASCII, and a three-byte character so the ceiling falls inside one).
@@ -358,12 +363,15 @@ mod tests {
     fn a_refused_status_is_quoted_up_to_the_ceiling() {
         for (case, value) in [
             ("a value no ceiling touches", "bogus-status".to_string()),
-            ("a kilobyte", "s".repeat(1024)),
-            ("exactly at the ceiling", "s".repeat(MAX_RESTORED_ECHO)),
+            ("a quarter of the ceiling", "s".repeat(LARGEST_QUOTED_VALUE_BYTES / 4)),
+            (
+                "exactly at the ceiling",
+                "s".repeat(LARGEST_QUOTED_VALUE_BYTES),
+            ),
             (
                 "multibyte characters just under the ceiling",
-                // 5460 * 3 = 16380 bytes.
-                "€".repeat(5460),
+                // 255 * 3 = 765 bytes, three short of the 768 byte ceiling.
+                "€".repeat((LARGEST_QUOTED_VALUE_BYTES / 3) - 1),
             ),
         ] {
             let quoted = quoted_value(&enum_violation(&value));
@@ -376,13 +384,16 @@ mod tests {
         }
 
         for (case, value) in [
-            ("one byte past the ceiling", "s".repeat(MAX_RESTORED_ECHO + 1)),
+            (
+                "one byte past the ceiling",
+                "s".repeat(LARGEST_QUOTED_VALUE_BYTES + 1),
+            ),
             ("a megabyte", "s".repeat(1024 * 1024)),
             (
-                // 16384 is not a multiple of three, so the ceiling falls inside a
+                // One ASCII byte then three-byte characters, so the ceiling falls INSIDE a
                 // character and the prefix must step back to a boundary.
                 "multibyte characters past the ceiling",
-                "€".repeat(16 * 1024),
+                format!("x{}", "€".repeat(LARGEST_QUOTED_VALUE_BYTES)),
             ),
         ] {
             let quoted = quoted_value(&enum_violation(&value));
@@ -405,9 +416,10 @@ mod tests {
             // bytes for UTF-8): the fidelity the echo exists for still lands, and the
             // clause cannot grow with the request.
             assert!(
-                prefix.len() <= MAX_RESTORED_ECHO && prefix.len() + 3 > MAX_RESTORED_ECHO,
-                "case {case:?}: expected a prefix at the {MAX_RESTORED_ECHO} byte ceiling, \
-                 got {} bytes",
+                prefix.len() <= LARGEST_QUOTED_VALUE_BYTES
+                    && prefix.len() + 3 > LARGEST_QUOTED_VALUE_BYTES,
+                "case {case:?}: expected a prefix at the {LARGEST_QUOTED_VALUE_BYTES} byte \
+                 ceiling, got {} bytes",
                 prefix.len()
             );
         }

@@ -70,7 +70,11 @@
 //!   echo rather than the restored violation), which is a model constant rather than a
 //!   request-sized one. A stated ceiling raises the per-message total with it, and bounds one
 //!   LEAF value only: a COMPOSITE's rendering keeps this ceiling, since it is built from many
-//!   of a caller's values rather than being one of them.
+//!   of a caller's values rather than being one of them. The same seams serve the OTHER
+//!   direction: a service whose model bounds the member a refusal is CARRIED in — the prose
+//!   member of its error shapes — states its ceiling from THAT maximum, so a clause fits the
+//!   member that has to hold it instead of overrunning it sixteenfold. Either way the number
+//!   is read off a model and the default is what a service that states nothing is held to.
 //! * [`MAX_RESTORED_TOTAL`] (64 KiB) — the restored bytes ALL clauses of one message may
 //!   carry together, so `violations x value size` is bounded as a product. For scale, the
 //!   framework's own ceiling on the same text is 100 clauses x 256 bytes ~= 25 KiB, so
@@ -753,17 +757,93 @@ pub(crate) fn violations_in<O: Operation>(
 ///
 /// The CHECK must still be made against the value the caller sent, never against this
 /// rendering: eliding before the check compares text nobody submitted.
+///
+/// A service whose model states a ceiling of its own asks [`quoted_echo_up_to`] instead.
 #[must_use]
 pub fn quoted_echo(value: &str) -> ::std::borrow::Cow<'_, str> {
-    if value.len() <= MAX_RESTORED_ECHO {
+    quoted_echo_up_to(value, MAX_RESTORED_ECHO)
+}
+
+/// [`quoted_echo`], with the largest value one clause may quote stated by the SERVICE
+/// rather than taken from [`MAX_RESTORED_ECHO`].
+///
+/// `max_echo` is the only difference: the rendering, the character-boundary-safe prefix and
+/// the marker naming the whole value's byte count are the same, so a clause a HANDLER words
+/// is quoted exactly as one restored from the framework's walk. A service that states its
+/// own ceiling for the walk ([`refusing_violations_quoting_up_to`]) states the same one
+/// here, so its two refusal paths cannot carry different ceilings — which is what a model
+/// that declares a bound of its own on the member a refusal is CARRIED in needs, in either
+/// direction: a member declared longer than [`MAX_RESTORED_ECHO`] so a value can be quoted
+/// in full, and one declared shorter so a clause fits the member that has to hold it.
+#[must_use]
+pub fn quoted_echo_up_to(value: &str, max_echo: usize) -> ::std::borrow::Cow<'_, str> {
+    if value.len() <= max_echo {
         return ::std::borrow::Cow::Borrowed(value);
     }
-    // Truncate on a character boundary, never mid-UTF-8.
-    let mut end = MAX_RESTORED_ECHO;
+    ::std::borrow::Cow::Owned(format!(
+        "{}... [{} bytes]",
+        char_prefix(value, max_echo),
+        value.len()
+    ))
+}
+
+/// One clause's ECHO — the value itself, or an elision of it ([`quoted_echo_up_to`], or the
+/// framework's own rendering, which has the same shape) — stated in at most `max_echo`
+/// bytes.
+///
+/// For a service whose MESSAGE carries a bound of its own: where the member a refusal is
+/// carried in declares an `@length` maximum, what all the clauses of one sentence may quote
+/// TOGETHER is bounded, so a per-value ceiling is not enough and each echo has to be held to
+/// its share of that budget — which is what this does, after the fact, to an echo a walk
+/// already rendered.
+///
+/// An echo that already NAMES a byte count is a prefix of a value the caller of this
+/// function does not hold: shortening it keeps that count, because the count is the
+/// submitted value's size rather than the rendering's, and only the prefix gets shorter. So
+/// a clause held twice still reports how much was sent, and what it quotes is still an
+/// elision of the same value ([`is_elision_of`]). An echo that names none is the value
+/// itself, and is elided as [`quoted_echo_up_to`] elides one.
+///
+/// A `max_echo` smaller than the marker leaves the marker: how much was sent is the one
+/// thing a caller can read nowhere else.
+#[must_use]
+pub fn echo_held_to(echo: &str, max_echo: usize) -> ::std::borrow::Cow<'_, str> {
+    if echo.len() <= max_echo {
+        return ::std::borrow::Cow::Borrowed(echo);
+    }
+    let (value_prefix, marker) = match named_byte_count(echo) {
+        Some(at) => (&echo[..at], echo[at..].to_string()),
+        None => (echo, format!("... [{} bytes]", echo.len())),
+    };
+    let room = max_echo.saturating_sub(marker.len());
+    ::std::borrow::Cow::Owned(format!("{}{marker}", char_prefix(value_prefix, room)))
+}
+
+/// Where the marker naming a submitted byte count starts in `echo`, when `echo` is an
+/// elision of a value rather than the value itself.
+///
+/// The marker is the one [`quoted_echo_up_to`] and the framework's own walk append —
+/// `... [<n> bytes]` at the very end — and it is read as one only when the count it names is
+/// larger than the text before it, which is what makes it an elision of something longer
+/// rather than a value that happens to end in those characters.
+fn named_byte_count(echo: &str) -> Option<usize> {
+    let digits = echo.strip_suffix(" bytes]")?;
+    let at = digits.rfind("... [")?;
+    let named: usize = digits[at + "... [".len()..].parse().ok()?;
+    (named > at).then_some(at)
+}
+
+/// The longest prefix of `value` no longer than `max` bytes that ends on a character
+/// boundary, so a rendering never splits a UTF-8 character.
+fn char_prefix(value: &str, max: usize) -> &str {
+    if value.len() <= max {
+        return value;
+    }
+    let mut end = max;
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
-    ::std::borrow::Cow::Owned(format!("{}... [{} bytes]", &value[..end], value.len()))
+    &value[..end]
 }
 
 /// The largest single submitted value restored into a clause by default, and the ceiling a
@@ -2340,12 +2420,12 @@ impl ShapeSerializer for SubmittedValues {
 #[cfg(test)]
 mod tests {
     use super::{
-        echo_of, is_elision_of, list_of_element, quoted_echo, rendered_declared_structure,
-        rendered_entries, rendered_map, rendered_sequence, rendered_structure, unanchored,
-        unanchored_grouping_alternation, unanchored_keeping_inner_anchors, Composite,
-        RenderedChild, Submitted, SubmittedEcho, SubmittedValues, MAX_RECORDED_BYTES,
-        MAX_RECORDED_LEAVES, MAX_RECORDED_RENDERED_BYTES, MAX_RECORDED_RENDERINGS,
-        MAX_RENDERED_CHILDREN, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
+        echo_of, is_elision_of, list_of_element, named_byte_count, quoted_echo, quoted_echo_up_to,
+        echo_held_to, rendered_declared_structure, rendered_entries, rendered_map,
+        rendered_sequence, rendered_structure, unanchored, unanchored_grouping_alternation,
+        unanchored_keeping_inner_anchors, Composite, RenderedChild, Submitted, SubmittedEcho,
+        SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES, MAX_RECORDED_RENDERED_BYTES,
+        MAX_RECORDED_RENDERINGS, MAX_RENDERED_CHILDREN, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
     };
     use super::whole_value_expression;
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
@@ -2544,6 +2624,137 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// RULE: the same rendering holds at a ceiling the SERVICE states, in either direction:
+    /// a value within it is quoted whole and one past it keeps a character-boundary-safe
+    /// prefix plus the marker naming the whole value's byte count.
+    #[test]
+    fn a_stated_ceiling_quotes_the_value_itself_up_to_that_ceiling() {
+        // Rows differ along the ceiling (far below the default, the default itself, and far
+        // above it), the value's size relative to it, and its encoding.
+        let rows: [(&str, usize, String, bool); 6] = [
+            ("a short value under a small ceiling", 768, "bob".to_string(), true),
+            ("a value at a small ceiling", 768, "x".repeat(768), true),
+            (
+                "a value one byte over a small ceiling",
+                768,
+                "x".repeat(769),
+                false,
+            ),
+            (
+                "a value the default would have quoted whole",
+                768,
+                "x".repeat(MAX_RESTORED_ECHO),
+                false,
+            ),
+            (
+                // Three bytes per character, and 768 is a multiple of three only by
+                // accident of the repeat count: the prefix must not split a character.
+                "a multi-byte value over a small ceiling",
+                1000,
+                "€".repeat(500),
+                false,
+            ),
+            (
+                "a value under a ceiling above the default",
+                64 * 1024,
+                "x".repeat(MAX_RESTORED_ECHO + 1),
+                true,
+            ),
+        ];
+        for (case, ceiling, value, whole) in rows {
+            let quoted = quoted_echo_up_to(&value, ceiling);
+            if whole {
+                assert_eq!(
+                    quoted, value,
+                    "case {case:?}: expected the value itself, got {} bytes",
+                    quoted.len()
+                );
+                continue;
+            }
+            let marker = format!("... [{} bytes]", value.len());
+            let Some(prefix) = quoted.strip_suffix(marker.as_str()) else {
+                panic!(
+                    "case {case:?}: expected the marker naming {} bytes, got {} quoted bytes",
+                    value.len(),
+                    quoted.len()
+                );
+            };
+            assert!(
+                value.starts_with(prefix) && prefix.len() <= ceiling,
+                "case {case:?}: expected a prefix of the value no longer than {ceiling} \
+                 bytes, got {} bytes",
+                prefix.len()
+            );
+            assert!(
+                is_elision_of(&quoted, &value),
+                "case {case:?}: the walk must recognise the rendering as this value's elision"
+            );
+        }
+    }
+
+    /// RULE: an echo held to a smaller bound keeps the byte count it names — the submitted
+    /// value's size, not the rendering's — and shortens only the prefix, so a clause held
+    /// twice still reports how much was sent and still quotes an elision of the same value.
+    #[test]
+    fn an_echo_held_again_keeps_the_count_it_names() {
+        let submitted = "v".repeat(5000);
+        let once = quoted_echo_up_to(&submitted, 768).into_owned();
+        // Rows differ along what the echo IS (the value itself, an elision of a longer one),
+        // the bound it is held to, and the encoding.
+        let rows: [(&str, String, usize); 5] = [
+            ("the value itself, within the bound", "bob".to_string(), 64),
+            ("the value itself, over the bound", "v".repeat(700), 200),
+            ("an elision, within the bound", once.clone(), 2048),
+            ("an elision, over the bound", once.clone(), 200),
+            (
+                "an elision of multibyte characters, over the bound",
+                quoted_echo_up_to(&"€".repeat(2000), 768).into_owned(),
+                200,
+            ),
+        ];
+        for (case, echo, bound) in rows {
+            let held = echo_held_to(&echo, bound);
+            assert!(
+                held.len() <= bound,
+                "case {case:?}: expected at most {bound} bytes, got {}",
+                held.len()
+            );
+            if echo.len() <= bound {
+                assert_eq!(
+                    held, echo,
+                    "case {case:?}: expected the echo unchanged, got {} bytes",
+                    held.len()
+                );
+                continue;
+            }
+            let named = named_byte_count(&echo)
+                .map_or(echo.len(), |at| echo[at + "... [".len()..].trim_end_matches(" bytes]").parse().expect("a byte count"));
+            assert!(
+                held.ends_with(&format!("... [{named} bytes]")),
+                "case {case:?}: expected the count {named} kept, got the tail {:?}",
+                &held[held.len().saturating_sub(32)..]
+            );
+            assert!(
+                echo.starts_with(held.split("... [").next().unwrap_or_default()),
+                "case {case:?}: expected the kept prefix to be a prefix of the echo"
+            );
+        }
+
+        // Held to the submitted value's own elision bound, the count still names the value
+        // the caller sent rather than the text the first rendering produced.
+        let twice = echo_held_to(&once, 200);
+        assert!(
+            twice.ends_with(&format!("... [{} bytes]", submitted.len())),
+            "case \"a doubly held echo\": expected the submitted {} bytes named, got {twice:?}",
+            submitted.len()
+        );
+        assert!(
+            is_elision_of(&twice, &submitted),
+            "case \"a doubly held echo\": the walk must still recognise it as this value's \
+             elision"
+        );
     }
 
     /// RULE: a stored echo is the submitted value's elision when it is that value, or a

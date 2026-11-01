@@ -90,12 +90,71 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// The HTTP status that shape's `@httpError` declares.
 const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 
+/// The greatest number of bytes of prose THIS SERVICE's errors can carry, read off the
+/// model: every error shape it declares (`AccessDeniedException`, `ConflictException`,
+/// `InternalServiceError`, `ResourceNotFoundException`, `ServiceQuotaExceededException`,
+/// `ThrottlingException`, `ValidationException`) has exactly one member, `Message`,
+/// targeting `FailureReason`, whose `@length` is min 0 **max 1024**
+/// (`smithy_query(query="shape",shape="FailureReason,ValidationException")`).
+///
+/// It is the member that has to HOLD a refusal, so it is the bound on what a refusal may
+/// say — not a property of any member a request carries.
+const LARGEST_MESSAGE_BYTES: usize = 1024;
+
+/// What ONE clause of a refusal of this service states besides the value it quotes.
+///
+/// The longest such text this model can produce is the envelope
+/// (`1 validation error detected: Value '` … `' at '<member path>' failed to satisfy
+/// constraint: `, 85 bytes over this model's longest member path, `trajectoryId`) plus the
+/// longest requirement the framework words for a member of this model — the job-ARN
+/// `@pattern` as a regular expression, 150 bytes — which is 235 together; every other
+/// requirement (an `@length` bound, the `CompletionStatus` value set, an absent `@required`
+/// member) is shorter, and so is this service's own malformed-ARN wording.
+///
+/// It is the allowance for ONE clause, which is what [`LARGEST_QUOTED_VALUE_BYTES`] needs: a
+/// sentence of SEVERAL clauses carries that much prose per clause, so what its clauses may
+/// quote together is bounded by the sentence rather than by this
+/// ([`held_within_the_message_maximum`], which reads the prose off the rendered sentence
+/// instead of counting it). `a_refusal_of_any_clause_count_fits_the_carrying_member` pins
+/// both, so a wording that outgrew the allowance fails here rather than overrunning the
+/// member.
+const LARGEST_CLAUSE_PROSE_BYTES: usize = 256;
+
+/// The largest single value ONE clause of this service's refusal quotes back.
+///
+/// An AWS constraint message quotes the value it refused, and the shared restorer's own
+/// default ceiling (`service_common::validation`, 16 KiB) is sized for the members most
+/// models declare — 64x the 256 maximum a typical member carries. This model bounds the
+/// member a refusal is CARRIED in instead ([`LARGEST_MESSAGE_BYTES`]), so quoting to that
+/// default answers a `Message` up to sixteen times the maximum its own shape declares. The
+/// ceiling is therefore stated from the model: the declared maximum of the carrying member,
+/// less what one clause states around the value ([`LARGEST_CLAUSE_PROSE_BYTES`]), so no
+/// single value is restored larger than the member could hold even alone. It is a MODEL
+/// constant, not a request-sized one; past it the framework's own shortened rendering stands
+/// — a character-boundary-safe prefix plus the marker naming the submitted byte count —
+/// which is the one divergence `services/common/src/validation.rs` records as the core seam
+/// that whole re-read exists until.
+///
+/// This is the ceiling on ONE value. The bound on the whole sentence is
+/// [`refusal_message`]'s, and it holds whatever the clause count, on both refusal paths of
+/// this service: the violations collected here, and the clause
+/// `crate::ops::complete_rollout` words itself for a value its handler is the one to reach.
+pub const LARGEST_QUOTED_VALUE_BYTES: usize = LARGEST_MESSAGE_BYTES - LARGEST_CLAUSE_PROSE_BYTES;
+
 /// How this service reports a value that is not an ARN at all.
 ///
-/// Built from the value the request sent, which is the only thing the caller can act on.
+/// Built from the value the request sent, which is the only thing the caller can act on —
+/// held, like every clause, to what the carrying member leaves once this sentence's own
+/// prose is in it ([`refusal_message`]).
 #[must_use]
 fn malformed_arn_message(value: &str) -> String {
     format!("Input arn {value} is malformed")
+}
+
+/// What [`malformed_arn_message`] states besides the value, so the value's room in it is
+/// read off the sentence rather than counted by hand.
+fn malformed_arn_prose_bytes() -> usize {
+    malformed_arn_message("").len()
 }
 
 /// Whether `violation` is an ARN-valued member holding something that is not an ARN.
@@ -119,7 +178,14 @@ fn is_malformed_arn(violation: &Violation) -> bool {
 /// value that fails it as a malformed ARN naming the value it was given, rather than as
 /// a regular-expression clause: a caller cannot act on the pattern source, and the ARN
 /// is the thing it got wrong.
-fn refusal_message(violations: &[Violation]) -> Option<String> {
+///
+/// It is also where the MEMBER that has to hold this sentence bounds it
+/// ([`LARGEST_MESSAGE_BYTES`]): the ONE renderer both refusal paths of this service reach,
+/// so the bound cannot hold on one path and not the other, and the only part of a sentence
+/// that is the caller's to size — the values its clauses quote — is held to what the prose
+/// leaves ([`held_within_the_message_maximum`]). A sentence already inside the maximum is
+/// returned exactly as the framework worded it.
+pub(crate) fn refusal_message(violations: &[Violation]) -> Option<String> {
     // Only when the value is actually known: a pattern violation that captured none
     // would otherwise be reported as "Input arn  is malformed", which tells the caller
     // nothing, so the framework's own clause is kept for it instead.
@@ -128,9 +194,81 @@ fn refusal_message(violations: &[Violation]) -> Option<String> {
         .filter(|violation| is_malformed_arn(violation))
         .find_map(|violation| violation.value.as_deref());
     if let Some(value) = malformed_arn {
-        return Some(malformed_arn_message(value));
+        // One clause, one value: its room is the whole member less this wording's prose.
+        let room = LARGEST_MESSAGE_BYTES.saturating_sub(malformed_arn_prose_bytes());
+        return Some(malformed_arn_message(
+            &service_common::validation::echo_held_to(value, room),
+        ));
     }
-    constraints::envelope(violations)
+    let rendered = constraints::envelope(violations)?;
+    if rendered.len() <= LARGEST_MESSAGE_BYTES {
+        return Some(rendered);
+    }
+    held_within_the_message_maximum(violations, &rendered).or(Some(rendered))
+}
+
+/// `violations` worded again with every quoted value held to its share of what the carrying
+/// member leaves after the clauses' own prose, for a sentence that did not fit it.
+///
+/// Why a share rather than a per-clause ceiling: the clauses of one refusal are joined into
+/// ONE `Message`, so what they may quote is bounded TOGETHER — a ceiling that fits one
+/// clause fits two of them twice over. The prose is read off the sentence the framework just
+/// worded (its length less the echoes interpolated into it), so no count of clause text is
+/// kept by hand, and what is left is handed out shortest echo first: a clause that needs
+/// less than an equal share leaves the rest to the clauses that quote more, so the sentence
+/// states as much of each value as the member admits.
+///
+/// Holding an echo keeps the byte count it names
+/// ([`service_common::validation::echo_held_to`]), so every clause still reports how much
+/// was sent. Where the clauses' own prose alone fills the member — which takes more clauses
+/// than this model's four input members can break at once — there is nothing caller-sized
+/// left to hold, and the framework's own wording stands rather than a sentence with clauses
+/// missing from it.
+fn held_within_the_message_maximum(
+    violations: &[Violation],
+    rendered: &str,
+) -> Option<String> {
+    // The clauses that quote a value, shortest echo first, so an unspent share reaches the
+    // clauses that quote more.
+    let mut quoting: Vec<usize> = (0..violations.len())
+        .filter(|at| violations[*at].value.is_some())
+        .collect();
+    if quoting.is_empty() {
+        return None;
+    }
+    quoting.sort_by_key(|at| violations[*at].value.as_deref().unwrap_or_default().len());
+
+    let echoed: usize = violations
+        .iter()
+        .filter_map(|violation| violation.value.as_deref())
+        .map(str::len)
+        .sum();
+    let prose = rendered.len().saturating_sub(echoed);
+    let mut budget = LARGEST_MESSAGE_BYTES.saturating_sub(prose);
+    let mut room = vec![0_usize; violations.len()];
+    let mut left = quoting.len();
+    for at in quoting {
+        let share = budget / left;
+        let echo = violations[at].value.as_deref().unwrap_or_default();
+        let spent = service_common::validation::echo_held_to(echo, share).len();
+        budget -= spent.min(budget);
+        room[at] = share;
+        left -= 1;
+    }
+
+    let held: Vec<Violation> = violations
+        .iter()
+        .enumerate()
+        .map(|(at, violation)| Violation {
+            path: violation.path.clone(),
+            kind: violation.kind.clone(),
+            value: violation
+                .value
+                .as_deref()
+                .map(|echo| service_common::validation::echo_held_to(echo, room[at]).into_owned()),
+        })
+        .collect();
+    constraints::envelope(&held)
 }
 
 /// The names that identify THIS service to the router: its SigV4 signing name — shared
@@ -198,7 +336,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// The framework's pre-dispatch renderer gets the status (400) and the error code
 /// (`ValidationException`) right, but writes the prose into a framework-chosen lowercase
 /// `message` key, the same for every restJson1 service. This service models the prose
-/// member of each of its error shapes as `Message` (`FailureReason`, `@required`), so
+/// member of each of its error shapes as `Message` (`FailureReason`, `@required`,
+/// `@length` min 0 max 1024 — the bound [`LARGEST_QUOTED_VALUE_BYTES`] is stated from), so
 /// that envelope carries no `Message` at all and an SDK surfaces a constraint refusal
 /// with an empty reason.
 ///
@@ -258,16 +397,23 @@ where
 /// `constraints::validate` over the built input), so this cannot find a different set of
 /// violations from the walk that follows it.
 ///
-/// What the violations are then put through is NOT another check:
-/// [`service_common::validation::refusing_violations`] re-reads the SAME built input to
-/// restore each violation's value echo to the bytes the caller sent, which the
-/// framework's walk stores elided (a prefix plus `... [<n> bytes]`). An AWS
-/// constraint-validation message is built from the request, so the echoed value is part
-/// of the rule a caller reads the rejected input back out of. The collecting step is the
-/// shared crate's: it is the same for every service that words its own pre-handler
+/// What the violations are then put through is NOT another check: the shared restorer
+/// re-reads the SAME built input to restore each violation's value echo to the bytes the
+/// caller sent, which the framework's walk stores elided (a prefix plus `... [<n> bytes]`).
+/// An AWS constraint-validation message is built from the request, so the echoed value is
+/// part of the rule a caller reads the rejected input back out of. The collecting step is
+/// the shared crate's: it is the same for every service that words its own pre-handler
 /// refusal, and only the ENVELOPE below is this service's.
+///
+/// How LONG a value it will quote is this service's own, and is stated from this model
+/// ([`LARGEST_QUOTED_VALUE_BYTES`]) rather than left to the shared default, because this
+/// model bounds the member a refusal is carried in.
 fn refused_by<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Vec<Violation> {
-    service_common::validation::refusing_violations::<O>(protocol, req)
+    service_common::validation::refusing_violations_quoting_up_to::<O>(
+        protocol,
+        req,
+        LARGEST_QUOTED_VALUE_BYTES,
+    )
 }
 
 /// This service's answer to `violations`: HTTP 400 `ValidationException` with the prose
@@ -391,5 +537,165 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        refusal_message, Violation, ViolationKind, ARN_MEMBER_PATH, LARGEST_CLAUSE_PROSE_BYTES,
+        LARGEST_MESSAGE_BYTES, LARGEST_QUOTED_VALUE_BYTES,
+    };
+
+    /// The `@pattern` every ARN-valued member of this model declares, as the framework
+    /// quotes it in a requirement
+    /// (`smithy_query(query="shape",shape="JobArn")`) — the longest requirement text a
+    /// clause of this service can state.
+    const JOB_ARN_PATTERN: &str = r"^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:job/[a-zA-Z0-9_\-]+/[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}$";
+
+    /// The longest member path this model binds, which every row states its clause over so
+    /// the prose measured is the longest this service can produce
+    /// (`smithy_query(query="operation",operation="CompleteRollout")`: `TrajectoryId`, the
+    /// validating walk's lowerCamel spelling).
+    const LONGEST_MEMBER_PATH: &str = "trajectoryId";
+
+    /// One violation per constraint class this service's refusals can state, each over
+    /// [`LONGEST_MEMBER_PATH`] and quoting `value`.
+    fn every_requirement(value: &str) -> Vec<(&'static str, Violation)> {
+        let clause = |kind: ViolationKind, value: Option<String>| Violation {
+            path: LONGEST_MEMBER_PATH.to_string(),
+            kind,
+            value,
+        };
+        vec![
+            (
+                "an absent required member",
+                clause(ViolationKind::MissingRequiredMember, None),
+            ),
+            (
+                "a length minimum",
+                clause(ViolationKind::MinLength(1), Some(value.to_string())),
+            ),
+            (
+                "a length maximum",
+                clause(ViolationKind::MaxLength(256), Some(value.to_string())),
+            ),
+            (
+                "the job-ARN regular expression",
+                clause(
+                    ViolationKind::Pattern(JOB_ARN_PATTERN.to_string()),
+                    Some(value.to_string()),
+                ),
+            ),
+            (
+                "the completion-status value set",
+                clause(
+                    ViolationKind::EnumValue(vec!["ready".to_string(), "failed".to_string()]),
+                    Some(value.to_string()),
+                ),
+            ),
+        ]
+    }
+
+    /// RULE: a refusal of this service fits the maximum the carrying member declares,
+    /// whatever its clauses quote and however many clauses it states — the allowance one
+    /// clause's prose is given covers every requirement this model can word, and what
+    /// SEVERAL clauses quote is held to what the sentence leaves them.
+    ///
+    /// Rows are the constraint classes a refusal of this service can state, each over the
+    /// longest member path this model binds, at the clause counts a request to this service
+    /// can reach (its four input members break at most four constraints at once) and well
+    /// past them; the malformed-ARN wording this service puts in place of the ARN pattern
+    /// clause is measured beside them.
+    #[test]
+    fn a_refusal_of_any_clause_count_fits_the_carrying_member() {
+        // ONE clause: the prose allowance the per-value ceiling is stated from.
+        let at_ceiling = "v".repeat(LARGEST_QUOTED_VALUE_BYTES);
+        for (case, violation) in every_requirement(&at_ceiling) {
+            let quoted = violation.value.as_deref().unwrap_or_default().len();
+            let message = refusal_message(std::slice::from_ref(&violation))
+                .unwrap_or_else(|| panic!("case {case:?}: expected a refusal sentence"));
+            let prose = message.len() - quoted;
+            assert!(
+                prose <= LARGEST_CLAUSE_PROSE_BYTES,
+                "case {case:?}: expected at most {LARGEST_CLAUSE_PROSE_BYTES} bytes of clause \
+                 prose, got {prose}"
+            );
+            assert!(
+                message.len() <= LARGEST_MESSAGE_BYTES,
+                "case {case:?}: expected a refusal within the {LARGEST_MESSAGE_BYTES} byte \
+                 maximum the carrying member declares, got {} bytes",
+                message.len()
+            );
+        }
+
+        // SEVERAL clauses, every one of them quoting a value: rows differ along the clause
+        // count — two, the three a request to this service can reach, and four, the most its
+        // models' constrained members could ever break at once (`JobArn` length and pattern,
+        // `TrajectoryId` length, `Status` value set; `ClientToken`, `Rewards` and the
+        // inference `Body` declare no constraint to break) — and along the size of the values
+        // quoted, from under the per-value ceiling to a megabyte, which the walk hands over
+        // already shortened.
+        let every_class: Vec<Violation> = every_requirement(&at_ceiling)
+            .into_iter()
+            .filter(|(_, violation)| violation.value.is_some())
+            .map(|(_, violation)| violation)
+            .collect();
+        for clauses in [2_usize, 3, 4] {
+            for (sized, value) in [
+                ("a quarter of the per-value ceiling", {
+                    "v".repeat(LARGEST_QUOTED_VALUE_BYTES / 4)
+                }),
+                ("the per-value ceiling", at_ceiling.clone()),
+                (
+                    "a value the walk already shortened",
+                    service_common::validation::quoted_echo_up_to(
+                        &"v".repeat(1024 * 1024),
+                        LARGEST_QUOTED_VALUE_BYTES,
+                    )
+                    .into_owned(),
+                ),
+            ] {
+                let case = &format!("{clauses} clauses, each quoting {sized}");
+                let violations: Vec<Violation> = (0..clauses)
+                    .map(|at| {
+                        let mut violation = every_class[at % every_class.len()].clone();
+                        violation.value = Some(value.clone());
+                        violation
+                    })
+                    .collect();
+                let message = refusal_message(&violations)
+                    .unwrap_or_else(|| panic!("case {case:?}: expected a refusal sentence"));
+                assert!(
+                    message.starts_with(&format!("{clauses} validation errors detected: ")),
+                    "case {case:?}: expected all {clauses} clauses in one envelope, got {:?}",
+                    message.chars().take(120).collect::<String>()
+                );
+                assert!(
+                    message.len() <= LARGEST_MESSAGE_BYTES,
+                    "case {case:?}: expected a refusal within the {LARGEST_MESSAGE_BYTES} byte \
+                     maximum the carrying member declares, got {} bytes",
+                    message.len()
+                );
+            }
+        }
+
+        let malformed = refusal_message(&[Violation {
+            path: ARN_MEMBER_PATH.to_string(),
+            kind: ViolationKind::Pattern(JOB_ARN_PATTERN.to_string()),
+            value: Some("z".repeat(1024 * 1024)),
+        }])
+        .expect("the malformed-ARN sentence");
+        assert!(
+            malformed.len() <= LARGEST_MESSAGE_BYTES,
+            "case \"the malformed-ARN wording\": expected a refusal within the \
+             {LARGEST_MESSAGE_BYTES} byte maximum the carrying member declares, got {} bytes",
+            malformed.len()
+        );
+        assert!(
+            malformed.starts_with("Input arn ") && malformed.ends_with(" is malformed"),
+            "case \"the malformed-ARN wording\": expected this service's own wording, got \
+             {malformed:?}"
+        );
     }
 }

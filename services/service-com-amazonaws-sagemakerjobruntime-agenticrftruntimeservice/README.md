@@ -141,7 +141,13 @@ a call rather than serving it:
   `state::serve_rollout_trajectory`).
 
 A value that misses the modelled constraints never gets that far: it is refused
-`400 ValidationException` by the front door (`Input arn … is malformed`).
+`400 ValidationException` by the front door (`Input arn … is malformed`). Whatever a
+refusal says, it has to fit the member that carries it — every error shape of this
+model declares one `Message` member targeting `FailureReason`, `@length` max 1024 — so
+no single value a clause quotes passes that maximum less one clause's own prose
+(`service::LARGEST_QUOTED_VALUE_BYTES`), the clauses of a sentence that states several
+are held to what its prose leaves them together (`service::refusal_message`), and a
+value longer than its room keeps the shortened rendering naming its byte count.
 
 Beside job resolution, a sampling call is refused on state this service owns: a
 trajectory `CompleteRollout` has already sealed, and the emulator's own store bounds

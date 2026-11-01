@@ -5,16 +5,17 @@
 //! RULE: a constraint-validation message is BUILT FROM THE REQUEST —
 //! `1 validation error detected: Value '<value>' at '<member path>' failed to satisfy
 //! constraint: <requirement>` — so the value between the quotes is the one the request
-//! carried, reproduced unmodified however long it is, and the same holds for this
-//! service's own wording of a value that is not an ARN at all (`Input arn <value> is
-//! malformed`). The server reports the offending input nowhere else, so a caller that
-//! compares the echo against what it sent must see its own bytes and never a shortened,
-//! annotated form of them.
+//! carried, reproduced unmodified up to the ceiling this service states from its own model
+//! (the declared maximum of the member a refusal is carried in, less the clause's own
+//! prose), and the same holds for this service's own wording of a value that is not an ARN
+//! at all (`Input arn <value> is malformed`). The server reports the offending input
+//! nowhere else, so a caller that compares the echo against what it sent must see its own
+//! bytes and never a shortened, annotated form of them.
 //!
 //! The rows below span what the rule generalises over, not one recorded request:
 //!
 //! * the value's SIZE — one character past the modelled maximum, the recorded
-//!   300-character case, and a kilobyte;
+//!   300-character case, and twice that;
 //! * its ENCODING — ASCII, multibyte UTF-8 (where the `@length` bound counts characters
 //!   while the elision counted bytes), and values carrying the quote, brace and space
 //!   characters the clause and the JSON envelope have to survive;
@@ -33,6 +34,7 @@
 //! `CompletionStatus` enum (`ready`, `failed`).
 
 use serde_json::json;
+use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::service::LARGEST_QUOTED_VALUE_BYTES;
 use smithy_server_runtime::MultiServiceRouter;
 
 // The shared harness: the wire-answer reduction and the job-directory setup every suite
@@ -211,9 +213,9 @@ async fn an_over_long_value_is_echoed_in_full() {
             "t".repeat(300),
         ),
         (
-            "a kilobyte, header-bound",
+            "twice the recorded case, header-bound",
             Op::Sample,
-            "a".repeat(1024),
+            "a".repeat(600),
         ),
         (
             "a header value carrying the quote the clause delimits with",
@@ -342,27 +344,29 @@ async fn a_value_at_the_maximum_is_not_refused() {
     );
 }
 
-/// RULE (the echo's own bound): the echo is restored up to the per-clause maximum stated
-/// in `services/common/src/validation.rs` — `MAX_RESTORED_ECHO`, 16 KiB, 64x the largest
-/// `@length` maximum this model declares — and past it the response stays bounded rather
-/// than request-sized: the clause keeps a shortened rendering naming the submitted byte
-/// count, and the refusal is still a `400 ValidationException` about the right member.
+/// RULE (the echo's own bound): the echo is restored up to the ceiling this service states
+/// from its model — `LARGEST_QUOTED_VALUE_BYTES`, the declared maximum of the member a
+/// refusal is carried in less the clause's own prose — and past it the message stays inside
+/// that member rather than being request-sized: the clause keeps a shortened rendering
+/// naming the submitted byte count, and the refusal is still a `400 ValidationException`
+/// about the right member.
 #[tokio::test]
 async fn the_echo_is_restored_up_to_the_stated_bound_and_bounded_past_it() {
-    /// The per-clause bound this suite pins. Source: `MAX_RESTORED_ECHO` in
-    /// `services/common/src/validation.rs`, where it is stated with its rationale.
-    const MAX_RESTORED_ECHO: usize = 16 * 1024;
+    /// The maximum the model declares for the member a refusal is carried in: `Message`
+    /// targets `FailureReason`, `@length` min 0 max 1024
+    /// (`smithy_query(query="shape",shape="FailureReason")`).
+    const LARGEST_MESSAGE_BYTES: usize = 1024;
 
     let job_arn = well_formed_job();
     let requirement = format!("Member must have length less than or equal to {TRAJECTORY_ID_MAX}");
 
     // AT the bound: restored in full. Carried in the JSON body, the binding with no
     // per-header size convention of its own.
-    let at_bound = "b".repeat(MAX_RESTORED_ECHO);
+    let at_bound = "b".repeat(LARGEST_QUOTED_VALUE_BYTES);
     let router = mounted_service_with_job();
     let reply = call(&router, Op::CompleteRollout, &job_arn, &at_bound, "ready").await;
     assert_refused(
-        "a value at the 16 KiB echo bound",
+        "a value at the stated echo bound",
         &reply,
         &one_validation_error(&at_bound, "trajectoryId", &requirement),
     );
@@ -371,9 +375,12 @@ async fn the_echo_is_restored_up_to_the_stated_bound_and_bounded_past_it() {
     for (case, value) in [
         (
             "one byte past the echo bound",
-            "b".repeat(MAX_RESTORED_ECHO + 1),
+            "b".repeat(LARGEST_QUOTED_VALUE_BYTES + 1),
         ),
-        ("far past the echo bound", "b".repeat(4 * MAX_RESTORED_ECHO)),
+        (
+            "far past the echo bound",
+            "b".repeat(64 * LARGEST_QUOTED_VALUE_BYTES),
+        ),
     ] {
         let router = mounted_service_with_job();
         let reply = call(&router, Op::CompleteRollout, &job_arn, &value, "ready").await;
@@ -390,8 +397,9 @@ async fn the_echo_is_restored_up_to_the_stated_bound_and_bounded_past_it() {
             "case {case:?}: expected the length clause for trajectoryId, got {message:?}"
         );
         assert!(
-            message.len() < value.len(),
-            "case {case:?}: expected a message smaller than the {} byte value, got {} bytes",
+            message.len() <= LARGEST_MESSAGE_BYTES,
+            "case {case:?}: expected a message within the {LARGEST_MESSAGE_BYTES} byte \
+             maximum the carrying member declares for a {} byte value, got {} bytes",
             value.len(),
             message.len()
         );

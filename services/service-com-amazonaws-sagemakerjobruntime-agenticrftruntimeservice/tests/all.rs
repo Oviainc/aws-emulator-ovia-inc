@@ -34,6 +34,9 @@ mod job_resolution_is_documented_once;
 #[path = "all/modelled_rejections.rs"]
 mod modelled_rejections;
 
+#[path = "all/refusal_fits_the_modelled_message_member.rs"]
+mod refusal_fits_the_modelled_message_member;
+
 #[path = "all/refused_sampling_leaves_no_trajectory.rs"]
 mod refused_sampling_leaves_no_trajectory;
 
