@@ -33,6 +33,8 @@ mod delete_policy_idempotency;
 mod delete_policy_template;
 #[path = "all/entities_exclude_action_entities.rs"]
 mod entities_exclude_action_entities;
+#[path = "all/entity_list_refusal_pointers.rs"]
+mod entity_list_refusal_pointers;
 #[path = "all/error_messages.rs"]
 mod error_messages;
 #[path = "all/evaluation_errors.rs"]

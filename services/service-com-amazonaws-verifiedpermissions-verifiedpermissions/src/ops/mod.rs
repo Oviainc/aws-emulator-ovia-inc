@@ -83,14 +83,31 @@ impl InvalidInput {
         self
     }
 
+    /// This member, re-rooted under ONE element of a list the request carries,
+    /// whose pointer is `list_path` and whose position in that list is `index`.
+    ///
+    /// `ValidationExceptionField$path` is "the path to the specific element that
+    /// Verified Permissions found to be not valid", and a member that lives
+    /// inside a list element is only addressable through that element's own
+    /// position: a pointer numbers an array element from 0 (RFC 6901), which is
+    /// also the spelling a refusal of a modelled constraint on the very same
+    /// member carries ([`crate::service`] builds it that way). So a check written
+    /// for ONE element keeps one implementation, and the walk over the list says
+    /// which element it refused — leaving a pointer that resolves against the
+    /// request body the caller sent.
+    pub fn within_list_element(self, list_path: &str, index: usize) -> Self {
+        self.within(&format!("{list_path}/{index}"))
+    }
+
     /// This member, re-rooted under one request of a batch.
     ///
     /// A check that evaluates ONE authorization request names the member as that
     /// request carries it (`/principal`); inside a batch the same member lives at
     /// `/requests/1/principal`, so the check keeps one implementation and the
-    /// batch says which of its requests it was.
+    /// batch says which of its requests it was. The batch's requests are a list,
+    /// so this is [`Self::within_list_element`] over that list.
     pub fn within_batch_request(self, index: usize) -> Self {
-        self.within(&format!("{}/{index}", paths::REQUESTS))
+        self.within_list_element(paths::REQUESTS, index)
     }
 }
 
@@ -396,12 +413,17 @@ pub mod paths {
     pub const ENTITIES: &str = "/entities";
     /// `entities`' Cedar-JSON arm.
     pub const ENTITIES_CEDAR_JSON: &str = "/entities/cedarJson";
-    /// An `entityList` item's attribute map.
-    pub const ENTITY_LIST_ATTRIBUTES: &str = "/entities/entityList/attributes";
-    /// An `entityList` item's parent list.
-    pub const ENTITY_LIST_PARENTS: &str = "/entities/entityList/parents";
-    /// An `entityList` item's tag map.
-    pub const ENTITY_LIST_TAGS: &str = "/entities/entityList/tags";
+    /// `entities`' modelled entity-list arm. It is a LIST on the wire, so one of
+    /// its items is named by [`super::InvalidInput::within_list_element`], which
+    /// appends that item's own 0-based position; the three constants below are the
+    /// item's members as the item carries them, relative to that position.
+    pub const ENTITY_LIST: &str = "/entities/entityList";
+    /// An entity item's attribute map, WITHIN the item that carries it.
+    pub const ENTITY_ITEM_ATTRIBUTES: &str = "/attributes";
+    /// An entity item's parent list, WITHIN the item that carries it.
+    pub const ENTITY_ITEM_PARENTS: &str = "/parents";
+    /// An entity item's tag map, WITHIN the item that carries it.
+    pub const ENTITY_ITEM_TAGS: &str = "/tags";
 
     /// The `tags` map a create operation of this service takes
     /// (`CreatePolicyStore`), which is the tag set the new resource starts out

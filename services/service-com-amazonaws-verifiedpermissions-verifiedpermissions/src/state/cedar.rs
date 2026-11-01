@@ -1526,8 +1526,8 @@ pub fn entities_to_cedar_json(
             // which is also what makes it a Cedar entity store, where one uid
             // carries one entity.
             let mut at: HashMap<(&str, &str), usize> = HashMap::new();
-            for item in items.iter().take(capacity + 1) {
-                let entity = entity_item_to_cedar_json(item)?;
+            for (index, item) in items.iter().take(capacity + 1).enumerate() {
+                let entity = entity_item_to_cedar_json(item, index)?;
                 let identifier = (
                     item.identifier.entity_type.as_str(),
                     item.identifier.entity_id.as_str(),
@@ -1557,7 +1557,27 @@ pub fn entities_to_cedar_json(
 }
 
 /// One `EntityItem` as Cedar's entity JSON form.
-fn entity_item_to_cedar_json(item: &EntityItem) -> Result<serde_json::Value, InvalidInput> {
+///
+/// `index` is the item's own 0-based position in the `entityList` the request
+/// sent, and a refusal about one of the item's members is re-rooted at that
+/// position, so the member it names is the one the request really carries and the
+/// pointer resolves against the request body — the spelling a refusal of a
+/// modelled constraint on the same member already has.
+fn entity_item_to_cedar_json(
+    item: &EntityItem,
+    index: usize,
+) -> Result<serde_json::Value, InvalidInput> {
+    entity_item_members_to_cedar_json(item)
+        .map_err(|invalid| invalid.within_list_element(paths::ENTITY_LIST, index))
+}
+
+/// The conversion [`entity_item_to_cedar_json`] re-roots: one entity item's
+/// members, each refusal naming the member RELATIVE to the item that carries it,
+/// so the checks are written once and the walk over the list supplies the
+/// position.
+fn entity_item_members_to_cedar_json(
+    item: &EntityItem,
+) -> Result<serde_json::Value, InvalidInput> {
     let mut entity = serde_json::Map::new();
     entity.insert(
         "uid".to_string(),
@@ -1569,7 +1589,7 @@ fn entity_item_to_cedar_json(item: &EntityItem) -> Result<serde_json::Value, Inv
 
     let mut attrs = serde_json::Map::new();
     if let Some(given) = item.attributes.as_ref() {
-        let path = paths::ENTITY_LIST_ATTRIBUTES;
+        let path = paths::ENTITY_ITEM_ATTRIBUTES;
         check_len(given.len(), path)?;
         for (key, value) in given {
             attrs.insert(key.clone(), attribute_value_to_cedar_json(value, 1, path)?);
@@ -1579,7 +1599,7 @@ fn entity_item_to_cedar_json(item: &EntityItem) -> Result<serde_json::Value, Inv
 
     let mut parents = Vec::new();
     if let Some(given) = item.parents.as_ref() {
-        check_len(given.len(), paths::ENTITY_LIST_PARENTS)?;
+        check_len(given.len(), paths::ENTITY_ITEM_PARENTS)?;
         for parent in given {
             parents.push(serde_json::json!({
                 "type": parent.entity_type,
@@ -1590,7 +1610,7 @@ fn entity_item_to_cedar_json(item: &EntityItem) -> Result<serde_json::Value, Inv
     entity.insert("parents".to_string(), serde_json::Value::Array(parents));
 
     if let Some(given) = item.tags.as_ref() {
-        let path = paths::ENTITY_LIST_TAGS;
+        let path = paths::ENTITY_ITEM_TAGS;
         check_len(given.len(), path)?;
         let mut tags = serde_json::Map::new();
         for (key, value) in given {
