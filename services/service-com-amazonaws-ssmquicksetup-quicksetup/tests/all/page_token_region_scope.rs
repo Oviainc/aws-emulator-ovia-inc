@@ -24,6 +24,12 @@
 //! halves — the empty string an exhausted listing reports, and the refusal of a token
 //! the other listing issued — are pinned by `tests/all/pagination_tokens.rs` and
 //! `tests/all/configuration_managers.rs`.
+//!
+//! The rows here hold one record per manager, and a manager ARN embeds its Region, so the
+//! store key a token carries sorts with its Region in the manager listing. A
+//! `ListConfigurations` token carries a configuration's service-generated id instead,
+//! which places it anywhere among another Region's keys; that half is pinned by
+//! `tests/all/configuration_token_region_scope.rs`, which reuses the harness below.
 
 use std::collections::BTreeSet;
 
@@ -74,7 +80,7 @@ fn request(
 }
 
 /// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -106,25 +112,28 @@ async fn call(
 
 /// One paginated listing of this service: where to POST it, the member carrying its
 /// rows, and the member identifying one row.
-struct Listing {
-    uri: &'static str,
-    rows: &'static str,
-    id: &'static str,
+pub(crate) struct Listing {
+    pub(crate) uri: &'static str,
+    pub(crate) rows: &'static str,
+    pub(crate) id: &'static str,
 }
 
+/// The manager listing.
+const MANAGER_LISTING: Listing = Listing {
+    uri: "/listConfigurationManagers",
+    rows: "ConfigurationManagersList",
+    id: "ManagerArn",
+};
+
+/// The configuration listing.
+pub(crate) const CONFIGURATION_LISTING: Listing = Listing {
+    uri: "/listConfigurations",
+    rows: "ConfigurationsList",
+    id: "Id",
+};
+
 /// Every paginated listing this service serves.
-const LISTINGS: [Listing; 2] = [
-    Listing {
-        uri: "/listConfigurationManagers",
-        rows: "ConfigurationManagersList",
-        id: "ManagerArn",
-    },
-    Listing {
-        uri: "/listConfigurations",
-        rows: "ConfigurationsList",
-        id: "Id",
-    },
-];
+const LISTINGS: [Listing; 2] = [MANAGER_LISTING, CONFIGURATION_LISTING];
 
 /// Create `count` managers through the endpoint of `region`, each with one definition
 /// deploying into that one Region, so that Region holds `count` managers and `count`
@@ -159,7 +168,7 @@ async fn fill(router: &MultiServiceRouter, case: &str, region: &str, count: usiz
 }
 
 /// One page of `listing` through the endpoint of `region`.
-async fn page(
+pub(crate) async fn page(
     router: &MultiServiceRouter,
     listing: &Listing,
     region: &str,
@@ -184,7 +193,7 @@ async fn page(
 }
 
 /// The ids one page reports.
-fn ids_of(case: &str, listing: &Listing, answer: &Value) -> Vec<String> {
+pub(crate) fn ids_of(case: &str, listing: &Listing, answer: &Value) -> Vec<String> {
     answer
         .get(listing.rows)
         .and_then(Value::as_array)
@@ -201,7 +210,7 @@ fn ids_of(case: &str, listing: &Listing, answer: &Value) -> Vec<String> {
 
 /// Every id `region` holds, read by paging `listing` with `max_items` from the start,
 /// asserting every page succeeds and that paging terminates.
-async fn all_ids(
+pub(crate) async fn all_ids(
     router: &MultiServiceRouter,
     case: &str,
     listing: &Listing,
