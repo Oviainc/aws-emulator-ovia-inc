@@ -392,7 +392,7 @@ async fn each_component_is_matched_against_the_stored_advisories() {
         if let Some(purl) = case.purl {
             entry["purl"] = json!(purl);
         }
-        let request = json!({ "sbom": bom(vec![entry]) });
+        let request = json!({ "sbom": bom(vec![entry]), "outputFormat": "CYCLONE_DX_1_5" });
         let (status, response) = post_scan(&router, &request).await;
         assert_eq!(
             status, 200,
@@ -410,7 +410,10 @@ async fn each_component_is_matched_against_the_stored_advisories() {
         {
             assert_eq!(
                 entry["affects"][0]["ref"].as_str(),
-                Some("pkg:under-test"),
+                // The scan identifies the components of its own report, so the
+                // only component of this one is named by the first ref the scan
+                // assigns, whatever ref the request carried.
+                Some("comp-1"),
                 "case {case:?}: affects[].ref must name the matched component, got {:?}",
                 entry["affects"]
             );
@@ -428,6 +431,7 @@ async fn a_finding_carries_both_the_nvd_and_the_inspector_rating() {
             "2.14.1",
             "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
         )]),
+        "outputFormat": "CYCLONE_DX_1_5",
     });
     let (status, response) = post_scan(&router, &request).await;
     assert_eq!(status, 200, "expected HTTP 200, got {status}: {response}");
@@ -514,8 +518,8 @@ async fn a_finding_carries_both_the_nvd_and_the_inspector_rating() {
     );
     assert_eq!(
         finding["affects"][0]["ref"].as_str(),
-        Some("ref-log4j"),
-        "affects[].ref must name the submitted component's bom-ref, got {}",
+        Some("comp-1"),
+        "affects[].ref must name the scan's own ref for the matched component, got {}",
         finding["affects"]
     );
 }
@@ -538,7 +542,11 @@ async fn a_submitted_serial_number_is_preserved_and_an_absent_one_is_stamped() {
     let submitted_serial = "urn:uuid:3e671687-395b-41f5-a30f-a58921a69b79";
     let mut with_serial = bom(components.clone());
     with_serial["serialNumber"] = json!(submitted_serial);
-    let (status, response) = post_scan(&router, &json!({ "sbom": with_serial.clone() })).await;
+    let (status, response) = post_scan(
+        &router,
+        &json!({ "sbom": with_serial.clone(), "outputFormat": "CYCLONE_DX_1_5" }),
+    )
+    .await;
     assert_eq!(status, 200, "expected HTTP 200, got {status}: {response}");
     assert_eq!(
         response["sbom"]["serialNumber"].as_str(),
@@ -550,7 +558,11 @@ async fn a_submitted_serial_number_is_preserved_and_an_absent_one_is_stamped() {
     // Row 2: an EMPTY serial number names no instance, so one is stamped.
     let mut empty_serial = bom(components.clone());
     empty_serial["serialNumber"] = json!("");
-    let (status, response) = post_scan(&router, &json!({ "sbom": empty_serial })).await;
+    let (status, response) = post_scan(
+        &router,
+        &json!({ "sbom": empty_serial, "outputFormat": "CYCLONE_DX_1_5" }),
+    )
+    .await;
     assert_eq!(status, 200, "expected HTTP 200, got {status}: {response}");
     assert!(
         response["sbom"]["serialNumber"]
@@ -561,7 +573,11 @@ async fn a_submitted_serial_number_is_preserved_and_an_absent_one_is_stamped() {
     );
 
     // Row 3: the same document twice answers the same serial number.
-    let (status, repeat) = post_scan(&router, &json!({ "sbom": with_serial })).await;
+    let (status, repeat) = post_scan(
+        &router,
+        &json!({ "sbom": with_serial, "outputFormat": "CYCLONE_DX_1_5" }),
+    )
+    .await;
     assert_eq!(status, 200, "expected HTTP 200, got {status}: {repeat}");
     assert_eq!(
         repeat["sbom"]["serialNumber"].as_str(),
@@ -580,7 +596,11 @@ async fn the_report_preserves_the_submitted_bom_and_stamps_its_identity() {
         "1.26.4",
         "pkg:pypi/urllib3@1.26.4",
     )]);
-    let (status, response) = post_scan(&router, &json!({ "sbom": submitted })).await;
+    let (status, response) = post_scan(
+        &router,
+        &json!({ "sbom": submitted, "outputFormat": "CYCLONE_DX_1_5" }),
+    )
+    .await;
     assert_eq!(status, 200, "expected HTTP 200, got {status}: {response}");
 
     let report = &response["sbom"];
@@ -631,7 +651,11 @@ async fn a_component_without_a_bom_ref_is_given_one_the_findings_resolve_against
         "version": "1.2.5",
         "purl": "pkg:npm/minimist@1.2.5",
     })]);
-    let (status, response) = post_scan(&router, &json!({ "sbom": submitted })).await;
+    let (status, response) = post_scan(
+        &router,
+        &json!({ "sbom": submitted, "outputFormat": "CYCLONE_DX_1_5" }),
+    )
+    .await;
     assert_eq!(status, 200, "expected HTTP 200, got {status}: {response}");
 
     let stamped = response["sbom"]["components"][0]["bom-ref"]
@@ -719,8 +743,30 @@ async fn every_output_format_reports_the_same_finding_set() {
         .map(str::to_string)
         .collect();
 
-    // CYCLONE_DX_1_5, and the absent member, which answers in the input's form.
-    for requested in [None, Some("CYCLONE_DX_1_5")] {
+    // CYCLONE_DX_1_5 answers the submitted document augmented with the scan.
+    {
+        let request = json!({ "sbom": submitted, "outputFormat": "CYCLONE_DX_1_5" });
+        let (status, response) = post_scan(&router, &request).await;
+        assert_eq!(
+            status, 200,
+            "case CYCLONE_DX_1_5: expected HTTP 200, got {status}: {response}"
+        );
+        let ids: BTreeSet<String> = cyclonedx_ids(&response).into_iter().collect();
+        assert_eq!(
+            ids, expected,
+            "case CYCLONE_DX_1_5: expected finding ids {expected:?}, got {ids:?}"
+        );
+        assert_eq!(
+            response["sbom"]["bomFormat"].as_str(),
+            Some("CycloneDX"),
+            "case CYCLONE_DX_1_5: the CycloneDX form answers a CycloneDX BOM, got {}",
+            response["sbom"]
+        );
+    }
+
+    // An absent `outputFormat` answers the Inspector-native report, so its
+    // matches are read where that form carries them.
+    for requested in [None, Some("INSPECTOR")] {
         let mut request = json!({ "sbom": submitted });
         if let Some(format) = requested {
             request["outputFormat"] = json!(format);
@@ -730,27 +776,27 @@ async fn every_output_format_reports_the_same_finding_set() {
             status, 200,
             "case {requested:?}: expected HTTP 200, got {status}: {response}"
         );
-        let ids: BTreeSet<String> = cyclonedx_ids(&response).into_iter().collect();
+        let ids: BTreeSet<String> = response["sbom"]["vulnerabilities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap_or_default().to_string())
+            .collect();
         assert_eq!(
             ids, expected,
             "case {requested:?}: expected finding ids {expected:?}, got {ids:?}"
         );
-        assert_eq!(
-            response["sbom"]["bomFormat"].as_str(),
-            Some("CycloneDX"),
-            "case {requested:?}: the CycloneDX form answers a CycloneDX BOM, got {}",
-            response["sbom"]
-        );
     }
 
-    // INSPECTOR: a findings list.
+    // INSPECTOR: a vulnerabilities list.
     let (status, response) = post_scan(
         &router,
         &json!({ "sbom": submitted, "outputFormat": "INSPECTOR" }),
     )
     .await;
     assert_eq!(status, 200, "INSPECTOR: expected HTTP 200, got {response}");
-    let findings = response["sbom"]["findings"]
+    let findings = response["sbom"]["vulnerabilities"]
         .as_array()
         .cloned()
         .unwrap_or_default();
@@ -787,7 +833,7 @@ async fn every_output_format_reports_the_same_finding_set() {
         );
     }
 
-    // INSPECTOR_ALT: the same findings, keyed by vulnerability id.
+    // INSPECTOR_ALT: the same matches, keyed by vulnerability id.
     let (status, response) = post_scan(
         &router,
         &json!({ "sbom": submitted, "outputFormat": "INSPECTOR_ALT" }),
@@ -797,7 +843,7 @@ async fn every_output_format_reports_the_same_finding_set() {
         status, 200,
         "INSPECTOR_ALT: expected HTTP 200, got {response}"
     );
-    let keyed = response["sbom"]["findings"]
+    let keyed = response["sbom"]["vulnerabilities"]
         .as_object()
         .cloned()
         .unwrap_or_default();
@@ -1041,8 +1087,8 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
             field: "sbom.components[0].name",
         },
         RefusalCase {
-            // The `bom-ref` of an assembly is the prefix of every synthesized
-            // child ref below it, so its length is bounded.
+            // Every submitted `bom-ref` is retained for the uniqueness check
+            // CycloneDX requires, so its length is bounded.
             what: "a component whose bom-ref is longer than a scan resolves",
             sbom: bom(vec![json!({
                 "type": "library",
@@ -1237,7 +1283,10 @@ async fn a_nested_assembly_is_scanned_and_counted_against_the_documented_limit()
     // CycloneDX 1.5 lets a component carry its own `components[]`. A vulnerable
     // package below the first level is reported like any other, with an
     // `affects[].ref` that resolves to that nested component.
-    let request = json!({ "sbom": bom(vec![nested_assembly(3)]) });
+    let request = json!({
+        "sbom": bom(vec![nested_assembly(3)]),
+        "outputFormat": "CYCLONE_DX_1_5",
+    });
     let (status, response) = post_scan(&router, &request).await;
     assert_eq!(status, 200, "expected HTTP 200, got {status}: {response}");
     assert_eq!(
@@ -1248,7 +1297,10 @@ async fn a_nested_assembly_is_scanned_and_counted_against_the_documented_limit()
     );
     assert_eq!(
         response["sbom"]["vulnerabilities"][0]["affects"][0]["ref"].as_str(),
-        Some("ref-deep"),
+        // The walk assigns refs in document order, parents before children, so
+        // the three assemblies take comp-1..comp-3 and the vulnerable leaf
+        // below them takes comp-4.
+        Some("comp-4"),
         "affects[].ref must name the nested component, got {}",
         response["sbom"]["vulnerabilities"][0]["affects"]
     );

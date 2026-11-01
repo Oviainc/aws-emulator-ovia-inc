@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/scan_invariants.rs"]
 mod scan_invariants;
+#[path = "all/scan_report_annotations.rs"]
+mod scan_report_annotations;
 #[path = "all/scan_sbom.rs"]
 mod scan_sbom;
 #[path = "all/state_roundtrip.rs"]

@@ -193,6 +193,20 @@ impl ComAmazonawsInspectorscanInspectorscanState {
             .collect()
     }
 
+    /// Does the advisory data hold any rule for this package coordinate?
+    ///
+    /// This is what a scan reports a component as SKIPPED by: the store holds
+    /// nothing about the package, so the scan reached no conclusion about that
+    /// component at all. It is a different answer from
+    /// [`Self::matching_advisories`] being empty, which means a rule was
+    /// applied and the resolved version fell outside every affected range —
+    /// i.e. the component was ruled on and is clean.
+    pub fn has_supported_rules(&self, package_type: &str, package_name: &str) -> bool {
+        self.index
+            .get(&lookup_key(package_type, package_name))
+            .is_some_and(|candidates| !candidates.is_empty())
+    }
+
     /// The scan already recorded for this document and output format, if any.
     /// `ScanSbom` is `@idempotent`, so a repeat of a scan answers from the
     /// record the first one wrote instead of minting a second identity.

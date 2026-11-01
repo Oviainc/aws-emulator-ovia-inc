@@ -8,11 +8,13 @@
 //! The whole operation is: parse the document, refuse anything that is not a
 //! CycloneDX 1.5 BOM, resolve each `components[]` entry to a package coordinate
 //! (purl ecosystem + ecosystem-canonical name + version), look that coordinate
-//! up in the state's advisory index, and render the matched advisories in the
-//! requested `outputFormat`. Nothing in the report is a literal: every rating,
-//! CWE, advisory URL and fixed-in version is a field of the matched
-//! [`crate::state::VulnRecord`], and every `affects[].ref` is a `bom-ref` of the
-//! submitted document.
+//! up in the state's advisory index, and render the matched advisories — plus
+//! the scan summary and the components nothing could be concluded about — in
+//! the requested `outputFormat`. Nothing in the report is a literal: every
+//! rating, CWE, advisory URL and fixed-in version is a field of the matched
+//! [`crate::state::VulnRecord`], every count is a total over the matched set,
+//! and every `affects[].ref` is a `bom-ref` this scan assigned to a component
+//! of the report.
 //!
 //! ## Reaching this service's state
 //!
@@ -84,7 +86,7 @@ use crate::state::{OutputFormat, ScanRecord, VulnRecord};
 use aws_smithy_types::{Document, Number};
 use serde_json::{json, Map, Value};
 use sha2::Digest;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -226,6 +228,32 @@ const INSPECTOR_PROPERTY_NAMESPACE: &str = "amazon:inspector:sbom_scanner";
 /// The rating source Amazon Inspector reports its own adjusted score under.
 const INSPECTOR_RATING_SOURCE: &str = "Amazon Inspector";
 
+/// The `name` the scanning service reports itself under in the CycloneDX
+/// report's `metadata.tools.services`.
+const SCANNER_SERVICE_NAME: &str = "Amazon Inspector Scan SBOM API";
+
+/// The `version` reported beside [`SCANNER_SERVICE_NAME`]: the build version of
+/// the service that answered the scan, which for this emulator is the version
+/// of the crate serving it. Resolved by the compiler from this crate's own
+/// manifest — it is not read from the host at run time.
+const SCANNER_SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What a scan reports for a component it holds no rule for — the component was
+/// seen but nothing could be concluded about it. It is reported both as that
+/// component's CycloneDX `…:info` property and as the `info_message` of the
+/// Inspector report's `messages[]` entry for it.
+const SKIPPED_COMPONENT_MESSAGE: &str = "Component skipped: no supported rules found.";
+
+/// The prefix of the document-local `bom-ref` a scan assigns every component of
+/// the report (`comp-1`, `comp-2`, …).
+const COMPONENT_REF_PREFIX: &str = "comp-";
+
+/// The CWE a malicious-package detection is classified under: CWE-506,
+/// "Embedded Malicious Code". A matched advisory carrying it reports a package
+/// that is itself malicious rather than a defect in an otherwise legitimate
+/// release, and a scan summarises the two separately.
+const CWE_EMBEDDED_MALICIOUS_CODE: u32 = 506;
+
 /// `ScanSbom`'s `ValidationException.reason` values, from the model's
 /// `ValidationExceptionReason` enum (`super::types::VALIDATION_EXCEPTION_REASON_VALUES`).
 const REASON_CANNOT_PARSE: &str = "CANNOT_PARSE";
@@ -360,8 +388,9 @@ fn json_to_document(value: &Value, depth: usize) -> Option<Document> {
 /// keyed by.
 #[derive(Debug, Clone)]
 struct ScannedComponent {
-    /// The entry's CycloneDX `bom-ref`, or the one this scan stamps on it when
-    /// the submitted entry carries none — `affects[].ref` has to resolve.
+    /// The document-local `bom-ref` this scan assigns the entry, which is the
+    /// ref the report carries for it and the one every `affects[].ref` naming
+    /// it resolves to.
     bom_ref: String,
     /// The purl ecosystem (`npm`, `maven`, …), empty when the entry carries no
     /// `purl` and so names no ecosystem.
@@ -542,9 +571,9 @@ fn component_object<'v>(
 /// submitted `bom-ref`.
 ///
 /// CycloneDX requires `bom-ref` to be unique within a document, so a repeat is
-/// refused — left alone it would make `affects[].ref` ambiguous and collapse
-/// findings across two different components. The set this returns is also what
-/// a synthesized ref is kept clear of.
+/// refused — left alone a submitted document could name two different
+/// components by one ref, which is ambiguous however the report re-identifies
+/// them.
 ///
 /// The documented [`MAX_COMPONENTS`] limit is enforced HERE, as the count passes
 /// it, rather than on the total afterwards: the refusal then costs what the
@@ -632,14 +661,12 @@ fn nested_components<'v>(
 /// The `bom-ref` a component submitted, `None` when it carries none, or a
 /// refusal when the one it carries is longer than [`MAX_BOM_REF_LEN`].
 ///
-/// The LENGTH bound is what keeps the ref a bounded cost: a submitted ref is
-/// retained once per component of the resolved tree, once per finding that
-/// affects it and twice more in the rendered report, and an assembly's ref is
-/// also the prefix of every synthesized child ref below it — so an unbounded
-/// ref would be duplicated a bounded NUMBER of times but at an unbounded SIZE.
-/// Bounding it here, at the one site both passes read it, is what makes neither
-/// the component count nor the nesting depth the only limit on what one request
-/// can allocate.
+/// The LENGTH bound is what keeps the ref a bounded cost: every submitted ref
+/// is retained for the uniqueness check above, once per component of the
+/// submitted tree, so an unbounded ref would be retained a bounded NUMBER of
+/// times but at an unbounded SIZE. Bounding it here, at the one site that reads
+/// it, is what makes neither the component count nor the nesting depth the only
+/// limit on what one request can allocate.
 fn submitted_bom_ref<'v>(
     field: &str,
     object: &'v Map<String, Value>,
@@ -665,40 +692,24 @@ fn submitted_bom_ref<'v>(
     Ok(Some(submitted))
 }
 
-/// A `bom-ref` built from `candidate` that no entry of the document already
-/// uses.
-///
-/// The search is BOUNDED by the number of refs the document itself has taken,
-/// and the bound is also why it cannot fail: `taken` holds `taken.len()` names
-/// while the suffixes below offer `taken.len() + 1` candidates, so at least one
-/// of them is free (pigeonhole). The loop therefore has no panicking exit, and
-/// no caller-chosen set of refs can make it walk `usize`.
-fn unique_bom_ref(candidate: &str, taken: &mut BTreeSet<String>) -> String {
-    if taken.insert(candidate.to_string()) {
-        return candidate.to_string();
-    }
-    let limit = taken.len() + 2;
-    for suffix in 2..=limit {
-        let alternative = format!("{candidate}-{suffix}");
-        if taken.insert(alternative.clone()) {
-            return alternative;
-        }
-    }
-    // Unreachable by the argument above; answered rather than panicked so that
-    // a request path cannot abort a handler thread even if that argument is
-    // later broken by a change to how refs are collected.
-    let fallback = format!("{candidate}-{}", limit + 1);
-    taken.insert(fallback.clone());
-    fallback
-}
-
 /// SECOND PASS over the component tree: resolve every entry to a scannable
-/// coordinate, and return the entries with a `bom-ref` stamped on each.
+/// coordinate, and return the entries with the `bom-ref` this scan assigns
+/// stamped on each.
+///
+/// The scan IDENTIFIES the components of the report itself, by a sequential
+/// document-local ref ([`COMPONENT_REF_PREFIX`] plus the entry's 1-based
+/// position in the walk), rather than re-using whatever identifier the
+/// submitted document happened to carry: the ref a report hands a consumer is
+/// the scanner's, so a finding's `affects[].ref` names a component of THAT
+/// document and does not depend on a submitted ref being present, unique or
+/// usable as a key (generators commonly set it to the component's purl, which
+/// repeats across two entries of one package at two versions).
 ///
 /// CycloneDX 1.5 lets a component carry its own `components[]` (an assembly),
 /// and the scanner resolves the whole tree, so a vulnerable package below the
 /// first level is matched like any other. `out` is filled in document order,
-/// parents before children.
+/// parents before children, and `next_ref` counts across the whole tree so one
+/// ref names exactly one component of the report.
 ///
 /// `depth` is carried here as well as in [`collect_component_refs`], rather than
 /// relying on that pass having already refused a deeper tree: the bound belongs
@@ -707,9 +718,8 @@ fn unique_bom_ref(candidate: &str, taken: &mut BTreeSet<String>) -> String {
 fn resolve_component_tree(
     entries: &[Value],
     path: &str,
-    ref_prefix: &str,
     depth: usize,
-    taken_refs: &mut BTreeSet<String>,
+    next_ref: &mut usize,
     out: &mut Vec<ScannedComponent>,
 ) -> Result<Vec<Value>, ScanSbomError> {
     if depth > MAX_COMPONENT_NESTING {
@@ -817,10 +827,8 @@ fn resolve_component_tree(
             ));
         }
 
-        let bom_ref = match submitted_bom_ref(&field, object)? {
-            Some(submitted) => submitted.to_string(),
-            None => unique_bom_ref(&format!("{ref_prefix}{index}"), taken_refs),
-        };
+        *next_ref += 1;
+        let bom_ref = format!("{COMPONENT_REF_PREFIX}{next_ref}");
 
         out.push(ScannedComponent {
             bom_ref: bom_ref.clone(),
@@ -830,17 +838,17 @@ fn resolve_component_tree(
             purl: purl.map(str::to_string),
         });
 
-        // The stamped entry, with its children resolved the same way, so a
-        // synthesized ref an `affects[].ref` points at appears in the report.
+        // The stamped entry, with its children resolved the same way, so the
+        // ref an `affects[].ref` points at appears on its component in the
+        // report.
         let mut stamped = object.clone();
         stamped.insert("bom-ref".to_string(), Value::String(bom_ref.clone()));
         if let Some(children) = nested_components(&field, object)? {
             let resolved = resolve_component_tree(
                 children,
                 &format!("{field}.components"),
-                &format!("{bom_ref}/"),
                 depth + 1,
-                taken_refs,
+                next_ref,
                 out,
             )?;
             stamped.insert("components".to_string(), Value::Array(resolved));
@@ -945,12 +953,12 @@ fn parse_sbom(sbom: &Value) -> Result<ParsedSbom, ScanSbomError> {
     )?;
 
     let mut resolved = Vec::with_capacity(total);
+    let mut next_ref = 0usize;
     let normalized = resolve_component_tree(
         components,
         "sbom.components",
-        "component-",
         0,
-        &mut submitted_refs,
+        &mut next_ref,
         &mut resolved,
     )?;
     Ok(ParsedSbom {
@@ -1101,6 +1109,125 @@ fn cyclonedx_severity(stored: &str) -> String {
     }
 }
 
+/// The buckets a scan's findings are summarised over.
+///
+/// A scan summary reports a total per rated severity plus one `other` total,
+/// which is what a finding rated outside the four named severities (or not
+/// rated at all) is counted under — so every finding is counted exactly once,
+/// however it is rated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeverityBucket {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Other,
+}
+
+impl SeverityBucket {
+    /// The bucket a stored severity falls in. The store keeps Inspector's
+    /// uppercase spelling; a report spells a severity in lowercase.
+    fn of(stored: &str) -> Self {
+        match stored.to_ascii_lowercase().as_str() {
+            "critical" => Self::Critical,
+            "high" => Self::High,
+            "medium" => Self::Medium,
+            "low" => Self::Low,
+            _ => Self::Other,
+        }
+    }
+
+    /// The bucket's reported spelling.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// What a scan found, counted: how many findings fell in each severity bucket,
+/// and how many of them report a malicious package.
+///
+/// Every total is a count over the matched [`Finding`] set, so a scan that
+/// matched nothing summarises as zeros rather than as nothing: the report says
+/// "scanned, nothing found", which is a different answer from "no counts
+/// reported".
+#[derive(Debug, Default, Clone, Copy)]
+struct ScanSummary {
+    critical: usize,
+    high: usize,
+    medium: usize,
+    low: usize,
+    other: usize,
+    malicious_packages: usize,
+}
+
+impl ScanSummary {
+    /// Summarise `findings`: each counts once in the bucket its reported
+    /// severity falls in, and again under `malicious_packages` when the
+    /// advisory it matched is a malicious-package detection
+    /// ([`CWE_EMBEDDED_MALICIOUS_CODE`]).
+    fn of(findings: &[Finding]) -> Self {
+        let mut summary = Self::default();
+        for finding in findings {
+            let counter = match SeverityBucket::of(&finding.advisory.inspector_severity) {
+                SeverityBucket::Critical => &mut summary.critical,
+                SeverityBucket::High => &mut summary.high,
+                SeverityBucket::Medium => &mut summary.medium,
+                SeverityBucket::Low => &mut summary.low,
+                SeverityBucket::Other => &mut summary.other,
+            };
+            *counter += 1;
+            if finding
+                .advisory
+                .cwes
+                .contains(&CWE_EMBEDDED_MALICIOUS_CODE)
+            {
+                summary.malicious_packages += 1;
+            }
+        }
+        summary
+    }
+
+    /// The Inspector report's per-severity count object: one member per bucket,
+    /// always present.
+    fn vulnerability_count(&self) -> Value {
+        json!({
+            "critical": self.critical,
+            "high": self.high,
+            "medium": self.medium,
+            "low": self.low,
+            "other": self.other,
+        })
+    }
+
+    /// The same summary as the CycloneDX report carries it: namespaced
+    /// `metadata.properties` entries, each value the decimal count (CycloneDX
+    /// types a `properties[].value` as a string).
+    fn cyclonedx_properties(&self) -> Vec<Value> {
+        [
+            ("critical_vulnerabilities", self.critical),
+            ("high_vulnerabilities", self.high),
+            ("medium_vulnerabilities", self.medium),
+            ("low_vulnerabilities", self.low),
+            ("other_vulnerabilities", self.other),
+            ("malicious_packages", self.malicious_packages),
+        ]
+        .into_iter()
+        .map(|(name, count)| {
+            json!({
+                "name": format!("{INSPECTOR_PROPERTY_NAMESPACE}:{name}"),
+                "value": count.to_string(),
+            })
+        })
+        .collect()
+    }
+}
+
 /// The Amazon Inspector `packageManager` name for a purl ecosystem.
 ///
 /// Maps the purl `type` the SBOM states onto the package-manager vocabulary
@@ -1186,12 +1313,84 @@ fn cyclonedx_vulnerability(finding: &Finding) -> Value {
     })
 }
 
-/// The input BOM augmented with the scan's results — the `CYCLONE_DX_1_5` form,
-/// and the form the operation answers in when `outputFormat` is absent.
+/// The CycloneDX `metadata.tools.services` entry the scanning service reports
+/// itself under.
+fn scanner_service() -> Value {
+    json!({
+        "name": SCANNER_SERVICE_NAME,
+        "version": SCANNER_SERVICE_VERSION,
+    })
+}
+
+/// A deprecated 1.4-style `metadata.tools[]` entry as the tool COMPONENT the
+/// 1.5 object form holds.
+///
+/// CycloneDX 1.5 replaces the array of `{vendor, name, version}` tool objects
+/// with an object carrying `components` and `services`, and the scan reports
+/// itself under the latter — so a submitted array is carried over into
+/// `components` rather than dropped, mapping `vendor` onto the component
+/// `publisher` the specification names.
+fn tool_component(entry: &Value) -> Value {
+    let mut component = Map::new();
+    component.insert("type".to_string(), json!("application"));
+    if let Some(vendor) = entry.get("vendor") {
+        component.insert("publisher".to_string(), vendor.clone());
+    }
+    for member in ["name", "version", "hashes", "externalReferences"] {
+        if let Some(value) = entry.get(member) {
+            component.insert(member.to_string(), value.clone());
+        }
+    }
+    Value::Object(component)
+}
+
+/// Report, on every component of `components` the scan held no rule for, that
+/// it was skipped.
+///
+/// The annotation is appended to the component's own `properties`, so what the
+/// caller submitted there is preserved beside it. The walk is bounded exactly
+/// as the two resolution passes are: the tree it walks came from
+/// [`resolve_component_tree`], which refuses anything deeper.
+fn annotate_skipped_components(components: &mut Value, skipped: &HashSet<String>, depth: usize) {
+    if depth > MAX_COMPONENT_NESTING {
+        return;
+    }
+    let Some(entries) = components.as_array_mut() else {
+        return;
+    };
+    for entry in entries {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        let was_skipped = object
+            .get("bom-ref")
+            .and_then(Value::as_str)
+            .is_some_and(|bom_ref| skipped.contains(bom_ref));
+        if was_skipped {
+            let property = json!({
+                "name": format!("{INSPECTOR_PROPERTY_NAMESPACE}:info"),
+                "value": SKIPPED_COMPONENT_MESSAGE,
+            });
+            match object.get_mut("properties") {
+                Some(Value::Array(list)) => list.push(property),
+                _ => {
+                    object.insert("properties".to_string(), json!([property]));
+                }
+            }
+        }
+        if let Some(children) = object.get_mut("components") {
+            annotate_skipped_components(children, skipped, depth + 1);
+        }
+    }
+}
+
+/// The input BOM augmented with the scan's results — the `CYCLONE_DX_1_5` form.
 fn cyclonedx_report(
     submitted: &Map<String, Value>,
     parsed: &ParsedSbom,
     findings: &[Finding],
+    skipped: &HashSet<String>,
+    summary: &ScanSummary,
     serial_number: &str,
     timestamp: &str,
 ) -> Value {
@@ -1232,11 +1431,13 @@ fn cyclonedx_report(
         report.insert("version".to_string(), json!(1));
     }
 
-    // The resolved component tree, with a `bom-ref` on every entry: a ref this
-    // scan stamped has to appear on its component too, or the `affects[].ref`
-    // pointing at it resolves to nothing.
+    // The resolved component tree, with the `bom-ref` this scan assigned on
+    // every entry — the ref each `affects[].ref` resolves to — and the
+    // scanner's own annotation on every component it held no rule for.
     if let Some(components) = &parsed.components_value {
-        report.insert("components".to_string(), components.clone());
+        let mut components = components.clone();
+        annotate_skipped_components(&mut components, skipped, 0);
+        report.insert("components".to_string(), components);
     }
 
     let mut metadata = match report.get("metadata") {
@@ -1244,28 +1445,39 @@ fn cyclonedx_report(
         _ => Map::new(),
     };
     metadata.insert("timestamp".to_string(), Value::String(timestamp.to_string()));
-    let scanner = json!({
-        "type": "application",
-        "name": "Amazon Inspector SBOM Scanner",
-        "publisher": "Amazon Web Services",
-    });
-    match metadata.get_mut("tools") {
-        // CycloneDX 1.5 `metadata.tools` as an object carrying `components`.
-        Some(Value::Object(tools)) => match tools.get_mut("components") {
-            Some(Value::Array(list)) => list.push(scanner),
-            _ => {
-                tools.insert("components".to_string(), json!([scanner]));
-            }
-        },
-        // The 1.4-style array form, which 1.5 still accepts.
-        Some(Value::Array(list)) => list.push(json!({
-            "name": "Amazon Inspector SBOM Scanner",
-            "vendor": "Amazon Web Services",
-        })),
+
+    // The scan reports WHO scanned the document: the scanning service, under
+    // `metadata.tools.services`, beside whatever the submitted document already
+    // said about the tools that produced it.
+    let mut tools = match metadata.remove("tools") {
+        Some(Value::Object(existing)) => existing,
+        Some(Value::Array(entries)) => {
+            let mut object = Map::new();
+            object.insert(
+                "components".to_string(),
+                Value::Array(entries.iter().map(tool_component).collect()),
+            );
+            object
+        }
+        _ => Map::new(),
+    };
+    match tools.get_mut("services") {
+        Some(Value::Array(services)) => services.push(scanner_service()),
         _ => {
-            metadata.insert("tools".to_string(), json!({ "components": [scanner] }));
+            tools.insert("services".to_string(), json!([scanner_service()]));
         }
     }
+    metadata.insert("tools".to_string(), Value::Object(tools));
+
+    // And WHAT it found, as the namespaced scan summary, appended to the
+    // document's own `metadata.properties` rather than replacing them.
+    let mut properties = match metadata.remove("properties") {
+        Some(Value::Array(existing)) => existing,
+        _ => Vec::new(),
+    };
+    properties.extend(summary.cyclonedx_properties());
+    metadata.insert("properties".to_string(), Value::Array(properties));
+
     report.insert("metadata".to_string(), Value::Object(metadata));
 
     report.insert(
@@ -1311,7 +1523,9 @@ fn inspector_finding(finding: &Finding) -> Value {
     json!({
         "id": advisory.cve_id,
         "title": format!("{} - {}", advisory.cve_id, component.package_name),
-        "severity": advisory.inspector_severity,
+        // The report spells a severity the way it spells the per-severity
+        // counts beside it, so a reader keying on one can read the other.
+        "severity": SeverityBucket::of(&advisory.inspector_severity).as_str(),
         "description": advisory.description,
         "source": advisory.source,
         "sourceUrl": advisory.source_url,
@@ -1336,32 +1550,41 @@ fn inspector_finding(finding: &Finding) -> Value {
 
 /// The Inspector-native report — the `INSPECTOR` and `INSPECTOR_ALT` forms.
 ///
-/// Both carry the same envelope and the same findings, computed from the same
-/// matches as the CycloneDX form, so the formats can never disagree. They differ
-/// only in how the findings are presented: `INSPECTOR` as a list in the report's
-/// order, `INSPECTOR_ALT` as a map keyed by vulnerability id (one entry per id,
-/// listing every component that id affects).
+/// Both carry the same envelope and the same matches, computed from the same
+/// findings as the CycloneDX form, so the formats can never disagree. They
+/// differ only in how the matches are presented: `INSPECTOR` as a list in the
+/// report's order, `INSPECTOR_ALT` as a map keyed by vulnerability id (one entry
+/// per id, listing every component that id affects).
 ///
-/// The ENVELOPE IS CHOSEN, NOT MODELLED. `sbom` is a Smithy `document`, and
-/// neither the model nor this operation's documentation states the member names
-/// of the Inspector-native report or what distinguishes `INSPECTOR` from
-/// `INSPECTOR_ALT`; the model's `OutputFormat` enum only names the two values.
-/// So the wrapper below (`scanId`, `scanTimestamp`, `sbomFormat`,
-/// `sbomSpecVersion`, `componentCount`, `findingCount`, `findings`) and the
-/// list-vs-map difference are this emulator's choice, and a recorded response
-/// should correct them rather than be read as a regression. What is NOT chosen
-/// is the finding content: every field of every finding is a projection of a
-/// matched [`crate::state::VulnRecord`] onto the component it was matched
-/// against, the same records the CycloneDX form reports.
+/// What the report says about the scan as a whole is NOT chosen: it carries
+/// `vulnerabilities` (one entry per matched advisory, each naming the advisory
+/// `id` and the `severity` it was rated at), the unconditional per-severity
+/// `vulnerability_count`, and `messages`, one entry per component the scanner
+/// held no rule for — so a reader can tell a clean scan from an uncovered one
+/// instead of reading an empty report as either.
+///
+/// The rest of the ENVELOPE IS CHOSEN, NOT MODELLED. `sbom` is a Smithy
+/// `document`, and neither the model nor this operation's documentation states
+/// what distinguishes `INSPECTOR` from `INSPECTOR_ALT`; the model's
+/// `OutputFormat` enum only names the two values. So the wrapper members
+/// (`scanId`, `scanTimestamp`, `sbomFormat`, `sbomSpecVersion`,
+/// `componentCount`, `findingCount`) and the list-vs-map difference are this
+/// emulator's choice, and a recorded response should correct them rather than be
+/// read as a regression. What is NOT chosen is the content of a match: every
+/// field of it is a projection of a matched [`crate::state::VulnRecord`] onto
+/// the component it was matched against, the same records the CycloneDX form
+/// reports.
 fn inspector_report(
     scan_id: &str,
     timestamp: &str,
     component_count: usize,
     findings: &[Finding],
+    messages: Vec<Value>,
+    summary: &ScanSummary,
     keyed_by_id: bool,
 ) -> Value {
     let rendered: Vec<Value> = findings.iter().map(inspector_finding).collect();
-    let findings_value = if keyed_by_id {
+    let vulnerabilities = if keyed_by_id {
         let mut by_id: Map<String, Value> = Map::new();
         for (finding, value) in findings.iter().zip(&rendered) {
             match by_id.get_mut(&finding.advisory.cve_id) {
@@ -1386,7 +1609,9 @@ fn inspector_report(
         "sbomSpecVersion": CYCLONEDX_SPEC_VERSION,
         "componentCount": component_count,
         "findingCount": findings.len(),
-        "findings": findings_value,
+        "vulnerabilities": vulnerabilities,
+        "vulnerability_count": summary.vulnerability_count(),
+        "messages": messages,
     })
 }
 
@@ -1433,10 +1658,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| internal("the inspector-scan vulnerability database is unavailable"))?;
 
-        // An absent `outputFormat` answers in the input's own form: the request
-        // is a CycloneDX 1.5 document, so the report is one too.
+        // `outputFormat` is OPTIONAL, and a request that names none is answered
+        // the Inspector-native report: the format a scan reports in by default
+        // is the service's own, not the CycloneDX document the request carried.
         let output_format = match input.output_format.as_deref() {
-            None => OutputFormat::CycloneDx15,
+            None => OutputFormat::Inspector,
             Some(requested) => OutputFormat::from_wire(requested).ok_or_else(|| {
                 invalid(
                     REASON_FIELD_VALIDATION_FAILED,
@@ -1468,13 +1694,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        // Match every component against the stored advisories, then settle this
-        // scan's identity, all under one lock.
-        let (scan_id, received_at, findings) = {
+        // Match every component against the stored advisories, note the ones
+        // the store holds no rule for, then settle this scan's identity, all
+        // under one lock.
+        let (scan_id, received_at, findings, skipped) = {
             let mut store = state.lock();
 
             let mut findings: Vec<Finding> = Vec::new();
+            // The components the scan could not rule on: the store holds no
+            // advisory for their package at all, which is a different answer
+            // from "a rule applied and cleared this version".
+            let mut skipped: HashSet<String> = HashSet::new();
             for component in &parsed.components {
+                if !store.has_supported_rules(&component.package_type, &component.package_name) {
+                    skipped.insert(component.bom_ref.clone());
+                }
                 for index in store.matching_advisories(
                     &component.package_type,
                     &component.package_name,
@@ -1528,11 +1762,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect(),
                 sbom_digest: digest.clone(),
             });
-            (scan_id, received_at, findings)
+            (scan_id, received_at, findings, skipped)
         };
 
         let timestamp = rfc3339(received_at);
         let component_count = parsed.components.len();
+        let summary = ScanSummary::of(&findings);
+        // One message per component the scan held no rule for, naming it by the
+        // purl the submitted document states for it — a component the document
+        // gives no purl for has no coordinate to name it by, so the entry
+        // carries the reason alone.
+        let messages: Vec<Value> = parsed
+            .components
+            .iter()
+            .filter(|component| skipped.contains(&component.bom_ref))
+            .map(|component| {
+                let mut message = Map::new();
+                if let Some(purl) = &component.purl {
+                    message.insert("purl".to_string(), Value::String(purl.clone()));
+                }
+                message.insert(
+                    "info_message".to_string(),
+                    Value::String(SKIPPED_COMPONENT_MESSAGE.to_string()),
+                );
+                Value::Object(message)
+            })
+            .collect();
 
         let report = match output_format {
             OutputFormat::CycloneDx15 => cyclonedx_report(
@@ -1541,15 +1796,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .ok_or_else(|| internal("the submitted document is not an object"))?,
                 &parsed,
                 &findings,
+                &skipped,
+                &summary,
                 &serial_number_from_digest(&digest),
                 &timestamp,
             ),
-            OutputFormat::Inspector => {
-                inspector_report(&scan_id, &timestamp, component_count, &findings, false)
-            }
-            OutputFormat::InspectorAlt => {
-                inspector_report(&scan_id, &timestamp, component_count, &findings, true)
-            }
+            OutputFormat::Inspector => inspector_report(
+                &scan_id,
+                &timestamp,
+                component_count,
+                &findings,
+                messages,
+                &summary,
+                false,
+            ),
+            OutputFormat::InspectorAlt => inspector_report(
+                &scan_id,
+                &timestamp,
+                component_count,
+                &findings,
+                messages,
+                &summary,
+                true,
+            ),
         };
 
         let rendered = json_to_document(&report, 0).ok_or_else(|| {

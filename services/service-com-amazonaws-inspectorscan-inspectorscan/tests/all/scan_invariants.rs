@@ -47,7 +47,7 @@ async fn the_report_is_ordered_and_a_rescan_is_identical() {
                 component(&format!("ref-{position}"), name, version, purl)
             })
             .collect();
-        let request = json!({ "sbom": bom(components) });
+        let request = json!({ "sbom": bom(components), "outputFormat": "CYCLONE_DX_1_5" });
 
         let (status, first) = post_scan(&router, &request).await;
         assert_eq!(
