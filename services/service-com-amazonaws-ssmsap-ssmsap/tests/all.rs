@@ -85,6 +85,8 @@ mod region_partition_reclamation;
 mod region_scoping;
 #[path = "all/registration_derived_state.rs"]
 mod registration_derived_state;
+#[path = "all/registration_instance_resolution.rs"]
+mod registration_instance_resolution;
 #[path = "all/registration_operation_properties.rs"]
 mod registration_operation_properties;
 #[path = "all/registration_tag_ceiling.rs"]
@@ -107,6 +109,8 @@ mod stop_connected_entity;
 mod sub_check_result_cursor;
 #[path = "all/sub_check_results.rs"]
 mod sub_check_results;
+#[path = "all/tag_key_form.rs"]
+mod tag_key_form;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
 #[path = "all/tagging_error_channel.rs"]

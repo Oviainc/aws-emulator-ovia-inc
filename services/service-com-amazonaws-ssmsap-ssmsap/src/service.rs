@@ -119,16 +119,29 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
         ViolationKind::MaxValue(max) => {
             format!("Member must have value less than or equal to {max}")
         }
-        ViolationKind::Pattern(pattern) => format!(
-            "Member must satisfy regular expression pattern: {}",
-            unanchored(pattern)
-        ),
+        ViolationKind::Pattern(pattern) => pattern_requirement(pattern),
         ViolationKind::EnumValue(allowed) => {
             format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
         }
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
     })
+}
+
+/// The requirement a value outside a `@pattern` states, as this service phrases it: the
+/// framework's own sentence over the expression reported [`unanchored`].
+///
+/// Named on its own because a handler states it too: the ONE constraint class no walk
+/// ahead of a handler can apply is a `@pattern` on a map's KEY (the walk treats a key as a
+/// path segment), and this service's key expression is one the walk's regex engine cannot
+/// compile either — so the sentence a handler-stated refusal carries
+/// ([`map_key_pattern_refusal`], [`element_pattern_refusal`]) is this same one rather than
+/// a second spelling of it.
+fn pattern_requirement(pattern: &str) -> String {
+    format!(
+        "Member must satisfy regular expression pattern: {}",
+        unanchored(pattern)
+    )
 }
 
 /// What a clause states AROUND the requirement an ELEMENT of a list failed: the element's
@@ -274,6 +287,70 @@ fn envelope(clauses: &[String]) -> Option<String> {
 /// request's lists to read ([`Service::override_refusal`]).
 fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     constraint_message(violations, &HashMap::new())
+}
+
+/// The whole `ValidationException` message for a MAP whose KEY is outside the `@pattern`
+/// the map's KEY SHAPE declares.
+///
+/// A HANDLER states this, because no walk ahead of one can: the validating walk treats a
+/// map's key as a path segment rather than as a constrained leaf, so it applies no
+/// constraint a key shape declares. The wording is still the framework's envelope and
+/// clause over the map MEMBER, with the requirement a KEY has to satisfy listed as such
+/// and no value quoted — a map has no scalar rendering to echo — and the requirement
+/// sentence is [`pattern_requirement`]'s, the same one a reported member gets, so a clause
+/// about a key cannot drift from a clause about a member.
+pub(crate) fn map_key_pattern_refusal(member_path: &str, pattern: &str) -> String {
+    let clause = format!(
+        "Value at '{member_path}' failed to satisfy constraint: Map keys must satisfy \
+         constraint: {}",
+        service_common::validation_message::bracketed_findings(&[pattern_requirement(pattern)])
+    );
+    match envelope(std::slice::from_ref(&clause)) {
+        Some(stated) => stated,
+        None => clause,
+    }
+}
+
+/// The whole `ValidationException` message for a LIST one of whose ELEMENTS is outside the
+/// `@pattern` the element shape declares, when the walk could not apply that expression
+/// itself — this service's tag-key expression is one its regex engine cannot compile, so
+/// every value satisfies it there and the handler applies it instead.
+///
+/// Worded by the SAME renderer every refused request of this service is worded by
+/// ([`constraint_message`]), handed the violation the walk would have reported — at the
+/// element's own path, spelled by the walk's own path builder — and the list the caller
+/// sent: so the clause lands at the LIST member quoting the whole list, and two elements
+/// breaking one rule are one clause, exactly as when the walk reports them. `position` is
+/// the 1-based position of the offending element.
+pub(crate) fn element_pattern_refusal(
+    member_path: &str,
+    elements: &[String],
+    position: usize,
+    pattern: &str,
+) -> String {
+    use aws_smithy_schema_server::constraints::path;
+
+    let violation = Violation {
+        path: path::join(&[member_path.to_string(), path::element(position)]),
+        kind: ViolationKind::Pattern(pattern.to_string()),
+        value: Some(
+            elements
+                .get(position.saturating_sub(1))
+                .cloned()
+                .unwrap_or_default(),
+        ),
+    };
+    // The value a clause states at a list member is the whole list, rendered the way the
+    // walk's own collector renders one (`service_common::validation::submitted_lists`):
+    // the elements in position order, comma-separated, in brackets.
+    let lists: HashMap<String, String> = [(
+        member_path.to_string(),
+        format!("[{}]", elements.join(", ")),
+    )]
+    .into_iter()
+    .collect();
+    constraint_message(std::slice::from_ref(&violation), &lists)
+        .unwrap_or_else(|| violation.message())
 }
 
 /// The `com-amazonaws-ssmsap-ssmsap` emulated service: the generated [`ServiceDefinition`] plus

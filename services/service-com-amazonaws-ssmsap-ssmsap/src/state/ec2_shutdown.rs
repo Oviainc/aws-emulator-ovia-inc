@@ -3,11 +3,12 @@
 //! Shutting down the Amazon EC2 instances a registered application runs on.
 //!
 //! An EC2 instance is EC2's resource, not this service's, so the only way a call here can
-//! shut one down is to ask the service that owns it: the AWS SDK driven over the
-//! in-process callback ([`smithy_server_runtime::OperationContext::callback`]), which
-//! routes inside this emulator, so this crate names no other service's crate and nothing
-//! leaves the process. The effect is therefore observable where an instance's state
-//! lives — `DescribeInstances` — rather than only in this service's own records.
+//! shut one down is to ask the service that owns it, over the one client every hop into
+//! EC2 goes through ([`super::ec2::client`]): the AWS SDK driven over the in-process
+//! callback, which routes inside this emulator, so this crate names no other service's
+//! crate and nothing leaves the process. The effect is therefore observable where an
+//! instance's state lives — `DescribeInstances` — rather than only in this service's own
+//! records.
 //!
 //! Nothing is invented when EC2 cannot be asked (no EC2 mounted, or a refusal): the hop
 //! is logged at `warn` and the application's own shutdown stands, because this service
@@ -15,37 +16,6 @@
 //! did not observe. What EC2 answered for each instance IS answered back here
 //! ([`InstanceStop`]), so the stop's own operation record reports each instance's
 //! milestone as the outcome it had rather than as work that completed.
-
-/// The EC2 client this service shuts an instance down through.
-///
-/// `region` is the request's own signing region, so the hop stays in the Region the
-/// caller addressed. The client is given the callback's own HTTP client, so the endpoint
-/// URL below is only the address that transport routes on IN PROCESS: no socket is
-/// opened, no name is resolved and nothing leaves this process. The credentials are the
-/// callback's, which sign this in-process hop and never appear in a response.
-fn ec2(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-) -> ::aws_sdk_ec2::Client {
-    let config = ::aws_sdk_ec2::Config::builder()
-        .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .region(::aws_sdk_ec2::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://ec2.{region}.amazonaws.com"))
-        // The transport is in-process: there is nothing to retry, time out or watch for a
-        // stalled stream, and each of those would need a sleep implementation this client
-        // is not given. The same goes for caching the identity: the credentials the
-        // callback hands over are used directly.
-        .retry_config(::aws_sdk_ec2::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_ec2::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_ec2::config::IdentityCache::no_cache())
-        .stalled_stream_protection(
-            ::aws_sdk_ec2::config::StalledStreamProtectionConfig::disabled(),
-        )
-        .build();
-    ::aws_sdk_ec2::Client::from_conf(config)
-}
 
 /// What asking EC2 to stop ONE instance answered with.
 ///
@@ -80,7 +50,7 @@ pub async fn stop_instances(
     if instance_ids.is_empty() {
         return Vec::new();
     }
-    let client = ec2(ctx, region);
+    let client = super::ec2::client(ctx, region);
     let mut answers: Vec<InstanceStop> = Vec::with_capacity(instance_ids.len());
     for instance_id in instance_ids {
         let answer = client

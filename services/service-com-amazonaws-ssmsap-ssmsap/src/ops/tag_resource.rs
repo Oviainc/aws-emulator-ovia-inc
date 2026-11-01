@@ -151,6 +151,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // partition, so a resource tagged at one regional endpoint is neither reported
         // nor altered through another.
         let region = crate::state::request_region(ctx.parts());
+        // Every tag key this call carries has to be one the model's `TagKey` admits — no
+        // reserved `aws:` prefix, and nothing outside its character class — which nothing
+        // ahead of this handler applies to the KEYS of a map
+        // (`crate::state::tags_within_modelled_form` says why). Stated FIRST, like every
+        // other constraint on what the request carries: a request the service will not
+        // read is refused for what it holds rather than for the resource it names.
+        crate::state::tags_within_modelled_form(&input.tags)
+            .map_err(TagResourceErrorModeled::ValidationException)?;
         // Nothing this operation can answer with describes an unreachable store: the
         // model declares only `ConflictException`, `ResourceNotFoundException` and
         // `ValidationException` here, and the service's only common error is
@@ -167,11 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and that application's tags by the time this write resolves the ARN.
         state.settle(::std::time::SystemTime::now());
 
-        // `ResourceArn` is modelled `@required` with a `@pattern` and every `TagKey` /
-        // `TagValue` carries its own constraints, so reaching here means the request is
-        // well formed. The ARN still has to NAME something: the resources this service
-        // holds are the registered SAP application and the resources derived from that
-        // registration — its SAP HANA databases and its components — so an ARN naming none
+        // `ResourceArn` is modelled `@required` with a `@pattern` and every `TagValue`
+        // carries its own constraints, so reaching here means the request is well formed
+        // (its tag KEYS are read above, which no walk ahead of this handler does). The ARN
+        // still has to NAME something: the resources this service holds are the
+        // registered SAP application and the resources derived from that registration —
+        // its SAP HANA databases and its components — so an ARN naming none
         // of them is the `ResourceNotFoundException` this
         // operation models rather than a tag persisted against a resource that does not
         // exist. Resolved through [`crate::state::RegionState::holds_resource`], the one

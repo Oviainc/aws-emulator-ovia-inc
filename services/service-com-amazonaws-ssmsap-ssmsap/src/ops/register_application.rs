@@ -7,7 +7,9 @@
 //! `DeregisterApplication` resolves the same record. A registration that omits a member
 //! its `ApplicationType` conditionally requires
 //! ([`crate::state::CONDITIONALLY_REQUIRED_MEMBERS`]) is refused with the modelled
-//! `ValidationException` before anything is stored. The call is asynchronous in the
+//! `ValidationException` before anything is stored, as is one carrying a tag key outside
+//! the form the model declares for one ([`crate::state::tags_within_modelled_form`]). The
+//! call is asynchronous in the
 //! real service: the application is returned `REGISTERING` and the `OperationId` names
 //! a stored `INPROGRESS` operation record that reaches `SUCCESS`
 //! [`crate::state::TRANSITION_SPAN`] later, materialised by the first request at or
@@ -219,6 +221,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request size. Like the check above it runs before ANY state is written.
         crate::state::components_within_bounds(input.components_info.as_deref().unwrap_or_default())
             .map_err(RegisterApplicationErrorModeled::ValidationException)?;
+
+        // Every tag key the registration carries has to be one the model's `TagKey` admits
+        // — no reserved `aws:` prefix, and nothing outside its character class — which
+        // nothing ahead of this handler applies to the KEYS of a map
+        // (`crate::state::tags_within_modelled_form` says why). Refused before anything is
+        // written, so a registration carrying such a key attaches no tag and registers no
+        // application: this call and `TagResource` are the two ways a tag reaches this
+        // service, and they apply the one rule.
+        if let Some(tags) = input.tags.as_ref() {
+            crate::state::tags_within_modelled_form(tags)
+                .map_err(RegisterApplicationErrorModeled::ValidationException)?;
+        }
 
         // An `ApplicationId` is unique within an account AND a Region, so one already
         // registered HERE conflicts while the same id in another Region does not.

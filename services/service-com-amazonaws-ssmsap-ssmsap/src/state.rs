@@ -125,6 +125,10 @@
 //! resolution the tagging calls run), so the policy a read reports always belongs to a
 //! resource some registration brought into being, and the grants go when it does.
 
+/// The hop into Amazon EC2: the one client this crate asks the owner of an instance
+/// through.
+pub mod ec2;
+
 /// Shutting down the Amazon EC2 instances of an application through the service that
 /// owns them, which is what `StopApplication$IncludeEc2InstanceShutdown` asks for.
 pub mod ec2_shutdown;
@@ -452,6 +456,97 @@ pub const MAX_PERMISSION_SOURCES_PER_RESOURCE: usize = 100;
 /// process's memory without bound. It is reported with `ValidationException`, which
 /// every tagging call models.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The expression the model declares for a tag key
+/// (`smithy_query(query="shape", shape="TagKey")`: `^(?!aws:)[a-zA-Z+-=._:/]+$`), which
+/// is the key shape of the one `TagMap` every tagging path of this service carries.
+///
+/// Re-stated here because NOTHING ahead of a handler applies it. The validating walk
+/// treats a map's KEY as a path segment rather than as a constrained leaf, so it applies
+/// no constraint a key shape declares at all; and this expression opens with a negative
+/// lookahead, which the walk's regex engine does not compile, so even where a tag key
+/// IS a constrained leaf (the `TagKeyList` `UntagResource` binds to its query string)
+/// every value satisfies it. So the rule is the handler's to apply, and
+/// [`tag_key_within_modelled_form`] is the one reading of it.
+pub const TAG_KEY_PATTERN: &str = r"^(?!aws:)[a-zA-Z+-=._:/]+$";
+
+/// The prefix [`TAG_KEY_PATTERN`]'s lookahead excludes: AWS reserves `aws:`-prefixed tag
+/// keys for the tags it sets itself, so no caller may attach, change or remove one.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The member path a clause names a `TagMap` at: both calls that carry one bind it to a
+/// `Tags` member, which a message states in the lowerCamel the validating walk spells a
+/// member in.
+pub const TAGS_MEMBER_PATH: &str = "tags";
+
+/// The member path a clause names `UntagResource`'s key list at, spelled as the model
+/// spells that member (`@httpQuery("tagKeys")`).
+pub const TAG_KEYS_MEMBER_PATH: &str = "tagKeys";
+
+/// Whether `key` is a tag key [`TAG_KEY_PATTERN`] admits.
+///
+/// The expression read as it is written: at least one character, every one of them inside
+/// its character class — the ASCII letters, `_`, and the `+`-to-`=` range its `+-=`
+/// spells, which covers `+ , - . / 0-9 : ; < =` — and not the reserved prefix its
+/// lookahead excludes ([`RESERVED_TAG_KEY_PREFIX`]).
+pub fn tag_key_within_modelled_form(key: &str) -> bool {
+    !key.is_empty()
+        && !key.starts_with(RESERVED_TAG_KEY_PREFIX)
+        && key
+            .chars()
+            .all(|character| matches!(character, 'a'..='z' | 'A'..='Z' | '_' | '+'..='='))
+}
+
+/// Refuse a `Tags` map carrying a key outside the modelled form ([`TAG_KEY_PATTERN`]).
+///
+/// `Ok(())` when every key it carries is admitted, and for a map carrying none.
+/// Otherwise the modelled `ValidationException` (HTTP 400), worded the way this service
+/// words a constraint the request broke
+/// ([`crate::service::map_key_pattern_refusal`]): one clause, at the map member, stating
+/// the requirement its KEYS have to satisfy. One clause for one request however many
+/// keys broke the rule, and whatever order the request's entries arrived in, exactly as
+/// a reported collection states one requirement once.
+///
+/// The caller must apply this BEFORE writing anything, so a refused call attaches no tag
+/// — which is what keeps a reserved key out of the set every later read reports.
+pub fn tags_within_modelled_form(
+    tags: &HashMap<String, String>,
+) -> Result<(), ValidationException> {
+    if tags.keys().all(|key| tag_key_within_modelled_form(key)) {
+        return Ok(());
+    }
+    Err(validation(crate::service::map_key_pattern_refusal(
+        TAGS_MEMBER_PATH,
+        TAG_KEY_PATTERN,
+    )))
+}
+
+/// Refuse a `tagKeys` list naming a key outside the modelled form ([`TAG_KEY_PATTERN`]) —
+/// the SAME rule [`tags_within_modelled_form`] applies to the keys of a map, for the one
+/// call that names keys in a list.
+///
+/// Stated at the LIST member with the requirement its ELEMENTS have to satisfy nested in
+/// it and the whole list quoted ([`crate::service::element_pattern_refusal`]), which is
+/// how this service states every constraint an element of a list breaks. The position
+/// reported is the first offending element's, so one list yields one refusal whichever
+/// of its keys broke the rule.
+pub fn named_tag_keys_within_modelled_form(
+    tag_keys: &[String],
+) -> Result<(), ValidationException> {
+    let offending = tag_keys
+        .iter()
+        .position(|key| !tag_key_within_modelled_form(key));
+    match offending {
+        // `position` is 0-based and a clause names a 1-based one.
+        Some(index) => Err(validation(crate::service::element_pattern_refusal(
+            TAG_KEYS_MEMBER_PATH,
+            tag_keys,
+            index + 1,
+            TAG_KEY_PATTERN,
+        ))),
+        None => Ok(()),
+    }
+}
 
 /// How many credentials this emulator will hold for ONE application.
 ///

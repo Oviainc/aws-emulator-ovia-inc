@@ -153,6 +153,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // partition, so a resource registered at one regional endpoint is neither
         // reported nor altered through another.
         let region = crate::state::request_region(ctx.parts());
+        // Every key this call NAMES has to be one the model's `TagKey` admits — no
+        // reserved `aws:` prefix, and nothing outside its character class — which the
+        // boundary walk cannot apply here either
+        // (`crate::state::named_tag_keys_within_modelled_form` says why). Stated FIRST,
+        // like every other constraint on what the request carries: a request the service
+        // will not read is refused for what it holds rather than for the resource it
+        // names.
+        crate::state::named_tag_keys_within_modelled_form(&input.tag_keys)
+            .map_err(UntagResourceErrorModeled::ValidationException)?;
         // Nothing this operation can answer with describes an unreachable store: the
         // model declares only `ConflictException`, `ResourceNotFoundException` and
         // `ValidationException` here, and the service's only common error is
@@ -169,8 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // application's tags by the time this write resolves the ARN.
         state.settle(::std::time::SystemTime::now());
 
-        // `ResourceArn` is modelled `@required` with a `@pattern` and every `TagKey`
-        // carries its own, so reaching here means the request is well formed. The ARN
+        // `ResourceArn` is modelled `@required` with a `@pattern`, and the keys this call
+        // names are read above — which the boundary walk does not do for a `TagKey` — so
+        // reaching here means the request is well formed. The ARN
         // still has to NAME something: the resources this service holds are the
         // registered SAP application and the resources derived from that registration —
         // its SAP HANA databases and its components — so an ARN naming none of them is
