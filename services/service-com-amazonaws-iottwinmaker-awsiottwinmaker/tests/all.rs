@@ -215,6 +215,9 @@ mod scene_read;
 #[path = "all/scene_update.rs"]
 mod scene_update;
 
+#[path = "all/scope_resolution_order.rs"]
+mod scope_resolution_order;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

@@ -48,7 +48,10 @@
 //!   a variable no `MATCH` declares, an unknown workspace (the model declares no
 //!   `ResourceNotFoundException` here, so an unknown workspace is a bad request like it
 //!   is for `ListEntities`) and a `nextToken` not minted for this query — a 400
-//!   `ValidationException`;
+//!   `ValidationException`. The workspace is the SCOPE of the request, so it is resolved
+//!   before the statement and the `nextToken` are judged: a query naming a workspace this
+//!   service does not hold is refused for that workspace whatever else it carries, the
+//!   order every other workspace-scoped operation of this service resolves them in;
 //! * a query whose evaluation exceeds [`MATCH_STEP_BUDGET`] candidate bindings or
 //!   [`QUERY_DEADLINE`] of wall clock — the modelled 400 `QueryTimeoutException`, which
 //!   is what the service answers for a query it will not finish;
@@ -236,9 +239,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         };
 
-        // Parsed and planned BEFORE the store is touched: a statement that is not a
-        // query needs no state to be refused, and the store's lock below is held for as
-        // little as possible.
+        // The SCOPE is resolved FIRST, before any member of the request is judged, so a
+        // query against a workspace this service does not hold is refused for that
+        // workspace whatever else the request carries — the order `ListEntities` and
+        // every other workspace-scoped operation of this service resolve them in.
+        //
+        // The store is read under its lock and the lock is RELEASED before anything is
+        // evaluated: the walk below is caller-chosen work with a wall-clock bound, and
+        // holding the lock for it would serialise every other operation of this service
+        // behind one query. What the query reads is the snapshot taken here, which is
+        // also what makes the walk a consistent read of one instant — and the statement
+        // and the token below are judged OUTSIDE the lock, so resolving the scope first
+        // does not widen what the lock is held for.
+        let entities: Vec<crate::state::Entity> = {
+            let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+                ExecuteQueryErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the iottwinmaker store is unavailable".to_string()),
+                })
+            })?;
+            let state = state.lock();
+            let state = state.region(&region);
+            // The model declares no `ResourceNotFoundException` for this operation, so an
+            // unknown workspace is refused the way `ListEntities` refuses one.
+            let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+                return Err(invalid(crate::state::workspace_not_found_message(
+                    &input.workspace_id,
+                ))
+                .into());
+            };
+            workspace.entities.values().cloned().collect()
+        };
+
+        // Parsed and planned once the scope holds, and still before the walk: a
+        // statement that is not a query needs no state to be refused.
         let query = parse_query(&input.query_statement)
             .map_err(|reason| invalid(format!("{INVALID_STATEMENT}: {reason}")))?;
         let plan = Plan::build(&query)
@@ -273,30 +306,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|requested| usize::try_from(requested).ok())
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .clamp(1, MAX_MAX_RESULTS);
-
-        // The store is read under its lock and the lock is RELEASED before anything is
-        // evaluated: the walk below is caller-chosen work with a wall-clock bound, and
-        // holding the lock for it would serialise every other operation of this service
-        // behind one query. What the query reads is the snapshot taken here, which is
-        // also what makes the walk a consistent read of one instant.
-        let entities: Vec<crate::state::Entity> = {
-            let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-                ExecuteQueryErrorModeled::InternalServerException(InternalServerException {
-                    message: Some("the iottwinmaker store is unavailable".to_string()),
-                })
-            })?;
-            let state = state.lock();
-            let state = state.region(&region);
-            // The model declares no `ResourceNotFoundException` for this operation, so an
-            // unknown workspace is refused the way `ListEntities` refuses one.
-            let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
-                return Err(invalid(crate::state::workspace_not_found_message(
-                    &input.workspace_id,
-                ))
-                .into());
-            };
-            workspace.entities.values().cloned().collect()
-        };
 
         // The match is bounded (see `MATCH_STEP_BUDGET` and `QUERY_DEADLINE`) but
         // CPU-bound and caller-chosen, so it runs on the blocking pool rather than on the
