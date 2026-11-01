@@ -503,3 +503,8 @@ mod defaulted_member_token_identity;
 // position for a lens suite falls in a crowded run of this list.
 #[path = "all/bare_lens_name_resolution.rs"]
 mod bare_lens_name_resolution;
+
+// Appended at the end of this list for the same reason as the declaration above: modules
+// are appended here so a new suite does not collide with another insertion.
+#[path = "all/next_token_spelling.rs"]
+mod next_token_spelling;

@@ -8485,11 +8485,48 @@ fn encode_cursor(cursor: &::serde_json::Value) -> String {
     hex::encode(cursor.to_string())
 }
 
-/// The cursor a `NextToken` carries, or `None` when the token is not one this service
-/// issued.
+/// The `NextToken` for the one-member cursor `{key: value}`: the shared mint behind every
+/// single-keyed encoder below, so the token a cursor is handed out as and the token a
+/// cursor is recognised by ([`decode_keyed_cursor`]) are spelled in exactly one place.
+fn encode_keyed_cursor(key: &str, value: &str) -> String {
+    let mut cursor = ::serde_json::Map::new();
+    cursor.insert(
+        key.to_string(),
+        ::serde_json::Value::String(value.to_string()),
+    );
+    encode_cursor(&::serde_json::Value::Object(cursor))
+}
+
+/// The JSON a `NextToken` carries, or `None` when the token is not hex of a JSON value at
+/// all.
+///
+/// Decoding is only the first half of reading a token: `hex::decode` accepts upper-case
+/// digits where [`encode_cursor`] writes lower-case ones, and `::serde_json` accepts every
+/// spelling of one value (added whitespace, an escaped member name, a repeated or an extra
+/// member, a respelled number), so a value that decodes here is NOT yet a cursor this
+/// service handed out. Each `decode_*` below finishes the read by minting the token again
+/// from the cursor it understood and keeping it only when that token is the one it was
+/// given, byte for byte.
 fn decode_cursor(token: &str) -> Option<::serde_json::Value> {
     let bytes = hex::decode(token).ok()?;
     ::serde_json::from_slice(&bytes).ok()
+}
+
+/// The string a one-member cursor keyed `key` carries, or `None` when `token` is not the
+/// token this service issues for exactly that cursor.
+///
+/// A `NextToken` is this service's OWN opaque value, minted by [`encode_keyed_cursor`] and
+/// meaningful to nothing else, so the only token that carries a cursor is that token byte
+/// for byte: a caller holding one can do nothing with it but send it back as it was handed
+/// out. Every other string that happens to decode to the same cursor — a differently
+/// spelled hex or JSON, or a cursor carrying a member the encoder does not write — is a
+/// value no caller was ever handed, so it is not a resume point but a bad request.
+///
+/// The shared read behind every single-keyed `decode_*` below, so none of them repeats
+/// either half of it.
+fn decode_keyed_cursor(token: &str, key: &str) -> Option<String> {
+    let value = decode_cursor(token)?.get(key)?.as_str()?.to_string();
+    (encode_keyed_cursor(key, &value) == token).then_some(value)
 }
 
 /// Encode a `ListWorkloads` cursor: the `WorkloadId` last served, in the same opaque
@@ -8499,26 +8536,26 @@ fn decode_cursor(token: &str) -> Option<::serde_json::Value> {
 /// where `WorkloadName` is a member `UpdateWorkload` can move. Its own key, so a cursor
 /// issued by another paginated operation is not a cursor here.
 pub fn encode_next_token(workload_id: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "i": workload_id }))
+    encode_keyed_cursor("i", workload_id)
 }
 
 /// The `WorkloadId` a `NextToken` points just past, or `None` when the token is not one
-/// this service issued.
+/// this service issued — the check [`decode_keyed_cursor`] states.
 pub fn decode_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("i")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "i")
 }
 
 /// Encode a `ListWorkloadShares` cursor: the last `ShareId` served, in the same opaque
 /// scheme as [`encode_next_token`]. Shares are enumerated in `ShareId` order, so that id
 /// is the whole cursor.
 pub fn encode_share_next_token(share_id: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "s": share_id }))
+    encode_keyed_cursor("s", share_id)
 }
 
 /// The `ShareId` a `ListWorkloadShares` `NextToken` points just past, or `None` when the
 /// token is not one this service issued.
 pub fn decode_share_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("s")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "s")
 }
 
 /// Encode a `ListShareInvitations` cursor: the last `ShareInvitationId` served, in the
@@ -8526,13 +8563,13 @@ pub fn decode_share_next_token(token: &str) -> Option<String> {
 /// `ShareInvitationId` order, so that id is the whole cursor. Its own key, so a cursor
 /// issued by another paginated operation is not a cursor here.
 pub fn encode_share_invitation_next_token(share_invitation_id: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "v": share_invitation_id }))
+    encode_keyed_cursor("v", share_invitation_id)
 }
 
 /// The `ShareInvitationId` a `ListShareInvitations` `NextToken` points just past, or
 /// `None` when the token is not one this service issued.
 pub fn decode_share_invitation_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("v")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "v")
 }
 
 /// Encode a `ListMilestones` cursor: the `MilestoneNumber` of the last milestone the
@@ -8543,10 +8580,12 @@ pub fn encode_milestone_next_token(milestone_number: i32) -> String {
 }
 
 /// The `MilestoneNumber` a `ListMilestones` `NextToken` points just past, or `None`
-/// when the token is not one this service issued.
+/// when the token is not one this service issued — the token minted again from the number
+/// read back, for the reason [`decode_keyed_cursor`] states.
 pub fn decode_milestone_next_token(token: &str) -> Option<i32> {
     let cursor = decode_cursor(token)?;
-    i32::try_from(cursor.get("m")?.as_i64()?).ok()
+    let milestone_number = i32::try_from(cursor.get("m")?.as_i64()?).ok()?;
+    (encode_milestone_next_token(milestone_number) == token).then_some(milestone_number)
 }
 
 /// Encode a `ListReviewTemplates` cursor: the `TemplateArn` last served, in the same
@@ -8555,13 +8594,13 @@ pub fn decode_milestone_next_token(token: &str) -> Option<i32> {
 /// so that ARN is the whole cursor. Its own key, so a cursor issued by another paginated
 /// operation is not a cursor here.
 pub fn encode_review_template_next_token(template_arn: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "t": template_arn }))
+    encode_keyed_cursor("t", template_arn)
 }
 
 /// The `TemplateArn` a `ListReviewTemplates` `NextToken` points just past, or `None` when
 /// the token is not one this service issued.
 pub fn decode_review_template_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("t")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "t")
 }
 
 /// Encode a `ListProfiles` cursor: the `ProfileArn` last served, in the same opaque
@@ -8570,13 +8609,13 @@ pub fn decode_review_template_next_token(token: &str) -> Option<String> {
 /// so that ARN is the whole cursor. Its own key, so a cursor issued by another paginated
 /// operation is not a cursor here.
 pub fn encode_profile_next_token(profile_arn: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "o": profile_arn }))
+    encode_keyed_cursor("o", profile_arn)
 }
 
 /// The `ProfileArn` a `ListProfiles` `NextToken` points just past, or `None` when the
 /// token is not one this service issued.
 pub fn decode_profile_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("o")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "o")
 }
 
 /// Encode a `ListProfileNotifications` cursor: the `(WorkloadId, ProfileArn)` of the last
@@ -8592,12 +8631,14 @@ pub fn encode_profile_notification_next_token(workload_id: &str, profile_arn: &s
 }
 
 /// The `(WorkloadId, ProfileArn)` a `ListProfileNotifications` `NextToken` points just
-/// past, or `None` when the token is not one this service issued.
+/// past, or `None` when the token is not one this service issued — the token minted again
+/// from the pair read back, for the reason [`decode_keyed_cursor`] states.
 pub fn decode_profile_notification_next_token(token: &str) -> Option<(String, String)> {
     let cursor = decode_cursor(token)?;
     let workload_id = cursor.get("w")?.as_str()?.to_string();
     let profile_arn = cursor.get("f")?.as_str()?.to_string();
-    Some((workload_id, profile_arn))
+    (encode_profile_notification_next_token(&workload_id, &profile_arn) == token)
+        .then_some((workload_id, profile_arn))
 }
 
 /// Encode a `ListNotifications` cursor: the `(resource key, lens alias)` of the last lens
@@ -8613,12 +8654,14 @@ pub fn encode_lens_notification_next_token(resource_key: &str, alias: &str) -> S
 }
 
 /// The `(resource key, lens alias)` a `ListNotifications` `NextToken` points just past, or
-/// `None` when the token is not one this service issued.
+/// `None` when the token is not one this service issued — the token minted again from the
+/// pair read back, for the reason [`decode_keyed_cursor`] states.
 pub fn decode_lens_notification_next_token(token: &str) -> Option<(String, String)> {
     let cursor = decode_cursor(token)?;
     let resource_key = cursor.get("nr")?.as_str()?.to_string();
     let alias = cursor.get("nl")?.as_str()?.to_string();
-    Some((resource_key, alias))
+    (encode_lens_notification_next_token(&resource_key, &alias) == token)
+        .then_some((resource_key, alias))
 }
 
 /// Encode a `ListAgentContexts` cursor: the context `UUID` last served, in the same
@@ -8626,13 +8669,13 @@ pub fn decode_lens_notification_next_token(token: &str) -> Option<(String, Strin
 /// id is the whole cursor. Its own key, so a cursor issued by another paginated
 /// operation is not a cursor here.
 pub fn encode_agent_context_next_token(context_id: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "x": context_id }))
+    encode_keyed_cursor("x", context_id)
 }
 
 /// The context `UUID` a `ListAgentContexts` `NextToken` points just past, or `None` when
 /// the token is not one this service issued.
 pub fn decode_agent_context_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("x")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "x")
 }
 
 /// Encode a `ListAgentRecommendationGenerations` cursor: the generation `UUID` last
@@ -8640,13 +8683,13 @@ pub fn decode_agent_context_next_token(token: &str) -> Option<String> {
 /// enumerated in id order, so that id is the whole cursor. Its own key, so a cursor
 /// issued by another paginated operation is not a cursor here.
 pub fn encode_agent_generation_next_token(generation_id: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "j": generation_id }))
+    encode_keyed_cursor("j", generation_id)
 }
 
 /// The generation `UUID` a `ListAgentRecommendationGenerations` `NextToken` points just
 /// past, or `None` when the token is not one this service issued.
 pub fn decode_agent_generation_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("j")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "j")
 }
 
 /// Encode a `ListAgentGoals` cursor: the goal `UUID` last served, in the same opaque
@@ -8654,13 +8697,13 @@ pub fn decode_agent_generation_next_token(token: &str) -> Option<String> {
 /// whole cursor. Its own key, so a cursor issued by another paginated operation is not a
 /// cursor here.
 pub fn encode_agent_goal_next_token(goal_id: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "g": goal_id }))
+    encode_keyed_cursor("g", goal_id)
 }
 
 /// The goal `UUID` a `ListAgentGoals` `NextToken` points just past, or `None` when the
 /// token is not one this service issued.
 pub fn decode_agent_goal_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("g")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "g")
 }
 
 /// Encode a `ListAgentProfiles` cursor: the `AgentProfileArn` last served, in the same
@@ -8669,13 +8712,13 @@ pub fn decode_agent_goal_next_token(token: &str) -> Option<String> {
 /// so that ARN is the whole cursor. Its own key, so a cursor issued by another paginated
 /// operation is not a cursor here.
 pub fn encode_agent_profile_next_token(profile_arn: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "p": profile_arn }))
+    encode_keyed_cursor("p", profile_arn)
 }
 
 /// The `AgentProfileArn` a `ListAgentProfiles` `NextToken` points just past, or `None`
 /// when the token is not one this service issued.
 pub fn decode_agent_profile_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("p")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "p")
 }
 
 /// Encode a `ListAgentRecommendations` cursor: the `RecommendationArn` last served, in
@@ -8685,13 +8728,13 @@ pub fn decode_agent_profile_next_token(token: &str) -> Option<String> {
 /// so that ARN is the whole cursor. Its own key, so a cursor issued by another paginated
 /// operation is not a cursor here.
 pub fn encode_agent_recommendation_next_token(recommendation_arn: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "a": recommendation_arn }))
+    encode_keyed_cursor("a", recommendation_arn)
 }
 
 /// The `RecommendationArn` a `ListAgentRecommendations` `NextToken` points just past, or
 /// `None` when the token is not one this service issued.
 pub fn decode_agent_recommendation_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("a")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "a")
 }
 
 /// Encode a `ListAgentRecommendationItems` cursor: the item id last served, in the same
@@ -8700,13 +8743,13 @@ pub fn decode_agent_recommendation_next_token(token: &str) -> Option<String> {
 /// id is the whole cursor. Its own key, so a cursor issued by another paginated operation
 /// is not a cursor here.
 pub fn encode_agent_recommendation_item_next_token(item_id: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "ri": item_id }))
+    encode_keyed_cursor("ri", item_id)
 }
 
 /// The item id a `ListAgentRecommendationItems` `NextToken` points just past, or `None`
 /// when the token is not one this service issued.
 pub fn decode_agent_recommendation_item_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("ri")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "ri")
 }
 
 /// What a `NextToken` this service did not issue is answered with. The token is this
@@ -8751,13 +8794,13 @@ pub fn self_share_exception() -> crate::ops::types::ValidationException {
 /// served, in the same opaque scheme as [`encode_next_token`]. Its own key, so a cursor
 /// issued by another paginated operation is not a cursor here.
 pub fn encode_lens_next_token(key: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "c": key }))
+    encode_keyed_cursor("c", key)
 }
 
 /// The [`lens_catalog_key`] a `ListLenses` `NextToken` points just past, or `None` when
-/// the token is not one this service issued.
+/// the token is not one this service issued — the check [`decode_keyed_cursor`] states.
 pub fn decode_lens_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("c")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "c")
 }
 
 /// Encode a `ListLensReviews` cursor: the [`lens_alias`] of the last lens review the page
@@ -8766,25 +8809,25 @@ pub fn decode_lens_next_token(token: &str) -> Option<String> {
 /// so that alias is the whole cursor. Its own key, so a cursor issued by another
 /// paginated operation is not a cursor here.
 pub fn encode_lens_review_next_token(alias: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "r": alias }))
+    encode_keyed_cursor("r", alias)
 }
 
 /// The [`lens_alias`] a `ListLensReviews` `NextToken` points just past, or `None` when the
 /// token is not one this service issued.
 pub fn decode_lens_review_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("r")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "r")
 }
 
 /// Encode a cursor over a lens's questions: the `QuestionId` last served, in the same
 /// opaque scheme as [`encode_next_token`].
 pub fn encode_question_token(question_id: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "q": question_id }))
+    encode_keyed_cursor("q", question_id)
 }
 
 /// The `QuestionId` a questions `NextToken` points just past, or `None` when the token
 /// is not one this service issued.
 pub fn decode_question_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("q")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "q")
 }
 
 /// Encode a cursor over the Trusted Advisor checks of one best practice: the
@@ -8797,12 +8840,13 @@ pub fn encode_check_next_token(account_id: &str, check_id: &str) -> String {
 }
 
 /// The `(account id, check id)` a checks `NextToken` points just past, or `None` when the
-/// token is not one this service issued.
+/// token is not one this service issued — the token minted again from the pair read back,
+/// for the reason [`decode_keyed_cursor`] states.
 pub fn decode_check_next_token(token: &str) -> Option<(String, String)> {
     let cursor = decode_cursor(token)?;
     let account_id = cursor.get("ca")?.as_str()?.to_string();
     let check_id = cursor.get("ck")?.as_str()?.to_string();
-    Some((account_id, check_id))
+    (encode_check_next_token(&account_id, &check_id) == token).then_some((account_id, check_id))
 }
 
 /// Encode a cursor over the Trusted Advisor checks of one best practice SUMMARIZED for
@@ -8812,13 +8856,13 @@ pub fn decode_check_next_token(token: &str) -> Option<(String, String)> {
 /// paginated operation — including the per-account [`encode_check_next_token`] — is not a
 /// cursor here.
 pub fn encode_check_summary_next_token(check_id: &str) -> String {
-    encode_cursor(&::serde_json::json!({ "cs": check_id }))
+    encode_keyed_cursor("cs", check_id)
 }
 
 /// The `CheckId` a check-summaries `NextToken` points just past, or `None` when the token
 /// is not one this service issued.
 pub fn decode_check_summary_next_token(token: &str) -> Option<String> {
-    Some(decode_cursor(token)?.get("cs")?.as_str()?.to_string())
+    decode_keyed_cursor(token, "cs")
 }
 
 /// One page of a lens's questions: the questions to report, and the `NextToken` the next
