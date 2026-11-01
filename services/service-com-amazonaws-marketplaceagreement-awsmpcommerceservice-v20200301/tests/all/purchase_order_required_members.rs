@@ -28,7 +28,11 @@
 //! member reported is `chargeId`, the one the MODEL requires, and a list that
 //! omits one of the other two is refused as the unsupported action — which the
 //! second test below pins, because a refusal of the omission there would tell a
-//! caller it could repair a request that nothing will act on.
+//! caller it could repair a request that nothing will act on. Every element that
+//! leg sends names the agreement holding its charge, the one member
+//! `UpdatePurchaseOrders` does require of every element it is sent
+//! (`purchase_order_update_agreement_id`), so no row of it can pass on that
+//! member instead.
 //! Every charge id comes from the quote that minted it, and the complete element
 //! each row is derived from is the one the other purchase-order suites send, so
 //! no row can agree with a handler that refuses on something else.
@@ -40,7 +44,7 @@ use serde_json::{json, Value};
 use crate::agreement_lifecycle::{accept, emulator, Answer};
 use crate::purchase_order_associations::{order, quote};
 use crate::purchase_order_updates::{
-    agreement_holding, assert_unsupported_action, references, update,
+    agreement_holding, assert_unsupported_action, naming_agreement, references, update,
 };
 
 /// One row: the member one element of the list leaves out, and the refusal that
@@ -67,7 +71,7 @@ fn omissions() -> Vec<Omission> {
             case: "the charge the association writes to",
             member: "chargeId",
             reason: "MISSING_CHARGE_ID",
-            message: "Provided charge id is missing.",
+            message: "Charge id is required.",
             charges: 1,
             elements: 1,
             position: 1,
@@ -76,7 +80,7 @@ fn omissions() -> Vec<Omission> {
             case: "the revision that charge is at",
             member: "chargeRevision",
             reason: "MISSING_CHARGE_REVISION",
-            message: "Provided charge revision is missing.",
+            message: "Charge revision is required.",
             charges: 1,
             elements: 1,
             position: 1,
@@ -85,7 +89,7 @@ fn omissions() -> Vec<Omission> {
             case: "the reference the association records",
             member: "purchaseOrderReference",
             reason: "MISSING_PURCHASE_ORDER_REFERENCE",
-            message: "Provided purchase order reference is missing.",
+            message: "Purchase order reference is required.",
             charges: 2,
             elements: 1,
             position: 1,
@@ -94,7 +98,7 @@ fn omissions() -> Vec<Omission> {
             case: "the revision, on the second element of two",
             member: "chargeRevision",
             reason: "MISSING_CHARGE_REVISION",
-            message: "Provided charge revision is missing.",
+            message: "Charge revision is required.",
             charges: 2,
             elements: 2,
             position: 2,
@@ -103,7 +107,7 @@ fn omissions() -> Vec<Omission> {
             case: "the revision, on the second element of three",
             member: "chargeRevision",
             reason: "MISSING_CHARGE_REVISION",
-            message: "Provided charge revision is missing.",
+            message: "Charge revision is required.",
             charges: 3,
             elements: 3,
             position: 2,
@@ -112,7 +116,7 @@ fn omissions() -> Vec<Omission> {
             case: "the reference, on the last element of three",
             member: "purchaseOrderReference",
             reason: "MISSING_PURCHASE_ORDER_REFERENCE",
-            message: "Provided purchase order reference is missing.",
+            message: "Purchase order reference is required.",
             charges: 3,
             elements: 3,
             position: 3,
@@ -121,7 +125,7 @@ fn omissions() -> Vec<Omission> {
             case: "the charge, on the second element of two",
             member: "chargeId",
             reason: "MISSING_CHARGE_ID",
-            message: "Provided charge id is missing.",
+            message: "Charge id is required.",
             charges: 2,
             elements: 2,
             position: 2,
@@ -225,7 +229,9 @@ fn unassociated(charge_ids: &[String]) -> BTreeMap<String, Option<String>> {
 /// member it reports is `chargeId`, the one the model itself requires, and a
 /// list omitting either of the other two is refused as the unsupported action.
 /// Either way it associates nothing, and the same list with every member stated
-/// is refused the same way.
+/// is refused the same way. Every element here names the agreement holding its
+/// charge, the member this operation does require of each of them, so a row is
+/// about the member it leaves out and not about that one.
 #[tokio::test]
 async fn an_update_reports_only_the_absent_member_the_model_requires() {
     for (index, row) in omissions().iter().enumerate() {
@@ -235,7 +241,11 @@ async fn an_update_reports_only_the_absent_member_the_model_requires() {
             agreement_holding(&router, &format!("ap-offerPOm{index}"), row.charges).await;
         let nothing = unassociated(&charge_ids);
 
-        let answered = update(&router, json!(with_omission(&charge_ids, row))).await;
+        let answered = update(
+            &router,
+            naming_agreement(json!(with_omission(&charge_ids, row)), &agreement),
+        )
+        .await;
         if row.member == "chargeId" {
             assert_refused("UpdatePurchaseOrders", &answered, row);
         } else {
@@ -247,7 +257,11 @@ async fn an_update_reports_only_the_absent_member_the_model_requires() {
             "case {case:?}: a refused update must associate nothing, got {reported:?}"
         );
 
-        let stated = update(&router, json!(complete(&charge_ids, row.elements))).await;
+        let stated = update(
+            &router,
+            naming_agreement(json!(complete(&charge_ids, row.elements)), &agreement),
+        )
+        .await;
         assert_unsupported_action(
             &format!("UpdatePurchaseOrders: {case}, with every member stated"),
             &stated,

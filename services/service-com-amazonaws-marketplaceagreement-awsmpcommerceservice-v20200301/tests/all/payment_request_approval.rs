@@ -36,7 +36,7 @@ use crate::payment_requests::{
     PENDING_APPROVAL,
 };
 use crate::purchase_order_associations::order;
-use crate::purchase_order_updates::{assert_unsupported_action, charges, items as charge_items};
+use crate::purchase_order_updates::{assert_unsupported_action, charges, items as charge_items, naming_agreement};
 
 /// `PaymentRequestStatus`'s value for an approved request: "Once accepted, the
 /// payment request transitions to APPROVED status"
@@ -896,7 +896,10 @@ async fn the_purchase_order_of_an_approved_charge_has_one_value() {
         let updated = call(
             &router,
             "UpdatePurchaseOrders",
-            json!({"purchaseOrders": [order(&charge_id, then)]}),
+            json!({
+                "purchaseOrders":
+                    naming_agreement(json!([order(&charge_id, then)]), &agreement_id),
+            }),
         )
         .await;
         assert_unsupported_action(case, &updated);

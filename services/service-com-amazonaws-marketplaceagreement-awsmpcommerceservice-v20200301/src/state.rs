@@ -4022,6 +4022,58 @@ pub fn validate_purchase_orders(
     Ok(())
 }
 
+/// A member an element has to state, as its name and the test of whether the
+/// element states it.
+type RequiredMember = (&'static str, fn(&PurchaseOrder) -> bool);
+
+/// The members an element of an `UpdatePurchaseOrders` list has to STATE, over
+/// and above the ones the model constrains.
+///
+/// `PurchaseOrder` marks only `chargeId` `@required`
+/// (`smithy_query(query="shape", shape="PurchaseOrder")`), but an update names
+/// the association by the charge AND the agreement that holds it — "the unique
+/// identifier of the agreement associated with this charge" — so an element
+/// that leaves `agreementId` out names no association to update, and the
+/// service publishes a dedicated reason for that member being absent
+/// (`MISSING_AGREEMENT_ID`). The member is NOT required at the door that mints
+/// the agreement (`AcceptAgreementRequest$purchaseOrders`), where the agreement
+/// does not exist yet and no value a caller could state is its id, which is why
+/// the requirement lives here rather than in [`validate_purchase_orders`].
+const UPDATE_PURCHASE_ORDER_REQUIRED_MEMBERS: &[RequiredMember] =
+    &[("agreementId", |order| order.agreement_id.is_some())];
+
+/// Refuse an `UpdatePurchaseOrders` list an element of which leaves out a member
+/// the operation requires of every element
+/// ([`UPDATE_PURCHASE_ORDER_REQUIRED_MEMBERS`]), BEFORE the request-level
+/// refusal of the action and before anything is resolved against the store.
+///
+/// A member the caller left out is something the caller can repair, and the
+/// modelled envelope is what says so: the `MISSING_<MEMBER>` reason the member
+/// resolves to ([`member_reason`]) and one `fields` entry naming the element and
+/// the member inside it ([`purchase_order_member_path`]), so a caller with a
+/// long list learns WHICH element to fix. A refusal of the whole action names no
+/// member at all ([`unsupported_action`]), so it cannot carry that information
+/// and is answered only once every element states what it has to.
+///
+/// The walk is over the WHOLE list in the order the request sent it and reads
+/// nothing but the request, so the answer does not depend on what the store
+/// holds — an element naming a charge the store does not hold is still refused
+/// on its own absent member, never on its `chargeId`.
+pub fn update_purchase_orders_refusal(orders: &[PurchaseOrder]) -> Option<PurchaseOrderRefusal> {
+    orders.iter().enumerate().find_map(|(index, order)| {
+        UPDATE_PURCHASE_ORDER_REQUIRED_MEMBERS
+            .iter()
+            .find(|(_, stated)| !stated(order))
+            .map(|(member, _)| {
+                let path = purchase_order_member_path(index, member);
+                PurchaseOrderRefusal {
+                    reason: member_reason(&path, RefusalKind::Missing),
+                    path,
+                }
+            })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Modelled failures
 // ---------------------------------------------------------------------------
@@ -4074,18 +4126,15 @@ pub const VALIDATION_MESSAGE_FALLBACK: &str =
 /// none, which is the distinction `ValidationExceptionReason`'s own
 /// `INVALID_…`/`MISSING_…` pairs draw.
 ///
-/// The WORDING is this service's own and is deliberately one sentence per
-/// kind: no rule the model or the documentation states produces this text, and
-/// the recorded AWS responses do not agree with each other on it — a recorded
-/// refusal of a `partyType` on one listing operation states the sentence
-/// without a closing full stop while the recorded refusal of the SAME member on
-/// a sibling listing operation states it with one. So there is nothing to
-/// derive and no per-member wording to guess; the machine-readable part a
-/// client branches on is `reason` and `fields[].name`, which this service does
-/// state per member.
+/// One sentence per kind, and the SAME sentence whichever member and whichever
+/// operation the entry is about: the machine-readable part a client branches on
+/// is `reason` and `fields[].name`, which this service does state per member,
+/// so there is no per-member wording to guess.
 pub const FIELD_INVALID: &str = "Member is invalid.";
-/// See [`FIELD_INVALID`].
-pub const FIELD_MISSING: &str = "Member must not be null.";
+/// See [`FIELD_INVALID`]. The absent-member class is worded as the requirement
+/// the member is under rather than as the value it did not carry, which is how
+/// AWS states it for this service.
+pub const FIELD_MISSING: &str = "Member is required.";
 
 /// How a member was wrong: it carried a value the service does not accept, or
 /// it carried none at all.
@@ -4212,10 +4261,23 @@ pub fn validation_message(reason: &str) -> String {
         stem.to_lowercase().replace('_', " ")
     }
 
+    /// `MISSING_AGREEMENT_ID` → `Agreement id`.
+    fn sentence_case(stem: &str) -> String {
+        let mut words = words(stem);
+        if let Some(first) = words.get_mut(0..1) {
+            first.make_ascii_uppercase();
+        }
+        words
+    }
+
     if let Some(stem) = reason.strip_prefix("INVALID_") {
         format!("Provided {} is invalid.", words(stem))
     } else if let Some(stem) = reason.strip_prefix("MISSING_") {
-        format!("Provided {} is missing.", words(stem))
+        // The absent-member class states the requirement the member is under,
+        // naming the member the reason names: `MISSING_AGREEMENT_ID` is
+        // "Agreement id is required." — the sentence AWS states for this
+        // service, for whichever member of whichever operation was left out.
+        format!("{} is required.", sentence_case(stem))
     } else {
         VALIDATION_MESSAGE_FALLBACK.to_string()
     }

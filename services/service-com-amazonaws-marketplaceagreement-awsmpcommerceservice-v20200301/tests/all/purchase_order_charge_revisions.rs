@@ -19,7 +19,10 @@
 //! (`purchase_order_updates`), so there a list is refused as the unsupported
 //! action whatever revision it states — except for a revision the MODEL itself
 //! refuses (`ChargeRevision` is `@range(min: 1)`), which the boundary walk
-//! reports on that element's own member before any handler runs.
+//! reports on that element's own member before any handler runs. Every element
+//! sent to that door names the agreement holding its charge, the one member it
+//! does require (`purchase_order_update_agreement_id`), so no case of it can
+//! pass on that member instead.
 //!
 //! The rows differ in what the rule generalises over: whether the member is
 //! stated at all, how far the stated revision is from the charge's own (one
@@ -43,7 +46,8 @@ use crate::agreement_lifecycle::{accept, call, emulator, Answer};
 use crate::payment_requests::{agreement_with_variable_term, get, sent};
 use crate::purchase_order_associations::{order_at, quote};
 use crate::purchase_order_updates::{
-    agreement_holding, assert_unsupported_action, charges, items, references, update,
+    agreement_holding, assert_unsupported_action, charges, items, naming_agreement, references,
+    update,
 };
 
 /// The `ValidationExceptionReason` the model publishes for a revision the charge
@@ -58,7 +62,7 @@ const MISSING_CHARGE_REVISION: &str = "MISSING_CHARGE_REVISION";
 const INVALID_CHARGE_REVISION_MESSAGE: &str = "Provided charge revision is invalid.";
 
 /// The sentence stated for the member being absent.
-const MISSING_CHARGE_REVISION_MESSAGE: &str = "Provided charge revision is missing.";
+const MISSING_CHARGE_REVISION_MESSAGE: &str = "Charge revision is required.";
 
 /// `ChargeRevision` is `@range(min: 1)`
 /// (`smithy_query(query="shape", shape="ChargeRevision")`), so this is the
@@ -307,7 +311,11 @@ async fn an_update_states_the_revision_the_charge_is_at() {
             ));
         }
 
-        let answered = update(&router, Value::Array(orders.clone())).await;
+        let answered = update(
+            &router,
+            naming_agreement(Value::Array(orders.clone()), &agreement),
+        )
+        .await;
         match below_the_range(&orders) {
             Some(position) => {
                 assert_refused(case, &answered, position, row.elements[position - 1].1)
@@ -507,7 +515,7 @@ async fn the_revision_of_a_charge_an_approval_created_is_the_one_checked() {
     ] {
         let answered = update(
             &router,
-            json!([order_at(&charge_id, "PO-approval", revision)]),
+            naming_agreement(json!([order_at(&charge_id, "PO-approval", revision)]), &agreement),
         )
         .await;
         assert_unsupported_action(&format!("a charge created by an approval: {case}"), &answered);

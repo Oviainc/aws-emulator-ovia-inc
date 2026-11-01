@@ -19,10 +19,13 @@
 //! hold the charges is minted BY the call, so no agreement holds them when the
 //! request is made and every stated value is refused there.
 //! `UpdatePurchaseOrders` performs no association at all
-//! (`purchase_order_updates`), so there a list is refused as the unsupported
-//! action whatever its elements state about the agreement — which the first test
-//! below pins, because a refusal of the member there would tell a caller it
-//! could repair a request that nothing will act on.
+//! (`purchase_order_updates`), but it does require the member of every element it
+//! is sent: a list whose every element states an agreement is refused there as
+//! the unsupported action whatever the value — which the first test below pins,
+//! because a refusal of the value there would tell a caller it could repair a
+//! request that nothing will act on — while a list that leaves the member out
+//! names no association to update and is refused on that member
+//! (`purchase_order_update_agreement_id`).
 //!
 //! The rows differ in what the rule generalises over: whether the member is
 //! stated at all, what it states (the holder, another agreement the store holds,
@@ -43,6 +46,7 @@ use serde_json::{json, Value};
 
 use crate::agreement_lifecycle::{accept, emulator, Answer};
 use crate::purchase_order_associations::{order, quote};
+use crate::purchase_order_update_agreement_id::assert_missing_agreement_id;
 use crate::purchase_order_updates::{
     agreement_holding, assert_unsupported_action, charges, items, references, update,
 };
@@ -240,9 +244,10 @@ fn assert_refused(case: &str, answer: &Answer, position: usize) {
 }
 
 /// `UpdatePurchaseOrders` associates nothing whatever its elements state about
-/// the agreement: the member is not what it refuses a list for, so every list —
-/// the one naming each charge's own holder among them — is refused as the
-/// unsupported action, and the charge report is unchanged.
+/// the agreement: the VALUE is not what it refuses a list for, so every list
+/// whose elements each state one — the one naming each charge's own holder among
+/// them — is refused as the unsupported action, while one that leaves the member
+/// out is refused on that member; either way the charge report is unchanged.
 #[tokio::test]
 async fn an_update_states_the_agreement_holding_the_charge() {
     assert_published_bounds();
@@ -275,7 +280,17 @@ async fn an_update_states_the_agreement_holding_the_charge() {
             .collect();
 
         let answered = update(&router, Value::Array(orders)).await;
-        assert_unsupported_action(case, &answered);
+        // An element stating no agreement names no association to update, so the
+        // update door reports THAT member first; a list whose every element
+        // states one is refused as the action, whatever the value.
+        match row
+            .elements
+            .iter()
+            .position(|(_, _, stated)| matches!(stated, Stated::Omitted))
+        {
+            Some(at) => assert_missing_agreement_id(case, &answered, at + 1),
+            None => assert_unsupported_action(case, &answered),
+        }
 
         // No charge of any agreement the row holds carries an association.
         for (position, (agreement, charge_ids)) in agreements.iter().enumerate() {

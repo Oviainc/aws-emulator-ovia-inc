@@ -5,8 +5,8 @@
 //!
 //! The rule under test: associating purchase orders with the charges of an
 //! agreement is not an action this service performs for its caller, so a request
-//! the modelled constraints on `purchaseOrders` admit is refused at the REQUEST
-//! level — the modelled `ValidationException` (HTTP 400,
+//! every element of which states what an association is NAMED by is refused at
+//! the REQUEST level — the modelled `ValidationException` (HTTP 400,
 //! `smithy_query(query="operation", operation="UpdatePurchaseOrders")`) carrying
 //! the `UNSUPPORTED_ACTION` reason `ValidationExceptionReason` publishes
 //! (`smithy_query(query="shape", shape="ValidationExceptionReason")`) and the
@@ -15,10 +15,14 @@
 //! resolved against a stored charge, so no identifier of the caller's is ever
 //! reported as unknown, and nothing is associated.
 //!
-//! What the model itself states about the input is still refused first, on the
-//! member at fault, by the boundary walk: `purchaseOrders` is `@required` and
-//! `@length(1..86)`, an element's `chargeId` is a `@required` `ResourceId` and
-//! its `chargeRevision` is `@range(min: 1)`.
+//! What the request itself gets wrong is refused first, on the member at fault:
+//! what the model states about the input, by the boundary walk
+//! (`purchaseOrders` is `@required` and `@length(1..86)`, an element's
+//! `chargeId` is a `@required` `ResourceId` and its `chargeRevision` is
+//! `@range(min: 1)`), and then this operation's own requirement that every
+//! element name the agreement holding its charge
+//! (`purchase_order_update_agreement_id`), which is why every list sent here
+//! states that member.
 //!
 //! The rows differ in what the rule generalises over: how long the list is (one
 //! element, a few, and the published maximum), whether its elements name charges
@@ -124,6 +128,33 @@ pub(crate) async fn update(router: &MultiServiceRouter, orders: Value) -> Answer
         json!({"purchaseOrders": orders}),
     )
     .await
+}
+
+/// Every element of `orders` naming `agreement` as the agreement holding its
+/// charge, where the element does not already name one of its own.
+///
+/// `agreementId` is the member `UpdatePurchaseOrders` requires of every element
+/// it is sent: an element that leaves it out names no association to update, so
+/// it is refused on THAT member before anything else about the request is
+/// answered (`purchase_order_update_agreement_id` is the suite for that rule).
+/// A case that is about something else therefore states it, so the case cannot
+/// pass on this member instead.
+///
+/// `pub(crate)` because every suite that sends this operation a list builds it
+/// through this one helper.
+pub(crate) fn naming_agreement(orders: Value, agreement: &str) -> Value {
+    let Value::Array(mut listed) = orders else {
+        panic!("a purchase order list is a JSON array, got {orders:?}");
+    };
+    for element in &mut listed {
+        let object = element
+            .as_object_mut()
+            .expect("an association is a JSON object");
+        object
+            .entry("agreementId")
+            .or_insert_with(|| Value::String(agreement.to_string()));
+    }
+    Value::Array(listed)
 }
 
 /// `ListAgreementCharges` with the selectors `request` carries.
@@ -380,7 +411,11 @@ async fn an_update_is_refused_as_the_unsupported_action_whatever_its_list_names(
             .collect();
 
         for attempt in 0..2 {
-            let answer = update(&router, (row.orders)(&fixture)).await;
+            let answer = update(
+                &router,
+                naming_agreement((row.orders)(&fixture), &fixture.agreements[0]),
+            )
+            .await;
             assert_unsupported_action(&format!("{case} (attempt {attempt})"), &answer);
 
             for (position, agreement_id) in fixture.agreements.iter().enumerate() {
@@ -495,10 +530,15 @@ async fn the_modelled_constraints_on_the_list_are_refused_on_their_own_member() 
     }
 
     // The other half of the rule: the same list with every modelled constraint
-    // satisfied is refused as the action rather than about a member.
+    // satisfied, and the agreement of its association named, is refused as the
+    // action rather than about a member.
     let answer = update(
         &router,
-        json!([{"chargeId": "ch-0000000000000001", "chargeRevision": 1}]),
+        json!([{
+            "chargeId": "ch-0000000000000001",
+            "chargeRevision": 1,
+            "agreementId": "agmt-0000000000000001",
+        }]),
     )
     .await;
     assert_unsupported_action("a list the modelled constraints admit", &answer);

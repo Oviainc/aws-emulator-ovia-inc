@@ -97,7 +97,13 @@ fn message_of(reason: &str) -> String {
     if let Some(stem) = reason.strip_prefix("INVALID_") {
         format!("Provided {} is invalid.", stem.to_lowercase().replace('_', " "))
     } else if let Some(stem) = reason.strip_prefix("MISSING_") {
-        format!("Provided {} is missing.", stem.to_lowercase().replace('_', " "))
+        // The absent-member class states the requirement the member is under:
+        // `MISSING_AGREEMENT_ID` is "Agreement id is required."
+        let mut member = stem.to_lowercase().replace('_', " ");
+        if let Some(first) = member.get_mut(0..1) {
+            first.make_ascii_uppercase();
+        }
+        format!("{member} is required.")
     } else {
         UNPLACED_REFUSAL_MESSAGE.to_string()
     }

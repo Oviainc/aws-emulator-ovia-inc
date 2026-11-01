@@ -89,6 +89,8 @@ mod purchase_order_associations;
 mod purchase_order_charge_revisions;
 #[path = "all/purchase_order_required_members.rs"]
 mod purchase_order_required_members;
+#[path = "all/purchase_order_update_agreement_id.rs"]
+mod purchase_order_update_agreement_id;
 #[path = "all/purchase_order_updates.rs"]
 mod purchase_order_updates;
 #[path = "all/refusal_wording.rs"]

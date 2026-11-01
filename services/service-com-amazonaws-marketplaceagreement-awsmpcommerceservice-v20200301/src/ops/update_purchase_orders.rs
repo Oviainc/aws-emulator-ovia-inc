@@ -8,18 +8,22 @@
 //! ## What this operation does
 //!
 //! Nothing to the store. The association this operation exists for is unavailable to
-//! the caller, so a request whose members are acceptable is refused at the REQUEST
-//! level — the modelled `ValidationException` (HTTP 400) carrying the
-//! `UNSUPPORTED_ACTION` reason and the sentence that class states
+//! the caller, so a request every element of which states what an association is made
+//! of is refused at the REQUEST level — the modelled `ValidationException` (HTTP 400)
+//! carrying the `UNSUPPORTED_ACTION` reason and the sentence that class states
 //! (`crate::state::unsupported_action`) — and no element is resolved against the
-//! stored charges, so the refusal does not depend on what the store holds.
+//! stored charges, so that refusal does not depend on what the store holds.
 //!
-//! What the request itself gets wrong is still reported first, by the boundary walk
-//! over the modelled constraints: `purchaseOrders` is `@required` and
-//! `@length(1..86)`, and an element's `chargeId` is a `@required` `ResourceId` whose
-//! `chargeRevision` is `@range(min: 1)`. Beyond those, no rule of this service's own
-//! is applied to the list — a refusal naming an element's member would say the
-//! caller can repair the request, and it cannot.
+//! What the request itself gets wrong is reported FIRST, on the member at fault: the
+//! boundary walk over the modelled constraints (`purchaseOrders` is `@required` and
+//! `@length(1..86)`, an element's `chargeId` is a `@required` `ResourceId` and its
+//! `chargeRevision` is `@range(min: 1)`), and then this operation's own requirement
+//! that every element NAME the association it updates — the agreement holding the
+//! charge (`crate::state::update_purchase_orders_refusal`). A member the caller left
+//! out is something the caller can repair, so it is answered with the
+//! `MISSING_<MEMBER>` reason and a `fields` entry locating the element and the member
+//! inside it; the refusal of the whole action names no member, so it can say none of
+//! that and is answered only once every element states what it has to.
 //!
 //! The purchase-order associations this service does hold are made where it serves
 //! them: `AcceptAgreementRequest$purchaseOrders` records them on the charges the
@@ -157,16 +161,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        _input: Self::Input,
+        input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing about the request and nothing in the store can make this call
-        // succeed, so neither is read: no charge is resolved, no agreement is
-        // written and no transition is materialised — which is why this
-        // handler's input and context are unused. The store is still reached
-        // for, as every handler of this crate does first, so a request this
-        // service could not serve at all is reported as its modelled server
-        // error rather than as a refusal of the caller's input.
+        // Nothing in the store can make this call succeed, so nothing in it is
+        // read: no charge is resolved, no agreement is written and no transition
+        // is materialised — which is why this handler's context is unused. The
+        // store is still reached for, as every handler of this crate does first,
+        // so a request this service could not serve at all is reported as its
+        // modelled server error rather than as a refusal of the caller's input.
         if crate::state::service_state(&*self.engine).is_none() {
             return Err(UpdatePurchaseOrdersErrorModeled::InternalServerException(
                 crate::state::store_unavailable(),
@@ -174,11 +177,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An element that does not name the association it updates — the
+        // agreement holding the charge — is refused on THAT member, before the
+        // request-level refusal below: the caller left a member out and can put
+        // it back, which the modelled envelope says by naming the member
+        // (`MISSING_<MEMBER>` with a `fields` entry locating the element and the
+        // member inside it). The walk reads only the request, so the member a
+        // caller forgot is reported whatever the store holds and whatever the
+        // element's other members name.
+        if let Some(refusal) = crate::state::update_purchase_orders_refusal(&input.purchase_orders)
+        {
+            return Err(UpdatePurchaseOrdersErrorModeled::ValidationException(
+                crate::state::validation_exception(&refusal.reason, refusal.path),
+            )
+            .into());
+        }
+
         // Associating purchase orders with the charges of an agreement is not
         // available to the caller of this service. The refusal is of the ACTION
         // rather than of a member of the request, so it is answered for every
-        // request the modelled constraints on `purchaseOrders` and its elements
-        // admit — whatever the elements name, and whatever the store holds:
+        // request whose elements each state what an association is made of —
+        // whatever they name, and whatever the store holds:
         // "unknown identifier" is never reported for an id this call never
         // resolved. `ValidationExceptionReason` publishes that class as
         // `UNSUPPORTED_ACTION` (`crate::state::unsupported_action`), which is

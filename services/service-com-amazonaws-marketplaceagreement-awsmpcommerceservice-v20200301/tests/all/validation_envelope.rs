@@ -49,8 +49,9 @@ const SIGNED_FOR_US_EAST_1: &str = "AWS4-HMAC-SHA256 \
 /// here rather than imported, so a change of wording in the service fails this
 /// test instead of silently agreeing with it.
 const FIELD_INVALID: &str = "Member is invalid.";
-/// See [`FIELD_INVALID`].
-const FIELD_MISSING: &str = "Member must not be null.";
+/// See [`FIELD_INVALID`]. The absent-member class states the requirement the
+/// member is under, not the value it did not carry.
+const FIELD_MISSING: &str = "Member is required.";
 
 /// `ValidationException`'s own documentation, which is the message a refusal
 /// states when no `ValidationExceptionReason` value names the member
@@ -239,7 +240,7 @@ fn rows() -> Vec<Row> {
             reason: "MISSING_AGREEMENT_ID",
             field: "agreementId".to_string(),
             member: Member::Absent,
-            message: "Provided agreement id is missing.",
+            message: "Agreement id is required.",
         },
         Row {
             case: "the same member, the same constraint, another operation",
@@ -370,7 +371,7 @@ fn rows() -> Vec<Row> {
             reason: "MISSING_FILTER_NAME",
             field: "filters.1.member.name".to_string(),
             member: Member::Absent,
-            message: "Provided filter name is missing.",
+            message: "Filter name is required.",
         },
         Row {
             case: "another member of a list element left out",
@@ -379,7 +380,7 @@ fn rows() -> Vec<Row> {
             reason: "MISSING_FILTER_VALUES",
             field: "filters.1.member.values".to_string(),
             member: Member::Absent,
-            message: "Provided filter values is missing.",
+            message: "Filter values is required.",
         },
         Row {
             case: "a scalar element of a list inside a list element",
@@ -406,7 +407,7 @@ fn rows() -> Vec<Row> {
             reason: "MISSING_AGREEMENT_PROPOSAL_IDENTIFIER",
             field: "agreementProposalIdentifier".to_string(),
             member: Member::Absent,
-            message: "Provided agreement proposal identifier is missing.",
+            message: "Agreement proposal identifier is required.",
         },
         Row {
             case: "that same member outside its pattern",
@@ -441,7 +442,7 @@ fn rows() -> Vec<Row> {
             reason: "MISSING_REQUESTED_TERM_ID",
             field: "requestedTerms.2.member.id".to_string(),
             member: Member::Absent,
-            message: "Provided requested term id is missing.",
+            message: "Requested term id is required.",
         },
         Row {
             case: "a required list left out",
@@ -450,7 +451,7 @@ fn rows() -> Vec<Row> {
             reason: "MISSING_PURCHASE_ORDERS",
             field: "purchaseOrders".to_string(),
             member: Member::Absent,
-            message: "Provided purchase orders is missing.",
+            message: "Purchase orders is required.",
         },
         Row {
             case: "that same list below its minimum length",
@@ -468,7 +469,7 @@ fn rows() -> Vec<Row> {
             reason: "MISSING_CHARGE_ID",
             field: "purchaseOrders.2.member.chargeId".to_string(),
             member: Member::Absent,
-            message: "Provided charge id is missing.",
+            message: "Charge id is required.",
         },
     ];
     rows.sort_by_key(|row| row.case);
