@@ -150,6 +150,13 @@ pub const IMAGE_RECIPE_FILTER_NAMES: &[&str] = &["name", "parentImage", "platfor
 /// `maxResults`: the modelled `maxResults` range's own maximum (1..25).
 pub const MAX_IMAGE_RECIPES_PER_PAGE: usize = 25;
 
+/// The most tags one resource carries.
+///
+/// The modelled `TagMap`'s own length bound (`len 1..50`) — and `TagMap` is the target of
+/// every `tags` member, the one a resource reports as much as the one a request submits, so
+/// it bounds the map a resource ends up holding and not only the map one call carries.
+pub const MAX_RESOURCE_TAGS: usize = 50;
+
 /// The most components one image recipe includes.
 ///
 /// The documented quota, from the modelled `components` member of `ImageRecipe`: "A recipe
@@ -491,6 +498,22 @@ pub struct CreateReceipt {
     pub filed: u64,
 }
 
+/// Which of this store's resource kinds an ARN names, once the ARN has been found to
+/// name a stored resource.
+///
+/// The modelled `ImageBuilderArn` the tagging operations take admits ten resource kinds;
+/// these are the ones this store holds, so they are the ones a tag can be read from or
+/// written to. An ARN of any other kind names nothing stored and is reported missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// An infrastructure configuration ([`INFRASTRUCTURE_CONFIGURATION_ARN_PREFIX`]).
+    InfrastructureConfiguration,
+    /// One component build version ([`COMPONENT_ARN_PREFIX`]).
+    Component,
+    /// An image recipe ([`IMAGE_RECIPE_ARN_PREFIX`]).
+    ImageRecipe,
+}
+
 /// Per-service state for com-amazonaws-imagebuilder-imagebuilder. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsImagebuilderImagebuilderState {
@@ -818,6 +841,83 @@ impl ComAmazonawsImagebuilderImagebuilderState {
     #[must_use]
     pub fn image_recipe_store_is_full(&self) -> bool {
         self.image_recipes.len() >= MAX_IMAGE_RECIPES
+    }
+
+    /// Which stored resource `arn` names, when one of this Region's resources carries that
+    /// ARN exactly.
+    ///
+    /// A tagging call names its resource by the resource's OWN ARN, so the lookup is exact:
+    /// a component ARN answers the build version it names, never the latest build of a
+    /// version it resolves to. A regional endpoint reaches only its own Region's
+    /// resources, which each lookup below already enforces.
+    #[must_use]
+    pub fn tagged_resource(&self, arn: &str, request_region: &str) -> Option<TaggedResource> {
+        if self.infrastructure_configuration(arn, request_region).is_some() {
+            return Some(TaggedResource::InfrastructureConfiguration);
+        }
+        if self.component(arn, request_region).is_some() {
+            return Some(TaggedResource::Component);
+        }
+        if self.image_recipe(arn, request_region).is_some() {
+            return Some(TaggedResource::ImageRecipe);
+        }
+        None
+    }
+
+    /// The tags the resource `arn` names currently carries, or `None` when nothing in
+    /// this Region carries that ARN.
+    ///
+    /// Named for the resource's own `tags` member, which is what a tagging call reads and
+    /// writes — NOT the `resourceTags` an infrastructure configuration puts on its build
+    /// and test instances, which is a different member of one record.
+    ///
+    /// A stored resource that was never tagged carries NO tags, which is an empty map
+    /// rather than an absent resource — the two are different answers.
+    #[must_use]
+    pub fn tags_of_resource(
+        &self,
+        arn: &str,
+        request_region: &str,
+    ) -> Option<BTreeMap<String, String>> {
+        let stored = match self.tagged_resource(arn, request_region)? {
+            TaggedResource::InfrastructureConfiguration => self
+                .infrastructure_configurations
+                .get(arn)
+                .and_then(|record| record.tags.clone()),
+            TaggedResource::Component => {
+                self.components.get(arn).and_then(|record| record.tags.clone())
+            }
+            TaggedResource::ImageRecipe => self
+                .image_recipes
+                .get(arn)
+                .and_then(|record| record.tags.clone()),
+        };
+        Some(stored.unwrap_or_default())
+    }
+
+    /// The tag map of the resource `arn` names, to write through, or `None` when nothing
+    /// in this Region carries that ARN.
+    ///
+    /// Hands back the record's own `tags` member, so a tag written here is the tag every
+    /// later read of that resource reports — whether the read is a tag listing or the
+    /// resource's own Get.
+    pub fn tags_of_resource_mut(
+        &mut self,
+        arn: &str,
+        request_region: &str,
+    ) -> Option<&mut Option<BTreeMap<String, String>>> {
+        match self.tagged_resource(arn, request_region)? {
+            TaggedResource::InfrastructureConfiguration => self
+                .infrastructure_configurations
+                .get_mut(arn)
+                .map(|record| &mut record.tags),
+            TaggedResource::Component => {
+                self.components.get_mut(arn).map(|record| &mut record.tags)
+            }
+            TaggedResource::ImageRecipe => {
+                self.image_recipes.get_mut(arn).map(|record| &mut record.tags)
+            }
+        }
     }
 }
 
@@ -2011,6 +2111,29 @@ pub fn image_recipe_exists_message(name: &str, semantic_version: &str) -> String
 #[must_use]
 pub fn image_recipe_not_found_message(arn: &str) -> String {
     format!("The image recipe {arn} does not exist.")
+}
+
+/// Why a tagging call naming no stored resource reports nothing.
+///
+/// Names the ARN the caller asked about and nothing about any resource that does exist.
+/// The ARN a tagging call carries may name any of the resource kinds the modelled
+/// `ImageBuilderArn` admits, so the wording names "the resource" rather than one kind.
+#[must_use]
+pub fn tagged_resource_not_found_message(arn: &str) -> String {
+    format!("The resource {arn} does not exist.")
+}
+
+/// Why a tagging call that would leave a resource holding more tags than one resource may
+/// carry is refused.
+///
+/// The bound is the modelled `TagMap`'s own ([`MAX_RESOURCE_TAGS`]); the wording names it
+/// and how many tags the merged map would have held.
+#[must_use]
+pub fn too_many_resource_tags_message(arn: &str, merged: usize) -> String {
+    format!(
+        "The resource {arn} can carry a maximum of {MAX_RESOURCE_TAGS} tags; this request would \
+         leave it with {merged}."
+    )
 }
 
 /// Why a list naming an unsupported filter is refused.

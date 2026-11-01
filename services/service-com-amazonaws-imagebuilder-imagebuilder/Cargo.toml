@@ -39,5 +39,11 @@ hex = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# The percent-encoding an AWS SDK applies to a non-greedy `@httpLabel`, so the resource
+# ARN the tagging operations take rides in the URI path the way a signed request puts it
+# there, rather than through a hand-rolled escape in the tests.
+percent-encoding = "2.3"
+
 [lints]
 workspace = true
