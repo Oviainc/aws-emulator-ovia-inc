@@ -191,6 +191,8 @@ mod no_op_mutation_clock;
 mod object_malware_scan;
 #[path = "all/organization_admin_accounts.rs"]
 mod organization_admin_accounts;
+#[path = "all/organization_admin_no_op_clock.rs"]
+mod organization_admin_no_op_clock;
 #[path = "all/organization_admin_redesignation.rs"]
 mod organization_admin_redesignation;
 #[path = "all/organization_admin_removal.rs"]

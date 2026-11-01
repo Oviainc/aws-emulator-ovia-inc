@@ -1146,16 +1146,29 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// `None` when that endpoint holds no delegated administrator at all;
     /// `Some(false)` when the one it holds is a different account than
     /// `admin_account_id`, which is not a removal this call may make; `Some(true)`
-    /// when the removal was accepted. The mutation clock is read only on the path
-    /// that writes, so neither refusal advances it — the discipline
+    /// when the removal was accepted, whether this call is the one that accepted it
+    /// or a repeat of one already in flight. The mutation clock is read only on the
+    /// path that writes, so neither refusal advances it and neither does that
+    /// repeat — the discipline
     /// [`Self::disassociate_detector_from_administrator`] keeps too.
     pub fn disable_organization_admin_account(
         &mut self,
         region: &str,
         admin_account_id: &str,
     ) -> Option<bool> {
-        if self.organization_admin_account_in(region)?.admin_account_id != admin_account_id {
+        let record = self.organization_admin_account_in(region)?;
+        if record.admin_account_id != admin_account_id {
             return Some(false);
+        }
+        // Asking again for a removal still in flight asks for the state the record is
+        // already transitioning to: the instant the first request made due stands
+        // ([`OrganizationAdminAccountRecord::begin_disable`]), so such a call is
+        // accepted and writes nothing at all. Tested BEFORE the clock is read, exactly
+        // as [`Self::disassociate_detector_from_administrator`] tests the relationship
+        // it drops, so a repeat consumes no instant of the "this resource changed now"
+        // counter either.
+        if record.disable_due_millis.is_some() {
+            return Some(true);
         }
         let now = self.tick_millis();
         if let Some(record) = self.organization_admin_accounts.get_mut(region) {
