@@ -7,13 +7,15 @@
 //! of the preference plane) report exactly what this call stored. `@idempotent`: a replay
 //! of the same request answers with the ARN the first call minted.
 //!
-//! Two combinations of members no modelled constraint can express are refused with the
-//! modelled `ValidationException`, by the rules every write of a preference reaches:
+//! Three requirements no modelled constraint can express are refused with the modelled
+//! `ValidationException`, by the rules every write of a preference reaches:
 //! `MarketplacePunchOutPreference` is required while `MarketplacePunchOutEnabled` is true
 //! — for the one portal this operation's own member states that for
-//! ([`crate::state::PunchOutConfigRequirement::CoupaOnly`]) — and the approval redirect
+//! ([`crate::state::PunchOutConfigRequirement::CoupaOnly`]) — the approval redirect
 //! URL this write stores has to name the host of the instance endpoint it stores beside it
-//! ([`crate::state::check_marketplace_punch_out_redirect_host`]).
+//! ([`crate::state::check_marketplace_punch_out_redirect_host`]), and an endpoint member
+//! this write states that its own input documents as a secure URL has to be a valid HTTPS
+//! URL ([`crate::state::check_secure_endpoint_url`]).
 //!
 //! ## Shape of an operation
 //!
@@ -208,6 +210,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+
+        // The delivery endpoint this create states has to be a valid HTTPS URL, the one
+        // rule `crate::state::check_secure_endpoint_url` holds for every write of a member
+        // whose own input documents that — refused before anything is minted or persisted,
+        // so no preference reports an endpoint its member says cannot be stored.
+        crate::state::check_secure_endpoint_url(
+            crate::state::PROCUREMENT_PORTAL_INSTANCE_ENDPOINT_MEMBER,
+            input.procurement_portal_instance_endpoint.as_deref(),
+        )
+        .map_err(CreateProcurementPortalPreferenceErrorModeled::ValidationException)?;
 
         // `MarketplacePunchOutEnabled`'s default, the combination no modelled constraint
         // can express — enabled for a portal without the configuration that portal

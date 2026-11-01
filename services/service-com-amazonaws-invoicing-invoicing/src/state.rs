@@ -1428,6 +1428,72 @@ fn endpoint_host(endpoint: &str) -> Option<String> {
         .and_then(|uri| uri.host().map(str::to_ascii_lowercase))
 }
 
+/// The scheme an endpoint member the model documents as a secure URL has to name:
+/// `CreateProcurementPortalPreferenceRequest$ProcurementPortalInstanceEndpoint` is "the
+/// endpoint URL where e-invoices will be delivered to the procurement portal. Must be a
+/// valid HTTPS URL" (`smithy_query(query="shape",
+/// shape="CreateProcurementPortalPreferenceRequest")`), and the update's own member states
+/// the same requirement for the value it writes.
+const SECURE_ENDPOINT_SCHEME: &str = "https";
+
+/// Whether `endpoint` is a valid URL on [`SECURE_ENDPOINT_SCHEME`]: it has to PARSE as a
+/// URL that names that scheme and a host, so a bare host (`portal.example.com`), a value
+/// that is no URL at all, and a URL on any other scheme are each not one.
+///
+/// A URL's scheme is case-insensitive, so it is compared that way. The parse is
+/// [`http::Uri`]'s, the crate the request this write arrived on is carried in, rather than
+/// a hand-rolled scan — the same parse [`endpoint_host`] reads a host with.
+fn is_secure_endpoint_url(endpoint: &str) -> bool {
+    let Ok(uri) = endpoint.parse::<http::Uri>() else {
+        return false;
+    };
+    uri.scheme_str()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(SECURE_ENDPOINT_SCHEME))
+        && uri.host().is_some_and(|host| !host.is_empty())
+}
+
+/// The URL rule a write of a procurement portal preference applies to an endpoint member
+/// its own input documents as having to be a valid HTTPS URL: a value that is not one is
+/// refused with the modelled `ValidationException` (HTTP 400) before the write stores
+/// anything, so no preference can report a delivery endpoint its member says cannot be
+/// stored.
+///
+/// The members carrying that requirement are the two writes' own
+/// `ProcurementPortalInstanceEndpoint` ("Must be a valid HTTPS URL"); each is optional, so
+/// a write that states none states nothing for this rule to be about. The requirement is a
+/// property of the VALUE that no modelled constraint can express — the member's target
+/// gives it only `@length(0..1024)` and `^\S+$`, which any non-space string satisfies — so
+/// the boundary validator passes it and it is refused here, the way
+/// [`resolve_marketplace_punch_out`] refuses the combination the model cannot express.
+///
+/// The refusal names the member it is about, worded as that member words its own
+/// requirement, and is keyed the way this plane's bodies key their text
+/// ([`MessageKey::Capitalised`]). It lives beside the preference registry, for the reason
+/// [`PORTAL_COUPA`] states: both writes that set such a member apply it.
+pub fn check_secure_endpoint_url(
+    member: &str,
+    endpoint: Option<&str>,
+) -> Result<(), ValidationException> {
+    let Some(endpoint) = endpoint else {
+        return Ok(());
+    };
+    if is_secure_endpoint_url(endpoint) {
+        return Ok(());
+    }
+    Err(ValidationException {
+        message: Some(format!("{member} must be a valid HTTPS URL")),
+        // `invalidInput` is one of the model's `ValidationExceptionReason` values
+        // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]).
+        reason: Some("invalidInput".to_string()),
+        message_key: MessageKey::Capitalised,
+        ..Default::default()
+    })
+}
+
+/// The member the two writes of a preference state the delivery endpoint on, as a refusal
+/// about it names it (`ProcurementPortalInstanceEndpoint`).
+pub const PROCUREMENT_PORTAL_INSTANCE_ENDPOINT_MEMBER: &str = "ProcurementPortalInstanceEndpoint";
+
 /// The host rule a write of a procurement portal preference applies to the pair of
 /// endpoints it leaves on that preference:
 /// `MarketplacePunchOutPreference$ApprovalRequestRedirectUrl` is documented as "when

@@ -39,6 +39,8 @@ mod modelled_enum_value_set;
 mod modelled_refusal_on_every_implemented_operation;
 #[path = "all/own_account_and_request_derived_refusals.rs"]
 mod own_account_and_request_derived_refusals;
+#[path = "all/portal_endpoint_must_be_a_secure_url.rs"]
+mod portal_endpoint_must_be_a_secure_url;
 #[path = "all/portal_validation_code_issue.rs"]
 mod portal_validation_code_issue;
 #[path = "all/procurement_portal_error_message_key.rs"]

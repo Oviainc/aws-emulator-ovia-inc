@@ -21,13 +21,15 @@
 //! configuration write of a preference: a plane this write enables reports a status, and a
 //! plane it disables reports none.
 //!
-//! Two combinations of members no modelled constraint can express are refused with the
-//! modelled `ValidationException`, by the rules every write of a preference reaches:
+//! Three requirements no modelled constraint can express are refused with the modelled
+//! `ValidationException`, by the rules every write of a preference reaches:
 //! `MarketplacePunchOutPreference` is required while `MarketplacePunchOutEnabled` is true
 //! — for EVERY portal, the scope this operation's own member states
-//! ([`crate::state::PunchOutConfigRequirement::EveryPortal`]) — and the approval redirect
+//! ([`crate::state::PunchOutConfigRequirement::EveryPortal`]) — the approval redirect
 //! URL this write leaves on the preference has to name the host of the instance endpoint
-//! it leaves on it ([`crate::state::check_marketplace_punch_out_redirect_host`]).
+//! it leaves on it ([`crate::state::check_marketplace_punch_out_redirect_host`]), and an
+//! endpoint member this write states that its own input documents as a secure URL has to
+//! be a valid HTTPS URL ([`crate::state::check_secure_endpoint_url`]).
 //!
 //! `@idempotent`: a replay — the same `ClientToken` against the same preference — answers
 //! with the ARN the first call returned and performs the write ONCE, through the ledger
@@ -217,6 +219,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+
+        // The delivery endpoint this update states has to be a valid HTTPS URL, the one
+        // rule `crate::state::check_secure_endpoint_url` holds for every write of a member
+        // whose own input documents that — refused before anything is written, so no
+        // preference reports an endpoint its member says cannot be stored. An update that
+        // states none keeps the endpoint an earlier write already applied the rule to.
+        crate::state::check_secure_endpoint_url(
+            crate::state::PROCUREMENT_PORTAL_INSTANCE_ENDPOINT_MEMBER,
+            input.procurement_portal_instance_endpoint.as_deref(),
+        )
+        .map_err(PutProcurementPortalPreferenceErrorModeled::ValidationException)?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutProcurementPortalPreferenceErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),
