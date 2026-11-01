@@ -5,8 +5,8 @@
 //! the request names, mints the `AssociationId` a later
 //! `GetCustomDetectionRuleAssociation` reports, and answers with the association's full
 //! detail. A `RuleId` the catalogue does not publish is refused with the modelled
-//! `ResourceNotFoundException`, and a second create for a `(RuleId, Mode)` pair this
-//! account already associated with the modelled `ConflictException`; a replayed
+//! `ResourceNotFoundException`, and a second create for a rule this account already
+//! associated with the modelled `ConflictException`; a replayed
 //! `ClientToken` answers with the association the first call made.
 //! This is the ONLY file to touch for this operation.
 //!
@@ -190,21 +190,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A custom detection rule is published BY GuardDuty, so an association can
-        // only ever name one the catalogue carries. The modelled 404 is the only
-        // way a caller can tell "this rule was never authored" from "you may not do
-        // this" (`AccessDeniedException`), which is why it is answered as the
-        // modelled shape and not under the `BadRequestException` envelope this
-        // service's 400s use.
-        if state.custom_detection_rules.rule(&input.rule_id).is_none() {
-            return Err(not_found(&input.rule_id));
-        }
-
         // Creating is not updating: `UpdateCustomDetectionRuleAssociation` is the
         // operation that changes an existing association's mode, so a second
-        // create for the same `(RuleId, Mode)` pair is the modelled conflict.
+        // create for a rule this account has already associated is the modelled
+        // conflict whatever mode either call names.
+        //
+        // Asked BEFORE the catalogue is consulted: an association the store holds
+        // is itself proof that the rule it binds exists, so a rule a caller is
+        // already associated with is a conflict however the catalogue resolves the
+        // id — answering "no such rule" for a rule this account demonstrably
+        // associated would tell a caller retrying an idempotent create to stop.
         if state
-            .detection_rule_association(&region, &input.rule_id, &input.mode)
+            .detection_rule_association(&region, &input.rule_id)
             .is_some()
         {
             return Err(
@@ -223,6 +220,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // A custom detection rule is published BY GuardDuty, so an association can
+        // only ever name one the catalogue carries. The modelled 404 is the only
+        // way a caller can tell "this rule was never authored" from "you may not do
+        // this" (`AccessDeniedException`), which is why it is answered as the
+        // modelled shape and not under the `BadRequestException` envelope this
+        // service's 400s use.
+        if state.custom_detection_rules.rule(&input.rule_id).is_none() {
+            return Err(not_found(&input.rule_id));
         }
 
         // The Region is request-chosen, so the number of PARTITIONS needs its own
@@ -255,15 +262,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .unwrap_or_default(),
             client_token: token,
+            // A DRY_RUN association stops evaluating a fixed interval after it is
+            // made, which is the instant `ExpiresAt` reports; a `LIVE` one runs
+            // until it is deleted and has none
+            // ([`crate::state::dry_run_association_expiry`]).
+            expires_at_millis: crate::state::dry_run_association_expiry(&input.mode, now),
             created_at_millis: now,
             // Nothing has changed it yet, so it reports the instant it was made.
             updated_at_millis: now,
         };
         let view = crate::state::detection_rule_association_view(&record);
-        state.custom_detection_rule_associations.insert(
-            (region, input.rule_id.clone(), input.mode.clone()),
-            record,
-        );
+        state
+            .custom_detection_rule_associations
+            .insert((region, input.rule_id.clone()), record);
 
         Ok(CreateCustomDetectionRuleAssociationOutput {
             rule_association: view,
@@ -280,8 +291,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// the same absence.
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
-/// The error CLASS a second create for an already-associated `(RuleId, Mode)` pair
-/// is named by — the modelled 409.
+/// The error CLASS a second create for a rule this account already associated is
+/// named by — the modelled 409.
 const CONFLICT_EXCEPTION: &str = "ConflictException";
 
 /// Refuse a `RuleId` the catalogue does not publish with the modelled 404, naming

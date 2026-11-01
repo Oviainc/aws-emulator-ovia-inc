@@ -158,12 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`smithy_query(operation="DeleteCustomDetectionRuleAssociation,GetCustomDetectionRuleAssociation")`).
         // Both carry their own length and pattern constraints, refused at the request
         // boundary, so reaching here means only the association's EXISTENCE is open.
-        // The store keys an association by `(region, RuleId, Mode)`, so the mode the
-        // record carries is what names the entry to take out.
-        let Some(mode) = state
+        if state
             .detection_rule_association_by_id(&region, &input.rule_id, &input.association_id)
-            .map(|record| record.mode.clone())
-        else {
+            .is_none()
+        {
             // The pair resolves to nothing, so there is nothing to disable: the
             // modelled 404, the same class and message a read of that pair answers,
             // so "never associated", "associated through another Region's endpoint"
@@ -175,28 +173,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // hold, which the modelled `ResourceNotFoundException` is there to
             // report.
             return Err(not_found(&input.association_id));
-        };
+        }
 
-        // Dropping the one entry that key names is the whole delete: an association
-        // owns nothing else, its tags and the `ClientToken` the create carried live ON
-        // the record, so removing it retires that idempotency mapping with it and no
-        // token is left resolving to an association the store no longer holds. The
-        // account's ORGANIZATION configuration for the same `(RuleId, Mode)` pair is a
+        // Dropping the one entry the rule's key names is the whole delete: an
+        // association owns nothing else, its tags and the `ClientToken` the create
+        // carried live ON the record, so removing it retires that idempotency mapping
+        // with it and no token is left resolving to an association the store no longer
+        // holds. The account's ORGANIZATION configuration for the same rule is a
         // different resource in a store of its own, so it is untouched, and the
         // published rule itself is GuardDuty's catalogue entry rather than this
         // account's, so it stands too.
         //
         // The `else` is DEFENSIVE and not a refusal path a caller can reach: the
-        // lookup above already resolved the record, and every record is held under the
-        // key its own `(region, rule_id, mode)` fields give.
+        // lookup above already resolved this very entry.
         if state
             .custom_detection_rule_associations
-            .remove(&(region, input.rule_id, mode))
+            .remove(&(region, input.rule_id))
             .is_none()
         {
             debug_assert!(
                 false,
-                "an association resolved by id must be held under its own (region, rule, mode) key"
+                "an association resolved by id must be held under its own (region, rule) key"
             );
             return Err(not_found(&input.association_id));
         }

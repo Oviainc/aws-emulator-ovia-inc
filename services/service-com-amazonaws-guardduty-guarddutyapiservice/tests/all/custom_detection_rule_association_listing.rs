@@ -14,7 +14,7 @@
 //!    through the Region serving the request — "Returns all custom detection rule
 //!    associations for your account"
 //!    (`smithy_query(query="doc",shape="ListCustomDetectionRuleAssociations")`) — in
-//!    `(RuleId, Mode)` order whatever order they were created in, and every summary
+//!    `RuleId` order whatever order they were created in, and every summary
 //!    it reports resolves through `GetCustomDetectionRuleAssociation` to the same
 //!    values.
 //! 2. `RuleId` and `Mode` are EQUALITY filters on the members the summary reports
@@ -244,18 +244,16 @@ async fn walk(
     panic!("case {case:?}: the list never ran out of pages");
 }
 
-/// The `(ruleId, mode)` pairs this suite enrolls the account in: the first four
-/// published rules in both `AssociationMode`s, so the set spans both modes, several
-/// rules, and a rule carrying one association as well as rules carrying two.
+/// The `(ruleId, mode)` pairs this suite enrolls the account in: the first eight
+/// published rules, one association each because a rule carries at most one, in
+/// alternating `AssociationMode`s so the set spans both modes over several rules.
 ///
 /// Returned in the order the creates are MADE, which is deliberately the reverse of
 /// the order the list must report, so an assertion on order cannot pass by accident.
 fn plan(ids: &[String]) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = Vec::new();
-    for rule_id in ids.iter().take(4) {
-        for mode in MODES {
-            pairs.push((rule_id.clone(), mode.to_string()));
-        }
+    for (index, rule_id) in ids.iter().take(8).enumerate() {
+        pairs.push((rule_id.clone(), MODES[index % MODES.len()].to_string()));
     }
     pairs.reverse();
     pairs
@@ -333,12 +331,22 @@ async fn the_list_reports_every_association_the_region_holds_and_each_resolves()
             MODES.contains(&mode),
             "case {case:?}: mode must be an AssociationMode member, got {mode:?}"
         );
-        // `ExpiresAt` is the shape's only optional member and GuardDuty documents no
-        // lifetime for an association, so it is reported absent rather than invented.
-        assert!(
-            summary.get("expiresAt").is_none_or(Value::is_null),
-            "case {case:?}: expiresAt must be absent, got {summary:?}"
-        );
+        // `ExpiresAt` is the shape's only optional member: a DRY_RUN association
+        // stops evaluating a fixed interval after it is made and reports that
+        // instant, and a LIVE one runs until it is deleted, so it reports none.
+        let expires_at = summary.get("expiresAt").and_then(Value::as_f64);
+        if mode == "DRY_RUN" {
+            let created_at = summary["createdAt"].as_f64().unwrap_or_default();
+            assert!(
+                expires_at.is_some_and(|expires| expires > created_at),
+                "case {case:?}: a DRY_RUN association must expire after it was created, got {summary:?}"
+            );
+        } else {
+            assert!(
+                expires_at.is_none(),
+                "case {case:?}: a LIVE association must report no expiresAt, got {summary:?}"
+            );
+        }
 
         // The summary resolves through the detail read to the SAME association:
         // `AssociationSummary` is `AssociationDetail` without `AccountId`
@@ -356,7 +364,15 @@ async fn the_list_reports_every_association_the_region_holds_and_each_resolves()
             "case {case:?}: get-association expected 200, got {status} {detail:?}"
         );
         let association = &detail["ruleAssociation"];
-        for member in ["associationId", "arn", "ruleId", "mode", "createdAt", "updatedAt"] {
+        for member in [
+            "associationId",
+            "arn",
+            "ruleId",
+            "mode",
+            "createdAt",
+            "updatedAt",
+            "expiresAt",
+        ] {
             assert_eq!(
                 summary.get(member),
                 association.get(member),
@@ -546,12 +562,13 @@ async fn only_the_region_that_made_an_association_reports_it() {
     let router = new_router();
     let ids = published_rule_ids(&router).await;
 
-    // One Region takes the first two rules in both modes, the other the third rule in
-    // one mode: the two sets are disjoint in both rule and size.
+    // One Region takes the first two rules, the other the third: a rule carries at
+    // most one association, so the two sets are disjoint in both rule and size.
     let home: Vec<(String, String)> = ids
         .iter()
         .take(2)
-        .flat_map(|rule_id| MODES.map(|mode| (rule_id.clone(), mode.to_string())))
+        .enumerate()
+        .map(|(index, rule_id)| (rule_id.clone(), MODES[index % MODES.len()].to_string()))
         .collect();
     let other: Vec<(String, String)> = vec![(ids[2].clone(), MODES[0].to_string())];
     for (rule_id, mode) in home.iter().chain(other.iter()) {

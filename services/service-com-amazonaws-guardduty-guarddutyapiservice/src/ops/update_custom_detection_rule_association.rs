@@ -7,9 +7,9 @@
 //! `AssociationId`, `Arn` and `CreatedAt`. An `(AssociationId, RuleId)` pair this
 //! account holds no association for is refused with the modelled
 //! `ResourceNotFoundException` (an update is never an upsert —
-//! `CreateCustomDetectionRuleAssociation` is what makes an association), and a move
-//! onto a `(RuleId, Mode)` pair this account already associated with the modelled
-//! `ConflictException`.
+//! `CreateCustomDetectionRuleAssociation` is what makes an association). Asking for
+//! the mode the association is already in changes nothing, which is what
+//! `@idempotent` on this PUT means observably.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -183,57 +183,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(UpdateCustomDetectionRuleAssociationOutput {});
         }
 
-        // An association is the account's enrollment of one published rule in one
-        // mode, so `(RuleId, Mode)` identifies it: moving this one onto a pair the
-        // account already associated would make a second association of that pair,
-        // which is the modelled conflict the create answers for the same reason.
-        if state
-            .detection_rule_association(&region, &input.rule_id, &input.mode)
-            .is_some()
-        {
-            return Err(UpdateCustomDetectionRuleAssociationErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(crate::state::detection_rule_association_conflict_message(
-                        &input.rule_id,
-                    )),
-                    // "The error type"
-                    // (`smithy_query(shape="ConflictException")`): the class, the
-                    // same value the body's `__type` carries.
-                    r#type: Some(CONFLICT_EXCEPTION.to_string()),
-                },
-            )
-            .into());
-        }
-
         // A MUTATION, so the instant this hands out is the association's new
         // `UpdatedAt`; `CreatedAt`, the minted `AssociationId` and the tags the
         // create recorded are untouched, because the mode is the only value this
         // operation sets.
+        //
+        // Changed IN PLACE: the rule's association is the store's entry for that
+        // rule, so moving it between modes neither re-keys it nor can leave a
+        // second association of the rule behind — and no Region PARTITION is
+        // added, so the store bound `CreateCustomDetectionRuleAssociation`
+        // enforces cannot be crossed here. The `else` is DEFENSIVE and not a
+        // refusal path a caller can reach: the lookup above already resolved this
+        // very entry.
         let now = state.tick_millis();
-        // Taken OUT of the store under the key its current mode gives, so the move
-        // cannot leave a second copy of the association behind. The `else` is
-        // DEFENSIVE and not a refusal path a caller can reach: the lookup above
-        // already resolved the record, and every record is held under the key its
-        // own `(region, rule_id, mode)` fields give.
-        let Some(mut record) = state.custom_detection_rule_associations.remove(&(
-            region.clone(),
-            input.rule_id.clone(),
-            current_mode,
-        )) else {
+        let Some(record) = state.detection_rule_association_mut(&region, &input.rule_id) else {
             debug_assert!(
                 false,
-                "an association resolved by id must be held under its own (region, rule, mode) key"
+                "an association resolved by id must be held under its own (region, rule) key"
             );
             return Err(not_found(&input.association_id));
         };
         record.mode = input.mode.clone();
         record.updated_at_millis = now;
-        // Put back under the mode the record now carries. No Region PARTITION is
-        // added — the record came out of this same Region — so the store bound
-        // `CreateCustomDetectionRuleAssociation` enforces cannot be crossed here.
-        state
-            .custom_detection_rule_associations
-            .insert((region, record.rule_id.clone(), record.mode.clone()), record);
+        // The expiry belongs to the MODE the association is in: a mode that stops
+        // evaluating a fixed interval after the association entered it reports that
+        // instant, and a move onto a mode that does not expire leaves nothing to
+        // report ([`crate::state::dry_run_association_expiry`]).
+        record.expires_at_millis = crate::state::dry_run_association_expiry(&input.mode, now);
 
         // `UpdateCustomDetectionRuleAssociationResponse` declares no members
         // (`smithy_query(operation="UpdateCustomDetectionRuleAssociation")`): the
@@ -248,10 +224,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// answered as the modelled shape rather than under the `BadRequestException`
 /// envelope this service's 400s use.
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
-
-/// The error CLASS a move onto an already-associated `(RuleId, Mode)` pair is named
-/// by — the modelled 409.
-const CONFLICT_EXCEPTION: &str = "ConflictException";
 
 /// Refuse an `(AssociationId, RuleId)` pair this account holds no association for
 /// with the modelled 404, carrying the message a read of the same absence answers

@@ -172,8 +172,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // selecting nothing is an empty page, not an error: this operation models no
         // `ResourceNotFoundException`.
         //
-        // The store is keyed `(region, RuleId, Mode)` and ordered by that key, so
-        // iterating it yields one Region's associations in `(RuleId, Mode)` order.
+        // The store is keyed `(region, RuleId)` and ordered by that key, so
+        // iterating it yields one Region's associations in `RuleId` order.
         // A TOTAL order is what makes a page token mean the same thing on the call
         // that handed it back.
         let selected: Vec<&crate::state::DetectionRuleAssociationRecord> = state
@@ -242,9 +242,9 @@ const MAX_ASSOCIATIONS_PER_PAGE: usize = 100;
 /// [`crate::state::custom_detection_rule_association_arn`], so a list and a read
 /// cannot report different ARNs for one association.
 ///
-/// `ExpiresAt` is the shape's only optional member and GuardDuty documents no
-/// lifetime for an association, so it is reported ABSENT rather than filled with an
-/// invented instant — exactly as
+/// `ExpiresAt` is the shape's only optional member and is read off the record, so
+/// the list reports the instant a mode that expires gives an association and
+/// nothing for one that does not — exactly as
 /// [`crate::state::detection_rule_association_view`] reports it.
 fn summary(record: &crate::state::DetectionRuleAssociationRecord) -> AssociationSummary {
     AssociationSummary {
@@ -258,7 +258,9 @@ fn summary(record: &crate::state::DetectionRuleAssociationRecord) -> Association
         mode: record.mode.clone(),
         created_at: ::aws_smithy_types::DateTime::from_millis(record.created_at_millis),
         updated_at: ::aws_smithy_types::DateTime::from_millis(record.updated_at_millis),
-        expires_at: None,
+        expires_at: record
+            .expires_at_millis
+            .map(::aws_smithy_types::DateTime::from_millis),
     }
 }
 

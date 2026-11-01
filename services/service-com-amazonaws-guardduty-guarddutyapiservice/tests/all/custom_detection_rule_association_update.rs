@@ -21,9 +21,10 @@
 //!    mode the association is already in changes nothing, which is what `@idempotent`
 //!    on this PUT (`smithy_query(operation="UpdateCustomDetectionRuleAssociation")`)
 //!    means observably.
-//! 3. `(RuleId, Mode)` identifies an association, so moving one onto a pair the
+//! 3. A rule carries at most ONE association, so a second create for a rule the
 //!    account already associated is refused with the modelled 409
-//!    `ConflictException` and leaves both associations as they were.
+//!    `ConflictException` whatever mode it names, while an update moves that one
+//!    association between the modes freely.
 //! 4. An `(AssociationId, RuleId)` pair the account holds no association for —
 //!    an id never minted, a real id under another published rule, or an association
 //!    made through another Region's endpoint — is refused with the modelled 404
@@ -362,47 +363,67 @@ async fn update_sets_the_mode_and_keeps_every_other_member() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 3: `(RuleId, Mode)` identifies an association, so a move onto a pair the
-// account already associated is the modelled conflict.
+// Rule 3: a rule carries at most one association, so the second CREATE is the
+// modelled conflict and the update is what moves the one association's mode.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn move_onto_an_associated_pair_is_refused_as_a_conflict() {
+async fn a_second_create_conflicts_where_the_update_moves_the_mode() {
     let router = new_router();
     let rules = published_rule_ids(&router).await;
 
-    // Both directions over two published rules: whichever of the two associations is
-    // moved, the pair it would land on is already taken.
+    // Both starting modes over two published rules: whichever mode the account
+    // associated a rule in, a create naming that rule again is the conflict and the
+    // update is what lands the other mode.
     for rule_id in rules.iter().take(2) {
         for mode in MODES {
             let router = new_router();
             let to = other_mode(mode);
-            let case = format!("{rule_id}: {mode} -> {to} already associated");
-            let moving = associate(&router, rule_id, mode, None).await;
-            let blocking = associate(&router, rule_id, to, None).await;
+            let case = format!("{rule_id}: associated {mode}, create again as {to}");
+            let association = associate(&router, rule_id, mode, None).await;
+            let before = read_association(&router, rule_id, &association, &case).await;
 
-            let before_moving = read_association(&router, rule_id, &moving, &case).await;
-            let before_blocking = read_association(&router, rule_id, &blocking, &case).await;
-
-            let (status, body) = update_association(&router, rule_id, &moving, to).await;
+            let (status, body) = call_in(
+                &router,
+                HOME_REGION,
+                "POST",
+                ASSOCIATIONS_PATH,
+                Some(json!({"ruleId": rule_id, "mode": to})),
+            )
+            .await;
             assert_modelled_error(&case, status, &body, CONFLICT, 409);
             let message = body["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message,
+                format!("Association already exists for rule {rule_id}"),
+                "case {case:?}: the conflict must name the rule the request carried, got {message:?}"
+            );
             assert!(
-                !message.contains(moving.as_str()) && !message.contains(blocking.as_str()),
-                "case {case:?}: a refusal must not echo the caller's value, got {message:?}"
+                !message.contains(association.as_str()),
+                "case {case:?}: a refusal must not echo a value the caller never sent, got {message:?}"
             );
 
-            // A refusal changes nothing: both associations still report the modes
-            // they were made in.
+            // A refusal changes nothing: the association still reports the mode it
+            // was made in.
             assert_eq!(
-                read_association(&router, rule_id, &moving, &case).await,
-                before_moving,
-                "case {case:?}: a refused update must leave the association it named alone"
+                read_association(&router, rule_id, &association, &case).await,
+                before,
+                "case {case:?}: a refused create must leave the association alone"
+            );
+
+            // The move the create may not make is exactly what the update makes.
+            let (status, body) = update_association(&router, rule_id, &association, to).await;
+            assert_empty_success(&case, status, &body);
+            let moved = read_association(&router, rule_id, &association, &case).await;
+            assert_eq!(
+                moved["ruleAssociation"]["mode"].as_str(),
+                Some(to),
+                "case {case:?}: the update must set the mode, got {moved:?}"
             );
             assert_eq!(
-                read_association(&router, rule_id, &blocking, &case).await,
-                before_blocking,
-                "case {case:?}: a refused update must leave the association it collided with alone"
+                listed_pairs(&router, HOME_REGION, &case).await,
+                vec![(rule_id.clone(), to.to_string())],
+                "case {case:?}: the rule must still carry exactly one association"
             );
         }
     }

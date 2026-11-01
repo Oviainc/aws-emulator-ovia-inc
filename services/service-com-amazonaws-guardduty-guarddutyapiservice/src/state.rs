@@ -124,27 +124,29 @@ pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// [`CustomDetectionRuleCatalog::default`].
     pub custom_detection_rules: CustomDetectionRuleCatalog,
     /// Every custom detection rule ASSOCIATION this account has made, keyed by
-    /// `(region, RuleId, Mode)`.
+    /// `(region, RuleId)`.
     ///
     /// An association binds a PUBLISHED rule
-    /// ([`Self::custom_detection_rules`]) to this account in one execution mode,
-    /// so `(RuleId, Mode)` identifies it: a second create for the same pair is the
-    /// `ConflictException` the operation models rather than a second record. The
-    /// `AssociationId` the model also carries is a minted handle onto that pair,
-    /// resolved by [`Self::detection_rule_association_by_id`].
+    /// ([`Self::custom_detection_rules`]) to this account, so the RULE identifies
+    /// it: a second create for a rule the account already associated is the
+    /// `ConflictException` the operation models rather than a second record,
+    /// whatever execution mode either names, and
+    /// `UpdateCustomDetectionRuleAssociation` is what moves the one association a
+    /// rule has between modes. The `AssociationId` the model also carries is a
+    /// minted handle onto that rule's association, resolved by
+    /// [`Self::detection_rule_association_by_id`].
     ///
     /// BOUNDED by construction: a Region holds at most one association per
-    /// published rule per `AssociationMode` member — a fixed catalogue times a
-    /// two-member enum — across at most [`MAX_DETECTION_RULE_REGIONS`] Regions,
-    /// which the create enforces before it writes
-    /// ([`Self::detection_rule_regions_exhausted`]). The `ClientToken` a create
-    /// carried lives ON the record rather than in an index of its own, so the
-    /// idempotency mappings are bounded by the same ceiling.
+    /// published rule — a fixed catalogue — across at most
+    /// [`MAX_DETECTION_RULE_REGIONS`] Regions, which the create enforces before it
+    /// writes ([`Self::detection_rule_regions_exhausted`]). The `ClientToken` a
+    /// create carried lives ON the record rather than in an index of its own, so
+    /// the idempotency mappings are bounded by the same ceiling.
     pub custom_detection_rule_associations:
-        BTreeMap<(String, String, String), DetectionRuleAssociationRecord>,
+        BTreeMap<(String, String), DetectionRuleAssociationRecord>,
     /// Every custom detection rule ORGANIZATION configuration this account has
-    /// created, keyed by `(region, RuleId, Mode)` — the same key, and for the same
-    /// reason, as [`Self::custom_detection_rule_associations`].
+    /// created, keyed by `(region, RuleId, Mode)` — the Region for the same reason
+    /// [`Self::custom_detection_rule_associations`] is keyed by it.
     ///
     /// Separate from the associations on purpose: an association enrolls THIS
     /// account in a rule, while an organization configuration says which member
@@ -975,40 +977,48 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
         !regions.contains(region) && regions.len() >= MAX_MALWARE_SCAN_REGIONS
     }
 
-    /// The association `region`'s endpoint holds for `(rule_id, mode)`, if any.
+    /// The association `region`'s endpoint holds for `rule_id`, if any.
     ///
-    /// Regional for the same reason a detector is: an association is made through
-    /// one Region's endpoint and only that endpoint reports it.
+    /// A rule carries at most ONE association per account, whatever mode it is in,
+    /// so this is both the duplicate check a create makes and the way the rule's
+    /// association is reached. Regional for the same reason a detector is: an
+    /// association is made through one Region's endpoint and only that endpoint
+    /// reports it.
     pub fn detection_rule_association(
         &self,
         region: &str,
         rule_id: &str,
-        mode: &str,
     ) -> Option<&DetectionRuleAssociationRecord> {
-        self.custom_detection_rule_associations.get(&(
-            region.to_string(),
-            rule_id.to_string(),
-            mode.to_string(),
-        ))
+        self.custom_detection_rule_associations
+            .get(&(region.to_string(), rule_id.to_string()))
+    }
+
+    /// [`Self::detection_rule_association`], for an operation that is going to
+    /// change the association it finds.
+    pub fn detection_rule_association_mut(
+        &mut self,
+        region: &str,
+        rule_id: &str,
+    ) -> Option<&mut DetectionRuleAssociationRecord> {
+        self.custom_detection_rule_associations
+            .get_mut(&(region.to_string(), rule_id.to_string()))
     }
 
     /// The association `region`'s endpoint holds under `association_id` for
     /// `rule_id`, if any.
     ///
-    /// The id is a handle onto the `(RuleId, Mode)` pair the record is keyed by,
-    /// so this resolves it by scanning that Region's associations: a Region holds
-    /// at most one per published rule per mode, so the scan is over a table of
-    /// fixed, single-digit-times-two length.
+    /// The id is a handle onto the rule's association, so this resolves it by
+    /// checking the entry that rule's key names: an id naming no association of
+    /// `rule_id` resolves to nothing, exactly as one naming no association at all
+    /// does.
     pub fn detection_rule_association_by_id(
         &self,
         region: &str,
         rule_id: &str,
         association_id: &str,
     ) -> Option<&DetectionRuleAssociationRecord> {
-        self.custom_detection_rule_associations
-            .values()
-            .filter(|record| record.region == region && record.rule_id == rule_id)
-            .find(|record| record.association_id == association_id)
+        self.detection_rule_association(region, rule_id)
+            .filter(|record| record.association_id == association_id)
     }
 
     /// The association `region`'s endpoint made under `token`, if a create
@@ -1088,8 +1098,9 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// than they will hold ([`MAX_DETECTION_RULE_REGIONS`])?
     ///
     /// The Region is request-chosen ([`request_region`]), so this is the bound on
-    /// the number of PARTITIONS that makes the per-Region ceiling — one record per
-    /// published rule per `AssociationMode` member — a bound on the whole store. A
+    /// the number of PARTITIONS that makes the per-Region ceiling — one association
+    /// per published rule, and one organization configuration per published rule
+    /// per `AssociationMode` member — a bound on the whole store. A
     /// Region the store already holds a record for is never refused by it, so the
     /// bound is invisible to a caller using the Regions AWS runs. Counted over
     /// BOTH maps, because both are keyed by the same request-chosen Region.
@@ -8589,18 +8600,28 @@ pub fn custom_detection_rule_not_found_message(rule_id: &str) -> String {
     format!("Rule not found: {rule_id}")
 }
 
+/// The FIXED resource path every custom-detection-rule ARN opens with: the
+/// resource type the ARN's own shape names (`DetectionRuleArn`), qualified by the
+/// `custom` family the rule belongs to, so a custom rule's ARN is never the ARN of
+/// a rule of another family.
+///
+/// One constant for the rule and for the associations hanging off it
+/// ([`custom_detection_rule_association_arn`]), so no operation can report a path
+/// another one does not.
+const CUSTOM_DETECTION_RULE_ARN_PATH: &str = "detection-rule/custom";
+
 /// The ARN of the custom detection rule `rule_id` as `region`'s endpoint reports
 /// it.
 ///
 /// Derived, never stored, exactly as [`malware_protection_plan_arn`] is: the rule's
 /// own id and the Region serving the read are the only variable parts, so a read
 /// cannot report an ARN that disagrees with the id it was asked about. The resource
-/// type is the one the ARN's own shape names (`DetectionRuleArn`).
+/// path is [`CUSTOM_DETECTION_RULE_ARN_PATH`] followed by the rule's own id.
 pub fn custom_detection_rule_arn(region: &str, rule_id: &str) -> String {
     ::engine::emulator_arn(
         GUARDDUTY_ARN_SERVICE,
         region,
-        &format!("detection-rule/{rule_id}"),
+        &format!("{CUSTOM_DETECTION_RULE_ARN_PATH}/{rule_id}"),
     )
 }
 
@@ -8655,8 +8676,9 @@ pub const ORG_CONFIGURATION_TRANSITION_MILLIS: i64 = 500;
 /// How many Regions this store will hold custom-detection-rule associations and
 /// organization configurations for.
 ///
-/// Per Region the records are bounded by construction — one per published rule
-/// per `AssociationMode` member — but the Region is read from the request's
+/// Per Region the records are bounded by construction — one association per
+/// published rule, and one organization configuration per published rule per
+/// `AssociationMode` member — but the Region is read from the request's
 /// credential scope ([`request_region`]), so the caller chooses the partition key:
 /// without a ceiling on the number of partitions a caller signing for invented
 /// Region names could make the process retain a full set per distinct Region
@@ -8686,10 +8708,11 @@ pub fn detection_rule_association_not_found_message(association_id: &str) -> Str
     format!("Association not found: {association_id}")
 }
 
-/// The message a second association for a `(RuleId, Mode)` pair the account has
-/// already associated is refused with — the `ConflictException` the create
-/// models. Creating is not updating: `UpdateCustomDetectionRuleAssociation` is
-/// the operation that changes an existing association's mode.
+/// The message a second association for a rule the account has already associated
+/// is refused with — the `ConflictException` the create models. Creating is not
+/// updating: `UpdateCustomDetectionRuleAssociation` is the operation that changes
+/// an existing association's mode, so the refusal holds whatever mode either call
+/// names.
 ///
 /// The conflict is about ONE rule, named by the `RuleId` the request carried, so
 /// GuardDuty echoes that id after a fixed prefix: a caller associating a batch of
@@ -8750,17 +8773,50 @@ pub const ORG_CONFIGURATION_ACCOUNT_SCOPE_MESSAGE: &str =
 /// Derived, never stored, exactly as [`custom_detection_rule_arn`] is: the ids and
 /// the Region serving the read are the only variable parts, so a read cannot
 /// report an ARN that disagrees with the ids it was asked about. The resource path
-/// extends the rule's own, because an association belongs to a rule.
+/// EXTENDS the rule's own — it is built from [`custom_detection_rule_arn`] rather
+/// than spelled again — because an association belongs to a rule.
 pub fn custom_detection_rule_association_arn(
     region: &str,
     rule_id: &str,
     association_id: &str,
 ) -> String {
-    ::engine::emulator_arn(
-        GUARDDUTY_ARN_SERVICE,
-        region,
-        &format!("detection-rule/{rule_id}/association/{association_id}"),
+    format!(
+        "{}/association/{association_id}",
+        custom_detection_rule_arn(region, rule_id)
     )
+}
+
+/// `AssociationMode`: the association evaluates the rule without producing
+/// findings — one of `LIVE | DRY_RUN`
+/// (`smithy_query(shape="AssociationMode")`).
+pub const ASSOCIATION_MODE_DRY_RUN: &str = "DRY_RUN";
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::ASSOCIATION_MODE_VALUES,
+    ASSOCIATION_MODE_DRY_RUN
+));
+
+/// How long after it enters [`ASSOCIATION_MODE_DRY_RUN`] an association stops
+/// evaluating its rule — fourteen days, the dry-run trial window GuardDuty gives
+/// an association it does not keep evaluating for ever.
+///
+/// Not a wait a caller asks for and not a status the clock moves: it is the
+/// instant `ExpiresAt` reports, so a caller can tell when a temporary association
+/// stops and schedule its renewal.
+pub const DRY_RUN_ASSOCIATION_LIFETIME_MILLIS: i64 = 14 * 24 * 60 * 60 * 1_000;
+
+/// When an association that entered `mode` at `since_millis` expires, or `None`
+/// for a mode that does not expire.
+///
+/// `ExpiresAt` is "the timestamp when the association expires"
+/// (`smithy_query(shape="AssociationDetail")`) and only a DRY_RUN association has
+/// one: a `LIVE` association evaluates its rule until the account deletes it, so
+/// there is no instant to report for it and the optional member stays absent.
+/// Stored on the record ([`DetectionRuleAssociationRecord::expires_at_millis`])
+/// rather than recomputed per read, so every read of one association reports the
+/// same instant.
+pub fn dry_run_association_expiry(mode: &str, since_millis: i64) -> Option<i64> {
+    (mode == ASSOCIATION_MODE_DRY_RUN)
+        .then(|| since_millis.saturating_add(DRY_RUN_ASSOCIATION_LIFETIME_MILLIS))
 }
 
 /// One custom detection rule association as the store holds it.
@@ -8790,6 +8846,10 @@ pub struct DetectionRuleAssociationRecord {
     /// The `ClientToken` the create carried, so a replay answers with this same
     /// association instead of making a second one.
     pub client_token: Option<String>,
+    /// When this association stops evaluating its rule, for a mode that expires —
+    /// [`dry_run_association_expiry`] of the instant it entered its current mode.
+    /// `None` for a mode that does not expire.
+    pub expires_at_millis: Option<i64>,
     pub created_at_millis: i64,
     pub updated_at_millis: i64,
 }
@@ -8842,9 +8902,9 @@ impl DetectionRuleOrgConfigurationRecord {
 /// `Arn` is DERIVED from the record's own ids and `region`, never stored.
 ///
 /// `ExpiresAt` is the shape's only optional member — "the timestamp when the
-/// association expires" (`smithy_query(shape="AssociationDetail")`) — and
-/// GuardDuty documents no lifetime for an association, so it is reported ABSENT
-/// rather than filled with an invented instant.
+/// association expires" (`smithy_query(shape="AssociationDetail")`) — and is read
+/// off the record, so it is reported for an association whose mode expires
+/// ([`dry_run_association_expiry`]) and absent for one that does not.
 pub fn detection_rule_association_view(
     record: &DetectionRuleAssociationRecord,
 ) -> crate::ops::types::AssociationDetail {
@@ -8860,7 +8920,9 @@ pub fn detection_rule_association_view(
         mode: record.mode.clone(),
         created_at: ::aws_smithy_types::DateTime::from_millis(record.created_at_millis),
         updated_at: ::aws_smithy_types::DateTime::from_millis(record.updated_at_millis),
-        expires_at: None,
+        expires_at: record
+            .expires_at_millis
+            .map(::aws_smithy_types::DateTime::from_millis),
     }
 }
 
@@ -9097,14 +9159,37 @@ impl PublishedRule {
 /// several services and tactics, and both a rule with Runtime Monitoring platform
 /// requirements and rules with none.
 ///
-/// The ids are this emulator's, because AWS publishes none the model or any
-/// response here names: an operation handed a `ruleId` from the real service — a
-/// `CreateCustomDetectionRuleAssociation`, say — answers the modelled "no such
-/// rule" rather than inventing a rule to match it, which is the correct answer for
-/// a rule this service does not publish. Should a recorded response ever expose the
-/// real catalogue, replace these rows with it; nothing outside this table names a
-/// rule.
+/// The ids are the ones GuardDuty's own catalogue carries where a response has
+/// exposed them, and this emulator's elsewhere: an operation handed a `ruleId`
+/// outside this table — a `CreateCustomDetectionRuleAssociation`, say — answers the
+/// modelled "no such rule" rather than inventing a rule to match it, which is the
+/// correct answer for a rule this service does not publish. Nothing outside this
+/// table names a rule.
 const PUBLISHED_CUSTOM_DETECTION_RULES: &[PublishedRule] = &[
+    PublishedRule {
+        rule_id: "admin-policy-attached-to-role",
+        name: "Administrator policy attached to an IAM role",
+        description: "Detects a policy granting administrator permissions being attached to an IAM role, which lets every principal that can assume the role control the account.",
+        severity: DETECTION_RULE_SEVERITY_HIGH,
+        data_source: DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL,
+        tactic: "Privilege Escalation",
+        technique: "T1098.003 Account Manipulation: Additional Cloud Roles",
+        service: "iam",
+        expression: "SELECT * FROM cloudtrail WHERE eventSource = 'iam.amazonaws.com' AND eventName IN ('AttachRolePolicy', 'PutRolePolicy') AND requestParameters.policyArn = 'arn:aws:iam::aws:policy/AdministratorAccess'",
+        runtime_platforms: &[],
+    },
+    PublishedRule {
+        rule_id: "admin-policy-attached-to-user",
+        name: "Administrator policy attached to an IAM user",
+        description: "Detects a policy granting administrator permissions being attached to an IAM user, which hands that user full control of the account.",
+        severity: DETECTION_RULE_SEVERITY_HIGH,
+        data_source: DETECTION_RULE_DATA_SOURCE_CLOUD_TRAIL,
+        tactic: "Privilege Escalation",
+        technique: "T1098.003 Account Manipulation: Additional Cloud Roles",
+        service: "iam",
+        expression: "SELECT * FROM cloudtrail WHERE eventSource = 'iam.amazonaws.com' AND eventName IN ('AttachUserPolicy', 'PutUserPolicy') AND requestParameters.policyArn = 'arn:aws:iam::aws:policy/AdministratorAccess'",
+        runtime_platforms: &[],
+    },
     PublishedRule {
         rule_id: "cloudtrail-logging-disabled",
         name: "CloudTrail logging disabled",

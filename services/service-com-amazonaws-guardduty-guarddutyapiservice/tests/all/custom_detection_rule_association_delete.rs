@@ -355,34 +355,37 @@ async fn a_delete_removes_the_association_the_labels_identify() {
 // Rule 2: the delete removes nothing but the association it names.
 // ---------------------------------------------------------------------------
 
-/// With both modes of two rules associated, one Region over from a third
-/// association and an organization configuration for the target pair, deleting one
-/// association leaves every other resource byte-for-byte as it was — asserted for
+/// With two rules associated through this Region's endpoint, one Region over from a
+/// third association and an organization configuration for the target pair, deleting
+/// one association leaves every other resource byte-for-byte as it was — asserted for
 /// every association in turn, each over a store of its own.
 #[tokio::test]
 async fn a_delete_removes_only_the_association_it_names() {
     let catalogue = published_rule_ids(&new_router()).await;
     let rules = [catalogue[0].clone(), catalogue[1].clone()];
 
-    for target_rule in &rules {
-        for target_mode in MODES {
+    for (target_index, target_rule) in rules.iter().enumerate() {
+        // A rule carries at most one association, so each round associates every
+        // rule in ONE mode; the offset rotates which mode each rule takes, so the
+        // table still spans both modes for every target.
+        for offset in 0..MODES.len() {
+            let target_mode = MODES[(target_index + offset) % MODES.len()];
             let case = format!("deleting {target_rule}/{target_mode}");
             let router = new_router();
 
-            // Every (rule, mode) pair of two rules through this Region's endpoint,
-            // each with tags of its own so a mix-up between them would show.
+            // Both rules through this Region's endpoint, each with tags of its own
+            // so a mix-up between them would show.
             let mut made: Vec<(String, &str, String)> = Vec::new();
             for (rule_index, rule_id) in rules.iter().enumerate() {
-                for (mode_index, mode) in MODES.iter().enumerate() {
-                    let association_id = associate(
-                        &router,
-                        rule_id,
-                        mode,
-                        Some(json!({"tags": {"slot": format!("{rule_index}-{mode_index}")}})),
-                    )
-                    .await;
-                    made.push((rule_id.clone(), mode, association_id));
-                }
+                let mode = MODES[(rule_index + offset) % MODES.len()];
+                let association_id = associate(
+                    &router,
+                    rule_id,
+                    mode,
+                    Some(json!({"tags": {"slot": format!("{rule_index}-{offset}")}})),
+                )
+                .await;
+                made.push((rule_id.clone(), mode, association_id));
             }
             // One more through ANOTHER Region's endpoint, over the pair this case
             // deletes: an association belongs to the Region that made it.
@@ -695,13 +698,13 @@ async fn a_deleted_associations_client_token_stops_replaying() {
                 "case {case:?}: the re-create associates the pair it named, got {detail:?}"
             );
 
-            // The other mode was never associated here, so it is still free and the
-            // delete above did not touch it.
-            let free = other_mode(mode);
-            let other = associate(&router, &rule_id, free, None).await;
+            // Another published rule was never associated here, so it is still free
+            // and the delete above did not touch it.
+            let free_rule = catalogue[(index + 1) % catalogue.len()].clone();
+            let other = associate(&router, &free_rule, other_mode(mode), None).await;
             assert_ne!(
                 other, remade,
-                "case {case:?}: the other mode is its own association, got {other}"
+                "case {case:?}: another rule's association is its own, got {other}"
             );
         }
     }

@@ -29,6 +29,8 @@ mod coverage_listing;
 mod coverage_statistics;
 #[path = "all/criterion_value_domain.rs"]
 mod criterion_value_domain;
+#[path = "all/custom_detection_rule_association_arn_and_expiry.rs"]
+mod custom_detection_rule_association_arn_and_expiry;
 #[path = "all/custom_detection_rule_association_delete.rs"]
 mod custom_detection_rule_association_delete;
 #[path = "all/custom_detection_rule_association_listing.rs"]

@@ -1024,8 +1024,10 @@ async fn associating_an_unpublished_rule_is_refused_with_the_modelled_404() {
 
     // A published rule IS associable, in either mode, and the association reads back
     // through `GetCustomDetectionRuleAssociation` with the values the create minted.
-    for mode in MODES {
-        let rule_id = &published[0];
+    // A rule carries at most one association, so each mode takes a published rule of
+    // its own.
+    for (index, mode) in MODES.iter().enumerate() {
+        let rule_id = &published[index % published.len()];
         let case = format!("published ruleId {rule_id:?} in mode {mode}");
         let (status, created) = create_association(
             &router,
