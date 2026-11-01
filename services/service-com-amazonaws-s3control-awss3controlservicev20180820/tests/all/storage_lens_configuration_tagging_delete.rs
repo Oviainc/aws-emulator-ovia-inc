@@ -24,7 +24,7 @@
 use crate::access_point_lifecycle::{Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION};
 use crate::storage_lens_configuration::{
     documents, get_configuration, get_tagging, put_configuration, put_tagging, reported_tags,
-    sorted, sorted_leaves, tag, tag_sets, Document,
+    sorted, sorted_leaves, tag, tag_sets, Document, NO_CONTENT,
 };
 
 /// No tag at all, as a tagging read reports it.
@@ -54,9 +54,8 @@ async fn tagged_configuration(
 ) {
     let put = put_configuration(emulator, account_id, config_id, document, Some(tags)).await;
     assert_eq!(
-        put.status,
-        200,
-        "setting up {config_id:?}: expected 200 from the put, got {} {}",
+        put.status, NO_CONTENT,
+        "setting up {config_id:?}: expected {NO_CONTENT} from the put, got {} {}",
         put.status,
         put.body
     );
@@ -80,9 +79,8 @@ async fn a_delete_removes_the_whole_tag_set_and_leaves_the_configuration() {
 
         let deleted = delete_tagging(&emulator, ACCOUNT, &config_id).await;
         assert_eq!(
-            deleted.status,
-            200,
-            "case {case:?}: expected 200 from the tagging delete, got {} {}",
+            deleted.status, NO_CONTENT,
+            "case {case:?}: expected {NO_CONTENT} from the tagging delete, got {} {}",
             deleted.status,
             deleted.body
         );
@@ -130,9 +128,8 @@ async fn repeating_the_delete_is_the_same_answer_and_a_later_put_starts_from_emp
         for attempt in 1..=3 {
             let deleted = delete_tagging(&emulator, ACCOUNT, &config_id).await;
             assert_eq!(
-                deleted.status,
-                200,
-                "case {case:?} (delete {attempt}): expected 200, got {} {}",
+                deleted.status, NO_CONTENT,
+                "case {case:?} (delete {attempt}): expected {NO_CONTENT}, got {} {}",
                 deleted.status,
                 deleted.body
             );
@@ -150,9 +147,8 @@ async fn repeating_the_delete_is_the_same_answer_and_a_later_put_starts_from_emp
         let replacement = vec![tag("after", "delete"), tag("set", "")];
         let put = put_tagging(&emulator, ACCOUNT, &config_id, &replacement).await;
         assert_eq!(
-            put.status,
-            200,
-            "case {case:?}: expected 200 re-tagging after the delete, got {} {}",
+            put.status, NO_CONTENT,
+            "case {case:?}: expected {NO_CONTENT} re-tagging after the delete, got {} {}",
             put.status,
             put.body
         );
@@ -193,9 +189,8 @@ async fn a_delete_touches_only_the_configuration_the_request_names() {
 
     let deleted = delete_tagging(&emulator, ACCOUNT, config_id).await;
     assert_eq!(
-        deleted.status,
-        200,
-        "expected 200 from the tagging delete, got {} {}",
+        deleted.status, NO_CONTENT,
+        "expected {NO_CONTENT} from the tagging delete, got {} {}",
         deleted.status,
         deleted.body
     );

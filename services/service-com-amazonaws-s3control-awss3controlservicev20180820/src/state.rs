@@ -360,6 +360,16 @@ pub const STORAGE_LENS_CONFIGURATION_QUOTA: usize = 1_000;
 /// maximum of 50 tags."
 pub const MAX_STORAGE_LENS_TAGS: usize = 50;
 
+/// The status an operation of the S3 Storage Lens configuration surface whose
+/// response carries NO document answers a success with: `204 No Content`.
+///
+/// The model's `http.code` for each of them is 200, which is stale for a member
+/// that carries no body — the wire answers No Content, which is what a client
+/// distinguishing the two reads "there is no document to parse" from. The
+/// operations that DO report a document (the configuration and its tag set)
+/// keep the modelled 200, because they answer one.
+pub const NO_CONTENT_SUCCESS_STATUS: u16 = 204;
+
 /// How many entries one page of `ListStorageLensConfigurations` carries.
 ///
 /// The operation is `@paginated` and its request models NO page-size member, so
@@ -2601,6 +2611,31 @@ pub fn valid_access_point_name(name: &str) -> bool {
         && !name.ends_with(ALIAS_TAIL)
 }
 
+/// The characters a Storage Lens configuration id can be ADDRESSED with: the
+/// ASCII letters and digits, the hyphen and the underscore.
+///
+/// The modelled `ConfigId` pattern (`^[a-zA-Z0-9\-\_\.]+$`) also admits the
+/// dot, but the id is read out of the request path before any operation is
+/// named and a segment carrying a dot is not one the wire reads as a
+/// configuration id at all — so the ids the model admits and the ids a URI can
+/// carry are two different sets, and this is the narrower one.
+fn storage_lens_config_id_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+}
+
+/// Whether `config_id` is one the wire can ADDRESS a Storage Lens
+/// configuration by.
+///
+/// Read off the request path by `crate::service::envelope` before an operation
+/// is named — exactly as [`addressable_access_point_name`] is one resource over
+/// — so an id the path cannot carry is answered [`INVALID_URI_CODE`] before any
+/// configuration is read, written or deleted. The id's remaining rule, its
+/// length, is the one the model states (`ConfigId` is 1..64) and is held
+/// against the parsed member by the request boundary.
+pub fn addressable_storage_lens_config_id(config_id: &str) -> bool {
+    !config_id.is_empty() && config_id.chars().all(storage_lens_config_id_character)
+}
+
 /// The ARN of an S3 Storage Lens configuration.
 ///
 /// `StorageLensConfiguration$StorageLensArn` documents the member as read-only
@@ -3165,26 +3200,155 @@ pub fn no_such_storage_lens_configuration<E>() -> crate::scaffolded::Scaffolded<
     )
 }
 
-/// `InvalidRequestException` (HTTP 400): a `PutStorageLensConfiguration` whose
-/// URI names one configuration id and whose document names another.
+/// `InvalidIncludeExcludeContainers` (HTTP 400): the submitted S3 Storage Lens
+/// document carries an `Include` container and an `Exclude` container at once.
 ///
-/// Both members are documented as the id OF the S3 Storage Lens configuration
-/// (`PutStorageLensConfigurationRequest$ConfigId`, `StorageLensConfiguration$Id`),
-/// so a request carrying two different ids names no one configuration. The code
-/// and status are this service's own modelled `InvalidRequestException`
-/// (`com.amazonaws.s3control#InvalidRequestException`, a 400 client error),
-/// which this operation's model does not list.
-pub fn storage_lens_configuration_id_mismatch<E>(
-    config_id: &str,
-    document_id: &str,
+/// The model documents the rule on the member itself
+/// (`StorageLensConfiguration$Include`: "This container can only be valid if
+/// there is no `Exclude` container submitted, and it's not empty"), and the two
+/// containers scope the same configuration in opposite directions — so a
+/// document submitting both scopes it two ways and names no one scope.
+///
+/// The message is fixed text, naming neither container's contents: it is what
+/// the service answers for every document that carries the pair.
+pub fn invalid_include_exclude_containers<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "InvalidIncludeExcludeContainers",
+        400,
+        "Only one of Include or Exclude should be present.".to_string(),
+    )
+}
+
+/// A family of S3 Storage Lens metrics that `AccountLevel` and `BucketLevel`
+/// BOTH declare a container for.
+///
+/// The two containers declare the same five metric members
+/// (`smithy_query(query="shape",shape="AccountLevel,BucketLevel")`), and
+/// `AccountLevel` documents the rule that spans them: "You must enable Storage
+/// Lens metrics consistently at both the account level and bucket level, or
+/// your request will fail." This is the one place that set and the words each
+/// member is refused in are written down, so the rule is stated once for every
+/// family rather than once per family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageLensMetrics {
+    Activity,
+    AdvancedCostOptimization,
+    AdvancedDataProtection,
+    DetailedStatusCodes,
+    AdvancedPerformance,
+}
+
+impl StorageLensMetrics {
+    /// Every family the rule spans, in the order `AccountLevel` declares them.
+    pub const ALL: [Self; 5] = [
+        Self::Activity,
+        Self::AdvancedCostOptimization,
+        Self::AdvancedDataProtection,
+        Self::DetailedStatusCodes,
+        Self::AdvancedPerformance,
+    ];
+
+    /// The member both containers declare this family under.
+    pub fn member(self) -> &'static str {
+        match self {
+            Self::Activity => "ActivityMetrics",
+            Self::AdvancedCostOptimization => "AdvancedCostOptimizationMetrics",
+            Self::AdvancedDataProtection => "AdvancedDataProtectionMetrics",
+            Self::DetailedStatusCodes => "DetailedStatusCodesMetrics",
+            Self::AdvancedPerformance => "AdvancedPerformanceMetrics",
+        }
+    }
+
+    /// The wire `<Code>` of [`missing_bucket_level_metrics`] for this family:
+    /// what is missing, and the member it is missing from.
+    pub fn missing_bucket_level_code(self) -> &'static str {
+        match self {
+            Self::Activity => "MissingBucketLevelActivityMetrics",
+            Self::AdvancedCostOptimization => "MissingBucketLevelAdvancedCostOptimizationMetrics",
+            Self::AdvancedDataProtection => "MissingBucketLevelAdvancedDataProtectionMetrics",
+            Self::DetailedStatusCodes => "MissingBucketLevelDetailedStatusCodesMetrics",
+            Self::AdvancedPerformance => "MissingBucketLevelAdvancedPerformanceMetrics",
+        }
+    }
+
+    /// The words a refusal names this family in: the member read as prose, as
+    /// a sentence opens.
+    pub fn words(self) -> &'static str {
+        match self {
+            Self::Activity => "Activity metrics",
+            Self::AdvancedCostOptimization => "Advanced cost optimization metrics",
+            Self::AdvancedDataProtection => "Advanced data protection metrics",
+            Self::DetailedStatusCodes => "Detailed status codes metrics",
+            Self::AdvancedPerformance => "Advanced performance metrics",
+        }
+    }
+}
+
+/// `MissingBucketLevel<Metrics>` (HTTP 400): the submitted document enables a
+/// metric family for the account and does not enable it for the buckets under
+/// it.
+///
+/// The rule is the one `AccountLevel` documents — metrics are enabled
+/// "consistently at both the account level and bucket level, or your request
+/// will fail" — so the same refusal is answered for every family both
+/// containers declare ([`StorageLensMetrics`]), each naming its own family in
+/// the code and in the sentence: what must be enabled where, opening with the
+/// family and closing with the level it was enabled at.
+pub fn missing_bucket_level_metrics<E>(
+    family: StorageLensMetrics,
 ) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
-        "InvalidRequestException",
+        family.missing_bucket_level_code(),
         400,
         format!(
-            "ConfigId is {config_id} but the submitted StorageLensConfiguration's Id is \
-             {document_id}; they must name the same configuration."
+            "{words} must be enabled at bucket level when {spoken} is enabled at account level",
+            words = family.words(),
+            spoken = family.words().to_lowercase(),
         ),
+    )
+}
+
+/// `MalformedXML` (HTTP 400): the document a Storage Lens configuration
+/// request carried is not one this service can take — it is not a document the
+/// protocol can read, or it breaks a rule the shape it is read into states.
+///
+/// Answered by `crate::service::envelope` for a request that surface's
+/// boundary refused over the document it carried, so a caller sees one refusal
+/// for a document the service will not take whatever part of it was wrong.
+///
+/// The wire `<Code>` a client branches on.
+pub const MALFORMED_XML_CODE: &str = "MalformedXML";
+
+/// The HTTP status of a [`MALFORMED_XML_CODE`] refusal.
+pub const MALFORMED_XML_STATUS: u16 = 400;
+
+/// The message of a [`MALFORMED_XML_CODE`] refusal: fixed text, naming neither
+/// the member nor the value that caused it.
+pub const MALFORMED_XML_MESSAGE: &str =
+    "The XML you provided was not well-formed or did not validate against our published schema";
+
+/// A [`MALFORMED_XML_CODE`] refusal, for a handler that READ the document and
+/// will not take it.
+///
+/// The same refusal the request boundary's is restated as
+/// (`crate::service::envelope`): a document the Storage Lens configuration
+/// surface will not take is one refusal whatever part of it the service could
+/// not take — a body it could not parse, a value breaking a rule its shape
+/// states, or a document whose own `Id` is not the configuration the URI
+/// addresses (`PutStorageLensConfigurationRequest$ConfigId` and
+/// `StorageLensConfiguration$Id` are both documented as the id OF the
+/// configuration, so a document naming another one does not describe the
+/// configuration the request addresses).
+///
+/// A document the service DID take and whose values break a rule it documents
+/// elsewhere is a different answer, under that rule's own code — see
+/// [`invalid_include_exclude_containers`] and
+/// [`missing_bucket_level_metrics`].
+pub fn malformed_storage_lens_document<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        MALFORMED_XML_CODE,
+        MALFORMED_XML_STATUS,
+        MALFORMED_XML_MESSAGE,
     )
 }
 
@@ -3263,9 +3427,7 @@ pub fn storage_lens_group_already_exists<E>(name: &str) -> crate::scaffolded::Sc
 /// is the group's identity — it is what the store keys a record by and what the
 /// read-only `StorageLensGroupArn` is built from — so a request carrying two
 /// different names names no one group, and an update is not a rename. The code
-/// and status are the ones this service already answers the same disagreement
-/// one resource over with (see [`storage_lens_configuration_id_mismatch`]):
-/// this service's own modelled `InvalidRequestException`
+/// and status are this service's own modelled `InvalidRequestException`
 /// (`com.amazonaws.s3control#InvalidRequestException`, a 400 client error),
 /// which this operation's model does not list.
 pub fn storage_lens_group_name_mismatch<E>(

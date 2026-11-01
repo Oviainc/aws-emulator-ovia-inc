@@ -59,6 +59,8 @@ mod state_roundtrip;
 mod storage_lens_configuration;
 #[path = "all/storage_lens_configuration_delete.rs"]
 mod storage_lens_configuration_delete;
+#[path = "all/storage_lens_configuration_envelope.rs"]
+mod storage_lens_configuration_envelope;
 #[path = "all/storage_lens_configuration_list.rs"]
 mod storage_lens_configuration_list;
 #[path = "all/storage_lens_configuration_tagging_delete.rs"]

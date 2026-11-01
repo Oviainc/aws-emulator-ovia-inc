@@ -92,6 +92,11 @@ pub struct PutStorageLensConfigurationOutput;
 impl PutStorageLensConfigurationOutput {
     // `with_http` carries this operation's modelled response status. Remove it and
     // the status falls back to the protocol default, so a modelled 204 answers 200.
+    //
+    // The status here is 204 rather than the model's 200: this member carries no
+    // document at all, and a stored configuration is answered No Content on the
+    // wire. See `SUCCESS_STATUS` below, which is the status the response is
+    // actually built with.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
@@ -100,7 +105,7 @@ impl PutStorageLensConfigurationOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "PUT",
         "/v20180820/storagelens/{ConfigId}",
-        Some(200u16),
+        Some(crate::state::NO_CONTENT_SUCCESS_STATUS),
     ));
 }
 
@@ -164,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "PutStorageLensConfiguration";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_STORAGE_LENS_CONFIGURATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = PUT_STORAGE_LENS_CONFIGURATION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,
@@ -177,13 +182,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut configuration = input.storage_lens_configuration;
         // The URI's `ConfigId` and the document's `Id` are both documented as the
-        // id of the Storage Lens configuration, so a request naming two different
-        // ids names no one configuration.
+        // id of the Storage Lens configuration, so a document naming another id
+        // does not describe the configuration the request addresses: it is a
+        // document this surface will not take, which is the one refusal it
+        // answers for every such document.
         if configuration.id != input.config_id {
-            return Err(crate::state::storage_lens_configuration_id_mismatch(
-                &input.config_id,
-                &configuration.id,
-            ));
+            return Err(crate::state::malformed_storage_lens_document());
+        }
+
+        // `Include` and `Exclude` scope the same configuration in opposite
+        // directions, and the model documents that an `Include` "can only be
+        // valid if there is no Exclude container submitted", so a document
+        // carrying both names no one scope and is refused before anything is
+        // stored.
+        if configuration.include.is_some() && configuration.exclude.is_some() {
+            return Err(crate::state::invalid_include_exclude_containers());
+        }
+
+        // Every metric family the account level and the bucket level both
+        // declare has to be asked for consistently: `AccountLevel` documents
+        // that "You must enable Storage Lens metrics consistently at both the
+        // account level and bucket level, or your request will fail", so a
+        // document enabling a family for the ACCOUNT without enabling it for
+        // the buckets under it is refused before anything is stored. Each
+        // family is read from the one container pair that declares it, in the
+        // order `AccountLevel` declares them.
+        let account_level = &configuration.account_level;
+        let bucket_level = &account_level.bucket_level;
+        let asked_for = |enabled: Option<bool>| enabled == Some(true);
+        for family in crate::state::StorageLensMetrics::ALL {
+            let (at_account, at_bucket) = match family {
+                crate::state::StorageLensMetrics::Activity => (
+                    account_level.activity_metrics.as_ref().map(|m| m.is_enabled),
+                    bucket_level.activity_metrics.as_ref().map(|m| m.is_enabled),
+                ),
+                crate::state::StorageLensMetrics::AdvancedCostOptimization => (
+                    account_level
+                        .advanced_cost_optimization_metrics
+                        .as_ref()
+                        .map(|m| m.is_enabled),
+                    bucket_level
+                        .advanced_cost_optimization_metrics
+                        .as_ref()
+                        .map(|m| m.is_enabled),
+                ),
+                crate::state::StorageLensMetrics::AdvancedDataProtection => (
+                    account_level
+                        .advanced_data_protection_metrics
+                        .as_ref()
+                        .map(|m| m.is_enabled),
+                    bucket_level
+                        .advanced_data_protection_metrics
+                        .as_ref()
+                        .map(|m| m.is_enabled),
+                ),
+                crate::state::StorageLensMetrics::DetailedStatusCodes => (
+                    account_level
+                        .detailed_status_codes_metrics
+                        .as_ref()
+                        .map(|m| m.is_enabled),
+                    bucket_level
+                        .detailed_status_codes_metrics
+                        .as_ref()
+                        .map(|m| m.is_enabled),
+                ),
+                crate::state::StorageLensMetrics::AdvancedPerformance => (
+                    account_level
+                        .advanced_performance_metrics
+                        .as_ref()
+                        .map(|m| m.is_enabled),
+                    bucket_level
+                        .advanced_performance_metrics
+                        .as_ref()
+                        .map(|m| m.is_enabled),
+                ),
+            };
+            if asked_for(at_account) && !asked_for(at_bucket) {
+                return Err(crate::state::missing_bucket_level_metrics(family));
+            }
         }
 
         let tags = input.tags;

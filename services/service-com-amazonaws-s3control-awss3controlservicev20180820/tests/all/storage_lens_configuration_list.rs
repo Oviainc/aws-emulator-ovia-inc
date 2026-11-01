@@ -12,7 +12,8 @@
 //! token answers the same page.
 //!
 //! Every row below differs along something that rule generalises over: how long
-//! a configuration id is and which of the characters its pattern allows it uses,
+//! a configuration id is and which of the characters the wire can address it by
+//! it uses,
 //! whether the configuration is enabled, which Region the put was signed for,
 //! which account owns it, the order the configurations were put in (which is not
 //! the order they are listed in), how many configurations there are either side
@@ -26,7 +27,7 @@
 use crate::access_point_lifecycle::{
     call_in_region, Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION, XMLNS,
 };
-use crate::storage_lens_configuration::{document_xml, leaf, leaves_of, Leaf};
+use crate::storage_lens_configuration::{document_xml, leaf, leaves_of, Leaf, NO_CONTENT};
 use std::collections::BTreeSet;
 
 /// How many entries one page carries — the page size the service itself fixes,
@@ -191,14 +192,14 @@ fn cases() -> Vec<Case> {
             region: THIRD_REGION,
         },
         Case {
-            case: "an id carrying every allowed character class",
-            config_id: "MixedCase.Id-With_Every.Allowed-Character_0123456789".to_string(),
+            case: "an id carrying every addressable character class",
+            config_id: "MixedCase_Id-With_Every-Addressable-Character_0123456789".to_string(),
             is_enabled: true,
             region: THIRD_REGION,
         },
         Case {
-            case: "a dotted id in another region",
-            config_id: "reports.daily".to_string(),
+            case: "an underscored id in another region",
+            config_id: "reports-daily".to_string(),
             is_enabled: true,
             region: OTHER_REGION,
         },
@@ -278,8 +279,8 @@ async fn put_every_case(emulator: &Emulator, cases: &[Case]) {
             put_configuration(emulator, case.region, ACCOUNT, &case.config_id, case.is_enabled)
                 .await;
         assert_eq!(
-            put.status, 200,
-            "case {:?}: expected the put to be accepted with 200, got {} {}",
+            put.status, NO_CONTENT,
+            "case {:?}: expected the put to be accepted with {NO_CONTENT}, got {} {}",
             case.case, put.status, put.body
         );
     }
@@ -320,7 +321,7 @@ async fn a_list_reports_one_entry_per_configuration_the_account_holds() {
         put_configuration(&emulator, REGION, OTHER_ACCOUNT, &cases[0].config_id, false)
             .await
             .status,
-        200,
+        NO_CONTENT,
         "expected the other account's put to be accepted"
     );
 
@@ -383,8 +384,8 @@ async fn a_replacing_put_changes_the_entry_the_configuration_is_listed_with() {
     ] {
         let put = put_configuration(&emulator, region, ACCOUNT, config_id, is_enabled).await;
         assert_eq!(
-            put.status, 200,
-            "case {case:?}: expected the put to be accepted with 200, got {} {}",
+            put.status, NO_CONTENT,
+            "case {case:?}: expected the put to be accepted with {NO_CONTENT}, got {} {}",
             put.status, put.body
         );
 
@@ -415,8 +416,8 @@ async fn a_list_pages_through_every_configuration_and_a_token_names_a_position()
     for (index, id) in ids.iter().enumerate() {
         let put = put_configuration(&emulator, REGION, ACCOUNT, id, index % 2 == 0).await;
         assert_eq!(
-            put.status, 200,
-            "case {id:?}: expected the put to be accepted with 200, got {} {}",
+            put.status, NO_CONTENT,
+            "case {id:?}: expected the put to be accepted with {NO_CONTENT}, got {} {}",
             put.status, put.body
         );
     }

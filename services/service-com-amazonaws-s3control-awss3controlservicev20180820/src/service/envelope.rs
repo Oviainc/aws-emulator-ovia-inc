@@ -41,7 +41,22 @@
 //!   against a shape, and every token that resolves to nothing is the same
 //!   not-found answer whatever its text. A client polling an operation by a
 //!   token it did not construct then sees the 404 that means "unknown", not a
-//!   400 it reads as its own bug.
+//!   400 it reads as its own bug;
+//! * a request addressing a Storage Lens configuration by an id the wire cannot
+//!   carry is answered as a URI this service could not parse, before an
+//!   operation is named and so before anything is read, written or deleted.
+//!
+//! Not every failure travels in the wrapped envelope: the Storage Lens
+//! CONFIGURATION surface answers the refusals of its OWN resource in the FLAT
+//! document `<Error><Code/><Message/>[<member/>…]<RequestId/><HostId/></Error>`
+//! — one element, no `<ErrorResponse>` root and no `<Type>`, with the
+//! correlation pair INSIDE it — which is what a client reads the code out of
+//! there. [`Envelope`] is which of the two a failure travels in, and it is
+//! decided from the request PATH rather than from the operation, so a failure
+//! answered before an operation is named travels in the same envelope as one a
+//! handler raised. A request whose URI this service could not PARSE is the one
+//! exception: it addresses no resource at all, so it is stated in the service's
+//! own envelope whatever path it carried.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema_server::xml_escape;
@@ -77,6 +92,14 @@ const ERROR_RESPONSE_CLOSE: &str = "</ErrorResponse>";
 /// `<Error><Type>`: a 4xx is the caller's fault, which restXml words `Sender`.
 const SENDER: &str = "Sender";
 
+/// The element a failure is stated in: the one the wrapped envelope holds, and
+/// the root of the flat document.
+const ERROR_ELEMENT: &str = "Error";
+
+/// The element the wrapped envelope states which side is at fault in
+/// ([`SENDER`]), and the flat document does not carry at all.
+const TYPE_ELEMENT: &str = "Type";
+
 /// The error code the framework names a request it refused before any handler
 /// ran. Not a shape this service's model declares, which is why a response
 /// carrying it is a refusal to restate rather than an S3 Control error.
@@ -89,6 +112,21 @@ const REFUSED: u16 = 400;
 /// the protocol's own serializer never writes — see [`framework_refusal`].
 const XML_DECLARATION: &str = "<?xml";
 
+/// The path segment every route of this service is bound under: each route's
+/// `http.uri` begins with it (`smithy_query(query="digest")`). A refusal the
+/// Storage Lens surface answers names the resource path the request addressed
+/// UNDER it, which is what [`addressed_resource`] takes off.
+const API_VERSION_PREFIX: &str = "/v20180820/";
+
+/// The resource a Storage Lens CONFIGURATION is addressed as, under
+/// [`API_VERSION_PREFIX`]: `GET /v20180820/storagelens/{ConfigId}` and its
+/// `/tagging` sub-resource, so the segment after this prefix is the
+/// configuration id (`smithy_query(query="digest")`). The prefix ends in a
+/// separator, so the Storage Lens GROUP routes under
+/// `/v20180820/storagelensgroup` — a different resource, with its own name
+/// rules and its own envelope — are not in this space.
+const STORAGE_LENS_CONFIGURATION_RESOURCE: &str = "storagelens/";
+
 /// The path space the asynchronous Multi-Region Access Point request
 /// operations are bound under: `DescribeMultiRegionAccessPointOperation` is
 /// `GET /v20180820/async-requests/mrap/{RequestTokenARN+}`, so a GET under this
@@ -100,6 +138,13 @@ const ASYNC_REQUEST_PATH: &str = "/v20180820/async-requests/mrap/";
 /// (`Value '<x>' at '<member>' failed to satisfy constraint: …`) — the member
 /// path of `DescribeMultiRegionAccessPointOperationRequest$RequestTokenARN`.
 const REQUEST_TOKEN_MEMBER: &str = "requestTokenARN";
+
+/// The members a request's own ADDRESS is read from, as a refusal names them:
+/// the configuration id its path carries and the account id its header carries
+/// (`PutStorageLensConfigurationRequest$ConfigId` is an `@httpLabel` and
+/// `$AccountId` an `@httpHeader`, per `smithy_query(query="operation")`),
+/// spelled as the request boundary states a member path.
+const ADDRESS_MEMBERS: [&str; 2] = ["configId", "accountId"];
 
 /// The path space an access point is addressed in: every route that names one
 /// is `/v20180820/accesspoint/{Name}` or a sub-resource of it
@@ -148,14 +193,72 @@ fn body_text(resp: &RtResponse) -> Option<&str> {
     std::str::from_utf8(resp.body().bytes()?).ok()
 }
 
-/// The text of the first `<name>` element of `document`.
+/// The content of the first `<name>` element of `document`.
 ///
-/// Enough for the envelope's own flat elements (`Code`, `Message`), which is
-/// all this module reads: the documents it reads are the ones this service just
-/// serialized.
+/// Enough for the envelope's own flat elements (`Code`, `Message`) and for its
+/// one nesting level (the `Error` element, whose content is the markup of
+/// everything the failure states), which is all this module reads: the
+/// documents it reads are the ones this service just serialized.
 fn element_text<'a>(document: &'a str, name: &str) -> Option<&'a str> {
     let after_open = document.split_once(&format!("<{name}>"))?.1;
     Some(after_open.split_once(&format!("</{name}>"))?.0)
+}
+
+/// `document` without the `<name>` element it carries, and unchanged when it
+/// carries none.
+///
+/// What re-rooting a finished failure document drops: the elements the flat
+/// form states elsewhere or not at all ([`as_flat_error`]). Removing an element
+/// it does not carry is a no-op, which is what makes re-rooting a document
+/// already in that form leave it alone.
+fn without_element(document: &str, name: &str) -> String {
+    match element_text(document, name) {
+        Some(text) => document.replace(&format!("<{name}>{text}</{name}>"), ""),
+        None => document.to_string(),
+    }
+}
+
+/// The resource path a request addressed: its path without this service's API
+/// version segment, which is how a Storage Lens refusal names the URI it could
+/// not parse.
+fn addressed_resource(path: &str) -> &str {
+    path.strip_prefix(API_VERSION_PREFIX).unwrap_or(path)
+}
+
+/// The Storage Lens configuration id `path` addresses, or `None` for a path
+/// that addresses no configuration — the Storage Lens listing route, which
+/// names no id, and every other resource of this service included.
+fn storage_lens_config_id(path: &str) -> Option<&str> {
+    let rest = addressed_resource(path).strip_prefix(STORAGE_LENS_CONFIGURATION_RESOURCE)?;
+    let config_id = rest.split('/').next().unwrap_or_default();
+    (!config_id.is_empty()).then_some(config_id)
+}
+
+/// Which document a failure travels in.
+///
+/// Decided from the request PATH, for every failure answered once the resource
+/// the request addresses is resolved: the boundary's, the handler's and this
+/// module's own alike. A request whose URI this service could not PARSE has no
+/// resolved resource, so its refusal is stated in [`Envelope::Wrapped`] — the
+/// service's own envelope — whatever path it carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Envelope {
+    /// `<ErrorResponse><Error>…</Error><RequestId/><HostId/></ErrorResponse>`,
+    /// which the rest of this service answers in.
+    Wrapped,
+    /// `<Error>…<RequestId/><HostId/></Error>`, which the Storage Lens
+    /// configuration surface answers in.
+    Flat,
+}
+
+impl Envelope {
+    /// The envelope a failure answered for `path` travels in.
+    fn of(path: &str) -> Self {
+        match storage_lens_config_id(path) {
+            Some(_) => Self::Flat,
+            None => Self::Wrapped,
+        }
+    }
 }
 
 /// `req` with its path replaced by `path`, so the operation a sub-resource
@@ -191,8 +294,15 @@ fn with_bound_path(req: &RtRequest, path: &str) -> Option<RtRequest> {
 ///
 /// The one renderer for a failure this module answers itself; a failure a
 /// handler raised or the boundary refused is rendered by the protocol and
-/// reaches the same envelope through [`with_error_correlation`].
-fn error_response(status: u16, code: &str, message: &str, details: &[(&str, &str)]) -> RtResponse {
+/// reaches the same envelope through [`with_error_correlation`] or
+/// [`as_flat_error`].
+fn error_response(
+    envelope: Envelope,
+    status: u16,
+    code: &str,
+    message: &str,
+    details: &[(&str, &str)],
+) -> RtResponse {
     let (request_id, host_id) = crate::state::new_error_correlation();
     let named: String = details
         .iter()
@@ -204,15 +314,24 @@ fn error_response(status: u16, code: &str, message: &str, details: &[(&str, &str
             )
         })
         .collect();
-    let body = format!(
-        "<ErrorResponse xmlns=\"{namespace}\"><Error><Type>{SENDER}</Type><Code>{code}</Code>\
-         <Message>{message}</Message>{named}</Error>\
-         <{REQUEST_ID_ELEMENT}>{request_id}</{REQUEST_ID_ELEMENT}>\
-         <{HOST_ID_ELEMENT}>{host_id}</{HOST_ID_ELEMENT}></ErrorResponse>",
-        namespace = xml_escape(XML_NAMESPACE),
-        code = xml_escape(code),
-        message = xml_escape(message),
+    let code = xml_escape(code);
+    let message = xml_escape(message);
+    let correlation = format!(
+        "<{REQUEST_ID_ELEMENT}>{request_id}</{REQUEST_ID_ELEMENT}>\
+         <{HOST_ID_ELEMENT}>{host_id}</{HOST_ID_ELEMENT}>"
     );
+    let body = match envelope {
+        Envelope::Wrapped => format!(
+            "<ErrorResponse xmlns=\"{namespace}\"><Error><Type>{SENDER}</Type><Code>{code}</Code>\
+             <Message>{message}</Message>{named}</Error>{correlation}</ErrorResponse>",
+            namespace = xml_escape(XML_NAMESPACE),
+        ),
+        // The flat document is one element, so the pair naming the request
+        // sits inside it rather than beside it.
+        Envelope::Flat => format!(
+            "<Error><Code>{code}</Code><Message>{message}</Message>{named}{correlation}</Error>"
+        ),
+    };
     let mut resp = RtResponse::new(
         StatusCode::try_from(status)
             .unwrap_or(StatusCode::try_from(REFUSED).expect("400 is a valid status code")),
@@ -274,6 +393,60 @@ pub fn with_error_correlation(mut resp: RtResponse) -> RtResponse {
     with_correlation_headers(resp, request_id, host_id)
 }
 
+/// `resp` with its failure document re-rooted as the FLAT one
+/// ([`Envelope::Flat`]), naming the request it answers.
+///
+/// The protocol serializer and the request boundary both render a failure in
+/// the wrapped envelope — the one the rest of this service answers in, and both
+/// renderers live in the read-only vendored tree — so a refusal for a resource
+/// whose surface states the flat document is re-rooted here rather than in a
+/// second serializer. What the failure SAYS is carried through unchanged: every
+/// element the `Error` element holds, less the `Type` the flat form does not
+/// carry, and the correlation pair moved inside the one element the document
+/// has. A response that is not a failure, or one already in that form, is
+/// handed back saying exactly what it said — so this, like
+/// [`with_error_correlation`], is applied to EVERY response of its surface
+/// without having to know which ones are errors.
+pub fn as_flat_error(mut resp: RtResponse) -> RtResponse {
+    // A success is never an error envelope, whatever its document happens to
+    // contain: the status is what says this response states a failure.
+    if resp.status().as_u16() < 400 {
+        return resp;
+    }
+    let Some(body) = body_text(&resp) else {
+        return resp;
+    };
+    let Some(stated) = element_text(body, ERROR_ELEMENT) else {
+        return resp;
+    };
+    // The pair naming the request: the one the document already carries,
+    // wherever it carries it, and a new one for a document rendered without it.
+    let (request_id, host_id) = match (
+        element_text(body, REQUEST_ID_ELEMENT),
+        element_text(body, HOST_ID_ELEMENT),
+    ) {
+        (Some(request_id), Some(host_id)) => (request_id.to_string(), host_id.to_string()),
+        _ => crate::state::new_error_correlation(),
+    };
+    let stated = without_element(stated, TYPE_ELEMENT);
+    let stated = without_element(&stated, REQUEST_ID_ELEMENT);
+    let stated = without_element(&stated, HOST_ID_ELEMENT);
+    let rewritten = format!(
+        "<{ERROR_ELEMENT}>{stated}\
+         <{REQUEST_ID_ELEMENT}>{request_id}</{REQUEST_ID_ELEMENT}>\
+         <{HOST_ID_ELEMENT}>{host_id}</{HOST_ID_ELEMENT}></{ERROR_ELEMENT}>"
+    );
+    let length = rewritten.len();
+    *resp.body_mut() = SdkBody::from(rewritten);
+    // Only a response that already states its length gets the new one: a
+    // renderer that left the framing to the transport keeps doing so.
+    if resp.headers().get("content-length").is_some() {
+        resp.headers_mut()
+            .insert("content-length", length.to_string());
+    }
+    with_correlation_headers(resp, request_id, host_id)
+}
+
 /// `resp`'s body when `resp` is a refusal the request boundary made before any
 /// handler ran, and `None` for anything else — including every refusal this
 /// service's own handlers answer.
@@ -295,24 +468,39 @@ fn framework_refusal(resp: &RtResponse) -> Option<&str> {
     (element_text(body, "Code")? == FRAMEWORK_REFUSAL_CODE).then_some(body)
 }
 
-/// Whether `refusal` is the boundary refusing the request over the TOKEN its
-/// path carries.
+/// Whether `refusal` is the boundary refusing the request over `member`.
 ///
 /// Read off the refusal's own sentence, which names the member it refused: a
 /// request under the same route refused for something else — the account id it
 /// names, say — keeps the cause its caller has to fix. Both spellings of the
 /// quotation marks are looked for, because the sentence is XML-escaped into the
 /// envelope.
-fn refused_over_request_token(refusal: &str) -> bool {
+fn refused_over_member(refusal: &str, member: &str) -> bool {
     let Some(message) = element_text(refusal, "Message") else {
         return false;
     };
     [
-        format!("at '{REQUEST_TOKEN_MEMBER}'"),
-        format!("at &apos;{REQUEST_TOKEN_MEMBER}&apos;"),
+        format!("at '{member}'"),
+        format!("at &apos;{member}&apos;"),
     ]
     .iter()
     .any(|marker| message.contains(marker))
+}
+
+/// Whether `refusal` is the boundary refusing a value it read out of the
+/// request's own ADDRESS — the configuration id its path carries or the account
+/// id its header carries — rather than out of the DOCUMENT the request
+/// carried.
+///
+/// What tells the two apart on the Storage Lens configuration surface: a
+/// document that surface will not take is one refusal
+/// ([`crate::state::MALFORMED_XML_CODE`]), and a request whose address it could
+/// not read is not about the document at all, so it keeps the cause its caller
+/// has to fix.
+fn refused_over_address(refusal: &str) -> bool {
+    ADDRESS_MEMBERS
+        .iter()
+        .any(|member| refused_over_member(refusal, member))
 }
 
 /// Whether `refusal` is the boundary refusing the request because it could not
@@ -377,19 +565,35 @@ fn access_point_name_refusal(path: &str) -> Option<(u16, &'static str, &'static 
 /// service's wording nor a code a client branches on.
 fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     let refusal = framework_refusal(resp)?;
+    let path = request_path(req.uri());
     if req.method().eq_ignore_ascii_case("GET")
-        && request_path(req.uri()).starts_with(ASYNC_REQUEST_PATH)
-        && refused_over_request_token(refusal)
+        && path.starts_with(ASYNC_REQUEST_PATH)
+        && refused_over_member(refusal, REQUEST_TOKEN_MEMBER)
     {
         return Some(error_response(
+            Envelope::of(path),
             crate::state::NO_SUCH_ASYNC_REQUEST_STATUS,
             crate::state::NO_SUCH_ASYNC_REQUEST_CODE,
             crate::state::NO_SUCH_ASYNC_REQUEST_MESSAGE,
             &[],
         ));
     }
+    // A Storage Lens configuration request the boundary refused over the
+    // DOCUMENT it carried: that surface answers one refusal for a document it
+    // will not take, whether the document could not be read at all or a value
+    // it did read breaks a rule its shape states.
+    if storage_lens_config_id(path).is_some() && !refused_over_address(refusal) {
+        return Some(error_response(
+            Envelope::Flat,
+            crate::state::MALFORMED_XML_STATUS,
+            crate::state::MALFORMED_XML_CODE,
+            crate::state::MALFORMED_XML_MESSAGE,
+            &[],
+        ));
+    }
     if refused_as_unreadable(refusal) {
         return Some(error_response(
+            Envelope::of(path),
             crate::state::REQUEST_INVALID_STATUS,
             crate::state::REQUEST_INVALID_CODE,
             crate::state::REQUEST_INVALID_MESSAGE,
@@ -513,8 +717,28 @@ impl ErasedOperation for Dispatch {
             let path = request_path(req.uri());
             if let Some((status, code, message)) = access_point_name_refusal(path) {
                 // The `URI` member carries the path the caller sent, which is
-                // what it has to change.
-                return error_response(status, code, message, &[("URI", path)]);
+                // what it has to change. A path this service could not parse
+                // names no resource, so the refusal is stated in the service's
+                // own envelope rather than in any resource's.
+                return error_response(Envelope::Wrapped, status, code, message, &[("URI", path)]);
+            }
+            // The same stage for the Storage Lens configuration space: an id
+            // the wire cannot carry
+            // ([`crate::state::addressable_storage_lens_config_id`]) is not a
+            // path this service can parse, so it is answered here — before an
+            // operation is named, and so before any configuration is read,
+            // written or deleted — naming the resource path the caller
+            // addressed.
+            if storage_lens_config_id(path)
+                .is_some_and(|id| !crate::state::addressable_storage_lens_config_id(id))
+            {
+                return error_response(
+                    Envelope::Wrapped,
+                    crate::state::INVALID_URI_STATUS,
+                    crate::state::INVALID_URI_CODE,
+                    crate::state::INVALID_URI_MESSAGE,
+                    &[("URI", addressed_resource(path))],
+                );
             }
             // A sub-resource of a Multi-Region Access Point: the operation that
             // route names, handed the request with the route's trailing literal
@@ -536,7 +760,12 @@ impl ErasedOperation for Dispatch {
                 },
             };
             let resp = restated(req, &resp).unwrap_or(resp);
-            with_error_correlation(resp)
+            // Finished in the envelope this request's own resource answers in,
+            // whichever layer rendered the document.
+            match Envelope::of(path) {
+                Envelope::Flat => as_flat_error(resp),
+                Envelope::Wrapped => with_error_correlation(resp),
+            }
         })
     }
 }
@@ -770,8 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_this_rule_does_not_own_keeps_its_own_wording() {
-        let cases: [(&str, RtRequest, RtResponse); 4] = [
+    fn a_refusal_this_rule_does_not_own_keeps_its_own_wording() {        let cases: [(&str, RtRequest, RtResponse); 4] = [
             (
                 "a refusal over another member of the same route",
                 request("GET", "/v20180820/async-requests/mrap/arn:aws:s3:::request"),
@@ -815,6 +1043,209 @@ mod tests {
                 restated(&req, &resp).is_none(),
                 "case {case:?}: expected the refusal to keep its own wording"
             );
+        }
+    }
+
+    #[test]
+    fn the_envelope_a_failure_travels_in_follows_the_resource_its_path_addresses() {
+        // Each row is a path, and the envelope a failure answered for the
+        // resource it addresses travels in: the Storage Lens CONFIGURATION
+        // resource and its tagging sub-resource state the flat document, and
+        // every other path space of this service — the Storage Lens listing
+        // route and the Storage Lens GROUP resource, whose segment merely
+        // starts with the same letters, included — states the wrapped
+        // envelope.
+        for (case, path, envelope) in [
+            ("a configuration", "/v20180820/storagelens/dashboard", Envelope::Flat),
+            (
+                "a configuration's tag set",
+                "/v20180820/storagelens/dashboard/tagging",
+                Envelope::Flat,
+            ),
+            ("the configuration listing", "/v20180820/storagelens", Envelope::Wrapped),
+            (
+                "the configuration listing with a trailing separator",
+                "/v20180820/storagelens/",
+                Envelope::Wrapped,
+            ),
+            (
+                "a Storage Lens group",
+                "/v20180820/storagelensgroup/dev",
+                Envelope::Wrapped,
+            ),
+            ("an access point", "/v20180820/accesspoint/reports-ap", Envelope::Wrapped),
+        ] {
+            assert_eq!(
+                Envelope::of(path),
+                envelope,
+                "case {case:?} at {path:?}: expected {envelope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failure_re_rooted_as_the_flat_document_says_exactly_what_it_said() {
+        // One row per renderer a failure can arrive from: the protocol's, the
+        // pre-dispatch one, this module's own wrapped envelope (correlation
+        // pair beside the error element), and a document already in the flat
+        // form — which must come out of a second re-rooting unchanged.
+        let already_flat = as_flat_error(serialized_error(
+            404,
+            "NoSuchConfiguration",
+            "The specified configuration does not exist.",
+        ));
+        let flat_body = body_text(&already_flat).expect("a text body").to_string();
+        for (case, resp) in [
+            (
+                "a refusal the protocol serialized",
+                serialized_error(404, "NoSuchConfiguration", "not there"),
+            ),
+            (
+                "a refusal the boundary rendered",
+                boundary_refusal(FRAMEWORK_REFUSAL_CODE, "1 validation error detected: nope"),
+            ),
+            (
+                "a refusal this module answered",
+                error_response(Envelope::Wrapped, 400, "MalformedXML", "no good", &[]),
+            ),
+            (
+                "a refusal naming what the request named",
+                error_response(
+                    Envelope::Wrapped,
+                    400,
+                    "InvalidURI",
+                    "Couldn't parse the specified URI.",
+                    &[("URI", "storagelens/a.b")],
+                ),
+            ),
+            ("a document already in the flat form", already_flat),
+        ] {
+            let before = body_text(&resp).expect("a text body").to_string();
+            let code = element_text(&before, "Code").map(str::to_string);
+            let message = element_text(&before, "Message").map(str::to_string);
+            let named = element_text(&before, "URI").map(str::to_string);
+            let answered = as_flat_error(resp);
+            let body = body_text(&answered).expect("a text body").to_string();
+            assert!(
+                body.starts_with(&format!("<{ERROR_ELEMENT}>"))
+                    && body.ends_with(&format!("</{ERROR_ELEMENT}>"))
+                    && !body.contains(ERROR_RESPONSE_OPEN)
+                    && !body.contains(&format!("<{TYPE_ELEMENT}>")),
+                "case {case:?}: expected the flat document, got {body}"
+            );
+            assert_eq!(
+                (
+                    element_text(&body, "Code").map(str::to_string),
+                    element_text(&body, "Message").map(str::to_string),
+                    element_text(&body, "URI").map(str::to_string),
+                ),
+                (code, message, named),
+                "case {case:?}: the re-rooted document must say what it said, got {body}"
+            );
+            assert_eq!(
+                body.matches(&format!("<{REQUEST_ID_ELEMENT}>")).count(),
+                1,
+                "case {case:?}: expected exactly one correlation pair, got {body}"
+            );
+            assert_eq!(
+                answered
+                    .headers()
+                    .get(REQUEST_ID_HEADER)
+                    .map(str::to_string),
+                element_text(&body, REQUEST_ID_ELEMENT).map(str::to_string),
+                "case {case:?}: the header must mirror the element, got {body}"
+            );
+        }
+        // Re-rooting a document already in the flat form leaves it alone,
+        // correlation pair included.
+        assert_eq!(
+            body_text(&as_flat_error(as_flat_error(RtResponse::new(
+                StatusCode::try_from(404u16).expect("a valid status"),
+                SdkBody::from(flat_body.clone()),
+            ))))
+            .map(str::to_string),
+            Some(flat_body),
+            "case \"a flat document re-rooted twice\": expected it unchanged"
+        );
+    }
+
+    #[test]
+    fn a_success_is_never_re_rooted() {
+        let ok = RtResponse::new(
+            StatusCode::try_from(200u16).expect("200"),
+            SdkBody::from("<GetStorageLensConfigurationResult/>".to_string()),
+        );
+        assert_eq!(
+            body_text(&as_flat_error(ok)),
+            Some("<GetStorageLensConfigurationResult/>"),
+            "case \"a success\": expected the document untouched"
+        );
+    }
+
+    #[test]
+    fn a_storage_lens_document_the_boundary_refused_is_restated_as_malformed() {
+        // A refusal over the DOCUMENT is restated; one over the request's own
+        // address — the id in its path, the account in its header — keeps the
+        // cause its caller has to fix.
+        for (case, message, restated_as_malformed) in [
+            (
+                "a body the codec could not read",
+                "xml parse error: ill-formed document".to_string(),
+                true,
+            ),
+            (
+                "a required member of the document left out",
+                "1 validation error detected: Value null at \
+                 &apos;storageLensConfiguration&apos; failed to satisfy constraint: Member must \
+                 not be null"
+                    .to_string(),
+                true,
+            ),
+            (
+                "a value in the document outside its declared range",
+                "1 validation error detected: Value 11 at \
+                 &apos;storageLensConfiguration.accountLevel&apos; failed to satisfy constraint: \
+                 Member must be between 1 and 10"
+                    .to_string(),
+                true,
+            ),
+            (
+                "the configuration id in the path",
+                format!(
+                    "1 validation error detected: Value &apos;x&apos; at &apos;{}&apos; failed \
+                     to satisfy constraint: Member must have length less than or equal to 64",
+                    ADDRESS_MEMBERS[0]
+                ),
+                false,
+            ),
+            (
+                "the account id in the header",
+                format!(
+                    "1 validation error detected: Value &apos;x&apos; at &apos;{}&apos; failed \
+                     to satisfy constraint: Member must satisfy regular expression pattern: \
+                     ^\\d{{12}}$",
+                    ADDRESS_MEMBERS[1]
+                ),
+                false,
+            ),
+        ] {
+            for path in [
+                "/v20180820/storagelens/dashboard",
+                "/v20180820/storagelens/dashboard/tagging",
+            ] {
+                let req = request("PUT", path);
+                let refusal = boundary_refusal(FRAMEWORK_REFUSAL_CODE, &message);
+                let answered = restated(&req, &refusal);
+                let stated = answered.as_ref().and_then(|resp| {
+                    body_text(resp).and_then(|body| element_text(body, "Code").map(str::to_string))
+                });
+                let expected = restated_as_malformed
+                    .then(|| crate::state::MALFORMED_XML_CODE.to_string());
+                assert_eq!(
+                    stated, expected,
+                    "case {case:?} at {path:?}: expected {expected:?}"
+                );
+            }
         }
     }
 }

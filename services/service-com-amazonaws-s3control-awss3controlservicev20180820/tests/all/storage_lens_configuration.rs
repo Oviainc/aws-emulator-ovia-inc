@@ -42,6 +42,15 @@ use crate::access_point_lifecycle::{
 /// region its request was signed for rather than a fixed one.
 const OTHER_REGION: &str = "eu-central-1";
 
+/// The status every Storage Lens configuration call whose response carries no
+/// document answers a success with, as the service states it
+/// ([`::service_com_amazonaws_s3control_awss3controlservicev20180820::state::NO_CONTENT_SUCCESS_STATUS`]).
+///
+/// `pub(crate)` because the sibling Storage Lens suites assert the same status
+/// rather than each spelling a number.
+pub(crate) const NO_CONTENT: u16 =
+    ::service_com_amazonaws_s3control_awss3controlservicev20180820::state::NO_CONTENT_SUCCESS_STATUS;
+
 /// One leaf element of a document: the `/`-separated path of element names from
 /// the document's root element (exclusive), and the element's text. An empty
 /// value is an element with no text at all (`<BucketLevel/>`), which is how an
@@ -513,19 +522,22 @@ pub(crate) fn documents() -> Vec<Document> {
 
 /// The configuration ids the rows are put under, one per row.
 ///
-/// They differ in length and in which of the characters `ConfigId`'s pattern
-/// allows they use (`^[a-zA-Z0-9\-\_\.]+$`), including the one-character
-/// minimum and the 64-character maximum the model declares.
+/// They differ in length and in which of the characters the wire can ADDRESS a
+/// configuration by they use (the letters, digits, hyphen and underscore of
+/// `crate::state::addressable_storage_lens_config_id`), including the
+/// one-character minimum and the 64-character maximum the model declares for
+/// `ConfigId`. The dot the model's pattern also admits is NOT among them — the
+/// envelope suite is where a dotted id is held to the URI rule.
 fn config_ids() -> Vec<String> {
     vec![
         "a".to_string(),
         "Dashboard-1".to_string(),
-        "reports.daily".to_string(),
+        "reports-daily".to_string(),
         "reports_weekly".to_string(),
-        "MixedCase.Id-With_Every.Allowed-Character_0123456789".to_string(),
+        "MixedCase_Id-With_Every-Addressable-Character_0123456789".to_string(),
         "x".repeat(64),
         "lens-export".to_string(),
-        "lens.export.parquet".to_string(),
+        "lens-export-parquet".to_string(),
         "expanded-prefixes".to_string(),
         "already-has-an-arn".to_string(),
     ]
@@ -611,8 +623,8 @@ async fn a_put_stores_the_whole_document_and_every_read_reports_it() {
         let case = document.case;
         let put = put_configuration(&emulator, ACCOUNT, &config_id, document, None).await;
         assert_eq!(
-            put.status, 200,
-            "case {case:?}: expected the put to be accepted with 200, got {} {}",
+            put.status, NO_CONTENT,
+            "case {case:?}: expected the put to be accepted with {NO_CONTENT}, got {} {}",
             put.status, put.body
         );
         assert!(
@@ -668,8 +680,8 @@ async fn a_put_replaces_the_whole_document_rather_than_merging_it() {
             for document in [previous, next] {
                 let put = put_configuration(&emulator, ACCOUNT, config_id, document, None).await;
                 assert_eq!(
-                    put.status, 200,
-                    "case {case}: expected the put to be accepted with 200, got {} {}",
+                    put.status, NO_CONTENT,
+                    "case {case}: expected the put to be accepted with {NO_CONTENT}, got {} {}",
                     put.status, put.body
                 );
             }
@@ -707,7 +719,7 @@ async fn the_assigned_arn_follows_the_configuration_identity_and_the_signing_reg
     // the configuration's identity and the region the request is signed for,
     // and never the ARN a request submitted.
     for region in [REGION, OTHER_REGION] {
-        for config_id in ["dashboard", "dashboard.2"] {
+        for config_id in ["dashboard", "dashboard-2"] {
             let case = format!("{config_id} in {region}");
             let put = call_in_region(
                 &emulator.router,
@@ -719,8 +731,8 @@ async fn the_assigned_arn_follows_the_configuration_identity_and_the_signing_reg
             )
             .await;
             assert_eq!(
-                put.status, 200,
-                "case {case}: expected 200, got {} {}",
+                put.status, NO_CONTENT,
+                "case {case}: expected {NO_CONTENT}, got {} {}",
                 put.status, put.body
             );
 
@@ -755,8 +767,8 @@ async fn a_put_whose_document_names_another_id_is_refused_and_stores_nothing() {
 
     let stored = put_configuration(&emulator, ACCOUNT, config_id, document, None).await;
     assert_eq!(
-        stored.status, 200,
-        "expected the first put to be accepted with 200, got {} {}",
+        stored.status, NO_CONTENT,
+        "expected the first put to be accepted with {NO_CONTENT}, got {} {}",
         stored.status, stored.body
     );
     let before = sorted_leaves(&get_configuration(&emulator, ACCOUNT, config_id).await.body);
@@ -786,8 +798,9 @@ async fn a_put_whose_document_names_another_id_is_refused_and_stores_nothing() {
         );
         assert_eq!(
             refused.code(),
-            "InvalidRequestException",
-            "case {case}: expected the request to be refused as invalid, got {}",
+            ::service_com_amazonaws_s3control_awss3controlservicev20180820::state::MALFORMED_XML_CODE,
+            "case {case}: expected the document to be refused as one this surface \
+             will not take, got {}",
             refused.body
         );
 
@@ -818,8 +831,8 @@ async fn configurations_are_scoped_to_the_account_that_put_them() {
     for (account, document) in [(ACCOUNT, mine), (OTHER_ACCOUNT, theirs)] {
         let put = put_configuration(&emulator, account, config_id, document, None).await;
         assert_eq!(
-            put.status, 200,
-            "account {account}: expected 200, got {} {}",
+            put.status, NO_CONTENT,
+            "account {account}: expected {NO_CONTENT}, got {} {}",
             put.status, put.body
         );
     }
@@ -909,8 +922,8 @@ async fn the_tag_set_is_a_resource_of_its_own() {
         // A put that names a tag set stores it beside the document.
         let put = put_configuration(&emulator, ACCOUNT, &config_id, first, Some(&tags)).await;
         assert_eq!(
-            put.status, 200,
-            "case {case:?}: expected 200, got {} {}",
+            put.status, NO_CONTENT,
+            "case {case:?}: expected {NO_CONTENT}, got {} {}",
             put.status, put.body
         );
         let reported = get_tagging(&emulator, ACCOUNT, &config_id).await;
@@ -939,8 +952,8 @@ async fn the_tag_set_is_a_resource_of_its_own() {
             .collect();
         let replaced = put_tagging(&emulator, ACCOUNT, &config_id, &replacement).await;
         assert_eq!(
-            replaced.status, 200,
-            "case {case:?}: expected 200 from the tagging put, got {} {}",
+            replaced.status, NO_CONTENT,
+            "case {case:?}: expected {NO_CONTENT} from the tagging put, got {} {}",
             replaced.status, replaced.body
         );
         let reported = get_tagging(&emulator, ACCOUNT, &config_id).await;
@@ -959,8 +972,8 @@ async fn the_tag_set_is_a_resource_of_its_own() {
         // set alone: the put is about the document, not about the tags.
         let put = put_configuration(&emulator, ACCOUNT, &config_id, second, None).await;
         assert_eq!(
-            put.status, 200,
-            "case {case:?}: expected 200 from the second put, got {} {}",
+            put.status, NO_CONTENT,
+            "case {case:?}: expected {NO_CONTENT} from the second put, got {} {}",
             put.status, put.body
         );
         assert_eq!(
@@ -978,8 +991,8 @@ async fn the_tag_set_is_a_resource_of_its_own() {
         // An empty tag set put through the tagging operation clears it.
         let cleared = put_tagging(&emulator, ACCOUNT, &config_id, &[]).await;
         assert_eq!(
-            cleared.status, 200,
-            "case {case:?}: expected 200 clearing the tag set, got {} {}",
+            cleared.status, NO_CONTENT,
+            "case {case:?}: expected {NO_CONTENT} clearing the tag set, got {} {}",
             cleared.status, cleared.body
         );
         let reported = get_tagging(&emulator, ACCOUNT, &config_id).await;
@@ -1030,8 +1043,8 @@ async fn a_tag_set_past_the_documented_maximum_is_refused() {
         let put =
             put_configuration(&emulator, ACCOUNT, "too-many-on-tagging", &documents[0], None).await;
         assert_eq!(
-            put.status, 200,
-            "case {case}: expected 200 from the put, got {} {}",
+            put.status, NO_CONTENT,
+            "case {case}: expected {NO_CONTENT} from the put, got {} {}",
             put.status, put.body
         );
         let refused = put_tagging(&emulator, ACCOUNT, "too-many-on-tagging", &tags).await;
@@ -1062,7 +1075,7 @@ async fn a_tag_set_past_the_documented_maximum_is_refused() {
         put_configuration(&emulator, ACCOUNT, "exactly-the-maximum", &documents[0], Some(&tags))
             .await;
     assert_eq!(
-        accepted.status, 200,
+        accepted.status, NO_CONTENT,
         "exactly {maximum} tags must be accepted, got {} {}",
         accepted.status, accepted.body
     );
@@ -1082,12 +1095,12 @@ async fn every_call_against_a_configuration_that_is_not_there_is_not_found() {
     // for rather than about an empty store.
     let put = put_configuration(&emulator, ACCOUNT, "present", &documents()[0], None).await;
     assert_eq!(
-        put.status, 200,
-        "expected 200 from the put, got {} {}",
+        put.status, NO_CONTENT,
+        "expected {NO_CONTENT} from the put, got {} {}",
         put.status, put.body
     );
 
-    for config_id in ["absent", "Present", "present.1", &"z".repeat(64)] {
+    for config_id in ["absent", "Present", "present-1", &"z".repeat(64)] {
         for (operation, reply) in [
             (
                 "GetStorageLensConfiguration",

@@ -76,6 +76,11 @@ pub struct DeleteStorageLensConfigurationOutput;
 impl DeleteStorageLensConfigurationOutput {
     // `with_http` carries this operation's modelled response status. Remove it and
     // the status falls back to the protocol default, so a modelled 204 answers 200.
+    //
+    // The status here is 204 rather than the model's 200: this member carries no
+    // document at all, and a deleted configuration is answered No Content on the
+    // wire. See `SUCCESS_STATUS` below, which is the status the response is
+    // actually built with.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
@@ -84,7 +89,7 @@ impl DeleteStorageLensConfigurationOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "DELETE",
         "/v20180820/storagelens/{ConfigId}",
-        Some(200u16),
+        Some(crate::state::NO_CONTENT_SUCCESS_STATUS),
     ));
 }
 
@@ -148,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteStorageLensConfiguration";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_STORAGE_LENS_CONFIGURATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_STORAGE_LENS_CONFIGURATION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,

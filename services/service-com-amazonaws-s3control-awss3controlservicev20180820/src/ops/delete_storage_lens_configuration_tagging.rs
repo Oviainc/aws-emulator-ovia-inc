@@ -75,6 +75,23 @@ use super::types::*;
 // `DeleteStorageLensConfigurationTaggingError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3control-awss3controlservicev20180820.json");
 
+/// The schema this operation's response is serialized through: the `Unit`
+/// shape, which carries NO document.
+///
+/// The model's own result shape
+/// (`DeleteStorageLensConfigurationTaggingResult`) declares no member, and the
+/// wire answers a deleted tag set `204 No Content`
+/// ([`crate::state::NO_CONTENT_SUCCESS_STATUS`]) — a status whose response
+/// carries no content at all — so the response is serialized through the shape
+/// the protocol emits an empty body for rather than through an envelope element
+/// holding nothing.
+static DELETE_STORAGE_LENS_CONFIGURATION_TAGGING_NO_CONTENT_SCHEMA: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[],
+    );
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `DeleteStorageLensConfigurationTaggingError` alias below. An operation that models no errors
@@ -128,8 +145,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     const NAME: &'static str = "DeleteStorageLensConfigurationTagging";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_STORAGE_LENS_CONFIGURATION_TAGGING_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_STORAGE_LENS_CONFIGURATION_TAGGING_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema =
+        &DELETE_STORAGE_LENS_CONFIGURATION_TAGGING_NO_CONTENT_SCHEMA;
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,

@@ -16,9 +16,9 @@
 //! configuration document the deleted configuration carried and how deeply it
 //! nested, how many tags it held (none, one, several, the documented maximum)
 //! and which characters and lengths their keys and values used, how long the
-//! configuration id is and which of the characters its pattern allows it uses,
-//! how many configurations the account held beside it, which account owns it,
-//! and how many times the delete is repeated.
+//! configuration id is and which of the characters the wire can address it by
+//! it uses, how many configurations the account held beside it, which account
+//! owns it, and how many times the delete is repeated.
 //!
 //! The router, the request builder, the document and tag-set tables and the XML
 //! readers are the access point and Storage Lens configuration suites', reused
@@ -27,7 +27,7 @@
 use crate::access_point_lifecycle::{Emulator, Reply, ACCOUNT, OTHER_ACCOUNT, REGION};
 use crate::storage_lens_configuration::{
     documents, get_configuration, get_tagging, put_configuration, reported_tags, sorted,
-    sorted_leaves, tag, tag_sets, Document,
+    sorted_leaves, tag, tag_sets, Document, NO_CONTENT,
 };
 
 /// What a refusal of a Storage Lens configuration the account does not hold
@@ -35,20 +35,20 @@ use crate::storage_lens_configuration::{
 /// configuration id, so every row below expects the same sentence.
 const NO_SUCH_CONFIGURATION: &str = "The specified configuration does not exist.";
 
-/// Configuration ids the deleted rows are put under, spanning the lengths and
-/// the characters `ConfigId` allows (len 1..64, pattern
-/// `^[a-zA-Z0-9\-\_\.]+$`, from the `DeleteStorageLensConfiguration` input
-/// member) rather than one shape of id.
+/// Configuration ids the deleted rows are put under, spanning the lengths the
+/// model declares for `ConfigId` (len 1..64, from the
+/// `DeleteStorageLensConfiguration` input member) and the characters the wire
+/// can address a configuration by, rather than one shape of id.
 fn config_ids() -> Vec<String> {
     vec![
         "d".to_string(),
         "Dashboard-2".to_string(),
-        "reports.monthly".to_string(),
+        "reports-monthly".to_string(),
         "reports_hourly".to_string(),
-        "MixedCase.Id-With_Every.Allowed-Character_0123456789".to_string(),
+        "MixedCase_Id-With_Every-Addressable-Character_0123456789".to_string(),
         "y".repeat(64),
         "lens-delete".to_string(),
-        "lens.delete.parquet".to_string(),
+        "lens-delete-parquet".to_string(),
         "deleted-prefixes".to_string(),
         "deleted-had-an-arn".to_string(),
     ]
@@ -91,8 +91,8 @@ async fn tagged_configuration(
 ) {
     let put = put_configuration(emulator, account_id, config_id, document, Some(tags)).await;
     assert_eq!(
-        put.status, 200,
-        "setting up {config_id:?}: expected 200 from the put, got {} {}",
+        put.status, NO_CONTENT,
+        "setting up {config_id:?}: expected {NO_CONTENT} from the put, got {} {}",
         put.status, put.body
     );
     let read = get_configuration(emulator, account_id, config_id).await;
@@ -154,8 +154,8 @@ async fn a_delete_removes_the_configuration_and_its_tag_set() {
 
         let deleted = delete_configuration(&emulator, ACCOUNT, config_id).await;
         assert_eq!(
-            deleted.status, 200,
-            "case {case:?}: expected 200 from the delete, got {} {}",
+            deleted.status, NO_CONTENT,
+            "case {case:?}: expected {NO_CONTENT} from the delete, got {} {}",
             deleted.status, deleted.body
         );
         assert!(
@@ -179,8 +179,8 @@ async fn a_delete_removes_the_configuration_and_its_tag_set() {
         let replacement = &documents[(index + 1) % documents.len()];
         let put = put_configuration(&emulator, ACCOUNT, config_id, replacement, None).await;
         assert_eq!(
-            put.status, 200,
-            "case {case:?}: expected 200 re-putting the id after the delete, got {} {}",
+            put.status, NO_CONTENT,
+            "case {case:?}: expected {NO_CONTENT} re-putting the id after the delete, got {} {}",
             put.status, put.body
         );
         let read = get_configuration(&emulator, ACCOUNT, config_id).await;
@@ -225,8 +225,8 @@ async fn a_delete_touches_only_the_configuration_the_request_names() {
 
     let deleted = delete_configuration(&emulator, ACCOUNT, config_id).await;
     assert_eq!(
-        deleted.status, 200,
-        "expected 200 from the delete, got {} {}",
+        deleted.status, NO_CONTENT,
+        "expected {NO_CONTENT} from the delete, got {} {}",
         deleted.status, deleted.body
     );
 
@@ -347,8 +347,8 @@ async fn repeating_the_delete_is_refused_and_a_later_put_restores_the_id() {
     tagged_configuration(&emulator, ACCOUNT, config_id, document, &[tag("round", "one")]).await;
     let deleted = delete_configuration(&emulator, ACCOUNT, config_id).await;
     assert_eq!(
-        deleted.status, 200,
-        "expected 200 from the first delete, got {} {}",
+        deleted.status, NO_CONTENT,
+        "expected {NO_CONTENT} from the first delete, got {} {}",
         deleted.status, deleted.body
     );
 
@@ -382,8 +382,8 @@ async fn repeating_the_delete_is_refused_and_a_later_put_restores_the_id() {
     tagged_configuration(&emulator, ACCOUNT, config_id, document, &tags).await;
     let deleted = delete_configuration(&emulator, ACCOUNT, config_id).await;
     assert_eq!(
-        deleted.status, 200,
-        "expected 200 deleting the re-put configuration, got {} {}",
+        deleted.status, NO_CONTENT,
+        "expected {NO_CONTENT} deleting the re-put configuration, got {} {}",
         deleted.status, deleted.body
     );
     assert_gone(&emulator, ACCOUNT, config_id, "the re-put configuration").await;
