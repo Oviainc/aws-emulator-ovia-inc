@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataLakeExceptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataLakeExceptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataLakeExceptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the exceptions this account's data lakes have recorded, narrowed to the
+//! Regions the request names, `maxResults` at a time behind an opaque `nextToken`. An
+//! account with Security Lake enabled in no Region at all holds no such collection, so
+//! the read is refused with the enablement precondition instead.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +128,10 @@ impl From<ListDataLakeExceptionsErrorModeled> for ListDataLakeExceptionsError {
     }
 }
 
+/// `ListDataLakeExceptionsRequest$maxResults` carries `@default(50)` in the model, and a
+/// member sent with no value deserializes to zero.
+const DEFAULT_MAX_RESULTS: usize = 50;
+
 /// The `ListDataLakeExceptions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,20 +166,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataLakeExceptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataLakeExceptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataLakeExceptions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListDataLakeExceptionsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the Security Lake state store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `maxResults` reaches this handler already inside the model's
+        // `@range(min: 1, max: 100)` — the boundary validator refused anything else — so
+        // the only value to interpret here is the zero that stands for "not sent".
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|requested| *requested > 0)
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // A pure read: paging consumes nothing, so the same token always returns the same
+        // page.
+        let store = state.lock();
+
+        // ENABLEMENT PRECONDITION. The exception collection belongs to an account that has
+        // Security Lake enabled somewhere; until then there is nothing to report on, so
+        // the read is refused with the modelled ResourceNotFoundException (404) carrying
+        // the documented remedy rather than answered with an empty page a client cannot
+        // tell apart from an enabled account that has recorded no failure. Checked before
+        // the token is interpreted: a token can only have been issued from a collection
+        // that exists.
+        if !store.enabled_in_any_region() {
+            return Err(
+                ListDataLakeExceptionsErrorModeled::ResourceNotFoundException(
+                    crate::state::not_enabled_in_any_region(),
+                )
+                .into(),
+            );
+        }
+
+        // The exceptions this account has recorded, in the Regions' creation order, read
+        // out of each stored data lake's own request status. `regions` narrows the read to
+        // the Regions it names; a request that names none asks about every Region, and one
+        // naming a Region that recorded nothing simply reports nothing for it. The scan is
+        // over the stored data lakes (bounded by `MAX_DATA_LAKES`), so a long `regions`
+        // list cannot grow the answer.
+        let named = input.regions.unwrap_or_default();
+        let exceptions: Vec<DataLakeException> = store
+            .data_lakes()
+            .iter()
+            .filter(|lake| named.is_empty() || named.contains(&lake.region))
+            .filter_map(crate::state::DataLake::to_exception)
+            .collect();
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some((index, anchor)) = crate::state::decode_next_token(token) else {
+                    return Err(ListDataLakeExceptionsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(
+                                "nextToken is not a token this service issued".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                // Resume at the anchor's Region while it still reports an exception, and
+                // otherwise at the position it held when the token was issued, so a
+                // collection that changed between pages does not break an in-flight
+                // paginator.
+                exceptions
+                    .iter()
+                    .position(|recorded| recorded.region.as_deref() == Some(anchor.as_str()))
+                    .unwrap_or_else(|| index.min(exceptions.len()))
+            }
+        };
+
+        let page: Vec<DataLakeException> = exceptions
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .cloned()
+            .collect();
+
+        // A token only when something follows this page, and it names the NEXT entry, so a
+        // round trip resumes exactly after the last one returned.
+        let next = start + page.len();
+        let next_token = exceptions
+            .get(next)
+            .and_then(|recorded| recorded.region.as_deref())
+            .map(|region| crate::state::encode_next_token(next, region));
+
+        Ok(ListDataLakeExceptionsOutput {
+            exceptions: Some(page),
+            next_token,
+        })
     }
 }

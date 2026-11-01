@@ -54,18 +54,19 @@
 //! Security Lake's data lake is administered by the organization's delegated Security
 //! Lake administrator or by a standalone Security Lake account
 //! ([`crate::state::AccountRole`]). A caller account holding neither role may not
-//! configure or inspect a data lake, and that verdict is reached from the caller's role
-//! alone: it precedes the request-level validation the modelled walk performs, so a
-//! gated call is refused identically whatever it carries, and nothing it would have
-//! written is applied. That ordering is only reachable from this pre-dispatch seam, which
-//! is why the gate lives here rather than in each handler.
+//! configure or inspect a data lake, nor reach a subscriber of one, and that verdict is
+//! reached from the caller's role alone: it precedes the request-level validation the
+//! modelled walk performs, so a gated call is refused identically whatever it carries,
+//! and nothing it would have written is applied. That ordering is only reachable from
+//! this pre-dispatch seam, which is why the gate lives here rather than in each handler.
 //!
 //! Each gated route reports that refusal the way Security Lake does for that route
 //! ([`ENTITLEMENT_GATED_OPERATIONS`]): the routes the service itself denies answer the
 //! modelled `AccessDeniedException` (HTTP 403) carrying the fixed entitlement text, and
-//! the two whose authorizer refuses ahead of the service answer HTTP 401
+//! those whose authorizer refuses ahead of the service answer HTTP 401
 //! `UnauthorizedException` / "Unauthorized". A reporting call that only tells the caller
-//! which of its own Regions are enabled (`ListDataLakes`) is not gated, and neither are
+//! about its OWN account — which of its Regions are enabled (`ListDataLakes`) or what
+//! those Regions have recorded (`ListDataLakeExceptions`) — is not gated, and neither are
 //! the delegated-administrator registration calls, which the organization MANAGEMENT
 //! account makes rather than the account being administered.
 //!
@@ -111,13 +112,25 @@ enum Gate {
 /// The operations an unentitled caller account may not invoke, and how each one reports
 /// the refusal.
 ///
-/// The gated set is the DATA LAKE control plane: the operations that configure the
-/// account's data lake, its exception subscription and its organization configuration, or
-/// report what those hold. `ListDataLakes` is absent on purpose — it reports only which
-/// of the caller's own Regions are enabled, which any account may ask about itself — and
-/// so are `RegisterDataLakeDelegatedAdministrator` and
+/// The gated set is the data lake AND the resources it administers: the operations that
+/// CONFIGURE the account's data lake, its exception subscription and its organization
+/// configuration, report what those configurations hold, or reach one named subscriber of
+/// that data lake. The reporting calls that only tell the caller about its OWN account —
+/// which of its Regions are enabled (`ListDataLakes`) and what those Regions have
+/// recorded (`ListDataLakeExceptions`) — are absent on purpose: any account may ask about
+/// itself, and Security Lake answers them from that account's own state, so their
+/// precondition is enablement rather than a role verdict. So are
+/// `RegisterDataLakeDelegatedAdministrator` and
 /// `DeregisterDataLakeDelegatedAdministrator`, which the organization management account
 /// calls to GIVE an account the role this gate tests for.
+///
+/// The refusal is a property of the ROUTE rather than one verdict for the whole service,
+/// so each entry carries the refusal Security Lake reports on ITS route: a route whose
+/// authorizer refuses ahead of the service answers HTTP 401 even where the operation
+/// beside it answers the modelled 403. A route enters this table only where Security
+/// Lake's refusal of an account holding no role is recorded for it, which is why the
+/// subscriber surface is here by the single-subscriber routes while the collection read
+/// beside them (`ListSubscribers`) is not.
 const ENTITLEMENT_GATED_OPERATIONS: &[(&str, Gate)] = &[
     ("CreateDataLake", Gate::AccessDenied),
     ("CreateDataLakeExceptionSubscription", Gate::AccessDenied),
@@ -125,11 +138,12 @@ const ENTITLEMENT_GATED_OPERATIONS: &[(&str, Gate)] = &[
     ("DeleteDataLake", Gate::Unauthorized),
     ("DeleteDataLakeExceptionSubscription", Gate::AccessDenied),
     ("DeleteDataLakeOrganizationConfiguration", Gate::AccessDenied),
+    ("DeleteSubscriber", Gate::Unauthorized),
     ("GetDataLakeExceptionSubscription", Gate::AccessDenied),
     ("GetDataLakeOrganizationConfiguration", Gate::AccessDenied),
     ("GetDataLakeSources", Gate::Unauthorized),
-    ("ListDataLakeExceptions", Gate::AccessDenied),
-    ("UpdateDataLake", Gate::AccessDenied),
+    ("GetSubscriber", Gate::Unauthorized),
+    ("UpdateDataLake", Gate::Unauthorized),
     ("UpdateDataLakeExceptionSubscription", Gate::AccessDenied),
 ];
 

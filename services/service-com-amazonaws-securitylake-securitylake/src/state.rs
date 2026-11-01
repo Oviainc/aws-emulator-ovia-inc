@@ -33,6 +33,9 @@ const ARN_SERVICE: &str = "securitylake";
 pub const DATA_LAKE_STATUS_INITIALIZED: &str = "INITIALIZED";
 /// See [`DATA_LAKE_STATUS_INITIALIZED`].
 pub const DATA_LAKE_STATUS_COMPLETED: &str = "COMPLETED";
+/// See [`DATA_LAKE_STATUS_INITIALIZED`]. The status a Region's data lake carries when its
+/// last request failed, which is the condition `ListDataLakeExceptions` reports.
+pub const DATA_LAKE_STATUS_FAILED: &str = "FAILED";
 
 /// `SubscriberStatus` member, from `SUBSCRIBER_STATUS_VALUES` in `ops::types::shared_types`.
 pub const SUBSCRIBER_STATUS_ACTIVE: &str = "ACTIVE";
@@ -177,6 +180,35 @@ impl DataLake {
             create_status: Some(self.create_status.clone()),
             update_status: self.update_status.clone(),
         }
+    }
+
+    /// The modelled `DataLakeException` this Region has recorded, or `None` while nothing
+    /// about this data lake has failed.
+    ///
+    /// An exception exists for a Region exactly when that Region's data lake carries a
+    /// FAILED request status: the failure Security Lake recorded against the Region IS
+    /// what `ListDataLakeExceptions` reports, so the list is read out of the stored status
+    /// rather than held a second time beside it.
+    ///
+    /// `exception` is the failure's stored code — `DataLakeException$exception` is a
+    /// `SafeString` (pattern `^[\\\w\-_:/.@=+]*$`, so no prose fits it) — while
+    /// `remediation` and `timestamp` stay ABSENT: this store records no remediation steps
+    /// and no instant for a failure, and an absent member says that, where an invented one
+    /// would report a step nobody wrote and a time nothing happened at.
+    pub fn to_exception(&self) -> Option<DataLakeException> {
+        let status = self.update_status.as_ref()?;
+        if status.status.as_deref() != Some(DATA_LAKE_STATUS_FAILED) {
+            return None;
+        }
+        Some(DataLakeException {
+            region: Some(self.region.clone()),
+            exception: status
+                .exception
+                .as_ref()
+                .and_then(|failure| failure.code.clone()),
+            remediation: None,
+            timestamp: None,
+        })
     }
 }
 
@@ -575,9 +607,9 @@ pub fn resource_share_name(subscriber_name: &str) -> String {
 }
 
 /// The opaque `nextToken` that resumes a paginated read at `anchor` — the id of the next
-/// item, a `subscriberId` for `ListSubscribers` and an account id for
-/// `GetDataLakeSources` — which sat at `index` in the page order the token was issued
-/// from.
+/// item, a `subscriberId` for `ListSubscribers`, an account id for `GetDataLakeSources`
+/// and a Region for `ListDataLakeExceptions` — which sat at `index` in the page order the
+/// token was issued from.
 ///
 /// Carrying BOTH lets a resume stay exact while the anchor is still stored, and fall back
 /// to the position it held when a `DeleteSubscriber` removed it between pages, rather than

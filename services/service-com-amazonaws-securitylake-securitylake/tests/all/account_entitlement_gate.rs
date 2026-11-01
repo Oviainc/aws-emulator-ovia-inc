@@ -5,14 +5,15 @@
 //!
 //! RULE under test: Security Lake's data lake is administered by the organization's
 //! delegated Security Lake administrator or by a standalone Security Lake account, so a
-//! caller account holding neither role may not configure or inspect a data lake. The
+//! caller account holding neither role may not configure or inspect a data lake, nor
+//! reach a subscriber of one. The
 //! verdict is reached from the caller's role ALONE — before the request is validated and
 //! before anything is looked up or written — and each gated route reports it the way
 //! Security Lake reports it there: the routes the service denies itself answer the
 //! modelled `AccessDeniedException` (HTTP 403) carrying the fixed entitlement text, and
-//! the two whose authorizer refuses ahead of the service answer HTTP 401
-//! `UnauthorizedException` / "Unauthorized". `ListDataLakes`, which only reports which of
-//! the caller's own Regions are enabled, is not gated.
+//! those whose authorizer refuses ahead of the service answer HTTP 401
+//! `UnauthorizedException` / "Unauthorized". The reads that only report the caller's own
+//! account state — `ListDataLakes` and `ListDataLakeExceptions` — are not gated.
 //!
 //! Every case drives a real `restJson1` request through the router into this service, on
 //! the shared harness in `data_lake_and_subscriber_lifecycle`; only the account-topology
@@ -34,6 +35,11 @@ const ENTITLEMENT_MESSAGE: &str = "To perform this operation, your account must 
 /// A `RoleArn`-shaped value, matching `CreateDataLakeRequest$metaStoreManagerRoleArn`'s
 /// pattern `^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`.
 const META_STORE_ROLE: &str = "arn:aws:iam::000000000000:role/AmazonSecurityLakeMetaStoreManager";
+
+/// The single-subscriber route the gated rows below use, carrying a `UUID`-shaped id
+/// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`). The verdict comes
+/// from the caller's role, so it is reached whether or not that subscriber exists.
+const GATED_SUBSCRIBER_PATH: &str = "/v1/subscribers/0f1e2d3c-4b5a-4968-8776-65544332211f";
 
 /// The roles that may administer Security Lake, and so lift the gate.
 const ADMINISTERING_ROLES: &[(&str, AccountRole)] = &[
@@ -72,10 +78,11 @@ struct Call {
 
 /// Every operation the gate covers, one row each, with the refusal its route reports.
 ///
-/// The rows span the whole data-lake control plane — the data lake itself, its exception
-/// subscription and its organization configuration — and every HTTP method the service
-/// binds to those routes (`POST`, `PUT`, `GET`, `DELETE`), because the verdict comes from
-/// the caller's role rather than from the shape of the call.
+/// The rows span the whole gated surface — the data lake itself, its exception
+/// subscription, its organization configuration and one named subscriber of it — and
+/// every HTTP method the service binds to those routes (`POST`, `PUT`, `GET`, `DELETE`),
+/// because the verdict comes from the caller's role rather than from the shape of the
+/// call.
 fn gated_calls() -> Vec<(Call, Refusal)> {
     vec![
         (
@@ -100,7 +107,7 @@ fn gated_calls() -> Vec<(Call, Refusal)> {
                     "metaStoreManagerRoleArn": META_STORE_ROLE,
                 })),
             },
-            Refusal::AccessDenied,
+            Refusal::Unauthorized,
         ),
         (
             Call {
@@ -173,12 +180,21 @@ fn gated_calls() -> Vec<(Call, Refusal)> {
         ),
         (
             Call {
-                case: "ListDataLakeExceptions",
-                method: "POST",
-                path: "/v1/datalake/exceptions",
-                body: Some(json!({})),
+                case: "GetSubscriber",
+                method: "GET",
+                path: GATED_SUBSCRIBER_PATH,
+                body: None,
             },
-            Refusal::AccessDenied,
+            Refusal::Unauthorized,
+        ),
+        (
+            Call {
+                case: "DeleteSubscriber",
+                method: "DELETE",
+                path: GATED_SUBSCRIBER_PATH,
+                body: None,
+            },
+            Refusal::Unauthorized,
         ),
         (
             Call {

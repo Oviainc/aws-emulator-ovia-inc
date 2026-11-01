@@ -85,7 +85,15 @@ impl Emulator {
     /// Give the caller account `role`, answering the role it held before. The account
     /// topology is a record of this service's store, like its authorization records.
     pub(crate) fn set_account_role(&self, role: AccountRole) -> AccountRole {
-        self.engine.state::<Store>().lock().set_account_role(role)
+        self.store().lock().set_account_role(role)
+    }
+
+    /// This service's store in the shared engine — the one the service itself reads,
+    /// never a second one. `pub(crate)` so a suite beside this one can seed a record no
+    /// modelled operation writes (the account topology above, or the failure a Region's
+    /// data lake has recorded).
+    pub(crate) fn store(&self) -> ::engine::ServiceState<Store> {
+        self.engine.state::<Store>()
     }
 
     pub(crate) async fn send(
