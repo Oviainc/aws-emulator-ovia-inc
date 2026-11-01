@@ -93,6 +93,48 @@ wire_enum! {
     }
 }
 
+impl ActionType {
+    /// The `(feature, severity)` pair the service publishes for this action type.
+    ///
+    /// The model types `RecommendedAction$type`, `$feature` and `$severity` as three
+    /// independent enums and says nothing about how they pair up, but the pairing is
+    /// not account data: the service publishes a fixed catalog of recommended action
+    /// types, each belonging to ONE Billing and Cost Management feature and reported
+    /// at ONE severity tier (the AWS Billing and Cost Management user guide's
+    /// recommended-actions catalog). Expressing it once here is what keeps a record
+    /// this service produces from naming a pair the service does not publish:
+    /// `INFO` is an opportunity to set something up or an amount to look at (an
+    /// invoice that is merely due included), `WARNING` is something already needing
+    /// attention (expiring, exceeded, triggered), and `CRITICAL` is reserved for a
+    /// payment that is past due or cannot be charged at all.
+    pub const fn published_pair(self) -> (Feature, Severity) {
+        match self {
+            Self::AddAlternateBillingContact => (Feature::Account, Severity::Info),
+            Self::CreateAnomalyMonitor => (Feature::CostAnomalyDetection, Severity::Info),
+            Self::CreateBudget => (Feature::Budgets, Severity::Info),
+            Self::EnableCostOptimizationHub => (Feature::CostOptimizationHub, Severity::Info),
+            Self::MigrateToGranularPermissions => (Feature::Iam, Severity::Warning),
+            Self::PaymentsDue => (Feature::Payments, Severity::Info),
+            Self::PaymentsPastDue => (Feature::Payments, Severity::Critical),
+            Self::ReviewAnomalies => (Feature::CostAnomalyDetection, Severity::Warning),
+            Self::ReviewBudgetAlerts => (Feature::Budgets, Severity::Warning),
+            Self::ReviewBudgetsExceeded => (Feature::Budgets, Severity::Warning),
+            Self::ReviewExpiringRi => (Feature::Reservations, Severity::Warning),
+            Self::ReviewExpiringSp => (Feature::SavingsPlans, Severity::Warning),
+            Self::ReviewFreetierUsageAlerts => (Feature::FreeTier, Severity::Warning),
+            Self::ReviewFreetierCreditsRemaining => (Feature::FreeTier, Severity::Info),
+            Self::ReviewFreetierDaysRemaining => (Feature::FreeTier, Severity::Info),
+            Self::ReviewSavingsOpportunityRecommendations => {
+                (Feature::CostOptimizationHub, Severity::Info)
+            }
+            Self::UpdateExpiredPaymentMethod => (Feature::Payments, Severity::Critical),
+            Self::UpdateInvalidPaymentMethod => (Feature::Payments, Severity::Critical),
+            Self::UpdateTaxExemptionCertificate => (Feature::TaxSettings, Severity::Warning),
+            Self::UpdateTaxRegistrationNumber => (Feature::TaxSettings, Severity::Warning),
+        }
+    }
+}
+
 wire_enum! {
     /// `com.amazonaws.bcmrecommendedactions#Severity` — how urgent the action is.
     ///
@@ -194,16 +236,15 @@ fn iso8601(at: std::time::SystemTime) -> String {
 
 /// One record of the inventory the service computed for this account, built from
 /// the action it recommends.
-fn computed(
-    id: &str,
-    action_type: ActionType,
-    severity: Severity,
-    feature: Feature,
-    next_step: &str,
-    computed_at: &str,
-) -> StoredAction {
+///
+/// The record's `feature` and `severity` are NOT arguments: they are the pair
+/// [`ActionType::published_pair`] publishes for the type, so the inventory cannot
+/// report a type in a feature or a severity tier the service does not publish for
+/// it.
+fn computed(action_type: ActionType, next_step: &str, computed_at: &str) -> StoredAction {
+    let (feature, severity) = action_type.published_pair();
     StoredAction {
-        id: id.to_string(),
+        id: boot_id(action_type),
         action_type,
         account_id: ::engine::emulator_account_id().to_string(),
         severity,
@@ -217,6 +258,74 @@ fn computed(
     }
 }
 
+/// The `RecommendedAction$id` the boot inventory gives the record it holds for an
+/// action type.
+///
+/// The model types the member as a plain `String` and fixes no form, so this is the
+/// emulator's own value; deriving it from the type keeps the ids unique, stable
+/// across runs and readable.
+fn boot_id(action_type: ActionType) -> String {
+    format!(
+        "ra-{}",
+        action_type.as_str().to_ascii_lowercase().replace('_', "-")
+    )
+}
+
+/// The next step the inventory's record for an action type reports
+/// (`RecommendedAction$nextSteps`): what a customer does to adopt the
+/// recommendation.
+///
+/// Each row is ONE recommendation this emulator's account is in the condition for,
+/// with that condition stated above it. The service computes a recommendation from a
+/// condition it detects, so a type whose condition this account is NOT in carries no
+/// record: nothing is past due and the payment method on file is valid (no `PAYMENTS`
+/// recommendation), no budget exists so none can be exceeded or have alerted, no
+/// anomaly monitor exists so no anomaly has been detected, the account is not on Free
+/// Tier, and no tax document on file is expiring. Rows are in model order, which is
+/// the insertion order the store keeps.
+const BOOT_INVENTORY: &[(ActionType, &str)] = &[
+    // No alternate billing contact is on the account.
+    (
+        ActionType::AddAlternateBillingContact,
+        "Add an alternate billing contact for this account.",
+    ),
+    // No cost anomaly monitor is configured.
+    (
+        ActionType::CreateAnomalyMonitor,
+        "Create a cost anomaly monitor so unexpected spend is detected.",
+    ),
+    // No budget exists — the baseline recommendation of a fresh account.
+    (
+        ActionType::CreateBudget,
+        "Create a budget to track and control your costs.",
+    ),
+    // Cost Optimization Hub is not enabled.
+    (
+        ActionType::EnableCostOptimizationHub,
+        "Enable Cost Optimization Hub to see your consolidated savings opportunities.",
+    ),
+    // The account's billing policies still name the coarse billing permissions.
+    (
+        ActionType::MigrateToGranularPermissions,
+        "Migrate your billing IAM policies to the fine-grained billing permissions.",
+    ),
+    // Reserved Instances the account holds expire soon.
+    (
+        ActionType::ReviewExpiringRi,
+        "Review the Reserved Instances that expire soon.",
+    ),
+    // Savings Plans the account holds expire soon.
+    (
+        ActionType::ReviewExpiringSp,
+        "Review the Savings Plans that expire soon.",
+    ),
+    // The account's usage carries savings opportunities to look at.
+    (
+        ActionType::ReviewSavingsOpportunityRecommendations,
+        "Review the savings opportunities in Cost Optimization Hub.",
+    ),
+];
+
 /// The recommended actions this emulator holds when it starts.
 ///
 /// `ListRecommendedActions` only REPORTS, and the service models no create
@@ -227,10 +336,18 @@ fn computed(
 /// starts with the set this account has, the way the real service's generator
 /// produces one; `seed` and `clear` stay the seam that installs another.
 ///
-/// Every record names a modelled `ActionType`, `Severity` and `Feature`, and the
-/// account the emulator presents ([`engine::emulator_account_id`]). The three
-/// severities differ, so a filter on any one of them keeps some records and excludes
-/// others. The inventory is fixed rather than derived from traffic: this emulator
+/// The inventory carries one record per recommendation this account's condition
+/// makes due ([`BOOT_INVENTORY`]), in model order, each carrying the
+/// `(feature, severity)` pair the service publishes for its type
+/// ([`ActionType::published_pair`]) and the account the emulator presents
+/// ([`engine::emulator_account_id`]). It spans the baseline recommendations a fresh
+/// account in good standing carries — a budget to create, an anomaly monitor to
+/// create, Cost Optimization Hub to enable, an alternate billing contact to add,
+/// billing permissions to migrate, commitments expiring and savings opportunities to
+/// look at — so a filter over a value the account carries answers the way the API's
+/// filtering contract requires: the `EQUALS` side and the `NOT_EQUALS` side of the
+/// partition are both non-empty, instead of a type the account should have returning
+/// nothing. The inventory is fixed rather than derived from traffic: this emulator
 /// observes no billing usage to derive one from.
 fn computed_recommendations() -> Vec<StoredAction> {
     // The instant the inventory was produced, which is the instant this store is
@@ -239,32 +356,10 @@ fn computed_recommendations() -> Vec<StoredAction> {
     // timestamp it was computed with however long the emulator runs before it is
     // first listed.
     let computed_at = iso8601(std::time::SystemTime::now());
-    vec![
-        computed(
-            "ra-savings-opportunities",
-            ActionType::ReviewSavingsOpportunityRecommendations,
-            Severity::Info,
-            Feature::CostOptimizationHub,
-            "Review the savings opportunities in Cost Optimization Hub.",
-            &computed_at,
-        ),
-        computed(
-            "ra-expiring-reserved-instances",
-            ActionType::ReviewExpiringRi,
-            Severity::Warning,
-            Feature::Reservations,
-            "Review the Reserved Instances that expire soon.",
-            &computed_at,
-        ),
-        computed(
-            "ra-expiring-savings-plans",
-            ActionType::ReviewExpiringSp,
-            Severity::Critical,
-            Feature::SavingsPlans,
-            "Review the Savings Plans that expire soon.",
-            &computed_at,
-        ),
-    ]
+    BOOT_INVENTORY
+        .iter()
+        .map(|&(action_type, next_step)| computed(action_type, next_step, &computed_at))
+        .collect()
 }
 
 /// The recommended actions this emulator holds, in insertion order.

@@ -17,6 +17,8 @@ mod boot_inventory_timestamp;
 mod context_map_order;
 #[path = "all/list_recommended_actions.rs"]
 mod list_recommended_actions;
+#[path = "all/recommended_action_catalog.rs"]
+mod recommended_action_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unreadable_input.rs"]
