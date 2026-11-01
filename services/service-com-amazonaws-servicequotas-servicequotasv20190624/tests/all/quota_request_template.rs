@@ -38,10 +38,15 @@ const ORGANIZATIONS_TARGET_PREFIX: &str = "AWSOrganizationsV20161128.";
 
 /// The Region the quota request template plane is served from
 /// (`crate::state::TEMPLATE_HOME_REGION`).
-const HOME_REGION: &str = "us-east-1";
+pub(crate) const HOME_REGION: &str = "us-east-1";
 
 /// Service Quotas and AWS Organizations over one shared engine.
-struct Emulator {
+///
+/// `pub(crate)` so the other suites in this target that drive the template plane share
+/// ONE harness instead of each growing a copy of it: the plane's gate reads the
+/// account's organization out of AWS Organizations, so both services have to be mounted
+/// on the same engine to reach it at all.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
@@ -67,7 +72,7 @@ impl Emulator {
 
     /// Both services, with the account made the management account of an organization
     /// whose `FeatureSet` is `feature_set`.
-    async fn in_organization(feature_set: &str) -> Self {
+    pub(crate) async fn in_organization(feature_set: &str) -> Self {
         let emulator = Self::new();
         let created = emulator
             .call(
@@ -137,7 +142,7 @@ impl Emulator {
 
     /// One Service Quotas call at the template plane's home Region, required to answer
     /// 200.
-    async fn ok(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
         let (status, parsed) = self.quotas(HOME_REGION, operation, body.clone()).await;
         assert_eq!(
             status, 200,

@@ -162,7 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // requests for one quota this endpoint serves, narrowed by the `Status` and
         // level the caller asked for — so a token cut from another selection cannot
         // resume here. A caller that names no level is served the ACCOUNT one, so the
-        // two label the same listing.
+        // two label the same listing. The position is the order key of the record the
+        // page stopped after, so a further increase requested on this quota while a
+        // caller walks the history repeats no record and hides none.
         let listing = crate::state::listing_label(
             Self::NAME,
             &[
@@ -175,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             ],
         );
-        let page = crate::state::paginate(
+        let page = crate::state::paginate_after(
             &listing,
             history,
             input.max_results,

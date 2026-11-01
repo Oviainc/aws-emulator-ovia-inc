@@ -53,6 +53,8 @@ mod history_filter_chain;
 mod no_such_quota_wording;
 #[path = "all/open_request_plane_scope.rs"]
 mod open_request_plane_scope;
+#[path = "all/pagination_token_position.rs"]
+mod pagination_token_position;
 #[path = "all/pagination_token_scope.rs"]
 mod pagination_token_scope;
 #[path = "all/published_default_quota_codes.rs"]

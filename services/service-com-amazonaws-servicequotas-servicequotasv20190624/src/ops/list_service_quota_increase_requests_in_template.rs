@@ -12,7 +12,10 @@
 //! Past the gate this ENUMERATES the stored entries and writes nothing: narrowed to the
 //! optional `ServiceCode` and `AwsRegion` the call names (a call that names neither gets
 //! the whole template), in the entries' own stable order, and paginated by `MaxResults` /
-//! `NextToken`. A token that does not name a position in THIS listing is the modelled
+//! `NextToken`. The token names the POSITION in that order — the key of the entry the
+//! page stopped after — so an entry put into or deleted from the template around a page
+//! boundary leaves a walk in progress reporting every other entry exactly once. A token
+//! that does not name a position in THIS listing is the modelled
 //! `IllegalArgumentException` — the refusal this operation carries for a bad input, since
 //! it models no pagination-token error of its own.
 //!
@@ -170,7 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // A pure read: it reports the stored entries and writes nothing.
+        // A pure read: it reports the stored entries and writes nothing. Each entry
+        // comes paired with the order key that names its position in the template's
+        // own key order, which is what the page token carries.
         let entries = state.lock().template_entries(
             input.service_code.as_deref(),
             input.aws_region.as_deref(),
@@ -182,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Self::NAME,
             &[input.service_code.as_deref(), input.aws_region.as_deref()],
         );
-        let page = crate::state::paginate(
+        let page = crate::state::paginate_after(
             &label,
             entries,
             input.max_results,

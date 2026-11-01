@@ -18,8 +18,9 @@
 //! * the **quota increase requests** (`RequestServiceQuotaIncrease`,
 //!   `GetRequestedServiceQuotaChange`, `CreateSupportCase`,
 //!   `ListRequestedServiceQuotaChangeHistoryByQuota`) — append-only, with an
-//!   insertion-ordered index so a history listing is newest-first and a pagination
-//!   token keeps meaning the same position;
+//!   insertion-ordered index so a history listing is newest-first, and paginated by
+//!   the position each record's own `Created`/`Id` key has in that order, so a token
+//!   keeps meaning the same position while further requests are made;
 //! * the **quota utilization reports** (`StartQuotaUtilizationReport`,
 //!   `GetQuotaUtilizationReport`) — each one a FROZEN snapshot of the quota values in
 //!   force when it was initiated and of the account's usage of them at that moment
@@ -806,7 +807,7 @@ struct RegionState {
     applied_quotas: BTreeMap<AppliedKey, AppliedQuota>,
     quota_requests: BTreeMap<String, QuotaRequest>,
     /// Request ids in the order they were minted: the index a history listing walks
-    /// backwards and a pagination token indexes into.
+    /// backwards.
     request_order: Vec<String>,
     /// How many requests this region has minted; part of the id derivation, so two
     /// requests for the same quota in the same nanosecond still get distinct ids.
@@ -1573,7 +1574,8 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
 
     /// One history listing's page of records: of the `requests` selected for it, the
     /// ones that carry `status` now and were made at a level [`requested_at_level`]
-    /// keeps, each rendered through [`Self::request_view`].
+    /// keeps, each rendered through [`Self::request_view`] and paired with the
+    /// [`request_order_key`] that names its position in the listing's order.
     ///
     /// Both history listings differ only in which requests they select — the account's
     /// ([`Self::requests_in_history`]) or one quota's
@@ -1586,12 +1588,12 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         requests: Vec<QuotaRequest>,
         status: Option<&str>,
         level: Option<&str>,
-    ) -> Vec<RequestedServiceQuotaChange> {
+    ) -> Vec<(String, RequestedServiceQuotaChange)> {
         requests
             .into_iter()
             .filter(|request| status.is_none_or(|status| request.status == status))
             .filter(|request| requested_at_level(&request.quota_requested_at_level, level))
-            .map(|request| self.request_view(&request))
+            .map(|request| (request_order_key(&request), self.request_view(&request)))
             .collect()
     }
 
@@ -1936,19 +1938,27 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// entries matching them, and one that names neither gets the whole template.
     ///
     /// The order is the key's own — `(ServiceCode, AwsRegion, QuotaCode)` — so it is
-    /// the same for two callers and a pagination token keeps meaning the same position
-    /// as entries are added and removed around it.
+    /// the same for two callers, and each entry is paired with the
+    /// [`template_entry_order_key`] that names its position in that order: an entry
+    /// put or deleted around a page boundary moves no other entry's key, so a
+    /// pagination token keeps meaning the same position as entries are added and
+    /// removed around it.
     pub fn template_entries(
         &self,
         service_code: Option<&str>,
         aws_region: Option<&str>,
-    ) -> Vec<ServiceQuotaIncreaseRequestInTemplate> {
+    ) -> Vec<(String, ServiceQuotaIncreaseRequestInTemplate)> {
         self.templates
             .entries
             .iter()
             .filter(|(key, _)| service_code.is_none_or(|code| key.service_code == code))
             .filter(|(key, _)| aws_region.is_none_or(|region| key.aws_region == region))
-            .map(|(key, desired_value)| self.template_entry_view(key, *desired_value))
+            .map(|(key, desired_value)| {
+                (
+                    template_entry_order_key(key),
+                    self.template_entry_view(key, *desired_value),
+                )
+            })
             .collect()
     }
 
@@ -2050,9 +2060,9 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
 ///
 /// A listing can draw on more than one region's store — an account-wide quota's plane
 /// is the whole account — so the order has to be a property of the RECORDS rather than
-/// of the store they were read out of, and it has to be TOTAL: a page token names an
-/// offset, so two requests created in the same instant must not swap between two pages
-/// of one listing.
+/// of the store they were read out of, and it has to be TOTAL: a page token names a
+/// position in this order ([`request_order_key`]), so two requests created in the same
+/// instant must not swap between two pages of one listing.
 fn sort_newest_first(requests: &mut [QuotaRequest]) {
     requests.sort_by(|left, right| {
         right
@@ -2060,6 +2070,33 @@ fn sort_newest_first(requests: &mut [QuotaRequest]) {
             .cmp(&left.created)
             .then_with(|| left.id.cmp(&right.id))
     });
+}
+
+/// The [`order_key`] of one quota increase request in a listing [`sort_newest_first`]
+/// has ordered.
+///
+/// The two fields that order compares, in the same precedence: the instant the request
+/// was created — COMPLEMENTED, so the key ascends exactly where the listing descends,
+/// and fixed width, so it compares the way the number does — then the request's `Id`.
+/// Both are written once when the request is minted, so a request appended to the
+/// history (its own key the smallest of all, since it is the newest) moves no stored
+/// request's key.
+fn request_order_key(request: &QuotaRequest) -> String {
+    let nanos = request
+        .created
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default();
+    order_key(&[&format!("{:039}", u128::MAX - nanos), &request.id])
+}
+
+/// The [`order_key`] of one quota request template entry: the three members of the key
+/// the template holds it under, in that key's own precedence.
+///
+/// The entry's own identity, so putting or deleting another entry — which the template
+/// stores at ITS key's position — leaves this one's key exactly where it was.
+fn template_entry_order_key(key: &TemplateKey) -> String {
+    order_key(&[&key.service_code, &key.aws_region, &key.quota_code])
 }
 
 /// The overlay contexts that cover `context`, most specific first: the resource's own
@@ -2477,6 +2514,35 @@ pub struct Page<T> {
 #[derive(Debug)]
 pub struct InvalidPageToken;
 
+/// The separator an [`order_key`] joins its parts with.
+///
+/// It sorts BELOW every character a part can hold — the modelled codes and ids are
+/// letters, digits and `-`, a context id is an ARN, and a rank is digits — so a joined
+/// key compares exactly the way the tuple of its parts does. A visible separator would
+/// not: joined with `-`, the pair `("a", "z")` would sort after `("ab", "a")`, which
+/// the tuples do not.
+const ORDER_KEY_SEPARATOR: &str = "\u{1f}";
+
+/// The ORDER KEY of one record of an ordered listing: the parts that listing's order
+/// compares, most significant first, joined so the string ascends exactly where the
+/// order does.
+///
+/// A page token names a position in a listing's order, and this is how such a position
+/// is spelled, so every part of a key has to be a property of the RECORD (or of state
+/// that is never mutated) and never of the `Vec` one call happened to build.
+pub fn order_key(parts: &[&str]) -> String {
+    parts.join(ORDER_KEY_SEPARATOR)
+}
+
+/// A record's position in a sequence that is NEVER MUTATED, as one part of an
+/// [`order_key`] — the published position of a quota in the seeded catalog.
+///
+/// Fixed width, so the string compares the way the number does, and wide enough for
+/// any catalog this service seeds (the longest service publishes hundreds of quotas).
+pub fn rank_key(rank: usize) -> String {
+    format!("{rank:010}")
+}
+
 /// The marker a listing label carries where the caller named NO value for a
 /// selector.
 ///
@@ -2486,9 +2552,10 @@ pub struct InvalidPageToken;
 /// marker and "none named" stays distinguishable from every narrowing.
 const NO_SELECTOR: &str = "-";
 
-/// The label of the listing a request selected, for [`paginate`]'s `listing`.
+/// The label of the listing a request selected, for [`paginate`]'s and
+/// [`paginate_after`]'s `listing`.
 ///
-/// A page token names an offset, and an offset means something only in ONE ordered
+/// A page token names a position, and a position means something only in ONE ordered
 /// result set, so the label carries the operation name AND every input that chose
 /// which records that set holds — in a fixed order, each in the form the handler
 /// filtered by (a selector the caller left out is passed as the default the listing
@@ -2521,6 +2588,14 @@ pub fn listing_label(operation: &str, selectors: &[Option<&str>]) -> String {
 /// may ask for, not what a listing serves when none is asked for. A listing whose own
 /// unasked page size IS published goes through [`paginate_bounded`] with it instead
 /// (`GetQuotaUtilizationReport`, with the 1,000 its model declares).
+///
+/// Counting records ahead of a page is a position only in a result set NOTHING can
+/// insert into or remove from between two calls, so this form serves exactly those:
+/// the seeded catalog listings (`ListServices`, `ListAWSDefaultServiceQuotas`), whose
+/// records are written once in [`Default`] and never mutated, and the FROZEN snapshot
+/// `GetQuotaUtilizationReport` pages, taken when the report was initiated. A listing
+/// whose records are stored and removed while a caller walks it pages through
+/// [`paginate_after`], whose token names the position in the ORDER instead.
 pub fn paginate<T>(
     listing: &str,
     all: Vec<T>,
@@ -2575,12 +2650,83 @@ pub fn paginate_bounded<T>(
     })
 }
 
+/// Cut one page out of an ordered listing whose RECORD SET changes while a caller
+/// walks it, resuming at a position in the listing's OWN ORDER.
+///
+/// `all` is the listing in order, each record paired with the [`order_key`] that names
+/// its position in it, and the token carries the key of the record the page stopped
+/// after: the next page is the records whose key is GREATER than that one. A record
+/// stored or removed anywhere around that position therefore moves no other record's
+/// key, so the walk reports no record twice and hides none — which counting records
+/// ahead of the page cannot do, since every insertion and removal before the boundary
+/// shifts that count by one.
+///
+/// `listing`, `max_results` and the page sizes mean exactly what they do in
+/// [`paginate`]: a token is good only for the listing [`listing_label`] names, a
+/// caller's `MaxResults` is clamped to [`MAX_PAGE_SIZE`], and a caller that asks for no
+/// page size is served [`UNASKED_PAGE_SIZE`] — the whole remainder, in one page.
+pub fn paginate_after<T>(
+    listing: &str,
+    all: Vec<(String, T)>,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+) -> Result<Page<T>, InvalidPageToken> {
+    let start = match next_token {
+        Some(token) => match decode_cursor_token(listing, token)? {
+            // The records at or before the position the token names are the ones the
+            // walk has already reported, whatever has happened to the listing since.
+            Some(key) => all.partition_point(|(held, _)| *held <= key),
+            None => 0,
+        },
+        None => 0,
+    };
+    let total = all.len();
+    let size = max_results.map_or(UNASKED_PAGE_SIZE, |requested| {
+        (requested.max(1) as usize).min(MAX_PAGE_SIZE)
+    });
+    let page: Vec<(String, T)> = all.into_iter().skip(start).take(size).collect();
+    let stopped_after = page.last().map(|(key, _)| key.clone());
+    let remaining = start + page.len() < total;
+    let next_token = match stopped_after {
+        Some(key) if remaining => Some(encode_cursor_token(listing, &key)),
+        _ => None,
+    };
+    Ok(Page {
+        items: page.into_iter().map(|(_, item)| item).collect(),
+        next_token,
+    })
+}
+
+/// The opaque token for "resume `listing` after the record whose order key is `key`".
+fn encode_cursor_token(listing: &str, key: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(format!("{listing}:{key}"))
+}
+
+/// The order key a token says `listing` has been walked up to — `None` for the empty
+/// token, which is the same request as no token at all — or [`InvalidPageToken`] when
+/// it is not a token this service issued for that listing.
+fn decode_cursor_token(listing: &str, token: &str) -> Result<Option<String>, InvalidPageToken> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .map_err(|_| InvalidPageToken)?;
+    let text = String::from_utf8(decoded).map_err(|_| InvalidPageToken)?;
+    let key = text
+        .strip_prefix(&format!("{listing}:"))
+        .ok_or(InvalidPageToken)?;
+    if key.is_empty() {
+        // A token carrying no key names no position in the listing.
+        return Err(InvalidPageToken);
+    }
+    Ok(Some(key.to_string()))
+}
+
 /// The opaque token for "resume `listing` at `offset`".
 fn encode_page_token(listing: &str, offset: usize) -> String {
     base64::engine::general_purpose::STANDARD.encode(format!("{listing}:{offset}"))
-}
-
-/// The position a token names in `listing`, or [`InvalidPageToken`] when it is not
+}/// The position a token names in `listing`, or [`InvalidPageToken`] when it is not
 /// one this service issued for that listing.
 fn decode_page_token(listing: &str, token: &str) -> Result<usize, InvalidPageToken> {
     // An empty token is the same request as no token at all: start at the beginning.

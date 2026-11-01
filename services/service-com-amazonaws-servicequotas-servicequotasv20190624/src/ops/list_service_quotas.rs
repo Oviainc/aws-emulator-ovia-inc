@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let level = input.quota_applied_at_level.as_deref();
-            let mut quotas: Vec<ServiceQuota> = Vec::new();
+            let mut quotas: Vec<(String, ServiceQuota)> = Vec::new();
             // Which plane's records the caller asked for is the crate's ONE
             // `AppliedLevelEnum` filter rule ([`crate::state::requested_at_level`]),
             // asked here of the level each plane's records sit at rather than written
@@ -166,22 +166,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // view's own rule ([`crate::state::DefaultQuota::has_plane`]): a quota
             // adjustable for an individual resource only has no account-wide record,
             // so the listing carries none for it.
+            //
+            // Each record is paired with the order key naming its position in this
+            // listing: the plane it answers for (the ACCOUNT records come first, and
+            // the two level names order the same way), then the quota's PUBLISHED
+            // position in the catalog — which is seeded once and never mutated, so it
+            // names the same quota on every call — then the resource context, for a
+            // record that answers for one. A resource-plane record appearing or going
+            // away while a caller walks the listing therefore moves no other record's
+            // key, which is what the page token carries.
             if crate::state::requested_at_level(crate::state::LEVEL_ACCOUNT, level) {
-                quotas.extend(codes.iter().filter_map(|code| {
-                    quotas_state.applied_quota_view(&region, &input.service_code, code, None)
+                quotas.extend(codes.iter().enumerate().filter_map(|(rank, code)| {
+                    quotas_state
+                        .applied_quota_view(&region, &input.service_code, code, None)
+                        .map(|quota| {
+                            let key = crate::state::order_key(&[
+                                crate::state::LEVEL_ACCOUNT,
+                                &crate::state::rank_key(rank),
+                            ]);
+                            (key, quota)
+                        })
                 }));
             }
             if crate::state::requested_at_level(crate::state::LEVEL_RESOURCE, level) {
-                for code in &codes {
+                for (rank, code) in codes.iter().enumerate() {
                     for context in
                         quotas_state.applied_contexts(&region, &input.service_code, code)
                     {
-                        quotas.extend(quotas_state.applied_quota_view(
-                            &region,
-                            &input.service_code,
-                            code,
-                            Some(&context),
-                        ));
+                        let key = crate::state::order_key(&[
+                            crate::state::LEVEL_RESOURCE,
+                            &crate::state::rank_key(rank),
+                            &context,
+                        ]);
+                        quotas.extend(
+                            quotas_state
+                                .applied_quota_view(
+                                    &region,
+                                    &input.service_code,
+                                    code,
+                                    Some(&context),
+                                )
+                                .map(|quota| (key, quota)),
+                        );
                     }
                 }
             }
@@ -192,7 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's records for one service, narrowed by the `QuotaCode` and the
         // plane the caller asked for — so a token cut from another selection cannot
         // resume here. A caller that names no plane is served the ACCOUNT one, so
-        // the two label the same listing.
+        // the two label the same listing. The position is the order key of the record
+        // the page stopped after, so a resource-plane record applied or removed while
+        // a caller walks the listing repeats no record and hides none.
         let listing = crate::state::listing_label(
             Self::NAME,
             &[
@@ -204,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             ],
         );
-        let page = crate::state::paginate(
+        let page = crate::state::paginate_after(
             &listing,
             quotas,
             input.max_results,
