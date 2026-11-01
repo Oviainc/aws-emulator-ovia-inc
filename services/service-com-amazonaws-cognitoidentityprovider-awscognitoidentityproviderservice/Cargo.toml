@@ -9,6 +9,10 @@ build = "build.rs"
 [dependencies]
 engine = { workspace = true }
 service-common = { path = "../common" }
+# The WAFv2 web ACL in front of a user pool decides the pool's API operations
+# (`src/service/web_acl.rs`): the association and the rule evaluation are WAFv2's own
+# records and its own data plane, read through that crate rather than copied here.
+service-com-amazonaws-wafv2-awswaf-20190729 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -51,6 +55,10 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
+# A `ByteMatchStatement$SearchString` is a blob, which travels base64-encoded in an
+# awsJson body: the web-ACL suite encodes its search strings with the same coder the
+# wafv2 crate decodes them with.
+base64 = "0.22"
 
 [lints]
 workspace = true

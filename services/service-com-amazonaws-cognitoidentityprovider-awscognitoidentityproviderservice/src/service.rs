@@ -24,7 +24,9 @@
 //! - `override_operation` — EDITED HERE: the key and the handler stay the generated
 //!   table's, but each operation is served through [`WithSubmittedValues`], so a request
 //!   refused before the handler runs states the COLLECTION the caller submitted, which
-//!   the framework's walk can only summarise as `<n> items`.
+//!   the framework's walk can only summarise as `<n> items` — and through
+//!   [`BehindWebAcl`], so a request to a pool with a WAFv2 web ACL associated is decided
+//!   by that web ACL before the operation serves it.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -71,6 +73,10 @@ use std::sync::Arc;
 /// carries, and the header naming the error shape it refused with. Private: it is reached
 /// through `override_protocol` and the refusal tail below, not by a caller.
 mod error_wire;
+
+/// The WAFv2 web ACL in front of a user pool, which decides the pool's API operations
+/// before the operation serves them ([`BehindWebAcl`]).
+mod web_acl;
 
 /// The error code Amazon Cognito answers a bad parameter with, and the code this service
 /// gives a refusal the framework made before any handler ran. Restated beside the message
@@ -156,8 +162,12 @@ macro_rules! wrap_operations {
         $(
             $table.add_operation(
                 stringify!($operation),
-                ::std::boxed::Box::new(WithSubmittedValues::new(
-                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                ::std::boxed::Box::new(BehindWebAcl::new(
+                    stringify!($operation),
+                    ::std::sync::Arc::clone(&$engine),
+                    ::std::boxed::Box::new(WithSubmittedValues::new(
+                        crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                    )) as ::std::boxed::Box<dyn ErasedOperation>,
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
         )+
@@ -312,6 +322,66 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             with_submitted_values,
             protocol: error_wire::ErrorWireProtocol::new(),
         }
+    }
+}
+
+/// One modelled operation, served BEHIND the WAFv2 web ACL associated with the user pool
+/// the request addresses.
+///
+/// A web ACL is "a set of rules that defines the strategy that WAF uses to inspect and
+/// handle web requests" and it sits in FRONT of the resource it is associated with, so it
+/// is asked ahead of everything the operation itself decides about the request — the
+/// parameters, the app client, the credential and the pool's own records, none of which a
+/// request it blocks ever reaches. A pool with no web ACL associated, and an operation no
+/// web ACL decides, are served exactly as they were before web ACLs were read at all; the
+/// whole decision and the answer it renders are [`web_acl`]'s.
+///
+/// A `CustomRequestHandling`'s inserted headers are deliberately not carried onto the
+/// request the operation goes on to serve: WAF inserts them "into the web request" for the
+/// ORIGIN to read, and an operation of this service is addressed entirely by its modelled
+/// input rather than by a header of its request, so there is nothing here that would read
+/// one.
+struct BehindWebAcl<Eng> {
+    /// The operation shape name, which is both this entry's routing key and the name
+    /// [`web_acl::governs`] asks about.
+    name: &'static str,
+    /// The shared engine, so the web ACL the wafv2 control plane stored for this pool is
+    /// read from the one store every service of this emulator shares.
+    engine: Arc<Eng>,
+    /// The operation this one wraps, served for every request the web ACL let through.
+    operation: Box<dyn ErasedOperation>,
+}
+
+impl<Eng> BehindWebAcl<Eng> {
+    /// Put `operation`, already constructed from the shared engine, behind the web ACL.
+    fn new(name: &'static str, engine: Arc<Eng>, operation: Box<dyn ErasedOperation>) -> Self {
+        Self {
+            name,
+            engine,
+            operation,
+        }
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for BehindWebAcl<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            if let Some(refused) = web_acl::refusal(&*self.engine, self.name, req) {
+                return refused;
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
     }
 }
 
@@ -637,7 +707,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // NOT a re-route: the key is the one the generated table's own protocol resolves,
         // and the operation it names is the one served — wrapped in
         // [`WithSubmittedValues`] so a constraint refusal states the value the caller
-        // submitted rather than the framework's summary of it. A key the model does not
+        // submitted rather than the framework's summary of it, and in [`BehindWebAcl`] so
+        // the web ACL in front of the pool decides the request first. A key the model does not
         // name resolves to `None` here exactly as it does in the generated table (the two
         // non-modelled GET routes below are among them), so the router's routing-error
         // path is unchanged.
