@@ -323,6 +323,19 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
             .filter(|definition| definition.account_id == account_id)
     }
 
+    /// [`Self::network_migration_definition_of`], for a write: the record of this
+    /// account, so what an update stores is what every reader of the same store reports
+    /// afterwards. A definition of another account stays invisible here too.
+    pub fn network_migration_definition_of_mut(
+        &mut self,
+        account_id: &str,
+        definition_id: &str,
+    ) -> Option<&mut NetworkMigrationDefinition> {
+        self.network_migration_definitions
+            .get_mut(definition_id)
+            .filter(|definition| definition.account_id == account_id)
+    }
+
     /// A fresh `networkMigrationDefinitionID` no stored definition holds.
     pub fn mint_network_migration_definition_id(&self) -> String {
         loop {

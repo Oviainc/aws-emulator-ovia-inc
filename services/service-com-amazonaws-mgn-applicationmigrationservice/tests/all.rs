@@ -17,6 +17,8 @@ mod application_lifecycle;
 mod network_migration_definition;
 #[path = "all/network_migration_definition_listing.rs"]
 mod network_migration_definition_listing;
+#[path = "all/network_migration_definition_update.rs"]
+mod network_migration_definition_update;
 #[path = "all/network_migration_execution_listing.rs"]
 mod network_migration_execution_listing;
 #[path = "all/request_body_validation.rs"]

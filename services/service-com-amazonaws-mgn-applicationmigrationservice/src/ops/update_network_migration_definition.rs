@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNetworkMigrationDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNetworkMigrationDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNetworkMigrationDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the stored network migration definition a request names, member by member.
 //!
 //! ## Shape of an operation
 //!
@@ -131,12 +123,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `UpdateNetworkMigrationDefinitionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#UpdateNetworkMigrationDefinition")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#UpdateNetworkMigrationDefinition",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UpdateNetworkMigrationDefinitionErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -190,18 +189,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNetworkMigrationDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNetworkMigrationDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNetworkMigrationDefinition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateNetworkMigrationDefinitionErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        // The operation models no `accountID` member, so it updates only the definitions
+        // of the account the request is signed for.
+        let account = crate::state::account_key(None);
+        let definition_id = input.network_migration_definition_id;
+        let mut store = state.lock();
+
+        let Some(definition) = store.network_migration_definition_of_mut(&account, &definition_id)
+        else {
+            return Err(
+                UpdateNetworkMigrationDefinitionErrorModeled::ResourceNotFoundException(
+                    crate::state::network_migration_definition_not_found(&definition_id),
+                )
+                .into(),
+            );
+        };
+
+        // The configuration this request leaves on the definition: every member the
+        // request CARRIES replaces the stored one, every member it OMITS keeps the value
+        // the definition already holds.
+        let mut updated = definition.configuration.clone();
+        if let Some(name) = input.name {
+            updated.name = name;
+        }
+        if let Some(description) = input.description {
+            updated.description = Some(description);
+        }
+        if let Some(source_configurations) = input.source_configurations {
+            updated.source_configurations = source_configurations;
+        }
+        if let Some(target_deployment) = input.target_deployment {
+            updated.target_deployment = Some(target_deployment);
+        }
+        if let Some(vpc_provisioning_strategy) = input.vpc_provisioning_strategy {
+            updated.vpc_provisioning_strategy = Some(vpc_provisioning_strategy);
+        }
+        if let Some(cidr_mappings) = input.cidr_mappings {
+            updated.cidr_mappings = cidr_mappings;
+        }
+        if let Some(scope_tags) = input.scope_tags {
+            // Stored sorted, so the scope tags a read reports are in one stable order.
+            updated.scope_tags = scope_tags.into_iter().collect();
+        }
+        // `targetS3Configuration` and `targetNetwork` arrive as their own update shapes,
+        // whose members are ALL optional while the stored structures require some of
+        // them, so the same rule runs one level down: a sub-member the request names
+        // replaces the stored one, a sub-member it omits is preserved — an update cannot
+        // leave a definition without the topology or the bucket its record requires.
+        if let Some(target_s3_configuration) = input.target_s3_configuration {
+            if let Some(s3_bucket) = target_s3_configuration.s3_bucket {
+                updated.target_s3_configuration.s3_bucket = s3_bucket;
+            }
+            if let Some(s3_bucket_owner) = target_s3_configuration.s3_bucket_owner {
+                updated.target_s3_configuration.s3_bucket_owner = s3_bucket_owner;
+            }
+        }
+        if let Some(target_network) = input.target_network {
+            if let Some(topology) = target_network.topology {
+                updated.target_network.topology = topology;
+            }
+            if let Some(inbound_cidr) = target_network.inbound_cidr {
+                updated.target_network.inbound_cidr = Some(inbound_cidr);
+            }
+            if let Some(outbound_cidr) = target_network.outbound_cidr {
+                updated.target_network.outbound_cidr = Some(outbound_cidr);
+            }
+            if let Some(inspection_cidr) = target_network.inspection_cidr {
+                updated.target_network.inspection_cidr = Some(inspection_cidr);
+            }
+        }
+
+        // The rule the model documents on `cidrMappings` ("CIDR mappings can be provided
+        // only when `vpcProvisioningStrategy` is set to `USE_EXISTING`") is a property of
+        // the RECORD, so it is checked against the configuration this update would leave:
+        // moving a definition off `USE_EXISTING` while mappings stay on it is refused the
+        // same way adding mappings outside `USE_EXISTING` is, and a refused update leaves
+        // the stored definition exactly as it was.
+        let migrates_into_existing_vpcs = updated.vpc_provisioning_strategy.as_deref()
+            == Some(crate::state::VPC_PROVISIONING_USE_EXISTING);
+        if !updated.cidr_mappings.is_empty() && !migrates_into_existing_vpcs {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &definition_id,
+                "refused: ValidationException",
+            );
+            return Err(
+                UpdateNetworkMigrationDefinitionErrorModeled::ValidationException(
+                    crate::state::cidr_mappings_need_existing_vpcs(),
+                )
+                .into(),
+            );
+        }
+
+        // `@idempotent`: a call that leaves every member as it already was has the same
+        // effect as never having been made, so it does not move `updatedAt` either — a
+        // retry answers the record the first call left rather than a differing one.
+        // Anything else is a change, and `updatedAt` is the instant it was made.
+        let changed = !definition.configuration.matches(&updated);
+        if changed {
+            definition.configuration = updated;
+            definition.updated_at = ::std::time::SystemTime::now();
+        }
+
+        // The stored record, member for member: what this update left is what a later
+        // read reports.
+        let reported = definition.to_shape();
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &account,
+            &definition_id,
+            if changed { "updated" } else { "unchanged" },
+        );
+        Ok(UpdateNetworkMigrationDefinitionOutput {
+            arn: reported.arn,
+            network_migration_definition_id: reported.network_migration_definition_id,
+            name: reported.name,
+            description: reported.description,
+            source_configurations: reported.source_configurations,
+            target_s3_configuration: reported.target_s3_configuration,
+            target_network: reported.target_network,
+            target_deployment: reported.target_deployment,
+            vpc_provisioning_strategy: reported.vpc_provisioning_strategy,
+            cidr_mappings: reported.cidr_mappings,
+            created_at: reported.created_at,
+            updated_at: reported.updated_at,
+            tags: reported.tags,
+            scope_tags: reported.scope_tags,
+        })
     }
 }
+
