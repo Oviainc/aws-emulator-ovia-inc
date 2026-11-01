@@ -22,7 +22,7 @@
 //! [`EMF_DISABLED_ERRORS_METRIC`] metric in [`LOGS_NAMESPACE`], so a client can tell a
 //! suppressing policy from a broken pipeline.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
 
@@ -79,6 +79,12 @@ const COUNT_UNIT: &str = "Count";
 /// writing an unbounded number of series. THE EMULATOR'S OWN CEILING, not a documented
 /// limit.
 pub const MAX_DATAPOINTS_PER_EVENT: usize = 100;
+
+/// How many DISTINCT dimension projections one directive resolves, whatever number of
+/// dimension sets it declares: the ceiling that keeps the work one message drives linear in
+/// its own size rather than a product of the counts it declares. THE EMULATOR'S OWN CEILING,
+/// not a documented limit.
+const MAX_PROJECTIONS_PER_DIRECTIVE: usize = 30;
 
 /// One datapoint an ingested Embedded Metric Format document publishes.
 #[derive(Debug, Clone, PartialEq)]
@@ -161,14 +167,22 @@ pub fn extracted_datapoints_bounded(
         else {
             continue;
         };
+        // A directive that declares no metric publishes nothing, so its dimension sets are
+        // never resolved: the work one message drives is paid only where a datapoint can come
+        // of it.
+        if metrics.is_empty() {
+            continue;
+        }
         // "Dimensions" is a list of dimension SETS: each set publishes the directive's
         // metrics under its own dimensions, so one metric of a directive declaring two sets
         // is two series. A directive declaring no set at all publishes the metrics with no
-        // dimensions.
-        let dimension_sets = dimension_sets(directive, &document);
-        // A directive whose every declared set names a member the document does not supply
-        // a dimension value for resolves NO set, so it publishes nothing: there is no series
-        // for its metrics to be read for.
+        // dimensions. Resolving them is bounded by what this event may still publish, so no
+        // directive drives more of that work than its datapoints could ever amount to.
+        let dimension_sets =
+            dimension_sets(directive, &document, limit.saturating_sub(datapoints.len()));
+        // A directive that declares no PROJECTION at all — every element of its `Dimensions`
+        // being something other than a list of names — resolves no series for its metrics to
+        // be read for, so it publishes nothing.
         if dimension_sets.is_empty() {
             continue;
         }
@@ -255,12 +269,23 @@ pub fn suppressed_datapoints(
 /// The dimension sets one directive publishes under, each resolved from the document's own
 /// members: a dimension's value is the value of the document member named by it.
 ///
-/// A set naming a member the document does not carry, or whose value is not a string, names
-/// no dimension value, so that set is left out rather than published with a value nothing
-/// supplied.
+/// A declared name the document supplies no string value for is not a dimension of the
+/// published series: it is LEFT OUT of the projection it was declared in, so a projection
+/// whose names the document supplies none of is the projection with no dimensions — the
+/// series a metric declared without dimensions is read back under. Declaring one name twice,
+/// or two projections the document resolves to the same dimensions, is one series and not
+/// two, so the resolved projections are a SET: a value observed once is one datapoint of its
+/// series.
+///
+/// `limit` is how many datapoints the event this document travelled in may still publish, and
+/// it bounds this resolution as well as the answer: a projection past it could publish no
+/// datapoint anyway, and no directive resolves more than [`MAX_PROJECTIONS_PER_DIRECTIVE`] of
+/// them whatever its `Dimensions` declares, so one message cannot drive work proportional to a
+/// product of the counts it declares.
 fn dimension_sets(
     directive: &::serde_json::Value,
     document: &::serde_json::Value,
+    limit: usize,
 ) -> Vec<BTreeMap<String, String>> {
     let Some(sets) = directive
         .get(DIMENSIONS_MEMBER)
@@ -271,30 +296,32 @@ fn dimension_sets(
     if sets.is_empty() {
         return vec![BTreeMap::new()];
     }
-    let mut resolved: Vec<BTreeMap<String, String>> = Vec::with_capacity(sets.len());
+    let ceiling = limit.min(MAX_PROJECTIONS_PER_DIRECTIVE);
+    // A SET of the projections resolved so far, so one more of them costs a lookup rather
+    // than a scan of every projection the message has declared before it.
+    let mut resolved: BTreeSet<BTreeMap<String, String>> = BTreeSet::new();
     for set in sets {
+        if resolved.len() >= ceiling {
+            break;
+        }
+        // An element that is not a list of names declares no projection at all, which is not
+        // the same as declaring an empty one.
         let Some(names) = set.as_array() else {
             continue;
         };
         let mut dimensions: BTreeMap<String, String> = BTreeMap::new();
-        let mut complete = true;
         for name in names {
-            let value = name
-                .as_str()
-                .and_then(|name| document.get(name))
-                .and_then(::serde_json::Value::as_str);
-            match (name.as_str(), value) {
-                (Some(name), Some(value)) => {
-                    dimensions.insert(name.to_string(), value.to_string());
-                }
-                _ => complete = false,
-            }
+            let Some(name) = name.as_str() else {
+                continue;
+            };
+            let Some(value) = document.get(name).and_then(::serde_json::Value::as_str) else {
+                continue;
+            };
+            dimensions.insert(name.to_string(), value.to_string());
         }
-        if complete {
-            resolved.push(dimensions);
-        }
+        resolved.insert(dimensions);
     }
-    resolved
+    resolved.into_iter().collect()
 }
 
 /// The numeric observations a document member holds: one value, every value of an array of

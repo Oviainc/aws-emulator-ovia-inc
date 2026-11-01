@@ -675,6 +675,11 @@ mod logs_emf_disabled_errors;
 // both regions every concurrently landing router suite puts its line in.
 #[path = "all/logs_emf_extraction_policy_scope.rs"]
 mod logs_emf_extraction_policy_scope;
+// Declared HERE, beside the two sibling suites above in the same quiet `n`/`o` gap, for the
+// reason their entries record: the appended tail at the end of this file and the head of the
+// list are both regions every concurrently landing router suite puts its line in.
+#[path = "all/logs_emf_declared_projections.rs"]
+mod logs_emf_declared_projections;
 // Declared HERE, beside the sibling `logs_*` suites in the same quiet `n`/`o` gap, for the
 // reason those entries record: the appended tail at the end of this file and the head of the
 // list are both regions every concurrently landing router suite puts its line in.

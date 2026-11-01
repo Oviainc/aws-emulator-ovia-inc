@@ -456,19 +456,6 @@ async fn several_dimension_sets_are_several_series_and_a_plain_message_publishes
             ),
             "Absent",
         ),
-        (
-            "a dimension set naming a member the document does not carry",
-            emf_document(
-                at,
-                json!({
-                    "Namespace": "EmfNothing",
-                    "Dimensions": [["Missing"]],
-                    "Metrics": [{"Name": "Present"}],
-                }),
-                json!({"Present": 1}),
-            ),
-            "Present",
-        ),
     ];
     for (case, message, metric) in publishes_nothing {
         ingest(&router, case, GROUP, "stream", at, &message).await;
@@ -487,6 +474,51 @@ async fn several_dimension_sets_are_several_series_and_a_plain_message_publishes
             "case {case:?}: a message that declares no metric publishes none, got {points:?}"
         );
     }
+
+    // A declared dimension name the document supplies no value for is not a dimension of the
+    // published series: it is left out of the projection it was declared in, so this
+    // projection is the one with no dimensions — the series the metric is read back under.
+    // The sibling `logs_emf_declared_projections` suite is where that rule is tabulated.
+    const UNSUPPLIED: &str = "a dimension set naming a member the document does not carry";
+    ingest(
+        &router,
+        UNSUPPLIED,
+        GROUP,
+        "stream",
+        at,
+        &emf_document(
+            at,
+            json!({
+                "Namespace": "EmfUnsupplied",
+                "Dimensions": [["Missing"]],
+                "Metrics": [{"Name": "Present"}],
+            }),
+            json!({"Present": 1}),
+        ),
+    )
+    .await;
+    let points = datapoints(
+        &router,
+        UNSUPPLIED,
+        "EmfUnsupplied",
+        "Present",
+        &json!([]),
+        at,
+        &["Maximum"],
+    )
+    .await;
+    assert_eq!(
+        points.len(),
+        1,
+        "case {UNSUPPLIED:?}: the metric publishes under the projection with no dimensions, got \
+         {points:?}"
+    );
+    assert_eq!(
+        statistic(&points[0], "Maximum"),
+        Some(1.0),
+        "case {UNSUPPLIED:?}: the published value is the one the document declared, got {:?}",
+        points[0]
+    );
 }
 
 /// A `METRIC_EXTRACTION_POLICY` suppresses extraction for exactly the log groups its
