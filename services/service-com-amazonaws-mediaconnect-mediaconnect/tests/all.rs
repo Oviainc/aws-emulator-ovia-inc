@@ -235,5 +235,7 @@ mod flow_name_addressed_sub_resource_tags;
 mod flow_delete_and_bridge_source_writes_agree;
 #[path = "all/flow_start_stop_preconditions.rs"]
 mod flow_start_stop_preconditions;
+#[path = "all/maintenance_window_follows_the_preference.rs"]
+mod maintenance_window_follows_the_preference;
 #[path = "all/router_maintenance_reschedule.rs"]
 mod router_maintenance_reschedule;
