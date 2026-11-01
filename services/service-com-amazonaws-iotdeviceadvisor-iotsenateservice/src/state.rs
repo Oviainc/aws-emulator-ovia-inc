@@ -195,6 +195,55 @@ pub enum TaggedResource {
     },
 }
 
+/// The six fields an ARN is written in:
+/// `arn:<partition>:<service>:<region>:<account>:<resource>`.
+///
+/// `resource` is the TAIL of the value it was read from, so a `:` inside it stays in it.
+struct ArnFields<'a> {
+    partition: &'a str,
+    service: &'a str,
+    region: &'a str,
+    account: &'a str,
+    resource: &'a str,
+}
+
+/// Split `arn` into [`ArnFields`], or `None` when it does not open with `arn:` or does not
+/// carry all six fields.
+///
+/// The ONE place this module splits an ARN, so the two readers of one — [`ArnScope::of`],
+/// which keeps the scope fields, and [`parse_resource_arn`], which checks the resource
+/// portion — cannot disagree about where an ARN's fields are. Neither emptiness nor the
+/// service is judged here: each caller applies the rule it needs.
+fn arn_fields(arn: &str) -> Option<ArnFields<'_>> {
+    // `splitn(6, ..)` so a `:` inside the resource portion stays in it.
+    let mut fields = arn.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some(service),
+        Some(region),
+        Some(account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return None;
+    };
+    Some(ArnFields {
+        partition,
+        service,
+        region,
+        account,
+        resource,
+    })
+}
+
 /// Parse `arn` as the ARN of a taggable IoT Device Advisor resource.
 ///
 /// The tagging operations address a resource ONLY by ARN, and the model constrains
@@ -213,30 +262,14 @@ pub fn parse_resource_arn(arn: &str) -> Result<TaggedResource, String> {
             "resourceArn {shown} is not an IoT Device Advisor suite definition or suite run ARN"
         ))
     };
-    // `splitn(6, ..)` so a `:` inside the resource portion stays in it.
-    let mut fields = arn.splitn(6, ':');
-    let (
-        Some("arn"),
-        Some(partition),
-        Some(service),
-        Some(_region),
-        Some(account),
-        Some(resource),
-    ) = (
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-        fields.next(),
-    )
-    else {
+    let Some(fields) = arn_fields(arn) else {
         return Err(malformed());
     };
-    if partition.is_empty() || account.is_empty() || service != ARN_NAMESPACE {
+    if fields.partition.is_empty() || fields.account.is_empty() || fields.service != ARN_NAMESPACE
+    {
         return Err(malformed());
     }
-    let mut parts = resource.split('/');
+    let mut parts = fields.resource.split('/');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some("suitedefinition"), Some(id), None, None) if !id.is_empty() => {
             Ok(TaggedResource::SuiteDefinition(id.to_string()))
@@ -376,7 +409,8 @@ impl SuiteDefinition {
 pub struct SuiteRun {
     /// The minted `suiteRunId` (a UUID).
     pub id: String,
-    /// `arn:aws:iotdeviceadvisor:<region>:<account>:suiterun/<definition id>/<run id>`.
+    /// `arn:aws:iotdeviceadvisor:<region>:<account>:suiterun/<definition id>/<run id>`,
+    /// minted in the scope the parent definition's own ARN records (see [`ArnScope`]).
     pub arn: String,
     pub suite_definition_id: String,
     pub suite_definition_version: String,
@@ -1262,6 +1296,60 @@ pub fn has_published_region_shape(region: &str) -> bool {
 /// This service's ARN for `resource` in `region`.
 pub fn arn(region: &str, resource: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, resource)
+}
+
+/// The scope an ARN names its resource in: the `arn:<partition>:<service>:<region>:<account>:`
+/// fields that precede the resource portion.
+///
+/// A resource this store already holds records the scope it was minted in inside its own
+/// ARN, so a call that mints a CHILD of that resource takes the scope off the PARENT's
+/// stored ARN ([`ArnScope::arn`]) rather than off the request that happened to make the
+/// call. Parent and child then agree about the scope an ARN carries — the one
+/// [`ComAmazonawsIotdeviceadvisorIotsenateserviceState::holds_tagged_resource`] reads out
+/// of it — so a single scope addresses both, and every regional value the child reports
+/// (its ARN and its endpoint, [`ArnScope::region`]) names that one scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArnScope<'a> {
+    /// `arn:<partition>:<service>:<region>:<account>:` verbatim, including the separator
+    /// that closes the account field, so an ARN in this scope is this followed by a
+    /// resource portion.
+    prefix: &'a str,
+    /// The region field of those five.
+    region: &'a str,
+}
+
+impl<'a> ArnScope<'a> {
+    /// The scope `arn` names its resource in, or `None` when `arn` does not carry the six
+    /// ARN fields with a partition, service, region and account — there is then no scope to
+    /// inherit, and the caller falls back to the request's own.
+    pub fn of(arn: &'a str) -> Option<Self> {
+        let fields = arn_fields(arn)?;
+        if fields.partition.is_empty()
+            || fields.service.is_empty()
+            || fields.region.is_empty()
+            || fields.account.is_empty()
+        {
+            return None;
+        }
+        // The resource portion is the TAIL of `arn`, so what precedes it is the scope,
+        // separator included.
+        let prefix = &arn[..arn.len() - fields.resource.len()];
+        Some(Self {
+            prefix,
+            region: fields.region,
+        })
+    }
+
+    /// The region this scope is in — what a resource of this scope reports its endpoint in.
+    pub fn region(&self) -> &'a str {
+        self.region
+    }
+
+    /// `resource` addressed in THIS scope: the scope's partition, service, region and
+    /// account, with the resource portion the caller names.
+    pub fn arn(&self, resource: &str) -> String {
+        format!("{}{resource}", self.prefix)
+    }
 }
 
 /// The modelled `Endpoint` length bounds (`smithy_query(query="shape",shape="Endpoint")`

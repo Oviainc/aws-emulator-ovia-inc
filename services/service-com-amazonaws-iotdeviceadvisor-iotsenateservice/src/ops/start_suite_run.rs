@@ -25,6 +25,17 @@
 //! share a definition are capped by
 //! [`crate::state::MAX_PARALLEL_RUNS_PER_DEFINITION`].
 //!
+//! ## The run is minted in its DEFINITION's scope
+//!
+//! A suite run is a child of the definition it runs — its ARN's resource portion is
+//! `suiterun/<suiteDefinitionId>/<suiteRunId>`, so a run is not addressable apart from
+//! that definition. The scope it is minted in therefore comes from the parent definition's
+//! STORED ARN ([`crate::state::ArnScope`]), not from whichever request started it: the
+//! run's ARN and the endpoint it reports name the same partition, region and account the
+//! definition's own ARN names, so one scope addresses parent and child alike. The
+//! request's region still stamps the audit record, which is about the CALL rather than
+//! about the resource.
+//!
 //! ## An unknown definition is a `ValidationException`, not a `ResourceNotFoundException`
 //!
 //! `smithy_query(query="operation",operation="StartSuiteRun")` declares exactly three
@@ -224,6 +235,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             ));
         };
+        // The scope this run is minted in: the one the parent definition's STORED ARN
+        // records. Read while the definition is in hand, so the mint below needs no second
+        // lookup.
+        let definition_arn = definition.arn.clone();
         let version = input
             .suite_definition_version
             .clone()
@@ -284,18 +299,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // A suite run is a CHILD of the definition it runs — its resource portion is
+        // `suiterun/<definition id>/<run id>`, so it is not addressable apart from that
+        // definition — and it is therefore minted in the scope the definition's own stored
+        // ARN records: its partition, region and account. Taking that scope off the parent
+        // rather than off this request is what keeps the two addressable under ONE scope,
+        // the scope `holds_tagged_resource` reads out of an ARN; a definition whose record
+        // carries no ARN scope to inherit (which a stored one always does) falls back to
+        // the request's own region.
+        let scope = crate::state::ArnScope::of(&definition_arn);
+        let run_region = scope.map_or(region.as_str(), |scope| scope.region());
         let id = crate::state::new_uuid();
-        let arn = crate::state::arn(
-            &region,
-            &format!("suiterun/{}/{id}", input.suite_definition_id),
+        let resource = format!("suiterun/{}/{id}", input.suite_definition_id);
+        let arn = scope.map_or_else(
+            || crate::state::arn(run_region, &resource),
+            |scope| scope.arn(&resource),
         );
         // The host this run reports is the host its PRIMARY DEVICE connects to, taken from
         // the one derivation in `crate::state::endpoint_for` that `GetEndpoint` answers
         // from: a run names a device, so what it reports is that device's own host, and a
         // client told this host by the start call is told the same one when it asks
-        // `GetEndpoint` where that device should connect.
+        // `GetEndpoint` where that device should connect — in the run's own region, which
+        // is the region of the scope it was minted in.
         let endpoint = crate::state::endpoint_for(
-            &region,
+            run_region,
             &crate::state::DeviceIdentity::of(&input.suite_run_configuration.primary_device),
         );
         // Retention, so a definition run over and over cannot grow the store without

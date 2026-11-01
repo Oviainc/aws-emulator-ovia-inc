@@ -14,6 +14,9 @@
 #[path = "all/audit_trail.rs"]
 mod audit_trail;
 
+#[path = "all/child_resource_scope.rs"]
+mod child_resource_scope;
+
 #[path = "all/definition_configuration_arn_rules.rs"]
 mod definition_configuration_arn_rules;
 
