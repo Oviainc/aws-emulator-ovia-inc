@@ -6,7 +6,7 @@
 //! implemented operation computes its answer from the records below: nothing is canned,
 //! and nothing is echoed straight back out of a request without being stored first.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -74,6 +74,14 @@ pub const MAX_RESULTS_LIMIT: i32 = 100;
 /// generously so no realistic workflow meets it, so that a caller looping on create
 /// cannot grow this process's memory without bound.
 pub const MAX_PIPELINES: usize = 1_000;
+
+/// How many tags one pipeline can carry.
+///
+/// AWS bounds tagging at 50 tags per resource, and `TagResource` models
+/// `LimitExceededException` for a call that would take a pipeline past the allowed number
+/// of tags — which is also what keeps a caller looping on tag writes from growing this
+/// process's memory without bound.
+pub const MAX_TAGS_PER_PIPELINE: usize = 50;
 
 /// A status change the clock owes a pipeline: where it lands, and when.
 #[derive(Debug, Clone)]
@@ -552,6 +560,67 @@ impl ComAmazonawsOsisAmazonopensearchingestionserviceState {
             pipeline.settle(now);
         }
     }
+
+    /// The pipeline this ARN names, or `None` when no stored pipeline carries it.
+    ///
+    /// A pipeline ARN names the account, the Region and the pipeline, so the whole string
+    /// identifies the resource: an ARN that differs in any segment names a different
+    /// pipeline (or none), never this one.
+    pub fn pipeline_by_arn(&self, arn: &str) -> Option<&StoredPipeline> {
+        self.pipelines
+            .values()
+            .find(|pipeline| pipeline.pipeline_arn == arn)
+    }
+
+    /// [`Self::pipeline_by_arn`], for a caller that writes to the record it finds.
+    pub fn pipeline_by_arn_mut(&mut self, arn: &str) -> Option<&mut StoredPipeline> {
+        self.pipelines
+            .values_mut()
+            .find(|pipeline| pipeline.pipeline_arn == arn)
+    }
+}
+
+/// Add or replace tags in a pipeline's tag set.
+///
+/// Tag keys are unique per pipeline (the `Tag$Key` member's own doc: "Tag keys must be
+/// unique for the pipeline to which they are attached"), so a key the set already carries
+/// takes the submitted value in place — keeping its position, so the set's order is stable
+/// across writes — and a key it does not carry is appended. `incoming` is applied in
+/// order, so a request that names one key twice leaves the last value it gave.
+///
+/// The incoming keys are resolved through a position index built once, so the work is
+/// linear in the number of tags the request carries rather than in their product with the
+/// set the pipeline already holds.
+pub fn merge_tags(tags: &mut Vec<Tag>, incoming: impl IntoIterator<Item = Tag>) {
+    let mut positions: BTreeMap<String, usize> = tags
+        .iter()
+        .enumerate()
+        .map(|(position, tag)| (tag.key.clone(), position))
+        .collect();
+    for tag in incoming {
+        match positions.get(&tag.key).copied() {
+            Some(position) => {
+                if let Some(stored) = tags.get_mut(position) {
+                    stored.value = tag.value;
+                }
+            }
+            None => {
+                positions.insert(tag.key.clone(), tags.len());
+                tags.push(tag);
+            }
+        }
+    }
+}
+
+/// Remove the named tag keys from a pipeline's tag set.
+///
+/// Removing a key the pipeline does not carry is not an error: the set a removal leaves is
+/// the same whether or not the key was there, so untagging is idempotent. The keys are
+/// indexed once, so the work is linear in the request rather than in its product with the
+/// stored set.
+pub fn remove_tags(tags: &mut Vec<Tag>, keys: &[String]) {
+    let removed: BTreeSet<&str> = keys.iter().map(String::as_str).collect();
+    tags.retain(|tag| !removed.contains(tag.key.as_str()));
 }
 
 /// The region this request was signed for, read from its SigV4 credential scope.

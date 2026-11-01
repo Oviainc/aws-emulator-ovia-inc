@@ -187,6 +187,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `Tags` carries no modelled length bound, so the list's size is the caller's
+        // choice: refuse one longer than the tags a pipeline may ever carry BEFORE any of
+        // it is merged into a set, so no request-sized work and no allocation happens
+        // first. This is the ceiling `TagResource` enforces, so a create cannot start a
+        // pipeline out with more tags than a tag write would ever be allowed to add.
+        if input.tags.as_ref().is_some_and(|tags| tags.len() > crate::state::MAX_TAGS_PER_PIPELINE)
+        {
+            return Err(CreatePipelineErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(
+                        "You attempted to create more than the allowed number of tags".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
         store.settle(now);
@@ -226,6 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let pipeline_name = input.pipeline_name.clone();
         let arn = crate::state::pipeline_arn(&region, &pipeline_name);
+        // Tag keys are unique per pipeline, so the create's tag list is merged into an
+        // empty set rather than stored as given: a list that names one key twice leaves
+        // the last value it gave, exactly as a later TagResource would. The list was
+        // bounded against the tag ceiling above, so the merged set cannot exceed it.
+        let mut tags = Vec::new();
+        crate::state::merge_tags(&mut tags, input.tags.unwrap_or_default());
         let record = crate::state::StoredPipeline {
             ingest_endpoint_urls: crate::state::ingest_endpoint_urls(
                 &region,
@@ -251,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             buffer_options: input.buffer_options,
             encryption_at_rest_options: input.encryption_at_rest_options,
             pipeline_role_arn: input.pipeline_role_arn,
-            tags: input.tags.unwrap_or_default(),
+            tags,
         };
         store.pipelines.insert(pipeline_name.clone(), record);
 
