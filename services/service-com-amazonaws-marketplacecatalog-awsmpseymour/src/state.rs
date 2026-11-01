@@ -1118,13 +1118,13 @@ impl EntityRecord {
     /// shape.
     fn product_summary(&self, entity_type: &str) -> Option<(Option<String>, Option<String>)> {
         (self.entity_type == entity_type && PRODUCT_ENTITY_TYPES.contains(&entity_type))
-            .then(|| (self.name.clone(), Some(self.visibility.clone())))
+            .then(|| (self.summary_name(), Some(self.visibility.clone())))
     }
 
     /// The `EntitySummary` projection `ListEntities` reports.
     pub fn to_summary(&self) -> EntitySummary {
         EntitySummary {
-            name: self.name.clone(),
+            name: self.summary_name(),
             entity_type: Some(self.entity_type.clone()),
             entity_id: Some(self.id.clone()),
             entity_arn: Some(self.arn.clone()),
@@ -1163,49 +1163,49 @@ impl EntityRecord {
             // The four remaining summaries name members of their own, each the
             // name of the details member the entity carries that value in.
             offer_summary: self.is_type("Offer").then(|| OfferSummary {
-                name: self.name.clone(),
-                product_id: self.detail_text("ProductId"),
-                resale_authorization_id: self.detail_text("ResaleAuthorizationId"),
-                release_date: self.detail_text("ReleaseDate"),
-                availability_end_date: self.detail_text("AvailabilityEndDate"),
-                buyer_accounts: self.detail_texts("BuyerAccounts"),
-                state: self.detail_text("State"),
-                targeting: self.detail_texts("Targeting"),
-                offer_set_id: self.detail_text("OfferSetId"),
-                target_agreement_id: self.detail_text("TargetAgreementId"),
-                target_agreement_intent: self.detail_text("TargetAgreementIntent"),
-                created_by_source: self.detail_text("CreatedBySource"),
+                name: self.summary_name(),
+                product_id: self.summary_text("ProductId"),
+                resale_authorization_id: self.summary_text("ResaleAuthorizationId"),
+                release_date: self.summary_text("ReleaseDate"),
+                availability_end_date: self.summary_text("AvailabilityEndDate"),
+                buyer_accounts: self.summary_texts("BuyerAccounts"),
+                state: self.summary_text("State"),
+                targeting: self.summary_texts("Targeting"),
+                offer_set_id: self.summary_text("OfferSetId"),
+                target_agreement_id: self.summary_text("TargetAgreementId"),
+                target_agreement_intent: self.summary_text("TargetAgreementIntent"),
+                created_by_source: self.summary_text("CreatedBySource"),
             }),
             resale_authorization_summary: self.is_type("ResaleAuthorization").then(|| {
                 ResaleAuthorizationSummary {
-                    name: self.name.clone(),
-                    product_id: self.detail_text("ProductId"),
-                    product_name: self.detail_text("ProductName"),
-                    manufacturer_account_id: self.detail_text("ManufacturerAccountId"),
-                    manufacturer_legal_name: self.detail_text("ManufacturerLegalName"),
-                    reseller_account_id: self.detail_text("ResellerAccountID"),
-                    reseller_legal_name: self.detail_text("ResellerLegalName"),
-                    status: self.detail_text("Status"),
-                    offer_extended_status: self.detail_text("OfferExtendedStatus"),
-                    created_date: self.detail_text("CreatedDate"),
-                    availability_end_date: self.detail_text("AvailabilityEndDate"),
-                    reseller_role: self.detail_text("ResellerRole"),
-                    source_authorization: self.detail_text("SourceAuthorization"),
-                    issuer_account_id: self.detail_text("IssuerAccountId"),
+                    name: self.summary_name(),
+                    product_id: self.summary_text("ProductId"),
+                    product_name: self.summary_text("ProductName"),
+                    manufacturer_account_id: self.summary_text("ManufacturerAccountId"),
+                    manufacturer_legal_name: self.summary_text("ManufacturerLegalName"),
+                    reseller_account_id: self.summary_text("ResellerAccountID"),
+                    reseller_legal_name: self.summary_text("ResellerLegalName"),
+                    status: self.summary_text("Status"),
+                    offer_extended_status: self.summary_text("OfferExtendedStatus"),
+                    created_date: self.summary_text("CreatedDate"),
+                    availability_end_date: self.summary_text("AvailabilityEndDate"),
+                    reseller_role: self.summary_text("ResellerRole"),
+                    source_authorization: self.summary_text("SourceAuthorization"),
+                    issuer_account_id: self.summary_text("IssuerAccountId"),
                 }
             }),
             offer_set_summary: self.is_type("OfferSet").then(|| OfferSetSummary {
-                name: self.name.clone(),
-                state: self.detail_text("State"),
-                release_date: self.detail_text("ReleaseDate"),
-                associated_offer_ids: self.detail_texts("AssociatedOfferIds"),
-                solution_id: self.detail_text("SolutionId"),
+                name: self.summary_name(),
+                state: self.summary_text("State"),
+                release_date: self.summary_text("ReleaseDate"),
+                associated_offer_ids: self.summary_texts("AssociatedOfferIds"),
+                solution_id: self.summary_text("SolutionId"),
             }),
             express_private_offer_configuration_summary: self
                 .is_type("ExpressPrivateOfferConfiguration")
                 .then(|| ExpressPrivateOfferConfigurationSummary {
-                    product_id: self.detail_text("ProductId"),
-                    state: self.detail_text("State"),
+                    product_id: self.summary_text("ProductId"),
+                    state: self.summary_text("State"),
                 }),
         }
     }
@@ -1213,6 +1213,52 @@ impl EntityRecord {
     /// Whether this entity is of `entity_type`.
     fn is_type(&self, entity_type: &str) -> bool {
         self.entity_type == entity_type
+    }
+
+    /// The `Name` this entity's summary reports: the name it holds, when that
+    /// name satisfies the contract the model declares for the members that
+    /// report it ([`entity_name_contract`]).
+    ///
+    /// Judged here as well as on the write path, exactly as an entity's
+    /// `Visibility` is ([`details_defects`] fails the change set and
+    /// [`detail_visibility`] drops the value): a value a summary member cannot
+    /// hold is reported by no projection of this record.
+    fn summary_name(&self) -> Option<String> {
+        let name = self.name.clone()?;
+        entity_name_contract(&self.entity_type)
+            .admits_text(&name)
+            .then_some(name)
+    }
+
+    /// The string this entity's summary reports at `member`: the string the
+    /// details carry there, when it satisfies the contract the model declares
+    /// for the summary member of that name ([`summary_member_contract`]).
+    ///
+    /// Judged twice for the same reason as [`EntityRecord::summary_name`]. A
+    /// member no per-type summary reports is bounded by nothing, so what the
+    /// details hold is what is read.
+    fn summary_text(&self, member: &str) -> Option<String> {
+        let held = self.details.get(member)?;
+        if summary_member_contract(&self.entity_type, member)
+            .is_some_and(|contract| !contract.admits(held))
+        {
+            return None;
+        }
+        self.detail_text(member)
+    }
+
+    /// The list of strings this entity's summary reports at `member`, under the
+    /// same rule as [`EntityRecord::summary_text`]: the list the details carry
+    /// there, when the list and every value in it satisfy the contract declared
+    /// for the summary member of that name.
+    fn summary_texts(&self, member: &str) -> Option<Vec<String>> {
+        let held = self.details.get(member)?;
+        if summary_member_contract(&self.entity_type, member)
+            .is_some_and(|contract| !contract.admits(held))
+        {
+            return None;
+        }
+        self.detail_texts(member)
     }
 
     /// The string the entity's details carry at `member`, if any.
@@ -1949,7 +1995,8 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
         let mut entity_details: HashMap<String, Map<String, Value>> = HashMap::new();
         for (index, change) in record.changes.iter().enumerate() {
             let details = change.details_value();
-            verdict.change_errors[index] = details_defects(details.as_ref());
+            verdict.change_errors[index] =
+                details_defects(entity_type_of(&change.entity_type), details.as_ref());
             // Every change resolved to an entity, whatever the intent, so every
             // change is judged against what that entity would then hold: a
             // validation reaches the verdict applying the same request reaches.
@@ -2058,7 +2105,7 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
                 entry.last_modified_date = stamp.clone();
                 merge_tags(&mut entry.tags, change.entity_tags);
                 if let Some(Value::Object(members)) = details {
-                    if let Some(name) = detail_name(&members) {
+                    if let Some(name) = detail_name(&entity_type, &members) {
                         entry.name = Some(name);
                     }
                     if let Some(visibility) = detail_visibility(&members) {
@@ -2657,12 +2704,21 @@ fn pins_container_image(reference: &str) -> bool {
         .is_some_and(|(_, tag)| !tag.is_empty() && tag != FLOATING_IMAGE_TAG)
 }
 
-/// The `Name` the details of an applied change give an entity, if any.
-fn detail_name(members: &Map<String, Value>) -> Option<String> {
+/// The `Name` the details of an applied change give an entity of
+/// `entity_type`, if any.
+///
+/// Only an applied change set reaches here, and a name outside
+/// [`entity_name_contract`] fails the change set before it is applied
+/// ([`details_defects`]), so nothing a summary member cannot hold reaches a
+/// record — the same two-sided rule [`detail_visibility`] follows.
+fn detail_name(entity_type: &str, members: &Map<String, Value>) -> Option<String> {
+    let contract = entity_name_contract(entity_type);
     ENTITY_NAME_DETAIL_MEMBERS
         .iter()
         .filter_map(|member| members.get(*member))
-        .find_map(|value| value.as_str().map(str::to_string))
+        .filter_map(|value| value.as_str())
+        .find(|text| contract.admits_text(text))
+        .map(str::to_string)
 }
 
 /// The `Visibility` the details of an applied change give an entity, if any.
@@ -2698,26 +2754,424 @@ impl ChangeSetVerdict {
     }
 }
 
-/// The `ErrorDetail`s applying a change finds among the details members the
-/// catalog READS into the entity's own attributes.
+/// The characters the `@pattern` of a shape a summary member targets admits.
+///
+/// A pattern is a statement about the FORM of a value, so each variant is one
+/// such form, named after the shapes that declare it; a value is judged against
+/// every form the members reporting it declare, beside the `@length` of their
+/// targets ([`DetailContract`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailSyntax {
+    /// `^(.)+$`, the pattern of every title, name and free-text member of the
+    /// per-type summaries: one or more characters, none of them a line break
+    /// (`.` matches no line terminator).
+    OneLine,
+    /// `EntityNameString`'s `^\S+[\S\s]*$`: a value whose first character is
+    /// not whitespace.
+    NonBlankStart,
+    /// `^\d{12}$`, the pattern of every account-id member: exactly that many
+    /// digits, the count being the `@length` of the shape that declares it.
+    Digits(usize),
+    /// [`ENTITY_ID_PATTERN`], the pattern of every id member a seller or the
+    /// catalog assigns.
+    Id,
+    /// The same form behind a fixed prefix, as `OfferSetIdString`'s
+    /// `^offerset-[a-zA-Z0-9][.a-zA-Z0-9/-]+[a-zA-Z0-9]$` declares it.
+    PrefixedId(&'static str),
+    /// `DateTimeISO8601`'s pattern: the 20-character instant [`is_iso8601`]
+    /// judges.
+    Instant,
+}
+
+impl DetailSyntax {
+    /// Whether `value` takes this form.
+    fn admits(self, value: &str) -> bool {
+        match self {
+            Self::OneLine => !value.is_empty() && !value.chars().any(is_line_break),
+            Self::NonBlankStart => value.chars().next().is_some_and(|c| !c.is_whitespace()),
+            Self::Digits(_) => !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()),
+            Self::Id => is_entity_id(value),
+            Self::PrefixedId(prefix) => value.strip_prefix(prefix).is_some_and(is_entity_id),
+            Self::Instant => is_iso8601(value),
+        }
+    }
+
+    /// The `@pattern` this form is, as the model writes it — which is what a
+    /// refusal quotes back, as every other syntax this service refuses a value
+    /// against is quoted back ([`ENTITY_ID_PATTERN`]).
+    fn pattern(self) -> String {
+        match self {
+            Self::OneLine => "^(.)+$".to_string(),
+            Self::NonBlankStart => r"^\S+[\S\s]*$".to_string(),
+            Self::Digits(count) => format!(r"^\d{{{count}}}$"),
+            Self::Id => ENTITY_ID_PATTERN.to_string(),
+            Self::PrefixedId(prefix) => {
+                format!("^{prefix}{}", ENTITY_ID_PATTERN.trim_start_matches('^'))
+            }
+            Self::Instant => DATE_TIME_PATTERN.to_string(),
+        }
+    }
+}
+
+/// Whether `c` is a line terminator — a character `.` does not match, which is
+/// what makes `^(.)+$` a single-line value.
+fn is_line_break(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}')
+}
+
+/// `DateTimeISO8601`'s `@pattern`, quoted in a refusal of a value outside it.
+pub const DATE_TIME_PATTERN: &str = r"^([\d]{4})\-(1[0-2]|0[1-9])\-(3[01]|0[1-9]|[12][\d])T(2[0-3]|[01][\d]):([0-5][\d]):([0-5][\d])Z$";
+
+/// What one details member may hold, as the model declares it on the
+/// `EntitySummary` member that REPORTS that value: the enum's values, or the
+/// `@length` and `@pattern`s of the string shapes it targets.
+#[derive(Debug, Clone, Copy)]
+pub struct DetailContract {
+    /// The values the target ENUMERATES, and `&[]` when the target is a string
+    /// shape bounded by a length and a pattern instead.
+    values: &'static [&'static str],
+    /// The target's `@length(min, max)`, in characters. Unused for an
+    /// enumerated member, whose contract is its value set.
+    length: (usize, usize),
+    /// Every `@pattern` the value satisfies: the one its own target declares,
+    /// and the one of any other member reporting the same value.
+    syntax: &'static [DetailSyntax],
+    /// `Some(max)` when the summary member is a LIST of such values, carrying
+    /// that list's own `@length(max)`.
+    items: Option<usize>,
+}
+
+impl DetailContract {
+    /// Whether `value`, as a details member holds it, is one this member may
+    /// report: a list member one list of admitted values, and every other
+    /// member one admitted string.
+    fn admits(&self, value: &Value) -> bool {
+        match self.items {
+            Some(max) => value.as_array().is_some_and(|items| {
+                items.len() <= max
+                    && items
+                        .iter()
+                        .all(|item| item.as_str().is_some_and(|text| self.admits_text(text)))
+            }),
+            None => value.as_str().is_some_and(|text| self.admits_text(text)),
+        }
+    }
+
+    /// Whether the string `value` is one this member may report.
+    fn admits_text(&self, value: &str) -> bool {
+        if !self.values.is_empty() {
+            return self.values.contains(&value);
+        }
+        let (min, max) = self.length;
+        (min..=max).contains(&value.chars().count())
+            && self.syntax.iter().all(|form| form.admits(value))
+    }
+
+    /// What this member accepts, as a refusal states it: the published set, or
+    /// the length and the pattern(s) the value has to satisfy.
+    fn accepts(&self) -> String {
+        match self.items {
+            Some(max) => format!(
+                "a list of at most {max} values, each {}",
+                self.accepts_value()
+            ),
+            None => self.accepts_value(),
+        }
+    }
+
+    /// The same sentence for ONE value of the member, which is the whole of it
+    /// for every member that is not a list.
+    fn accepts_value(&self) -> String {
+        if !self.values.is_empty() {
+            return format!("one of {:?}", self.values);
+        }
+        let (min, max) = self.length;
+        let length = if min == max {
+            format!("{min} characters")
+        } else {
+            format!("{min} to {max} characters")
+        };
+        let patterns: Vec<String> = self.syntax.iter().map(|form| form.pattern()).collect();
+        format!("{length} matching {}", patterns.join(" and "))
+    }
+}
+
+/// The contract of a member whose target ENUMERATES its values.
+const fn choice(values: &'static [&'static str]) -> DetailContract {
+    DetailContract {
+        values,
+        length: (0, 0),
+        syntax: &[],
+        items: None,
+    }
+}
+
+/// The contract of a member targeting a string of one to `max` characters on a
+/// single line (`@length(min: 1, max)` with `@pattern("^(.)+$")`).
+const fn text(max: usize) -> DetailContract {
+    DetailContract {
+        values: &[],
+        length: (1, max),
+        syntax: &[DetailSyntax::OneLine],
+        items: None,
+    }
+}
+
+/// The contract of a member targeting an id of at most `max` characters
+/// ([`ENTITY_ID_PATTERN`]).
+const fn id(max: usize) -> DetailContract {
+    DetailContract {
+        values: &[],
+        length: (1, max),
+        syntax: &[DetailSyntax::Id],
+        items: None,
+    }
+}
+
+/// The contract of a member that is a LIST of at most `max_items` values, each
+/// one `of`.
+const fn list(of: DetailContract, max_items: usize) -> DetailContract {
+    DetailContract {
+        values: of.values,
+        length: of.length,
+        syntax: of.syntax,
+        items: Some(max_items),
+    }
+}
+
+/// The contract of a member targeting `DateTimeISO8601`: `@length(20, 20)` and
+/// that shape's pattern.
+const INSTANT: DetailContract = DetailContract {
+    values: &[],
+    length: (20, 20),
+    syntax: &[DetailSyntax::Instant],
+    items: None,
+};
+
+/// The contract of a member targeting an account id: `@length(12, 12)` and
+/// `^\d{12}$`.
+const ACCOUNT_ID: DetailContract = DetailContract {
+    values: &[],
+    length: (ACCOUNT_ID_DIGITS, ACCOUNT_ID_DIGITS),
+    syntax: &[DetailSyntax::Digits(ACCOUNT_ID_DIGITS)],
+    items: None,
+};
+
+/// The `@length(12, 12)` of every account-id member, which is also the count
+/// its `^\d{12}$` states.
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The contract of `OfferSummary$OfferSetId`: `OfferSetIdString`'s
+/// `@length(min: 1, max: 50)` and its prefixed-id pattern.
+const OFFER_SET_ID: DetailContract = DetailContract {
+    values: &[],
+    length: (1, 50),
+    syntax: &[DetailSyntax::PrefixedId("offerset-")],
+    items: None,
+};
+
+/// `OfferSummary$State`'s and `OfferSetSummary$State`'s published values:
+/// `OfferStateString` and `OfferSetStateString` enumerate the same two.
+pub const OFFER_STATE_VALUES: &[&str] = &["Draft", "Released"];
+
+/// `OfferSummary$Targeting`'s published values (`OfferTargetingString`).
+pub const OFFER_TARGETING_VALUES: &[&str] = &[
+    "BuyerAccounts",
+    "CountryCodes",
+    "None",
+    "ParticipatingPrograms",
+];
+
+/// `OfferSummary$TargetAgreementIntent`'s published values
+/// (`OfferTargetAgreementIntentString`).
+pub const OFFER_TARGET_AGREEMENT_INTENT_VALUES: &[&str] = &["Renew"];
+
+/// `OfferSummary$CreatedBySource`'s published values
+/// (`OfferCreatedBySourceString`).
+pub const OFFER_CREATED_BY_SOURCE_VALUES: &[&str] = &["AwsMarketplace", "Seller"];
+
+/// `ResaleAuthorizationSummary$Status`'s published values
+/// (`ResaleAuthorizationStatusString`).
+pub const RESALE_AUTHORIZATION_STATUS_VALUES: &[&str] = &["Active", "Draft", "Restricted"];
+
+/// `ResaleAuthorizationSummary$ResellerRole`'s published values
+/// (`ResaleAuthorizationResellerRoleString`).
+pub const RESALE_AUTHORIZATION_RESELLER_ROLE_VALUES: &[&str] = &["ChannelPartner", "Distributor"];
+
+/// `ExpressPrivateOfferConfigurationSummary$State`'s published values
+/// (`ExpressPrivateOfferConfigurationStateString`).
+pub const EXPRESS_PRIVATE_OFFER_CONFIGURATION_STATE_VALUES: &[&str] = &["ACTIVE", "INACTIVE"];
+
+/// The members `OfferSummary` reports besides the entity's `Name`, each with
+/// the contract its own target declares
+/// (`smithy_query(query="shape", shape="OfferSummary")`).
+const OFFER_SUMMARY_MEMBERS: &[(&str, DetailContract)] = &[
+    ("ProductId", text(255)),
+    ("ResaleAuthorizationId", id(255)),
+    ("ReleaseDate", INSTANT),
+    ("AvailabilityEndDate", INSTANT),
+    ("BuyerAccounts", list(ACCOUNT_ID, 26)),
+    ("State", choice(OFFER_STATE_VALUES)),
+    ("Targeting", list(choice(OFFER_TARGETING_VALUES), 4)),
+    ("OfferSetId", OFFER_SET_ID),
+    ("TargetAgreementId", text(64)),
+    (
+        "TargetAgreementIntent",
+        choice(OFFER_TARGET_AGREEMENT_INTENT_VALUES),
+    ),
+    ("CreatedBySource", choice(OFFER_CREATED_BY_SOURCE_VALUES)),
+];
+
+/// The same for `OfferSetSummary`
+/// (`smithy_query(query="shape", shape="OfferSetSummary")`).
+const OFFER_SET_SUMMARY_MEMBERS: &[(&str, DetailContract)] = &[
+    ("State", choice(OFFER_STATE_VALUES)),
+    ("ReleaseDate", INSTANT),
+    ("AssociatedOfferIds", list(id(255), 10)),
+    ("SolutionId", id(50)),
+];
+
+/// The same for `ResaleAuthorizationSummary`
+/// (`smithy_query(query="shape", shape="ResaleAuthorizationSummary")`).
+const RESALE_AUTHORIZATION_SUMMARY_MEMBERS: &[(&str, DetailContract)] = &[
+    ("ProductId", text(255)),
+    ("ProductName", text(255)),
+    ("ManufacturerAccountId", ACCOUNT_ID),
+    ("ManufacturerLegalName", text(255)),
+    ("ResellerAccountID", ACCOUNT_ID),
+    ("ResellerLegalName", text(255)),
+    ("Status", choice(RESALE_AUTHORIZATION_STATUS_VALUES)),
+    ("OfferExtendedStatus", text(255)),
+    ("CreatedDate", INSTANT),
+    ("AvailabilityEndDate", INSTANT),
+    (
+        "ResellerRole",
+        choice(RESALE_AUTHORIZATION_RESELLER_ROLE_VALUES),
+    ),
+    ("SourceAuthorization", text(255)),
+    ("IssuerAccountId", ACCOUNT_ID),
+];
+
+/// The same for `ExpressPrivateOfferConfigurationSummary`
+/// (`smithy_query(query="shape",
+/// shape="ExpressPrivateOfferConfigurationSummary")`).
+const EXPRESS_PRIVATE_OFFER_CONFIGURATION_SUMMARY_MEMBERS: &[(&str, DetailContract)] = &[
+    ("ProductId", id(255)),
+    (
+        "State",
+        choice(EXPRESS_PRIVATE_OFFER_CONFIGURATION_STATE_VALUES),
+    ),
+];
+
+/// The details members the per-type summary of `entity_type` reports, each with
+/// the contract the model declares for the summary member that reports it.
+///
+/// The five `*ProductSummary` shapes report only the entity's name and its
+/// visibility, which [`entity_name_contract`] and [`ENTITY_VISIBILITY_VALUES`]
+/// bound for every type, so a product type names nothing further here — and
+/// neither does a type whose summary the model does not declare
+/// ([`SHAPED_ENTITY_TYPES`]).
+fn summary_member_contracts(entity_type: &str) -> &'static [(&'static str, DetailContract)] {
+    match entity_type {
+        "Offer" => OFFER_SUMMARY_MEMBERS,
+        "OfferSet" => OFFER_SET_SUMMARY_MEMBERS,
+        "ResaleAuthorization" => RESALE_AUTHORIZATION_SUMMARY_MEMBERS,
+        "ExpressPrivateOfferConfiguration" => {
+            EXPRESS_PRIVATE_OFFER_CONFIGURATION_SUMMARY_MEMBERS
+        }
+        _ => &[],
+    }
+}
+
+/// The contract the model declares for the member `member` of the per-type
+/// summary of an entity of `entity_type`, and `None` when that summary reports
+/// no member of that name.
+fn summary_member_contract(entity_type: &str, member: &str) -> Option<DetailContract> {
+    summary_member_contracts(entity_type)
+        .iter()
+        .find(|(declared, _)| *declared == member)
+        .map(|(_, contract)| *contract)
+}
+
+/// The `@length(max)` of `EntityNameString`, the shape `EntitySummary$Name`
+/// targets for an entity of any type.
+const ENTITY_NAME_MAX: usize = 255;
+
+/// The `@length(max)` of `OfferNameString` and `OfferSetNameString`, the two
+/// per-type name members the model bounds more tightly than
+/// `EntityNameString` does.
+const OFFER_NAME_MAX: usize = 150;
+
+/// The entity types whose own summary names the entity's name, as
+/// `ProductTitle` or as `Name` — the types whose name satisfies a per-type
+/// `@pattern("^(.)+$")` beside `EntityNameString`'s own.
+///
+/// Read off `EntitySummary`'s per-type summary members: the five product
+/// summaries name `ProductTitle` ([`PRODUCT_ENTITY_TYPES`]) and three more name
+/// `Name`. `ExpressPrivateOfferConfigurationSummary` names neither, so an
+/// entity of that type reports its name only through the common member.
+const NAMED_ENTITY_TYPES: &[&str] = &["Offer", "OfferSet", "ResaleAuthorization"];
+
+/// The contract the value an entity's `Name` is read from
+/// ([`ENTITY_NAME_DETAIL_MEMBERS`]) has to satisfy for an entity of
+/// `entity_type`.
+///
+/// One value is reported by two members: `EntitySummary$Name` reports it for
+/// every type (`EntityNameString`: one to [`ENTITY_NAME_MAX`] characters whose
+/// first is not whitespace), and the summary of a type that names it reports
+/// the same value under its own member — so the value has to satisfy BOTH, and
+/// this contract is their intersection. `OfferNameString` and
+/// `OfferSetNameString` bound it at [`OFFER_NAME_MAX`]; every other per-type
+/// name member (`AmiProductTitleString` and the four product titles beside it,
+/// `ResaleAuthorizationNameString`) carries the same max as
+/// `EntityNameString`.
+pub fn entity_name_contract(entity_type: &str) -> DetailContract {
+    /// `EntityNameString`'s pattern with the per-type member's beside it.
+    const NAMED: &[DetailSyntax] = &[DetailSyntax::OneLine, DetailSyntax::NonBlankStart];
+    /// `EntityNameString`'s pattern alone.
+    const COMMON: &[DetailSyntax] = &[DetailSyntax::NonBlankStart];
+
+    let max = match entity_type {
+        "Offer" | "OfferSet" => OFFER_NAME_MAX,
+        _ => ENTITY_NAME_MAX,
+    };
+    let names_its_own = PRODUCT_ENTITY_TYPES.contains(&entity_type)
+        || NAMED_ENTITY_TYPES.contains(&entity_type);
+    DetailContract {
+        values: &[],
+        length: (1, max),
+        syntax: if names_its_own { NAMED } else { COMMON },
+        items: None,
+    }
+}
+
+/// The `ErrorDetail`s applying a change to an entity of `entity_type` finds
+/// among the details members the catalog READS.
 ///
 /// The members of a change's details belong to its change type, which the model
-/// declares no shape for, so what the catalog can judge is what it reads: the
-/// member an entity's `Name` comes from ([`ENTITY_NAME_DETAIL_MEMBERS`]) is a
-/// string, and the one its `Visibility` comes from
-/// ([`ENTITY_VISIBILITY_DETAIL_MEMBER`]) is one of the values the model's
-/// `*VisibilityString` enums publish ([`ENTITY_VISIBILITY_VALUES`]). Every
-/// other member is carried into the entity's details untouched, so nothing here
-/// judges it.
-pub fn details_defects(details: Option<&Value>) -> Vec<ErrorDetail> {
+/// declares no shape for, so what the catalog can judge is what it reads — and
+/// it reads a member to REPORT it, so the contract each one is judged against is
+/// the one the model declares for the `EntitySummary` member that reports that
+/// value: the published set of an enumerated member, and the `@length` and
+/// `@pattern` of a member targeting a string shape. The member an entity's
+/// `Name` comes from ([`ENTITY_NAME_DETAIL_MEMBERS`]) is bounded by
+/// [`entity_name_contract`], the one its `Visibility` comes from
+/// ([`ENTITY_VISIBILITY_DETAIL_MEMBER`]) by the values the model's
+/// `*VisibilityString` enums publish ([`ENTITY_VISIBILITY_VALUES`]), and every
+/// member the listed entity's per-type summary reports by
+/// [`summary_member_contracts`]. A member NO summary reports is carried into
+/// the entity's details untouched and reported only inside the opaque `Details`
+/// document, so nothing here judges it.
+pub fn details_defects(entity_type: &str, details: Option<&Value>) -> Vec<ErrorDetail> {
     let mut defects: Vec<ErrorDetail> = Vec::new();
     let Some(Value::Object(members)) = details else {
         return defects;
     };
+    let name = entity_name_contract(entity_type);
     for member in ENTITY_NAME_DETAIL_MEMBERS {
         if let Some(value) = members.get(*member) {
-            if !value.is_string() {
-                defects.push(invalid_detail_value(member, "a string", value));
+            if !name.admits(value) {
+                defects.push(invalid_detail_value(member, &name.accepts(), value));
             }
         }
     }
@@ -2731,6 +3185,16 @@ pub fn details_defects(details: Option<&Value>) -> Vec<ErrorDetail> {
                 &format!("one of {ENTITY_VISIBILITY_VALUES:?}"),
                 value,
             ));
+        }
+    }
+    for (member, contract) in summary_member_contracts(entity_type) {
+        if ENTITY_NAME_DETAIL_MEMBERS.contains(member) {
+            continue;
+        }
+        if let Some(value) = members.get(*member) {
+            if !contract.admits(value) {
+                defects.push(invalid_detail_value(member, &contract.accepts(), value));
+            }
         }
     }
     defects
@@ -2754,14 +3218,15 @@ fn invalid_detail_value(member: &str, accepts: &str, value: &Value) -> ErrorDeta
 /// so each change is applicable on its own and it is their combination the
 /// catalog cannot apply.
 ///
-/// Only the members the catalog READS are claims about the entity
-/// ([`details_defects`] lists them): every other member is carried into the
-/// entity's details, where the last change to name it is the one that stands,
-/// so two changes naming it is a merge rather than a contradiction. Each change
-/// is therefore looked at through that fixed, short list of members, never by
-/// walking the submitted document, and `RequestedChangeList` bounds the changes
-/// at 20 — so the work here is bounded by the request's modelled length and not
-/// by how wide a details document the caller sent.
+/// Only the members the catalog reads into one of the entity's own FIELDS — its
+/// name and its visibility — are claims about the entity: every other member is
+/// carried into the entity's details, where the last change to name it is the
+/// one that stands, so two changes naming it is a merge rather than a
+/// contradiction. Each change is therefore looked at through that fixed, short
+/// list of members, never by walking the submitted document, and
+/// `RequestedChangeList` bounds the changes at 20 — so the work here is bounded
+/// by the request's modelled length and not by how wide a details document the
+/// caller sent.
 fn contradicting_details(changes: &[ChangeRecord]) -> Option<String> {
     let read_members = || {
         ENTITY_NAME_DETAIL_MEMBERS

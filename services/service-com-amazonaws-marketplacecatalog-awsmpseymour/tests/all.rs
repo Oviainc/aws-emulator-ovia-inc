@@ -77,6 +77,8 @@ mod resource_policy_validation;
 mod sort_order_direction;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/summary_member_contracts.rs"]
+mod summary_member_contracts;
 #[path = "all/tag_set_uniqueness.rs"]
 mod tag_set_uniqueness;
 #[path = "all/validate_intent_verdict.rs"]
