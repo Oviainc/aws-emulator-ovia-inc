@@ -56,7 +56,10 @@ const NO_SUCH_ANNOTATION_MESSAGE: &str = "The specified annotation does not exis
 
 /// `DELETE /<bucket>/<key>?annotation&annotationName=<name>` — `DeleteObjectAnnotation`,
 /// with whatever extra query parameters and bound headers the case under test carries.
-async fn delete_annotation(
+///
+/// `pub(crate)`: the resource-naming suite ([`super::refusal_resource_naming`]) drives the
+/// same removal through this helper rather than standing up a second copy of it.
+pub(crate) async fn delete_annotation(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,

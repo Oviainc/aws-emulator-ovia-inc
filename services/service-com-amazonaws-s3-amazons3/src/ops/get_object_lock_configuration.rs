@@ -192,16 +192,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // written — a later caller sees exactly what this one saw.
         let store = state.lock();
         let Some(bucket) = store.bucket(&input.bucket) else {
-            return Err(
-                GetObjectLockConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
-            );
+            // The refusal names the bucket it is about, the way every resource-scoped
+            // refusal of this handler does — see [`crate::scaffolded::Scaffolded::naming`].
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                GetObjectLockConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}),
+            )
+            .naming_bucket(&input.bucket));
         };
         if !bucket.object_lock_enabled() {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::OBJECT_LOCK_CONFIGURATION_NOT_FOUND_CODE,
                 OBJECT_LOCK_CONFIGURATION_NOT_FOUND_STATUS,
                 crate::state::OBJECT_LOCK_CONFIGURATION_NOT_FOUND_MESSAGE,
-            ));
+            )
+            // The code and the message are fixed text for this condition; the bucket whose
+            // configuration is not there is the variable part of the envelope.
+            .naming_bucket(&input.bucket));
         }
 
         Ok(GetObjectLockConfigurationOutput {

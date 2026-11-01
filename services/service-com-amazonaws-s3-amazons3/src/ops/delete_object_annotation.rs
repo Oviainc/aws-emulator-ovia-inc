@@ -286,7 +286,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`DeleteObjectAnnotationRequest$VersionId`), and with none the key's current
         // object — what every reader naming no version answers from.
         let Some(bucket) = store.bucket(&input.bucket) else {
-            return Err(DeleteObjectAnnotationErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+            // The refusal names the bucket it is about, the way every resource-scoped
+            // refusal of this handler does — see [`crate::scaffolded::Scaffolded::naming`].
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                DeleteObjectAnnotationErrorModeled::NoSuchBucket(NoSuchBucket {}),
+            )
+            .naming_bucket(&input.bucket));
         };
         let Some(object) = bucket.addressed_object(&input.key, input.version_id.as_deref()) else {
             // A well-formed `versionId` that names no stored version is `NoSuchVersion`
@@ -344,9 +349,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // same lock), and answered rather than asserted so a future caller of this
             // state seam cannot turn a vanished address into a panic.
             None => {
-                return Err(
-                    DeleteObjectAnnotationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+                return Err(crate::scaffolded::Scaffolded::Modeled(
+                    DeleteObjectAnnotationErrorModeled::NoSuchBucket(NoSuchBucket {}),
                 )
+                .naming_bucket(&input.bucket))
             }
             Some(crate::state::AnnotationRemoval::NoSuchObject) => {
                 return Err(DeleteObjectAnnotationErrorModeled::NoSuchKey(NoSuchKey {}).into())
@@ -357,10 +363,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // under a prefix S3 reserves) answers, since no object can be carrying it —
             // exactly as the reader of this subresource answers the same name.
             Some(crate::state::AnnotationRemoval::NoSuchAnnotation) => {
-                return Err(
-                    DeleteObjectAnnotationErrorModeled::NoSuchAnnotation(NoSuchAnnotation {})
-                        .into(),
+                // An annotation-scoped refusal names the ANNOTATION it is about: the name
+                // the request addressed, exactly as the reader of this subresource names it.
+                return Err(crate::scaffolded::Scaffolded::Modeled(
+                    DeleteObjectAnnotationErrorModeled::NoSuchAnnotation(NoSuchAnnotation {}),
                 )
+                .naming_annotation(&input.annotation_name))
             }
         }
 

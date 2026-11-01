@@ -216,7 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::NO_SUCH_BUCKET_CODE,
                 NO_SUCH_BUCKET_STATUS,
                 crate::state::NO_SUCH_BUCKET_MESSAGE,
-            ));
+            )
+            // The refusal names the bucket it is about, the way the reader and the updates
+            // of this same subresource name it — see
+            // [`crate::scaffolded::Scaffolded::naming`].
+            .naming_bucket(&input.bucket));
         }
 
         // `Unit` output: success is the modelled 204 and an empty body.

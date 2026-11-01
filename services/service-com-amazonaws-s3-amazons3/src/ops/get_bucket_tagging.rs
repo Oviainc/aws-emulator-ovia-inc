@@ -167,7 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // written — a later caller sees exactly what this one saw.
         let store = state.lock();
         let Some(bucket) = store.bucket(&input.bucket) else {
-            return Err(GetBucketTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+            // The refusal names the bucket it is about, the way every resource-scoped
+            // refusal of this handler does — see [`crate::scaffolded::Scaffolded::naming`].
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                GetBucketTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}),
+            )
+            .naming_bucket(&input.bucket));
         };
 
         let tags = bucket.tags();
@@ -183,7 +188,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::NO_SUCH_TAG_SET_CODE,
                 NO_SUCH_TAG_SET_STATUS,
                 crate::state::NO_SUCH_TAG_SET_MESSAGE,
-            ));
+            )
+            // The code and the message are fixed text for this condition; the bucket whose
+            // tag set is not there is the variable part of the envelope.
+            .naming_bucket(&input.bucket));
         }
 
         Ok(GetBucketTaggingOutput {

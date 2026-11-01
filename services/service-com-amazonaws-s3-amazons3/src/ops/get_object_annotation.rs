@@ -231,7 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not there. With no `versionId` it is the key's current object, which is what every
         // reader naming no version answers from.
         let Some(bucket) = store.bucket(&input.bucket) else {
-            return Err(GetObjectAnnotationErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+            // The refusal names the bucket it is about, the way every resource-scoped
+            // refusal of this handler does — see [`crate::scaffolded::Scaffolded::naming`].
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                GetObjectAnnotationErrorModeled::NoSuchBucket(NoSuchBucket {}),
+            )
+            .naming_bucket(&input.bucket));
         };
         let Some(object) = bucket.addressed_object(&input.key, input.version_id.as_deref()) else {
             return Err(match input.version_id.as_deref() {
@@ -249,9 +254,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name no write could have recorded (one past the documented bounds, or under a
         // reserved prefix) answers, since no object can be carrying it.
         let Some(annotation) = object.annotation(&input.annotation_name) else {
-            return Err(
-                GetObjectAnnotationErrorModeled::NoSuchAnnotation(NoSuchAnnotation {}).into(),
-            );
+            // An annotation-scoped refusal names the ANNOTATION it is about: the name the
+            // request addressed, which is the only place this refusal says which of an
+            // object's annotations was asked for.
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                GetObjectAnnotationErrorModeled::NoSuchAnnotation(NoSuchAnnotation {}),
+            )
+            .naming_annotation(&input.annotation_name));
         };
 
         Ok(GetObjectAnnotationOutput {

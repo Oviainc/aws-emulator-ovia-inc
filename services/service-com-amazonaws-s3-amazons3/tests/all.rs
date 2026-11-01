@@ -244,6 +244,8 @@ mod refusal_codes;
 mod request_integrity_headers;
 #[path = "all/refusal_messages_published.rs"]
 mod refusal_messages_published;
+#[path = "all/refusal_resource_naming.rs"]
+mod refusal_resource_naming;
 #[path = "all/signature_refusal_wording.rs"]
 mod signature_refusal_wording;
 #[path = "all/state_roundtrip.rs"]

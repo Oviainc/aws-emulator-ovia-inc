@@ -320,10 +320,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this crate keeps).
         let mut store = state.lock();
         let Some(bucket) = store.bucket(&input.bucket) else {
-            return Err(
-                CreateBucketMetadataConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {})
-                    .into(),
-            );
+            // The refusal names the bucket it is about, the way every resource-scoped
+            // refusal of this handler does — see [`crate::scaffolded::Scaffolded::naming`].
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                CreateBucketMetadataConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}),
+            )
+            .naming_bucket(&input.bucket));
         };
         // "Creates an S3 Metadata V2 metadata configuration for a general purpose bucket"
         // (this operation's own documentation): a CREATE, and a bucket carries at most one
@@ -336,7 +338,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::METADATA_CONFIGURATION_ALREADY_EXISTS_CODE,
                 crate::state::METADATA_CONFIGURATION_ALREADY_EXISTS_STATUS,
                 crate::state::METADATA_CONFIGURATION_ALREADY_EXISTS_MESSAGE,
-            ));
+            )
+            // The code and the message are fixed text for this condition; the bucket that
+            // already carries a configuration is the variable part of the envelope.
+            .naming_bucket(&input.bucket));
         }
 
         // The tables are created now and fall due to be in service a span later, so a

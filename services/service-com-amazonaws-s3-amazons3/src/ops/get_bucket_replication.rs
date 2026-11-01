@@ -181,7 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(bucket) = store.bucket(&input.bucket) else {
-            return Err(GetBucketReplicationErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+            // The refusal names the bucket it is about, the way every resource-scoped
+            // refusal of this handler does — see [`crate::scaffolded::Scaffolded::naming`].
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                GetBucketReplicationErrorModeled::NoSuchBucket(NoSuchBucket {}),
+            )
+            .naming_bucket(&input.bucket));
         };
         // A bucket with no configuration has nothing to report: S3 answers
         // `ReplicationConfigurationNotFoundError` for it, the same way `GetBucketPolicy`
@@ -191,7 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::REPLICATION_CONFIGURATION_NOT_FOUND_CODE,
                 crate::state::REPLICATION_CONFIGURATION_NOT_FOUND_STATUS,
                 crate::state::REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE,
-            ));
+            )
+            // The code and the message are fixed text for this condition; the bucket whose
+            // configuration is not there is the variable part of the envelope.
+            .naming_bucket(&input.bucket));
         };
 
         Ok(GetBucketReplicationOutput {

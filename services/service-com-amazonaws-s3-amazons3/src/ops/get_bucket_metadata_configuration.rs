@@ -197,9 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let store = state.lock();
         let Some(bucket) = store.bucket(&input.bucket) else {
-            return Err(
-                GetBucketMetadataConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
-            );
+            // The refusal names the bucket it is about, the way every resource-scoped
+            // refusal of this handler does — see [`crate::scaffolded::Scaffolded::naming`].
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                GetBucketMetadataConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}),
+            )
+            .naming_bucket(&input.bucket));
         };
         let Some(configuration) = bucket.metadata_configuration() else {
             // A bucket is created carrying no metadata configuration, and a delete takes the
@@ -211,7 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
                 crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
                 crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
-            ));
+            )
+            // The code and the message are fixed text for this condition; the bucket whose
+            // configuration is not there is the variable part of the envelope.
+            .naming_bucket(&input.bucket));
         };
         // The tables live in the Region the general purpose bucket lives in, so the ARNs
         // reported for them are scoped to it rather than to anything the request carried.

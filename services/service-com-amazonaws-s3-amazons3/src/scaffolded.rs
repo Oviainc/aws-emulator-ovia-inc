@@ -65,6 +65,17 @@
 //! [`SerializableStruct`] impl for [`Scaffolded`] therefore writes the error code's
 //! documented message from [`DOCUMENTED_ERROR_MESSAGES`] before the shape's own members,
 //! for every modeled error of every operation — the one place the rule lives.
+//!
+//! ## A resource-scoped refusal names its resource
+//!
+//! Beside the code and the message, S3's error document carries the member that says WHICH
+//! resource the refusal is about — `<BucketName>` for a bucket-scoped refusal,
+//! `<AnnotationName>` for an annotation-scoped one — copied from the request. No error
+//! shape in this model declares such a member, and the codes the model does not declare
+//! have no shape at all, so a handler refusing a request because of the resource it
+//! addresses attaches the name through [`Scaffolded::naming`] (or the
+//! `naming_bucket`/`naming_annotation` shorthands) and the serializer above writes it after
+//! the message, whichever channel the refusal travels on.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -423,6 +434,78 @@ fn models_its_own_message(schema: &Schema) -> bool {
     })
 }
 
+/// The `<BucketName>` of an S3 error document: the member a BUCKET-scoped refusal names
+/// the bucket it is about by.
+///
+/// Same construction as [`DOCUMENTED_MESSAGE`] and the three synthetic message members
+/// above — the member name Smithy would spell (`bucketName`) with the element name S3's
+/// error document carries — so the value renders as `<BucketName>` on this service's
+/// restXml wire. Written AFTER the message, which is where S3's own document carries it.
+static BUCKET_NAME: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedResource$bucketName",
+        "smithy.framework",
+        "bucketName",
+    ),
+    ShapeType::String,
+    "bucketName",
+    1,
+)
+.with_xml_name("BucketName");
+
+/// The `<AnnotationName>` of an S3 error document: the member an ANNOTATION-scoped refusal
+/// names the annotation it is about by. See [`BUCKET_NAME`].
+static ANNOTATION_NAME: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedResource$annotationName",
+        "smithy.framework",
+        "annotationName",
+    ),
+    ShapeType::String,
+    "annotationName",
+    2,
+)
+.with_xml_name("AnnotationName");
+
+/// The resource a refusal is ABOUT, and therefore which member of the error document names
+/// it.
+///
+/// S3's error document for a resource-scoped refusal is
+/// `<Error><Code/><Message/><resource-naming member/><RequestId/><HostId/></Error>`: the
+/// code and the message are the fixed text of the error class, and the naming member is a
+/// variable part copied from the request, because the envelope is the only place the refusal
+/// says WHICH resource it is about. No error shape in this service's model declares such a
+/// member (`smithy_query(query="shape",shape="NoSuchBucket,NoSuchAnnotation",
+/// model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`
+/// reports no members at all), and the codes the model does not declare have no shape to
+/// carry one either — so the member lives on the error CHANNEL, here, once, rather than in
+/// each handler's serializer.
+#[derive(Debug, Clone)]
+pub enum RefusedResource {
+    /// A bucket-scoped refusal, named by `<BucketName>`: the bucket the request addressed.
+    Bucket(String),
+    /// An annotation-scoped refusal, named by `<AnnotationName>`: the annotation name the
+    /// request addressed.
+    Annotation(String),
+}
+
+impl RefusedResource {
+    /// The member of the error document this resource is named by.
+    fn member(&self) -> &'static Schema {
+        match self {
+            Self::Bucket(_) => &BUCKET_NAME,
+            Self::Annotation(_) => &ANNOTATION_NAME,
+        }
+    }
+
+    /// The name itself, exactly as the request spelled it.
+    fn name(&self) -> &str {
+        match self {
+            Self::Bucket(name) | Self::Annotation(name) => name.as_str(),
+        }
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -445,6 +528,10 @@ pub enum Scaffolded<E> {
     /// A rejection whose code the model does not declare, rendered with the code and
     /// status S3 actually sends. See [`Unmodeled`].
     Unmodeled(Unmodeled),
+    /// Any of the refusals above, ABOUT a named resource: the refusal is rendered exactly
+    /// as it would be on its own, plus the member S3's error document names that resource
+    /// by. See [`RefusedResource`] and [`Scaffolded::naming`].
+    Naming(Box<Scaffolded<E>>, RefusedResource),
 }
 
 impl<E> Scaffolded<E> {
@@ -486,6 +573,33 @@ impl<E> Scaffolded<E> {
             message: message.into(),
         })
     }
+
+    /// This refusal, with the member S3's error document names `resource` by.
+    ///
+    /// Reach for it wherever a request is refused BECAUSE of the resource it addresses —
+    /// the resource, or a configuration of it, not being there, or already being there —
+    /// since the envelope is the only place such a refusal says which resource it is
+    /// about: a client driving several buckets or annotations through one code path cannot
+    /// attribute the failure without it, and an SDK error shape that exposes the member
+    /// hands back nothing. The code, the status and the message are untouched.
+    ///
+    /// Naming a resource twice REPLACES the name rather than writing the member twice.
+    pub fn naming(self, resource: RefusedResource) -> Self {
+        match self {
+            Self::Naming(refusal, _) => Self::Naming(refusal, resource),
+            refusal => Self::Naming(Box::new(refusal), resource),
+        }
+    }
+
+    /// [`Scaffolded::naming`] for the bucket a bucket-scoped refusal is about.
+    pub fn naming_bucket(self, bucket: &str) -> Self {
+        self.naming(RefusedResource::Bucket(bucket.to_string()))
+    }
+
+    /// [`Scaffolded::naming`] for the annotation an annotation-scoped refusal is about.
+    pub fn naming_annotation(self, annotation: &str) -> Self {
+        self.naming(RefusedResource::Annotation(annotation.to_string()))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -495,6 +609,9 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::Unmodeled(e) => write!(f, "{e}"),
+            // The refusal as it reads on its own, plus the resource it is about, so an
+            // operator reading a log sees which one it was refused for.
+            Self::Naming(refusal, resource) => write!(f, "{refusal} ({})", resource.name()),
         }
     }
 }
@@ -508,6 +625,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::Unmodeled(e) => e.source(),
+            Self::Naming(refusal, _) => refusal.source(),
         }
     }
 }
@@ -520,6 +638,10 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
 /// error gets the documented message for its wire code written first — `<Code>` then
 /// `<Message>`, the order S3's document uses — followed by whatever members its own shape
 /// declares (`InvalidObjectState`'s `StorageClass`, say).
+///
+/// A refusal that NAMES a resource is serialized as the refusal it wraps and then the
+/// member naming that resource, which is the order S3's error document carries them in
+/// (`<Message>` then `<BucketName>`) — whichever channel the refusal itself travels on.
 impl<E: OperationError> SerializableStruct for Scaffolded<E> {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         match self {
@@ -533,6 +655,10 @@ impl<E: OperationError> SerializableStruct for Scaffolded<E> {
                     }
                 }
                 e.as_serializable().serialize_members(s)
+            }
+            Self::Naming(refusal, resource) => {
+                refusal.serialize_members(s)?;
+                s.write_string(resource.member(), resource.name())
             }
         }
     }
@@ -556,6 +682,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::Unmodeled(_) => &UNMODELED_SCHEMA,
+            // The wrapped refusal's own shape: naming the resource adds a member to the
+            // document, it does not make the refusal a different error.
+            Self::Naming(refusal, _) => refusal.variant_schema(),
         }
     }
 
@@ -570,6 +699,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => "ValidationException",
             // The documented wire code this failure carries, not a Rust variant name.
             Self::Unmodeled(e) => e.code,
+            Self::Naming(refusal, _) => refusal.shape_name(),
         }
     }
 
@@ -583,6 +713,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
             Self::Unmodeled(e) => e.status,
+            Self::Naming(refusal, _) => refusal.http_status(),
         }
     }
 
@@ -596,6 +727,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => None,
             // Same reason: the synthetic shapes carry no `awsQueryError` trait.
             Self::Unmodeled(_) => None,
+            Self::Naming(refusal, _) => refusal.query_error_code(),
         }
     }
 }

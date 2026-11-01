@@ -244,12 +244,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // crate keeps).
         let mut store = state.lock();
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
-            return Err(
+            // The refusal names the bucket it is about, the way every resource-scoped
+            // refusal of this handler does — see [`crate::scaffolded::Scaffolded::naming`].
+            return Err(crate::scaffolded::Scaffolded::Modeled(
                 UpdateBucketMetadataJournalTableConfigurationErrorModeled::NoSuchBucket(
                     NoSuchBucket {},
-                )
-                .into(),
-            );
+                ),
+            )
+            .naming_bucket(&input.bucket));
         };
         // "Enables or disables journal table record expiration for an S3 Metadata
         // configuration on a general purpose bucket" (this operation's own documentation):
@@ -264,7 +266,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
                 crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
                 crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
-            ));
+            )
+            // The code and the message are fixed text for this condition; the bucket whose
+            // configuration is not there is the variable part of the envelope.
+            .naming_bucket(&input.bucket));
         }
 
         // `Unit` output: success is the modelled 200 and an empty body.
