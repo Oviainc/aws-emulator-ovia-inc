@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a new project in this service's store and answers with the ARN it minted for
+//! it. The stored record is the only thing `DescribeProjects` reads, so nothing here is
+//! answered without being persisted first.
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +92,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Every modelled error this handler answers with is built through this trait, so each
+// one carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -172,18 +170,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProject"))
+        // What the project is customized for: the request's own `Feature`, or the
+        // default this member documents when the request names none.
+        let feature = input
+            .feature
+            .unwrap_or_else(|| crate::state::DEFAULT_CUSTOMIZATION_FEATURE.to_string());
+
+        // `AutoUpdate` is documented as a required argument for Content Moderation, so a
+        // request that customizes that feature without it is incomplete. The model
+        // cannot express a conditionally required member, so it reaches this handler and
+        // is refused here with the parameter error this operation declares.
+        if feature == crate::state::CONTENT_MODERATION_FEATURE && input.auto_update.is_none() {
+            return Err(CreateProjectErrorModeled::InvalidParameterException(
+                InvalidParameterException::with_message(format!(
+                    "AutoUpdate is a required argument for a project with the {feature} feature"
+                )),
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateProjectErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        // A project name is the account's identity for the project, so a second create
+        // under a live project's name is a collision rather than an update: it must not
+        // replace the project the name already names, nor mint a second ARN for it.
+        if state.projects.contains_key(&input.project_name) {
+            return Err(CreateProjectErrorModeled::ResourceInUseException(
+                ResourceInUseException::with_message(format!(
+                    "The project name: {} already exists",
+                    input.project_name
+                )),
+            )
+            .into());
+        }
+
+        // The store is held in memory, so it has a capacity: past it a create is refused
+        // with the modelled limit error rather than allowed to grow the process without
+        // limit. The check precedes the write, so a refused request stores nothing.
+        if state.projects.len() >= crate::state::MAX_PROJECTS {
+            return Err(CreateProjectErrorModeled::LimitExceededException(
+                LimitExceededException::with_message(format!(
+                    "The maximum number of projects ({}) has been reached",
+                    crate::state::MAX_PROJECTS
+                )),
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let creation_timestamp = ::std::time::SystemTime::now();
+        let arn = crate::state::project_arn(&region, &input.project_name, creation_timestamp);
+        let project = crate::state::Project::new(
+            input.project_name.clone(),
+            arn.clone(),
+            feature,
+            input.auto_update,
+            input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<String, String>>(),
+            creation_timestamp,
+        );
+        state.projects.insert(input.project_name, project);
+
+        Ok(CreateProjectOutput {
+            project_arn: Some(arn),
+        })
     }
 }

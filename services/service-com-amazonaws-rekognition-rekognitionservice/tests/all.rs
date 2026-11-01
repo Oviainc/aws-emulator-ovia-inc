@@ -19,5 +19,7 @@ mod face_collections;
 mod face_detection;
 #[path = "all/image_content_refusal.rs"]
 mod image_content_refusal;
+#[path = "all/projects.rs"]
+mod projects;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

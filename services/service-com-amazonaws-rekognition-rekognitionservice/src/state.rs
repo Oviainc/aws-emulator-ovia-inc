@@ -43,7 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{Face, Image};
+use crate::ops::types::{Face, Image, ProjectDescription};
 
 /// The region an emulated request is treated as having been made in when its
 /// SigV4 credential scope does not name one (an unsigned or anonymous request).
@@ -81,6 +81,28 @@ pub const DEFAULT_FACE_MATCH_THRESHOLD: f32 = 80.0;
 /// process computes no graded similarity.
 pub const IDENTICAL_CONTENT_SIMILARITY: f32 = 100.0;
 
+/// The `CustomizationFeature` a project created without one is customized for.
+/// Documented on the member itself
+/// (`smithy_query(query="doc",shape="CreateProjectRequest",member="Feature")`: "If no
+/// value is provided CUSTOM_LABELS is used as a default").
+pub const DEFAULT_CUSTOMIZATION_FEATURE: &str = "CUSTOM_LABELS";
+
+/// The `CustomizationFeature` whose projects are adapters, for which `AutoUpdate` is a
+/// required argument
+/// (`smithy_query(query="doc",shape="CreateProjectRequest",member="AutoUpdate")`:
+/// "Required argument for Content Moderation").
+pub const CONTENT_MODERATION_FEATURE: &str = "CONTENT_MODERATION";
+
+/// The `ProjectStatus` a project of this store carries once it has been created.
+///
+/// `CreateProject` provisions nothing — a project is a container for datasets and model
+/// versions, both of which are created by their own operations — and its response
+/// carries no status, so the project is already created by the time any reader can ask
+/// about it. The other two `ProjectStatus` values (`smithy_query(query="shape",
+/// shape="ProjectStatus")`: CREATING | CREATED | DELETING) belong to transitions no
+/// operation of this slice starts.
+pub const PROJECT_STATUS_CREATED: &str = "CREATED";
+
 /// How many collections this store will hold, and how many faces one collection will
 /// hold, before a create or an index is refused with the modelled
 /// `ServiceQuotaExceededException`.
@@ -93,6 +115,12 @@ pub const IDENTICAL_CONTENT_SIMILARITY: f32 = 100.0;
 /// a client sees a quota refusal either way.
 pub const MAX_COLLECTIONS: usize = 100;
 pub const MAX_FACES_PER_COLLECTION: usize = 1_000;
+
+/// How many projects this store will hold before a create is refused with the modelled
+/// `LimitExceededException`. The same reasoning as [`MAX_COLLECTIONS`]: the store is
+/// this process's memory, so a caller repeating `CreateProject` is refused rather than
+/// allowed to grow it without limit.
+pub const MAX_PROJECTS: usize = 100;
 
 /// One face stored in a collection by `IndexFaces`.
 ///
@@ -197,6 +225,76 @@ impl Collection {
     }
 }
 
+/// One project recorded by `CreateProject`: the name it was created under, the ARN
+/// this service minted for it, when it was created, what it is customized for, and the
+/// tags the create attached to it.
+///
+/// A project is a container (`CreateProject`: "A project is a group of resources
+/// (datasets, model versions)"), so nothing here measures or trains anything: the
+/// record is what the caller asked for plus what the service assigned.
+#[derive(Debug, Clone)]
+pub struct Project {
+    /// `CreateProject.ProjectName` — this API's identity for the project, and the
+    /// store's key for it.
+    pub name: String,
+    /// The ARN this service minted for the project; what every operation ON a project
+    /// names it by.
+    pub arn: String,
+    pub creation_timestamp: SystemTime,
+    /// The project's `ProjectStatus`; see [`PROJECT_STATUS_CREATED`].
+    pub status: String,
+    /// The `CustomizationFeature` the project is customized for: what the create
+    /// named, or [`DEFAULT_CUSTOMIZATION_FEATURE`] when it named none.
+    pub feature: String,
+    /// `CreateProject.AutoUpdate`, carried through unchanged — absent when the create
+    /// named none, since nothing else decides whether a project auto-updates.
+    pub auto_update: Option<String>,
+    /// The tags the create attached to the project. Stored because `CreateProject`
+    /// attaches them, so the record is what the caller asked for; the operations that
+    /// report and change a resource's tags resolve collection ARNs only so far, so
+    /// extending them to project ARNs belongs to those operations.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl Project {
+    /// A project as `CreateProject` records it: created, with no datasets and no model
+    /// versions, since each of those is created by its own operation.
+    pub fn new(
+        name: String,
+        arn: String,
+        feature: String,
+        auto_update: Option<String>,
+        tags: BTreeMap<String, String>,
+        creation_timestamp: SystemTime,
+    ) -> Self {
+        Self {
+            name,
+            arn,
+            creation_timestamp,
+            status: PROJECT_STATUS_CREATED.to_string(),
+            feature,
+            auto_update,
+            tags,
+        }
+    }
+
+    /// This project as the modelled `ProjectDescription`.
+    ///
+    /// `Datasets` is the project's training and test datasets, of which it has none
+    /// until `CreateDataset` records one, so the list is empty rather than absent: the
+    /// project HAS a dataset list and this is its content.
+    pub fn modeled(&self) -> ProjectDescription {
+        ProjectDescription {
+            project_arn: Some(self.arn.clone()),
+            creation_timestamp: Some(::aws_smithy_types::DateTime::from(self.creation_timestamp)),
+            status: Some(self.status.clone()),
+            datasets: Some(Vec::new()),
+            feature: Some(self.feature.clone()),
+            auto_update: self.auto_update.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-rekognition-rekognitionservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRekognitionRekognitionserviceState {
@@ -205,6 +303,32 @@ pub struct ComAmazonawsRekognitionRekognitionserviceState {
     /// `BTreeMap` so `ListCollections` order, and therefore its pagination, is
     /// deterministic. Bounded by [`MAX_COLLECTIONS`].
     pub collections: BTreeMap<String, Collection>,
+    /// Every live project, keyed by its `ProjectName` — the name a project is created
+    /// under and the one `DescribeProjects` filters by, unique per account because a
+    /// create that repeats one is refused. A `BTreeMap` for the same reason as
+    /// `collections`: `DescribeProjects`' order, and therefore its pagination, is
+    /// deterministic. Bounded by [`MAX_PROJECTS`].
+    pub projects: BTreeMap<String, Project>,
+}
+
+/// The position of a project in the order `DescribeProjects` reports projects in —
+/// documented on the output member itself
+/// (`smithy_query(query="doc",shape="DescribeProjectsResponse",member="ProjectDescriptions")`:
+/// "The list is sorted by the date and time the projects are created") — with the
+/// project's name breaking the tie between two projects created in the same
+/// millisecond, so the order is total and therefore deterministic.
+///
+/// The instant is rendered fixed-width so the keys sort as strings exactly as they sort
+/// by creation instant. A page cursor is built from this key rather than from a project,
+/// so a page still resumes at the right position when the project the token was minted
+/// at has since been deleted.
+pub fn project_order_key(project: &Project) -> String {
+    let millis = project
+        .creation_timestamp
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or_default();
+    format!("{millis:020}/{}", project.name)
 }
 
 /// The region of the request being served: the third field of its SigV4
@@ -248,10 +372,32 @@ pub fn collection_arn(region: &str, collection_id: &str) -> String {
     )
 }
 
+/// The ARN of a project in `region` created at `creation_timestamp`:
+/// `arn:aws:rekognition:<region>:<account>:project/<ProjectName>/<version>`.
+///
+/// A project ARN ends in a numeric version segment the service assigns when it creates
+/// the project (`ProjectArn`'s pattern ends `project\/[a-zA-Z0-9_.\-]{1,255}\/[0-9]+$`,
+/// `smithy_query(query="operation",operation="CreateProject")`). It is the project's
+/// creation instant in milliseconds, so the ARN a create answers with is derived from
+/// the record it just wrote and stays that project's ARN for as long as the project
+/// lives.
+pub fn project_arn(region: &str, project_name: &str, creation_timestamp: SystemTime) -> String {
+    let version = creation_timestamp
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or_default();
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("project/{project_name}/{version}"),
+    )
+}
+
 /// The cursor scope of each paginated list, so one list's token cannot be replayed
 /// against another and a hex string the service never minted names no position.
 pub const FACES_CURSOR_SCOPE: &str = "faces";
 pub const COLLECTIONS_CURSOR_SCOPE: &str = "collections";
+pub const PROJECTS_CURSOR_SCOPE: &str = "projects";
 
 /// The pagination cursor of the `scope` list for a page that starts at `key`.
 ///
@@ -305,6 +451,24 @@ pub fn page_size(requested: Option<i32>) -> usize {
 /// finished iteration.
 pub fn page_ends_here(page_size: usize) -> bool {
     page_size == 0
+}
+
+/// The largest page `DescribeProjects` serves, and the one it serves when the caller
+/// sends no `MaxResults`: the top of the modelled `ProjectsPageSize` range
+/// (`range 1..100`, `smithy_query(query="operation",operation="DescribeProjects")`).
+/// The model documents no other default, and the range's floor of 1 means a projects
+/// page is never empty while projects remain.
+pub const PROJECTS_PAGE_SIZE_MAX: usize = 100;
+
+/// The page size a `MaxResults` of `requested` asks `DescribeProjects` for, held inside
+/// the modelled range — which the boundary validator has already enforced, so this only
+/// keeps the page size a page size for a value that reached here anyway.
+pub fn projects_page_size(requested: Option<i32>) -> usize {
+    requested.map_or(PROJECTS_PAGE_SIZE_MAX, |max| {
+        usize::try_from(max)
+            .unwrap_or(1)
+            .clamp(1, PROJECTS_PAGE_SIZE_MAX)
+    })
 }
 
 /// What an `Image` identifies, as bytes to digest: the image bytes themselves, or
