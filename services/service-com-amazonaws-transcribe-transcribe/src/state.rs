@@ -5618,6 +5618,78 @@ pub async fn store_job_outputs(
     stored_every_one
 }
 
+/// The objects a job's reported output locations name in THIS SERVICE'S OWN bucket
+/// ([`service_managed_bucket`]), out of every location `record` reports
+/// ([`JobOutputs::output_objects`]).
+///
+/// The service-managed branch of a reported location is the only one this service owns:
+/// a bucket the REQUEST named belongs to the caller, who created it before starting the
+/// job ([`store_job_outputs`]), so nothing of the caller's is ever named here. The
+/// addresses are the record's own projection — the very one the write addresses — so a
+/// caller can never be told about one location and have another touched.
+///
+/// Taken while the record is still held, since it is the record that knows where its
+/// files are; what is DONE with them is awaited outside the store lock
+/// ([`withdraw_job_outputs`]).
+pub fn service_managed_outputs<R: JobOutputs>(record: &R, region: &str) -> Vec<OutputObject> {
+    let service_managed = service_managed_bucket(region);
+    let mut objects = record.output_objects();
+    objects.retain(|object| object.bucket == service_managed);
+    // ONE withdrawal per address, however many times the record reports it, for the
+    // reason [`due_output_objects`] deduplicates the writes.
+    let mut seen = ::std::collections::BTreeSet::new();
+    objects.retain(|object| seen.insert(object.key.clone()));
+    objects
+}
+
+/// Withdraw the documents this service's own bucket holds for a job whose record has
+/// just been removed.
+///
+/// The other direction of [`store_job_outputs`], and the same rule the vocabulary
+/// family's delete closes with ([`store_vocabulary_content`] called with no terms): the
+/// record is gone, so this service reports those locations to nobody, and the files it
+/// wrote into its OWN bucket for that record are withdrawn with it rather than left
+/// behind for a job nothing holds. Only the service-managed objects are passed in
+/// ([`service_managed_outputs`]) — an object in a bucket the request named is the
+/// caller's, who created that bucket and keeps whatever is in it.
+///
+/// Object storage answering nothing says nothing about this service's record — the
+/// control plane is real whether or not the emulator was assembled with Amazon S3 — so a
+/// withdrawal that is not taken is logged and the delete still answers. An answer saying
+/// the bucket or the object is not there already means nothing is served there, which is
+/// why that is not a warning.
+pub async fn withdraw_job_outputs(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    objects: &[OutputObject],
+) {
+    if objects.is_empty() {
+        return;
+    }
+    let client = s3_client(ctx, region);
+    for object in objects {
+        match client
+            .delete_object()
+            .bucket(&object.bucket)
+            .key(&object.key)
+            .send()
+            .await
+        {
+            Ok(_) => ::tracing::info!(
+                bucket = ?object.bucket,
+                key = ?object.key,
+                "the document this job's reported output location named was withdrawn"
+            ),
+            Err(error) => ::tracing::debug!(
+                bucket = ?object.bucket,
+                key = ?object.key,
+                detail = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "no document was withdrawn for this job; nothing is served there"
+            ),
+        }
+    }
+}
+
 /// Give the documents a write did NOT store back to `record`, so the next operation
 /// that reads the job takes them again ([`due_output_objects`]).
 ///

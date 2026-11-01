@@ -182,47 +182,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region's endpoint are this call's to delete.
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // The lookup materialises the clock-owed transitions FIRST, so a job whose
-        // completion was already due is deleted rather than refused for a status it
-        // had left.
-        let Some(record) =
-            store.transcription_job_mut(&region, &input.transcription_job_name, now)
-        else {
-            return Err(DeleteTranscriptionJobErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::not_found_message(crate::state::KIND_JOB)),
-                },
-            )
-            .into());
+        // The guard is SCOPED: the store lock is released before this handler awaits
+        // the withdrawal of the documents this job's reported output locations named,
+        // which is a call out to another emulated service and reaches none of this
+        // state.
+        let withdrawn = {
+            let mut store = state.lock();
+            // The lookup materialises the clock-owed transitions FIRST, so a job whose
+            // completion was already due is deleted rather than refused for a status it
+            // had left.
+            let Some(record) =
+                store.transcription_job_mut(&region, &input.transcription_job_name, now)
+            else {
+                return Err(DeleteTranscriptionJobErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::not_found_message(crate::state::KIND_JOB)),
+                    },
+                )
+                .into());
+            };
+
+            // "Your request didn't pass one or more validation tests. This can occur
+            // when the entity you're trying to delete doesn't exist or if it's in a
+            // non-terminal state (such as IN PROGRESS)" (`BadRequestException`'s own
+            // documentation): a job the service is still working on is not deletable.
+            if !crate::state::is_terminal_job_status(&record.status) {
+                let (name, status) = (record.name.clone(), record.status.clone());
+                return Err(DeleteTranscriptionJobErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "The transcription job {name} is in the {status} state and can't \
+                             be deleted. Wait until it is no longer being processed and try \
+                             your request again."
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // Where the files this service wrote into its OWN bucket for this job live,
+            // read off the record that reports those locations while it is still held
+            // (`crate::state::service_managed_outputs`). A location the REQUEST named
+            // is the caller's bucket and is not among them.
+            let withdrawn = crate::state::service_managed_outputs(record, &region);
+            store
+                .transcription_jobs
+                .remove(&region, &input.transcription_job_name);
+            ::tracing::info!(
+                operation = "DeleteTranscriptionJob",
+                job = %input.transcription_job_name,
+                "transcription job deleted"
+            );
+            withdrawn
         };
 
-        // "Your request didn't pass one or more validation tests. This can occur when
-        // the entity you're trying to delete doesn't exist or if it's in a non-terminal
-        // state (such as IN PROGRESS)" (`BadRequestException`'s own documentation): a
-        // job the service is still working on is not deletable.
-        if !crate::state::is_terminal_job_status(&record.status) {
-            let (name, status) = (record.name.clone(), record.status.clone());
-            return Err(DeleteTranscriptionJobErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(format!(
-                        "The transcription job {name} is in the {status} state and can't be \
-                         deleted. Wait until it is no longer being processed and try your \
-                         request again."
-                    )),
-                },
-            )
-            .into());
-        }
+        // The job is gone, so the locations it reported serve nothing: the documents
+        // this service stored in its own bucket for it are withdrawn with it
+        // (`crate::state::withdraw_job_outputs`), exactly as the vocabulary family's
+        // delete withdraws the file its `DownloadUri` named.
+        crate::state::withdraw_job_outputs(ctx, &region, &withdrawn).await;
 
-        store
-            .transcription_jobs
-            .remove(&region, &input.transcription_job_name);
-        ::tracing::info!(
-            operation = "DeleteTranscriptionJob",
-            job = %input.transcription_job_name,
-            "transcription job deleted"
-        );
         Ok(DeleteTranscriptionJobOutput)
     }
 }

@@ -59,6 +59,8 @@ mod get_medical_vocabulary_reads;
 mod job_concurrency_quota;
 #[path = "all/job_output_objects.rs"]
 mod job_output_objects;
+#[path = "all/job_output_withdrawal.rs"]
+mod job_output_withdrawal;
 #[path = "all/job_start_language_model_status.rs"]
 mod job_start_language_model_status;
 #[path = "all/job_start_vocabulary_state.rs"]

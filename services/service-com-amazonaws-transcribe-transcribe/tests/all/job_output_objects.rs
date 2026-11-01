@@ -57,8 +57,12 @@ fn media() -> Value {
 
 /// Which family a row drives: the start, the reader, and the members each spells the
 /// job and its output with.
+///
+/// `pub(crate)`, like the harness it is built on: the suite that asserts what a job's
+/// DELETE does to those same documents (`crate::job_output_withdrawal`) drives the
+/// families through this table rather than spelling a second one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Family {
+pub(crate) enum Family {
     /// `StartTranscriptionJob` -> `GetTranscriptionJob`.
     Transcription,
     /// `StartMedicalTranscriptionJob` -> `GetMedicalTranscriptionJob`.
@@ -70,7 +74,7 @@ enum Family {
 }
 
 impl Family {
-    fn start(self) -> &'static str {
+    pub(crate) fn start(self) -> &'static str {
         match self {
             Self::Transcription => "StartTranscriptionJob",
             Self::Medical => "StartMedicalTranscriptionJob",
@@ -79,7 +83,7 @@ impl Family {
         }
     }
 
-    fn get(self) -> &'static str {
+    pub(crate) fn get(self) -> &'static str {
         match self {
             Self::Transcription => "GetTranscriptionJob",
             Self::Medical => "GetMedicalTranscriptionJob",
@@ -88,7 +92,7 @@ impl Family {
         }
     }
 
-    fn name_member(self) -> &'static str {
+    pub(crate) fn name_member(self) -> &'static str {
         match self {
             Self::Transcription => "TranscriptionJobName",
             Self::Medical => "MedicalTranscriptionJobName",
@@ -98,7 +102,7 @@ impl Family {
     }
 
     /// The member of a successful read that carries the job.
-    fn job_member(self) -> &'static str {
+    pub(crate) fn job_member(self) -> &'static str {
         match self {
             Self::Transcription => "TranscriptionJob",
             Self::Medical => "MedicalTranscriptionJob",
@@ -108,7 +112,7 @@ impl Family {
     }
 
     /// The member of the job that carries its status.
-    fn status_member(self) -> &'static str {
+    pub(crate) fn status_member(self) -> &'static str {
         match self {
             Self::Scribe => "MedicalScribeJobStatus",
             Self::CallAnalytics => "CallAnalyticsJobStatus",
@@ -118,7 +122,7 @@ impl Family {
 
     /// The smallest valid start request of this family, before a row's own members are
     /// merged in.
-    fn start_request(self, name: &str) -> Value {
+    pub(crate) fn start_request(self, name: &str) -> Value {
         match self {
             Self::Transcription => json!({
                 "TranscriptionJobName": name,
@@ -147,7 +151,7 @@ impl Family {
 
     /// Every output location the finished job reports, read off the job the reader
     /// answered with.
-    fn reported_locations(self, job: &Value) -> Vec<String> {
+    pub(crate) fn reported_locations(self, job: &Value) -> Vec<String> {
         let mut locations = Vec::new();
         match self {
             Self::Scribe => {
@@ -174,24 +178,24 @@ impl Family {
 
 /// One row: a job, where its start directs the output, and how many locations the
 /// finished job must therefore report.
-struct Row {
+pub(crate) struct Row {
     /// What this row varies, named in every assertion it fails.
-    case: &'static str,
-    family: Family,
-    name: &'static str,
+    pub(crate) case: &'static str,
+    pub(crate) family: Family,
+    pub(crate) name: &'static str,
     /// The members merged into the family's smallest start request.
-    output: fn() -> Value,
+    pub(crate) output: fn() -> Value,
     /// The buckets the row's start names, which the CALLER creates before starting the
     /// job — exactly as the real service requires. A row that named none leaves this
     /// empty: the service-managed bucket is the service's own to stand up.
-    buckets: &'static [&'static str],
+    pub(crate) buckets: &'static [&'static str],
     /// How many output locations the finished job reports, so a row cannot pass by
     /// reporting none.
-    locations: usize,
+    pub(crate) locations: usize,
 }
 
 /// The bucket the rows that name one of their own direct their output to.
-const OUTPUT_BUCKET: &str = "example-job-output";
+pub(crate) const OUTPUT_BUCKET: &str = "example-job-output";
 
 /// The rows. They span all four start operations, every documented shape of an output
 /// location, both redaction outputs and each subtitle format the model enumerates
@@ -350,7 +354,7 @@ fn rows() -> Vec<Row> {
 
 /// The start request of a row: the family's smallest valid one with the row's own
 /// output members merged in.
-fn start_request(row: &Row) -> Value {
+pub(crate) fn start_request(row: &Row) -> Value {
     let mut request = row.family.start_request(row.name);
     let Value::Object(output) = (row.output)() else {
         panic!("case {:?}: a row's output members are an object", row.case);
@@ -364,7 +368,7 @@ fn start_request(row: &Row) -> Value {
 /// The path a client resolves a reported output URI to: everything from the bucket on,
 /// whether the URI is the `s3://BUCKET/KEY` of a caller-named location or the
 /// path-style `https://s3.REGION.amazonaws.com/BUCKET/KEY` of a service-managed one.
-fn object_path(case: &str, uri: &str) -> String {
+pub(crate) fn object_path(case: &str, uri: &str) -> String {
     if let Some(rest) = uri.strip_prefix("s3://") {
         return format!("/{rest}");
     }
@@ -380,7 +384,7 @@ fn object_path(case: &str, uri: &str) -> String {
 
 /// Create the buckets a row's start directs its output to, as the caller must before
 /// starting the job.
-async fn given_output_buckets(router: &MultiServiceRouter, row: &Row) {
+pub(crate) async fn given_output_buckets(router: &MultiServiceRouter, row: &Row) {
     for bucket in row.buckets {
         let (status, body) = s3(router, "PUT", &format!("/{bucket}"), &[]).await;
         assert!(
@@ -395,7 +399,7 @@ async fn given_output_buckets(router: &MultiServiceRouter, row: &Row) {
 }
 
 /// Poll the family's reader until the job has FINISHED, and answer the job it reported.
-async fn finished_job(router: &MultiServiceRouter, row: &Row) -> Value {
+pub(crate) async fn finished_job(router: &MultiServiceRouter, row: &Row) -> Value {
     let request = json!({row.family.name_member(): row.name});
     for _ in 0..POLLS_FOR_FINISHED {
         let reply = call(router, row.family.get(), request.clone()).await;
@@ -422,7 +426,7 @@ async fn finished_job(router: &MultiServiceRouter, row: &Row) -> Value {
 
 /// Assert the document at `body` is the one the extension of `path` names, and that it
 /// carries the job's own identity rather than anything invented.
-fn assert_document(case: &str, name: &str, path: &str, body: &[u8]) {
+pub(crate) fn assert_document(case: &str, name: &str, path: &str, body: &[u8]) {
     let text = std::str::from_utf8(body)
         .unwrap_or_else(|error| panic!("case {case:?}: {path} is not UTF-8: {error}"));
     if path.ends_with(".vtt") {
