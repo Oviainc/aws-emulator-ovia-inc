@@ -7,7 +7,10 @@
 //! the single-run read ([`crate::ops::get_workflow_run`]) projects it — so a client working
 //! from the listing is never less informed than one re-reading each run.
 //!
-//! A `Name` this account holds no workflow under is refused with `EntityNotFoundException`.
+//! A `Name` this account holds no workflow under is refused with `EntityNotFoundException`,
+//! and so is a read with no run to report: `Runs` is `length 1..1000`, so this operation has
+//! no 2xx shape that reports nothing, and a workflow that has never run — or a cursor past
+//! the end of a history — is a refusal rather than a success with the member left out.
 //!
 //! ## Shape of an operation
 //!
@@ -263,11 +266,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|run| store.to_workflow_run(&region, run, include_graph))
             .collect();
 
+        // `Runs` is `length 1..1000`, so a success reporting NOTHING is not a shape this
+        // operation has: there is no 2xx encoding of "this workflow exists but has no run to
+        // report here". A read with nothing to report is therefore refused with the
+        // operation's own modelled `EntityNotFoundException` — the entity missing being the
+        // run history and not the workflow, which was found — so a client reading a run
+        // history either gets a non-empty `Runs` or an error it can branch on, and never a
+        // success whose list member is simply absent. This covers both ways a page can come
+        // up empty: a workflow no run has been started of, and a cursor that names a place
+        // past the end of the history.
+        if runs.is_empty() {
+            return Err(GetWorkflowRunsErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::no_workflow_runs_found()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
         Ok(GetWorkflowRunsOutput {
-            // `Runs` is `length 1..1000`, so the model admits no empty list: a workflow no
-            // run has been started of, and a page past the end of its history, report no
-            // `Runs` member at all rather than an empty one.
-            runs: (!runs.is_empty()).then_some(runs),
+            runs: Some(runs),
             next_token,
         })
     }

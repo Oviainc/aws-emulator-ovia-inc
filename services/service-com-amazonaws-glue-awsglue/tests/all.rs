@@ -269,6 +269,8 @@ mod workflow_graph;
 mod workflow_listing;
 #[path = "all/workflow_run_actions.rs"]
 mod workflow_run_actions;
+#[path = "all/workflow_run_history_absence.rs"]
+mod workflow_run_history_absence;
 #[path = "all/workflow_run_listing.rs"]
 mod workflow_run_listing;
 #[path = "all/workflow_run_properties.rs"]

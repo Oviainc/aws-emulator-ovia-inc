@@ -6,7 +6,9 @@
 //! the named parent — nothing of any other parent — in the order the listing serves,
 //! projected exactly as the single-child read projects it, one `MaxResults`-sized page at a
 //! time with a `NextToken` that resumes the walk and no token on the last page; a parent
-//! the store does not hold is refused with the operation's modelled not-found error. For a
+//! the store does not hold is refused with the operation's modelled not-found error, and so
+//! is a read with no child to report, because the list member's modelled minimum length of
+//! one leaves the operation no 2xx shape that reports nothing. For a
 //! run history the order is the chronological one, newest start first — the order this
 //! service's sibling run listing documents — so it is over the instant each run STARTED and
 //! not over the order the store happens to hold the runs in.
@@ -63,7 +65,7 @@ const HELD_OPEN: Duration = Duration::from_secs(3_600);
 /// The workflow names no `MaxConcurrentRuns`, so every run of a row may be in flight at
 /// once: "If you leave this parameter blank, there is no limit to the number of concurrent
 /// workflow runs" (`CreateWorkflowRequest$MaxConcurrentRuns`).
-async fn given_workflow_with_runs(
+pub(crate) async fn given_workflow_with_runs(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     name: &str,
@@ -144,17 +146,21 @@ fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, workflow: &str, at: Sys
     }
 }
 
-/// The `Runs` of one answer. `Runs` is `length 1..1000`, so the model admits no empty list:
-/// a listing with nothing to report carries no `Runs` member, which is read here as the
-/// empty listing it is.
-fn listed_runs(page: &Value) -> Vec<Value> {
-    match page.get("Runs") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(runs) => runs
-            .as_array()
-            .unwrap_or_else(|| panic!("GetWorkflowRuns must answer Runs as a list, got {page}"))
-            .clone(),
-    }
+/// The `Runs` of one answered page. `Runs` is `length 1..1000`, so this operation has no 2xx
+/// shape that reports nothing: an answered page always carries a non-empty `Runs`, and a
+/// read with nothing to report is a refusal instead (asserted in
+/// [`crate::workflow_run_history_absence`]).
+pub(crate) fn listed_runs(page: &Value) -> Vec<Value> {
+    let runs = page
+        .get("Runs")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("GetWorkflowRuns must answer Runs as a list, got {page}"))
+        .clone();
+    assert!(
+        !runs.is_empty(),
+        "an answered page carries a non-empty Runs, got {page}"
+    );
+    runs
 }
 
 /// The `WorkflowRunId` of every run one answer reports, in the order it reported them.
@@ -301,20 +307,22 @@ async fn runs_are_listed_newest_first_with_the_single_run_projection() {
 }
 
 #[tokio::test]
-async fn a_workflow_no_run_was_started_of_lists_none() {
+async fn a_workflow_no_run_was_started_of_is_refused() {
     let (router, _engine) = emulator_with_engine();
     let name = "unrun-workflow";
     ok(&router, "CreateWorkflow", &json!({ "Name": name })).await;
 
-    let page = ok(&router, "GetWorkflowRuns", &json!({ "Name": name })).await;
+    // `Runs` is `length 1..1000`, so there is no 2xx answer that reports no run: the read is
+    // refused instead. The whole class of reads with nothing to report is tabled in
+    // [`crate::workflow_run_history_absence`].
+    let (status, body) = call(&router, "GetWorkflowRuns", &json!({ "Name": name })).await;
     assert_eq!(
-        listed_runs(&page),
-        Vec::<Value>::new(),
-        "case \"a workflow with no runs\": expected an empty listing, got {page}"
+        status, 400,
+        "case \"a workflow with no runs\": expected 400, got {status} with {body}"
     );
     assert!(
-        page.get("NextToken").is_none(),
-        "case \"a workflow with no runs\": an empty listing carries no token, got {page}"
+        error_code(&body).ends_with("EntityNotFoundException"),
+        "case \"a workflow with no runs\": expected an EntityNotFoundException, got {body}"
     );
 }
 

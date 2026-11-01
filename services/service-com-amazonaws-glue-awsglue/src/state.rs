@@ -11572,6 +11572,17 @@ pub mod messages {
         format!("Workflow {name} not found.")
     }
 
+    /// A run-history read (`GetWorkflowRuns`) of a workflow this account DOES hold whose
+    /// history has no run to report. `GetWorkflowRunsResponse$Runs` is `length 1..1000`, so
+    /// a success carrying nothing is unrepresentable and the read is refused with the
+    /// operation's modelled `EntityNotFoundException` instead. NOT recorded: the sentence is
+    /// the fixed text Glue answers a run-history read with when there is no run history —
+    /// it names no resource, because the entity that is missing is the run history itself
+    /// and not the workflow, which was found.
+    pub fn no_workflow_runs_found() -> String {
+        "No workflow runs were found.".to_string()
+    }
+
     /// `StartWorkflowRun` for a workflow no trigger can begin a run of. RECORDED
     /// template: the sentence is fixed and its one variable part is the workflow the
     /// request named, taken from the request's own `Name`. The start is refused with the
