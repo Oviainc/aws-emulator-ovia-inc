@@ -21,6 +21,8 @@ mod bandwidth_rate_limit_schedule;
 mod bandwidth_rate_limit_schedule_consistency;
 #[path = "all/default_maintenance_window.rs"]
 mod default_maintenance_window;
+#[path = "all/element_position_counts_from_one.rs"]
+mod element_position_counts_from_one;
 #[path = "all/gateway_activation.rs"]
 mod gateway_activation;
 #[path = "all/gateway_lifecycle.rs"]

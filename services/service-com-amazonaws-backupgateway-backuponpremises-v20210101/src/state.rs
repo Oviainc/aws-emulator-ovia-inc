@@ -462,18 +462,23 @@ fn overlapping_day_of_week(
 /// another. AWS publishes no wording for these refusals, so each sentence below is an
 /// example: the requirement is the error shape, its status and the `ErrorCode`, and the
 /// sentence names the intervals and the values that clash — taken from the request — so the
-/// caller can fix it from the refusal alone.
+/// caller can fix it from the refusal alone. An interval is named by its place in the
+/// list, counted as [`crate::service::element_member_path`] counts a list's elements —
+/// from 1 — so this service answers "which element did you refuse?" in one numbering
+/// wherever the refusal is worded.
 pub fn bandwidth_rate_limit_schedule_violation(
     intervals: &[BandwidthRateLimitInterval],
 ) -> Option<String> {
     // Each interval on its own first: an interval that is not a window of one day has no
     // meaningful overlap with anything else.
     for (index, interval) in intervals.iter().enumerate() {
+        // As in `validate_tag_mappings`: the position names the interval that was refused.
+        let position = index + 1;
         if minute_of_day(interval.end_hour_of_day, interval.end_minute_of_hour)
             < minute_of_day(interval.start_hour_of_day, interval.start_minute_of_hour)
         {
             return Some(format!(
-                "The bandwidth rate limit interval at position {index} ends at \
+                "The bandwidth rate limit interval at position {position} ends at \
                  {:02}:{:02}, before it starts at {:02}:{:02}: a bandwidth rate limit \
                  interval is a period of time within one day, so EndHourOfDay and \
                  EndMinuteOfHour cannot precede StartHourOfDay and StartMinuteOfHour.",
@@ -483,10 +488,10 @@ pub fn bandwidth_rate_limit_schedule_violation(
                 interval.start_minute_of_hour,
             ));
         }
-        for (position, day) in interval.days_of_week.iter().enumerate() {
-            if interval.days_of_week[..position].contains(day) {
+        for (day_index, day) in interval.days_of_week.iter().enumerate() {
+            if interval.days_of_week[..day_index].contains(day) {
                 return Some(format!(
-                    "The bandwidth rate limit interval at position {index} lists day \
+                    "The bandwidth rate limit interval at position {position} lists day \
                      {day} of the week more than once: DaysOfWeek names each day of the \
                      week the interval applies to at most once."
                 ));
@@ -499,9 +504,12 @@ pub fn bandwidth_rate_limit_schedule_violation(
     for (index, interval) in intervals.iter().enumerate() {
         for (other_index, other) in intervals.iter().enumerate().skip(index + 1) {
             if let Some((day, from, through)) = overlapping_day_of_week(interval, other) {
+                // Both intervals named in the same numbering a single-interval refusal uses.
+                let position = index + 1;
+                let other_position = other_index + 1;
                 return Some(format!(
-                    "The bandwidth rate limit intervals at positions {index} and \
-                     {other_index} both apply on day {day} of the week, from {:02}:{:02} \
+                    "The bandwidth rate limit intervals at positions {position} and \
+                     {other_position} both apply on day {day} of the week, from {:02}:{:02} \
                      through {:02}:{:02}: bandwidth rate limit intervals cannot overlap.",
                     from / 60,
                     from % 60,
