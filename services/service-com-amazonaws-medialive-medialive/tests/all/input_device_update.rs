@@ -20,6 +20,11 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_medialive_medialive::state::{
+    repeated_audio_channel_pair_message, FIRST_AUDIO_CHANNEL_PAIR_ID, LAST_AUDIO_CHANNEL_PAIR_ID,
+    MAX_AUDIO_CHANNEL_PAIRS,
+};
+
 use crate::channel_lifecycle::wait_for_the_clock;
 use crate::input_device_maintenance_window::{claim_device, describe_device, device};
 use crate::wire::{call, error_code, error_message, medialive};
@@ -527,6 +532,177 @@ async fn settings_the_device_cannot_take_are_refused() {
             device(&router, case, id).await,
             before,
             "case {case:?}: expected the refused update to write nothing"
+        );
+    }
+}
+
+/// Rule: `AudioChannelPairs` configures the audio pairs of ONE source — "An
+/// array of eight audio configurations, one for each audio pair in the source" —
+/// so each pair the list names is a pair it configures once: a list that names
+/// one pair more than once leaves that pair's profile undecided and is refused
+/// with the operation's modelled `BadRequestException` (400), naming the
+/// repeated pair, and writes nothing. A list that names each of its pairs once
+/// is accepted however many pairs it carries, in whatever order, with whatever
+/// profiles.
+///
+/// The rows differ along what the rule generalises over: WHICH pair repeats
+/// (both published bounds of "a value from 1 to 8" and one in between), how
+/// often it repeats, where in the list the repeat falls, whether the repeated
+/// entries carry the same profile, a differing one or none, and how long the
+/// list is — because the rule is about one pair being configured twice rather
+/// than about any one id, profile, position or length.
+#[tokio::test]
+async fn one_audio_configuration_for_each_audio_pair() {
+    let uhd = "uhd-audiopairs001";
+
+    // (case, the request body, the pair the refusal must name)
+    let refused: [(&str, Value, i32); 6] = [
+        (
+            "the first pair configured twice with two different profiles",
+            json!({ "uhdDeviceSettings": { "audioChannelPairs": [
+                { "id": FIRST_AUDIO_CHANNEL_PAIR_ID, "profile": "CBR-AAC_HQ-192000" },
+                { "id": FIRST_AUDIO_CHANNEL_PAIR_ID, "profile": "DISABLED" },
+            ] } }),
+            FIRST_AUDIO_CHANNEL_PAIR_ID,
+        ),
+        (
+            "the last pair configured twice with the same profile",
+            json!({ "uhdDeviceSettings": { "audioChannelPairs": [
+                { "id": LAST_AUDIO_CHANNEL_PAIR_ID, "profile": "DISABLED" },
+                { "id": LAST_AUDIO_CHANNEL_PAIR_ID, "profile": "DISABLED" },
+            ] } }),
+            LAST_AUDIO_CHANNEL_PAIR_ID,
+        ),
+        (
+            "a pair configured twice with another pair's configuration between them",
+            json!({ "uhdDeviceSettings": { "audioChannelPairs": [
+                { "id": 2, "profile": "VBR-AAC_HE-64000" },
+                { "id": 3, "profile": "VBR-AAC_LC-128000" },
+                { "id": 2, "profile": "CBR-AAC_HQ-256000" },
+            ] } }),
+            2,
+        ),
+        (
+            "a pair configured three times",
+            json!({ "uhdDeviceSettings": { "audioChannelPairs": [
+                { "id": 5, "profile": "DISABLED" },
+                { "id": 5, "profile": "CBR-AAC_HQ-384000" },
+                { "id": 5, "profile": "CBR-AAC_HQ-512000" },
+            ] } }),
+            5,
+        ),
+        (
+            "a pair configured twice by entries that carry no profile at all",
+            json!({ "uhdDeviceSettings": { "audioChannelPairs": [{ "id": 4 }, { "id": 4 }] } }),
+            4,
+        ),
+        (
+            "as many configurations as a source has pairs, one pair twice and one not at all",
+            json!({ "uhdDeviceSettings": { "audioChannelPairs": [
+                { "id": 1, "profile": "DISABLED" }, { "id": 2, "profile": "DISABLED" },
+                { "id": 3, "profile": "DISABLED" }, { "id": 4, "profile": "DISABLED" },
+                { "id": 5, "profile": "DISABLED" }, { "id": 6, "profile": "DISABLED" },
+                { "id": 7, "profile": "DISABLED" }, { "id": 7, "profile": "VBR-AAC_HHE-16000" },
+            ] } }),
+            7,
+        ),
+    ];
+
+    for (case, body, repeated) in refused {
+        let router = medialive();
+        claim_device(&router, case, uhd).await;
+        let before = device(&router, case, uhd).await;
+
+        let (status, response) = update(&router, uhd, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the update to be refused, got {status}: {response}"
+        );
+        assert_eq!(
+            error_code(status, &response),
+            "BadRequestException",
+            "case {case:?}: expected the operation's modelled BadRequestException, got {response}"
+        );
+        assert_eq!(
+            error_message(&response),
+            repeated_audio_channel_pair_message(repeated),
+            "case {case:?}: expected the refusal to name audio pair {repeated}, got {:?}",
+            error_message(&response)
+        );
+
+        assert_eq!(
+            device(&router, case, uhd).await,
+            before,
+            "case {case:?}: expected the refused update to write nothing"
+        );
+    }
+
+    // Every profile is one the model's own enum declares
+    // (`smithy_query(query="shape",
+    // shape="InputDeviceConfigurableAudioChannelPairProfile")`: DISABLED |
+    // VBR-AAC_HHE-16000 | VBR-AAC_HE-64000 | VBR-AAC_LC-128000 |
+    // CBR-AAC_HQ-192000 | CBR-AAC_HQ-256000 | CBR-AAC_HQ-384000 |
+    // CBR-AAC_HQ-512000), and every id is inside "a value from 1 to 8".
+    let accepted: [(&str, Value); 4] = [
+        (
+            "one pair configured once",
+            json!([{ "id": 6, "profile": "VBR-AAC_HHE-16000" }]),
+        ),
+        (
+            "every pair a source has, each configured once",
+            json!([
+                { "id": 1, "profile": "DISABLED" },
+                { "id": 2, "profile": "VBR-AAC_HHE-16000" },
+                { "id": 3, "profile": "VBR-AAC_HE-64000" },
+                { "id": 4, "profile": "VBR-AAC_LC-128000" },
+                { "id": 5, "profile": "CBR-AAC_HQ-192000" },
+                { "id": 6, "profile": "CBR-AAC_HQ-256000" },
+                { "id": 7, "profile": "CBR-AAC_HQ-384000" },
+                { "id": 8, "profile": "CBR-AAC_HQ-512000" },
+            ]),
+        ),
+        (
+            "distinct pairs listed from the last to the first",
+            json!([
+                { "id": 8, "profile": "DISABLED" },
+                { "id": 7, "profile": "DISABLED" },
+                { "id": 6, "profile": "CBR-AAC_HQ-512000" },
+            ]),
+        ),
+        (
+            "distinct pairs that all carry the same profile",
+            json!([
+                { "id": 2, "profile": "VBR-AAC_HE-64000" },
+                { "id": 4, "profile": "VBR-AAC_HE-64000" },
+                { "id": 8, "profile": "VBR-AAC_HE-64000" },
+            ]),
+        ),
+    ];
+
+    for (case, pairs) in accepted {
+        let router = medialive();
+        claim_device(&router, case, uhd).await;
+
+        let (_, described) = update_and_read_back(
+            &router,
+            case,
+            uhd,
+            json!({ "uhdDeviceSettings": { "audioChannelPairs": pairs.clone() } }),
+        )
+        .await;
+        assert_eq!(
+            described["uhdDeviceSettings"]["audioChannelPairs"], pairs,
+            "case {case:?}: expected the device to report the configurations it was given, got {:?}",
+            described["uhdDeviceSettings"]["audioChannelPairs"]
+        );
+        assert!(
+            pairs
+                .as_array()
+                .expect("the configurations are an array")
+                .len()
+                <= MAX_AUDIO_CHANNEL_PAIRS,
+            "case {case:?}: expected the accepted rows to stay inside the {MAX_AUDIO_CHANNEL_PAIRS} pairs a source has, got {}",
+            pairs.as_array().expect("the configurations are an array").len()
         );
     }
 }

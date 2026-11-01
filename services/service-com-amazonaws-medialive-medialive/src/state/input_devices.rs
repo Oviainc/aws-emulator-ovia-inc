@@ -532,15 +532,33 @@ fn uhd_only_member(settings: &InputDeviceConfigurableSettings) -> Option<&'stati
     .find_map(|(member, named)| named.then_some(member))
 }
 
+/// The message an update refused for configuring one audio pair twice carries:
+/// the pair the request named more than once, and the rule the member's own
+/// documentation states ("An array of eight audio configurations, one for each
+/// audio pair in the source"). Built from the request, so it names what the
+/// caller must change.
+///
+/// Worded as the other audio-pair refusals of
+/// [`configurable_settings_error`] are, so the member's bounds cannot be
+/// reported three ways.
+pub fn repeated_audio_channel_pair_message(id: i32) -> String {
+    format!(
+        "AudioChannelPairs names audio pair {id} more than once; a source carries one audio \
+         configuration for each audio pair"
+    )
+}
+
 /// Why `settings` cannot configure a device of type `device_type`, worded for a
 /// refusal to report, or `None` when they can.
 ///
 /// The rule lives in the slice rather than in the handler, so the bounds the
 /// settings' own documentation states are checked in one place: the members only
 /// a UHD device has ([`uhd_only_member`]), the audio pairs a source has
-/// ([`MAX_AUDIO_CHANNEL_PAIRS`], [`FIRST_AUDIO_CHANNEL_PAIR_ID`]) and the
-/// resolutions a Link source can be set to ([`input_resolution`]). Built from
-/// the request, so each message names what the caller must change.
+/// ([`MAX_AUDIO_CHANNEL_PAIRS`], [`FIRST_AUDIO_CHANNEL_PAIR_ID`]) and the one
+/// configuration each of those pairs carries
+/// ([`repeated_audio_channel_pair_message`]), and the resolutions a Link source
+/// can be set to ([`input_resolution`]). Built from the request, so each message
+/// names what the caller must change.
 pub fn configurable_settings_error(
     device_type: &str,
     settings: &InputDeviceConfigurableSettings,
@@ -560,6 +578,12 @@ pub fn configurable_settings_error(
                 pairs.len()
             ));
         }
+        // The list configures the pairs of ONE source, "one for each audio pair
+        // in the source", so each pair it names is a pair it configures once: a
+        // second configuration for a pair the list already names leaves that
+        // pair's profile undecided, which is not a configuration the member
+        // describes.
+        let mut configured: Vec<i32> = Vec::with_capacity(pairs.len());
         for id in pairs.iter().filter_map(|pair| pair.id) {
             if !(FIRST_AUDIO_CHANNEL_PAIR_ID..=LAST_AUDIO_CHANNEL_PAIR_ID).contains(&id) {
                 return Some(format!(
@@ -567,6 +591,10 @@ pub fn configurable_settings_error(
                      {FIRST_AUDIO_CHANNEL_PAIR_ID} to {LAST_AUDIO_CHANNEL_PAIR_ID}"
                 ));
             }
+            if configured.contains(&id) {
+                return Some(repeated_audio_channel_pair_message(id));
+            }
+            configured.push(id);
         }
     }
     if let Some(resolution) = &settings.input_resolution {
