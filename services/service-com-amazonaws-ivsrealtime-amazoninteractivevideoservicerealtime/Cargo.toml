@@ -21,9 +21,21 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# PEM decoding of the `publicKeyMaterial` an `ImportPublicKey` call carries.
+pem = "3"
+# SubjectPublicKeyInfo parsing, so an import is refused unless the material really is a
+# DER-encoded public key.
+spki = "0.7"
+# MD5 digest: a public key's fingerprint is the MD5 of its public key's DER.
+md-5 = "0.10"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# Real key pairs for the public-key tests, so what they import is a genuine public key
+# rather than a hand-built byte string.
+rcgen = "0.13"
 
 [lints]
 workspace = true

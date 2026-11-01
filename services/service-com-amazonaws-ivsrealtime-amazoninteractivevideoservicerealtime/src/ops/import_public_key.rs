@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportPublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportPublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportPublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Imports the public half of a customer-generated key pair and persists it, so
+//! `GetPublicKey` answers from what was imported — this is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -79,9 +73,32 @@
 //!   exceeded.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an Amazon Web Services service.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   the SERVICE models it though this operation does not list it.
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use md5::{Digest, Md5};
+use spki::der::Decode as _;
+
+/// The resource type the public-key quota is on, as an IVS ARN spells it — the
+/// `public-key` of `PublicKeyArn` — so the quota refusal names the resource the same way
+/// this service's other quota refusals do.
+const PUBLIC_KEY_QUOTA_RESOURCE: &str = "public-key";
+
+/// The member a refused import names, as the request spells it.
+const PUBLIC_KEY_MATERIAL_MEMBER: &str = "publicKeyMaterial";
+
+/// What IVS states is wrong with material it cannot use, for every condition
+/// [`public_key_der`] checks: one clause for material that is no usable PEM block at all
+/// and for a block holding a key of another algorithm alike, so the refusal does not say
+/// which of them it was.
+const UNUSABLE_KEY_MATERIAL: &str = "could not decode as a PEM file";
+
+/// `id-ecPublicKey`, the `SubjectPublicKeyInfo` algorithm of every ECDSA public key
+/// (RFC 5480 §2.1.1), which is the kind of key a stage participant token is signed with.
+const EC_PUBLIC_KEY_OID: &str = "1.2.840.10045.2.1";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -94,11 +111,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `ImportPublicKeyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#ImportPublicKey")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#ImportPublicKey",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ImportPublicKeyErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    // Widened in through `extra_errors`: the SERVICE models `InternalServerException`
+    // (HTTP 500) though `ImportPublicKey` does not list it, and it is the only honest
+    // answer if the shared engine cannot hand back this service's store.
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
@@ -155,18 +179,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportPublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportPublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportPublicKey"))
+        // "Import a public key to be used for signing stage participant tokens": a
+        // mutation the spec names, so this call mints the key's ARN, fingerprints the
+        // material it was given and persists both. Only the PUBLIC half is ever handed
+        // to this service, so nothing secret is stored or reported.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(ImportPublicKeyErrorModeled::InternalServerException)
+        })?;
+
+        // The modelled `@pattern` on `PublicKeyMaterial` only pins the PEM ARMOUR, so the
+        // boundary validator cannot have checked that what the armour wraps really is a
+        // public key this service can use: this handler is where that is decided.
+        let key_der = public_key_der(&input.public_key_material).ok_or_else(|| {
+            audit(ctx, "", "", "rejected-invalid-material");
+            crate::state::validation_failed(
+                ImportPublicKeyErrorModeled::ValidationException,
+                crate::state::member_constraint_message(
+                    PUBLIC_KEY_MATERIAL_MEMBER,
+                    UNUSABLE_KEY_MATERIAL,
+                ),
+            )
+        })?;
+        let fingerprint = fingerprint(&key_der);
+
+        // A tag key in the reserved `aws:` namespace is AWS's own to write (see
+        // [`crate::state::RESERVED_TAG_KEY_PREFIX`]): refused here, before anything is
+        // minted or persisted, so a refused request leaves no key — the same rule,
+        // enforced the same way, as the one `CreateStage` and `TagResource` apply.
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tag_keys_unreserved(
+            Self::NAME,
+            "tags",
+            tags.keys().map(String::as_str),
+        )
+        .map_err(|message| {
+            crate::state::validation_failed(
+                ImportPublicKeyErrorModeled::ValidationException,
+                message,
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The fingerprint identifies the key MATERIAL, so a key this region's view
+        // already holds is a conflicting import however its PEM was wrapped and whatever
+        // name and tags accompany it — which is what `ConflictException` (HTTP 409),
+        // modelled on this operation and on no read, says. A key is a regional resource
+        // (its ARN names the region it was imported through), so the same material
+        // imported through another region's endpoint is a different resource, not a
+        // conflict.
+        if store.public_keys.values().any(|record| {
+            record.fingerprint == fingerprint
+                && crate::state::in_request_region(&record.arn, &region)
+        }) {
+            drop(store);
+            audit(ctx, &fingerprint, "", "rejected-conflict");
+            return Err(crate::state::conflict(
+                ImportPublicKeyErrorModeled::ConflictException,
+                crate::state::DUPLICATE_PUBLIC_KEY_MESSAGE,
+            ));
+        }
+
+        // The store grows only here, and a record is reclaimed only by an explicit
+        // `DeletePublicKey`, so the bound is checked before anything is minted or
+        // persisted.
+        if store.public_keys.len() >= crate::state::MAX_PUBLIC_KEYS {
+            drop(store);
+            audit(ctx, &fingerprint, "", "rejected-quota");
+            return Err(crate::state::quota_exceeded(
+                ImportPublicKeyErrorModeled::ServiceQuotaExceededException,
+                PUBLIC_KEY_QUOTA_RESOURCE,
+                crate::state::MAX_PUBLIC_KEYS,
+            ));
+        }
+
+        // A fresh id per import, re-minted on the (vanishingly unlikely) chance it
+        // already names a held key, so one ARN never denotes two of them — minted through
+        // the one place `crate::state` applies that rule. The NAME is not an identity:
+        // `PublicKeyName` carries no uniqueness requirement, so two keys may share one.
+        let crate::state::MintedResource { sequence, arn, .. } = crate::state::mint_unique_arn(
+            &mut store,
+            crate::state::PUBLIC_KEY_ID_LEN,
+            |public_key_id| crate::state::public_key_arn(&region, public_key_id),
+            |store, candidate| store.public_keys.contains_key(candidate),
+        );
+
+        let record = crate::state::PublicKeyRecord {
+            arn: arn.clone(),
+            // Materialised at import, so every projection of the key reports it: the
+            // empty string is a value `PublicKeyName`'s `@length(0..128)` admits (see
+            // [`crate::state::UNNAMED_RESOURCE_NAME`]).
+            name: input
+                .name
+                .unwrap_or_else(|| crate::state::UNNAMED_RESOURCE_NAME.to_string()),
+            // Reported back as it arrived: `PublicKey$publicKeyMaterial` is the material
+            // the caller imported, not a re-encoding of it.
+            public_key_material: input.public_key_material,
+            fingerprint,
+            tags,
+            created_at: ::std::time::SystemTime::now(),
+            sequence,
+        };
+
+        let public_key = record.to_public_key();
+        store.public_keys.insert(arn.clone(), record);
+        drop(store);
+
+        audit(
+            ctx,
+            public_key.fingerprint.as_deref().unwrap_or_default(),
+            &arn,
+            "imported",
+        );
+
+        Ok(ImportPublicKeyOutput {
+            public_key: Some(public_key),
+        })
     }
+}
+
+/// The record this state change leaves: who presented which access key id, which key the
+/// call touched and how it ended.
+///
+/// The imported material itself is never logged — only its fingerprint, which is the
+/// public identifier the response already carries — and neither is any secret: the access
+/// key id is the public half the request carries in its SigV4 scope.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    fingerprint: &str,
+    arn: &str,
+    outcome: &str,
+) {
+    ::tracing::info!(
+        operation = "ImportPublicKey",
+        access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+        public_key_arn = %arn,
+        fingerprint = %fingerprint,
+        outcome = outcome,
+        "ivs realtime state change"
+    );
+}
+
+/// The DER `SubjectPublicKeyInfo` a caller's `publicKeyMaterial` carries, or `None` when
+/// the material is not one this service can use.
+///
+/// The model documents the member as "the content of the public key to be imported", and
+/// the key is the one a customer signs stage participant tokens with: an ECDSA public key
+/// in a `PUBLIC KEY` PEM block (`openssl ec -in private.pem -pubout`). So the material is
+/// decoded as PEM, its tag must be exactly `PUBLIC KEY`, the bytes it carries must parse
+/// as a `SubjectPublicKeyInfo`, and that key's algorithm must be the elliptic-curve one —
+/// `id-ecPublicKey`, OID [`EC_PUBLIC_KEY_OID`]. Anything else (prose, a private key, a
+/// truncated structure, a key of another algorithm) is refused with this operation's
+/// `ValidationException` rather than persisted and fingerprinted. The curve itself is NOT
+/// constrained: the model names no curve, so any EC key the caller generated is accepted.
+fn public_key_der(material: &str) -> Option<Vec<u8>> {
+    let block = pem::parse(material.trim()).ok()?;
+    if block.tag() != "PUBLIC KEY" {
+        return None;
+    }
+    let key = spki::SubjectPublicKeyInfoRef::from_der(block.contents()).ok()?;
+    if key.algorithm.oid.to_string() != EC_PUBLIC_KEY_OID {
+        return None;
+    }
+    Some(block.into_contents())
+}
+
+/// The fingerprint of an imported key: the MD5 digest of the key's DER
+/// `SubjectPublicKeyInfo`, as colon-separated lowercase hex byte pairs.
+///
+/// That is the form `PublicKeyFingerprint` ("a short string used to identify or verify
+/// the full public key") carries, and the same value
+/// `openssl pkey -pubin -pubout -outform DER | md5` prints: it is computed from the
+/// imported material alone, so the same key always fingerprints to the same string and
+/// every read of the key answers that one value.
+fn fingerprint(public_key_der: &[u8]) -> String {
+    Md5::digest(public_key_der)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }

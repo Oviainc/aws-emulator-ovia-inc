@@ -5,8 +5,8 @@
 //! answer about exactly the same set of resources.
 //!
 //! The rule: an ARN is resolved to a resource kind this store holds — a stage, a
-//! composition, an ingest configuration, an encoder configuration or a storage
-//! configuration — and `ListTagsForResource`, `TagResource` and `UntagResource` all reach
+//! composition, an ingest configuration, an encoder configuration, a storage configuration
+//! or a public key — and `ListTagsForResource`, `TagResource` and `UntagResource` all reach
 //! the record of that one resolution; an ARN whose resource type names a kind the store
 //! never holds is the modelled `ResourceNotFoundException` (HTTP 404) on all three.
 //!
@@ -350,9 +350,9 @@ async fn every_stored_resource_kind_resolves_on_both_the_read_and_the_write_tag_
 /// holds is the modelled not-found on the read operation and on both writes alike — the two
 /// sides cannot disagree about which kinds are resolvable.
 ///
-/// The rows differ in WHY nothing is held: a resource type this model declares an ARN shape
-/// for that no operation of this service mints (`public-key`), a kind the store does hold
-/// whose record it never had, and one whose record it held and the delete removed.
+/// The rows differ in WHY nothing is held: a kind the store does hold whose record it
+/// never had (a public key, and a storage configuration), and one whose record it held and
+/// the delete removed.
 #[tokio::test]
 async fn an_arn_of_no_stored_kind_is_a_not_found_on_the_read_and_the_write_tag_path() {
     let realtime = RealTime::new();
@@ -366,11 +366,11 @@ async fn an_arn_of_no_stored_kind_is_a_not_found_on_the_read_and_the_write_tag_p
 
     let cases = [
         (
-            "a type this model declares an ARN shape for but mints nowhere".to_string(),
+            "a stored kind whose record this store never held".to_string(),
             arn("public-key", "0123456789ab"),
         ),
         (
-            "a stored kind whose record this store never held".to_string(),
+            "another stored kind whose record this store never held".to_string(),
             arn("storage-configuration", "ffffffffffff"),
         ),
         ("a stored kind that was deleted".to_string(), deleted),

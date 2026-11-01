@@ -115,6 +115,8 @@ mod participant_replication;
 mod participant_replication_stop;
 #[path = "all/participants.rs"]
 mod participants;
+#[path = "all/public_keys.rs"]
+mod public_keys;
 #[path = "all/region_scoped_resources.rs"]
 mod region_scoped_resources;
 #[path = "all/replica_attributes_merge_bound.rs"]

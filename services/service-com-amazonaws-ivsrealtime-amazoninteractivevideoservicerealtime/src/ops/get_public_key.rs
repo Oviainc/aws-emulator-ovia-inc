@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPublicKey`'s real behaviour. Implement it here — this is
+//! Reports the public key the request names, as `ImportPublicKey` persisted it — this is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +62,8 @@
 //!   exist.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an Amazon Web Services service.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   the SERVICE models it though this operation does not list it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -84,10 +79,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `GetPublicKeyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#GetPublicKey")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#GetPublicKey",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetPublicKeyErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    // Widened in through `extra_errors`: the SERVICE models `InternalServerException`
+    // (HTTP 500) though `GetPublicKey` does not list it, and it is the only honest answer
+    // if the shared engine cannot hand back this service's store.
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
@@ -143,18 +145,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPublicKey"))
+        // A pure read (`@readonly` in the model, and "Gets information for the specified
+        // public key"): the key is reported exactly as it is stored and nothing is
+        // written, so a later caller sees what this one saw — the fingerprint included,
+        // which is computed once at import and held on the record. It is read from this
+        // request's own region's view of the account: a key of another region is not a
+        // resource this request can be answered about.
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(GetPublicKeyErrorModeled::InternalServerException)
+        })?;
+        let store = state.lock();
+        let record = store.public_key_in(&region, &input.arn).ok_or_else(|| {
+            crate::state::resource_not_found(
+                GetPublicKeyErrorModeled::ResourceNotFoundException,
+                &input.arn,
+            )
+        })?;
+        Ok(GetPublicKeyOutput {
+            public_key: Some(record.to_public_key()),
+        })
     }
 }

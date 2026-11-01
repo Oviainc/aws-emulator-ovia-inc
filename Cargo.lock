@@ -10719,7 +10719,11 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "http",
+ "md-5 0.10.6",
+ "pem",
+ "rcgen",
  "serde_json",
+ "spki 0.7.3",
  "tokio",
  "tracing",
 ]

@@ -6,10 +6,11 @@
 //! `DeleteStage`), the token issuance that makes a stage usable
 //! (`CreateParticipantToken`), the stage sessions a stage's participants are
 //! grouped into (`GetParticipant`, `ListParticipants`), the occurrences during one of
-//! those sessions (`ListParticipantEvents`) and the compositions a stage is composed
-//! into (`StartComposition`, `GetComposition`, `StopComposition`) all read and write the
-//! records below, so the records, the id minting they share and the modelled defaults
-//! they apply live here rather than in any one operation's file.
+//! those sessions (`ListParticipantEvents`), the compositions a stage is composed
+//! into (`StartComposition`, `GetComposition`, `StopComposition`) and the public keys a
+//! customer signs its own participant tokens with (`ImportPublicKey`, `GetPublicKey`) all
+//! read and write the records below, so the records, the id minting they share and the
+//! modelled defaults they apply live here rather than in any one operation's file.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -28,7 +29,7 @@ use crate::ops::types::{
     GridConfiguration, IngestConfiguration,
     IngestConfigurationSummary, InternalServerException, LayoutConfiguration, Participant,
     ParticipantRecordingHlsConfiguration, ParticipantReplica, ParticipantSummary,
-    ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
+    ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration, PublicKey,
     RecordingConfiguration, RedundantIngestCredential, ResourceNotFoundException,
     S3DestinationConfiguration, S3StorageConfiguration,
     ServiceQuotaExceededException, Stage, StageEndpoints, StageSession, StageSessionSummary,
@@ -566,6 +567,12 @@ pub const DEFAULT_STORAGE_CONFIGURATION_PAGE_SIZE: usize =
         MAX_STORAGE_CONFIGURATION_RESULTS
     };
 
+/// Public keys this emulator keeps for one engine. Not an AWS quota — this emulator's
+/// own resource guard on the one store `ImportPublicKey` grows, set the same way
+/// [`MAX_STAGES`] is and answered with the same modelled `ServiceQuotaExceededException`
+/// (HTTP 402).
+pub const MAX_PUBLIC_KEYS: usize = 1_000;
+
 /// Stage sessions this emulator keeps per stage. Not an AWS quota — this emulator's
 /// own resource guard on the store [`join_stage_session`] grows, set the same way
 /// [`MAX_STAGES`] is. A session is not created by an API call (see
@@ -640,10 +647,12 @@ pub const NO_ASSOCIATED_STAGE_ARN: &str = "";
 // already apply to the two members whose documentation states the empty default outright.
 // ---------------------------------------------------------------------------
 
-/// `name` of an encoder configuration whose creating request named none.
+/// `name` of a resource whose creating request named none.
 ///
 /// `EncoderConfiguration$name` is "optional name to identify the resource", and a
 /// configuration created without one reports the member as empty rather than omitting it.
+/// `PublicKey$name` ("Public key name", `@length(0..128)` through `PublicKeyName`) is read
+/// the same way, so one constant stands for both.
 pub const UNNAMED_RESOURCE_NAME: &str = "";
 
 /// `userId` of an ingest configuration whose creating request supplied none.
@@ -1497,6 +1506,54 @@ impl StorageConfigurationRecord {
     fn to_s3(&self) -> S3StorageConfiguration {
         S3StorageConfiguration {
             bucket_name: self.bucket_name.clone(),
+        }
+    }
+}
+
+/// One public key, as `ImportPublicKey` persisted it and `GetPublicKey` reports it.
+///
+/// A public key is the half of a customer-generated key pair this service holds, so the
+/// stage participant tokens the customer signs with the private half can be verified:
+/// nothing of the private half reaches this record.
+#[derive(Debug, Clone)]
+pub struct PublicKeyRecord {
+    /// The public-key ARN, and the single key every lookup and delete uses.
+    pub arn: String,
+    /// The name the importing request gave, or [`UNNAMED_RESOURCE_NAME`] when it gave
+    /// none: materialised at import, so it is a value this record HOLDS rather than one
+    /// each projection decides, exactly as [`EncoderConfigurationRecord::name`] is.
+    pub name: String,
+    /// The PEM text the import carried, reported back verbatim by `PublicKey$publicKeyMaterial`
+    /// ("Public key material").
+    pub public_key_material: String,
+    /// The key's fingerprint, computed from its DER `SubjectPublicKeyInfo` at import by
+    /// `crate::ops::import_public_key`. Stored rather than recomputed per read, so every
+    /// projection of this key answers the one value — and it identifies the key MATERIAL,
+    /// which is what makes a re-import of the same key a conflict.
+    pub fingerprint: String,
+    pub tags: HashMap<String, String>,
+    /// When the key was imported. Reported by no member of the modelled `PublicKey`, and
+    /// recorded for the same reason [`StageRecord::created_at`] is.
+    pub created_at: SystemTime,
+    /// Import order, and the stable key `ListPublicKeys` pages over — the same role
+    /// [`StageRecord::sequence`] plays for `ListStages`.
+    pub sequence: u64,
+}
+
+impl PublicKeyRecord {
+    /// The modelled `PublicKey` this record reports.
+    pub fn to_public_key(&self) -> PublicKey {
+        PublicKey {
+            arn: Some(self.arn.clone()),
+            // Always reported, the empty string included: the name is materialised on the
+            // record ([`Self::name`]), so a caller reading it back finds a value wherever
+            // the key has one.
+            name: Some(self.name.clone()),
+            public_key_material: Some(self.public_key_material.clone()),
+            fingerprint: Some(self.fingerprint.clone()),
+            // Always reported, empty map included: `tags` is how a caller reads the tags
+            // back, exactly as on a stage.
+            tags: Some(self.tags.clone()),
         }
     }
 }
@@ -3852,6 +3909,8 @@ pub struct ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     pub encoder_configurations: HashMap<String, EncoderConfigurationRecord>,
     /// Every live storage configuration, keyed by its ARN.
     pub storage_configurations: HashMap<String, StorageConfigurationRecord>,
+    /// Every imported public key, keyed by its ARN.
+    pub public_keys: HashMap<String, PublicKeyRecord>,
     /// Every composition that has been started and not yet reclaimed, keyed by its ARN.
     /// Ephemeral: the clock drops the record once the stop `StopComposition` began has
     /// finished (see [`ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::materialize_due_compositions`]).
@@ -3964,6 +4023,17 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     ) -> Option<&mut StorageConfigurationRecord> {
         self.storage_configurations
             .get_mut(request_scoped(arn, region)?)
+    }
+
+    /// The public key `arn` names in `region`'s view, or `None` when that view holds
+    /// none.
+    pub fn public_key_in(&self, region: &str, arn: &str) -> Option<&PublicKeyRecord> {
+        self.public_keys.get(request_scoped(arn, region)?)
+    }
+
+    /// [`Self::public_key_in`], to be changed in place.
+    pub fn public_key_in_mut(&mut self, region: &str, arn: &str) -> Option<&mut PublicKeyRecord> {
+        self.public_keys.get_mut(request_scoped(arn, region)?)
     }
 
     /// The composition `arn` names in `region`'s view, or `None` when that view holds
@@ -4543,6 +4613,10 @@ pub const ENCODER_CONFIGURATION_ID_LEN: usize = 12;
 /// `storage-configuration/`, and caps the whole ARN at 128 characters.
 pub const STORAGE_CONFIGURATION_ID_LEN: usize = 12;
 
+/// Characters in a minted public-key id. The model's `PublicKeyArn` pattern allows
+/// `[a-zA-Z0-9-]+` after `public-key/`, and caps the whole ARN at 128 characters.
+pub const PUBLIC_KEY_ID_LEN: usize = 12;
+
 /// Characters a minted stage session id carries after its `st-` prefix.
 ///
 /// The model's `StageSessionId` is `@length 16..16` with `@pattern ^st-[a-zA-Z0-9]+$`,
@@ -4608,6 +4682,12 @@ pub fn storage_configuration_arn(region: &str, storage_configuration_id: &str) -
     )
 }
 
+/// The public-key ARN for `public_key_id`, in the form the model's `PublicKeyArn`
+/// pattern requires: `arn:aws:ivs:<region>:<account>:public-key/<id>`.
+pub fn public_key_arn(region: &str, public_key_id: &str) -> String {
+    ::engine::emulator_arn("ivs", region, &format!("public-key/{public_key_id}"))
+}
+
 /// An identity this store has just minted for a resource it is about to hold.
 #[derive(Debug)]
 pub struct MintedResource {
@@ -4652,7 +4732,7 @@ where
 /// the lookup of the map the caller is about to insert into — and the identity is
 /// re-minted while it does, through the one rule [`mint_unique_id`] states. Every
 /// creating operation of this service mints through here, so one ARN can never denote
-/// two resources and the five creates cannot drift apart on how they ensure it.
+/// two resources and the six creates cannot drift apart on how they ensure it.
 pub fn mint_unique_arn<A, H>(
     state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     id_len: usize,
@@ -5586,6 +5666,26 @@ pub fn quota_exceeded_message(resource: &str, limit: usize) -> String {
     format!("Resource: {resource} quota exceeded limit: {limit}")
 }
 
+/// How this service states an import of public key material it already holds
+/// (`ConflictException`, HTTP 409): one fixed sentence naming the member whose value is
+/// already present, with nothing of the request in it.
+///
+/// It is the sentence the sibling IVS endpoint was recorded answering for the same
+/// refusal on its own key import, with the resource named as this model's ARN spells
+/// this one (`public-key`) — the same family rule [`resource_not_found_message`] follows.
+pub const DUPLICATE_PUBLIC_KEY_MESSAGE: &str =
+    "A public-key resource already exists with the given publicKeyMaterial";
+
+/// How this service states a rejection of one member's VALUE for a reason the model
+/// cannot express: it names the member and the constraint the value failed.
+///
+/// The form the sibling IVS endpoint was recorded answering for material it cannot
+/// decode, so a refusal of the same member is worded the same across the IVS family
+/// rather than in this endpoint's operation-prefixed form.
+pub fn member_constraint_message(member: &str, constraint: &str) -> String {
+    format!("Request member: {member} failed to satisfy the constraints: {constraint}")
+}
+
 /// How this service states a request whose member names a resource of this service that
 /// this account holds none of: the operation, the dotted member path, the kind of
 /// resource the member must name and the identifier the request sent, in the construction
@@ -6315,10 +6415,11 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
 /// stated here once for both the read ([`resource_tags`]) and the write
 /// ([`resource_tags_mut`]) side of the `/tags/{resourceArn}` surface.
 ///
-/// A stage, an ingest configuration, an encoder configuration, a storage configuration
-/// and a composition are the resource types this store can hold: `CreateStage`,
-/// `CreateIngestConfiguration`, `CreateEncoderConfiguration`,
-/// `CreateStorageConfiguration` and `StartComposition` are the operations of this
+/// A stage, an ingest configuration, an encoder configuration, a storage configuration,
+/// a composition and a public key are the resource types this store can hold:
+/// `CreateStage`, `CreateIngestConfiguration`, `CreateEncoderConfiguration`,
+/// `CreateStorageConfiguration`, `StartComposition` and `ImportPublicKey` are the
+/// operations of this
 /// service that mint one, so every other resource type in its ARN shapes names nothing,
 /// and a well-formed ARN naming one is answered exactly as an ARN naming a deleted stage
 /// is — not found. Each remaining create is its own gap issue, and when one lands its
@@ -6337,6 +6438,8 @@ pub enum TaggedResourceKind {
     EncoderConfiguration,
     /// A storage configuration, from `CreateStorageConfiguration`.
     StorageConfiguration,
+    /// A public key, from `ImportPublicKey`.
+    PublicKey,
 }
 
 impl TaggedResourceKind {
@@ -6350,6 +6453,7 @@ impl TaggedResourceKind {
             "ingest-configuration" => Some(Self::IngestConfiguration),
             "encoder-configuration" => Some(Self::EncoderConfiguration),
             "storage-configuration" => Some(Self::StorageConfiguration),
+            "public-key" => Some(Self::PublicKey),
             _ => None,
         }
     }
@@ -6390,6 +6494,9 @@ pub fn resource_tags(
         TaggedResourceKind::StorageConfiguration => state
             .storage_configuration_in(region, arn)
             .map(|configuration| configuration.tags.clone()),
+        TaggedResourceKind::PublicKey => state
+            .public_key_in(region, arn)
+            .map(|public_key| public_key.tags.clone()),
     }
 }
 
@@ -6418,6 +6525,9 @@ pub fn resource_tags_mut<'a>(
         TaggedResourceKind::StorageConfiguration => state
             .storage_configuration_in_mut(region, arn)
             .map(|configuration| &mut configuration.tags),
+        TaggedResourceKind::PublicKey => state
+            .public_key_in_mut(region, arn)
+            .map(|public_key| &mut public_key.tags),
     }
 }
 
