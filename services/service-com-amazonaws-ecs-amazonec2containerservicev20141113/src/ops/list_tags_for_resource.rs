@@ -165,7 +165,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for": a full ARN, of one of the kinds that carry a tag set. A value that is
         // none of them names no resource whose tags could be listed, so it is refused as
         // the bad parameter it is rather than reported as an absent resource.
+        // An ARN is a WHOLE identifier, account included: a `resourceArn` whose account
+        // is not the caller's names another account's resource, which is refused as the
+        // invalid ARN it is rather than resolved against this account's records
+        // ([`crate::state::foreign_account_resource_arn_violation`]).
         let resource_arn = input.resource_arn.as_str();
+        if let Some(message) = crate::state::foreign_account_resource_arn_violation(resource_arn) {
+            return Err(ListTagsForResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
         let Some(kind) = crate::state::TaggedResourceKind::from_arn(resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
@@ -177,6 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A READ: the tag set is reported exactly as stored, and nothing here writes.
         let guard = state.lock();
+
+        // A cluster a delete has tombstoned is still discoverable ("Clusters with an
+        // INACTIVE status may remain discoverable in your account for a period of time"),
+        // but it is not an ACTIVE cluster whose tag set this call reports: the deleted
+        // cluster's ARN is refused as the parameter it is, so a client reading tags
+        // cannot conclude from a 200 that the cluster is still live.
+        if crate::state::names_an_inactive_cluster(guard.clusters.values(), resource_arn) {
+            return Err(ListTagsForResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::CLUSTER_INACTIVE_FOR_TAGGING_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         match guard.resource_tags(kind, resource_arn) {
             // "The tags for the resource" — a list, empty for a resource nobody has
             // tagged, so "this resource has no tags" and "this resource exists" stay

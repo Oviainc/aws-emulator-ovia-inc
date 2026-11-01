@@ -173,6 +173,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // An ARN is a WHOLE identifier, account included, so its account segment is
+        // checked before the identifier is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        if let Some(message) = crate::state::foreign_account_violation(Some(input.cluster.as_str()))
+        {
+            return Err(
+                UpdateServicePrimaryTaskSetErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // A service ARN carries the cluster that hosts it, so it names the cluster as
         // well as the service; a short name takes the `cluster` member's.
         let (arn_cluster, service_name) =

@@ -665,13 +665,6 @@ async fn an_override_log_configuration_is_required_and_a_setting_value_is_checke
             json!({ "cluster": "no-such-cluster", "containerInstance": "whatever" }),
         ),
         (
-            "UpdateClusterSettings",
-            json!({
-                "cluster": "deleted",
-                "settings": [{ "name": "containerInsights", "value": "enabled" }],
-            }),
-        ),
-        (
             "UpdateCluster",
             json!({
                 "cluster": "deleted",
@@ -713,6 +706,47 @@ async fn an_override_log_configuration_is_required_and_a_setting_value_is_checke
             request["cluster"]
         );
     }
+
+    // `UpdateClusterSettings` is the one of these that reports a cluster it DID find, in
+    // a status it cannot write settings to, as the state error it is: the tombstone is
+    // still there, so the condition is not "no such cluster" — and the sentence names the
+    // cluster the request asked for and the state it is not in.
+    let body = refused(
+        &router,
+        "UpdateClusterSettings",
+        json!({
+            "cluster": "deleted",
+            "settings": [{ "name": "containerInsights", "value": "enabled" }],
+        }),
+        "ClientException",
+        "UpdateClusterSettings against a deleted cluster",
+    )
+    .await;
+    assert_eq!(
+        body["message"].as_str(),
+        Some("Cluster deleted is not in ACTIVE state"),
+        "case \"UpdateClusterSettings against a deleted cluster\": expected the \
+         not-ACTIVE sentence naming the cluster, got {body}"
+    );
+    // The same call against a name this account never held is still the NOT-FOUND
+    // refusal: the two conditions stay apart.
+    let body = refused(
+        &router,
+        "UpdateClusterSettings",
+        json!({
+            "cluster": "no-such-cluster",
+            "settings": [{ "name": "containerInsights", "value": "enabled" }],
+        }),
+        "ClusterNotFoundException",
+        "UpdateClusterSettings against a cluster that never existed",
+    )
+    .await;
+    assert_eq!(
+        body["message"].as_str(),
+        Some(CLUSTER_NOT_FOUND_MESSAGE),
+        "case \"UpdateClusterSettings against a cluster that never existed\": expected \
+         {CLUSTER_NOT_FOUND_MESSAGE:?}, got {body}"
+    );
 }
 
 #[tokio::test]

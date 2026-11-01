@@ -15,6 +15,8 @@
 mod account_settings;
 #[path = "all/agent_plane.rs"]
 mod agent_plane;
+#[path = "all/arn_account_and_refusal_classes.rs"]
+mod arn_account_and_refusal_classes;
 #[path = "all/attachment_state_reports.rs"]
 mod attachment_state_reports;
 #[path = "all/awsvpc_configuration_store.rs"]

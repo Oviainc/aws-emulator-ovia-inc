@@ -455,7 +455,7 @@ async fn an_unusable_request_is_refused() {
     // A token this operation never minted names no page.
     for token in ["not-a-token", "|", "|stack", "arn:aws:ecs:::ci/demo/1|"] {
         let row = format!("nextToken={token:?}");
-        refused(
+        let body = refused(
             &router,
             "ListAttributes",
             json!({
@@ -467,5 +467,11 @@ async fn an_unusable_request_is_refused() {
             &row,
         )
         .await;
+        assert_eq!(
+            body["message"].as_str(),
+            Some("Invalid nextToken."),
+            "case {row:?}: expected the one sentence ECS answers for an unusable token, \
+             got {body}"
+        );
     }
 }

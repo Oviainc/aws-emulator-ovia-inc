@@ -228,6 +228,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expires_in_minutes
             .unwrap_or(crate::state::DEFAULT_TASK_PROTECTION_MINUTES);
 
+        // An ARN is a WHOLE identifier, account included, so the account segment of every
+        // identifier the request carries is checked before any of them is resolved
+        // ([`crate::state::foreign_account_violation`]). The scan is over the list the
+        // bound above has already clamped.
+        let references = ::std::iter::once(input.cluster.as_str())
+            .chain(input.tasks.iter().map(String::as_str));
+        if let Some(message) = crate::state::foreign_account_violation(references) {
+            return Err(UpdateTaskProtectionErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();

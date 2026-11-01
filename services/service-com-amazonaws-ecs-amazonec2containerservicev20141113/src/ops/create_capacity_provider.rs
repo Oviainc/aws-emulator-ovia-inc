@@ -249,6 +249,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // An ARN is a WHOLE identifier, account included, so its account segment is
+        // checked before the identifier is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        if let Some(message) = crate::state::foreign_account_violation(input.cluster.as_deref()) {
+            return Err(
+                CreateCapacityProviderErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The `cluster` member takes "the name of the cluster", by short name or ARN. A
         // request that names none scopes the provider to no cluster at all, which is NOT
         // the `default` cluster every other operation's `cluster` member falls back to.

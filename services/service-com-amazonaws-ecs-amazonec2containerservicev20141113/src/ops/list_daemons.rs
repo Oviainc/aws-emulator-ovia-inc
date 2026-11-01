@@ -130,6 +130,12 @@ impl From<ListDaemonsErrorModeled> for ListDaemonsError {
     }
 }
 
+/// `ServerException$message` for a `clusterArn` this listing cannot act on at all: the
+/// sentence Amazon ECS answers when the request reaches it carrying an identifier that is
+/// neither a cluster ARN nor a cluster name, so there is no cluster to filter by and none
+/// to report absent either. Fixed text, carrying nothing of the request.
+const SERVICE_UNAVAILABLE_MESSAGE: &str = "Service Unavailable. Please try again later.";
+
 /// The `ListDaemons` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -189,8 +195,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An ARN is a WHOLE identifier, account included, so its account segment is
+        // checked before the identifier is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        if let Some(message) = crate::state::foreign_account_violation(input.cluster_arn.as_deref())
+        {
+            return Err(ListDaemonsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // "The Amazon Resource Name (ARN) of the cluster to filter daemons by. If you do
         // not specify a cluster, the default cluster is assumed."
+        //
+        // A value that is NEITHER a cluster ARN nor a cluster name identifies no cluster
+        // in any account: there is nothing to filter by and nothing to report as absent
+        // either, so it is answered as the request this service cannot act on at all
+        // rather than as a cluster that happens to be missing.
+        let structurally_invalid = input
+            .cluster_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty())
+            .is_some_and(|reference| {
+                !crate::state::is_cluster_arn(reference) && !crate::state::is_valid_name(reference)
+            });
+        if structurally_invalid {
+            return Err(ListDaemonsErrorModeled::ServerException(ServerException {
+                message: Some(SERVICE_UNAVAILABLE_MESSAGE.to_string()),
+            })
+            .into());
+        }
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster_arn.as_deref());
         // The filter is a caller-supplied list, so it is bounded HERE, before the set it
         // is read into is built: the daemons of one cluster deploy onto the providers that
@@ -228,15 +266,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
+        // "The Amazon Resource Name (ARN) of the cluster to filter daemons by": this
+        // listing FILTERS by the cluster the request names rather than acting in it, so a
+        // well-formed cluster ARN that resolves to no stored cluster selects no daemon and
+        // is answered with the empty page it selects — the sweep a client is making over a
+        // set of cluster ARNs, some of them since deleted, completes. A reference that is
+        // not a cluster ARN at all (a bare name) names no cluster to filter by, and keeps
+        // the cluster-resolution refusal every other cluster-scoped read answers.
         if !guard.has_active_cluster(&cluster_name) {
-            return Err(ListDaemonsErrorModeled::ClusterNotFoundException(
-                ClusterNotFoundException {
-                    message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
-                    )),
-                },
-            )
-            .into());
+            let filtered_by_arn = input
+                .cluster_arn
+                .as_deref()
+                .is_some_and(crate::state::is_cluster_arn);
+            if !filtered_by_arn {
+                return Err(ListDaemonsErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(crate::state::cluster_refusal_message(
+                            guard.clusters.get(&cluster_name),
+                        )),
+                    },
+                )
+                .into());
+            }
+            return Ok(ListDaemonsOutput {
+                daemon_summaries_list: Some(Vec::new()),
+                next_token: None,
+            });
         }
 
         let mut matching: Vec<(String, DaemonSummary)> = guard

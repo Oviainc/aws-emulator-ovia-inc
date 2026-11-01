@@ -162,6 +162,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let _ = ctx;
 
+        // An ARN is a WHOLE identifier, account included, so its account segment is
+        // checked before the identifier is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        if let Some(message) = crate::state::foreign_account_violation(Some(input.cluster.as_str()))
+        {
+            return Err(
+                UpdateClusterSettingsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
 
         if let Err(message) = crate::state::validate_cluster_settings(&input.settings) {
@@ -179,15 +194,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.advance_clock(::std::time::SystemTime::now());
 
         // A deleted cluster is not one this operation may act in ("The cluster has been
-        // deleted"), so a tombstone is refused under the same error code a name that
-        // never existed earns — with the sentence that says it is still there, inactive.
+        // deleted"): the tombstone is still there, so the condition is the cluster's
+        // STATE rather than its absence, and it is reported as the state error it is —
+        // not as the not-found refusal a name this account never held earns.
+        if guard
+            .clusters
+            .get(&cluster_name)
+            .is_some_and(|cluster| cluster.status != crate::state::CLUSTER_ACTIVE)
+        {
+            return Err(UpdateClusterSettingsErrorModeled::ClientException(
+                ClientException {
+                    message: Some(crate::state::cluster_not_active_message(&cluster_name)),
+                },
+            )
+            .into());
+        }
         if !guard.has_active_cluster(&cluster_name) {
             return Err(
                 UpdateClusterSettingsErrorModeled::ClusterNotFoundException(
                     ClusterNotFoundException {
-                        message: Some(crate::state::cluster_refusal_message(
-                            guard.clusters.get(&cluster_name),
-                        )),
+                        message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into(),

@@ -393,10 +393,7 @@ async fn create_task_set_refuses_each_condition_it_models_and_creates_nothing() 
                 "launchType": "EC2",
             }),
             code: "ClientException",
-            message: format!(
-                "taskDefinition must be a family, family:revision or task-definition ARN; \
-                 got {foreign_arn:?}"
-            ),
+            message: "Family contains invalid characters.".to_string(),
         },
         RefusalCase {
             name: "a client token one character past the documented length",

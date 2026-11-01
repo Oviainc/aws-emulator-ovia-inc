@@ -214,6 +214,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // An ARN is a WHOLE identifier, account included, so its account segment is
+        // checked before the identifier is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        if let Some(message) = crate::state::foreign_account_violation(input.cluster.as_deref()) {
+            return Err(
+                DescribeCapacityProvidersErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let include_tags = crate::state::include_requests_tags(input.include.as_ref());
         let cluster_name = input
             .cluster

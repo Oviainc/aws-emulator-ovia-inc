@@ -599,8 +599,12 @@ async fn registering_an_instance_again_updates_the_one_already_stored() {
         .await;
     }
 
-    // "The specified cluster wasn't found."
-    refused(
+    // A cluster that was never created is reported in the OTHER class this operation
+    // models: this registration reports a request it cannot read as an
+    // `InvalidParameterException` (the identity-document rows above), so the missing
+    // cluster has to be distinguishable from it — "Cluster not found." under
+    // `ClientException`.
+    let body = refused(
         &router,
         "RegisterContainerInstance",
         json!({
@@ -608,10 +612,32 @@ async fn registering_an_instance_again_updates_the_one_already_stored() {
             "instanceIdentityDocument": document,
             "instanceIdentityDocumentSignature": signature,
         }),
-        "ClusterNotFoundException",
+        "ClientException",
         "unknown cluster",
     )
     .await;
+    assert_eq!(
+        body["message"].as_str(),
+        Some("Cluster not found."),
+        "case \"unknown cluster\": expected the fixed not-found sentence, got {body}"
+    );
+
+    // And the cluster is resolved BEFORE the request's shape is read, so a registration
+    // that is wrong in both ways reports the cluster rather than the document.
+    let body = refused(
+        &router,
+        "RegisterContainerInstance",
+        json!({ "cluster": "nosuchcluster" }),
+        "ClientException",
+        "unknown cluster and no identity document",
+    )
+    .await;
+    assert_eq!(
+        body["message"].as_str(),
+        Some("Cluster not found."),
+        "case \"unknown cluster and no identity document\": expected the cluster to be \
+         resolved first, got {body}"
+    );
 }
 
 #[tokio::test]

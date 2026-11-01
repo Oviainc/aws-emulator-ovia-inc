@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! How this service reads an ARN a REQUEST supplies, and what it refuses one for.
+//!
+//! An ARN is a WHOLE identifier: it carries the partition, the service, the Region, the
+//! ACCOUNT and the resource. Most of this service's reference members accept either form
+//! — "The short name or full Amazon Resource Name (ARN) of the cluster" — and reducing an
+//! ARN to its trailing name segment ([`super::cluster_name_from_reference`],
+//! [`super::task_arn_from_reference`]) throws the rest away. So the account segment is
+//! compared against the account this emulator serves BEFORE that reduction: otherwise
+//! another account's ARN resolves to this account's resource of the same name, and "this
+//! ARN is not yours" — a credentials or programming error a client must stop on — becomes
+//! indistinguishable from "this resource does not exist", which a client retries or treats
+//! as already-deleted.
+//!
+//! The reading is TOTAL: [`RequestArn::parse`] walks the colon-separated fields through an
+//! iterator and answers `None` for anything that is not an ARN, so no caller-supplied
+//! value reaches an index, a slice or an unwrap. A value that is not an ARN carries no
+//! account to disagree with, and neither does an ARN whose account field is empty, so both
+//! are left to resolve as the names they are.
+
+use super::{is_valid_name, ARN_NAMESPACE};
+
+/// How many colon-separated fields an ARN is spelled in. The RESOURCE is the last one, so
+/// it keeps any colon of its own (a task-definition revision, an IAM path).
+const ARN_FIELD_COUNT: usize = 6;
+
+/// The literal first field of every ARN.
+const ARN_SCHEME: &str = "arn";
+
+/// The resource-type segment a CLUSTER's ARN carries, as [`super::cluster_arn`] spells it.
+const CLUSTER_RESOURCE_TYPE: &str = "cluster";
+
+/// The fields of an ARN a request supplied, borrowed from the request's own value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestArn<'a> {
+    /// The partition (`aws`, `aws-cn`, …).
+    pub partition: &'a str,
+    /// The service namespace the resource belongs to (`ecs` for this service's own).
+    pub service: &'a str,
+    /// The Region, empty for a global service's ARN.
+    pub region: &'a str,
+    /// The account that owns the resource, empty where the resource has no owner.
+    pub account: &'a str,
+    /// The resource, colons and all.
+    pub resource: &'a str,
+}
+
+impl<'a> RequestArn<'a> {
+    /// The fields of `reference` when it is spelled as an ARN, and `None` when it is not
+    /// one at all — a bare resource name, which most reference members also accept.
+    ///
+    /// Every field is taken from the iterator with `?`, so a value with too few fields
+    /// answers `None` rather than reaching an index.
+    pub fn parse(reference: &'a str) -> Option<Self> {
+        let mut fields = reference.splitn(ARN_FIELD_COUNT, ':');
+        let scheme = fields.next()?;
+        let partition = fields.next()?;
+        let service = fields.next()?;
+        let region = fields.next()?;
+        let account = fields.next()?;
+        let resource = fields.next()?;
+        (scheme == ARN_SCHEME).then_some(Self {
+            partition,
+            service,
+            region,
+            account,
+            resource,
+        })
+    }
+
+    /// Whether this ARN names a resource of `resource_type` of THIS service, and the
+    /// resource's own name when it does.
+    fn named_resource(&self, resource_type: &str) -> Option<&'a str> {
+        if self.service != ARN_NAMESPACE {
+            return None;
+        }
+        let (segment, name) = self.resource.split_once('/')?;
+        (segment == resource_type).then_some(name)
+    }
+}
+
+/// Whether `reference` is an ARN whose ACCOUNT segment is not the account this emulator
+/// serves ([`::engine::emulator_account_id`], the account every ARN it mints carries and
+/// the one every caller it serves holds).
+pub fn names_another_account(reference: &str) -> bool {
+    RequestArn::parse(reference).is_some_and(|arn| {
+        !arn.account.is_empty() && arn.account != ::engine::emulator_account_id()
+    })
+}
+
+/// `InvalidParameterException$message` for a request whose resource IDENTIFIER is an ARN
+/// of another account — a member documented as taking "the short name or full Amazon
+/// Resource Name (ARN)" of the resource, given an ARN whose account is not the caller's.
+///
+/// Fixed text, carrying nothing from the request: the condition is about WHOSE resource
+/// the ARN names, which the caller can see in the value it sent.
+pub const ACCOUNT_IDS_MISMATCH_MESSAGE: &str = "AccountIDs mismatch";
+
+/// `InvalidParameterException$message` for a member whose whole value IS an ARN (a tagging
+/// `resourceArn`) naming another account's resource: the ARN itself is what the member was
+/// given and what is wrong with it.
+pub const INVALID_ARN_MESSAGE: &str = "The ARN provided is invalid.";
+
+/// The refusal a request earns when one of the resource identifiers it carries is an ARN
+/// of another account, or `None` when every one of them is this account's.
+///
+/// Spelled once for every operation that resolves such an identifier, so the same ARN is
+/// refused with the same sentence whichever of them a client called.
+pub fn foreign_account_violation<'a>(
+    references: impl IntoIterator<Item = &'a str>,
+) -> Option<&'static str> {
+    references
+        .into_iter()
+        .any(names_another_account)
+        .then_some(ACCOUNT_IDS_MISMATCH_MESSAGE)
+}
+
+/// The same check for a tagging `resourceArn`, which earns the sentence about the ARN
+/// ([`INVALID_ARN_MESSAGE`]) because that member accepts nothing but an ARN.
+pub fn foreign_account_resource_arn_violation(resource_arn: &str) -> Option<&'static str> {
+    names_another_account(resource_arn).then_some(INVALID_ARN_MESSAGE)
+}
+
+/// Whether `reference` is the full ARN of a CLUSTER of this service —
+/// `arn:<partition>:ecs:<region>:<account>:cluster/<name>` with a name of the character
+/// set a cluster name is spelled in — rather than a bare cluster name or an ARN of some
+/// other resource.
+pub fn is_cluster_arn(reference: &str) -> bool {
+    RequestArn::parse(reference)
+        .and_then(|arn| arn.named_resource(CLUSTER_RESOURCE_TYPE))
+        .is_some_and(is_valid_name)
+}

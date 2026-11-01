@@ -164,9 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DeregisterTaskDefinitionErrorModeled::ClientException(
                 ClientException {
-                    message: Some(crate::state::task_definition_reference_message(
-                        &input.task_definition,
-                    )),
+                    message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
                 },
             )
             .into());

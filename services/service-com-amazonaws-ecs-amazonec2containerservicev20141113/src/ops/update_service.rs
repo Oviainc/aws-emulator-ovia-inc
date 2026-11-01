@@ -372,6 +372,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An ARN is a WHOLE identifier, account included, so its account segment is
+        // checked before the identifier is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        if let Some(message) = crate::state::foreign_account_violation(input.cluster.as_deref()) {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A service ARN carries the cluster that hosts it, so an ARN names the cluster
         // too; `cluster` is what names it otherwise ("If you do not specify a cluster,
         // the default cluster is assumed"). Naming two different clusters in one request
@@ -558,7 +570,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::parse_task_definition_reference(reference)
                 else {
                     return Err(UpdateServiceErrorModeled::ClientException(ClientException {
-                        message: Some(crate::state::task_definition_reference_message(reference)),
+                        message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
                     })
                     .into());
                 };

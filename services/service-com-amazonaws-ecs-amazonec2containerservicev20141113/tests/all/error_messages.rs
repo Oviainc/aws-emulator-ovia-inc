@@ -161,9 +161,13 @@ fn missing_references(kind: &str, path: &str) -> Vec<(String, String)> {
 async fn a_cluster_that_does_not_exist_is_refused_with_one_fixed_sentence() {
     let router = fixture().await;
 
-    // Every implemented operation that resolves a `cluster`, each paired with a request
-    // that is well formed apart from the cluster it names.
-    let requests: [OperationRow; 12] = [
+    // Every implemented operation that resolves a `cluster` and reports a cluster it
+    // cannot resolve under the cluster-specific error, each paired with a request that is
+    // well formed apart from the cluster it names. The operations that report the same
+    // condition under a class of their own — the agent plane's `ClientException`,
+    // `RegisterContainerInstance` among them — carry the same SENTENCE and are covered by
+    // their own suites.
+    let requests: [OperationRow; 11] = [
         ("RunTask", |cluster| {
             json!({ "cluster": cluster, "taskDefinition": FAMILY })
         }),
@@ -189,13 +193,6 @@ async fn a_cluster_that_does_not_exist_is_refused_with_one_fixed_sentence() {
             json!({ "cluster": cluster, "services": ["ghost-service"] })
         }),
         ("DeleteCluster", |cluster| json!({ "cluster": cluster })),
-        ("RegisterContainerInstance", |cluster| {
-            json!({
-                "cluster": cluster,
-                "instanceIdentityDocument": identity_document("i-0a1b2c3d4e5f60718"),
-                "instanceIdentityDocumentSignature": identity_document_signature(),
-            })
-        }),
         ("ListContainerInstances", |cluster| {
             json!({ "cluster": cluster })
         }),

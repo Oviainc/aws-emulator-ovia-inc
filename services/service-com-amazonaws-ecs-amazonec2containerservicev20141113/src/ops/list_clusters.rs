@@ -129,6 +129,19 @@ impl From<ListClustersErrorModeled> for ListClustersError {
     }
 }
 
+/// `InvalidParameterException$message` for a `nextToken` this operation cannot resume
+/// from: the fixed words "Invalid token " followed by the token the REQUEST carried, which
+/// is the one value a caller needs to see to know which cursor to abandon. The member's
+/// own doc calls a token "an opaque identifier that is only used to retrieve the next
+/// items in a list and not for other programmatic purposes", so nothing is read out of it.
+///
+/// Local to this operation: which class and which sentence a cursor refusal carries is a
+/// property of the OPERATION, and the listings that answer
+/// [`crate::state::INVALID_NEXT_TOKEN_MESSAGE`] under `ClientException` keep theirs.
+fn invalid_next_token_message(token: &str) -> String {
+    format!("Invalid token {token}")
+}
+
 /// The `ListClusters` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -192,21 +205,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `nextToken`: "This token should be treated as an opaque identifier that is only
         // used to retrieve the next items in a list and not for other programmatic
         // purposes." This operation mints it as the ARN of the cluster the next page
-        // starts at, so a value that names no cluster this account holds is an identifier
-        // that names no page — a `ClientException`, the error for a request "specifying an
-        // identifier that isn't valid" — rather than being read as some insertion point in
-        // the sequence. The cluster only has to be STORED, whatever its status: a token
-        // minted mid-walk still resumes after the cluster it names has been deleted out of
-        // this listing.
+        // starts at, so a value that names no cluster this account holds is a token this
+        // listing never minted and names no page — the bad parameter it is, rather than
+        // some insertion point in the sequence. The cluster only has to be STORED,
+        // whatever its status: a token minted mid-walk still resumes after the cluster it
+        // names has been deleted out of this listing.
         let resume_at = match input.next_token.as_deref() {
             None => None,
             Some(token) if guard.clusters.values().any(|cluster| cluster.arn == token) => {
                 Some(token.to_string())
             }
-            Some(_) => {
-                return Err(ListClustersErrorModeled::ClientException(ClientException {
-                    message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
-                })
+            Some(token) => {
+                return Err(ListClustersErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(invalid_next_token_message(token)),
+                    },
+                )
                 .into())
             }
         };

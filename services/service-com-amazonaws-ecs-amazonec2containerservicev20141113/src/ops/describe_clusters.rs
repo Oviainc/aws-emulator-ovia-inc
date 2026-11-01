@@ -181,6 +181,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An ARN is a WHOLE identifier, account included, so the account segment of every
+        // identifier the request carries is checked before any of them is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        if let Some(message) =
+            crate::state::foreign_account_violation(requested.iter().map(String::as_str))
+        {
+            return Err(DescribeClustersErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // Every entry names a cluster, and a cluster name is "Up to 255 letters (uppercase
         // and lowercase), numbers, underscores, and hyphens": a value outside that set
         // names no cluster this account could hold, so it is refused as the invalid

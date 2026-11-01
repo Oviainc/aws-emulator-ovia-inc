@@ -288,6 +288,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The Amazon Resource Name (ARN) of the cluster to create the daemon in"; a
         // request that names none takes the default cluster, like every other `cluster`
         // member of this service.
+        // An ARN is a WHOLE identifier, account included, so its account segment is
+        // checked before the identifier is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        if let Some(message) = crate::state::foreign_account_violation(input.cluster_arn.as_deref())
+        {
+            return Err(CreateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster_arn.as_deref());
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();

@@ -296,6 +296,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An ARN is a WHOLE identifier, account included, so its account segment is
+        // checked before the identifier is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        if let Some(message) = crate::state::foreign_account_violation(Some(input.cluster.as_str()))
+        {
+            return Err(CreateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A service ARN carries the cluster that hosts it, so it names the cluster as
         // well as the service; a short name takes the `cluster` member's.
         let (arn_cluster, service_name) =
@@ -363,9 +376,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::parse_task_definition_reference(&input.task_definition)
         else {
             return Err(CreateTaskSetErrorModeled::ClientException(ClientException {
-                message: Some(crate::state::task_definition_reference_message(
-                    &input.task_definition,
-                )),
+                message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
             })
             .into());
         };

@@ -136,6 +136,15 @@ impl From<DeleteServiceErrorModeled> for DeleteServiceError {
     }
 }
 
+/// `ServiceNotFoundException$message` as THIS operation answers it: EMPTY.
+///
+/// RECORDED behaviour, and the one place in this crate where two operations word the same
+/// condition differently — `UpdateService` states `crate::state::SERVICE_NOT_FOUND_MESSAGE`
+/// for a service name it cannot resolve, while a `DeleteService` of the same name in the
+/// same cluster carries no sentence at all. The member is still PRESENT, so a client that
+/// reads the message of a refusal reads an empty string rather than nothing.
+const SERVICE_NOT_FOUND_MESSAGE: &str = "";
+
 /// The `DeleteService` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -177,6 +186,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the ECS store is unavailable".to_string()),
             })
         })?;
+
+        // An ARN is a WHOLE identifier, account included, so its account segment is
+        // checked before the identifier is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        if let Some(message) = crate::state::foreign_account_violation(input.cluster.as_deref()) {
+            return Err(DeleteServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
 
         // A service ARN carries the cluster that hosts it, so an ARN names the cluster
         // too; `cluster` is what names it otherwise ("If you do not specify a cluster,
@@ -220,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = guard.services.get(&key) else {
             return Err(DeleteServiceErrorModeled::ServiceNotFoundException(
                 ServiceNotFoundException {
-                    message: Some(crate::state::SERVICE_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(SERVICE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

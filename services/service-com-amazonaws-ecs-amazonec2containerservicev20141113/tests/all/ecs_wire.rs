@@ -80,6 +80,17 @@ pub(crate) async fn ok(
     parsed
 }
 
+/// One call, returning the HTTP status and the parsed body — for a suite whose table
+/// spans requests that are ANSWERED and requests that are REFUSED, where which of the
+/// two a row earns is itself what the row is about.
+pub(crate) async fn answered(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
+    call(router, operation, body).await
+}
+
 /// A call that must be refused with HTTP 400 and the named modelled error code,
 /// returning its error body so a caller can assert the message too.
 pub(crate) async fn refused(

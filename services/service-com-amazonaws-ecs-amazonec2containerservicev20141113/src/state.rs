@@ -100,7 +100,18 @@ use crate::ops::types::{
 /// How a `cluster` an operation cannot act in is WORDED: the two sentences behind the one
 /// error code, and the function that chooses between them off the stored cluster record.
 mod cluster_refusal;
-pub use cluster_refusal::{cluster_refusal_message, CLUSTER_INACTIVE_MESSAGE};
+pub use cluster_refusal::{
+    cluster_not_active_message, cluster_refusal_message, names_an_inactive_cluster,
+    CLUSTER_INACTIVE_FOR_TAGGING_MESSAGE, CLUSTER_INACTIVE_MESSAGE,
+};
+
+/// How an ARN a REQUEST supplies is read, and what it is refused for: the account segment
+/// checked before the identifier is resolved.
+mod request_arn;
+pub use request_arn::{
+    foreign_account_resource_arn_violation, foreign_account_violation, is_cluster_arn,
+    names_another_account, ACCOUNT_IDS_MISMATCH_MESSAGE, INVALID_ARN_MESSAGE,
+};
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
 /// credential scope to read a region from). `emulator_arn`'s own documented default.
@@ -1908,11 +1919,13 @@ impl TaskDefinitionRefusal {
 }
 
 /// `ClientException$message` for a `nextToken` a paginated read cannot resume from: a
-/// value the operation never minted. Like its neighbours above it is ONE fixed sentence
-/// naming the member and no value — the sentence Amazon ECS answers whatever the
-/// unusable token was, which is also why the member's own doc calls a token "an opaque
-/// identifier that is only used to retrieve the next items in a list and not for other
-/// programmatic purposes".
+/// value the operation never minted. ONE fixed sentence naming the member and no value.
+///
+/// Which CLASS and which sentence a cursor refusal takes is a property of the OPERATION,
+/// not of the condition: this is the one the task-definition, attribute and
+/// service-deployment listings answer (the corpus pins `ListTaskDefinitions` to it),
+/// while `ListClusters` answers [`invalid_next_token_message`] under
+/// `InvalidParameterException`.
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid nextToken.";
 
 /// `InvalidParameterException$message` for a caller-supplied list that names more entries
@@ -2054,21 +2067,24 @@ pub const DEPLOYMENT_CONTROLLER_PRIMARY_TASK_SET_REQUIRED_MESSAGE: &str =
 
 /// `ClientException$message` for a `taskDefinition` that is not a task-definition
 /// reference at all — the condition [`parse_task_definition_reference`] answers `None`
-/// for. DERIVED from the request: it names the member, the forms the member documents
-/// ("The family and revision (family:revision) or full ARN of the task definition") and
-/// the value that is none of them, so a caller sees which value was rejected.
+/// for.
+///
+/// FIXED text, carrying nothing from the request: every form the member documents ("The
+/// family and revision (family:revision) or full ARN of the task definition") carries a
+/// FAMILY, and a value that is none of those forms is one whose family part is outside
+/// the character set a family name is spelled in, which is what Amazon ECS states.
 ///
 /// Every operation that resolves a `taskDefinition` reference reports this ONE sentence,
 /// so the refusal cannot drift between the operation that reads a revision and the ones
 /// that use it.
-pub fn task_definition_reference_message(reference: &str) -> String {
-    revision_reference_message("taskDefinition", TASK_DEFINITION_RESOURCE_TYPE, reference)
-}
+pub const TASK_DEFINITION_REFERENCE_MESSAGE: &str = "Family contains invalid characters.";
 
 /// `ClientException$message` for a `daemonTaskDefinition` that is not a daemon
 /// task-definition reference at all — the condition
-/// [`parse_daemon_task_definition_reference`] answers `None` for, and the same sentence
-/// [`task_definition_reference_message`] states for the plain resource.
+/// [`parse_daemon_task_definition_reference`] answers `None` for. The DAEMON resource
+/// states this condition in its own words (the sentence this crate's daemon suites pin),
+/// which is why it is not the fixed [`TASK_DEFINITION_REFERENCE_MESSAGE`] the plain
+/// resource answers.
 pub fn daemon_task_definition_reference_message(reference: &str) -> String {
     revision_reference_message(
         "daemonTaskDefinition",

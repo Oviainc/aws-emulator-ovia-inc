@@ -518,29 +518,55 @@ async fn an_entry_that_names_no_one_revision_is_refused_and_deletes_nothing() {
 
     // Every row is a `ClientException` — the error for a request "specifying an identifier
     // that isn't valid" — because none of these entries names the ONE revision the call
-    // acts on: "You must specify a revision."
+    // acts on: "You must specify a revision." A row whose FAMILY part is not a family name
+    // fails on the family first, and carries the fixed sentence Amazon ECS states for
+    // that: nothing of the request reaches it.
     let eleven: Vec<String> = (1..=11).map(|slot| format!("{family}:{slot}")).collect();
     let arn_without_revision =
         format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task-definition/{family}");
-    let rows: [(&str, Vec<String>); 6] = [
-        ("family only", vec![family.to_string()]),
-        ("revision zero", vec![format!("{family}:0")]),
+    const FAMILY_CHARACTERS: &str = "Family contains invalid characters.";
+    /// The sentence a reference that names a family but no revision earns, for the
+    /// `taskDefinitions` entry `reference`.
+    fn needs_a_revision(reference: &str) -> String {
+        format!(
+            "taskDefinitions entries must each name a revision (family:revision or a \
+             task-definition ARN); got {reference:?}"
+        )
+    }
+    let rows: [(&str, Vec<String>, String); 6] = [
+        (
+            "family only",
+            vec![family.to_string()],
+            needs_a_revision(family),
+        ),
+        (
+            "revision zero",
+            vec![format!("{family}:0")],
+            FAMILY_CHARACTERS.to_string(),
+        ),
         (
             "family and the wildcard revision",
             vec![format!("{family}:*")],
+            needs_a_revision(&format!("{family}:*")),
         ),
-        ("ARN without a revision", vec![arn_without_revision]),
+        (
+            "ARN without a revision",
+            vec![arn_without_revision.clone()],
+            needs_a_revision(&arn_without_revision),
+        ),
         (
             "not a task-definition reference at all",
             vec!["not a reference".to_string()],
+            FAMILY_CHARACTERS.to_string(),
         ),
         (
             "a deletable entry beside one that names no revision",
             vec![format!("{family}:1"), family.to_string()],
+            needs_a_revision(family),
         ),
     ];
 
-    for (case, references) in rows {
+    for (case, references, expected) in rows {
         let (code, message) = refusal(
             &router,
             "DeleteTaskDefinitions",
@@ -553,11 +579,9 @@ async fn an_entry_that_names_no_one_revision_is_refused_and_deletes_nothing() {
             "case {case:?}: expected a ClientException for {references:?}, got {code} \
              with {message:?}"
         );
-        // DERIVED from the request: the sentence names the member it is about, so a
-        // caller sees which member missed its constraint.
-        assert!(
-            message.contains("taskDefinition"),
-            "case {case:?}: expected the refusal to name the member, got {message:?}"
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?} for {references:?}, got {message:?}"
         );
     }
 

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateContainerInstancesState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateContainerInstancesState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateContainerInstancesState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves stored container instances between the two statuses this action governs: the
+//! operation's own doc, "you can change the status of a container instance to DRAINING to
+//! manually remove an instance from a cluster ... When a container instance has been
+//! drained, you can set a container instance to ACTIVE status". The write is into the
+//! stored record, so `DescribeContainerInstances` reports the new status and a `DRAINING`
+//! instance stops accepting task placement (`ContainerInstance$status`: "The DRAINING
+//! indicates that new tasks aren't placed on the container instance"). What the SCHEDULER
+//! does around a drain — stopping a service's PENDING tasks at once and replacing its
+//! RUNNING ones under the service's deployment configuration — is not modelled here:
+//! nothing runs between calls in this emulator, so no task is reported stopped by work
+//! nothing did.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +121,18 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The two statuses this action may move a container instance to: the `status` member's
+/// own doc, "The only valid values for this action are ACTIVE and DRAINING". The other
+/// three values the `ContainerInstanceStatus` enum carries name a stage of REGISTRATION,
+/// which is the agent's to reach and not a caller's to set.
+const UPDATABLE_STATUSES: [&str; 2] = [
+    crate::state::CONTAINER_INSTANCE_ACTIVE,
+    crate::state::CONTAINER_INSTANCE_DRAINING,
+];
+
+/// The member a refusal of the requested status names.
+const STATUS_MEMBER: &str = "status";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -191,18 +205,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateContainerInstancesState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateContainerInstancesStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateContainerInstancesState"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateContainerInstancesStateErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx);
+
+        // "A list of up to 10 container instance IDs or full ARN entries" — bounded FIRST,
+        // before any per-entry work: every check and every lookup below walks the list,
+        // so the bound on its length dominates all of them.
+        if input.container_instances.len() > crate::state::MAX_DESCRIBE_BATCH {
+            return Err(
+                UpdateContainerInstancesStateErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::at_most_items_message(
+                            "container instances",
+                            crate::state::MAX_DESCRIBE_BATCH,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An ARN is a WHOLE identifier, account included, so the account segment of every
+        // identifier the request carries is checked before any of them is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        let foreign = input
+            .cluster
+            .as_deref()
+            .into_iter()
+            .chain(input.container_instances.iter().map(String::as_str));
+        if let Some(message) = crate::state::foreign_account_violation(foreign) {
+            return Err(
+                UpdateContainerInstancesStateErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The only valid values for this action are ACTIVE and DRAINING": the member's
+        // enum carries five statuses, three of which name a stage of registration no
+        // caller may move an instance to, so the two this action governs are checked here
+        // rather than by the model's own value set.
+        if !UPDATABLE_STATUSES.contains(&input.status.as_str()) {
+            return Err(
+                UpdateContainerInstancesStateErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::enum_value_message(
+                            STATUS_MEMBER,
+                            &UPDATABLE_STATUSES.map(str::to_string),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "A list of up to 10 container instance IDs or full ARN entries" — the length is
+        // bounded above, so this per-entry check is over a clamped list.
+        if let Some(message) = crate::state::container_instance_id_length_violation(
+            input.container_instances.iter().map(String::as_str),
+        ) {
+            return Err(
+                UpdateContainerInstancesStateErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        // "The short name or full Amazon Resource Name (ARN) of the cluster that hosts the
+        // container instance to update": a cluster this account does not hold hosts none,
+        // and the sentence is selected by the stored record as it is everywhere else.
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(
+                UpdateContainerInstancesStateErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(crate::state::cluster_refusal_message(
+                            guard.clusters.get(&cluster_name),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut container_instances = Vec::new();
+        let mut failures = Vec::new();
+        // An instance is answered once however many times the request names it: the same
+        // id repeated names the same instance, so it is one answer and one write.
+        let mut seen = ::std::collections::HashSet::new();
+        for reference in &input.container_instances {
+            let arn = crate::state::container_instance_arn_from_reference(
+                &region,
+                &cluster_name,
+                reference,
+            );
+            if !seen.insert(arn.clone()) {
+                continue;
+            }
+            // Only an instance REGISTERED in this cluster is one this call can move: a
+            // deregistered one "transitions to an INACTIVE status" and is out of the
+            // cluster, so it is no instance of this cluster to update — reported in the
+            // `failures` channel under the identifier the request sent, exactly as an id
+            // naming nothing is.
+            let resolved = guard
+                .resolve_container_instance(&region, &cluster_name, reference)
+                .filter(|instance| instance.is_registered())
+                .map(|instance| instance.arn.clone());
+            let Some(arn) = resolved else {
+                failures.push(crate::state::unresolved_failure(
+                    &region,
+                    crate::state::CONTAINER_INSTANCE_RESOURCE_TYPE,
+                    reference,
+                ));
+                continue;
+            };
+            let instance = guard.container_instances.get_mut(&arn);
+            // `ContainerInstance$version`: "every time a container instance experiences a
+            // change ... the version counter is incremented", so a call that asks for the
+            // status the instance already holds moves nothing.
+            if let Some(instance) = instance {
+                if instance.status != input.status {
+                    instance.status = input.status.clone();
+                    instance.status_reason = None;
+                    instance.version += 1;
+                }
+            }
+            if let Some(view) = guard
+                .container_instance_view(&arn, crate::state::ContainerInstanceFields::all())
+            {
+                container_instances.push(view);
+            }
+        }
+
+        Ok(UpdateContainerInstancesStateOutput {
+            container_instances: Some(container_instances),
+            failures: Some(failures),
+        })
     }
 }

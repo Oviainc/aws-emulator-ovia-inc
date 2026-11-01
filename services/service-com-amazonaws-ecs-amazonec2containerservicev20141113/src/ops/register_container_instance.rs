@@ -181,6 +181,49 @@ fn identity_document_member(document: &::serde_json::Value, member: &str) -> Opt
         .map(str::to_string)
 }
 
+/// The EC2 instance id the request's identity document names, or the sentence an
+/// `InvalidParameterException` carries when the document and its signature identify no
+/// machine this caller could be registering.
+///
+/// "The instance identity document for the EC2 instance to register", and "the instance
+/// identity document signature for the EC2 instance to register": the two together are
+/// what identifies the machine a registration is about, so a registration presents BOTH.
+/// A document whose members a registration must carry is read first, and a blank one is
+/// reported by name — the first of [`IDENTITY_DOCUMENT_REQUIRED_MEMBERS`], and nothing
+/// else about the request.
+///
+/// What is not read here is the machine itself: a document that is absent, that describes
+/// an instance of another account or Region, or that comes without a signature of the
+/// published form vouches for no machine this caller could be registering, so the pair is
+/// refused and no instance is registered for it.
+///
+/// The verdict is reached WITHOUT the store: the caller-supplied document is parsed here,
+/// outside the critical section the registration itself takes, and the refusal it earns is
+/// carried rather than answered so the CLUSTER is still reported first.
+fn documented_instance_id(input: &RegisterContainerInstanceInput, region: &str) -> Result<String, String> {
+    let document = input
+        .instance_identity_document
+        .as_deref()
+        .ok_or_else(|| IDENTITY_NOT_VALID.to_string())?;
+    let parsed = ::serde_json::from_str::<::serde_json::Value>(document)
+        .unwrap_or(::serde_json::Value::Null);
+    for member in IDENTITY_DOCUMENT_REQUIRED_MEMBERS {
+        if identity_document_member(&parsed, member).is_none() {
+            return Err(format!("{member} cannot be blank."));
+        }
+    }
+    if !describes_this_caller(&parsed, region)
+        || !is_presented_signature(input.instance_identity_document_signature.as_deref())
+    {
+        return Err(IDENTITY_NOT_VALID.to_string());
+    }
+    // The loop above has already refused a document whose `instanceId` is blank, so this
+    // reads the value it checked. Answered rather than asserted, so no request can make
+    // this operation panic.
+    identity_document_member(&parsed, IDENTITY_DOCUMENT_INSTANCE_ID)
+        .ok_or_else(|| IDENTITY_NOT_VALID.to_string())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -259,73 +302,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // An ARN is a WHOLE identifier, account included, so its account segment is
+        // checked before the identifier is resolved
+        // ([`crate::state::foreign_account_violation`]).
+        if let Some(message) = crate::state::foreign_account_violation(input.cluster.as_deref()) {
+            return Err(
+                RegisterContainerInstanceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let region = crate::state::request_region(ctx);
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        // Read the request's own shape BEFORE the store lock is taken, keeping the verdict
+        // rather than answering it: the caller-supplied document is parsed outside the
+        // critical section, and the CLUSTER is still the first thing reported.
+        let documented_instance_id = documented_instance_id(&input, &region);
 
-        // "The instance identity document for the EC2 instance to register", and "the
-        // instance identity document signature for the EC2 instance to register": the two
-        // together are what identifies the machine a registration is about, so a
-        // registration presents BOTH. A document whose members a registration must carry
-        // is read first, and a blank one is reported by name — the first of
-        // [`IDENTITY_DOCUMENT_REQUIRED_MEMBERS`], and nothing else about the request.
-        //
-        // What is not read here is the machine itself: a document that is absent, that
-        // describes an instance of another account or Region, or that comes without a
-        // signature of the published form vouches for no machine this caller could be
-        // registering, so the pair is refused and no instance is registered for it.
-        let Some(document) = input.instance_identity_document.as_deref() else {
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        // The cluster this agent registers INTO is resolved BEFORE the request's own
+        // shape is answered, and its failure is reported in its own error class: this
+        // operation reports a request it cannot read as an `InvalidParameterException`
+        // (the identity document below), so a cluster that is not there has to be the
+        // other class it models, or an agent could not tell "retry with a document" from
+        // "this cluster is gone". Which SENTENCE that class carries is selected by the
+        // stored record, exactly as it is for the operations that answer the
+        // cluster-specific error.
+        if !guard.has_active_cluster(&cluster_name) {
             return Err(
-                RegisterContainerInstanceErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(IDENTITY_NOT_VALID.to_string()),
-                    },
-                )
-                .into(),
-            );
-        };
-        let parsed =
-            ::serde_json::from_str::<::serde_json::Value>(document).unwrap_or(::serde_json::Value::Null);
-        for member in IDENTITY_DOCUMENT_REQUIRED_MEMBERS {
-            if identity_document_member(&parsed, member).is_none() {
-                return Err(
-                    RegisterContainerInstanceErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: Some(format!("{member} cannot be blank.")),
-                        },
-                    )
-                    .into(),
-                );
-            }
-        }
-        if !describes_this_caller(&parsed, &region)
-            || !is_presented_signature(input.instance_identity_document_signature.as_deref())
-        {
-            return Err(
-                RegisterContainerInstanceErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(IDENTITY_NOT_VALID.to_string()),
-                    },
-                )
+                RegisterContainerInstanceErrorModeled::ClientException(ClientException {
+                    message: Some(crate::state::cluster_refusal_message(
+                        guard.clusters.get(&cluster_name),
+                    )),
+                })
                 .into(),
             );
         }
-        let documented_instance_id =
-            match identity_document_member(&parsed, IDENTITY_DOCUMENT_INSTANCE_ID) {
-                Some(instance_id) => instance_id,
-                // Not reachable: the loop above has already refused a document whose
-                // `instanceId` is blank. Answered rather than asserted, so no request can
-                // make this operation panic.
-                None => {
-                    return Err(
-                        RegisterContainerInstanceErrorModeled::InvalidParameterException(
-                            InvalidParameterException {
-                                message: Some(IDENTITY_NOT_VALID.to_string()),
-                            },
-                        )
-                        .into(),
-                    )
-                }
-            };
+
+        let documented_instance_id = documented_instance_id.map_err(|message| {
+            RegisterContainerInstanceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+        })?;
 
         // A caller-supplied tag may not write into the namespace Amazon Web Services keeps
         // for its own tags, whichever operation carries the `tags` list.
@@ -336,23 +363,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 RegisterContainerInstanceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
                         message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        let now = ::std::time::SystemTime::now();
-        let mut guard = state.lock();
-        guard.advance_clock(now);
-
-        if !guard.has_active_cluster(&cluster_name) {
-            return Err(
-                RegisterContainerInstanceErrorModeled::ClusterNotFoundException(
-                    ClusterNotFoundException {
-                        message: Some(crate::state::cluster_refusal_message(
-                            guard.clusters.get(&cluster_name),
-                        )),
                     },
                 )
                 .into(),

@@ -904,8 +904,9 @@ async fn deleting_a_service_drains_its_tasks_and_settles_on_the_clock() {
         "case {case:?}: expected the service-not-found refusal, got {code:?}"
     );
     assert_eq!(
-        message, "Service not found.",
-        "case {case:?}: expected the fixed service-not-found sentence, got {message:?}"
+        message, "",
+        "case {case:?}: expected `DeleteService` to carry no sentence at all, got \
+         {message:?}"
     );
     let (code, message) = refusal(
         &router,
@@ -947,7 +948,7 @@ async fn a_tombstoned_cluster_is_no_longer_a_cluster_an_operation_can_work_in() 
     // existed, and with the sentence that says the cluster is STILL there and inactive,
     // which is what tells the two states apart. Rows: every implemented operation that
     // resolves a `cluster` to work in.
-    let rows: [TombstoneRow; 11] = [
+    let rows: [TombstoneRow; 10] = [
         ("RunTask", |cluster| {
             json!({ "cluster": cluster, "taskDefinition": "gonefamily" })
         }),
@@ -974,14 +975,6 @@ async fn a_tombstoned_cluster_is_no_longer_a_cluster_an_operation_can_work_in() 
         }),
         ("DescribeServices", |cluster| {
             json!({ "cluster": cluster, "services": ["web"] })
-        }),
-        ("RegisterContainerInstance", |cluster| {
-            json!({
-                "cluster": cluster,
-                "instanceIdentityDocument": identity_document("i-0a1b2c3d4e5f60718"),
-                "instanceIdentityDocumentSignature":
-                    crate::ecs_wire::identity_document_signature(),
-            })
         }),
         ("ListContainerInstances", |cluster| {
             json!({ "cluster": cluster })
@@ -1015,6 +1008,37 @@ async fn a_tombstoned_cluster_is_no_longer_a_cluster_an_operation_can_work_in() 
         assert_eq!(
             message, "Cluster not found.",
             "case {missing:?}: expected the fixed not-found sentence, got {message:?}"
+        );
+    }
+
+    // `RegisterContainerInstance` reports the same two conditions under the class IT
+    // models for them — the agent plane's `ClientException`, kept apart from the
+    // `InvalidParameterException` it answers a request it cannot read — and the SENTENCE
+    // is still selected by the cluster's own stored state.
+    for (reference, expected) in [
+        ("gone", "The referenced cluster was inactive."),
+        ("nosuchcluster", "Cluster not found."),
+    ] {
+        let case = format!("RegisterContainerInstance against cluster {reference:?}");
+        let (code, message) = refusal(
+            &router,
+            "RegisterContainerInstance",
+            json!({
+                "cluster": reference,
+                "instanceIdentityDocument": identity_document("i-0a1b2c3d4e5f60718"),
+                "instanceIdentityDocumentSignature":
+                    crate::ecs_wire::identity_document_signature(),
+            }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            code, "ClientException",
+            "case {case:?}: expected the agent-plane class, got {code:?} with {message:?}"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
     }
 

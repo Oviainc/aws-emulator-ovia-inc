@@ -823,7 +823,7 @@ async fn list_service_deployments_resolves_one_service_and_refuses_what_names_no
         ("a nextToken that is not an ARN", "not-a-token".to_string()),
         ("a nextToken of another service's deployment", other_token),
     ] {
-        refused(
+        let body = refused(
             &router,
             "ListServiceDeployments",
             json!({ "cluster": "listing", "service": "web", "nextToken": token }),
@@ -831,6 +831,12 @@ async fn list_service_deployments_resolves_one_service_and_refuses_what_names_no
             case,
         )
         .await;
+        assert_eq!(
+            body["message"].as_str(),
+            Some("Invalid nextToken."),
+            "case {case:?}: expected the one sentence ECS answers for an unusable token, \
+             got {body}"
+        );
     }
 
     let case = "a cluster that does not exist";

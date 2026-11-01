@@ -391,11 +391,13 @@ async fn list_clusters_refuses_an_out_of_range_page_size_and_an_unminted_token()
         .await;
     }
 
-    // A `nextToken` this operation never minted names no page: an identifier that isn't
-    // valid, which is what `ClientException` reports. The rows span the ways a token can
-    // fail to name a stored cluster: empty, not an identifier at all, a base64-looking
-    // opaque blob, the cluster's NAME rather than the ARN the operation mints, an ARN of a
-    // cluster this account never created, and an ARN of another resource kind.
+    // A `nextToken` this operation never minted names no page: the bad parameter it is,
+    // which is what `InvalidParameterException` reports, with the token the REQUEST
+    // carried so a paginating client knows which cursor to abandon. The rows span the
+    // ways a token can fail to name a stored cluster: empty, not an identifier at all, a
+    // base64-looking opaque blob, the cluster's NAME rather than the ARN the operation
+    // mints, an ARN of a cluster this account never created, and an ARN of another
+    // resource kind.
     let unminted = [
         String::new(),
         "not a token".to_string(),
@@ -415,12 +417,13 @@ async fn list_clusters_refuses_an_out_of_range_page_size_and_an_unminted_token()
         )
         .await;
         assert_eq!(
-            code, "ClientException",
-            "case {case:?}: expected a ClientException, got {code:?}"
+            code, "InvalidParameterException",
+            "case {case:?}: expected an InvalidParameterException, got {code:?}"
         );
         assert_eq!(
-            message, "Invalid nextToken.",
-            "case {case:?}: expected the one sentence ECS answers for an unusable token, \
+            message,
+            format!("Invalid token {token}"),
+            "case {case:?}: expected the sentence ECS answers for an unusable token, \
              got {message:?}"
         );
     }

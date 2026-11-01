@@ -165,7 +165,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN, of one of the kinds that carry a tag set. A value that is none of them
         // names no resource whose tags could be deleted, so it is refused as the bad
         // parameter it is rather than reported as an absent resource.
+        // An ARN is a WHOLE identifier, account included: a `resourceArn` whose account
+        // is not the caller's names another account's resource, which is refused as the
+        // invalid ARN it is rather than resolved against this account's records
+        // ([`crate::state::foreign_account_resource_arn_violation`]).
         let resource_arn = input.resource_arn.as_str();
+        if let Some(message) = crate::state::foreign_account_resource_arn_violation(resource_arn) {
+            return Err(UntagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
         let Some(kind) = crate::state::TaggedResourceKind::from_arn(resource_arn) else {
             return Err(UntagResourceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
@@ -177,6 +189,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
+
+        // A cluster a delete has tombstoned is still discoverable, but it is not an
+        // ACTIVE cluster whose tag set this call changes: the same refusal every tagging
+        // call answers for a deleted cluster's ARN.
+        if crate::state::names_an_inactive_cluster(guard.clusters.values(), resource_arn) {
+            return Err(UntagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::CLUSTER_INACTIVE_FOR_TAGGING_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         let Some(stored) = guard.resource_tags_mut(kind, resource_arn) else {
             let (refusal, message) = kind.not_found_refusal(resource_arn);
