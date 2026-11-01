@@ -75,6 +75,8 @@ mod existence_preconditions;
 mod hsm_client_certificates;
 #[path = "all/hsm_configurations.rs"]
 mod hsm_configurations;
+#[path = "all/identity_center_auth_token.rs"]
+mod identity_center_auth_token;
 #[path = "all/maintenance_tracks.rs"]
 mod maintenance_tracks;
 #[path = "all/modify_cluster_parameter_group.rs"]

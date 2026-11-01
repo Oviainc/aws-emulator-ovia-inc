@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIdentityCenterAuthToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIdentityCenterAuthToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIdentityCenterAuthToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Generates the encrypted token that propagates the CALLER'S IAM Identity Center
+//! identity to the Amazon Redshift clusters a request scopes it to — or says why
+//! no token could be generated for this caller.
+//!
+//! Two rules decide every call, in this order:
+//!
+//! 1. The clusters the token would be scoped to are judged against the
+//!    constraints the `ClusterIds` member documents — how many identifiers the
+//!    list may hold and the syntax of each — which the model expresses as prose
+//!    rather than as traits, so the boundary validator passed them and
+//!    [`crate::state::check_token_scope_clusters`] is what enforces them. A list
+//!    outside them is refused with the fault this operation models for a
+//!    parameter it cannot honour (`RedshiftInvalidParameterFault`, 400).
+//! 2. The identity the token would carry is then resolved — and it is a property
+//!    of the CREDENTIAL the request was signed with, not of the request: "this
+//!    API extracts the Amazon Web Services IAM Identity Center identity from
+//!    enhanced credentials", and "if the caller is not using enhanced credentials
+//!    with embedded Amazon Web Services IAM Identity Center identity, the API
+//!    will return an error". Only an identity-enhanced role session carries such
+//!    an identity, and a session becomes one by being minted from a trusted
+//!    context assertion that Security Token Service signed. Every credential this
+//!    emulator accepts is the access key it publishes at start or one its own
+//!    credential store minted — a long-term key or a plain session, neither
+//!    carrying an identity context — and the one call that would embed one
+//!    refuses every context assertion presented to it, because this emulator
+//!    issues none (see `AssumeRole` in the Security Token Service crate). So the
+//!    resolution finds no identity to propagate, and the call is answered with
+//!    the 400 the operation models for a caller without enhanced credentials
+//!    (`UnsupportedOperationFault`), carrying
+//!    [`crate::state::IDENTITY_CENTER_ENHANCED_CREDENTIALS_REQUIRED`].
+//!
+//! Which is also why nothing here resolves the clusters the request names: the
+//! `ClusterNotFoundFault` and `InvalidClusterStateFault` this operation models are
+//! about the clusters a token is MINTED for, and no caller of this emulator gets
+//! that far. Answering one of them for a caller AWS refuses on its credentials
+//! would be the wrong refusal, not a closer one.
+//!
+//! The call is reporting-only: it reads the request and the caller's credential,
+//! writes nothing to this service's store, and mints no credential — a token that
+//! carries an identity nobody proved is not a credential this emulator may issue.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +198,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIdentityCenterAuthToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIdentityCenterAuthTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as st;
+
+        // This operation reads no record of this service: both rules below are
+        // decided on the request and on the credential it was signed with, so the
+        // engine stays untouched — and nothing is written, because a call that
+        // mints no token changes nothing about the account's clusters.
+        let _ = &self.engine;
+
+        // "A list of cluster identifiers that the generated token can be used
+        // with": how many the list may hold and the syntax of each are documented
+        // on the member rather than modelled as traits, so they are judged here,
+        // and judged FIRST — a request that names no scope a token could be
+        // issued against is refused for the request it is, whatever credential
+        // signed it.
+        st::check_token_scope_clusters(&input.cluster_ids).map_err(invalid_parameter)?;
+
+        // The identity the token would carry travels in the CREDENTIAL the
+        // request was signed with (see this module's header): the emulator's
+        // credential channel attaches no IAM Identity Center identity to any
+        // credential it accepts, so the caller of every request reaching here is
+        // not using enhanced credentials and there is no identity to propagate.
+        // The call is therefore answered with the operation's own 400 rather than
+        // with a token carrying an identity nobody proved.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIdentityCenterAuthToken"))
+        // Issuing a database or cluster credential is the security-relevant event
+        // of this operation, so the attempt is attributable in the emulator's log:
+        // which operation, the access key id the request presented, how many
+        // clusters it asked the token to be scoped to, and the outcome. Nothing
+        // secret is logged — no token was minted at all.
+        ::tracing::info!(
+            operation = Self::NAME,
+            presented_access_key_id = %::engine::extract_akid(&ctx.parts().headers),
+            scoped_clusters = input.cluster_ids.len(),
+            outcome = "refused",
+            "no Amazon Web Services IAM Identity Center identity travels with the caller's credentials"
+        );
+        Err(
+            GetIdentityCenterAuthTokenErrorModeled::UnsupportedOperationFault(
+                UnsupportedOperationFault {
+                    message: Some(
+                        st::IDENTITY_CENTER_ENHANCED_CREDENTIALS_REQUIRED.to_string(),
+                    ),
+                },
+            )
+            .into(),
+        )
     }
+}
+
+/// The modelled refusal for a `ClusterIds` list outside the constraints its own
+/// member documents: "the request contains one or more invalid parameters … when
+/// required parameters are missing, parameter values are outside acceptable
+/// ranges, or parameter formats are incorrect"
+/// (`RedshiftInvalidParameterFault`), which is exactly the three ways
+/// [`crate::state::check_token_scope_clusters`] refuses one.
+fn invalid_parameter(why: String) -> GetIdentityCenterAuthTokenError {
+    GetIdentityCenterAuthTokenErrorModeled::RedshiftInvalidParameterFault(
+        RedshiftInvalidParameterFault { message: Some(why) },
+    )
+    .into()
 }
