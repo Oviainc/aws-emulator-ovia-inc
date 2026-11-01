@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // tagging operations.
         let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
             return Err(UntagResourceErrorModeled::InvalidParameterException(
-                crate::state::invalid_resource_arn(&input.resource_arn),
+                crate::state::invalid_parameters(),
             )
             .into());
         };

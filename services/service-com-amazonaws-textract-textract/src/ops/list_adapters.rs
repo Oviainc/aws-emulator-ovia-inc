@@ -202,14 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(offset) => offset,
                 None => {
                     return Err(ListAdaptersErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: Some(
-                                "NextToken was not issued for this listing's filtration \
-                                 criteria"
-                                    .to_string(),
-                            ),
-                            code: None,
-                        },
+                        crate::state::invalid_parameters(),
                     )
                     .into())
                 }
@@ -229,13 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::page_of(&scope, &adapters, input.max_results, offset)
         else {
             return Err(ListAdaptersErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(format!(
-                        "MaxResults must be at least 1, got {:?}",
-                        input.max_results
-                    )),
-                    code: None,
-                },
+                crate::state::invalid_parameters(),
             )
             .into());
         };

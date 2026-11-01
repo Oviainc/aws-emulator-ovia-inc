@@ -204,13 +204,23 @@ pub const ADAPTER_FEATURE_TYPE: &str = "QUERIES";
 /// Characters in a minted `AdapterId`, inside `AdapterId`'s modelled `12..1011` length.
 const ADAPTER_ID_LEN: usize = 32;
 
-/// The `ResourceNotFoundException` message every adapter operation answers for an
-/// `AdapterId` that names no adapter — one never created, or one already deleted.
+/// The `ResourceNotFoundException` message the `AdapterId`-addressed adapter operations
+/// answer for an id that names no adapter — one never created, or one already deleted.
 ///
-/// ONE sentence for the one failure, whichever operation looked the adapter up, and it
-/// carries nothing from the request: the id the caller sent is already in its own request.
-/// This is the sentence Amazon Textract itself answers for an unknown `AdapterId`.
+/// ONE sentence for that one failure, whichever of those operations looked the adapter up,
+/// and it carries nothing from the request: the id the caller sent is already in its own
+/// request. Amazon Textract states this refusal as a SENTENCE on the path that takes the
+/// id directly, terminal period included.
 pub const ADAPTER_NOT_FOUND_MESSAGE: &str = "Adapter Id not found.";
+
+/// The `ResourceNotFoundException` message the tagging operations answer when the resource
+/// their `ResourceARN` names is an adapter this service holds none of.
+///
+/// The same words, and Amazon Textract states them WITHOUT the terminal period on this
+/// path: resolving a `ResourceARN` is a different resolution from taking an `AdapterId`,
+/// and the two are worded independently. Fixed text either way — the ARN and the id it
+/// carries are already in the caller's own request, so neither reaches the error surface.
+pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Adapter Id not found";
 
 /// The message Amazon Textract states `UnsupportedDocumentException` with, for every
 /// document it cannot read a page out of.
@@ -797,18 +807,17 @@ pub fn parse_resource_arn(arn: &str) -> Option<ArnResource> {
     })
 }
 
-/// The modelled refusal of a `ResourceARN` that is not an Amazon Textract resource ARN.
+/// The modelled refusal of an input that violates a constraint on this service's input —
+/// an absent or inconsistent required member, a value outside a declared length, pattern,
+/// range or enum, or a cursor this listing never issued.
 ///
-/// ONE sentence for the one failure, shared by all three tagging operations, and built
-/// from the request: it names the member, the form the member must take and the value
-/// that did not take it, so the caller can fix the request from this text alone.
-pub fn invalid_resource_arn(arn: &str) -> InvalidParameterException {
+/// ONE sentence for the whole class ([`INVALID_PARAMETERS_MESSAGE`]), whichever operation
+/// and whichever member was refused: Amazon Textract names neither the member nor the
+/// rule it broke, so nothing of the request reaches the error surface and the refusal is
+/// the same string on every call.
+pub fn invalid_parameters() -> InvalidParameterException {
     InvalidParameterException {
-        message: Some(format!(
-            "ResourceARN must be the ARN of an Amazon Textract resource \
-             (arn:<partition>:{ARN_SERVICE}:<region>:<account>:/{ADAPTER_RESOURCE_TYPE}/<AdapterId>), \
-             got {arn}"
-        )),
+        message: Some(INVALID_PARAMETERS_MESSAGE.to_string()),
         code: None,
     }
 }
@@ -816,12 +825,12 @@ pub fn invalid_resource_arn(arn: &str) -> InvalidParameterException {
 /// The modelled refusal of a well-formed Amazon Textract ARN that names no resource
 /// this service holds.
 ///
-/// Every resource this service can tag is an adapter, so this is the one sentence every
-/// adapter lookup answers with ([`ADAPTER_NOT_FOUND_MESSAGE`]), whichever operation did
-/// the looking up.
+/// Every resource this service can tag is an adapter, so this is the one sentence all
+/// three tagging operations answer with ([`TAGGED_RESOURCE_NOT_FOUND_MESSAGE`]), whichever
+/// of them resolved the ARN.
 pub fn tagged_resource_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(ADAPTER_NOT_FOUND_MESSAGE.to_string()),
+        message: Some(TAGGED_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
         code: None,
     }
 }
@@ -999,17 +1008,11 @@ impl DocumentRef {
 /// The identity of a synchronous `Document`.
 ///
 /// Textract requires exactly one of `Bytes` and `S3Object`: neither (and, equally,
-/// both) violates the input constraint `InvalidParameterException` describes.
+/// both) violates the input constraint `InvalidParameterException` describes. `Err`
+/// carries the sentence that refusal is stated with ([`INVALID_PARAMETERS_MESSAGE`]).
 pub fn reference_for_document(document: &Document) -> Result<DocumentRef, String> {
     match (document.bytes.as_deref(), document.s3_object.as_ref()) {
-        (None, None) => Err(
-            "Document must have either its Bytes or its S3Object member set, but has neither"
-                .to_string(),
-        ),
-        (Some(_), Some(_)) => Err(
-            "Document must have either its Bytes or its S3Object member set, but not both"
-                .to_string(),
-        ),
+        (None, None) | (Some(_), Some(_)) => Err(INVALID_PARAMETERS_MESSAGE.to_string()),
         (Some(bytes), None) => Ok(DocumentRef {
             s3: None,
             bytes_digest: Some(hex::encode(Sha256::digest(bytes))),
@@ -1030,7 +1033,7 @@ pub fn reference_for_location(location: &DocumentLocation) -> Result<DocumentRef
     let s3 = location
         .s3_object
         .as_ref()
-        .ok_or_else(|| "DocumentLocation must have its S3Object member set".to_string())?;
+        .ok_or_else(|| INVALID_PARAMETERS_MESSAGE.to_string())?;
     Ok(DocumentRef {
         s3: Some(s3_ref(
             s3.bucket.as_deref(),
@@ -1054,8 +1057,7 @@ fn s3_ref(
             name: name.to_string(),
             version: version.filter(|v| !v.is_empty()).map(ToString::to_string),
         }),
-        (None, _) => Err("S3Object must have its Bucket member set".to_string()),
-        (_, None) => Err("S3Object must have its Name member set".to_string()),
+        (None, _) | (_, None) => Err(INVALID_PARAMETERS_MESSAGE.to_string()),
     }
 }
 
@@ -1130,7 +1132,9 @@ pub const QUERIES_CONFIG_WITHOUT_FEATURE_MESSAGE: &str =
 /// what the queries are supplied in and `QUERIES` is what asks for them, so one without
 /// the other violates the input constraint `InvalidParameterException` describes.
 /// `QueriesConfig` without the feature is answered with the sentence AWS states that
-/// refusal with ([`QUERIES_CONFIG_WITHOUT_FEATURE_MESSAGE`]).
+/// refusal with ([`QUERIES_CONFIG_WITHOUT_FEATURE_MESSAGE`]); every other violation of
+/// this input's constraints is answered with the one sentence the class is stated with
+/// ([`INVALID_PARAMETERS_MESSAGE`]), which carries nothing from the request.
 ///
 /// Read straight off the requested `FeatureTypes`, so the pairing is checked whatever else
 /// that list holds — including a modelled feature this emulator derives no blocks for,
@@ -1150,21 +1154,13 @@ pub fn queries_of(
     match (queries_requested, config) {
         (true, Some(config)) => {
             if config.queries.len() > max_queries {
-                return Err(format!(
-                    "QueriesConfig.Queries holds {} queries; at most {max_queries} queries \
-                     can be asked of one document",
-                    config.queries.len()
-                ));
+                return Err(INVALID_PARAMETERS_MESSAGE.to_string());
             }
             config.queries.iter().map(PreparedQuery::new).collect()
         }
         (false, None) => Ok(Vec::new()),
         (false, Some(_)) => Err(QUERIES_CONFIG_WITHOUT_FEATURE_MESSAGE.to_string()),
-        (true, None) => Err(
-            "FeatureTypes contains QUERIES, but no QueriesConfig was supplied: the QUERIES \
-             FeatureType must be used with QueriesConfig"
-                .to_string(),
-        ),
+        (true, None) => Err(INVALID_PARAMETERS_MESSAGE.to_string()),
     }
 }
 
@@ -1200,34 +1196,28 @@ enum PageFilter {
 }
 
 impl PreparedQuery {
-    /// Read one query, or say why its `Pages` is not one of the forms AWS documents.
+    /// Read one query, or refuse a `Pages` that is not one of the forms AWS documents.
     ///
     /// AWS, on `Query$Pages`: the only characters allowed are `0 1 2 3 4 5 6 7 8 9 - *`,
     /// with no whitespace; `*` must be the only element when used; intervals such as `1-3`
-    /// and `4-*` are allowed; a page must be greater than 0.
+    /// and `4-*` are allowed; a page must be greater than 0. `Err` carries the one
+    /// sentence a constraint violation is refused with ([`INVALID_PARAMETERS_MESSAGE`]),
+    /// so no entry of the caller's list is quoted back.
     fn new(query: &Query) -> Result<Self, String> {
         let pages = match query.pages.as_deref() {
             None => PageFilter::FirstPage,
             Some(entries) if entries.len() == 1 && entries[0] == "*" => PageFilter::EveryPage,
             Some(entries) => {
                 if entries.len() > MAX_PAGES_PER_QUERY {
-                    return Err(format!(
-                        "Query.Pages holds {} entries; at most {MAX_PAGES_PER_QUERY} can be \
-                         named for one query",
-                        entries.len()
-                    ));
+                    return Err(INVALID_PARAMETERS_MESSAGE.to_string());
                 }
                 let mut intervals = Vec::with_capacity(entries.len());
                 for entry in entries {
                     if entry == "*" {
-                        return Err(format!(
-                            "Query.Pages {entries:?} uses *, which must be the only element \
-                             of the list"
-                        ));
+                        return Err(INVALID_PARAMETERS_MESSAGE.to_string());
                     }
-                    let interval = parse_page_interval(entry).ok_or_else(|| {
-                        format!("Query.Pages entry {entry:?} is not a page or a page interval")
-                    })?;
+                    let interval = parse_page_interval(entry)
+                        .ok_or_else(|| INVALID_PARAMETERS_MESSAGE.to_string())?;
                     intervals.push(interval);
                 }
                 PageFilter::Intervals(intervals)
@@ -1276,21 +1266,16 @@ fn parse_page_interval(entry: &str) -> Option<(u32, Option<u32>)> {
 ///
 /// A narrower rule than [`parse_features`], which reads the list an analysis request
 /// carries: an adapter can only be trained on the feature types the service supports for
-/// adapters, which is [`ADAPTER_FEATURE_TYPE`] alone. `Err` carries the reason, which the
+/// adapters, which is [`ADAPTER_FEATURE_TYPE`] alone. `Err` carries the one sentence a
+/// constraint violation is refused with ([`INVALID_PARAMETERS_MESSAGE`]), which the
 /// caller answers with the modelled `InvalidParameterException`.
 pub fn validate_adapter_features(feature_types: &[String]) -> Result<(), String> {
     if feature_types.is_empty() {
-        return Err(
-            "FeatureTypes must name at least one feature type for the adapter to be trained on"
-                .to_string(),
-        );
+        return Err(INVALID_PARAMETERS_MESSAGE.to_string());
     }
     for value in feature_types {
         if value != ADAPTER_FEATURE_TYPE {
-            return Err(format!(
-                "FeatureTypes value '{value}' cannot be used to train an adapter; the only \
-                 supported feature type is {ADAPTER_FEATURE_TYPE}"
-            ));
+            return Err(INVALID_PARAMETERS_MESSAGE.to_string());
         }
     }
     Ok(())
@@ -1301,7 +1286,8 @@ pub fn validate_adapter_features(feature_types: &[String]) -> Result<(), String>
 /// AWS, on `UpdateAdapter`: "Update the configuration for an adapter. FeatureTypes
 /// configurations cannot be updated. At least one new parameter must be specified as an
 /// argument." So a request naming none of the three updatable members asks for no change
-/// at all and is refused; `Err` carries the reason, which the caller answers with the
+/// at all and is refused; `Err` carries the one sentence a constraint violation is
+/// refused with ([`INVALID_PARAMETERS_MESSAGE`]), which the caller answers with the
 /// modelled `InvalidParameterException`. The members' own length, pattern and enum
 /// constraints were already enforced at the boundary.
 pub fn validate_adapter_update(
@@ -1310,11 +1296,7 @@ pub fn validate_adapter_update(
     auto_update: Option<&str>,
 ) -> Result<(), String> {
     if adapter_name.is_none() && description.is_none() && auto_update.is_none() {
-        return Err(
-            "at least one of AdapterName, Description or AutoUpdate must be specified to \
-             update an adapter"
-                .to_string(),
-        );
+        return Err(INVALID_PARAMETERS_MESSAGE.to_string());
     }
     if let Some(auto_update) = auto_update {
         adapter_auto_update(Some(auto_update))?;
@@ -1325,17 +1307,15 @@ pub fn validate_adapter_update(
 /// The `AutoUpdate` an adapter carries for `value`, defaulting per
 /// [`DEFAULT_AUTO_UPDATE`] when the request named none.
 ///
-/// `Err` carries the reason for a value outside the modelled `AutoUpdate` enum, which the
+/// `Err` refuses a value outside the modelled `AutoUpdate` enum with the one sentence a
+/// constraint violation is stated with ([`INVALID_PARAMETERS_MESSAGE`]), which the
 /// caller answers with the modelled `InvalidParameterException`.
 pub fn adapter_auto_update(value: Option<&str>) -> Result<String, String> {
     match value {
         None => Ok(DEFAULT_AUTO_UPDATE.to_string()),
         // `AUTO_UPDATE_VALUES` is the AutoUpdate enum from the Smithy model.
         Some(value) if AUTO_UPDATE_VALUES.contains(&value) => Ok(value.to_string()),
-        Some(value) => Err(format!(
-            "AutoUpdate value '{value}' is not one of {}",
-            AUTO_UPDATE_VALUES.join(" | ")
-        )),
+        Some(_) => Err(INVALID_PARAMETERS_MESSAGE.to_string()),
     }
 }
 
@@ -1713,6 +1693,14 @@ struct LineLayout {
     bbox: BoundingBox,
     /// Word counts per tab-separated cell, when the line is a table row.
     cells: Vec<usize>,
+    /// Index in [`Self::words`] of each cell's FIRST word, index-aligned with
+    /// [`Self::cells`].
+    ///
+    /// The running sum of `cells`, taken once when the row is laid out: a cell's words
+    /// are then found by its own offset instead of by re-adding every cell before it, so
+    /// reading a row costs time proportional to its cells rather than to their square —
+    /// which one line of a caller's document can hold many thousands of.
+    cell_starts: Vec<usize>,
     /// Character column of the `:` that separates a label from its value.
     colon: Option<usize>,
 }
@@ -1918,7 +1906,7 @@ fn layout_page(
                     words.iter().any(|w| w.column <= *at) && words.iter().any(|w| w.column > *at)
                 })
             };
-            let cells = if is_row {
+            let cells: Vec<usize> = if is_row {
                 cell_texts
                     .iter()
                     .map(|cell| cell.split_whitespace().count())
@@ -1926,6 +1914,14 @@ fn layout_page(
             } else {
                 Vec::new()
             };
+            let cell_starts: Vec<usize> = cells
+                .iter()
+                .scan(0usize, |start, count| {
+                    let at = *start;
+                    *start = start.saturating_add(*count);
+                    Some(at)
+                })
+                .collect();
             LineLayout {
                 id: block_id(key, "LINE", &[page_index, index]),
                 index,
@@ -1938,6 +1934,7 @@ fn layout_page(
                 text: line.to_string(),
                 words,
                 cells,
+                cell_starts,
                 colon,
             }
         })
@@ -2142,45 +2139,69 @@ fn table_runs(lines: &[LineLayout]) -> Vec<&[LineLayout]> {
 }
 
 /// The words of column `column` of a table row.
+///
+/// The cell's first word is read off [`LineLayout::cell_starts`], so this costs the cell's
+/// own words and nothing per cell before it.
 fn cell_words(line: &LineLayout, column: usize) -> Vec<&WordLayout> {
-    let start: usize = line.cells.iter().take(column).sum();
+    let start = line.cell_starts.get(column).copied().unwrap_or_default();
     let count = line.cells.get(column).copied().unwrap_or_default();
     line.words
-        .get(start..start + count)
+        .get(start..start.saturating_add(count))
         .unwrap_or_default()
         .iter()
         .collect()
 }
 
-/// Where one cell of a table row sits on the page.
+/// Where each cell of a table row sits on the page, for the whole row at once.
 ///
-/// The box of the cell's own words, which is what was read in it. A cell with no words at
-/// all has no text to have been read anywhere, so it is bounded by the cells AROUND it:
+/// A cell is the box of its own words, which is what was read in it. A cell with no words
+/// at all has no text to have been read anywhere, so it is bounded by the cells AROUND it:
 /// from the right edge of the nearest populated cell before it to the left edge of the
 /// nearest one after it, on its row's own vertical band — never a cell-sized box at a
 /// position nothing measured.
-fn cell_box(line: &LineLayout, column: usize) -> BoundingBox {
-    let own = word_boxes(&cell_words(line, column));
-    if !own.is_empty() {
-        return union(&own);
+///
+/// Those two neighbours are carried ALONG the row, one pass each way, rather than looked
+/// for from each empty cell: a row of `n` cells costs `O(n)` plus its own words, so a line
+/// that is nothing but separators is laid out in time proportional to the blocks it
+/// becomes.
+fn cell_boxes(line: &LineLayout) -> Vec<BoundingBox> {
+    let own: Vec<Option<BoundingBox>> = (0..line.cells.len())
+        .map(|column| union_of(&word_boxes(&cell_words(line, column))))
+        .collect();
+
+    let row_left = line.bbox.left;
+    let row_right = line.bbox.left + line.bbox.width;
+
+    let mut left_edges: Vec<f32> = Vec::with_capacity(own.len());
+    let mut nearest_before: Option<f32> = None;
+    for cell in &own {
+        left_edges.push(nearest_before.unwrap_or(row_left));
+        if let Some(cell) = cell {
+            nearest_before = Some(cell.left + cell.width);
+        }
     }
-    let populated = |column: usize| {
-        let boxes = word_boxes(&cell_words(line, column));
-        (!boxes.is_empty()).then(|| union(&boxes))
-    };
-    let left = (0..column)
-        .rev()
-        .find_map(populated)
-        .map_or(line.bbox.left, |before| before.left + before.width);
-    let right = (column + 1..line.cells.len())
-        .find_map(populated)
-        .map_or(line.bbox.left + line.bbox.width, |after| after.left);
-    BoundingBox {
-        width: (right - left).max(0.0),
-        height: line.bbox.height,
-        left,
-        top: line.bbox.top,
+
+    let mut right_edges: Vec<f32> = vec![row_right; own.len()];
+    let mut nearest_after: Option<f32> = None;
+    for (column, cell) in own.iter().enumerate().rev() {
+        right_edges[column] = nearest_after.unwrap_or(row_right);
+        if let Some(cell) = cell {
+            nearest_after = Some(cell.left);
+        }
     }
+
+    own.iter()
+        .enumerate()
+        .map(|(column, cell)| match cell {
+            Some(bbox) => bbox.clone(),
+            None => BoundingBox {
+                width: (right_edges[column] - left_edges[column]).max(0.0),
+                height: line.bbox.height,
+                left: left_edges[column],
+                top: line.bbox.top,
+            },
+        })
+        .collect()
 }
 
 /// `TABLE` and `CELL` blocks for the page's tab-separated rows, and the table ids.
@@ -2207,6 +2228,8 @@ fn table_blocks(
         let mut cell_blocks = Vec::new();
         let mut cell_ids = Vec::new();
         for (row, line) in run.iter().enumerate() {
+            // Every cell's box for this row at once, so no cell rescans the row.
+            let boxes = cell_boxes(line);
             for column in 0..line.cells.len() {
                 let cell_words = cell_words(line, column);
                 let cell_id = block_id(key, "CELL", &[page_index, table_index, row, column]);
@@ -2216,7 +2239,7 @@ fn table_blocks(
                 cell.row_span = Some(1);
                 cell.column_span = Some(1);
                 cell.confidence = Some(words_confidence(line, &cell_words));
-                cell.geometry = Some(geometry(cell_box(line, column)));
+                cell.geometry = boxes.get(column).cloned().map(geometry);
                 if !cell_words.is_empty() {
                     cell.relationships = Some(vec![relationship(
                         "CHILD",

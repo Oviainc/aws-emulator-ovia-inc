@@ -275,15 +275,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let features = match crate::state::parse_features(&input.feature_types) {
             Ok(features) => features,
-            Err(crate::state::FeatureError::Empty) => {
-                return Err(invalid(
-                    "FeatureTypes must contain at least one FeatureType".to_string(),
-                ))
-            }
-            Err(crate::state::FeatureError::Unknown(value)) => {
-                return Err(invalid(format!(
-                    "FeatureTypes contains {value}, which is not a FeatureType"
-                )))
+            // An empty list, and a value outside the modelled `FeatureType` enum, are both
+            // violations of this input's constraints, so both answer the one sentence
+            // Amazon Textract states that class with.
+            Err(crate::state::FeatureError::Empty)
+            | Err(crate::state::FeatureError::Unknown(_)) => {
+                return Err(invalid(crate::state::INVALID_PARAMETERS_MESSAGE.to_string()))
             }
             Err(crate::state::FeatureError::NotDerived(value)) => {
                 return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(

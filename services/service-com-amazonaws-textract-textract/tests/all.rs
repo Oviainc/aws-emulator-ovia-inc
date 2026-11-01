@@ -33,6 +33,8 @@ mod queries_and_input_refusals;
 mod raster_documents;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
+#[path = "all/refusal_wording_for_lookups_and_parameters.rs"]
+mod refusal_wording_for_lookups_and_parameters;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/s3_sourced_documents.rs"]

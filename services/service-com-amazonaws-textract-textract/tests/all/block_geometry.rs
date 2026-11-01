@@ -855,3 +855,194 @@ async fn a_text_documents_blocks_are_laid_out_from_its_own_text() {
         );
     }
 }
+
+/// One row of the empty-cell table: the row as the document holds it, and the 1-based
+/// columns of it that hold no words.
+struct EmptyCellCase {
+    name: &'static str,
+    row: &'static str,
+    empty: &'static [usize],
+}
+
+/// The `CELL` blocks of one row of the page's one table, in column order.
+fn row_cells<'a>(case: &str, blocks: &'a [Value], row_index: i64) -> Vec<&'a Value> {
+    let mut cells: Vec<&Value> = of_type(blocks, "CELL")
+        .into_iter()
+        .filter(|cell| cell.get("RowIndex").and_then(Value::as_i64) == Some(row_index))
+        .collect();
+    cells.sort_by_key(|cell| cell.get("ColumnIndex").and_then(Value::as_i64).unwrap_or(0));
+    assert!(
+        !cells.is_empty(),
+        "case {case:?}: row {row_index} must report CELL blocks, got {blocks:?}"
+    );
+    cells
+}
+
+#[tokio::test]
+async fn a_table_cell_holding_no_words_is_bounded_by_the_cells_around_it() {
+    let router = harness();
+
+    // A cell's box is the extent of the words read IN it, so a cell that holds no words
+    // has nothing of its own to have been measured: it spans the gap its neighbours
+    // leave, from the right edge of the nearest populated cell before it to the left edge
+    // of the nearest one after it. The rows differ along WHERE the empty cells sit and
+    // HOW MANY run together — the only ways the gap can be formed — and a trailing empty
+    // cell is not among them because trailing whitespace is not part of a line's text.
+    let cases = [
+        EmptyCellCase {
+            name: "one empty cell between two populated ones",
+            row: "Widget\t\t1250.00",
+            empty: &[2],
+        },
+        EmptyCellCase {
+            name: "two empty cells running together",
+            row: "Widget\t\t\t1250.00",
+            empty: &[2, 3],
+        },
+        EmptyCellCase {
+            name: "an empty cell before every populated one",
+            row: "\tWidget\t1250.00",
+            empty: &[1],
+        },
+        EmptyCellCase {
+            name: "two empty cells before every populated one",
+            row: "\t\tWidget",
+            empty: &[1, 2],
+        },
+        EmptyCellCase {
+            name: "an empty cell at the start and another inside",
+            row: "\tWidget\t\t1250.00",
+            empty: &[1, 3],
+        },
+    ];
+
+    for case in &cases {
+        let text = format!("Item\tQty\tPrice\n{}\n", case.row);
+        let (status, body) = call(
+            &router,
+            "AnalyzeDocument",
+            &json!({ "Document": text_document(&text), "FeatureTypes": ["TABLES"] }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: a readable table must answer 200, got {status} with {body}",
+            case.name
+        );
+        let blocks = blocks_of(&body);
+        let cells = row_cells(case.name, &blocks, 2);
+        assert_eq!(
+            cells.len(),
+            case.row.split('\t').count(),
+            "case {:?}: expected one CELL per tab-separated cell of {:?}, got {:?}",
+            case.name,
+            case.row,
+            cells
+                .iter()
+                .map(|cell| text_of(cell))
+                .collect::<Vec<String>>()
+        );
+
+        let boxes: Vec<Rect> = cells.iter().map(|cell| bbox_of(case.name, cell)).collect();
+        let populated: Vec<usize> = (1..=cells.len())
+            .filter(|column| !case.empty.contains(column))
+            .collect();
+        assert!(
+            !populated.is_empty(),
+            "case {:?}: the row must hold at least one populated cell",
+            case.name
+        );
+
+        for &column in case.empty {
+            let own = boxes[column - 1];
+            assert!(
+                own.width >= -1e-6,
+                "case {:?}: the empty cell at column {column} must not be reported \
+                 inside out, got {own:?}",
+                case.name
+            );
+            match populated.iter().rev().find(|before| **before < column) {
+                Some(&before) => assert!(
+                    (own.left - boxes[before - 1].right()).abs() < 1e-6,
+                    "case {:?}: the empty cell at column {column} must start where column \
+                     {before} ends ({:?}), got {own:?}",
+                    case.name,
+                    boxes[before - 1]
+                ),
+                // No populated cell before it: nothing was read to its left, so it may
+                // not start further right than the first cell that was.
+                None => assert!(
+                    own.left <= boxes[populated[0] - 1].left + 1e-6,
+                    "case {:?}: the empty cell at column {column} must start at or before \
+                     the row's first populated cell ({:?}), got {own:?}",
+                    case.name,
+                    boxes[populated[0] - 1]
+                ),
+            }
+            match populated.iter().find(|after| **after > column) {
+                Some(&after) => assert!(
+                    (own.right() - boxes[after - 1].left).abs() < 1e-6,
+                    "case {:?}: the empty cell at column {column} must end where column \
+                     {after} starts ({:?}), got {own:?}",
+                    case.name,
+                    boxes[after - 1]
+                ),
+                None => {
+                    let last = populated.last().copied().unwrap_or_default();
+                    assert!(
+                        own.right() >= boxes[last - 1].right() - 1e-6,
+                        "case {:?}: the empty cell at column {column} must end at or after \
+                         the row's last populated cell ({:?}), got {own:?}",
+                        case.name,
+                        boxes[last - 1]
+                    );
+                }
+            }
+            assert!(
+                cells[column - 1].get("Relationships").is_none(),
+                "case {:?}: the empty cell at column {column} holds no words, so it must \
+                 name no children, got {}",
+                case.name,
+                cells[column - 1]
+            );
+        }
+
+        // The positive control on the same row: a populated cell spans the words read in
+        // it, which are the children it names, and the table encloses every cell.
+        let table = of_type(&blocks, "TABLE");
+        let table_box = bbox_of(case.name, table[0]);
+        for &column in &populated {
+            let own = boxes[column - 1];
+            let words = children(&blocks, cells[column - 1]);
+            assert!(
+                !words.is_empty(),
+                "case {:?}: the populated cell at column {column} must name the words read \
+                 in it, got {}",
+                case.name,
+                cells[column - 1]
+            );
+            let enclosing = union(
+                &words
+                    .iter()
+                    .map(|word| bbox_of(case.name, word))
+                    .collect::<Vec<Rect>>(),
+            );
+            assert!(
+                (own.left - enclosing.left).abs() < 1e-6
+                    && (own.right() - enclosing.right()).abs() < 1e-6,
+                "case {:?}: the cell at column {column} must span its own words \
+                 ({enclosing:?}), got {own:?}",
+                case.name
+            );
+        }
+        for (index, own) in boxes.iter().enumerate() {
+            assert!(
+                own.within(&table_box, 1e-6),
+                "case {:?}: the cell at column {} must sit inside its TABLE ({table_box:?}), \
+                 got {own:?}",
+                case.name,
+                index + 1
+            );
+        }
+    }
+}
