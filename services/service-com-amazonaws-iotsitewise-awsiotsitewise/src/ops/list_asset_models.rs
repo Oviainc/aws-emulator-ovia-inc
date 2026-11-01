@@ -175,30 +175,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|types| !types.is_empty());
         // `assetModelVersion` selects the LATEST (the documented default) or the
-        // ACTIVE version; it carries the modelled pattern `^(LATEST|ACTIVE)$`, which
-        // the runtime validates BEFORE this handler runs, so an alias that arrives
-        // here is one of those two and nothing else falls through to LATEST.
-        // This emulator keeps ONE version of an asset model, so
-        // ACTIVE resolves to it once the transition the clock owes has fallen due,
-        // and to nothing while the model is still settling — the same rule
-        // `crate::state::asset_model_target_etag` and
-        // `DescribeAssetModelCompositeModel` hold a version alias to. A list
-        // reports absence by leaving the model out, not by refusing.
-        let version = input
-            .asset_model_version
-            .as_deref()
-            .unwrap_or(crate::state::VERSION_TYPE_LATEST);
+        // ACTIVE version, and "the details are returned in the response": the
+        // selector is resolved on each record through
+        // `crate::state::AssetModelRecord::version_view`, the ONE place every
+        // operation carrying the selector resolves it, so a model this listing
+        // reports under an alias carries exactly the definition the reads of the
+        // same model answer that alias from. A model that has no version the alias
+        // names — under ACTIVE, one no version of which has ever been active — is
+        // left out of the enumeration, since a list reports absence by leaving the
+        // model out, not by refusing.
+        let version = input.asset_model_version.as_deref();
 
         let store = state.lock();
 
-        let mut matching: Vec<&crate::state::AssetModelRecord> = store
+        let mut matching: Vec<::std::borrow::Cow<'_, crate::state::AssetModelRecord>> = store
             .asset_models
             .values()
             .filter(|model| types.is_none_or(|types| types.contains(&model.model_type)))
-            .filter(|model| {
-                version != crate::state::VERSION_TYPE_ACTIVE
-                    || model.state(now) == crate::state::STATE_ACTIVE
-            })
+            .filter_map(|model| model.version_view(version, now))
             .collect();
         // A stable order is what makes `nextToken` resumable: oldest first, ties
         // broken by id so two models created in the same instant still order
@@ -221,7 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.next_token.as_deref(),
             input.max_results,
             DEFAULT_MAX_RESULTS,
-            |model| model.id.as_str(),
+            // The id is the same in every version of one model — a version view
+            // is the same resource read as an earlier version of itself — so the
+            // resume key a token carries is the one it has always been, whichever
+            // alias the page was taken under. Taken by value, since the key the
+            // shared walk reads must not borrow from the view it came off.
+            |model| model.id.clone(),
         )
         .ok_or_else(invalid_token)?;
 
@@ -241,13 +240,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `maxResults`.
 const DEFAULT_MAX_RESULTS: i32 = 50;
 
-/// One stored asset model as this operation's summary, as of `now`.
+/// One asset model as this operation's summary, as of `now`.
 ///
-/// Every member is read from the stored record, so a listed model reports what
-/// `DescribeAssetModel` reports for it: the status is the same derived one, and
-/// the version is the same stored counter. `description` is modelled required
-/// here while the stored one is optional, which is the same `unwrap_or_default`
-/// `DescribeAssetModel` answers a model created without a description with.
+/// `record` is the model as the request's version alias names it — the view
+/// `crate::state::AssetModelRecord::version_view` resolved — so every member is
+/// read from THAT version and a listed model reports what `DescribeAssetModel`
+/// reports for it under the same alias: the version's own name, description,
+/// number and last update date, and the status that version is in.
+/// `description` is modelled required here while the stored one is optional,
+/// which is the same `unwrap_or_default` `DescribeAssetModel` answers a model
+/// created without a description with.
 fn summary(
     record: &crate::state::AssetModelRecord,
     now: ::std::time::SystemTime,

@@ -10,7 +10,8 @@
 //! to the models that have the version the alias names, cut into pages of at most
 //! `maxResults` entries, where `nextToken` is present only while another entry
 //! follows and resumes the enumeration exactly where the previous page stopped; a
-//! listed model carries the same values `DescribeAssetModel` reports for it, and a
+//! listed model carries the same values `DescribeAssetModel` reports for it under
+//! the same version alias, and a
 //! `nextToken` the operation never issued is refused rather than answered with an
 //! empty page.
 //!
@@ -31,6 +32,23 @@ const ASSET_MODELS: &str = "/asset-models";
 /// Comfortably past `state::ACTIVATION_DELAY`, so the owed CREATING -> ACTIVE
 /// transition of every model in the fixture has fallen due.
 const PAST_THE_OWED_TRANSITION: std::time::Duration = std::time::Duration::from_millis(900);
+
+/// Every member of a listed summary, paired with the `DescribeAssetModel` member
+/// that reports the same value for the same version of the same model. The one
+/// oracle for "a listed model carries what the read of it carries", used both for
+/// a settled model and for each version alias while a write is settling.
+const SAME_AS_DESCRIBE: [(&str, &str); 10] = [
+    ("id", "assetModelId"),
+    ("externalId", "assetModelExternalId"),
+    ("arn", "assetModelArn"),
+    ("name", "assetModelName"),
+    ("assetModelType", "assetModelType"),
+    ("description", "assetModelDescription"),
+    ("creationDate", "assetModelCreationDate"),
+    ("lastUpdateDate", "assetModelLastUpdateDate"),
+    ("status", "assetModelStatus"),
+    ("version", "assetModelVersion"),
+];
 
 /// One row of the fixture: the model's name, its `assetModelType`, the external id
 /// it was created with (or none) and the description it was created with (or none).
@@ -292,20 +310,7 @@ async fn a_listed_asset_model_carries_what_describe_asset_model_reports() {
         "every created model must be listed, got {body}"
     );
 
-    // The summary member and the `DescribeAssetModel` member that reports the same
-    // stored value.
-    let same: [(&str, &str); 10] = [
-        ("id", "assetModelId"),
-        ("externalId", "assetModelExternalId"),
-        ("arn", "assetModelArn"),
-        ("name", "assetModelName"),
-        ("assetModelType", "assetModelType"),
-        ("description", "assetModelDescription"),
-        ("creationDate", "assetModelCreationDate"),
-        ("lastUpdateDate", "assetModelLastUpdateDate"),
-        ("status", "assetModelStatus"),
-        ("version", "assetModelVersion"),
-    ];
+    let same = SAME_AS_DESCRIBE;
     for summary in &summaries {
         let id = summary["id"].as_str().unwrap_or("");
         let (status, described) =
@@ -659,5 +664,270 @@ async fn max_results_outside_the_modelled_range_is_refused() {
                  refused, got {status} {body}"
             );
         }
+    }
+}
+
+/// The selector value naming the newest definition — the documented default.
+const LATEST: &str = "LATEST";
+
+/// The selector value naming the newest definition that has become active.
+const ACTIVE: &str = "ACTIVE";
+
+/// Every form `assetModelVersion` arrives in: left off, which is the documented
+/// default, and each value the modelled pattern `^(LATEST|ACTIVE)$` admits
+/// (`smithy_query(query="shape", shape="AssetModelVersionFilter")`).
+const SELECTOR_FORMS: [(&str, Option<&str>); 3] = [
+    ("the selector left off, which is LATEST", None),
+    ("LATEST", Some(LATEST)),
+    ("ACTIVE", Some(ACTIVE)),
+];
+
+/// The id of the composite model each model of the settling-window table is
+/// seeded with, so the write that removes one can address it by name.
+const SETTLING_COMPOSITE_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+/// One property definition: `name` as a `DOUBLE` measurement, which every row
+/// below can hold since a write may not change a kept property's data type.
+fn measurement(name: &str) -> Value {
+    json!({"name": name, "dataType": "DOUBLE", "type": {"measurement": {}}})
+}
+
+/// One write that makes an asset model accept a new definition, opening the
+/// window in which its LATEST and its ACTIVE version are two DIFFERENT
+/// definitions.
+struct WriteCase {
+    /// The write, named for the assertion messages and used as the model's name.
+    case: &'static str,
+    method: &'static str,
+    /// What this write appends to `/asset-models/{assetModelId}`.
+    suffix: String,
+    /// The request body, or `Value::Null` for a write that carries none.
+    body: Value,
+}
+
+/// The rows: every write of this service that bumps an asset model's version, so
+/// the rule is asserted of the writes as a class rather than of one of them. They
+/// differ in method, in which members of the definition they replace and in
+/// whether they carry a body at all.
+fn settling_writes() -> Vec<WriteCase> {
+    vec![
+        WriteCase {
+            case: "UpdateAssetModel",
+            method: "PUT",
+            suffix: String::new(),
+            body: json!({
+                "assetModelName": "UpdateAssetModel renamed",
+                "assetModelDescription": "the definition the update wrote",
+                "assetModelProperties": [measurement("Pressure")],
+            }),
+        },
+        WriteCase {
+            case: "CreateAssetModelCompositeModel",
+            method: "POST",
+            suffix: "/composite-models".to_string(),
+            body: json!({
+                "assetModelCompositeModelName": "Second",
+                "assetModelCompositeModelType": "CUSTOM",
+            }),
+        },
+        WriteCase {
+            case: "DeleteAssetModelCompositeModel",
+            method: "DELETE",
+            suffix: format!("/composite-models/{SETTLING_COMPOSITE_ID}"),
+            body: Value::Null,
+        },
+    ]
+}
+
+/// Create one model of the settling-window table — named `name`, with a
+/// description, a property of its own and one composite model — and return its
+/// id.
+async fn seed_settling_model(router: &MultiServiceRouter, name: &str) -> String {
+    let body = json!({
+        "assetModelName": name,
+        "assetModelDescription": format!("{name} as created"),
+        "assetModelProperties": [measurement("Temperature")],
+        "assetModelCompositeModels": [{
+            "id": SETTLING_COMPOSITE_ID,
+            "name": "Alarm",
+            "type": "CUSTOM",
+            "properties": [measurement("Threshold")],
+        }],
+    });
+    let (status, created) = call(router, "POST", ASSET_MODELS, Some(body)).await;
+    assert_eq!(
+        status, 202,
+        "case {name:?}: CreateAssetModel expected 202, got {status} {created}"
+    );
+    let id = created["assetModelId"].as_str().unwrap_or("").to_string();
+    assert!(
+        is_modelled_id(&id),
+        "case {name:?}: assetModelId must be a modelled UUID, got {created}"
+    );
+    id
+}
+
+/// The summary this listing reports for `model_id` under the selector `alias`, or
+/// `None` when the listing leaves the model out — which is how a listing reports
+/// that the model has no version the alias names.
+async fn listed(
+    router: &MultiServiceRouter,
+    model_id: &str,
+    alias: Option<&str>,
+) -> Option<Value> {
+    let mut query = vec!["maxResults=250".to_string()];
+    if let Some(alias) = alias {
+        query.push(format!("assetModelVersion={alias}"));
+    }
+    let (status, body) = call(router, "GET", &uri(&query), None).await;
+    assert_eq!(
+        status, 200,
+        "the listing at {alias:?} expected 200, got {status} {body}"
+    );
+    body["assetModelSummaries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the listing at {alias:?} must carry summaries, got {body}"))
+        .iter()
+        .find(|summary| summary["id"].as_str() == Some(model_id))
+        .cloned()
+}
+
+/// `GET /asset-models/{model_id}` under the selector `alias`, asserting it
+/// answered: the read this listing's summary is held against.
+async fn describe_at(router: &MultiServiceRouter, model_id: &str, alias: Option<&str>) -> Value {
+    let suffix = alias
+        .map(|alias| format!("?assetModelVersion={alias}"))
+        .unwrap_or_default();
+    let target = format!("{ASSET_MODELS}/{model_id}{suffix}");
+    let (status, body) = call(router, "GET", &target, None).await;
+    assert_eq!(
+        status, 200,
+        "DescribeAssetModel at {alias:?} expected 200 from {target}, got {status} {body}"
+    );
+    body
+}
+
+#[tokio::test]
+async fn each_version_alias_lists_the_details_of_the_version_it_names() {
+    let router = router();
+    let rows = settling_writes();
+
+    // One model per row, created first and waited for ONCE: the owed transition is
+    // a clock the whole store shares, so after this every seeded definition IS its
+    // model's active version — which is what the writes below supersede.
+    let mut ids = Vec::new();
+    for row in &rows {
+        ids.push(seed_settling_model(&router, row.case).await);
+    }
+    tokio::time::sleep(PAST_THE_OWED_TRANSITION).await;
+
+    for (row, id) in rows.iter().zip(&ids) {
+        let case = row.case;
+        // Before the write both aliases name ONE definition, so the listing
+        // reports the same summary under every form of the selector.
+        let settled = listed(&router, id, Some(ACTIVE))
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: a settled model must be listed at {ACTIVE}"));
+        for (form, alias) in SELECTOR_FORMS {
+            let summary = listed(&router, id, alias).await.unwrap_or_else(|| {
+                panic!("case {case:?} {form:?}: a settled model must be listed")
+            });
+            assert_eq!(
+                summary, settled,
+                "case {case:?} {form:?}: before any write every alias names one definition, got \
+                 {summary} against {settled}"
+            );
+        }
+
+        // The write is accepted, so from here until the transition it owes falls
+        // due the model's latest and active versions are two definitions.
+        let request = (row.body != Value::Null).then(|| row.body.clone());
+        let (status, answered) = call(
+            &router,
+            row.method,
+            &format!("{ASSET_MODELS}/{id}{}", row.suffix),
+            request,
+        )
+        .await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: the write expected 202, got {status} {answered}"
+        );
+
+        // Inside the window: the model HAS the version each alias names, so the
+        // listing reports it — with that version's details, member for member what
+        // the read of the same model under the same alias reports.
+        for (form, alias) in SELECTOR_FORMS {
+            let summary = listed(&router, id, alias).await.unwrap_or_else(|| {
+                panic!(
+                    "case {case:?} {form:?}: the model has the version this alias names, so the \
+                     listing must report it"
+                )
+            });
+            let described = describe_at(&router, id, alias).await;
+            for (member, described_as) in SAME_AS_DESCRIBE {
+                assert_eq!(
+                    summary[member], described[described_as],
+                    "case {case:?} {form:?}: the listed {member} must be the {described_as} the \
+                     read of that version reports: {summary} against {described}"
+                );
+            }
+        }
+
+        // And the two aliases name two DIFFERENT definitions for exactly this
+        // window: the one the write superseded, which is the active one, and the
+        // one the write wrote, which is still settling.
+        let active = listed(&router, id, Some(ACTIVE))
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: the model still has an active version"));
+        let latest = listed(&router, id, Some(LATEST))
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: the model has a latest version"));
+        for member in ["version", "name", "description", "lastUpdateDate"] {
+            assert_eq!(
+                active[member], settled[member],
+                "case {case:?}: the listed {member} at {ACTIVE} must be the superseded \
+                 definition's, got {active} against {settled}"
+            );
+        }
+        assert_ne!(
+            latest["version"], active["version"],
+            "case {case:?}: the write must leave a version of its own, got {latest} against \
+             {active}"
+        );
+        assert_ne!(
+            latest["lastUpdateDate"], active["lastUpdateDate"],
+            "case {case:?}: the two versions were written by two calls, got {latest} against \
+             {active}"
+        );
+        assert_eq!(
+            active["status"]["state"],
+            json!("ACTIVE"),
+            "case {case:?}: the version selected as the active one is in the ACTIVE state, got \
+             {active}"
+        );
+        assert_eq!(
+            latest["status"]["state"],
+            json!("UPDATING"),
+            "case {case:?}: the version the write wrote is still settling, got {latest}"
+        );
+    }
+
+    // Once the transition each write owes falls due, the version it wrote IS the
+    // active one, so both aliases name one definition again.
+    tokio::time::sleep(PAST_THE_OWED_TRANSITION).await;
+    for (row, id) in rows.iter().zip(&ids) {
+        let case = row.case;
+        let active = listed(&router, id, Some(ACTIVE))
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: a settled model is listed at {ACTIVE}"));
+        let latest = listed(&router, id, Some(LATEST))
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: a settled model is listed at {LATEST}"));
+        assert_eq!(
+            active, latest,
+            "case {case:?}: once the write settled both aliases name one definition, got {active} \
+             against {latest}"
+        );
     }
 }
