@@ -295,13 +295,29 @@ fn input_type_cases() -> Vec<InputTypeCase> {
             refused_as: None,
         },
         InputTypeCase {
-            label: "OutputLockingMode on MULTIVIEW input",
+            label: "OutputLockingMode NON_EPOCH_LOCKED on MULTIVIEW input",
             input_type: Some("MULTIVIEW"),
             // A MULTIVIEW channel carries the configuration its own doc calls required on
-            // that input type, over the CMAF source this suite seeds.
+            // that input type, over the CMAF source this suite seeds — so the only thing
+            // the create can be refused for is the locking mode it also names, which a
+            // multiview channel carries at its other value alone.
             members: || {
                 json!({
                     "OutputLockingMode": "NON_EPOCH_LOCKED",
+                    "MultiviewConfiguration": {
+                        "AvailableSources": ["source-a"],
+                        "AvailableLayouts": ["LAYOUT_2EH"],
+                    },
+                })
+            },
+            refused_as: Some("MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED"),
+        },
+        InputTypeCase {
+            label: "OutputLockingMode EPOCH_LOCKED on MULTIVIEW input",
+            input_type: Some("MULTIVIEW"),
+            members: || {
+                json!({
+                    "OutputLockingMode": "EPOCH_LOCKED",
                     "MultiviewConfiguration": {
                         "AvailableSources": ["source-a"],
                         "AvailableLayouts": ["LAYOUT_2EH"],

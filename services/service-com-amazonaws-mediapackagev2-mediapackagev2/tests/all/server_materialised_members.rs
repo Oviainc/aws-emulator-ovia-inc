@@ -183,11 +183,10 @@ fn channel_default_cases() -> Vec<Case> {
             ],
         },
         Case {
-            label: "a multiview channel naming the non-default locking mode",
+            label: "a multiview channel over a single source and layout",
             body: || {
                 json!({
                     "InputType": "MULTIVIEW",
-                    "OutputLockingMode": "NON_EPOCH_LOCKED",
                     "MultiviewConfiguration": {
                         "AvailableSources": ["feed-a"],
                         "AvailableLayouts": ["LAYOUT_4E"],
@@ -196,7 +195,10 @@ fn channel_default_cases() -> Vec<Case> {
             },
             expected: vec![
                 ("/InputType", json!("MULTIVIEW")),
-                ("/OutputLockingMode", json!("NON_EPOCH_LOCKED")),
+                // The documented default named explicitly is the only locking mode a
+                // multiview channel may have, so it is also what one that names none
+                // reports.
+                ("/OutputLockingMode", json!("EPOCH_LOCKED")),
             ],
         },
     ]

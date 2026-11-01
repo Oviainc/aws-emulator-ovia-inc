@@ -11,14 +11,18 @@
 //! with the `ValidationExceptionType` the model declares for that combination and stores
 //! nothing. A stored member and a refused one can never disagree.
 //!
-//! `OutputLockingMode` is the channel member documented that way: "only configurable when
-//! the channel InputType is CMAF or MULTIVIEW", "If you don't specify a value, the default
-//! is `EPOCH_LOCKED`", with `ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE` naming the
-//! refusal (`smithy_query(query="shape", shape="OutputLockingMode,ValidationExceptionType")`).
+//! `OutputLockingMode` is the channel member documented that way: "If you don't specify a
+//! value, the default is `EPOCH_LOCKED`", with the input types that may configure it named
+//! by the refusal the service answers for it ("OutputLockingMode can only be configured
+//! when the channel InputType is CMAF or MULTIVIEW") and
+//! `ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE` naming that refusal
+//! (`smithy_query(query="shape", shape="OutputLockingMode,ValidationExceptionType")`).
 //! The rows span the model's whole `InputType` enum (HLS | CMAF | MULTIVIEW) plus the
 //! absent case, which `CreateChannelRequest$InputType` defaults to HLS, against each value
-//! of the member's own enum. What every projection of a channel reports for the members
-//! the service applies is the sibling suite,
+//! of the member's own enum — including the one VALUE an input type that carries the member
+//! may not take, which is its own refusal and the subject of
+//! `tests/all/multiview_epoch_locking.rs`. What every projection of a channel reports for
+//! the members the service applies is the sibling suite,
 //! `tests/all/channel_members_by_input_type.rs`.
 
 use serde_json::json;
@@ -33,15 +37,21 @@ use crate::channel_members_by_input_type::multiview_members;
 /// submitted one.
 #[tokio::test]
 async fn the_input_types_that_carry_the_locking_mode_are_the_ones_that_accept_it() {
-    // (label, the InputType the create names, whether that input type carries the member)
-    let rows: &[(&str, Option<&str>, bool)] = &[
-        ("no input type at all, so the default HLS", None, false),
-        ("an HLS channel", Some("HLS"), false),
-        ("a CMAF channel", Some("CMAF"), true),
-        ("a multiview channel", Some("MULTIVIEW"), true),
+    // (label, the InputType the create names, whether that input type carries the member,
+    // the one value of the member that input type may not take)
+    let rows: &[(&str, Option<&str>, bool, Option<&str>)] = &[
+        ("no input type at all, so the default HLS", None, false, None),
+        ("an HLS channel", Some("HLS"), false, None),
+        ("a CMAF channel", Some("CMAF"), true, None),
+        (
+            "a multiview channel",
+            Some("MULTIVIEW"),
+            true,
+            Some("NON_EPOCH_LOCKED"),
+        ),
     ];
 
-    for (label, input_type, carries) in rows {
+    for (label, input_type, carries, refused_value) in rows {
         let emulator = Emulator::new();
         let group = "locking-group";
         assert_eq!(
@@ -98,25 +108,21 @@ async fn the_input_types_that_carry_the_locking_mode_are_the_ones_that_accept_it
         );
 
         // The accepting side: the same member SUBMITTED, at each value of its own enum.
+        // An input type that carries the member accepts every value but the one its own
+        // discriminator names, which is refused as a value rather than as a member.
         for mode in ["EPOCH_LOCKED", "NON_EPOCH_LOCKED"] {
             let mut body = base();
             body["OutputLockingMode"] = json!(mode);
             let name = format!("named-{}", mode.to_lowercase());
             let (status, answer) = emulator.create_channel(group, &name, body).await;
-            if *carries {
-                assert_eq!(
-                    status, 200,
-                    "case {label:?}: CreateChannel naming {mode} expected 200, got \
-                     {status} {answer}"
-                );
-                let actual = at(&answer, "/OutputLockingMode");
-                assert_eq!(
-                    actual,
-                    json!(mode),
-                    "case {label:?}: the channel must report the {mode} it was created \
-                     with, got {actual}"
-                );
+            let expected_type = if !*carries {
+                Some("ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE")
+            } else if *refused_value == Some(mode) {
+                Some("MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED")
             } else {
+                None
+            };
+            if let Some(expected_type) = expected_type {
                 assert_eq!(
                     status, 400,
                     "case {label:?}: CreateChannel naming {mode} expected 400, got \
@@ -130,16 +136,28 @@ async fn the_input_types_that_carry_the_locking_mode_are_the_ones_that_accept_it
                 );
                 assert_eq!(
                     answer["ValidationExceptionType"],
-                    json!("ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE"),
-                    "case {label:?}: naming {mode} expected \
-                     ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE, got {answer}"
+                    json!(expected_type),
+                    "case {label:?}: naming {mode} expected {expected_type}, got {answer}"
                 );
                 assert_eq!(
                     emulator.get_channel(group, &name).await.0,
                     404,
                     "case {label:?}: a refused create naming {mode} must store nothing"
                 );
+                continue;
             }
+            assert_eq!(
+                status, 200,
+                "case {label:?}: CreateChannel naming {mode} expected 200, got \
+                 {status} {answer}"
+            );
+            let actual = at(&answer, "/OutputLockingMode");
+            assert_eq!(
+                actual,
+                json!(mode),
+                "case {label:?}: the channel must report the {mode} it was created \
+                 with, got {actual}"
+            );
         }
     }
 }

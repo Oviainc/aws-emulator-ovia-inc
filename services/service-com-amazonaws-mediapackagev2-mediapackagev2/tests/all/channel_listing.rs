@@ -180,13 +180,20 @@ fn projection_cases() -> Vec<ProjectionCase> {
             },
         },
         ProjectionCase {
+            label: "CMAF input naming no locking mode, empty description",
+            channel: "c-cmaf-default",
+            body: || json!({"InputType": "CMAF", "Description": ""}),
+        },
+        ProjectionCase {
             label: "multiview channel compositing two sources",
             channel: "c-multiview",
             body: || {
                 json!({
                     "InputType": "MULTIVIEW",
                     "MultiviewConfiguration": {
-                        "AvailableSources": ["C_cmaf_0", "c-cmaf-nonepoch"],
+                        // A composition admits only epoch-locked sources, so the
+                        // non-epoch-locked row above is not one of these.
+                        "AvailableSources": ["C_cmaf_0", "c-cmaf-default"],
                         "AvailableLayouts": ["LAYOUT_2EH", "LAYOUT_4E"],
                     },
                 })

@@ -11,7 +11,8 @@
 //! can be changed but neither added nor removed — is preserved when the request omits it,
 //! and, when it carries one, is held to the same contents rules the create holds it to:
 //! neither of its lists may repeat an entry, and each available source must name a
-//! channel of the same group whose input type a tile source may have.
+//! channel of the same group whose input type and output locking mode a tile source may
+//! have.
 //! The read-only `AttachedMultiviewChannels` member is DERIVED from the group after the
 //! write, as on every other channel reader, since an update neither adds nor removes an
 //! attachment.
@@ -345,7 +346,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A submitted multiview configuration REPLACES the stored one, so its contents are
         // held to the rules the create holds them to: neither list may repeat an entry
         // (decided above, without the store), and every available source has to be a
-        // channel of this same group whose input type a tile source may have. The
+        // channel of this same group whose input type and output locking mode a tile
+        // source may have. The
         // required-member direction is not an update's: an absent configuration leaves the
         // stored one in place (below), so the channel still has the one its input type
         // requires.

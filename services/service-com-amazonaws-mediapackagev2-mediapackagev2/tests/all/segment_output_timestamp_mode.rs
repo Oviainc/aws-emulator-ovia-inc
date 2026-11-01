@@ -22,9 +22,10 @@
 //! (`smithy_query(query="shape", shape="OutputTimestampMode,OutputLockingMode,InputType")`):
 //! `OutputTimestampMode` is PASSTHROUGH | REBASED_TO_CHANNEL_START, `OutputLockingMode`
 //! is EPOCH_LOCKED | NON_EPOCH_LOCKED and `InputType` is HLS | CMAF | MULTIVIEW — and
-//! because an `OutputLockingMode` is itself only carried by some input types, the channel
-//! rows below cover each input type with the mode absent, with the default named, and
-//! with the non-default one.
+//! because an `OutputLockingMode` is itself only carried by some input types, and only at
+//! some of its values, the channel rows below cover each input type with the locking mode
+//! absent, with the default named and with the non-default one wherever a channel may
+//! have it.
 
 use serde_json::{json, Value};
 
@@ -54,9 +55,10 @@ struct ChannelCase {
     container: &'static str,
 }
 
-/// Each input type with no locking mode, with `EPOCH_LOCKED` and with `NON_EPOCH_LOCKED`
-/// — only the last of those carries an output-timestamp mode, whichever input type it is
-/// on, and an HLS channel carries no locking mode at all so it never does.
+/// Each input type with no locking mode, with `EPOCH_LOCKED` and — where a channel may
+/// have it — with `NON_EPOCH_LOCKED`; only the last of those carries an output-timestamp
+/// mode, and a channel that carries no locking mode, or that may only be epoch-locked,
+/// never does.
 fn channel_cases() -> Vec<ChannelCase> {
     vec![
         ChannelCase {
@@ -90,22 +92,7 @@ fn channel_cases() -> Vec<ChannelCase> {
             container: "TS",
         },
         ChannelCase {
-            label: "a multiview channel that is NOT epoch-locked",
-            body: || {
-                json!({
-                    "InputType": "MULTIVIEW",
-                    "OutputLockingMode": "NON_EPOCH_LOCKED",
-                    "MultiviewConfiguration": {
-                        "AvailableSources": ["source-feed"],
-                        "AvailableLayouts": ["LAYOUT_4E"],
-                    },
-                })
-            },
-            carries_mode: true,
-            container: "CMAF",
-        },
-        ChannelCase {
-            label: "a multiview channel naming no locking mode",
+            label: "a multiview channel, which can only be epoch-locked",
             body: || {
                 json!({
                     "InputType": "MULTIVIEW",
@@ -117,6 +104,21 @@ fn channel_cases() -> Vec<ChannelCase> {
             },
             carries_mode: false,
             container: "CMAF",
+        },
+        ChannelCase {
+            label: "a multiview channel naming the one locking mode it may have",
+            body: || {
+                json!({
+                    "InputType": "MULTIVIEW",
+                    "OutputLockingMode": "EPOCH_LOCKED",
+                    "MultiviewConfiguration": {
+                        "AvailableSources": ["source-feed"],
+                        "AvailableLayouts": ["LAYOUT_4E"],
+                    },
+                })
+            },
+            carries_mode: false,
+            container: "TS",
         },
     ]
 }

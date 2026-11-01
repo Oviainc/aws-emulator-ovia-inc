@@ -306,6 +306,12 @@ pub const VALIDATION_INVALID_PAGINATION_TOKEN: &str = "INVALID_PAGINATION_TOKEN"
 /// See [`VALIDATION_END_TIME_EARLIER_THAN_START_TIME`].
 pub const VALIDATION_ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE: &str =
     "ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE";
+/// See [`VALIDATION_END_TIME_EARLIER_THAN_START_TIME`].
+pub const VALIDATION_MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED: &str =
+    "MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED";
+/// See [`VALIDATION_END_TIME_EARLIER_THAN_START_TIME`].
+pub const VALIDATION_MULTIVIEW_SOURCE_NON_EPOCH_LOCKED: &str =
+    "MULTIVIEW_SOURCE_NON_EPOCH_LOCKED";
 
 /// The 409 for a conditional update that lost the race: the entity tag the caller
 /// presented is no longer the committed one.
@@ -1679,7 +1685,9 @@ pub fn materialized_input_type(submitted: Option<String>) -> String {
 /// channel that may not has no mode and reports none — which is what the recorded service
 /// reports for such a channel. The restriction is read off the same table a SUBMITTED
 /// mode is refused by ([`channel_carries_member`]), so a stored mode and a refused one can
-/// never disagree about which input types carry the member.
+/// never disagree about which input types carry the member. The default is also the one
+/// value every input type that carries the member may have, so applying it can never
+/// store the value [`channel_output_locking_mode_value_violation`] refuses.
 pub fn materialized_output_locking_mode(
     submitted: Option<String>,
     input_type: &str,
@@ -3276,19 +3284,26 @@ struct ChannelInputTypeRule {
     present: fn(&SubmittedChannelMembers) -> bool,
 }
 
-/// Every `InputType` restriction the model states for a channel member, one row per
-/// `ValidationExceptionType` that names one.
+/// Every `InputType` restriction the model states on the PRESENCE of a channel member,
+/// one row per `ValidationExceptionType` that names one. A restriction on a member's
+/// VALUE rather than on its presence is stated beside it, in
+/// [`channel_output_locking_mode_value_violation`].
 ///
-/// The rows are read off the model, not guessed: each member's own doc says which input
-/// types may carry it (`OutputLockingMode` — "only configurable when the channel
-/// InputType is CMAF or MULTIVIEW"; `MQCSInputSwitching` / `PreferredInput` /
-/// `PublishMQCS` — "valid only when InputType is CMAF"; `MultiviewConfiguration` —
-/// "required when InputType is MULTIVIEW, and can't be set for any other input type"),
-/// and `ValidationExceptionType` carries exactly one discriminator per row.
+/// The rows are read off the model and off the refusal the service itself answers, not
+/// guessed. `MQCSInputSwitching` / `PreferredInput` / `PublishMQCS` carry "valid only when
+/// InputType is CMAF" and `MultiviewConfiguration` "required when InputType is MULTIVIEW,
+/// and can't be set for any other input type" in their own member docs. For
+/// `OutputLockingMode` the recorded refusal names the input types that may configure the
+/// member — "OutputLockingMode can only be configured when the channel InputType is CMAF
+/// or MULTIVIEW" — which is also the only reading that leaves the model's
+/// `MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED` discriminator something to refuse: a
+/// multiview channel carries the member, at one of its two values only
+/// ([`channel_output_locking_mode_value_violation`]). `ValidationExceptionType` carries
+/// exactly one discriminator per row.
 const CHANNEL_INPUT_TYPE_RULES: &[ChannelInputTypeRule] = &[
     ChannelInputTypeRule {
-        member: "outputLockingMode",
-        allowed: &["CMAF", "MULTIVIEW"],
+        member: OUTPUT_LOCKING_MODE_MEMBER,
+        allowed: &["CMAF", INPUT_TYPE_MULTIVIEW],
         exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE",
         // The member has a documented DEFAULT, so an absent one is materialised rather
         // than refused: see `materialized_output_locking_mode`.
@@ -3425,6 +3440,55 @@ pub fn channel_required_member_violation(
                 exception_type,
             )
         })
+}
+
+/// The member path of a channel's output locking mode, as a validation message names it
+/// (lowerCamel, as on the wire). Written once: the member is restricted twice, on its
+/// PRESENCE by [`CHANNEL_INPUT_TYPE_RULES`] and on its VALUE by
+/// [`channel_output_locking_mode_value_violation`], and both refusals path it the same.
+const OUTPUT_LOCKING_MODE_MEMBER: &str = "outputLockingMode";
+
+/// The `OutputLockingMode` no channel of a multiview composition may have.
+///
+/// A multiview channel composites tiles from several channels into one output stream,
+/// which only lines up while every stream in the composition carries the deterministic,
+/// epoch-aligned segment boundaries the other mode does not: the model's
+/// `OutputLockingMode` doc gives `EPOCH_LOCKED` "deterministic sequence numbering and
+/// fixed segment boundaries aligned to epoch time" and this value "duration-based segment
+/// combining and monotonically increasing sequence numbers starting from 0". The model
+/// names the refusal once per side of the composition —
+/// `MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED` for the multiview channel itself
+/// ([`channel_output_locking_mode_value_violation`]) and `MULTIVIEW_SOURCE_NON_EPOCH_LOCKED`
+/// for a tile source it names ([`multiview_source_violation`]) — so both read this one
+/// value and cannot disagree about which mode a composition admits.
+pub const MULTIVIEW_REFUSED_OUTPUT_LOCKING_MODE: &str = "NON_EPOCH_LOCKED";
+
+/// The refusal for a request that asks for an output locking mode the channel's input
+/// type may not have, or `None` when it may.
+///
+/// The VALUE half of the member's restriction: [`channel_input_type_violation`] decides
+/// which input types carry the member at all, and a member an input type DOES carry can
+/// still be restricted to some of its values, with its own `ValidationExceptionType` —
+/// which is the only kind of refusal `MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED` can
+/// name, since a multiview channel carries the member. Decided from the request and the
+/// input type alone, so the create settles it before anything is stored; `UpdateChannel`
+/// does not bind the member, so no later write can introduce the refused value.
+pub fn channel_output_locking_mode_value_violation(
+    submitted: Option<&str>,
+    input_type: &str,
+) -> Option<ValidationException> {
+    let refused = submitted == Some(MULTIVIEW_REFUSED_OUTPUT_LOCKING_MODE)
+        && is_multiview_input_type(input_type);
+    refused.then(|| {
+        validation_failed(
+            OUTPUT_LOCKING_MODE_MEMBER,
+            &format!(
+                "OutputLockingMode can't be {MULTIVIEW_REFUSED_OUTPUT_LOCKING_MODE} when \
+                 the channel InputType is {INPUT_TYPE_MULTIVIEW}. {CHECK_THE_VALUE}"
+            ),
+            VALIDATION_MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED,
+        )
+    })
 }
 
 /// Which of an origin endpoint's restricted settings a request carries.
@@ -3680,10 +3744,12 @@ pub fn multiview_repetition_violation(
 ///
 /// `AvailableSources` names other CHANNELS, so it is resolved against the store the way
 /// every other reference to a resource is: a name no channel of the SAME group carries is
-/// the model's not-found discriminator, and one whose channel is not of the input type a
+/// the model's not-found discriminator, one whose channel is not of the input type a
 /// tile source must have is its invalid-input-type one
 /// (`MultiviewConfiguration$AvailableSources`: "Each source channel must be in the same
-/// channel group as the multiview channel, and must have an `InputType` of `CMAF`"). The
+/// channel group as the multiview channel, and must have an `InputType` of `CMAF`"), and
+/// one whose channel is locked the way no channel of a composition may be
+/// ([`MULTIVIEW_REFUSED_OUTPUT_LOCKING_MODE`]) is the source side of that same rule. The
 /// sources are walked in the order the request listed them, so the refusal is a function
 /// of the request and not of the store's iteration.
 pub fn multiview_source_violation(
@@ -3709,6 +3775,20 @@ pub fn multiview_source_violation(
                      {MULTIVIEW_SOURCE_INPUT_TYPE}. {CHECK_THE_VALUE}"
                 ),
                 "MULTIVIEW_SOURCE_INVALID_INPUT_TYPE",
+            ));
+        }
+        // The other side of the composition's one locking rule: a tile source whose own
+        // output locking mode is the one no channel of a composition may have cannot be
+        // composited, which is the refusal the model names for a source.
+        if channel.output_locking_mode.as_deref() == Some(MULTIVIEW_REFUSED_OUTPUT_LOCKING_MODE) {
+            return Some(validation_failed(
+                MULTIVIEW_SOURCES_MEMBER,
+                &format!(
+                    "A source channel of a multiview channel can't have an \
+                     OutputLockingMode of {MULTIVIEW_REFUSED_OUTPUT_LOCKING_MODE}. \
+                     {CHECK_THE_VALUE}"
+                ),
+                VALIDATION_MULTIVIEW_SOURCE_NON_EPOCH_LOCKED,
             ));
         }
     }
@@ -5478,6 +5558,48 @@ mod tests {
                     violation.is_none(),
                     "case {label:?}: expected no refusal, got {violation:?}"
                 ),
+            }
+        }
+    }
+
+    /// A VALUE an input type that CARRIES a member may not take is refused on that input
+    /// type and accepted on the ones the restriction does not name — the whole
+    /// `InputType` enum against the whole `OutputLockingMode` enum, plus the absent case.
+    ///
+    /// The catalogues are the model's own
+    /// (`smithy_query(query="shape", shape="InputType,OutputLockingMode")`): `InputType`
+    /// is HLS | CMAF | MULTIVIEW and `OutputLockingMode` is EPOCH_LOCKED |
+    /// NON_EPOCH_LOCKED.
+    #[test]
+    fn a_value_an_input_type_may_not_take_is_refused_on_that_input_type() {
+        for input_type in ["HLS", "CMAF", INPUT_TYPE_MULTIVIEW] {
+            for submitted in [None, Some(DEFAULT_OUTPUT_LOCKING_MODE), Some("NON_EPOCH_LOCKED")] {
+                let label = format!("{input_type} with {submitted:?}");
+                let violation = channel_output_locking_mode_value_violation(submitted, input_type);
+                let refused = submitted == Some(MULTIVIEW_REFUSED_OUTPUT_LOCKING_MODE)
+                    && input_type == INPUT_TYPE_MULTIVIEW;
+                assert_eq!(
+                    violation.is_some(),
+                    refused,
+                    "case {label:?}: this combination being refused is {refused}, got \
+                     {violation:?}"
+                );
+                let Some(violation) = violation else { continue };
+                assert_eq!(
+                    violation.validation_exception_type.as_deref(),
+                    Some(VALIDATION_MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED),
+                    "case {label:?}: expected \
+                     {VALIDATION_MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED}, got \
+                     {violation:?}"
+                );
+                let message = violation.message.as_deref().unwrap_or_default();
+                assert!(
+                    message.starts_with(&format!(
+                        "Validation error encountered at request.{OUTPUT_LOCKING_MODE_MEMBER}:"
+                    )),
+                    "case {label:?}: expected this service's message form at the member \
+                     the refusal is about, got {message:?}"
+                );
             }
         }
     }

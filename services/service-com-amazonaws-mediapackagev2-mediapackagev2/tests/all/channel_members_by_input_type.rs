@@ -19,7 +19,8 @@
 //!   default for the first of them ("Default is false").
 //! * `OutputLockingMode`, documented with both a default ("If you don't specify a value,
 //!   the default is `EPOCH_LOCKED`") and a restriction on which input types may carry it
-//!   ("only configurable when the channel InputType is CMAF or MULTIVIEW"), is applied
+//!   (the refusal the service answers for it names them: "only be configured when the
+//!   channel InputType is CMAF or MULTIVIEW"), is applied
 //!   only where the channel may carry one, and no projection of a channel that may not
 //!   reports one — which is also what the recorded service reports for such a channel.
 //!   The two sides of that restriction are pinned together in
@@ -140,21 +141,25 @@ fn cases() -> Vec<Case> {
             input_type: Some("MULTIVIEW"),
             sources: &["tile-source"],
             members: multiview_members,
-            // MULTIVIEW is the second input type that carries the locking mode.
+            // MULTIVIEW is the second input type that carries the locking mode, at the
+            // one value a composition admits.
             expected: || applied_state_with_locking_mode(json!("EPOCH_LOCKED")),
             after_empty_update: || applied_state_with_locking_mode(json!("EPOCH_LOCKED")),
         },
         Case {
-            label: "a multiview channel naming the non-default locking mode",
+            label: "a multiview channel over two tile sources and two layouts",
             input_type: Some("MULTIVIEW"),
-            sources: &["tile-source"],
+            sources: &["tile-source", "tile-source-b"],
             members: || {
-                let mut body = multiview_members();
-                body["OutputLockingMode"] = json!("NON_EPOCH_LOCKED");
-                body
+                json!({
+                    "MultiviewConfiguration": {
+                        "AvailableSources": ["tile-source", "tile-source-b"],
+                        "AvailableLayouts": ["LAYOUT_2EH", "LAYOUT_4E"],
+                    },
+                })
             },
-            expected: || applied_state_with_locking_mode(json!("NON_EPOCH_LOCKED")),
-            after_empty_update: || applied_state_with_locking_mode(json!("NON_EPOCH_LOCKED")),
+            expected: || applied_state_with_locking_mode(json!("EPOCH_LOCKED")),
+            after_empty_update: || applied_state_with_locking_mode(json!("EPOCH_LOCKED")),
         },
     ]
 }

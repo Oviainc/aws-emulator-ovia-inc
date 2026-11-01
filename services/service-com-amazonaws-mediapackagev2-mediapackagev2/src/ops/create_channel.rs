@@ -16,13 +16,15 @@
 //! here, before anything is stored:
 //!
 //! * a member the docs restrict to particular `InputType`s is refused on any other
-//!   input type, and a member the docs call REQUIRED on an input type is refused when it
+//!   input type, a VALUE an input type that does carry the member may not take is refused
+//!   on it, and a member the docs call REQUIRED on an input type is refused when it
 //!   is absent on one, each with the `ValidationExceptionType` the model names for it
-//!   (see [`crate::state::channel_input_type_violation`] and
+//!   (see [`crate::state::channel_input_type_violation`],
+//!   [`crate::state::channel_output_locking_mode_value_violation`] and
 //!   [`crate::state::channel_required_member_violation`]). A submitted multiview
 //!   configuration is checked through as well: each of its two lists admits an entry at
 //!   most once, and every available source it names has to be a channel of this same
-//!   group whose input type a tile source may have;
+//!   group whose input type and output locking mode a tile source may have;
 //! * `@idempotency`: a repeat under a `ClientToken` that already created a channel
 //!   replays that channel when the request is unchanged, and is a `ConflictException` /
 //!   `IDEMPOTENT_PARAMETER_MISMATCH` when any member differs.
@@ -262,12 +264,19 @@ fn submitted_members(input: &CreateChannelInput) -> crate::state::SubmittedChann
 
 /// The first `InputType` restriction this request breaks, as the modeled
 /// `ValidationException` to answer it with: a member submitted on an input type that may
-/// not carry it, or one an input type REQUIRES that the request leaves out. A create
-/// describes a whole channel, so both directions of the shared rule table apply to it.
+/// not carry it, a VALUE an input type that does carry the member may not take, or a
+/// member an input type REQUIRES that the request leaves out. A create describes a whole
+/// channel, so every direction of the shared rule table applies to it.
 fn input_type_violation(input: &CreateChannelInput) -> Option<ValidationException> {
     let submitted = submitted_members(input);
     let input_type = effective_input_type(input);
     crate::state::channel_input_type_violation(submitted, input_type)
+        .or_else(|| {
+            crate::state::channel_output_locking_mode_value_violation(
+                input.output_locking_mode.as_deref(),
+                input_type,
+            )
+        })
         .or_else(|| crate::state::channel_required_member_violation(submitted, input_type))
 }
 
@@ -401,7 +410,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Now that the group is in hand, every available source the multiview
         // configuration names is resolved against it: a tile source must be a channel of
-        // this same group, of the input type a source must have.
+        // this same group, of the input type a source must have and not locked the way no
+        // channel of a composition may be.
         if let Some(violation) = input
             .multiview_configuration
             .as_ref()
