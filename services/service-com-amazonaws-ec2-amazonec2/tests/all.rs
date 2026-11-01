@@ -896,6 +896,11 @@ mod vpc_endpoints_and_byoip;
 mod vpc_lifecycle;
 #[path = "all/vpc_network_lifecycle.rs"]
 mod vpc_network_lifecycle;
+// What `CreateVpcPeeringConnection` records between two VPCs and how
+// `DescribeVpcPeeringConnections` reports it: the status the clock moves, the expiry of an
+// unanswered request, the overlapping-range failure, and the ids, filters and pages.
+#[path = "all/vpc_peering_connections.rs"]
+mod vpc_peering_connections;
 #[path = "all/vpc_resources_blocking_encryption_enforcement.rs"]
 mod vpc_resources_blocking_encryption_enforcement;
 #[path = "all/vpn_connection_device_types.rs"]

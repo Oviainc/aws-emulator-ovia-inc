@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcPeeringConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpcPeeringConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records a peering request between the requester VPC the request names and
+//! the accepter VPC it asks to peer with, stores it as the modelled
+//! [`VpcPeeringConnection`] shape beside the status move the clock owes it, and answers it
+//! in `initiating-request` — or in `failed`, when this store can see that the two VPCs'
+//! CIDR blocks overlap (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::insert_vpc_peering_connection`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpcPeeringConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +152,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpcPeeringConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcPeeringConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpcPeeringConnection"))
+        use crate::state;
+
+        // "The ID of the VPC with which you are creating the VPC peering connection. You
+        // must specify this parameter in the request" (`PeerVpcId`) — the model leaves the
+        // member optional, so the rule the documentation states is enforced here.
+        let Some(peer_vpc_id) = input
+            .peer_vpc_id
+            .as_deref()
+            .filter(|peer_vpc_id| !peer_vpc_id.is_empty())
+        else {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter peerVpcId",
+            ));
+        };
+
+        // The Region this request was signed for: it is where the requester VPC is, and it
+        // is what `PeerRegion` defaults to.
+        let region = state::request_region(ctx.parts());
+
+        // "The Amazon Web Services account ID of the owner of the accepter VPC. Default:
+        // Your Amazon Web Services account ID" (`PeerOwnerId`) — an account id is twelve
+        // digits, so anything else names no account.
+        let peer_owner_id = match input
+            .peer_owner_id
+            .as_deref()
+            .filter(|owner| !owner.is_empty())
+        {
+            None => ::engine::emulator_account_id().to_string(),
+            Some(owner) if state::aws_account_id_is_well_formed(owner) => owner.to_string(),
+            Some(owner) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value '{owner}' for PeerOwnerId. It must be a 12-digit Amazon \
+                     Web Services account ID"
+                )))
+            }
+        };
+
+        // "The Region code for the accepter VPC, if the accepter VPC is located in a Region
+        // other than the Region in which you make the request. Default: The Region in which
+        // you make the request" (`PeerRegion`): held to the Region catalog of the account's
+        // own partition, plus the Region this call was signed for, the same reading
+        // `crate::ops::copy_snapshot` gives its own `SourceRegion`. A value that names no
+        // Region names no accepter VPC's Region, so it is refused rather than stored.
+        let peer_region = match input
+            .peer_region
+            .as_deref()
+            .filter(|peer_region| !peer_region.is_empty())
+        {
+            None => region.clone(),
+            Some(peer_region)
+                if peer_region == region
+                    || (state::is_catalog_region(peer_region)
+                        && state::regions_in_partition_of(&region).contains(&peer_region)) =>
+            {
+                peer_region.to_string()
+            }
+            Some(peer_region) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({peer_region}) for parameter peerRegion is invalid. \
+                     This is not a valid Region name."
+                )))
+            }
+        };
+
+        // Neither VPC id is looked up before its FORM is checked: a value that is no VPC id
+        // at all is a different client mistake from a well-formed id naming no VPC, and EC2
+        // answers the first without looking the value up — the ordering
+        // [`crate::state::require_well_formed_id`] holds every resource of this crate to. It
+        // is checked here, where the request's own members are, rather than after the store
+        // is read, so a malformed id is never answered by the DryRun arm below either.
+        state::require_well_formed_id(
+            state::RESOURCE_TYPE_VPC,
+            &input.vpc_id,
+            state::INVALID_VPC_ID_MALFORMED,
+        )?;
+        state::require_well_formed_id(
+            state::RESOURCE_TYPE_VPC,
+            peer_vpc_id,
+            state::INVALID_VPC_ID_MALFORMED,
+        )?;
+
+        // "The tags to assign to the peering connection" (`TagSpecifications`) — the shared
+        // reader refuses a specification naming any other resource type and holds the
+        // payload to the documented bounds.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_VPC_PEERING_CONNECTION,
+            Self::NAME,
+        )?;
+        // The caller-chosen bytes this request would retain, counted by the ONE definition
+        // of that charge.
+        let payload_bytes = state::vpc_peering_connection_payload_bytes(&tags);
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this write is allowed to apply before it reads the store: a
+        // request that has reached `pending-acceptance`, and one whose own expiry has
+        // passed, moved at those instants whether or not anybody called — and which of them
+        // a connection is in decides whether it still peers its pair below.
+        store.materialize_due_transitions();
+
+        // "The ID of the requester VPC" (`VpcId`): a VPC id this account holds no VPC for
+        // names no requester, so it is refused rather than peered from.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+        // The accepter VPC, which "can belong to another Amazon Web Services account and can
+        // be in a different Region to the requester VPC" (`CreateVpcPeeringConnection`). A
+        // VPC of THIS account is one the store holds, so an id it does not hold names
+        // nothing and is refused with the same not-found code the requester's is; a VPC of
+        // another account is not this store's to resolve, so its id is held to the form of a
+        // VPC id alone, which the check above already applied.
+        if peer_owner_id == ::engine::emulator_account_id()
+            && !store.vpcs.contains_key(peer_vpc_id)
+        {
+            return Err(state::invalid_vpc_id_not_found(peer_vpc_id));
+        }
+
+        // Two VPCs are peered by at most one connection: a second request for a pair a
+        // connection of this account still holds is a duplicate rather than a new request.
+        if let Some(existing) = store.vpc_peering_connection_between(&input.vpc_id, peer_vpc_id) {
+            return Err(state::vpc_peering_connection_already_exists(
+                existing,
+                &input.vpc_id,
+                peer_vpc_id,
+            ));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_vpc_peering_connection_capacity() {
+            return Err(state::vpc_peering_connection_limit_exceeded(format!(
+                "This emulator holds {max} VPC peering connections, which is as many as it \
+                 stores",
+                max = state::MAX_VPC_PEERING_CONNECTIONS,
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::vpc_peering_connection_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The record itself. The status the request starts in, the instant it expires at and
+        // the move the clock owes it are settled by the store's one writer, which reads the
+        // two VPCs' address space for the `failed` rule the operation documents, so a
+        // describe of this connection cannot disagree with this answer about any of them.
+        let vpc_peering_connection_id = store.insert_vpc_peering_connection(
+            state::VpcPeeringConnectionSpec {
+                vpc_id: input.vpc_id.clone(),
+                peer_vpc_id: peer_vpc_id.to_string(),
+                peer_owner_id,
+                region,
+                peer_region,
+                tags,
+            },
+            ::std::time::SystemTime::now(),
+        );
+
+        // The answer is the record as it was stored, through the ONE projection
+        // `DescribeVpcPeeringConnections` reports a connection with, so the two cannot drift
+        // apart.
+        let Some(vpc_peering_connection) = store
+            .vpc_peering_connections
+            .get(&vpc_peering_connection_id)
+            .map(|record| store.vpc_peering_connection_view(record))
+        else {
+            return Err(state::internal_error(
+                "the VPC peering connection just created could not be read back",
+            ));
+        };
+        Ok(CreateVpcPeeringConnectionOutput {
+            vpc_peering_connection: Some(vpc_peering_connection),
+        })
     }
 }

@@ -1732,6 +1732,14 @@ pub use public_ipv4_pools::*;
 pub mod traffic_mirror_sessions;
 pub use traffic_mirror_sessions::*;
 
+/// The VPC peering connections the account holds — what one is stored as, the status words,
+/// the `initiating-request` -> `pending-acceptance` move the clock owes a fresh request, the
+/// expiry of a request nobody answered, the store's bounds and its refusals — in a module of
+/// its own, re-exported so a handler reaches them as `crate::state::<item>` like every other
+/// primitive here.
+pub mod vpc_peering_connections;
+pub use vpc_peering_connections::*;
+
 /// The `Reservation` shape, under the name the scaffold generated for it.
 ///
 /// `com.amazonaws.ec2#Reservation` is both `RunInstances`'s output shape and the
@@ -2480,6 +2488,18 @@ pub const CALLER_NOT_ALLOWED_MESSAGE: &str = "Caller is not allowed to call this
 /// EC2's error code for a request that named a VPC id no VPC of the account has.
 pub const INVALID_VPC_ID_NOT_FOUND: &str = "InvalidVpcID.NotFound";
 
+/// EC2's error code for a value that is no VPC id at all: the `.Malformed` half of the pair
+/// [`INVALID_VPC_ID_NOT_FOUND`] is the not-found half of, spelled `ID` as that code is.
+///
+/// A surface answers this one BEFORE it looks an id up, so a caller can tell "not an id of
+/// this kind" from "no such VPC" ([`require_well_formed_id`], the one place that ordering
+/// lives). [`INVALID_CARRIER_GATEWAY_VPC_ID_MALFORMED`] is the RECORDED EXCEPTION: the
+/// surfaces recorded answering that spelling (`InvalidVpcId.Malformed`, with an `Id`) ask ONE
+/// question of the member and keep their own wording, so a surface that draws the
+/// malformed/not-found distinction reaches for this constant and the ones recorded otherwise
+/// keep theirs.
+pub const INVALID_VPC_ID_MALFORMED: &str = "InvalidVpcID.Malformed";
+
 /// EC2's error code for a request that named a subnet id no subnet of the account has.
 pub const INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
 
@@ -2969,6 +2989,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// ([`VpcAttributes::for_vpc`]), so a describe never has to invent a default for a
     /// VPC nobody has modified.
     pub vpc_attributes: BTreeMap<String, VpcAttributes>,
+    /// Every VPC peering connection the account holds, by `VpcPeeringConnectionId`, as the
+    /// modelled [`crate::ops::types::VpcPeeringConnection`] shape beside the status move the
+    /// clock owes it ([`VpcPeeringConnectionRecord`]) — a request a writer answers
+    /// `initiating-request` still owes `pending-acceptance`, which the modelled shape carries
+    /// no member for. Ordered by id, the one stable order `DescribeVpcPeeringConnections`
+    /// reports and pages over, so a pagination token can name the id the next page starts at.
+    ///
+    /// Starts EMPTY: a fresh account has requested no peering until
+    /// `CreateVpcPeeringConnection` makes one.
+    /// [`Self::insert_vpc_peering_connection`] is the one way one is stored and
+    /// [`Self::vpc_peering_connection_view`] the one way one is reported; see
+    /// [`vpc_peering_connections`].
+    pub vpc_peering_connections: BTreeMap<String, VpcPeeringConnectionRecord>,
     /// Every DHCP option set the account holds, by `DhcpOptionsId`, as the modelled
     /// [`DhcpOptions`] shape itself — so a member a writer sets round-trips through
     /// `DescribeDhcpOptions` without a field-by-field copy, the way [`Self::vpcs`] holds
@@ -4468,6 +4501,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpcs: BTreeMap::new(),
             vpc_available_at: BTreeMap::new(),
             vpc_attributes: BTreeMap::new(),
+            // A fresh account has requested no VPC peering connection.
+            vpc_peering_connections: BTreeMap::new(),
             dhcp_options: BTreeMap::new(),
             default_dhcp_options_ids: BTreeMap::new(),
             default_vpc_ids: BTreeMap::new(),
@@ -7824,6 +7859,11 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this VPC any more.
             false
         });
+        // A VPC peering request `CreateVpcPeeringConnection` answered as
+        // `initiating-request` is `pending-acceptance` once its due instant has passed, and
+        // one nobody answered by its own `ExpirationTime` expired at that instant — both owed
+        // whether or not anybody called, the same contract as the `pending` VPC above.
+        self.materialize_due_vpc_peering_connections(now, SystemTime::now());
         let carrier_gateways = &mut self.carrier_gateways;
         self.carrier_gateway_available_at
             .retain(|carrier_gateway_id, due_at| {
@@ -9951,6 +9991,7 @@ impl ComAmazonawsEc2Amazonec2State {
             vpc_block_public_access_exclusions => view,
             vpc_endpoint_services,
             vpc_endpoints,
+            vpc_peering_connections => view,
             vpcs,
             vpn_connections => view,
             vpn_gateways => view,
