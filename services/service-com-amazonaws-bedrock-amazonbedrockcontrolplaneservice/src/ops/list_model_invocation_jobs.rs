@@ -19,7 +19,7 @@
 //!   the cursor of the row the next page starts on — so the pages partition the listing
 //!   with neither a gap nor a repeat.
 //!
-//! `@readonly`, and the one write it makes is the status transition the CLOCK already made
+//! `@readonly`, and the one write it makes is the status transitions the CLOCK already made
 //! due for each record
 //! ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::settle_model_invocation_jobs`]):
 //! a listing reports — and `statusEquals` filters on — the status each job holds now, which

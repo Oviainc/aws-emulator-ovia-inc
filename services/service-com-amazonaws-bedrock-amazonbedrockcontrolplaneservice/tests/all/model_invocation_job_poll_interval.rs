@@ -2,26 +2,30 @@
 
 //! What a client polling a batch inference job READS, whatever interval it polls at.
 //!
-//! THE RULE UNDER TEST: every status `ModelInvocationJobStatus` documents for a job that has
-//! not finished is a status a caller reads the job in — "Submitted – this job has been
-//! submitted to a queue for validation", "Validating", "Scheduled – this job has been
-//! validated and is now in a queue", "InProgress – this job has begun. You can start viewing
-//! the results in the output S3 location"
-//! (`smithy_query(query="doc",shape="ModelInvocationJobSummary",member="status")`) — so which
-//! of them a caller gets to see, and gets to act on, is decided by the job's own progression
-//! and never by how long that caller waits between two of its reads. A client polling a
-//! submitted job therefore reads `Submitted`, `Validating`, `Scheduled`, `InProgress` and then
-//! the terminal status, in that order, whatever its interval; `StopModelInvocationJob`
-//! (`POST /model-invocation-job/{jobIdentifier}/stop`) on the job it just read running winds
-//! that job down to `Stopping` and then the terminal `Stopped`; and the terminal status, the
-//! record counts and the result objects under `outputDataConfig.s3OutputDataConfig.s3Uri` are
-//! all reachable by the same poller.
+//! THE RULE UNDER TEST: a batch inference job's progression is driven by the SERVICE as the
+//! job runs, so which status a read is answered is decided by the time elapsed since the
+//! submission and by nothing else — never by how many reads a caller has made, nor by how
+//! long it waited between two of them. `ModelInvocationJobStatus` documents the progression
+//! "Submitted – this job has been submitted to a queue for validation", "Validating",
+//! "Scheduled – this job has been validated and is now in a queue", "InProgress – this job
+//! has begun. You can start viewing the results in the output S3 location" and then a
+//! terminal status
+//! (`smithy_query(query="doc",shape="ModelInvocationJobSummary",member="status")`): those
+//! intermediate statuses are OBSERVABLE — a client polling tighter than the spans reads the
+//! job in each of them — and never waypoints a caller must poll through, so a client that
+//! waits and reads once is answered the status its wait has carried the job to, up to and
+//! including the terminal one. With the terminal status come the record counts and the result
+//! objects under `outputDataConfig.s3OutputDataConfig.s3Uri`, for the very read that first
+//! reports it; and `StopModelInvocationJob`
+//! (`POST /model-invocation-job/{jobIdentifier}/stop`) on a job the elapsed time has not
+//! finished winds it down to `Stopping` and then the terminal `Stopped`.
 //!
 //! The rows differ along what the rule generalises over: the INTERVAL between the client's
 //! reads — from a tenth of a second to an hour, four orders of magnitude, including intervals
 //! longer than every span of the lifecycle put together, which is what a client polling a real
-//! batch job every ten seconds or every minute does — and WHICH operation does the polling,
-//! the read of one job or the listing that carries it.
+//! batch job every ten seconds or every minute does — WHICH operation does the polling, the
+//! read of one job or the listing that carries it, and (for the stop) HOW LONG the client
+//! waited before its single read, one row per stage of the progression.
 //!
 //! The wall clock a long interval stands for is brought by ageing the stored record between
 //! reads (`Emulator::age_job`) rather than by sleeping through it, so the row that stands for
@@ -37,13 +41,24 @@ use serde_json::Value;
 use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::model_invocation_job_execution::{
-    count, emulator, given_bucket, given_input_object, job_id, llama_input, read_job, record,
-    submit, Emulator, BUCKET,
+    completed_at, count, emulator, given_bucket, given_input_object, in_progress_at, job_id,
+    llama_input, read_job, record, scheduled_at, submit, validating_at, Emulator, BUCKET,
 };
 use crate::support::{label, Reply};
 
 /// How long after a stop was accepted the job is owed its move to `Stopped`.
 const STOPPED_AFTER: Duration = bedrock::state::MODEL_INVOCATION_JOB_STOPPED_AFTER;
+
+/// The whole wall clock a job nobody stops takes from its submission to its terminal status,
+/// read off the shared harness so this suite cannot drift from the others when a span changes.
+fn lifespan() -> Duration {
+    completed_at()
+}
+
+/// How far into a stage's own window a row's single read lands: long enough that the stage
+/// before it is certainly behind the job, short enough that the stage after it is certainly
+/// still ahead — every span of the progression is several times this.
+const INTO_THE_STAGE: Duration = Duration::from_millis(100);
 
 /// `ModelInvocationJobStatus` values this emulator's lifecycle passes through.
 const SUBMITTED: &str = "Submitted";
@@ -59,8 +74,8 @@ const STOPPED: &str = "Stopped";
 const PROGRESSION: &[&str] = &[SUBMITTED, VALIDATING, SCHEDULED, IN_PROGRESS, COMPLETED];
 
 /// The most reads one row makes before it concludes the progression is stuck: a bound on the
-/// loop, far above the reads the shortest interval of the table needs.
-const MAX_READS: usize = 64;
+/// loop, far above the reads the shortest interval of the table needs to span the lifecycle.
+const MAX_READS: usize = 256;
 
 /// The model every row's records are invoked on, and the endpoint they are a body for: one
 /// pair this emulator's inference surface serves, because what varies between rows is the
@@ -197,7 +212,7 @@ fn status_of(case: &str, reply: &Reply) -> String {
 }
 
 #[tokio::test]
-async fn a_client_polling_at_any_interval_reads_every_stage_and_then_the_results() {
+async fn a_client_polling_at_any_interval_reaches_the_terminal_status_and_the_results() {
     let emu = emulator();
     given_bucket(&emu).await;
 
@@ -207,8 +222,11 @@ async fn a_client_polling_at_any_interval_reads_every_stage_and_then_the_results
         // The client's own loop: read, then wait its interval, until the job is finished.
         let mut seen: Vec<String> = Vec::new();
         let mut terminal: Option<Reply> = None;
+        let mut reads = 0_usize;
+        let mut waited = Duration::ZERO;
         for _ in 0..MAX_READS {
             let reply = poll_once(&emu, &case, &arn, poller).await;
+            reads += 1;
             let status = status_of(&case, &reply);
             if seen.last() != Some(&status) {
                 seen.push(status.clone());
@@ -219,12 +237,25 @@ async fn a_client_polling_at_any_interval_reads_every_stage_and_then_the_results
             }
             // Waiting the interval, brought by ageing the record rather than by sleeping.
             emu.age_job(&arn, interval);
+            waited += interval;
         }
 
+        // Whatever the interval, the statuses the client read are statuses of the documented
+        // progression, in its own order and none of them twice: a job never goes backwards and
+        // no poller is answered a status the progression does not carry.
+        let mut stages = PROGRESSION.iter();
+        for status in &seen {
+            assert!(
+                stages.any(|stage| stage == status),
+                "case {case:?}: the statuses a poller reads must be a subsequence of \
+                 {PROGRESSION:?}, in order, saw {seen:?}"
+            );
+        }
         assert_eq!(
-            seen, PROGRESSION,
-            "case {case:?}: a client polling the job must read it in every status of the \
-             progression, in order, saw {seen:?}"
+            seen.first().map(String::as_str),
+            Some(SUBMITTED),
+            "case {case:?}: the read of a job just submitted must answer the queued status, \
+             saw {seen:?}"
         );
         let terminal = terminal.unwrap_or_else(|| {
             panic!(
@@ -232,6 +263,28 @@ async fn a_client_polling_at_any_interval_reads_every_stage_and_then_the_results
                  saw {seen:?}"
             )
         });
+
+        // The ELAPSED time is what carried the job there, not the number of reads: the first
+        // read taken once the whole lifespan had passed answered the terminal status, so no
+        // client needs more reads than its own interval divides that lifespan into.
+        let lifespan = lifespan();
+        let reads_needed = lifespan.as_nanos() / interval.as_nanos() + 2;
+        assert!(
+            u128::try_from(reads).expect("a small read count") <= reads_needed,
+            "case {case:?}: the progression must be carried by elapsed time rather than by \
+             reads, took {reads} reads over {waited:?} of waiting where the elapsed time needs \
+             at most {reads_needed} reads, saw {seen:?}"
+        );
+
+        // A client polling tighter than every span of the lifecycle is the one that observes
+        // each intermediate status; a coarse one is simply answered the status its wait owes.
+        if interval <= INTERVALS[0] {
+            assert_eq!(
+                seen, PROGRESSION,
+                "case {case:?}: a client polling tighter than every span must read the job in \
+                 every status of the progression, in order, saw {seen:?}"
+            );
+        }
 
         // What the terminal read reports: the counts that account for every record of the
         // input, and the instant the job ended.
@@ -257,7 +310,8 @@ async fn a_client_polling_at_any_interval_reads_every_stage_and_then_the_results
         );
 
         // And the results the status told the client to view are under the prefix the
-        // submission named, one per input record.
+        // submission named, one per input record — there for the read that first reported the
+        // terminal status, however coarsely the client polled.
         let input_name = input_key
             .rsplit('/')
             .next()
@@ -281,81 +335,94 @@ async fn a_client_polling_at_any_interval_reads_every_stage_and_then_the_results
     }
 }
 
+/// One row of the single-read table: how long the client waited before its ONE read, and the
+/// status that wait owes the job.
+///
+/// The waits are the stages' own instants, each a little way into the stage's window, so the
+/// rows together cover every status a job that has not finished carries.
+fn single_read_rows() -> Vec<(String, Duration, &'static str)> {
+    let mut rows = Vec::new();
+    for (wait, expected) in [
+        (Duration::ZERO, SUBMITTED),
+        (validating_at() + INTO_THE_STAGE, VALIDATING),
+        (scheduled_at() + INTO_THE_STAGE, SCHEDULED),
+        (in_progress_at() + INTO_THE_STAGE, IN_PROGRESS),
+    ] {
+        rows.push((format!("one read {wait:?} after the submission"), wait, expected));
+    }
+    rows
+}
+
 #[tokio::test]
-async fn a_stop_of_the_job_a_poller_just_read_running_winds_it_down() {
+async fn a_stop_winds_down_the_job_the_elapsed_time_has_not_finished() {
     let emu = emulator();
     given_bucket(&emu).await;
 
-    for (index, (case, interval, poller)) in rows().into_iter().enumerate() {
-        let (arn, _) = given_job(&emu, &format!("stop-{index}")).await;
+    for (index, (case, wait, expected)) in single_read_rows().into_iter().enumerate() {
+        for poller in [Poller::Read, Poller::List] {
+            let case = format!("{case}, polled by {poller:?}");
+            let (arn, _) = given_job(&emu, &format!("stop-{index}-{poller:?}")).await;
 
-        // The documented control flow: poll until the job is running, then cancel it.
-        let mut seen: Vec<String> = Vec::new();
-        for _ in 0..MAX_READS {
-            let reply = poll_once(&emu, &case, &arn, poller).await;
-            let status = status_of(&case, &reply);
-            if seen.last() != Some(&status) {
-                seen.push(status.clone());
-            }
-            if status == IN_PROGRESS {
-                break;
-            }
-            emu.age_job(&arn, interval);
-        }
-        assert_eq!(
-            seen.last().map(String::as_str),
-            Some(IN_PROGRESS),
-            "case {case:?}: a client polling the job must read it running before it stops it, \
-             saw {seen:?}"
-        );
-
-        let stopped = emu
-            .bedrock(
-                "POST",
-                &format!("/model-invocation-job/{}/stop", label(&arn)),
-                None,
-            )
-            .await;
-        assert_eq!(
-            stopped.status, 200,
-            "case {case:?}: a stop of the running job must be accepted, got {} {:?}",
-            stopped.status, stopped.body
-        );
-
-        // The stop landed on a job that had not finished, so the caller observes the transient
-        // status and then the terminal one the stop owes.
-        let stopping = read_job(&emu, &arn).await;
-        assert_eq!(
-            status_of(&case, &stopping),
-            STOPPING,
-            "case {case:?}: the stopped job must be winding down, got {:?}",
-            stopping.body
-        );
-        emu.age_job(&arn, STOPPED_AFTER);
-        let done = read_job(&emu, &arn).await;
-        assert_eq!(
-            status_of(&case, &done),
-            STOPPED,
-            "case {case:?}: the stop must settle on {STOPPED}, got {:?}",
-            done.body
-        );
-        assert!(
-            done.get("endTime").is_string(),
-            "case {case:?}: a job the stop ended reports when it ended, got {:?}",
-            done.get("endTime")
-        );
-
-        // A stopped job is owed no completion of its own, however long the client goes on
-        // polling it.
-        for _ in 0..3 {
-            emu.age_job(&arn, interval);
-            let after = read_job(&emu, &arn).await;
+            // The client waits, then reads ONCE: the status it is answered is the one its own
+            // wait owes the job, whichever operation it read with.
+            emu.age_job(&arn, wait);
+            let before = poll_once(&emu, &case, &arn, poller).await;
             assert_eq!(
-                status_of(&case, &after),
-                STOPPED,
-                "case {case:?}: a stopped job never reports {COMPLETED}, got {:?}",
-                after.body
+                status_of(&case, &before),
+                expected,
+                "case {case:?}: a single read after {wait:?} must answer the status that wait \
+                 owes the job, got {:?}",
+                before.body
             );
+
+            let stopped = emu
+                .bedrock(
+                    "POST",
+                    &format!("/model-invocation-job/{}/stop", label(&arn)),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                stopped.status, 200,
+                "case {case:?}: a stop of the unfinished job must be accepted, got {} {:?}",
+                stopped.status, stopped.body
+            );
+
+            // The stop landed on a job that had not finished, so the caller observes the
+            // transient status and then the terminal one the stop owes.
+            let stopping = read_job(&emu, &arn).await;
+            assert_eq!(
+                status_of(&case, &stopping),
+                STOPPING,
+                "case {case:?}: the stopped job must be winding down, got {:?}",
+                stopping.body
+            );
+            emu.age_job(&arn, STOPPED_AFTER);
+            let done = read_job(&emu, &arn).await;
+            assert_eq!(
+                status_of(&case, &done),
+                STOPPED,
+                "case {case:?}: the stop must settle on {STOPPED}, got {:?}",
+                done.body
+            );
+            assert!(
+                done.get("endTime").is_string(),
+                "case {case:?}: a job the stop ended reports when it ended, got {:?}",
+                done.get("endTime")
+            );
+
+            // A stopped job is owed no completion of its own, however long the client goes on
+            // polling it — including past the instant an unstopped job would have finished.
+            for _ in 0..3 {
+                emu.age_job(&arn, lifespan());
+                let after = read_job(&emu, &arn).await;
+                assert_eq!(
+                    status_of(&case, &after),
+                    STOPPED,
+                    "case {case:?}: a stopped job never reports {COMPLETED}, got {:?}",
+                    after.body
+                );
+            }
         }
     }
 }

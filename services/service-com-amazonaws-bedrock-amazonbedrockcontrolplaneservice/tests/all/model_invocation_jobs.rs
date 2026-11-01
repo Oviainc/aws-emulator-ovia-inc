@@ -25,15 +25,17 @@
 //! 4. **`modelId` is resolved against the published catalog**: an identifier that names no
 //!    model of this account is 404 `ResourceNotFoundException`, while every model the
 //!    catalog publishes is accepted.
-//! 5. **`status` walks the documented progression, one stage per read**: `Submitted` with no
-//!    `endTime` straight after the create, then `Validating`, then `Scheduled`, then
+//! 5. **`status` walks the documented progression on the submission's own clock**: `Submitted`
+//!    with no `endTime` straight after the create, then `Validating`, then `Scheduled`, then
 //!    `InProgress`, each dwelling its own span and each stamped at the instant that span fell
 //!    due — the same status a listing reports and `statusEquals` filters on — and `Completed`
 //!    with an `endTime` only once the run span has elapsed on top of them. Asserted stage by
 //!    stage over the dwell of each one, and over the intervals a client polls a job at, four
-//!    orders of magnitude apart: at every one of them the poller reads the job in every status
-//!    of the progression, the first status it reads outside `{Submitted, Validating,
-//!    Scheduled}` is the running one, and reading twice reports the same instants.
+//!    orders of magnitude apart: at every one of them the statuses the poller reads are a
+//!    subsequence of the progression in its own order, the terminal status comes within the
+//!    reads the elapsed time implies rather than within a read per stage, the first status
+//!    read outside `{Submitted, Validating, Scheduled}` is the one that interval's own first
+//!    poll past the start instant falls in, and reading twice reports the same instants.
 //! 6. **A replayed `clientRequestToken` submits nothing**: the replay answers with the job
 //!    the first call minted and stores no second job, while a fresh token submits another.
 //! 7. **The listing orders, filters and pages** the stored jobs: creation order in both
@@ -52,13 +54,21 @@
 //! / `query="shape"`), or from the published foundation model catalog this service reports
 //! through `ListFoundationModels`.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
 use crate::support::{
     date_time_seconds, emulator, foundation_model_arn, label, wall_clock_seconds, Emulator, Reply,
     ACCOUNT, REGION,
+};
+
+// The instants this service's own spans put each stage of the progression at, derived once
+// beside the shared batch inference harness so these suites cannot drift from one another
+// when a span changes: `pre_start_span` is when the job is owed its start, `lifespan` the
+// whole span one nobody stops takes to its terminal status.
+use crate::model_invocation_job_execution::{
+    completed_at as lifespan, in_progress_at as pre_start_span,
 };
 
 type State = service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState;
@@ -118,22 +128,11 @@ const STOPPED: &str = "Stopped";
 /// waits for a job to start.
 const PRE_START: &[&str] = &[SUBMITTED, VALIDATING, SCHEDULED];
 
-/// How long after its submission a job is owed its start: the three pre-start spans end to
-/// end.
-fn pre_start_span() -> Duration {
-    VALIDATES_AFTER + SCHEDULES_AFTER + BEGINS_AFTER
-}
-
-/// The whole span a job nobody stops takes from its submission to `Completed`.
-fn lifespan() -> Duration {
-    pre_start_span() + COMPLETE_AFTER
-}
-
 /// How long a case polls a job for before it concludes the progression is stuck.
 ///
 /// An absolute bound, generous next to the spans this service arms: room for a slow machine
 /// and not room for another order of magnitude.
-const POLL_BUDGET: Duration = Duration::from_secs(20);
+const POLL_BUDGET: Duration = Duration::from_secs(45);
 
 /// How long a case waits between two reads of a job while it polls it.
 const POLL_STEP: Duration = Duration::from_millis(100);
@@ -142,9 +141,9 @@ const POLL_STEP: Duration = Duration::from_millis(100);
 /// hand back the read that first reported it beside the distinct statuses the poll walked
 /// through, in order.
 ///
-/// A job leaves each stage of the progression no earlier than the first call that reads it
-/// there, so a case reaches a stage by POLLING rather than by sleeping through a span and
-/// reading once.
+/// Each stage of the progression dwells its own span on the submission's clock, so a case
+/// reaches a stage by polling the way a client does — which is also what proves the stage is
+/// one a poller can read the job in rather than one the elapsed time carries it past unseen.
 async fn poll_until(emu: &Emulator, case: &str, arn: &str, target: &str) -> (Reply, Vec<String>) {
     let started = ::std::time::Instant::now();
     let mut seen: Vec<String> = Vec::new();
@@ -221,6 +220,22 @@ fn age_job(emu: &Emulator, arn: &str, by: Duration) {
             *instant -= by;
         }
     }
+}
+
+/// Age the stored job `arn` names so that the completion its clock owes stands `remaining`
+/// ahead of now: the elapsed time a client would have waited through, brought without
+/// waiting for it.
+///
+/// The instant is read off the JOB rather than computed from the case's own stopwatch,
+/// because the whole progression stands on the submission's own timeline.
+fn age_job_to_remaining(emu: &Emulator, arn: &str, remaining: Duration) {
+    let due = stored_job(emu, arn)
+        .completed_due_at
+        .unwrap_or_else(|| panic!("the job {arn} must still owe its completion"));
+    let ahead = due
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO);
+    age_job(emu, arn, ahead.saturating_sub(remaining));
 }
 
 /// The `modelId` of the `index`-th model the published catalog carries.
@@ -817,7 +832,7 @@ async fn the_model_is_resolved_against_the_published_catalog() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 5. The status walks the documented progression, one stage at a time, on the clock.
+// 5. The status walks the documented progression, stage by stage, on the submission's clock.
 // ---------------------------------------------------------------------------------------
 
 /// Every status a stored job's lifecycle passes through, so a case can assert that the
@@ -836,8 +851,9 @@ async fn the_status_walks_every_pre_start_stage_before_it_reports_the_job_runnin
     .await;
 
     // The stages a client polling a submitted job reads it in, in order. Each pre-start
-    // status the model documents is a status a caller READS the job in, so none of them may
-    // be skipped: the job leaves a stage no earlier than the first read that found it there.
+    // status the model documents dwells its own span on the submission's clock, so a client
+    // polling tighter than those spans reads the job in every one of them, in order, and in
+    // none of them before the stage before it.
     let stages: &[(&str, &str, Duration)] = &[
         ("straight after the create", SUBMITTED, Duration::ZERO),
         ("the read that found it validating", VALIDATING, VALIDATES_AFTER),
@@ -969,8 +985,8 @@ async fn a_job_reports_completed_only_once_its_whole_run_span_has_elapsed() {
     let lifespan = lifespan();
     let tick = Duration::from_millis(50);
 
-    // The job is polled to the status that says it has begun, because the run span is counted
-    // from the read that reported the start.
+    // The job is polled to the status that says it has begun, which is how a client reaches
+    // it; the run span then stands on the submission's own timeline rather than on this read.
     let case = "the read that reported the start";
     let (running, _) = poll_until(&emu, case, &arn, IN_PROGRESS).await;
     assert_eq!(
@@ -988,11 +1004,13 @@ async fn a_job_reports_completed_only_once_its_whole_run_span_has_elapsed() {
          after the submission ({pre_start} s), got {began} s"
     );
 
-    // A tick before the run span is up the job is still RUNNING. Ageing the stored record
+    // A tick before the completion is owed the job is still RUNNING. Ageing the stored record
     // brings the same elapsed time a wall clock would, which is how the whole run span is
-    // asserted without sleeping through it.
-    age_job(&emu, &arn, COMPLETE_AFTER.saturating_sub(tick));
-    let case = "a tick before the run span is up";
+    // asserted without sleeping through it — and the instant the completion is owed at is the
+    // job's OWN, read off the record, so it is the submission's timeline that is aged towards
+    // rather than any instant the poll above established.
+    age_job_to_remaining(&emu, &arn, tick);
+    let case = "a tick before the completion is owed";
     let still_running = get(&emu, &arn).await;
     assert_eq!(
         text(case, &still_running.body, "status"),
@@ -1008,8 +1026,8 @@ async fn a_job_reports_completed_only_once_its_whole_run_span_has_elapsed() {
     );
 
     // Once it is up the job is finished, stamped at the instant the completion was owed —
-    // which stands the whole lifespan after the submission at the earliest, the three
-    // pre-start spans the job was read through and then the run span.
+    // which stands the whole lifespan after the submission, the three pre-start spans and
+    // then the run span.
     age_job(&emu, &arn, tick.saturating_mul(2));
     let done = get(&emu, &arn).await;
     let case = "once the run span is up";
@@ -1102,7 +1120,8 @@ async fn each_stage_of_the_progression_dwells_its_own_span_before_the_next_is_ow
     let tick = Duration::from_millis(1);
     // How late the call that materialises a move is: a caller reads the job some time after
     // the move fell due, and what it reads is the instant the move was owed rather than the
-    // instant of its own read.
+    // instant of its own read. It is SHORTER than every span of the progression, so a read
+    // this late finds one further move due and not two.
     let lateness = Duration::from_millis(250);
 
     // One row per transition of the progression: the status the job holds, the span it dwells
@@ -1115,9 +1134,9 @@ async fn each_stage_of_the_progression_dwells_its_own_span_before_the_next_is_ow
     ];
 
     let mut record = pristine.clone();
-    // The instant the job entered the status it holds: the submission, and then the call that
-    // materialised each move, because the span of a stage is counted from the moment the job
-    // entered it.
+    // The instant the job entered the status it holds: the submission, and then the instant
+    // the clock OWED each move at — never the instant of the call that materialised it,
+    // because every span of the progression is counted from the submission's own timeline.
     let mut entered = submit_time;
     for (case, held, span, next) in stages {
         // A tick before the span is up nothing is owed, so a settle changes nothing.
@@ -1167,7 +1186,9 @@ async fn each_stage_of_the_progression_dwells_its_own_span_before_the_next_is_ow
             "case {case}: a second settle at the same instant must report the same job"
         );
 
-        entered = observed_at;
+        // The next stage stands its own span after the instant THIS move was owed, so a
+        // settle that ran late does not push the rest of the progression back.
+        entered = due;
     }
 
     // And nothing is owed past the end of the progression.
@@ -1186,7 +1207,8 @@ async fn each_stage_of_the_progression_dwells_its_own_span_before_the_next_is_ow
 }
 
 /// The whole progression an unstopped job walks, in the order the `status` member's
-/// documentation lists it: the statuses a client polling a job reads it in, one per read.
+/// documentation lists it: the statuses the clock carries a job through, each of them a
+/// status a caller can read it in.
 const PROGRESSION: &[&str] = &[SUBMITTED, VALIDATING, SCHEDULED, IN_PROGRESS, COMPLETED];
 
 /// The most reads one row of the polling table makes before it concludes the progression is
@@ -1194,7 +1216,7 @@ const PROGRESSION: &[&str] = &[SUBMITTED, VALIDATING, SCHEDULED, IN_PROGRESS, CO
 const MAX_POLLS: usize = 1024;
 
 #[tokio::test]
-async fn a_client_polling_at_any_interval_reads_every_stage_of_the_progression() {
+async fn a_client_polling_at_any_interval_reaches_the_terminal_status_on_the_elapsed_time() {
     let emu = emulator();
 
     let arn = submit(
@@ -1206,12 +1228,13 @@ async fn a_client_polling_at_any_interval_reads_every_stage_of_the_progression()
     let pristine = stored_job(&emu, &arn);
     let submit_time = pristine.submit_time;
 
-    // The intervals a client polls a job at, from a tight loop to the hour: at every one of
-    // them the job must be read in every status of the progression, because those are the
-    // states a caller acts on — watching progress, stopping a job that has not finished — and
-    // which of them a caller gets to act on cannot be decided by how long it waits between
-    // its own reads. The rows span four orders of magnitude of interval, from far shorter
-    // than every span of the lifecycle to far longer than all of them together.
+    // The intervals a client polls a job at, from a tight loop to the hour. The job's own
+    // progression runs on the time elapsed since its submission, so whatever the interval the
+    // statuses a poller reads are a subsequence of the progression, in order, and the job is
+    // finished by the first read taken once its whole lifespan has elapsed — a tight loop
+    // merely observes more of the intermediate statuses on the way. The rows span four orders
+    // of magnitude of interval, from far shorter than every span of the lifecycle to far
+    // longer than all of them together.
     for interval in [
         Duration::from_millis(50),
         Duration::from_millis(250),
@@ -1225,36 +1248,112 @@ async fn a_client_polling_at_any_interval_reads_every_stage_of_the_progression()
         let mut record = pristine.clone();
         let mut seen: Vec<&'static str> = Vec::new();
         let mut at = submit_time;
+        let mut polls = 0_usize;
+        let mut finished_at: Option<Duration> = None;
         for _ in 0..MAX_POLLS {
             record.settle(at);
+            polls += 1;
             if seen.last() != Some(&record.status) {
                 seen.push(record.status);
             }
             if record.status == COMPLETED {
+                finished_at = Some(
+                    at.duration_since(submit_time)
+                        .expect("a poll stands after the submission"),
+                );
                 break;
             }
             at += interval;
         }
 
+        let case = format!("a poll every {interval:?}");
+        let finished_at = finished_at.unwrap_or_else(|| {
+            panic!("case {case}: the job must finish however coarse the polling, saw {seen:?}")
+        });
+
+        // Every status the poller read is one of the progression, and they came in the
+        // progression's own order with none repeated: a job never goes backwards, and no
+        // poller is answered a status the progression does not carry.
+        let mut expected = PROGRESSION.iter();
+        for status in &seen {
+            assert!(
+                expected.any(|stage| stage == status),
+                "case {case}: the statuses a poller reads must be a subsequence of \
+                 {PROGRESSION:?}, in order, saw {seen:?}"
+            );
+        }
         assert_eq!(
-            seen, PROGRESSION,
-            "case a poll every {interval:?}: a client polling from the submission must read \
-             the job in every status of the progression, in order, saw {seen:?}"
+            seen.first().copied(),
+            Some(SUBMITTED),
+            "case {case}: the read of a job just submitted must answer the queued status, saw \
+             {seen:?}"
         );
+        assert_eq!(
+            seen.last().copied(),
+            Some(COMPLETED),
+            "case {case}: a poller must read the job in its terminal status, saw {seen:?}"
+        );
+
+        // The ELAPSED time decides when the job is finished, not the number of polls: the
+        // first poll taken a whole lifespan after the submission reads it terminal, so a
+        // poller needs no more reads than its own interval divides that lifespan into.
+        let lifespan = lifespan();
+        assert!(
+            finished_at >= lifespan,
+            "case {case}: the job must not finish before its whole lifespan ({lifespan:?}) has \
+             elapsed, finished after {finished_at:?}"
+        );
+        assert!(
+            finished_at < lifespan + interval,
+            "case {case}: the job must be finished for the first poll taken once its lifespan \
+             has elapsed, finished only after {finished_at:?}"
+        );
+        let polls_needed = lifespan.as_nanos() / interval.as_nanos() + 2;
+        assert!(
+            u128::try_from(polls).expect("a small poll count") <= polls_needed,
+            "case {case}: the progression must be carried by elapsed time rather than by \
+             polls, took {polls} reads where the elapsed time needs at most {polls_needed}, \
+             saw {seen:?}"
+        );
+
+        // A tight loop is the one that observes every intermediate stage; a coarse one is
+        // simply answered the stage the elapsed time owes it.
+        if interval <= Duration::from_millis(50) {
+            assert_eq!(
+                seen, PROGRESSION,
+                "case {case}: a loop tighter than every span must read the job in every status \
+                 of the progression, saw {seen:?}"
+            );
+        }
         let settled = seen
             .iter()
             .copied()
             .find(|status| !PRE_START.contains(status))
             .unwrap_or_else(|| {
-                panic!(
-                    "case a poll every {interval:?}: the job must leave the pre-start statuses, \
-                     saw {seen:?}"
-                )
+                panic!("case {case}: the job must leave the pre-start statuses, saw {seen:?}")
             });
+        // WHICH status that is follows from this row's own interval, because the polls stand
+        // at the submission plus a whole number of intervals: the first poll at or after the
+        // instant the job begins reads it running, unless that same poll already stands past
+        // the instant the completion is owed at — a poller whose interval carried it over the
+        // whole run in one step.
+        let first_poll_past_the_start = {
+            let start = pre_start_span().as_nanos();
+            let step = interval.as_nanos();
+            start.div_ceil(step) * step
+        };
+        let expected_settled = if first_poll_past_the_start < lifespan.as_nanos() {
+            IN_PROGRESS
+        } else {
+            COMPLETED
+        };
         assert_eq!(
-            settled, IN_PROGRESS,
-            "case a poll every {interval:?}: the first status outside the pre-start set must be \
-             the running one, saw {seen:?}"
+            settled, expected_settled,
+            "case {case}: the first poll outside the pre-start set stands {:?} after the \
+             submission, so it must read {expected_settled}, saw {seen:?}",
+            Duration::from_nanos(
+                u64::try_from(first_poll_past_the_start).expect("a span of a few seconds")
+            )
         );
     }
 }
@@ -1646,7 +1745,7 @@ fn carries_no_members(body: &Value) -> bool {
 struct StopRow {
     case: &'static str,
     /// The status the job holds when the stop arrives: the job is POLLED to it, because a
-    /// job leaves each stage no earlier than the read that found it there.
+    /// job dwells in each stage for its own span on the submission's clock.
     status_at_stop: &'static str,
     /// Whether the stop addresses the job by its ARN or by the bare minted id.
     by_arn: bool,
@@ -1893,8 +1992,8 @@ async fn a_stop_of_a_job_that_cannot_be_stopped_changes_nothing() {
                 tokio::time::sleep(STOPPED_AFTER + MARGIN).await;
             }
             Reach::Completed => {
-                // A client reaches the terminal status by polling the job to it, one stage of
-                // the progression per read.
+                // A client reaches the terminal status by polling the job until the elapsed
+                // time since its submission has carried it there.
                 poll_until(&emu, case, &arn, COMPLETED).await;
             }
         }

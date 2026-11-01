@@ -46,7 +46,7 @@ use crate::support::Reply;
 /// here even though every stored due instant would still be internally consistent. It is
 /// generous next to the spans the service actually arms, which is room for a slow machine and
 /// not room for another order of magnitude.
-const POLLING_BUDGET: Duration = Duration::from_secs(15);
+const POLLING_BUDGET: Duration = Duration::from_secs(40);
 
 /// How long the poll loop waits between two reads of a job — short enough that no status the
 /// clock carries a job through for its own span falls between two polls.

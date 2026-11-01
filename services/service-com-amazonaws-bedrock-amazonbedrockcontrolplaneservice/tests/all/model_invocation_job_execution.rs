@@ -57,6 +57,38 @@ const ABSENT_BUCKET: &str = "example-batch-inference-missing";
 /// How long after it began a job is owed its terminal status.
 const COMPLETE_AFTER: Duration = bedrock::state::MODEL_INVOCATION_JOB_COMPLETE_AFTER;
 
+/// The spans the submission arms the progression with, each counted from the one before it,
+/// and the instants after the submission they put each stage at.
+///
+/// They live HERE, beside the harness every batch inference suite drives, so the suites
+/// cannot drift from one another when a span changes: each is read off this service's own
+/// constants rather than written out as a figure.
+const VALIDATES_AFTER: Duration = bedrock::state::MODEL_INVOCATION_JOB_VALIDATES_AFTER;
+const SCHEDULES_AFTER: Duration = bedrock::state::MODEL_INVOCATION_JOB_SCHEDULES_AFTER;
+const BEGINS_AFTER: Duration = bedrock::state::MODEL_INVOCATION_JOB_BEGINS_AFTER;
+
+/// When `Validating` is owed, counted from the submission.
+pub(crate) fn validating_at() -> Duration {
+    VALIDATES_AFTER
+}
+
+/// When `Scheduled` is owed, counted from the submission.
+pub(crate) fn scheduled_at() -> Duration {
+    validating_at() + SCHEDULES_AFTER
+}
+
+/// When `InProgress` is owed, counted from the submission: the three pre-start spans end to
+/// end.
+pub(crate) fn in_progress_at() -> Duration {
+    scheduled_at() + BEGINS_AFTER
+}
+
+/// When the terminal status is owed, counted from the submission: the whole lifespan of a job
+/// nobody stops.
+pub(crate) fn completed_at() -> Duration {
+    in_progress_at() + COMPLETE_AFTER
+}
+
 /// Room for a slow machine on top of a clock-owed span.
 const SLACK: Duration = Duration::from_millis(500);
 
@@ -277,7 +309,7 @@ pub(crate) fn job_id(arn: &str) -> &str {
 ///
 /// An absolute bound, generous next to the spans this service arms — room for a slow machine
 /// rather than for another order of magnitude.
-pub(crate) const POLL_BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const POLL_BUDGET: Duration = Duration::from_secs(45);
 
 /// How long a case waits between two reads of a job while it polls it.
 pub(crate) const POLL_STEP: Duration = Duration::from_millis(100);
@@ -285,9 +317,10 @@ pub(crate) const POLL_STEP: Duration = Duration::from_millis(100);
 /// Poll `GetModelInvocationJob` the way a client does until the job reports `target`, and
 /// hand back the read that first reported it.
 ///
-/// A job leaves each stage of the progression no earlier than the first call that reads it
-/// there, so a case reaches a stage by POLLING rather than by sleeping through a span and
-/// reading once — which is also what a client does.
+/// The progression runs on the submission's own clock, and each stage dwells its own span, so
+/// a case reaches a stage by polling the way a client does — which is also what proves the
+/// stage is one a poller can read the job in, rather than one the elapsed time carries it
+/// past unseen.
 pub(crate) async fn poll_until_status(
     emu: &Emulator,
     case: &str,

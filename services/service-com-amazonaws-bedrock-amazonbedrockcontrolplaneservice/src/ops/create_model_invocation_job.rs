@@ -10,11 +10,14 @@
 //!
 //! Where that decision admits the pass, the job is minted `Submitted` — "this job has been
 //! submitted to a queue for validation" — and the submission arms the whole clock the job
-//! runs on (`state::ModelInvocationJobClock`), so it is owed `Validating`, then
-//! `Scheduled`, then `InProgress`, and only then its terminal status — one stage per call
-//! that reads it, each dwelling its own span, so no poller is carried past a stage
-//! (`state::ModelInvocationJobRecord::settle`). The record this operation writes is the one
-//! `ops/get_model_invocation_job.rs` reads back and `ops/list_model_invocation_jobs.rs`
+//! runs on (`state::ModelInvocationJobClock`): every stage's instant is fixed HERE, on this
+//! submission's own timeline, so it is owed `Validating`, then `Scheduled`, then
+//! `InProgress`, and then its terminal status, each a span after the one before it, and the
+//! status any later read is answered is a function of the time elapsed since this call alone
+//! (`state::ModelInvocationJobRecord::settle`) — the intermediate stages are observable to a
+//! caller polling tighter than their spans, never waypoints a caller must poll through, and
+//! no number of reads moves the job faster or slower. The record this operation writes is the
+//! one `ops/get_model_invocation_job.rs` reads back and `ops/list_model_invocation_jobs.rs`
 //! reports, so the job this call submits is the job every later request sees.
 //!
 //! The submission also performs the `Validating` step over REAL data: it reads the records
@@ -405,10 +408,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
             // The inference runs after this call returns, so the job is reported as queued
             // for validation now and the submission arms every later transition at once:
-            // each stage of the progression is owed at an instant fixed here, no single
-            // later call both arms a move and spends it, and the stage after the one a read
-            // materialises is re-counted from that read, so every stage is one a caller
-            // polling the job reads it in.
+            // each stage of the progression is owed at an instant fixed HERE, on this
+            // submission's own timeline, so the status the job holds is the one the time
+            // since this call owes it — a tightly polling caller observes each stage in turn,
+            // and one that waits and reads once is answered with the stage that elapsed time
+            // has carried the job to.
             status: crate::state::MODEL_INVOCATION_JOB_STATUS_SUBMITTED,
             validating_due_at: Some(clock.validating_at),
             // A job whose input cannot be processed is never scheduled and never begins:
