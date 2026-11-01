@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRevenueStatisticsSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRevenueStatisticsSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! "A summary of monetization revenue for the specified time window" (`RevenueBreakdown`):
+//! ONE aggregate over the scope's settlement ledger
+//! ([`crate::state::SettlementRecordEntry`]) — the transactions whose settlement
+//! instant the `TimeWindow` contains and which satisfy every filter the request
+//! applied, the same selection a settlement listing reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRevenueStatisticsSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Over that selection the breakdown is: `TotalMonetizeServed`, the HTTP 402
+//! Payment Required answers served, which is one per monetized request because the
+//! `Monetize` action "returns an HTTP 402 Payment Required response containing
+//! pricing information that the requesting client uses to complete payment";
+//! `TotalSettled`, the transactions whose `Status` is `SETTLED`, the one status
+//! whose transfer "is confirmed"; and the revenue amounts, the sum of `Amount` over
+//! exactly those settled transactions, split by their `Verified` member into the
+//! verified and unverified tiers that add up to it.
+//!
+//! A payment is settled by WAF's DATA plane, when a rule's `Monetize` action settles
+//! one for a request a web ACL evaluated. This emulator serves the WAFv2 control
+//! plane only, so no operation writes that ledger and a window reports a zeroed
+//! breakdown, which is the summary WAF answers for an account whose window settled
+//! nothing. The aggregation is still the whole answer: a ledger that holds
+//! transactions reports exactly the figures those come to.
+//!
+//! "This operation is only available for CLOUDFRONT scope", so a request naming the
+//! regional namespace is refused as the parameter failure it is, and "the maximum
+//! supported time window is 90 days", so a wider window is refused too.
+//!
+//! The call REPORTS: it reads the ledger and changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +181,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRevenueStatisticsSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRevenueStatisticsSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+
+        // The request's own members first, so a bad one is refused whatever the
+        // ledger holds.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRevenueStatisticsSummary"))
+        // An enum member's membership is refused at the request boundary, which
+        // words the member's own constraint; these are the handler's own guards, so
+        // a value that ever reaches one unchecked is reported as WAF's
+        // invalid-parameter refusal rather than silently aggregating nothing.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(invalid_parameter(
+                crate::state::FIELD_SCOPE_VALUE,
+                &input.scope,
+                "the scope names the namespace the transactions were settled in, and is \
+                 one of CLOUDFRONT or REGIONAL",
+            ));
+        }
+        // "This operation is only available for CLOUDFRONT scope": the regional
+        // namespace settles no payment, so the scope it names is a value this
+        // operation does not accept, not a zeroed summary.
+        if input.scope != crate::state::SCOPE_CLOUDFRONT {
+            return Err(invalid_parameter(
+                crate::state::FIELD_SCOPE_VALUE,
+                &input.scope,
+                "revenue statistics are available only for the CLOUDFRONT scope",
+            ));
+        }
+        if !crate::state::is_known_currency(&input.currency) {
+            return Err(invalid_parameter_without_field(
+                &input.currency,
+                "the currency names the denomination of the amounts in the response",
+            ));
+        }
+        let filters = input.filters.as_deref().unwrap_or_default();
+        crate::state::validate_monetization_filters(filters)
+            .map_err(GetRevenueStatisticsSummaryErrorModeled::WAFInvalidParameterException)?;
+        let window = crate::state::monetization_window(&input.time_window)
+            .map_err(GetRevenueStatisticsSummaryErrorModeled::WAFInvalidParameterException)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetRevenueStatisticsSummaryErrorModeled::WAFInternalErrorException(
+                    WAFInternalErrorException {
+                        message: Some("the wafv2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // Every transaction of this scope's ledger that the window contains and the
+        // filters select: the population every figure below is computed over, so one
+        // summary describes one set of transactions.
+        let selected: Vec<&SettlementRecord> = state
+            .settlement_records(&input.scope)
+            .iter()
+            .filter(|entry| {
+                window.contains(&crate::state::date_time_millis(&entry.record.timestamp))
+                    && crate::state::monetization_filters_select(entry, filters)
+            })
+            .map(|entry| &entry.record)
+            .collect();
+
+        // "The total number of successfully settled payment transactions": the ones
+        // whose transfer was confirmed, which are also the only ones that moved
+        // money, so they are the transactions the revenue amounts are summed over.
+        let settled: Vec<&SettlementRecord> = selected
+            .iter()
+            .copied()
+            .filter(|record| record.status == crate::state::SETTLEMENT_STATUS_SETTLED)
+            .collect();
+
+        // "The revenue amount from verified AI bots" and its unverified counterpart:
+        // `SettlementRecord$Verified` is "whether the AI bot's identity was
+        // verified", so it partitions the settled transactions and the two tiers add
+        // up to the total.
+        let verified_amount = total_amount(settled.iter().copied().filter(|record| record.verified));
+        let unverified_amount =
+            total_amount(settled.iter().copied().filter(|record| !record.verified));
+
+        Ok(GetRevenueStatisticsSummaryOutput {
+            revenue_breakdown: Some(RevenueBreakdown {
+                total_amount: Some(total_amount(settled.iter().copied())),
+                verified_amount: Some(verified_amount),
+                unverified_amount: Some(unverified_amount),
+                // "The currency of the revenue amounts", which is the denomination
+                // the request asked its amounts in.
+                currency: Some(input.currency.clone()),
+                total_settled: i64::try_from(settled.len()).unwrap_or(i64::MAX),
+                // "The total number of HTTP 402 Payment Required responses served to
+                // AI agents": the `Monetize` action answers every request it handles
+                // with one, and a transaction is recorded for each such request,
+                // whatever the payment went on to settle as.
+                total_monetize_served: i64::try_from(selected.len()).unwrap_or(i64::MAX),
+            }),
+        })
     }
+}
+
+/// The modelled `WAFInvalidParameterException` for a parameter the enum
+/// `ParameterExceptionField` names a settings group for, lifted into this
+/// operation's error channel.
+fn invalid_parameter(
+    field: &str,
+    parameter: &str,
+    reason: &str,
+) -> GetRevenueStatisticsSummaryError {
+    GetRevenueStatisticsSummaryErrorModeled::WAFInvalidParameterException(
+        crate::state::invalid_parameter_exception(field, parameter, reason),
+    )
+    .into()
+}
+
+/// [`invalid_parameter`] for a parameter that enum names no settings group for.
+fn invalid_parameter_without_field(
+    parameter: &str,
+    reason: &str,
+) -> GetRevenueStatisticsSummaryError {
+    GetRevenueStatisticsSummaryErrorModeled::WAFInvalidParameterException(
+        crate::state::invalid_parameter_exception_without_field(parameter, reason),
+    )
+    .into()
+}
+
+/// The sum of the `Amount` of each of `records`, in the `MonetizationAmountValue`
+/// form a revenue figure is reported in — the exact decimal the amounts come to,
+/// through the one reading of a monetization amount this service shares.
+fn total_amount<'a>(records: impl Iterator<Item = &'a SettlementRecord>) -> String {
+    crate::state::monetization_amount_total(records.map(|record| record.amount.as_str()))
 }

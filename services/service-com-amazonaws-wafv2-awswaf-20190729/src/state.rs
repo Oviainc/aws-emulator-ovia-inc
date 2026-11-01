@@ -937,6 +937,40 @@ pub fn monetization_window(
     Ok(start..=end)
 }
 
+/// `SettlementStatus`'s `SETTLED` value: the one status whose payment "was
+/// successfully settled on the blockchain and the transfer from the payer's wallet
+/// to the publisher's wallet is confirmed" (`SettlementRecord$Status`) — the
+/// transactions that moved money, which is what a revenue figure is of. Under
+/// every other status "the client is not charged" or "content is not served".
+pub const SETTLEMENT_STATUS_SETTLED: &str = "SETTLED";
+
+/// The quantity a monetization amount spells, as the exact decimal it is.
+///
+/// `MonetizationAmountValue` is a STRING in the model and an amount is a quantity
+/// of money, so it is read as a decimal rather than as a float: a sum of amounts
+/// has to come to exactly the figure the operands spell, which a binary float
+/// cannot do. A value that spells no number counts as nothing, which keeps one
+/// unreadable transaction from deciding a whole query's answer.
+pub fn monetization_amount(amount: &str) -> ::bigdecimal::BigDecimal {
+    amount
+        .trim()
+        .parse::<::bigdecimal::BigDecimal>()
+        .unwrap_or_else(|_| ::bigdecimal::BigDecimal::from(0))
+}
+
+/// The sum of `amounts`, as the `MonetizationAmountValue` a revenue figure is
+/// reported in. The sum of no amount is zero, the figure a window that settled
+/// nothing reports. See [`monetization_amount`].
+pub fn monetization_amount_total<'a>(amounts: impl IntoIterator<Item = &'a str>) -> String {
+    amounts
+        .into_iter()
+        .map(monetization_amount)
+        .fold(::bigdecimal::BigDecimal::from(0), |total, amount| {
+            total + amount
+        })
+        .to_string()
+}
+
 /// What this service sorts a settlement listing by when the request names no
 /// `SortBy`.
 ///

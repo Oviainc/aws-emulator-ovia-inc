@@ -39,27 +39,27 @@ const OPERATION: &str = "ListSettlementRecords";
 
 /// The one `Currency` the model declares
 /// (`smithy_query(query="shape",shape="Currency")`).
-const CURRENCY: &str = "USDC";
+pub(crate) const CURRENCY: &str = "USDC";
 
 /// The instant every window and every seeded transaction below is expressed
 /// relative to (epoch seconds for 2026-01-01T00:00:00Z), so the whole suite is
 /// deterministic and never races a wall clock.
-const BASE_SECS: i64 = 1_767_225_600;
+pub(crate) const BASE_SECS: i64 = 1_767_225_600;
 
 /// A `TimeWindow` spanning `[BASE_SECS + from, BASE_SECS + to]`, in the
 /// epoch-seconds form an awsJson1_1 body carries a timestamp in.
-fn window(from: i64, to: i64) -> Value {
+pub(crate) fn window(from: i64, to: i64) -> Value {
     json!({ "StartTime": BASE_SECS + from, "EndTime": BASE_SECS + to })
 }
 
 /// A request for `scope` over `time_window`, carrying the three members the model
 /// marks `@required`.
-fn request(scope: &str, time_window: Value) -> Value {
+pub(crate) fn request(scope: &str, time_window: Value) -> Value {
     json!({ "Scope": scope, "Currency": CURRENCY, "TimeWindow": time_window })
 }
 
 /// [`request`] with the members of `extra` merged in, for the optional members.
-fn with(mut body: Value, extra: Value) -> Value {
+pub(crate) fn with(mut body: Value, extra: Value) -> Value {
     if let (Some(target), Some(source)) = (body.as_object_mut(), extra.as_object()) {
         for (key, value) in source {
             target.insert(key.clone(), value.clone());
@@ -69,13 +69,13 @@ fn with(mut body: Value, extra: Value) -> Value {
 }
 
 /// One `MonetizationFilter`.
-fn filter(name: &str, values: &[&str]) -> Value {
+pub(crate) fn filter(name: &str, values: &[&str]) -> Value {
     json!({ "Name": name, "Values": values })
 }
 
 /// The members every seeded transaction shares, so each one below states only what
 /// it differs in.
-fn base_record(web_acl_arn: &str) -> SettlementRecord {
+pub(crate) fn base_record(web_acl_arn: &str) -> SettlementRecord {
     SettlementRecord {
         timestamp: ::aws_smithy_types::DateTime::from_millis(BASE_SECS * 1_000),
         payer_address: Some("0xPAYERA".to_string()),
@@ -100,7 +100,7 @@ fn base_record(web_acl_arn: &str) -> SettlementRecord {
 /// One ledger entry: the transaction, the rule that triggered the `Monetize`
 /// action, and the `(HttpSourceName, HttpSourceId)` of the resource that fronted
 /// the request.
-fn entry(
+pub(crate) fn entry(
     record: SettlementRecord,
     terminating_rule: &str,
     source: (&str, &str),
@@ -114,7 +114,7 @@ fn entry(
 }
 
 /// The instant `at` seconds after [`BASE_SECS`], as a modelled timestamp.
-fn at(seconds: i64) -> ::aws_smithy_types::DateTime {
+pub(crate) fn at(seconds: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis((BASE_SECS + seconds) * 1_000)
 }
 
@@ -232,7 +232,7 @@ fn ledger_fixture(web_acl_arn: &str) -> Vec<SettlementRecordEntry> {
 /// The one thing these suites cannot do over the wire: WAF's data plane is what
 /// settles a payment, and this emulator serves only the WAFv2 control plane, so
 /// nothing in the API fills that ledger.
-fn seed_ledger(
+pub(crate) fn seed_ledger(
     engine: &engine::InMemoryEngine,
     scope: &str,
     entries: Vec<SettlementRecordEntry>,
@@ -247,7 +247,7 @@ fn seed_ledger(
 }
 
 /// How many transactions the ledger of `scope` holds.
-fn ledger_len(engine: &engine::InMemoryEngine, scope: &str) -> usize {
+pub(crate) fn ledger_len(engine: &engine::InMemoryEngine, scope: &str) -> usize {
     engine
         .state::<ComAmazonawsWafv2Awswaf20190729State>()
         .lock()
@@ -276,7 +276,7 @@ fn ids(answer: &Value) -> Vec<String> {
 
 /// A web ACL in the CLOUDFRONT scope, for the `WebACLArn` filter and for the
 /// records' own `WebAclArn`.
-async fn monetized_web_acl(waf: &Waf, name: &str) -> String {
+pub(crate) async fn monetized_web_acl(waf: &Waf, name: &str) -> String {
     let (_id, arn, _lock) = create_web_acl(waf, SCOPE_CLOUDFRONT, name, json!([])).await;
     arn
 }

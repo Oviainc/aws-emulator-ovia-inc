@@ -99,6 +99,8 @@ mod resource_tagging;
 mod resource_untagging;
 #[path = "all/response_members.rs"]
 mod response_members;
+#[path = "all/revenue_statistics_summary.rs"]
+mod revenue_statistics_summary;
 #[path = "all/rule_evaluation_order.rs"]
 mod rule_evaluation_order;
 #[path = "all/rule_group_capacity_refusal.rs"]

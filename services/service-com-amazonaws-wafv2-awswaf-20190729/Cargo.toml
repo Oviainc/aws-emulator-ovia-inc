@@ -44,6 +44,11 @@ base64 = "0.22"
 # references, so a named, decimal or hexadecimal reference is decoded the way a browser
 # decodes it rather than by a hand-written table.
 html-escape = "0.2"
+# Exact decimal arithmetic over a `MonetizationAmountValue`, which the model carries
+# as a string: a revenue total is a sum of money, so it is added as the decimal each
+# amount spells rather than through a binary float (`state::monetization_amount`).
+# The same crate the sibling dynamodb service reads a numeric attribute with.
+bigdecimal = "0.4"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

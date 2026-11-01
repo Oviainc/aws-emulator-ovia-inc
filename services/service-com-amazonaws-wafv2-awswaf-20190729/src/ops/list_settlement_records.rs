@@ -365,7 +365,7 @@ fn compare_by(
     right: &SettlementRecord,
 ) -> ::std::cmp::Ordering {
     match sort_by {
-        "AMOUNT" => amount(left).total_cmp(&amount(right)),
+        "AMOUNT" => amount(left).cmp(&amount(right)),
         "NAME" => left
             .source_name
             .as_deref()
@@ -379,7 +379,8 @@ fn compare_by(
     }
 }
 
-/// The quantity a record's `Amount` spells. See [`compare_by`].
-fn amount(record: &SettlementRecord) -> f64 {
-    record.amount.trim().parse::<f64>().unwrap_or(0.0)
+/// The quantity a record's `Amount` spells, through the one reading of a
+/// monetization amount this service shares. See [`compare_by`].
+fn amount(record: &SettlementRecord) -> ::bigdecimal::BigDecimal {
+    crate::state::monetization_amount(&record.amount)
 }
