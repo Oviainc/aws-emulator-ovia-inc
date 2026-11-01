@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBucketMetadataAnnotationTableConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBucketMetadataAnnotationTableConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enables or disables the annotation table of the S3 Metadata configuration
+//! the named general purpose bucket carries, and applies the IAM role that manages it. The
+//! `ConfigurationState` the request carries replaces the one the configuration carried, and
+//! the table behind it follows — an enable creates the annotation table, reported as
+//! `CREATING` until it falls due to be in service
+//! ([`crate::state::METADATA_TABLE_ACTIVATION_DELAY`]) and `ACTIVE` from then on, and a
+//! disable drops it — while a `Role` the request names replaces the one in effect and a
+//! request naming none leaves it as it was, all of which `GetBucketMetadataConfiguration`
+//! reports. Nothing else about the configuration moves: its journal table, that table's
+//! record expiration and its inventory table are left exactly as they were.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBucketMetadataAnnotationTableConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404), one carrying no
+//! metadata configuration [`crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE`] (HTTP
+//! 404), an `x-amz-expected-bucket-owner` that is not this account's HTTP 403
+//! `AccessDenied`, an encryption configuration naming SSE-KMS with no KMS key ARN beside it
+//! `InvalidArgument` (HTTP 400), and an enable that would leave the annotation table with
+//! no managing IAM role at all [`crate::state::INVALID_REQUEST_CODE`] (HTTP 400) — each
+//! with nothing written.
 //!
 //! ## Shape of an operation
 //!
@@ -113,9 +122,20 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UpdateBucketMetadataAnno
 // here — hence the `UpdateBucketMetadataAnnotationTableConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#UpdateBucketMetadataAnnotationTableConfiguration")]
+// Widened by `NoSuchBucket`: the model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="UpdateBucketMetadataAnnotationTableConfiguration")`
+// reports `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that
+// does not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped operation
+// does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#UpdateBucketMetadataAnnotationTableConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum UpdateBucketMetadataAnnotationTableConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -169,18 +189,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBucketMetadataAnnotationTableConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBucketMetadataAnnotationTableConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Everything this write needs is in its deserialized input: the expected owner and
+        // the configuration updates travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner"
+        // (`UpdateBucketMetadataAnnotationTableConfigurationRequest$ExpectedBucketOwner`),
+        // judged the way every other bucket-scoped operation in this crate judges it: this
+        // emulator serves one account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; nothing can then be persisted, and this
+            // operation models no server-fault error to say so, so the scaffold's 501
+            // carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateBucketMetadataAnnotationTableConfiguration",
+            ));
+        };
+
+        let updates = &input.annotation_table_configuration;
+
+        // Refused BEFORE anything is written, so a refused update leaves the bucket carrying
+        // exactly the configuration it carried: the one rule an encryption container is
+        // judged by, shared with every other write of a metadata table that carries one.
+        if let Some(message) = crate::state::metadata_table_encryption_refusal(
+            "AnnotationTableConfiguration",
+            updates.encryption_configuration.as_ref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                message,
+            ));
+        }
+
+        // The one caller-supplied string a metadata configuration retains, bounded so the
+        // record one bucket carries is bounded whatever a caller sends — the emulator's own
+        // ceiling, so it goes out through the framework's 400 refusal channel rather than as
+        // an AWS error code, exactly as the create that first records a role bounds it.
+        if let Some(role) = updates.role.as_deref() {
+            if role.chars().count() > crate::state::MAX_METADATA_TABLE_ROLE_CHARS {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "AnnotationTableConfiguration.Role is {} characters, more than the {} \
+                     this emulator records for one metadata configuration",
+                    role.chars().count(),
+                    crate::state::MAX_METADATA_TABLE_ROLE_CHARS
+                )));
+            }
+        }
+
+        // A table this creates falls due to be in service a span after this call, so a
+        // caller reading the configuration straight afterwards still sees `CREATING`;
+        // nothing waits for the instant here.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBucketMetadataAnnotationTableConfiguration"))
+        // `ContentMD5` is NOT verified, and `ChecksumAlgorithm` not acted on: by the time
+        // this handler runs the payload is the deserialized container rather than the bytes
+        // a digest was computed over, so nothing this handler holds can confirm or deny
+        // either. That is where every other bucket-subresource write in this crate leaves
+        // them.
+        let now = ::std::time::SystemTime::now();
+        let table_name = crate::state::metadata_table_name(
+            &input.bucket,
+            crate::state::METADATA_ANNOTATION_TABLE_SUFFIX,
+        );
+        let enabling =
+            updates.configuration_state == crate::state::METADATA_CONFIGURATION_STATE_ENABLED;
+
+        // The bucket is looked up FIRST, so a request naming a bucket this emulator does not
+        // hold answers that rather than reporting whatever is wrong with the state of a
+        // bucket that does not exist (the order every other bucket-subresource write in this
+        // crate keeps).
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(
+                UpdateBucketMetadataAnnotationTableConfigurationErrorModeled::NoSuchBucket(
+                    NoSuchBucket {},
+                )
+                .into(),
+            );
+        };
+        // "To use this operation, the bucket must have an existing Amazon S3 Metadata
+        // configuration" (this operation's own documentation): the annotation table belongs
+        // to a metadata configuration, so a bucket carrying none has no table to enable or
+        // disable — the mutation is refused with the metadata configuration's own not-there
+        // condition, the same one a READ of it answers, and nothing is written (never a
+        // silent no-op that would look like a success).
+        let Some(role_in_effect) = bucket.metadata_configuration().map(|configuration| {
+            configuration
+                .annotation
+                .as_ref()
+                .and_then(|annotation| annotation.role.clone())
+        }) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
+            ));
+        };
+
+        // "The IAM role must have a trust policy that allows the Amazon S3 metadata service
+        // to assume it, and a permissions policy that grants the actions needed to read
+        // annotations from your bucket" (this operation's own documentation): an annotation
+        // table in service is read THROUGH such a role, so an enabled annotation table always
+        // has one — the role this request names, or failing that the one the configuration
+        // already carries. An enable that would leave the table with no role at all is a
+        // request S3 cannot carry out, which is what `InvalidRequest` (400) reports, with the
+        // sentence the modelled shape states for itself. A disable needs none: there is no
+        // table left to read.
+        if enabling && updates.role.is_none() && role_in_effect.is_none() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::INVALID_REQUEST_MESSAGE,
+            ));
+        }
+
+        // "Use this operation to enable or disable the annotation table, or to update its
+        // associated IAM role" (this operation's own documentation), and nothing else: the
+        // journal and inventory sub-resources of the same configuration are left exactly as
+        // they were.
+        if !bucket.update_metadata_annotation_table(
+            updates.configuration_state.clone(),
+            updates.role.clone(),
+            &table_name,
+            now,
+        ) {
+            // Unreachable: the configuration was read above under this same guard.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
+            ));
+        }
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(UpdateBucketMetadataAnnotationTableConfigurationOutput)
     }
 }
+
+/// The code S3 answers a request whose `x-amz-expected-bucket-owner` is not the owner of
+/// the bucket it names, the way every other bucket-scoped operation in this crate answers
+/// it. Not a shape in this model, so it goes out through the unmodelled channel.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`] — the status an owner mismatch is answered with: "403
+/// Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`] — the text Amazon S3 "Error responses" publishes for it.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";

@@ -4267,8 +4267,9 @@ pub struct MetadataTableConfiguration {
 }
 
 /// Record `configuration_state` as the state of the optional table configuration `slot`,
-/// with `table_name` the name a table this creates is created under and `now` the instant of
-/// the call asking for it.
+/// with `table_name` the name a table this creates is created under, `role` the IAM role the
+/// call names for the table (`None` when it names none) and `now` the instant of the call
+/// asking for it.
 ///
 /// The shape of enabling or disabling one of a metadata configuration's optional tables: the
 /// state the request names becomes the table's state, and the table behind it follows —
@@ -4277,9 +4278,16 @@ pub struct MetadataTableConfiguration {
 /// is what leaves the reported result carrying a state with no table name, status or ARN.
 /// Enabling a table that is already there leaves that table exactly as it is, so a repeated
 /// enable neither restarts its creation nor renames it.
+///
+/// `role` is "the new IAM role ARN to apply" (`AnnotationTableConfigurationUpdates$Role`) —
+/// for the annotation table, the only optional table managed by one: a call that names one
+/// replaces the role in effect, and a call that names none leaves whatever role the
+/// configuration carried in place (the inventory table has no such member, so its caller
+/// names none and its `role` stays `None`).
 fn set_optional_metadata_table_state(
     slot: &mut Option<MetadataTableConfiguration>,
     configuration_state: String,
+    role: Option<String>,
     table_name: &str,
     now: SystemTime,
 ) {
@@ -4291,9 +4299,7 @@ fn set_optional_metadata_table_state(
         table: enabled.then(|| {
             carried_table.unwrap_or_else(|| MetadataTable::creating(table_name.to_string(), now))
         }),
-        // The IAM role is the annotation table's own member and no update to the state of a
-        // table names one, so whatever role the configuration carried it carries still.
-        role: carried.and_then(|table| table.role),
+        role: role.or_else(|| carried.and_then(|table| table.role)),
     });
 }
 
@@ -5592,6 +5598,48 @@ impl Bucket {
         set_optional_metadata_table_state(
             &mut configuration.inventory,
             configuration_state,
+            // `InventoryTableConfigurationUpdates` carries no `Role`: only the annotation
+            // table is managed by an IAM role.
+            None,
+            table_name,
+            now,
+        );
+        true
+    }
+
+    /// Record `configuration_state` as the annotation table state of the bucket's S3 Metadata
+    /// configuration and `role` as the IAM role that manages it, with `table_name` the name an
+    /// annotation table this creates is created under — reporting whether the bucket carries a
+    /// configuration to record them on.
+    ///
+    /// What `UpdateBucketMetadataAnnotationTableConfiguration` does: it is used "to enable or
+    /// disable the annotation table, or to update its associated IAM role" (that operation's
+    /// own documentation), so the state the request names replaces the one the configuration
+    /// carried and the annotation table behind it follows
+    /// ([`set_optional_metadata_table_state`]), while a `role` the request names replaces the
+    /// role in effect and `None` leaves it as it was ("the new IAM role ARN to apply",
+    /// `AnnotationTableConfigurationUpdates$Role`, which is optional). Scoped to that one
+    /// table: the journal table, its record expiration and the inventory table are left
+    /// exactly as they were, the way [`Self::update_metadata_inventory_table`] is scoped to the
+    /// one table it names.
+    ///
+    /// `false` is a bucket carrying NO metadata configuration, in which case nothing is
+    /// written: there is no configuration to enable a table for, and the caller answers
+    /// [`METADATA_CONFIGURATION_NOT_FOUND_CODE`].
+    pub fn update_metadata_annotation_table(
+        &mut self,
+        configuration_state: String,
+        role: Option<String>,
+        table_name: &str,
+        now: SystemTime,
+    ) -> bool {
+        let Some(configuration) = self.metadata_configuration.as_mut() else {
+            return false;
+        };
+        set_optional_metadata_table_state(
+            &mut configuration.annotation,
+            configuration_state,
+            role,
             table_name,
             now,
         );
