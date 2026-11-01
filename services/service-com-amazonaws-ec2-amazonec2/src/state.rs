@@ -349,6 +349,19 @@
 //! leaves the ones it did not alone, and stamps the instance's `LastUpdatedTime`, so the
 //! modify and a later describe cannot report one instance differently.
 //!
+//! An instance's LOGGING configuration is a fact of the instance the modelled
+//! `VerifiedAccessInstance` shape carries no member for, so it is kept beside the instance in
+//! [`ComAmazonawsEc2Amazonec2State::verified_access_instance_logging_configurations`], as the
+//! modelled [`crate::ops::types::VerifiedAccessLogs`] shape a describe of the logging
+//! configurations reports, keyed by the same `VerifiedAccessInstanceId`.
+//! [`ComAmazonawsEc2Amazonec2State::set_verified_access_instance_logging_configuration`] is
+//! the one way one is written and
+//! [`ComAmazonawsEc2Amazonec2State::verified_access_instance_logging_configuration`] the one
+//! way one is read, so the modify of a configuration and a later describe of it cannot
+//! disagree. An instance nothing has configured has NO entry there and carries
+//! [`default_verified_access_logs`] — a read reports that configuration rather than storing
+//! it, so describing an instance leaves the store exactly as it was.
+//!
 //! [`ComAmazonawsEc2Amazonec2State::verified_access_groups`] holds the account's Verified
 //! Access groups as [`VerifiedAccessGroupRecord`]s, keyed by `VerifiedAccessGroupId`, and
 //! [`ComAmazonawsEc2Amazonec2State::insert_verified_access_group`] is the one way a group is
@@ -3396,6 +3409,23 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// modification, not a replay of that create.
     pub verified_access_instance_modification_client_tokens:
         HashMap<String, VerifiedAccessInstanceModification>,
+    /// The logging configuration of every Verified Access instance a
+    /// `ModifyVerifiedAccessInstanceLoggingConfiguration` has set one for, by
+    /// `VerifiedAccessInstanceId`, as the modelled
+    /// [`crate::ops::types::VerifiedAccessLogs`] shape a describe of the logging
+    /// configurations reports — see the module docs. An instance with NO entry here has had
+    /// none set and carries [`default_verified_access_logs`], which a read reports without
+    /// storing it.
+    pub verified_access_instance_logging_configurations:
+        BTreeMap<String, crate::ops::types::VerifiedAccessLogs>,
+    /// A `ModifyVerifiedAccessInstanceLoggingConfiguration` `ClientToken` and the update it
+    /// applied, so a repeat of the same request applies nothing further and the same token
+    /// carrying a different update is refused instead of configuring the instance twice.
+    /// Separate from [`Self::verified_access_instance_modification_client_tokens`] for the
+    /// same reason that map is separate from the create's: a token names the request it was
+    /// given with.
+    pub verified_access_instance_logging_client_tokens:
+        HashMap<String, VerifiedAccessInstanceLoggingConfigurationUpdate>,
     /// Every Verified Access group the account holds, by `VerifiedAccessGroupId`, as
     /// [`VerifiedAccessGroupRecord`]s — see the module docs. Ordered by id, the order a
     /// describe of the groups reports and pages over.
@@ -4529,6 +4559,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             verified_access_instances: BTreeMap::new(),
             verified_access_instance_client_tokens: HashMap::new(),
             verified_access_instance_modification_client_tokens: HashMap::new(),
+            // Nothing has configured logging on an instance of a fresh account, so every
+            // instance reads back with `default_verified_access_logs`.
+            verified_access_instance_logging_configurations: BTreeMap::new(),
+            verified_access_instance_logging_client_tokens: HashMap::new(),
             verified_access_groups: BTreeMap::new(),
             verified_access_group_client_tokens: HashMap::new(),
             verified_access_group_deletions: VecDeque::new(),
@@ -17061,6 +17095,222 @@ pub fn verified_access_instance_modification_payload_bytes(
         .saturating_add(client_token.len())
 }
 
+/// The logging configuration a Verified Access instance carries until a
+/// `ModifyVerifiedAccessInstanceLoggingConfiguration` sets one: no destination enabled, and
+/// no trust data in the logs.
+///
+/// The ONE definition of that configuration — the describe of the logging configurations
+/// reports it for an instance with no stored entry, and the modify applies the members a
+/// request carries to it — so an instance nothing has configured cannot be reported two ways.
+/// It carries no `LogVersion`, because nothing has chosen a log schema for this instance
+/// ("The log version", `VerifiedAccessLogs$LogVersion`), and no `DeliveryStatus` on any
+/// destination, because nothing has delivered a log record whose delivery there would be a
+/// status of ("The delivery status for access logs",
+/// `VerifiedAccessLogCloudWatchLogsDestination$DeliveryStatus`).
+pub fn default_verified_access_logs() -> crate::ops::types::VerifiedAccessLogs {
+    crate::ops::types::VerifiedAccessLogs {
+        s3: Some(crate::ops::types::VerifiedAccessLogS3Destination {
+            enabled: Some(false),
+            ..Default::default()
+        }),
+        cloud_watch_logs: Some(crate::ops::types::VerifiedAccessLogCloudWatchLogsDestination {
+            enabled: Some(false),
+            ..Default::default()
+        }),
+        kinesis_data_firehose: Some(
+            crate::ops::types::VerifiedAccessLogKinesisDataFirehoseDestination {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        ),
+        log_version: None,
+        include_trust_context: Some(false),
+    }
+}
+
+/// One `ModifyVerifiedAccessInstanceLoggingConfiguration` request: the instance it names and
+/// the logging options it carried.
+///
+/// Kept whole, rather than reduced to the configuration it produced, for the reason
+/// [`VerifiedAccessInstanceModification`] is: telling a REPLAY of one request from the SAME
+/// token carrying a DIFFERENT one ([`idempotent_parameter_mismatch`]) needs the request.
+#[derive(Debug, Clone)]
+pub struct VerifiedAccessInstanceLoggingConfigurationUpdate {
+    /// The instance the request named.
+    pub verified_access_instance_id: String,
+    /// "The configuration options for Verified Access instances"
+    /// (`ModifyVerifiedAccessInstanceLoggingConfigurationRequest$AccessLogs`), as the
+    /// request carried them.
+    pub access_logs: crate::ops::types::VerifiedAccessLogOptions,
+}
+
+/// One S3 logging destination's options as a comparable value: whether logging to it is
+/// enabled, and the bucket, prefix and owner the request named for it.
+///
+/// Named rather than written inline so
+/// [`VerifiedAccessInstanceLoggingConfigurationUpdate::same_request_as`] compares the
+/// destination's members as ONE value, the modelled options shapes deriving no equality of
+/// their own.
+type S3LogDestinationComparison<'a> = (bool, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+
+/// One CloudWatch Logs or Kinesis Data Firehose destination's options as a comparable value:
+/// whether logging to it is enabled, and the log group or delivery stream it names.
+type NamedLogDestinationComparison<'a> = (bool, Option<&'a str>);
+
+impl VerifiedAccessInstanceLoggingConfigurationUpdate {
+    /// `logs` as this update leaves them: every destination block and option the request
+    /// carried replaces the stored one, and every one it did not carry keeps its value — the
+    /// same rule [`VerifiedAccessInstanceModification::applied_to`] reads a modify's members
+    /// by.
+    ///
+    /// A destination block the request carries is the WHOLE configuration of that
+    /// destination, so a block naming no bucket leaves that destination with none. No
+    /// `DeliveryStatus` is set: nothing has delivered a log record to report the delivery of,
+    /// exactly as [`default_verified_access_logs`] leaves it.
+    ///
+    /// The ONE definition of what an update does to a configuration, so the pre-check of the
+    /// store's byte budget and
+    /// [`ComAmazonawsEc2Amazonec2State::set_verified_access_instance_logging_configuration`]'s
+    /// write cannot disagree about the configuration the call leaves behind.
+    pub fn applied_to(
+        &self,
+        logs: &crate::ops::types::VerifiedAccessLogs,
+    ) -> crate::ops::types::VerifiedAccessLogs {
+        let mut applied = logs.clone();
+        if let Some(s3) = self.access_logs.s3.as_ref() {
+            applied.s3 = Some(crate::ops::types::VerifiedAccessLogS3Destination {
+                enabled: Some(s3.enabled),
+                delivery_status: None,
+                bucket_name: s3.bucket_name.clone(),
+                prefix: s3.prefix.clone(),
+                bucket_owner: s3.bucket_owner.clone(),
+            });
+        }
+        if let Some(cloud_watch_logs) = self.access_logs.cloud_watch_logs.as_ref() {
+            applied.cloud_watch_logs =
+                Some(crate::ops::types::VerifiedAccessLogCloudWatchLogsDestination {
+                    enabled: Some(cloud_watch_logs.enabled),
+                    delivery_status: None,
+                    log_group: cloud_watch_logs.log_group.clone(),
+                });
+        }
+        if let Some(kinesis_data_firehose) = self.access_logs.kinesis_data_firehose.as_ref() {
+            applied.kinesis_data_firehose = Some(
+                crate::ops::types::VerifiedAccessLogKinesisDataFirehoseDestination {
+                    enabled: Some(kinesis_data_firehose.enabled),
+                    delivery_status: None,
+                    delivery_stream: kinesis_data_firehose.delivery_stream.clone(),
+                },
+            );
+        }
+        if let Some(log_version) = self.access_logs.log_version.clone() {
+            applied.log_version = Some(log_version);
+        }
+        if let Some(include_trust_context) = self.access_logs.include_trust_context {
+            applied.include_trust_context = Some(include_trust_context);
+        }
+        applied
+    }
+
+    /// Whether `other` asks for exactly what this update asks for: the same instance and the
+    /// same logging options, compared member by member because the modelled options shapes
+    /// derive no equality of their own.
+    ///
+    /// What tells a replay of one request from the same `ClientToken` carrying a different
+    /// one: "A unique, case-sensitive token that you provide to ensure idempotency of your
+    /// modification request"
+    /// (`ModifyVerifiedAccessInstanceLoggingConfigurationRequest$ClientToken`).
+    pub fn same_request_as(&self, other: &Self) -> bool {
+        fn s3(
+            options: &crate::ops::types::VerifiedAccessLogOptions,
+        ) -> Option<S3LogDestinationComparison<'_>> {
+            options.s3.as_ref().map(|destination| {
+                (
+                    destination.enabled,
+                    destination.bucket_name.as_deref(),
+                    destination.prefix.as_deref(),
+                    destination.bucket_owner.as_deref(),
+                )
+            })
+        }
+        fn cloud_watch_logs(
+            options: &crate::ops::types::VerifiedAccessLogOptions,
+        ) -> Option<NamedLogDestinationComparison<'_>> {
+            options
+                .cloud_watch_logs
+                .as_ref()
+                .map(|destination| (destination.enabled, destination.log_group.as_deref()))
+        }
+        fn kinesis_data_firehose(
+            options: &crate::ops::types::VerifiedAccessLogOptions,
+        ) -> Option<NamedLogDestinationComparison<'_>> {
+            options
+                .kinesis_data_firehose
+                .as_ref()
+                .map(|destination| (destination.enabled, destination.delivery_stream.as_deref()))
+        }
+
+        self.verified_access_instance_id == other.verified_access_instance_id
+            && s3(&self.access_logs) == s3(&other.access_logs)
+            && cloud_watch_logs(&self.access_logs) == cloud_watch_logs(&other.access_logs)
+            && kinesis_data_firehose(&self.access_logs)
+                == kinesis_data_firehose(&other.access_logs)
+            && self.access_logs.log_version.as_deref() == other.access_logs.log_version.as_deref()
+            && self.access_logs.include_trust_context == other.access_logs.include_trust_context
+    }
+}
+
+/// The caller-chosen bytes one stored logging configuration holds for the process's lifetime:
+/// the destination names the request chose and the log version it named. The enabled flags
+/// and the instance id the configuration is keyed by are bounded already, so they are not
+/// counted here.
+///
+/// ONE definition of the charge, computed identically by the modify's ceiling pre-check and
+/// by
+/// [`ComAmazonawsEc2Amazonec2State::set_verified_access_instance_logging_configuration`], so
+/// a writer cannot store bytes the store's budget never saw.
+pub fn verified_access_logs_payload_bytes(
+    logs: &crate::ops::types::VerifiedAccessLogs,
+    client_token: Option<&str>,
+) -> usize {
+    let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+    let mut bytes = text(&logs.log_version).saturating_add(client_token.map_or(0, str::len));
+    if let Some(s3) = logs.s3.as_ref() {
+        bytes = bytes
+            .saturating_add(text(&s3.bucket_name))
+            .saturating_add(text(&s3.prefix))
+            .saturating_add(text(&s3.bucket_owner));
+    }
+    if let Some(cloud_watch_logs) = logs.cloud_watch_logs.as_ref() {
+        bytes = bytes.saturating_add(text(&cloud_watch_logs.log_group));
+    }
+    if let Some(kinesis_data_firehose) = logs.kinesis_data_firehose.as_ref() {
+        bytes = bytes.saturating_add(text(&kinesis_data_firehose.delivery_stream));
+    }
+    bytes
+}
+
+/// The caller-chosen bytes one recorded logging-configuration update holds for the process's
+/// lifetime: the options the request carried and the token the map is keyed by, over a fixed
+/// floor for the entry itself.
+///
+/// The FLOOR is there for the reason
+/// [`verified_access_instance_modification_payload_bytes`] has one: nothing reclaims a
+/// recorded update, a client token may be a single byte, and an instance's logging
+/// configuration may be set any number of times, so this map has no record-count ceiling of
+/// its own.
+pub fn verified_access_instance_logging_update_payload_bytes(
+    update: &VerifiedAccessInstanceLoggingConfigurationUpdate,
+    client_token: &str,
+) -> usize {
+    ::std::mem::size_of::<VerifiedAccessInstanceLoggingConfigurationUpdate>()
+        .saturating_add(verified_access_logs_payload_bytes(
+            &update.applied_to(&default_verified_access_logs()),
+            None,
+        ))
+        .saturating_add(client_token.len())
+}
+
 /// The caller-chosen bytes one stored Verified Access endpoint holds for the process's
 /// lifetime: every string the REQUEST chose the length of, the policy document beside the
 /// record, the `EndpointDomainPrefix` the generated endpoint domain carries, and the client
@@ -17307,6 +17557,79 @@ impl ComAmazonawsEc2Amazonec2State {
                 .insert(token.to_string(), modification.clone());
         }
         Some(view)
+    }
+
+    /// The logging configuration stored for the Verified Access instance `instance_id`, or
+    /// `None` when nothing has set one — in which case that instance carries
+    /// [`default_verified_access_logs`].
+    ///
+    /// The one way a stored configuration is READ, so the modify that sets one and a later
+    /// describe of it cannot report one instance's logging differently. A read never stores
+    /// the default: an instance nothing has configured still has no entry after it has been
+    /// described.
+    pub fn verified_access_instance_logging_configuration(
+        &self,
+        instance_id: &str,
+    ) -> Option<&crate::ops::types::VerifiedAccessLogs> {
+        self.verified_access_instance_logging_configurations
+            .get(instance_id)
+    }
+
+    /// The update the `ModifyVerifiedAccessInstanceLoggingConfiguration` `ClientToken`
+    /// `token` named, or `None` when no update has been applied under it.
+    pub fn verified_access_instance_logging_update_for_token(
+        &self,
+        token: &str,
+    ) -> Option<&VerifiedAccessInstanceLoggingConfigurationUpdate> {
+        self.verified_access_instance_logging_client_tokens
+            .get(token)
+    }
+
+    /// Apply `update` to the logging configuration of the instance it names, record it under
+    /// `client_token` when the request carried one, and answer the configuration as it NOW
+    /// stands — `None` when this store holds no instance under that id.
+    ///
+    /// The one way a logging configuration is WRITTEN, so what the modify answers and what a
+    /// later describe of the same instance reports cannot differ. An option the update leaves
+    /// `None` is one the request did not carry, so the stored value stays as it was
+    /// ([`VerifiedAccessInstanceLoggingConfigurationUpdate::applied_to`]); an instance that
+    /// had no configuration at all starts from [`default_verified_access_logs`]. The
+    /// caller-chosen bytes are re-charged across the write — the configuration this replaces
+    /// is refunded and the one it becomes is charged — so a caller cannot grow the store past
+    /// [`MAX_STORED_BYTES`] by configuring one instance repeatedly; a handler asks
+    /// [`Self::would_exceed_stored_bytes_after_refund`] about that net change first.
+    pub fn set_verified_access_instance_logging_configuration(
+        &mut self,
+        update: &VerifiedAccessInstanceLoggingConfigurationUpdate,
+        client_token: Option<&str>,
+    ) -> Option<crate::ops::types::VerifiedAccessLogs> {
+        if !self
+            .verified_access_instances
+            .contains_key(&update.verified_access_instance_id)
+        {
+            return None;
+        }
+        let held = self
+            .verified_access_instance_logging_configurations
+            .get(&update.verified_access_instance_id);
+        let refund = held.map_or(0, |logs| verified_access_logs_payload_bytes(logs, None));
+        let current = held.cloned().unwrap_or_else(default_verified_access_logs);
+        let applied = update.applied_to(&current);
+        let charge = verified_access_logs_payload_bytes(&applied, None);
+        self.verified_access_instance_logging_configurations.insert(
+            update.verified_access_instance_id.clone(),
+            applied.clone(),
+        );
+        self.release_stored_bytes(refund);
+        self.add_stored_bytes(charge);
+        if let Some(token) = client_token {
+            self.add_stored_bytes(verified_access_instance_logging_update_payload_bytes(
+                update, token,
+            ));
+            self.verified_access_instance_logging_client_tokens
+                .insert(token.to_string(), update.clone());
+        }
+        Some(applied)
     }
 
     /// Whether another Verified Access group fits inside the store's ceiling

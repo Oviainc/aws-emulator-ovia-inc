@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVerifiedAccessInstanceLoggingConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVerifiedAccessInstanceLoggingConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVerifiedAccessInstanceLoggingConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the logging configuration of each Verified Access instance this
+//! service stores, narrowed by `VerifiedAccessInstanceIds` and `Filters` and paged by
+//! `MaxResults`/`NextToken` — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +69,18 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page this operation serves, and the page it serves when the request names no
+/// size.
+///
+/// The top of this operation's own modelled `MaxResults` range, `range 1..10`
+/// (`smithy_query(query="operation",operation="DescribeVerifiedAccessInstanceLoggingConfigurations")`),
+/// so a request that names no page size is answered with the largest page the operation can
+/// be ASKED for and the `NextToken` path behaves the same either way. It bounds nothing any
+/// other operation reads — the store's own ceilings live in `crate::state` — so it lives in
+/// this operation's one file, beside the paging that is the only thing it governs, as the
+/// other op-local page caps of this crate do.
+const MAX_LOGGING_CONFIGURATIONS_PAGE_SIZE: usize = 10;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +149,295 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVerifiedAccessInstanceLoggingConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVerifiedAccessInstanceLoggingConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVerifiedAccessInstanceLoggingConfigurations"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            decode_page_token, default_verified_access_logs, encode_page_token,
+            invalid_pagination_token, invalid_verified_access_instance_id_not_found,
+            matches_every_filter, require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS,
+            MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — the modelled
+        // `VerifiedAccessInstanceLoggingConfiguration` names no Region and carries no ARN. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // Read in place rather than copied: the ids are only compared against, and the cap
+        // below is asked before anything proportional to them is done.
+        let requested_ids: &[String] = input
+            .verified_access_instance_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "VerifiedAccessInstanceIds carries {} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored instances, and the model
+        // bounds none of those, so the request-controlled factors are capped here, before any
+        // work proportional to them is done — and their PRODUCT is charged to ONE
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not answer is refused whether or not any
+        // configuration would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The token for the next page of results"
+        // (`DescribeVerifiedAccessInstanceLoggingConfigurationsRequest$NextToken`) — anything
+        // else is refused rather than read as an id, and it is refused before any other member
+        // is looked at, so whether a bogus token is caught never depends on the rest of the
+        // request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "Describes the specified Amazon Web Services Verified Access instances": an id that
+        // names no instance of the account is an error, not an absent row.
+        for instance_id in requested_ids {
+            if !store.verified_access_instances.contains_key(instance_id) {
+                return Err(invalid_verified_access_instance_id_not_found(instance_id));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named instance
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that would
+        // have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The configuration an instance nothing has configured carries, built ONCE here: a
+        // read REPORTS it rather than storing it, so describing an instance leaves the store
+        // exactly as it was and a later caller sees what this one did.
+        let unconfigured = default_verified_access_logs();
+
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored instances,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the state lock. This
+        // loop only READS: a logging configuration carries no status at all, so the clock owes
+        // it no transition for a read to materialise.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<(&str, &VerifiedAccessLogs)> = Vec::new();
+        for instance_id in store.verified_access_instances.keys() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the stored key, so an instance the request did not
+            // name costs no comparison at all.
+            if !requested_ids.is_empty()
+                && !requested_ids.iter().any(|id| id == instance_id.as_str())
+            {
+                continue;
+            }
+            let logs = store
+                .verified_access_instance_logging_configuration(instance_id)
+                .unwrap_or(&unconfigured);
+            if matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(instance_id, logs, name)
+            }) {
+                selected.push((instance_id.as_str(), logs));
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `VerifiedAccessInstanceId` order, which the cursor below names a position
+        // in. The store is an ordered map, so its iteration order already satisfies this sort;
+        // doing it here establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by_key(|(instance_id, _)| *instance_id);
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|(instance_id, _)| *instance_id < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this operation can be asked
+        // for, so the `NextToken` path behaves the same whether or not a page size was asked
+        // for. The modelled `range 1..10` has already refused a size outside it; the clamp's
+        // floor of one page entry is what keeps the cursor below advancing — a zero-sized page
+        // would hand back a token naming the position it started from — if that modelled
+        // minimum ever stops guaranteeing it.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_LOGGING_CONFIGURATIONS_PAGE_SIZE)
+            .clamp(1, MAX_LOGGING_CONFIGURATIONS_PAGE_SIZE);
+
+        // A token only when a configuration follows this page: "This value is null when there
+        // are no more results to return"
+        // (`DescribeVerifiedAccessInstanceLoggingConfigurationsResult$NextToken`).
+        let next_token = page
+            .get(limit)
+            .map(|(instance_id, _)| encode_page_token(instance_id));
+
+        Ok(DescribeVerifiedAccessInstanceLoggingConfigurationsOutput {
+            logging_configurations: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|(instance_id, logs)| VerifiedAccessInstanceLoggingConfiguration {
+                        verified_access_instance_id: Some((*instance_id).to_string()),
+                        access_logs: Some((*logs).clone()),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The filter names this operation answers.
+///
+/// The model documents no list of its own — "One or more filters. Filter names and values are
+/// case-sensitive"
+/// (`DescribeVerifiedAccessInstanceLoggingConfigurationsRequest$Filters`) — and `Filter`
+/// itself says a filter matches resources "by specific criteria, such as tags, attributes, or
+/// IDs". So the names here are EC2's spelling (hyphenated, lower case) of the reported shape's
+/// own members — `smithy_query(query="shape",shape="VerifiedAccessInstanceLoggingConfiguration")`
+/// and the `VerifiedAccessLogs` block it carries — each destination's members prefixed by the
+/// destination they belong to, the way a nested member is spelled in the describes beside this
+/// one. A logging configuration carries no tags of its own, so there is no `tag-key` or
+/// `tag:<key>` filter here. Every entry must be answered by [`filter_values`].
+const LOGGING_CONFIGURATION_FILTERS: [&str; 11] = [
+    "cloud-watch-logs-enabled",
+    "cloud-watch-logs-log-group",
+    "include-trust-context",
+    "kinesis-data-firehose-delivery-stream",
+    "kinesis-data-firehose-enabled",
+    "log-version",
+    "s3-bucket-name",
+    "s3-bucket-owner",
+    "s3-enabled",
+    "s3-prefix",
+    "verified-access-instance-id",
+];
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None` when
+/// this operation answers no such filter.
+///
+/// "Filter names and values are case-sensitive"
+/// (`DescribeVerifiedAccessInstanceLoggingConfigurationsRequest$Filters`), so every comparison
+/// is exact.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    LOGGING_CONFIGURATION_FILTERS
+        .contains(&name)
+        .then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against the logging configuration `logs` of the
+/// instance `instance_id`.
+///
+/// A filter naming an attribute this configuration does not carry compares against NO values,
+/// so it selects nothing — which is the answer for `s3-bucket-name` on an instance whose logs
+/// go nowhere, and for `log-version` on one nothing has chosen a log schema for. `name` is a
+/// name [`canonical_filter_name`] resolved.
+fn filter_values<'a>(
+    instance_id: &'a str,
+    logs: &'a VerifiedAccessLogs,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    // A boolean attribute is rendered for a filter by the crate's ONE definition of that
+    // rendering, so every describe compares a boolean the same way.
+    let flag = crate::state::boolean_filter_values;
+    match name {
+        "cloud-watch-logs-enabled" => flag(
+            logs.cloud_watch_logs
+                .as_ref()
+                .and_then(|destination| destination.enabled),
+        ),
+        "cloud-watch-logs-log-group" => text(
+            logs.cloud_watch_logs
+                .as_ref()
+                .and_then(|destination| destination.log_group.as_deref()),
+        ),
+        "include-trust-context" => flag(logs.include_trust_context),
+        "kinesis-data-firehose-delivery-stream" => text(
+            logs.kinesis_data_firehose
+                .as_ref()
+                .and_then(|destination| destination.delivery_stream.as_deref()),
+        ),
+        "kinesis-data-firehose-enabled" => flag(
+            logs.kinesis_data_firehose
+                .as_ref()
+                .and_then(|destination| destination.enabled),
+        ),
+        "log-version" => text(logs.log_version.as_deref()),
+        "s3-bucket-name" => text(
+            logs.s3
+                .as_ref()
+                .and_then(|destination| destination.bucket_name.as_deref()),
+        ),
+        "s3-bucket-owner" => text(
+            logs.s3
+                .as_ref()
+                .and_then(|destination| destination.bucket_owner.as_deref()),
+        ),
+        "s3-enabled" => flag(logs.s3.as_ref().and_then(|destination| destination.enabled)),
+        "s3-prefix" => text(
+            logs.s3
+                .as_ref()
+                .and_then(|destination| destination.prefix.as_deref()),
+        ),
+        "verified-access-instance-id" => text(Some(instance_id)),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
     }
 }

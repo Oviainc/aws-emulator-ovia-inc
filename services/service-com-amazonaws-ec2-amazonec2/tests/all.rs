@@ -63,6 +63,14 @@ mod create_image_usage_report;
 // ec2 suite inserts its lines.
 #[path = "all/copy_snapshot.rs"]
 mod copy_snapshot;
+// What `ModifyVerifiedAccessInstanceLoggingConfiguration` sets on one Verified Access
+// instance, what an instance nothing has configured carries, and what
+// `DescribeVerifiedAccessInstanceLoggingConfigurations` reports, narrows, pages and refuses.
+// Declared HERE rather than in sorted position or beside `prefix_lists`: both of those are the
+// contended regions the note at the top of this file describes, and this fix lost two
+// serialized squash merges to the lines just below `prefix_lists`.
+#[path = "all/verified_access_instance_logging.rs"]
+mod verified_access_instance_logging;
 // What `CreateTransitGatewayConnect` computes a Connect attachment from — the transport
 // attachment it names, that attachment's own transit gateway, the requested tunnel protocol
 // and tags — the `pending` -> `available` move the clock owes it, and what it refuses.

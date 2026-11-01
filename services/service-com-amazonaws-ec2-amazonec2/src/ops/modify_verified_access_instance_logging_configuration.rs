@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVerifiedAccessInstanceLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVerifiedAccessInstanceLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVerifiedAccessInstanceLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: sets the logging configuration of one stored Verified Access instance from
+//! the options the request carries, and answers the configuration as it then stands — the
+//! configuration `DescribeVerifiedAccessInstanceLoggingConfigurations` reports. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +68,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The log schema versions a Verified Access instance's logs may be written under.
+///
+/// "Valid values: `ocsf-0.1` | `ocsf-1.0.0-rc.2`"
+/// (`smithy_query(query="doc",shape="VerifiedAccessLogOptions",member="LogVersion")`), so a
+/// request naming any other version is refused rather than stored as a schema nothing
+/// publishes.
+const VERIFIED_ACCESS_LOG_VERSIONS: [&str; 2] = ["ocsf-0.1", "ocsf-1.0.0-rc.2"];
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -141,18 +144,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVerifiedAccessInstanceLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVerifiedAccessInstanceLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVerifiedAccessInstanceLoggingConfiguration"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            aws_account_id_is_well_formed, default_verified_access_logs,
+            idempotent_parameter_mismatch, invalid_verified_access_instance_id_not_found,
+            require_service_state, verified_access_instance_limit_exceeded,
+            verified_access_instance_logging_update_payload_bytes,
+            verified_access_logs_payload_bytes, VerifiedAccessInstanceLoggingConfigurationUpdate,
+            MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
+        };
+
+        // `ctx` carries request metadata only, and nothing a logging configuration holds names
+        // a Region: the modelled `VerifiedAccessInstanceLoggingConfiguration` carries no ARN
+        // and no zone, so there is nothing on it to read off the request.
+        let _ = ctx;
+
+        // Bounded the way every other client token this service accepts is, so one update
+        // cannot retain caller-chosen text the budget was never asked about.
+        if input
+            .client_token
+            .as_deref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // "The logging version. Valid values: ocsf-0.1 | ocsf-1.0.0-rc.2"
+        // (`VerifiedAccessLogOptions$LogVersion`) — a version that list does not publish names
+        // no log schema, so it is refused rather than stored.
+        if let Some(log_version) = input.access_logs.log_version.as_deref() {
+            if !VERIFIED_ACCESS_LOG_VERSIONS.contains(&log_version) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{log_version}' for logVersion. Valid values: {}",
+                    VERIFIED_ACCESS_LOG_VERSIONS.join(" | ")
+                )));
+            }
+        }
+
+        // A destination that is ENABLED has to name where the records go: an enabled
+        // destination with no bucket, log group or delivery stream describes no delivery at
+        // all, so it is refused rather than stored as logging that goes nowhere. A destination
+        // that is enabled: false needs no name, and a block the request leaves out leaves that
+        // destination as it stands.
+        if let Some(s3) = input.access_logs.s3.as_ref() {
+            if s3.enabled
+                && s3
+                    .bucket_name
+                    .as_deref()
+                    .is_none_or(|bucket_name| bucket_name.trim().is_empty())
+            {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "Invalid value 'true' for s3.enabled. bucketName must name the bucket the \
+                     logs are delivered to",
+                ));
+            }
+            // "The ID of the Amazon Web Services account that owns the Amazon S3 bucket"
+            // (`VerifiedAccessLogS3DestinationOptions$BucketOwner`) — an account id is twelve
+            // digits, so anything else names no account.
+            if let Some(bucket_owner) = s3.bucket_owner.as_deref() {
+                if !aws_account_id_is_well_formed(bucket_owner) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{bucket_owner}' for s3.bucketOwner. It must be a \
+                         12-digit Amazon Web Services account ID"
+                    )));
+                }
+            }
+        }
+        if let Some(cloud_watch_logs) = input.access_logs.cloud_watch_logs.as_ref() {
+            if cloud_watch_logs.enabled
+                && cloud_watch_logs
+                    .log_group
+                    .as_deref()
+                    .is_none_or(|log_group| log_group.trim().is_empty())
+            {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "Invalid value 'true' for cloudWatchLogs.enabled. logGroup must name the \
+                     CloudWatch Logs log group the logs are delivered to",
+                ));
+            }
+        }
+        if let Some(kinesis_data_firehose) = input.access_logs.kinesis_data_firehose.as_ref() {
+            if kinesis_data_firehose.enabled
+                && kinesis_data_firehose
+                    .delivery_stream
+                    .as_deref()
+                    .is_none_or(|delivery_stream| delivery_stream.trim().is_empty())
+            {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "Invalid value 'true' for kinesisDataFirehose.enabled. deliveryStream must \
+                     name the delivery stream the logs are delivered to",
+                ));
+            }
+        }
+
+        // The update this request asks for: the instance it names and the options it carried.
+        // An option it does not carry is absent here too, so applying this leaves that part of
+        // the instance's logging configuration as it was.
+        let update = VerifiedAccessInstanceLoggingConfigurationUpdate {
+            verified_access_instance_id: input.verified_access_instance_id.clone(),
+            access_logs: input.access_logs.clone(),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "Modifies the logging configuration for the specified Amazon Web Services Verified
+        // Access instance": an id that names no instance of the account configures nothing and
+        // is refused, whatever the id looks like.
+        if !store
+            .verified_access_instances
+            .contains_key(&update.verified_access_instance_id)
+        {
+            return Err(invalid_verified_access_instance_id_not_found(
+                &update.verified_access_instance_id,
+            ));
+        }
+
+        // Idempotency: "A unique, case-sensitive token that you provide to ensure idempotency
+        // of your modification request"
+        // (`ModifyVerifiedAccessInstanceLoggingConfigurationRequest$ClientToken`) — a repeat of
+        // one request applies nothing further and reports the configuration as it stands, while
+        // the same token carrying a DIFFERENT request is the mismatch EC2 refuses rather than a
+        // second update. Read here, answered below the DryRun check, because a replay writes
+        // nothing and so passes the budget a fresh update has to clear.
+        let replayed = match input.client_token.as_deref() {
+            None => false,
+            Some(token) => match store.verified_access_instance_logging_update_for_token(token) {
+                None => false,
+                Some(recorded) if recorded.same_request_as(&update) => true,
+                Some(_) => return Err(idempotent_parameter_mismatch()),
+            },
+        };
+
+        // What this instance's logging configuration is now: the stored one, or the
+        // configuration an instance nothing has configured carries.
+        let stored = store
+            .verified_access_instance_logging_configuration(&update.verified_access_instance_id);
+        let refund = stored.map_or(0, |logs| verified_access_logs_payload_bytes(logs, None));
+        let current = stored.cloned().unwrap_or_else(default_verified_access_logs);
+
+        // The budget is asked about the NET change only on the path that writes: this call
+        // stores no further instance, so the instance ceiling cannot bound it, and the names it
+        // sets are caller-chosen text — replacing a short bucket name with a long one grows the
+        // store by the difference, and the token it is recorded under is retained too.
+        if !replayed {
+            // What this call would leave behind, computed by the store's ONE definition of what
+            // an update does to a configuration, so the figure checked here is exactly the one
+            // the write charges.
+            let charge = verified_access_logs_payload_bytes(&update.applied_to(&current), None)
+                .saturating_add(input.client_token.as_deref().map_or(0, |token| {
+                    verified_access_instance_logging_update_payload_bytes(&update, token)
+                }));
+            if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+                return Err(verified_access_instance_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store this logging configuration's \
+                     {charge} bytes",
+                    store.stored_bytes()
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and the instance resolved, and
+        // BEFORE the first write: the flag asks whether the request WOULD have worked, so one
+        // that would have been refused is refused with that reason instead, and one that would
+        // have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // A replay applies nothing and reports the configuration as it stands, which is what
+        // the first call left behind.
+        let access_logs = if replayed {
+            current
+        } else {
+            // Written through the store's ONE writer of a logging configuration, so what this
+            // answers is the stored configuration a later describe of the same instance
+            // reports.
+            store
+                .set_verified_access_instance_logging_configuration(
+                    &update,
+                    input.client_token.as_deref(),
+                )
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "the logging configuration of the Verified Access instance '{}' could \
+                         not be read back after it was set",
+                        update.verified_access_instance_id
+                    ))
+                })?
+        };
+
+        Ok(ModifyVerifiedAccessInstanceLoggingConfigurationOutput {
+            logging_configuration: Some(VerifiedAccessInstanceLoggingConfiguration {
+                verified_access_instance_id: Some(update.verified_access_instance_id.clone()),
+                access_logs: Some(access_logs),
+            }),
+        })
     }
 }
