@@ -150,6 +150,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata.
         let _ = ctx;
+        /// The input member the ARN filter arrives in, as every refusal that filter can draw
+        /// names it: one spelling for the length and the form alike.
+        const FILTER_MEMBER: &str = "CustomerGatewayArns";
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetCustomerGatewayAssociationsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -181,8 +185,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CustomerGatewayArnList` does not express as `@length`, so a longer filter is
         // refused — before anything is listed — rather than silently honoured, exactly as
         // the id-list filters of the other listings of this service are.
-        crate::state::check_filter_ids("CustomerGatewayArns", &requested)
+        crate::state::check_filter_ids(FILTER_MEMBER, &requested)
             .map_err(GetCustomerGatewayAssociationsErrorModeled::ValidationException)?;
+
+        // `CustomerGatewayArns` carries ARNs, so each value is judged for FORM the way the
+        // associate and the disassociate judge the ARN member they take: a string that names
+        // no customer gateway at all is a field failure on the member that carried it, so one
+        // malformed ARN is answered the same whichever customer gateway operation it arrived
+        // on. A well-formed ARN naming no stored association is NOT an error: it selects
+        // nothing, which is what the match below does with it.
+        crate::state::check_filter_arns(
+            FILTER_MEMBER,
+            &requested,
+            |arn| crate::state::parse_customer_gateway_arn(arn).is_some(),
+            crate::state::malformed_customer_gateway_arn,
+        )
+        .map_err(GetCustomerGatewayAssociationsErrorModeled::ValidationException)?;
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
@@ -195,7 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CustomerGatewayArns` narrows the global network's associations, the way every
         // other listing of this service treats the selectors its query string carries: an
         // ARN that names no stored association matches nothing rather than failing the
-        // read, and an absent filter reports every association of the global network.
+        // read, and an absent filter reports every association of the global network. A
+        // value that is no customer gateway ARN at all never reaches this match: it was
+        // refused above.
         let entries: Vec<(String, CustomerGatewayAssociation)> = store
             .customer_gateway_associations
             .iter()

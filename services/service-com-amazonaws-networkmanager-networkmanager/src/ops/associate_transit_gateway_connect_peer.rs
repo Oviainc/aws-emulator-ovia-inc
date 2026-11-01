@@ -159,11 +159,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map(str::to_string) else {
             return Err(
                 AssociateTransitGatewayConnectPeerErrorModeled::ValidationException(
-                    crate::state::field_rejection(
+                    crate::state::malformed_transit_gateway_connect_peer_arn(
                         crate::state::FIELD_TRANSIT_GATEWAY_CONNECT_PEER_ARN,
-                        crate::state::REASON_FIELD_VALIDATION_FAILED,
-                        "must name a transit gateway Connect peer and the Region it is in"
-                            .to_string(),
                     ),
                 )
                 .into(),

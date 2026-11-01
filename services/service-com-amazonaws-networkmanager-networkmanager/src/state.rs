@@ -6029,6 +6029,31 @@ fn check_filter_list(
     Ok(())
 }
 
+/// Check one ARN-LIST filter of a reporting operation: every value it carries must read as
+/// an ARN of the resource type the member documents.
+///
+/// `well_formed` is the walk that judges that form — the SAME one the operations that WRITE
+/// a tie to such a resource judge their own ARN member with — and `refusal` builds the field
+/// failure those operations answer for a string that is no such ARN, named here on the
+/// filter member that carried it. A value that passes `well_formed` and names nothing stored
+/// is NOT an error: it selects nothing, which is what a filter does.
+///
+/// One statement of that distinction for every ARN-list filter of this service, beside the
+/// one [`check_filter_ids`] makes about the LENGTH of such a filter, so a malformed ARN
+/// cannot be refused by the operation that writes a tie and quietly served by the listing
+/// that reports it.
+pub fn check_filter_arns(
+    member: &str,
+    arns: &[String],
+    well_formed: impl Fn(&str) -> bool,
+    refusal: impl FnOnce(&str) -> ValidationException,
+) -> Result<(), ValidationException> {
+    if arns.iter().all(|arn| well_formed(arn.as_str())) {
+        return Ok(());
+    }
+    Err(refusal(member))
+}
+
 /// The modelled `ValidationException` (HTTP 400) an operation answers when the string in
 /// its ARN member `member` is not an ARN of this service at all.
 ///
@@ -9276,6 +9301,34 @@ pub fn ec2_resource_region<'a>(arn: &'a str, resource_type: &str) -> Option<&'a 
         return None;
     }
     (!region.is_empty()).then_some(region)
+}
+
+/// The modelled `ValidationException` (HTTP 400) an operation answers when the string in its
+/// member `member` is not a transit gateway ARN at all (see [`ec2_resource_region`]).
+///
+/// Like [`malformed_customer_gateway_arn`]: a string that names no transit gateway — the
+/// Region it is in included, which such an ARN has to carry — is a FIELD failure on the
+/// member that carried it, a different answer from a well-formed ARN that names no
+/// registration or peering this service holds. One statement of the wording the register,
+/// the deregister, the peering create and the registration listing all answer, so one
+/// malformed ARN reads the same whichever of them it arrived on.
+pub fn malformed_transit_gateway_arn(member: &str) -> ValidationException {
+    field_rejection(
+        member,
+        REASON_FIELD_VALIDATION_FAILED,
+        "must name a transit gateway and the Region it is in".to_string(),
+    )
+}
+
+/// [`malformed_transit_gateway_arn`] for the Connect peer of a transit gateway: the answer
+/// the associate, the disassociate and the association listing give for a string that is no
+/// such ARN at all.
+pub fn malformed_transit_gateway_connect_peer_arn(member: &str) -> ValidationException {
+    field_rejection(
+        member,
+        REASON_FIELD_VALIDATION_FAILED,
+        "must name a transit gateway Connect peer and the Region it is in".to_string(),
+    )
 }
 
 /// `SystemTime` as a Smithy timestamp (epoch seconds, sub-second part kept).

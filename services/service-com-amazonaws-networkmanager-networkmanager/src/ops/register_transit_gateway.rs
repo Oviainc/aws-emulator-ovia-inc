@@ -167,10 +167,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .is_none()
         {
             return Err(RegisterTransitGatewayErrorModeled::ValidationException(
-                crate::state::field_rejection(
+                crate::state::malformed_transit_gateway_arn(
                     crate::state::FIELD_TRANSIT_GATEWAY_ARN,
-                    crate::state::REASON_FIELD_VALIDATION_FAILED,
-                    "must name a transit gateway and the Region it is in".to_string(),
                 ),
             )
             .into());

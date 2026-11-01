@@ -140,6 +140,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata.
         let _ = ctx;
+        /// The input member the ARN filter arrives in, as the refusal of a value that is no
+        /// such ARN names it.
+        const FILTER_MEMBER: &str = "TransitGatewayConnectPeerArns";
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetTransitGatewayConnectPeerAssociationsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -167,6 +171,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The member is "One or more transit gateway Connect peer Amazon Resource Names
+        // (ARNs)." (`smithy_query query="doc"
+        // shape="GetTransitGatewayConnectPeerAssociationsRequest"
+        // member="TransitGatewayConnectPeerArns"`), which documents none of the "The maximum
+        // is 10." bound `crate::state::check_filter_ids` guards for the filters that do, so
+        // no such refusal is invented here. What the member DOES document is that its values
+        // are ARNs, so each is judged for FORM the way the associate and the disassociate
+        // judge the ARN member they take: a string that names no Connect peer of a transit
+        // gateway at all is a field failure on the member that carried it, so one malformed
+        // ARN is answered the same whichever Connect peer operation it arrived on. A
+        // well-formed ARN naming no stored association is NOT an error: it selects nothing.
+        crate::state::check_filter_arns(
+            FILTER_MEMBER,
+            &requested,
+            |arn| {
+                crate::state::ec2_resource_region(
+                    arn,
+                    crate::state::TRANSIT_GATEWAY_CONNECT_PEER_TYPE,
+                )
+                .is_some()
+            },
+            crate::state::malformed_transit_gateway_connect_peer_arn,
+        )
+        .map_err(GetTransitGatewayConnectPeerAssociationsErrorModeled::ValidationException)?;
+
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
                 crate::state::decode_page_token_or_reject(Self::NAME, token).map_err(
@@ -179,12 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TransitGatewayConnectPeerArns` narrows the global network's associations, the way
         // every other listing of this service treats the selectors its query string carries:
         // an ARN that names no stored association matches nothing rather than failing the
-        // read, and an absent filter reports every association of the global network. The
-        // member is "One or more transit gateway Connect peer Amazon Resource Names (ARNs)."
-        // (`smithy_query query="doc" shape="GetTransitGatewayConnectPeerAssociationsRequest"
-        // member="TransitGatewayConnectPeerArns"`), which documents none of the "The maximum
-        // is 10." bound `crate::state::check_filter_ids` guards for the filters that do, so
-        // no such refusal is invented here.
+        // read, and an absent filter reports every association of the global network.
         let entries: Vec<(String, TransitGatewayConnectPeerAssociation)> = store
             .transit_gateway_connect_peer_associations
             .iter()

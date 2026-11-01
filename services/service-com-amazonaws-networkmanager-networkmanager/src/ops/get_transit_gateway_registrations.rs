@@ -142,6 +142,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata.
         let _ = ctx;
+        /// The input member the ARN filter arrives in, as every refusal that filter can
+        /// draw names it: one spelling for the length and the form alike.
+        const FILTER_MEMBER: &str = "TransitGatewayArns";
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetTransitGatewayRegistrationsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -173,8 +177,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TransitGatewayArnList` does not express as `@length`, so a longer filter is
         // refused — before anything is listed — rather than silently honoured, exactly as
         // the id-list filters of the other listings of this service are.
-        crate::state::check_filter_ids("TransitGatewayArns", &requested)
+        crate::state::check_filter_ids(FILTER_MEMBER, &requested)
             .map_err(GetTransitGatewayRegistrationsErrorModeled::ValidationException)?;
+
+        // `TransitGatewayArns` carries ARNs, so each value is judged for FORM the way the
+        // register and the deregister judge the ARN member they take: a string that names no
+        // transit gateway at all is a field failure on the member that carried it, so one
+        // malformed ARN is answered the same whichever transit gateway operation it arrived
+        // on. A well-formed ARN naming no stored registration is NOT an error: it selects
+        // nothing, which is what the match below does with it.
+        crate::state::check_filter_arns(
+            FILTER_MEMBER,
+            &requested,
+            |arn| {
+                crate::state::ec2_resource_region(arn, crate::state::TRANSIT_GATEWAY_TYPE)
+                    .is_some()
+            },
+            crate::state::malformed_transit_gateway_arn,
+        )
+        .map_err(GetTransitGatewayRegistrationsErrorModeled::ValidationException)?;
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
@@ -187,7 +208,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TransitGatewayArns` narrows the global network's registrations, the way every
         // other listing of this service treats the selectors its query string carries: an
         // ARN that names no stored registration matches nothing rather than failing the
-        // read, and an absent filter reports every registration of the global network.
+        // read, and an absent filter reports every registration of the global network. A
+        // value that is no transit gateway ARN at all never reaches this match: it was
+        // refused above.
         let entries: Vec<(String, TransitGatewayRegistration)> = store
             .transit_gateway_registrations
             .iter()
