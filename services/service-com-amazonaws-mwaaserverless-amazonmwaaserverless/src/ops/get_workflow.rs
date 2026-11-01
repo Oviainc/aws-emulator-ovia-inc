@@ -280,12 +280,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workflow_status: Some(workflow.status.clone()),
             definition_s3_location: Some(snapshot.definition_s3_location.clone()),
             code: snapshot.code.clone(),
-            // The definition snapshot is taken when a version is created.
-            code_snapshotted_at: Some(crate::state::timestamp(if requested.is_some() {
-                record.created_at
-            } else {
-                workflow.code_snapshotted_at
-            })),
+            // Absent, like every other unset optional member, for a version that froze
+            // no code location: nothing was copied, so there is no copy instant. For a
+            // version that froze one, the copy happened when that version was created
+            // (`crate::state::WorkflowVersionRecord::code_snapshotted_at`).
+            code_snapshotted_at: record.code_snapshotted_at().map(crate::state::timestamp),
             // The definition this version snapshotted when it was created, and the
             // schedule that definition declares: both come from the frozen snapshot, so
             // a read never goes to Amazon S3 and an overwrite of the object cannot

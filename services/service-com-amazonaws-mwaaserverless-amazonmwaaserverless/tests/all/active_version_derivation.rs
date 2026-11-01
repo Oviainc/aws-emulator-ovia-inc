@@ -114,12 +114,6 @@ async fn assert_active_version(
             newest.version,
             workflow.revision_id
         );
-        assert_eq!(
-            workflow.code_snapshotted_at, newest.created_at,
-            "case {case:?} after the {event}: expected the snapshot instant of the active \
-             version {:?}, got {:?}",
-            newest.created_at, workflow.code_snapshotted_at
-        );
         let frozen = newest
             .snapshot
             .schedule_configuration

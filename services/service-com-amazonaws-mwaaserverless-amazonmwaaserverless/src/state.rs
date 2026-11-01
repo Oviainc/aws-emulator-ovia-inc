@@ -300,6 +300,21 @@ pub struct WorkflowVersionRecord {
     pub sequence: u64,
 }
 
+impl WorkflowVersionRecord {
+    /// The instant this version's code artifacts were copied, and `None` for a
+    /// version that froze no code location at all.
+    ///
+    /// A `Code` location is copied "at the time of the request"
+    /// (`smithy_query(query="doc", shape="CreateWorkflowRequest", member="Code")`)
+    /// that supplied it, and a version is immutable, so the copy instant of the
+    /// artifacts a version reports IS that version's creation instant. A version
+    /// that supplied no location had nothing copied, so it has no such instant to
+    /// report — the same absence it reports for the location itself.
+    pub fn code_snapshotted_at(&self) -> Option<SystemTime> {
+        self.snapshot.code.as_ref().map(|_| self.created_at)
+    }
+}
+
 /// A run started under a workflow.
 #[derive(Debug, Clone)]
 pub struct WorkflowRun {
@@ -692,7 +707,6 @@ pub struct Workflow {
     pub status: String,
     pub created_at: SystemTime,
     pub modified_at: SystemTime,
-    pub code_snapshotted_at: SystemTime,
     pub current_version: String,
     pub revision_id: String,
     pub versions: Vec<WorkflowVersionRecord>,
@@ -784,9 +798,8 @@ impl Workflow {
     /// Called wherever the set of versions changes the active one — the first
     /// version appended by a create, a further version appended by an update, or
     /// the latest version removed by a delete — so
-    /// [`Workflow::current_version`], [`Workflow::revision_id`],
-    /// [`Workflow::code_snapshotted_at`] and the automated trigger
-    /// ([`Self::configure_trigger`]) always describe the one version
+    /// [`Workflow::current_version`], [`Workflow::revision_id`] and the automated
+    /// trigger ([`Self::configure_trigger`]) always describe the one version
     /// [`Self::version`] resolves with no version named. A workflow holding no
     /// version left has nothing to promote, and keeps what it last reported.
     pub fn promote_newest_version(&mut self, now: SystemTime) {
@@ -804,7 +817,6 @@ impl Workflow {
         };
         self.versions[newest].is_latest = true;
         self.current_version = self.versions[newest].version.clone();
-        self.code_snapshotted_at = self.versions[newest].created_at;
         self.revision_id = mint_revision_id(&self.arn, &self.current_version);
         self.configure_trigger(now);
     }

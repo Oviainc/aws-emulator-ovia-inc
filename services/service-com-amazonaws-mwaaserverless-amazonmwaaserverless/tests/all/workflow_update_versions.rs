@@ -280,13 +280,24 @@ async fn an_update_appends_a_version_that_carries_exactly_the_configuration_supp
              got {:?}",
             fetched["ModifiedAt"]
         );
-        // The code is copied "at the time of the request", so the new version's snapshot
-        // instant is the update's.
-        assert_eq!(
-            fetched["CodeSnapshottedAt"], updated["ModifiedAt"],
-            "case {case:?}: expected CodeSnapshottedAt to be the update's instant, got {:?}",
-            fetched["CodeSnapshottedAt"]
-        );
+        // The code is copied "at the time of the request" that supplies its location, so
+        // an update that supplied one reports the copy instant of the version it
+        // appended — the update's own instant — and an update that supplied none reports
+        // no instant, as it reports no `Code`.
+        if body["Code"].is_null() {
+            assert!(
+                fetched["CodeSnapshottedAt"].is_null(),
+                "case {case:?}: the update supplied no Code, so the new version can report \
+                 no copy instant, got {:?}",
+                fetched["CodeSnapshottedAt"]
+            );
+        } else {
+            assert_eq!(
+                fetched["CodeSnapshottedAt"], updated["ModifiedAt"],
+                "case {case:?}: expected CodeSnapshottedAt to be the update's instant, got {:?}",
+                fetched["CodeSnapshottedAt"]
+            );
+        }
         assert_eq!(
             fetched["WorkflowStatus"], created["WorkflowStatus"],
             "case {case:?}: an update must not move WorkflowStatus, got {:?}",

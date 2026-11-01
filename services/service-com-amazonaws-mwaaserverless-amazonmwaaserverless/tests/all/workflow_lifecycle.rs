@@ -372,11 +372,24 @@ async fn create_mints_a_modelled_workflow_and_get_reads_every_member_back() {
             "case {case:?}: expected a ModifiedAt timestamp, got {:?}",
             fetched["ModifiedAt"]
         );
-        assert!(
-            fetched["CodeSnapshottedAt"].is_number(),
-            "case {case:?}: expected a CodeSnapshottedAt timestamp, got {:?}",
-            fetched["CodeSnapshottedAt"]
-        );
+        // The code artifacts are copied at the time of the request that supplies their
+        // location, so a create that supplied one reports the copy instant of the
+        // version it minted — the workflow's own creation instant — and a create that
+        // supplied none reports no instant, as it reports no `Code`.
+        if body["Code"].is_null() {
+            assert!(
+                fetched["CodeSnapshottedAt"].is_null(),
+                "case {case:?}: the create supplied no Code, so no copy instant can be \
+                 reported, got {:?}",
+                fetched["CodeSnapshottedAt"]
+            );
+        } else {
+            assert_eq!(
+                fetched["CodeSnapshottedAt"], created["CreatedAt"],
+                "case {case:?}: expected CodeSnapshottedAt to be the create's instant, got {:?}",
+                fetched["CodeSnapshottedAt"]
+            );
+        }
 
         // The version the create reported selects the same stored record.
         let (status, by_version) = harness
@@ -1182,7 +1195,6 @@ async fn deleting_one_named_version_keeps_the_workflow_until_no_version_is_left(
                 },
             });
             workflow.current_version = second.clone();
-            workflow.code_snapshotted_at = created_at;
         }
 
         let (deleted, survivor) = if delete_the_latest {

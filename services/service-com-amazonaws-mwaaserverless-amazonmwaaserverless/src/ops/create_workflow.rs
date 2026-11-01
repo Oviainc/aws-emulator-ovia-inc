@@ -420,11 +420,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             modified_at: now,
             // What the workflow reports as its ACTIVE version — the flag on the
-            // record, the current version, the revision identifier and the instant
-            // that version snapshotted its code — is derived by
+            // record, the current version and the revision identifier — is derived by
             // `crate::state::Workflow::promote_newest_version` below, so these start
             // unset rather than being written a second time here.
-            code_snapshotted_at: now,
             current_version: String::new(),
             revision_id: String::new(),
             versions: vec![crate::state::WorkflowVersionRecord {

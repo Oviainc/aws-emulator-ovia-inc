@@ -48,9 +48,8 @@ enum StoredClock {
     Falling,
 }
 
-/// Rewrite the stored creation instants of every version of `arn` to follow `clock`,
-/// keeping the workflow's own snapshot instant the one its latest version carries — the
-/// coherent state the create and the updates left, with the instants moved.
+/// Rewrite the stored creation instants of every version of `arn` to follow `clock`, the
+/// coherent state the create and the updates left with the instants moved.
 fn seed_version_clock(harness: &Harness, arn: &str, clock: StoredClock) {
     let base = SystemTime::now() - Duration::from_secs(3_600);
     with_workflow(harness, arn, |workflow: &mut Workflow| {
@@ -62,9 +61,6 @@ fn seed_version_clock(harness: &Harness, arn: &str, clock: StoredClock) {
                 StoredClock::Rising => base + Duration::from_secs(index),
                 StoredClock::Falling => base + Duration::from_secs(count - index),
             };
-        }
-        if let Some(latest) = workflow.versions.iter().find(|record| record.is_latest) {
-            workflow.code_snapshotted_at = latest.created_at;
         }
     });
 }
