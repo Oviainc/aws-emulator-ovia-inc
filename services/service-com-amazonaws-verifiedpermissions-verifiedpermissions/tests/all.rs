@@ -59,6 +59,8 @@ mod identity_source_user_pool_existence;
 mod identity_sources;
 #[path = "all/is_authorized_with_token.rs"]
 mod is_authorized_with_token;
+#[path = "all/list_cursor_refusal_follows_store_lookup.rs"]
+mod list_cursor_refusal_follows_store_lookup;
 #[path = "all/list_identity_sources.rs"]
 mod list_identity_sources;
 #[path = "all/list_pagination_rule.rs"]
