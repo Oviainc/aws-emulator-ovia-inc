@@ -3735,6 +3735,65 @@ impl StoredStack {
         self.reevaluate_outputs();
     }
 
+    /// Record the attributes the service owning the resource `logical_id` names publishes for
+    /// it now that it has finished coming UP, and evaluate the stack's outputs again over
+    /// them.
+    ///
+    /// A resource whose owning service reports it still being created does not publish every
+    /// identifier it will have: an Amazon OpenSearch Service domain has no endpoint "used to
+    /// submit index, search, and data upload requests" until the cluster behind it is
+    /// running, so the value `Fn::GetAtt` reads for that endpoint exists only once that
+    /// service reports the domain up. CloudFormation resolves a stack's outputs for a
+    /// resource it reports CREATE_COMPLETE, which is the instant this records — so an output
+    /// over such an attribute carries the value the owning service publishes rather than
+    /// nothing, exactly as [`Self::record_materialised_resources`] does for an identity that
+    /// service assigned.
+    ///
+    /// Written onto the resource records of the operation IN FLIGHT where there is one, since
+    /// those are what [`Self::settle`] installs when it completes. An attribute already
+    /// carrying that value changes nothing, so a repeated read evaluates nothing again. The
+    /// set stays under the same ceiling as every other resource's
+    /// ([`template::MAX_ATTRIBUTES_PER_RESOURCE`]).
+    pub fn record_ready_attributes(
+        &mut self,
+        logical_id: &str,
+        attributes: &BTreeMap<String, String>,
+    ) {
+        if attributes.is_empty() {
+            return;
+        }
+        let held = match &mut self.pending_deployment {
+            Some(deployment) => deployment
+                .resources
+                .iter_mut()
+                .find(|resource| resource.logical_id == logical_id),
+            None => self
+                .resources
+                .iter_mut()
+                .map(|deployed| &mut deployed.resource)
+                .find(|resource| resource.logical_id == logical_id),
+        };
+        let Some(held) = held else {
+            return;
+        };
+        let mut changed = false;
+        for (name, value) in attributes {
+            if held.attributes.get(name) == Some(value) {
+                continue;
+            }
+            if !held.attributes.contains_key(name)
+                && held.attributes.len() >= template::MAX_ATTRIBUTES_PER_RESOURCE
+            {
+                continue;
+            }
+            held.attributes.insert(name.clone(), value.clone());
+            changed = true;
+        }
+        if changed {
+            self.reevaluate_outputs();
+        }
+    }
+
     /// Open a deletion CloudFormation CANCELS: the attempt runs and then puts the stack
     /// back where it was.
     ///

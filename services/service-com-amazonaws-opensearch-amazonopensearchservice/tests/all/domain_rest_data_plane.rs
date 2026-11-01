@@ -170,7 +170,7 @@ async fn rest(
 
 /// The same request under the PREFIXED path addressing, on the emulator's own endpoint —
 /// the one a client that cannot resolve the published host uses.
-async fn rest_prefixed(
+pub(crate) async fn rest_prefixed(
     emulator: &Emulator,
     domain: &str,
     method: &str,
@@ -216,7 +216,7 @@ async fn dispatch_rest(
 }
 
 /// The `error.type` a refused data-plane answer carries.
-fn error_type(answer: &Answer) -> String {
+pub(crate) fn error_type(answer: &Answer) -> String {
     answer.body["error"]["type"]
         .as_str()
         .unwrap_or_default()

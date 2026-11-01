@@ -427,6 +427,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new domain holds no index template either; the domain's own template API
             // is what writes one.
             index_templates: BTreeMap::new(),
+            // A new domain's cluster holds no setting of its own, no ingest pipeline and no
+            // index-management policy: the cluster's own settings, pipeline and policy APIs
+            // are what write them.
+            cluster_settings: crate::state::ClusterSettings::default(),
+            ingest_pipelines: BTreeMap::new(),
+            ism_policies: BTreeMap::new(),
             identity_center_options: input
                 .identity_center_options
                 .map(stored_identity_center_options),

@@ -1500,6 +1500,37 @@ impl Provisioner {
         }
     }
 
+    /// The attributes the owning service publishes for the resource this provisioner created
+    /// now that it reports the resource UP — the ones its create answer could not carry,
+    /// because the resource did not have them yet.
+    ///
+    /// Only a type whose create leaves the resource coming up has any ([`Self::readiness`]),
+    /// and only where that type publishes an attribute the owning service fills in when the
+    /// resource is running; every other type answers nothing, so its records stay exactly
+    /// what its create reported.
+    ///
+    /// `Err` is the owning service's own refusal of the READ: the caller decides what an
+    /// unanswered read means, exactly as it does for [`Self::readiness`].
+    pub(super) async fn ready_attributes(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        resource_type: &str,
+        physical_resource_id: &str,
+    ) -> Result<BTreeMap<String, String>, Refusal> {
+        match self {
+            // `DomainStatus$Endpoint` is "the domain-specific endpoint used to submit index,
+            // search, and data upload requests", and a domain still being provisioned has no
+            // such endpoint — nor the dual-stack or VPC hosts beside it — so the create's
+            // answer carries none of them and the type's endpoint attributes are read off the
+            // domain once that service reports it settled.
+            Self::OpenSearchServiceDomain => {
+                domain_ready_attributes(ctx, region, resource_type, physical_resource_id).await
+            }
+            _ => Ok(BTreeMap::new()),
+        }
+    }
+
     /// Whether the service that owns the resource this provisioner DELETED has finished
     /// removing it — read from that service, never decided here.
     ///
@@ -4148,6 +4179,22 @@ fn domain_created(resource_type: &str, status: &Value) -> Created {
         }
     }
     Created::attributes(attributes)
+}
+
+/// The published attributes of a domain Amazon OpenSearch Service now reports as settled:
+/// the whole set [`domain_created`] reads off a `DomainStatus`, which for a domain that is UP
+/// carries the addresses a client reaches it on as well as the identifiers the create
+/// already answered. A domain that service no longer holds publishes nothing.
+async fn domain_ready_attributes(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource_type: &str,
+    physical_resource_id: &str,
+) -> Result<BTreeMap<String, String>, Refusal> {
+    let Some(status) = read_domain(ctx, region, physical_resource_id).await? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(domain_created(resource_type, &status).attributes)
 }
 
 /// Whether Amazon OpenSearch Service has finished bringing up the domain a stack created.

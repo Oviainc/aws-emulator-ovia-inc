@@ -576,6 +576,30 @@ pub async fn advance_stabilisations(
                 None => Ok(Readiness::Ready),
             };
             let now = SystemTime::now();
+            // The identifiers the owning service publishes for a resource that has only NOW
+            // come up — an endpoint a still-creating resource did not have — read before the
+            // lock is taken, like every other call this module makes. Asked only where that
+            // service has just reported the resource ready; a read it refuses leaves the
+            // records as they stand, since one unanswered read is no evidence about the
+            // resource.
+            let ready_attributes = if matches!(readiness, Ok(Readiness::Ready))
+                && barrier.awaited == super::stabilising::Awaited::Ready
+            {
+                match provisioner_for(&barrier.resource_type) {
+                    Some(provisioner) => provisioner
+                        .ready_attributes(
+                            ctx,
+                            region,
+                            &barrier.resource_type,
+                            &barrier.physical_resource_id,
+                        )
+                        .await
+                        .unwrap_or_default(),
+                    None => BTreeMap::new(),
+                }
+            } else {
+                BTreeMap::new()
+            };
             // What a failure the answer makes due owes besides the stack's own failed
             // status: the resources a rolled-back CREATE has to remove again. Taken under
             // the lock and performed with it RELEASED, as every other call this module
@@ -587,6 +611,7 @@ pub async fn advance_stabilisations(
                 };
                 let taken = match readiness {
                     Ok(Readiness::Ready) => {
+                        stack.record_ready_attributes(&barrier.logical_id, &ready_attributes);
                         stack.release_stabilisation(&barrier, now);
                         None
                     }

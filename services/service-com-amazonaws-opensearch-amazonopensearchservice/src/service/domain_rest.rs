@@ -64,13 +64,15 @@
 //!    permitted every action this surface names.
 //!
 //! The REST surface served is the one this emulator can answer out of persisted state:
-//! the cluster banner and health, an index's create/read/delete, a document write, read
-//! and delete, a count and a search over a bounded query vocabulary ([`selector`]), index
-//! templates, and the security plugin's role and role-mapping API. A path outside it is
-//! answered the way the engine answers a path no handler is registered for, rather than
-//! with an invented body.
+//! the cluster banner and health, the cluster's nodes and its own settings, an index's
+//! create/read/delete, a document write, read and delete, a count and a search over a
+//! bounded query vocabulary ([`selector`]), index templates, ingest pipelines (declared,
+//! simulated and applied to a write that names one), the index-management plugin's policy
+//! API, and the security plugin's role and role-mapping API. A path outside it is answered
+//! the way the engine answers a path no handler is registered for, rather than with an
+//! invented body.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
@@ -90,6 +92,10 @@ use crate::state::{
 /// The segment that names THIS service's data plane behind `EMULATOR_PATH_NAMESPACE`: the
 /// `arnNamespace`/`endpointPrefix` this service publishes.
 const DATA_PLANE_SEGMENT: &str = state::ARN_NAMESPACE;
+
+/// The ingest pipeline engine: what a pipeline's processors are and what they do to a
+/// document, read once and used by both the write path and the simulate API.
+mod pipeline;
 
 /// The most bytes one data-plane request body is read as JSON.
 ///
@@ -132,9 +138,6 @@ const PARSE_EXCEPTION: &str = "parse_exception";
 /// register.
 const PARSING_EXCEPTION: &str = "parsing_exception";
 
-/// The engine's error type for an index that does not exist.
-const INDEX_NOT_FOUND_EXCEPTION: &str = "index_not_found_exception";
-
 /// The engine's error type for a create of an index that already exists.
 const RESOURCE_ALREADY_EXISTS_EXCEPTION: &str = "resource_already_exists_exception";
 
@@ -144,6 +147,22 @@ const INVALID_INDEX_NAME_EXCEPTION: &str = "invalid_index_name_exception";
 /// The engine's error type for a write that may not replace a document the index already
 /// holds.
 const VERSION_CONFLICT_ENGINE_EXCEPTION: &str = "version_conflict_engine_exception";
+
+/// The most documents ONE simulate request runs a pipeline over.
+///
+/// The emulator's OWN bound on the work one request does: every document is run through every
+/// processor the pipeline declares ([`pipeline::MAX_PROCESSORS`]), so the product of the two
+/// is what this caps.
+const MAX_SIMULATED_DOCUMENTS: usize = 1_000;
+
+/// The second segment of a `_nodes` path that names an API OF ITS OWN rather than a node:
+/// the node statistics, the hot threads, the feature usage and the secure-settings reload.
+///
+/// This emulator serves none of them, so such a request is answered the way the engine
+/// answers a path it has no handler for — instead of being read as a filter naming a node
+/// nothing is called, which would answer an empty node set for a request that asked for
+/// something else entirely.
+const NODES_SUB_APIS: [&str; 4] = ["hot_threads", "reload_secure_settings", "stats", "usage"];
 
 /// The most comma-separated index patterns one request may name.
 ///
@@ -494,6 +513,34 @@ fn serve_resolved(domain: &mut Domain, request: &Request<'_>, now: SystemTime) -
         },
         ["_index_template", name] => template_request(domain, request, name, false),
         ["_template", name] => template_request(domain, request, name, true),
+        // The nodes of the cluster, and one node of it by its id.
+        ["_nodes"] => match request.method {
+            "GET" => guarded(domain, request, fgac::ACTION_NODES_INFO, |domain| {
+                ok(&nodes_info(domain, None))
+            }),
+            _ => wrong_method(request, "GET"),
+        },
+        ["_nodes", node] if !NODES_SUB_APIS.contains(node) => match request.method {
+            "GET" => guarded(domain, request, fgac::ACTION_NODES_INFO, |domain| {
+                ok(&nodes_info(domain, Some(node)))
+            }),
+            _ => wrong_method(request, "GET"),
+        },
+        ["_cluster", "settings"] => cluster_settings_request(domain, request),
+        ["_ingest", "pipeline"] => match request.method {
+            "GET" => guarded(domain, request, fgac::ACTION_GET_PIPELINE, |domain| {
+                ok(&pipeline_view(domain, None))
+            }),
+            _ => wrong_method(request, "GET"),
+        },
+        ["_ingest", "pipeline", id] => pipeline_request(domain, request, id),
+        ["_ingest", "pipeline", id, "_simulate"] => match request.method {
+            "GET" | "POST" => guarded(domain, request, fgac::ACTION_SIMULATE_PIPELINE, |domain| {
+                simulate_pipeline(domain, request, id, now)
+            }),
+            _ => wrong_method(request, "GET, POST"),
+        },
+        ["_plugins", "_ism", "policies", id] => ism_policy_request(domain, request, id, now),
         // The security plugin's own "who am I". It is NOT guarded: the plugin answers it
         // for the authenticated user whatever roles that user holds, which is what makes
         // it the route a client checks its own identity and permissions with before it
@@ -749,6 +796,710 @@ fn health_rank(status: &str) -> Option<u8> {
     }
 }
 
+/// The nodes of this domain's cluster, as `GET /_nodes` reports them.
+///
+/// The CENSUS is the one `DescribeDomainNodes` reports — one node per node the stored
+/// `ClusterConfig` provisions, in the role, instance type and Availability Zone that record
+/// names ([`crate::ops::describe_domain_nodes::domain_nodes`]) — so the control plane and
+/// the cluster can never describe one domain's topology differently.
+///
+/// What this REPORT carries of each node is the configured topology and nothing else: its
+/// id, the roles its configured node type holds, the engine release the domain runs and the
+/// Availability Zone it sits in. The cluster's own addressing and process detail — a node's
+/// host, its IP, its transport address, its settings, the JVM and the operating system it
+/// runs on — is service-internal on a managed domain and is published in none of them,
+/// rather than invented.
+///
+/// `node` is the id a request addressing ONE node names; a filter matching no node of the
+/// cluster reports no node, which is what the engine answers a node filter that selects
+/// nothing.
+fn nodes_info(domain: &Domain, node: Option<&str>) -> Value {
+    let (_, version) = engine_distribution(&domain.engine_version);
+    let dedicated_master = domain.cluster_config.dedicated_master_enabled == Some(true);
+    let mut nodes = Map::new();
+    for reported in crate::ops::describe_domain_nodes::domain_nodes(domain) {
+        let Some(id) = reported.node_id else {
+            continue;
+        };
+        if node.is_some_and(|named| named != id) {
+            continue;
+        }
+        let mut attributes = Map::new();
+        if let Some(zone) = &reported.availability_zone {
+            attributes.insert("availability_zone".to_string(), json!(zone));
+        }
+        nodes.insert(
+            id.clone(),
+            json!({
+                "name": id,
+                "version": version,
+                "roles": node_roles(reported.node_type.as_deref().unwrap_or_default(), dedicated_master),
+                "attributes": Value::Object(attributes),
+            }),
+        );
+    }
+    let total = nodes.len();
+    json!({
+        "_nodes": { "total": total, "successful": total, "failed": 0 },
+        "cluster_name": cluster_name(domain),
+        "nodes": Value::Object(nodes),
+    })
+}
+
+/// The roles OpenSearch publishes for a node of this domain, from the ROLE its cluster
+/// configuration provisions the node in.
+///
+/// A data node holds the data and ingest roles, and is cluster-manager eligible as well on a
+/// domain that provisions no dedicated master — there has to be somewhere for the cluster
+/// manager to be elected. A dedicated master node holds the cluster-manager role alone,
+/// which is what makes it dedicated, and a warm node holds the warm role beside the data one
+/// it serves searches from. A node type this emulator does not provision holds no role.
+fn node_roles(node_type: &str, dedicated_master: bool) -> Vec<&'static str> {
+    match node_type {
+        state::NODE_TYPE_DATA if dedicated_master => vec!["data", "ingest"],
+        state::NODE_TYPE_DATA => vec!["cluster_manager", "data", "ingest"],
+        state::NODE_TYPE_MASTER => vec!["cluster_manager"],
+        state::NODE_TYPE_ULTRAWARM => vec!["data", "warm"],
+        _ => Vec::new(),
+    }
+}
+
+/// A `GET` or `PUT` on the cluster's own settings.
+fn cluster_settings_request(domain: &mut Domain, request: &Request<'_>) -> RtResponse {
+    match request.method {
+        "GET" => guarded(
+            domain,
+            request,
+            fgac::ACTION_GET_CLUSTER_SETTINGS,
+            |domain| {
+                ok(&json!({
+                    state::SETTINGS_PERSISTENT:
+                        reported_settings(&domain.cluster_settings.persistent, request),
+                    state::SETTINGS_TRANSIENT:
+                        reported_settings(&domain.cluster_settings.transient, request),
+                }))
+            },
+        ),
+        "PUT" => guarded(
+            domain,
+            request,
+            fgac::ACTION_UPDATE_CLUSTER_SETTINGS,
+            |domain| update_cluster_settings(domain, request),
+        ),
+        _ => wrong_method(request, "GET, PUT"),
+    }
+}
+
+/// Apply the settings update the request's body asks for.
+///
+/// "Settings can be specified in a flattened or expanded format": either spelling names the
+/// same setting, so a nested object is FLATTENED to the dotted name the setting has and one
+/// spelling is stored. A setting written `null` is REMOVED from its scope, which is how a
+/// client resets one, and a scope the request does not name is left exactly as it was: an
+/// update is of the settings it names.
+fn update_cluster_settings(domain: &mut Domain, request: &Request<'_>) -> RtResponse {
+    let body = match request.json() {
+        Ok(Some(Value::Object(members))) => members,
+        Ok(_) => {
+            return error(
+                400,
+                PARSE_EXCEPTION,
+                "failed to parse: expected the body to be a JSON object naming the settings \
+                 scopes to update",
+            )
+        }
+        Err(refusal) => return *refusal,
+    };
+    // Read and validate the whole request before anything is stored, so a refused update
+    // leaves the cluster's settings as they were.
+    let mut updates: Vec<ScopeUpdate> = Vec::new();
+    for (scope, written) in &body {
+        if !state::CLUSTER_SETTING_SCOPES.contains(&scope.as_str()) {
+            return error(
+                400,
+                X_CONTENT_PARSE_EXCEPTION,
+                &format!("[cluster_update_settings_request] unknown field [{scope}]"),
+            );
+        }
+        let Some(written) = written.as_object() else {
+            return error(
+                400,
+                X_CONTENT_PARSE_EXCEPTION,
+                &format!(
+                    "[cluster_update_settings_request] [{scope}] must be an object naming \
+                     settings"
+                ),
+            );
+        };
+        let mut flattened = Vec::new();
+        if let Err(refusal) = flatten_settings(written, &mut String::new(), &mut flattened) {
+            return *refusal;
+        }
+        updates.push((scope.as_str() == state::SETTINGS_TRANSIENT, flattened));
+    }
+    // Past the quota the WHOLE update is refused, before anything is stored: a setting a
+    // caller wrote and this cluster dropped would be indistinguishable from one it holds,
+    // and the scope's bound is a bound on what the cluster takes, not on what it keeps.
+    for (transient, settings) in &updates {
+        let (scope, held) = if *transient {
+            (state::SETTINGS_TRANSIENT, &domain.cluster_settings.transient)
+        } else {
+            (
+                state::SETTINGS_PERSISTENT,
+                &domain.cluster_settings.persistent,
+            )
+        };
+        let mut names: BTreeSet<&str> = held.keys().map(String::as_str).collect();
+        for (name, value) in settings {
+            if value.is_some() {
+                names.insert(name.as_str());
+            } else {
+                names.remove(name.as_str());
+            }
+        }
+        if names.len() > state::CLUSTER_SETTING_QUOTA {
+            return error(
+                400,
+                ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+                &format!(
+                    "cluster [{}] takes at most {} {scope} settings, so the update naming {} of \
+                     them was not applied",
+                    cluster_name(domain),
+                    state::CLUSTER_SETTING_QUOTA,
+                    names.len()
+                ),
+            );
+        }
+    }
+    for (transient, settings) in updates {
+        let held = if transient {
+            &mut domain.cluster_settings.transient
+        } else {
+            &mut domain.cluster_settings.persistent
+        };
+        for (name, value) in settings {
+            match value {
+                Some(value) => {
+                    held.insert(name, value);
+                }
+                // "You can reset a setting by assigning it a null value."
+                None => {
+                    held.remove(&name);
+                }
+            }
+        }
+    }
+    ok(&json!({
+        "acknowledged": true,
+        state::SETTINGS_PERSISTENT:
+            reported_settings(&domain.cluster_settings.persistent, request),
+        state::SETTINGS_TRANSIENT:
+            reported_settings(&domain.cluster_settings.transient, request),
+    }))
+}
+
+/// One setting an update writes: its flat dotted NAME, and the value it is written with —
+/// `None` for a setting the update RESETS.
+type SettingUpdate = (String, Option<String>);
+
+/// The settings one scope of an update writes: whether that scope is the transient one, and
+/// the settings it names.
+type ScopeUpdate = (bool, Vec<SettingUpdate>);
+
+/// The engine's error type for a document whose fields are not the ones a request body
+/// declares.
+const X_CONTENT_PARSE_EXCEPTION: &str = "x_content_parse_exception";
+
+/// Flatten one scope of a settings body to `(the setting's dotted name, its value)` pairs,
+/// `None` for a setting the body resets.
+///
+/// Iterative in the sense that matters: the recursion is on the body's own nesting, which
+/// [`state::INDEX_SCHEMA_MAX_DEPTH`] bounds here too — a body nesting deeper than a setting
+/// name may is refused rather than walked.
+fn flatten_settings(
+    written: &Map<String, Value>,
+    prefix: &mut String,
+    into: &mut Vec<SettingUpdate>,
+) -> Result<(), Box<RtResponse>> {
+    if prefix.matches('.').count() > state::INDEX_SCHEMA_MAX_DEPTH {
+        return Err(Box::new(error(
+            400,
+            ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+            &format!("setting [{prefix}] nests deeper than a setting name may"),
+        )));
+    }
+    for (key, value) in written {
+        let name = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            Value::Object(nested) => {
+                let mut nested_prefix = name;
+                flatten_settings(nested, &mut nested_prefix, into)?;
+            }
+            Value::Null => into.push((name, None)),
+            Value::String(text) => into.push((name, Some(text.clone()))),
+            Value::Bool(_) | Value::Number(_) => into.push((name, Some(value.to_string()))),
+            Value::Array(_) => {
+                return Err(Box::new(error(
+                    400,
+                    ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+                    &format!("Failed to parse value for setting [{name}]"),
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One scope's settings as a report carries them: EXPANDED into the objects their dotted
+/// names name, which is the form the settings API answers in, or flat for a request asking
+/// for `flat_settings`.
+///
+/// A name whose expansion would run THROUGH a setting the scope also holds as a value of its
+/// own (`a` beside `a.b`) has no object to nest under, so it is reported under the name it
+/// has rather than displacing the other: both settings the cluster holds are reported, which
+/// is what a client reading its own configuration back needs.
+fn reported_settings(held: &BTreeMap<String, String>, request: &Request<'_>) -> Value {
+    let flat = request.parameter("flat_settings") == Some("true");
+    let mut reported = Map::new();
+    for (name, value) in held {
+        let segments: Vec<&str> = name.split('.').collect();
+        if flat || segments.len() == 1 {
+            reported.insert(name.clone(), json!(value));
+            continue;
+        }
+        let mut at = Some(&mut reported);
+        for segment in &segments[..segments.len() - 1] {
+            at = at.and_then(|held| {
+                held.entry((*segment).to_string())
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+            });
+        }
+        match at {
+            Some(at) => {
+                at.insert(segments[segments.len() - 1].to_string(), json!(value));
+            }
+            None => {
+                reported.insert(name.clone(), json!(value));
+            }
+        }
+    }
+    Value::Object(reported)
+}
+
+/// The pipelines a `GET /_ingest/pipeline` reports: every one the cluster holds, or the ONE
+/// the path names.
+fn pipeline_view(domain: &Domain, id: Option<&str>) -> Value {
+    let mut reported = Map::new();
+    for pipeline in domain.ingest_pipelines.values() {
+        if id.is_some_and(|named| named != pipeline.id) {
+            continue;
+        }
+        reported.insert(pipeline.id.clone(), pipeline.definition.clone());
+    }
+    Value::Object(reported)
+}
+
+/// A `PUT`, `GET` or `DELETE` on ONE ingest pipeline.
+fn pipeline_request(domain: &mut Domain, request: &Request<'_>, id: &str) -> RtResponse {
+    match request.method {
+        "PUT" => guarded(domain, request, fgac::ACTION_PUT_PIPELINE, |domain| {
+            write_pipeline(domain, request, id)
+        }),
+        "GET" => guarded(domain, request, fgac::ACTION_GET_PIPELINE, |domain| {
+            if !domain.ingest_pipelines.contains_key(id) {
+                return pipeline_missing(id);
+            }
+            ok(&pipeline_view(domain, Some(id)))
+        }),
+        "DELETE" => guarded(domain, request, fgac::ACTION_DELETE_PIPELINE, |domain| {
+            match domain.ingest_pipelines.remove(id) {
+                Some(_) => ok(&json!({ "acknowledged": true })),
+                None => pipeline_missing(id),
+            }
+        }),
+        _ => wrong_method(request, "PUT, GET, DELETE"),
+    }
+}
+
+/// Declare the pipeline the request names.
+///
+/// The declaration is READ before it is stored ([`pipeline::parse`]): a pipeline naming a
+/// processor type this engine does not register, or a processor missing an option its type
+/// requires, is refused with the engine's own sentence rather than stored as a pipeline that
+/// would do less than it says.
+fn write_pipeline(domain: &mut Domain, request: &Request<'_>, id: &str) -> RtResponse {
+    let definition = match request.json() {
+        Ok(Some(Value::Object(members))) => Value::Object(members),
+        Ok(_) => {
+            return error(
+                400,
+                PARSE_EXCEPTION,
+                "failed to parse: expected the body to be a JSON object declaring the pipeline",
+            )
+        }
+        Err(refusal) => return *refusal,
+    };
+    if let Err(failed) = pipeline::parse(&definition) {
+        return error(400, failed.error_type, &failed.reason);
+    }
+    if !domain.ingest_pipelines.contains_key(id)
+        && domain.ingest_pipelines.len() >= state::INGEST_PIPELINE_QUOTA
+    {
+        return error(
+            400,
+            ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+            &format!(
+                "cluster [{}] already holds the maximum of {} ingest pipelines, so pipeline \
+                 [{id}] could not be created",
+                cluster_name(domain),
+                state::INGEST_PIPELINE_QUOTA
+            ),
+        );
+    }
+    domain.ingest_pipelines.insert(
+        id.to_string(),
+        state::IngestPipeline {
+            id: id.to_string(),
+            definition,
+        },
+    );
+    ok(&json!({ "acknowledged": true }))
+}
+
+/// The engine's refusal of a pipeline id the cluster holds no pipeline for.
+fn pipeline_missing(id: &str) -> RtResponse {
+    error(
+        404,
+        RESOURCE_NOT_FOUND_EXCEPTION,
+        &format!("pipeline [{id}] is missing"),
+    )
+}
+
+/// The engine's error type for a resource the cluster does not hold.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "resource_not_found_exception";
+
+/// Run the pipeline the path names over the documents the body carries, WITHOUT storing
+/// anything: `POST /_ingest/pipeline/{id}/_simulate`.
+///
+/// The processors are the ones the stored pipeline declares and are run by the same code a
+/// write runs them with, so what this answers is what a write through that pipeline would
+/// store. `verbose` reports each processor's own result in turn, which is the same walk with
+/// every step published instead of only the last.
+fn simulate_pipeline(
+    domain: &Domain,
+    request: &Request<'_>,
+    id: &str,
+    now: SystemTime,
+) -> RtResponse {
+    let Some(pipeline) = domain.ingest_pipelines.get(id) else {
+        return pipeline_missing(id);
+    };
+    let processors = match pipeline::parse(&pipeline.definition) {
+        Ok(processors) => processors,
+        Err(failed) => return error(400, failed.error_type, &failed.reason),
+    };
+    let body = match request.json() {
+        Ok(Some(Value::Object(members))) => Value::Object(members),
+        Ok(_) => {
+            return error(
+                400,
+                PARSE_EXCEPTION,
+                "failed to parse: expected the body to be a JSON object carrying docs",
+            )
+        }
+        Err(refusal) => return *refusal,
+    };
+    let Some(docs) = body.get("docs").and_then(Value::as_array) else {
+        return error(400, PARSE_EXCEPTION, "[docs] required property is missing");
+    };
+    if docs.len() > MAX_SIMULATED_DOCUMENTS {
+        return error(
+            400,
+            ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+            &format!(
+                "a simulate request carries at most {MAX_SIMULATED_DOCUMENTS} documents"
+            ),
+        );
+    }
+    let verbose = request.parameter("verbose").is_some_and(|value| value != "false");
+    let timestamp = state::datetime_text(now);
+    // What one simulate run may PRODUCE, in bytes, not only in documents and processors:
+    // a processor's declared value is written into every document it runs over, so the
+    // answer's size is the product of the counts and that value — three caller-chosen
+    // factors, of which the counts alone are no bound. Every value the answer retains is
+    // charged against this budget and a run that would exceed it is refused, so a small
+    // request cannot make a large answer.
+    let mut budget = MAX_SIMULATED_BYTES;
+    let mut answered = Vec::new();
+    for doc in docs {
+        let index = doc
+            .get("_index")
+            .and_then(Value::as_str)
+            .unwrap_or("_index")
+            .to_string();
+        let document_id = doc
+            .get("_id")
+            .and_then(Value::as_str)
+            .unwrap_or("_id")
+            .to_string();
+        let mut source = doc.get("_source").cloned().unwrap_or_else(|| json!({}));
+        if !source.is_object() {
+            return error(
+                400,
+                PARSE_EXCEPTION,
+                "failed to parse: expected [_source] to be a JSON object",
+            );
+        }
+        let mut steps = Vec::new();
+        let mut failed = None;
+        for processor in &processors {
+            match processor.apply(&mut source) {
+                Ok(()) => {
+                    // The document a processor LEFT is bounded by what an index takes, the
+                    // same bound the write path applies to a pipelined document.
+                    if rendered_bytes(&source) > ingest::MAX_DOCUMENT_BYTES {
+                        return oversized_simulation();
+                    }
+                    // A step is retained only for a run that asked for the steps: a
+                    // non-verbose run answers the last document, not one copy per
+                    // processor.
+                    if verbose {
+                        let step = json!({
+                            "processor_type": processor.kind(),
+                            "status": "success",
+                            "doc": simulated(&index, &document_id, &source, &timestamp),
+                        });
+                        match budget.checked_sub(rendered_bytes(&step)) {
+                            Some(left) => budget = left,
+                            None => return oversized_simulation(),
+                        }
+                        steps.push(step);
+                    }
+                }
+                Err(refusal) => {
+                    failed = Some(json!({
+                        "type": refusal.error_type,
+                        "reason": refusal.reason,
+                    }));
+                    break;
+                }
+            }
+        }
+        let answer = match failed {
+            Some(failure) => json!({ "error": failure }),
+            None if verbose => json!({ "processor_results": steps }),
+            None => json!({ "doc": simulated(&index, &document_id, &source, &timestamp) }),
+        };
+        // A verbose run has already charged its steps; charging the answer again would
+        // double-count them, so only what the answer adds is charged.
+        let charged = if verbose { 0 } else { rendered_bytes(&answer) };
+        match budget.checked_sub(charged) {
+            Some(left) => budget = left,
+            None => return oversized_simulation(),
+        }
+        answered.push(answer);
+    }
+    ok(&json!({ "docs": answered }))
+}
+
+/// The most bytes ONE simulate run may produce.
+///
+/// The emulator's OWN bound, and the bound that matters for this route: the document count,
+/// the processor count and the bytes a processor injects are all caller-chosen, so the
+/// counts alone leave the answer's size unbounded. The cap is the one a request body is
+/// read under ([`MAX_REQUEST_BODY_BYTES`]), so a simulate answers at most what this cluster
+/// would take in.
+const MAX_SIMULATED_BYTES: usize = MAX_REQUEST_BODY_BYTES;
+
+/// How many bytes a value occupies on the wire — what [`MAX_SIMULATED_BYTES`] is charged
+/// against. A value that cannot be rendered is charged the whole budget, so it cannot be
+/// retained for free.
+fn rendered_bytes(value: &Value) -> usize {
+    ::serde_json::to_vec(value).map_or(usize::MAX, |rendered| rendered.len())
+}
+
+/// The engine's refusal of a simulate run whose documents are larger than this cluster
+/// takes.
+fn oversized_simulation() -> RtResponse {
+    error(
+        400,
+        ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+        &format!(
+            "a simulate run answers at most {MAX_SIMULATED_BYTES} bytes over documents of at \
+             most {} bytes each",
+            ingest::MAX_DOCUMENT_BYTES
+        ),
+    )
+}
+
+/// One simulated document, as the simulate API reports it.
+fn simulated(index: &str, id: &str, source: &Value, timestamp: &str) -> Value {
+    json!({
+        "_index": index,
+        "_id": id,
+        "_source": source,
+        "_ingest": { "timestamp": timestamp },
+    })
+}
+
+/// A `PUT`, `GET` or `DELETE` on ONE index-management policy.
+fn ism_policy_request(
+    domain: &mut Domain,
+    request: &Request<'_>,
+    id: &str,
+    now: SystemTime,
+) -> RtResponse {
+    match request.method {
+        "PUT" => guarded(domain, request, fgac::ACTION_PUT_ISM_POLICY, |domain| {
+            write_ism_policy(domain, request, id, now)
+        }),
+        "GET" => guarded(domain, request, fgac::ACTION_GET_ISM_POLICY, |domain| {
+            match domain.ism_policies.get(id) {
+                Some(policy) => ok(&ism_policy_view(policy)),
+                None => error(404, STATUS_EXCEPTION, "Policy not found"),
+            }
+        }),
+        "DELETE" => guarded(domain, request, fgac::ACTION_DELETE_ISM_POLICY, |domain| {
+            match domain.ism_policies.remove(id) {
+                Some(policy) => ok(&json!({
+                    "_index": ISM_CONFIG_INDEX,
+                    "_id": policy.policy_id,
+                    "_version": policy.version,
+                    "result": "deleted",
+                    "_seq_no": policy.seq_no,
+                    "_primary_term": policy.primary_term,
+                })),
+                None => error(404, STATUS_EXCEPTION, "Policy not found"),
+            }
+        }),
+        _ => wrong_method(request, "PUT, GET, DELETE"),
+    }
+}
+
+/// The engine's error type for a request the index-management plugin refuses.
+const STATUS_EXCEPTION: &str = "status_exception";
+
+/// The index the index-management plugin keeps its own configuration in, which the write it
+/// performs is reported against.
+const ISM_CONFIG_INDEX: &str = ".opendistro-ism-config";
+
+/// The `_primary_term` every write of this cluster is taken in: one run of a cluster takes
+/// every write in one term, and nothing here re-elects a primary.
+const ISM_PRIMARY_TERM: i64 = 1;
+
+/// Write the index-management policy the path names.
+///
+/// Creating one is a 201; UPDATING one is a write against the revision the caller read, so
+/// it carries `if_seq_no` and `if_primary_term` — "to update an existing policy, you must
+/// specify the sequence number and primary term" — and a write that names neither, or names
+/// a revision the policy has moved past, is the engine's version conflict rather than a
+/// silent overwrite of someone else's policy.
+fn write_ism_policy(
+    domain: &mut Domain,
+    request: &Request<'_>,
+    id: &str,
+    now: SystemTime,
+) -> RtResponse {
+    let body = match request.json() {
+        Ok(Some(Value::Object(members))) => Value::Object(members),
+        Ok(_) => {
+            return error(
+                400,
+                PARSE_EXCEPTION,
+                "failed to parse: expected the body to be a JSON object carrying a policy",
+            )
+        }
+        Err(refusal) => return *refusal,
+    };
+    let Some(definition) = body.get("policy").filter(|policy| policy.is_object()) else {
+        return error(400, PARSE_EXCEPTION, "[policy] required property is missing");
+    };
+    let held = domain.ism_policies.get(id);
+    if let Some(held) = held {
+        let named = (
+            request.parameter("if_seq_no").and_then(|v| v.parse().ok()),
+            request
+                .parameter("if_primary_term")
+                .and_then(|v| v.parse().ok()),
+        );
+        if named != (Some(held.seq_no), Some(held.primary_term)) {
+            return error(
+                409,
+                VERSION_CONFLICT_ENGINE_EXCEPTION,
+                &format!(
+                    "[{id}]: version conflict, required seqNo [{}], primary term [{}]",
+                    held.seq_no, held.primary_term
+                ),
+            );
+        }
+    } else if domain.ism_policies.len() >= state::ISM_POLICY_QUOTA {
+        return error(
+            400,
+            ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+            &format!(
+                "cluster [{}] already holds the maximum of {} index management policies, so \
+                 policy [{id}] could not be created",
+                cluster_name(domain),
+                state::ISM_POLICY_QUOTA
+            ),
+        );
+    }
+    let created = held.is_none();
+    let version = held.map_or(1, |held| held.version.saturating_add(1));
+    // The sequence number of a write is the next one over the plugin's configuration index,
+    // so it is one past the highest any policy carries.
+    let seq_no = domain
+        .ism_policies
+        .values()
+        .map(|policy| policy.seq_no)
+        .max()
+        .map_or(0, |highest| highest.saturating_add(1));
+    let policy = state::IsmPolicy {
+        policy_id: id.to_string(),
+        definition: definition.clone(),
+        version,
+        seq_no,
+        primary_term: ISM_PRIMARY_TERM,
+        updated_at: now,
+    };
+    let view = ism_policy_view(&policy);
+    domain.ism_policies.insert(id.to_string(), policy);
+    rendered(if created { 201 } else { 200 }, &view)
+}
+
+/// One index-management policy, as that plugin's policy API reports it: the revision
+/// counters of the write that stored it, and the policy document itself under the member it
+/// was written in.
+///
+/// The document is reported as it was WRITTEN, with the two members the plugin fills in
+/// itself beside it — the policy's own id, which is the one the path addressed it by, and
+/// when it was last written. Nothing else is added: a member the client did not write is
+/// not one this plugin holds.
+fn ism_policy_view(policy: &state::IsmPolicy) -> Value {
+    let mut reported = policy
+        .definition
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    reported.insert("policy_id".to_string(), json!(policy.policy_id));
+    reported.insert(
+        "last_updated_time".to_string(),
+        json!(state::epoch_millis(policy.updated_at)),
+    );
+    json!({
+        "_id": policy.policy_id,
+        "_version": policy.version,
+        "_seq_no": policy.seq_no,
+        "_primary_term": policy.primary_term,
+        "policy": { "policy": Value::Object(reported) },
+    })
+}
+
 /// The number an index's `settings` section gives `name`, under the `index` sub-section or
 /// directly, as both spellings a client writes it with.
 fn setting_number(schema: &::aws_smithy_types::Document, name: &str) -> Option<i64> {
@@ -995,11 +1746,23 @@ fn document_write(
         }
     }
     let address = domain.arn.clone();
+    // "pipeline: The pipeline ID for preprocessing documents": a write naming one is
+    // preprocessed by exactly the processors that pipeline declares, run by the same code
+    // the simulate API runs them with, and what is STORED is the document they left. A
+    // pipeline the cluster does not hold, or a processor that cannot act on this document,
+    // refuses the write rather than storing the document unprocessed.
+    let processed = match request.parameter("pipeline") {
+        None => None,
+        Some(id) => match processed_source(domain, request, id) {
+            Ok(processed) => Some(processed),
+            Err(refusal) => return *refusal,
+        },
+    };
     let write = ingest::DocumentWrite {
         domain: &address,
         index_name,
         document_id: id.filter(|id| !id.is_empty()),
-        document: request.body,
+        document: processed.as_deref().unwrap_or(request.body),
         principal_arn: request.principal,
         now,
     };
@@ -1027,6 +1790,43 @@ fn document_write(
         }
         Err(refusal) => refused(&refusal),
     }
+}
+
+/// The document bytes a write naming an ingest PIPELINE stores: the request's own source
+/// with every processor that pipeline declares applied, in the order it declares them.
+fn processed_source(
+    domain: &Domain,
+    request: &Request<'_>,
+    id: &str,
+) -> Result<Vec<u8>, Box<RtResponse>> {
+    let Some(pipeline) = domain.ingest_pipelines.get(id) else {
+        return Err(Box::new(pipeline_missing(id)));
+    };
+    let processors = pipeline::parse(&pipeline.definition)
+        .map_err(|failed| Box::new(error(400, failed.error_type, &failed.reason)))?;
+    let mut source = match request.json() {
+        Ok(Some(source)) if source.is_object() => source,
+        Ok(_) => {
+            return Err(Box::new(error(
+                400,
+                ingest::MAPPER_PARSING_EXCEPTION,
+                "failed to parse: expected a document to be a JSON object",
+            )))
+        }
+        Err(refusal) => return Err(refusal),
+    };
+    for processor in &processors {
+        processor
+            .apply(&mut source)
+            .map_err(|failed| Box::new(error(400, failed.error_type, &failed.reason)))?;
+    }
+    ::serde_json::to_vec(&source).map_err(|failed| {
+        Box::new(error(
+            400,
+            ingest::MAPPER_PARSING_EXCEPTION,
+            &format!("failed to render the processed document: {failed}"),
+        ))
+    })
 }
 
 /// The `_shards` summary a write answers with, computed from the index's own replica
@@ -1450,7 +2250,7 @@ fn template_request(
                 })),
                 None => error(
                     404,
-                    INDEX_NOT_FOUND_EXCEPTION,
+                    ingest::INDEX_NOT_FOUND_EXCEPTION,
                     &format!("index_template [{name}] missing"),
                 ),
             }
@@ -1460,7 +2260,7 @@ fn template_request(
                 Some(_) => ok(&json!({ "acknowledged": true })),
                 None => error(
                     404,
-                    INDEX_NOT_FOUND_EXCEPTION,
+                    ingest::INDEX_NOT_FOUND_EXCEPTION,
                     &format!("index_template [{name}] missing"),
                 ),
             }
@@ -1739,10 +2539,12 @@ fn refused(refusal: &ingest::WriteRefusal) -> RtResponse {
             error_type,
             message,
         } => {
-            let status = if *error_type == ingest::SECURITY_EXCEPTION {
-                403
-            } else {
-                400
+            let status = match *error_type {
+                ingest::SECURITY_EXCEPTION => 403,
+                // An index the cluster does not hold is a missing resource, not a malformed
+                // request, so it carries the status the engine answers a missing index with.
+                ingest::INDEX_NOT_FOUND_EXCEPTION => 404,
+                _ => 400,
             };
             error(status, error_type, message)
         }
@@ -1781,7 +2583,7 @@ fn wrong_method(request: &Request<'_>, allowed: &str) -> RtResponse {
 fn index_not_found(index_name: &str) -> RtResponse {
     indexed_error(
         404,
-        INDEX_NOT_FOUND_EXCEPTION,
+        ingest::INDEX_NOT_FOUND_EXCEPTION,
         &format!("no such index [{index_name}]"),
         index_name,
     )

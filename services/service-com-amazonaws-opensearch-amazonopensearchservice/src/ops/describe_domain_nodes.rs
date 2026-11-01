@@ -262,7 +262,11 @@ fn node_status(zone: Option<usize>, serving_zones: Option<usize>) -> &'static st
 
 /// The nodes of the stored domain, as `DescribeDomainNodes` reports them: every role
 /// the configuration provisions, in zone order within each role.
-fn domain_nodes(domain: &Domain) -> Vec<DomainNodesStatus> {
+///
+/// `pub(crate)` because the DOMAIN's own node API reports the same census through its own
+/// projection ([`crate::service::domain_rest`]): one topology, read in one place, so the
+/// control plane and the cluster cannot describe one domain's nodes differently.
+pub(crate) fn domain_nodes(domain: &Domain) -> Vec<DomainNodesStatus> {
     let cluster = &domain.cluster_config;
     let zones = configured_zone_count(cluster);
     let standby = usize::try_from(standby_zone_count(cluster)).unwrap_or(0);

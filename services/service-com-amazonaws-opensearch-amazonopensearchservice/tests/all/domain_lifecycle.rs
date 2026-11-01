@@ -414,14 +414,15 @@ async fn a_created_domain_is_persisted_and_read_back_member_for_member() {
         created["DomainProcessingStatus"]
     );
 
-    // The endpoint is the domain's own host, in the Region the request was signed
-    // for, and it carries an opaque per-domain suffix rather than just the name.
-    let endpoint = string_member(&created, "Endpoint", "CreateDomain(endpoint)");
+    // A domain that is still being provisioned publishes no address for its data plane:
+    // `Endpoint` is the host index and search requests go to, and there is no cluster
+    // behind it yet. The address it publishes ONCE IT IS UP, and that the address is
+    // served, is the rule [`super::domain_endpoint_publication`] asserts.
     assert!(
-        endpoint.starts_with(&format!("search-{name}-"))
-            && endpoint.ends_with(".us-east-1.es.amazonaws.com"),
-        "case CreateDomain(endpoint): expected search-{name}-<suffix>.us-east-1.es.amazonaws.com, \
-         got {endpoint:?}"
+        created["Endpoint"].is_null()
+            && created["EndpointV2"].is_null()
+            && created["Endpoints"].is_null(),
+        "case CreateDomain(endpoint): a domain still Creating publishes no address, got {created:?}"
     );
 
     // Defaults the model documents: `MIXED` when no use case is given, `GENERAL`

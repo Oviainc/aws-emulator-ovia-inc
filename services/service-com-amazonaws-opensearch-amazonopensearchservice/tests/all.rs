@@ -23,6 +23,10 @@ mod application_updates;
 mod applications;
 #[path = "all/change_progress.rs"]
 mod change_progress;
+#[path = "all/cluster_apis.rs"]
+mod cluster_apis;
+#[path = "all/cluster_config_round_trip.rs"]
+mod cluster_config_round_trip;
 #[path = "all/cognito_dashboards_authentication.rs"]
 mod cognito_dashboards_authentication;
 #[path = "all/collection_element_refusals.rs"]
@@ -67,6 +71,8 @@ mod domain_auto_tunes;
 mod domain_batch_describe;
 #[path = "all/domain_configuration_rules.rs"]
 mod domain_configuration_rules;
+#[path = "all/domain_endpoint_publication.rs"]
+mod domain_endpoint_publication;
 #[path = "all/domain_health.rs"]
 mod domain_health;
 #[path = "all/domain_lifecycle.rs"]

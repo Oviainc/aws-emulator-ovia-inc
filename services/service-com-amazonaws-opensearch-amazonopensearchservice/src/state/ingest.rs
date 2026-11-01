@@ -150,6 +150,10 @@ pub enum WriteRefusal {
 /// The engine's error type for a request the domain does not authorize.
 pub const SECURITY_EXCEPTION: &str = "security_exception";
 
+/// The engine's error type for an index the cluster does not hold — a read of one, or a
+/// write the cluster may not create it for ([`super::auto_create_index`]).
+pub const INDEX_NOT_FOUND_EXCEPTION: &str = "index_not_found_exception";
+
 /// The engine's error type for a document carrying a field the mappings do not carry,
 /// where they are `strict`.
 pub const STRICT_DYNAMIC_MAPPING_EXCEPTION: &str = "strict_dynamic_mapping_exception";
@@ -422,16 +426,28 @@ fn index_for<'d>(
     index_name: &str,
     mappings: Option<::aws_smithy_types::Document>,
 ) -> Result<&'d mut Index, WriteRefusal> {
-    if !domain.indexes.contains_key(index_name) && domain.indexes.len() >= super::INDEX_QUOTA {
-        return Err(WriteRefusal::Rejected {
-            error_type: ILLEGAL_ARGUMENT_EXCEPTION,
-            message: format!(
-                "domain [{}] already holds the maximum of {} indexes, so index [{index_name}] \
-                 could not be created",
-                domain.domain_name,
-                super::INDEX_QUOTA
-            ),
-        });
+    if !domain.indexes.contains_key(index_name) {
+        // A write to an index the cluster does not hold CREATES it only while
+        // `action.auto_create_index` lets it: the setting is what a client turns implicit
+        // creation off with, and a write it forbids is refused rather than minting the
+        // index ([`super::auto_create_index`]).
+        if let super::AutoCreate::Refused(reason) = domain.auto_creates_index(index_name) {
+            return Err(WriteRefusal::Rejected {
+                error_type: INDEX_NOT_FOUND_EXCEPTION,
+                message: reason,
+            });
+        }
+        if domain.indexes.len() >= super::INDEX_QUOTA {
+            return Err(WriteRefusal::Rejected {
+                error_type: ILLEGAL_ARGUMENT_EXCEPTION,
+                message: format!(
+                    "domain [{}] already holds the maximum of {} indexes, so index \
+                     [{index_name}] could not be created",
+                    domain.domain_name,
+                    super::INDEX_QUOTA
+                ),
+            });
+        }
     }
     Ok(domain
         .indexes

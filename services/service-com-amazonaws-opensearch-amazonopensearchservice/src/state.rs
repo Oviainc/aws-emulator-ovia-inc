@@ -2416,6 +2416,146 @@ pub struct IndexTemplate {
     pub definition: ::serde_json::Value,
 }
 
+/// The cluster-wide settings of a domain's cluster: the two scopes `_cluster/settings`
+/// writes and reports, each a map from a setting's FLAT dotted name to its value.
+///
+/// Flat because that is the name a setting HAS — `action.auto_create_index` is one key, not
+/// a path through three objects — so one spelling is stored however a client wrote it and
+/// every reader of a setting looks it up by its name ([`Domain::cluster_setting`]).
+///
+/// "transient" settings are "lost when the cluster restarts" while persistent ones survive
+/// it, and a transient value OVERRIDES the persistent one for the same setting, which is
+/// what the lookup implements. A setting written with a null value is REMOVED from its
+/// scope, which is how a client resets one.
+#[derive(Debug, Clone, Default)]
+pub struct ClusterSettings {
+    /// The `persistent` scope.
+    pub persistent: BTreeMap<String, String>,
+    /// The `transient` scope.
+    pub transient: BTreeMap<String, String>,
+}
+
+/// The two scopes a cluster setting is written in, in the order a lookup consults them:
+/// a transient value overrides the persistent one for the same setting.
+pub const CLUSTER_SETTING_SCOPES: [&str; 2] = [SETTINGS_TRANSIENT, SETTINGS_PERSISTENT];
+
+/// The `transient` scope's own name on the wire.
+pub const SETTINGS_TRANSIENT: &str = "transient";
+
+/// The `persistent` scope's own name on the wire.
+pub const SETTINGS_PERSISTENT: &str = "persistent";
+
+/// The setting that decides whether writing a document to an index the cluster does not
+/// hold CREATES that index: "automatically create an index if it doesn't already exist".
+pub const AUTO_CREATE_INDEX_SETTING: &str = "action.auto_create_index";
+
+/// How many settings one scope may hold before a write is refused — the same kind of bound
+/// [`INDEX_QUOTA`] is, for the same reason: a caller looping with fresh names must not grow
+/// this process's state without end.
+pub const CLUSTER_SETTING_QUOTA: usize = 500;
+
+/// How many ingest pipelines one domain may hold before a write is refused.
+pub const INGEST_PIPELINE_QUOTA: usize = 100;
+
+/// How many index-management policies one domain may hold before a write is refused.
+pub const ISM_POLICY_QUOTA: usize = 100;
+
+/// One INGEST PIPELINE of a domain: "a series of processors that are to be executed in the
+/// same order as they are declared", applied to a document on its way into an index.
+#[derive(Debug, Clone)]
+pub struct IngestPipeline {
+    /// The pipeline's id — unique on the cluster, so the id IS the key.
+    pub id: String,
+    /// The pipeline document as it was written (`{"description": …, "processors": […]}`),
+    /// which the pipeline API reports back and which the write path reads the processors to
+    /// run from. Stored as the ONE copy both read, so a pipeline cannot run one set of
+    /// processors and report another.
+    pub definition: ::serde_json::Value,
+}
+
+/// One index-management POLICY of a domain, as the index-management plugin's policy API
+/// holds it.
+///
+/// The policy DOCUMENT is stored as it was written, under the `policy` member the API takes
+/// and reports it in; the revision counters beside it are the ones every write of a
+/// document to that plugin's own index moves, and are what a concurrent update is checked
+/// against.
+#[derive(Debug, Clone)]
+pub struct IsmPolicy {
+    /// The policy's id — unique on the cluster, so the id IS the key.
+    pub policy_id: String,
+    /// The `policy` object as it was written.
+    pub definition: ::serde_json::Value,
+    /// `_version`: 1 when the policy was created, bumped by each update of it.
+    pub version: i64,
+    /// `_seq_no`: the sequence number of the write that last changed the policy, counted
+    /// from 0 over the writes to the plugin's own configuration index.
+    pub seq_no: i64,
+    /// `_primary_term`: the term of the shard that took that write. One cluster run takes
+    /// every write in one term, so this stays at its initial value.
+    pub primary_term: i64,
+    /// When the policy was last written — what `last_updated_time` reports.
+    pub updated_at: SystemTime,
+}
+
+/// Whether an implicit index creation is permitted, and why not when it is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoCreate {
+    /// The setting permits creating this index.
+    Allowed,
+    /// It does not: the sentence the engine refuses the write with.
+    Refused(String),
+}
+
+/// Whether `action.auto_create_index` as the cluster holds it lets a write CREATE the index
+/// `index_name` names.
+///
+/// The setting's value is either a boolean — `true` permits every index and `false` none —
+/// or "a comma-separated list of patterns you want to allow, or prefix each pattern with +
+/// or - to indicate whether it should be allowed or blocked": the FIRST pattern the name
+/// matches decides, a bare pattern being an allow, and a name no pattern matches is
+/// blocked. A cluster holding no value for the setting permits every index, which is its
+/// documented default.
+///
+/// The refusal sentences are the engine's own for the two cases it distinguishes — the
+/// setting switched off, and a name its patterns do not match — each naming the index asked
+/// for and, for the pattern case, the value that refused it.
+pub fn auto_create_index(settings: Option<&str>, index_name: &str) -> AutoCreate {
+    let Some(value) = settings else {
+        return AutoCreate::Allowed;
+    };
+    let value = value.trim();
+    match value {
+        "true" => return AutoCreate::Allowed,
+        "false" => {
+            return AutoCreate::Refused(format!(
+                "no such index [{index_name}] and [{AUTO_CREATE_INDEX_SETTING}] is [false]"
+            ))
+        }
+        _ => {}
+    }
+    for pattern in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (allowed, pattern) = match pattern.strip_prefix('-') {
+            Some(rest) => (false, rest),
+            None => (true, pattern.strip_prefix('+').unwrap_or(pattern)),
+        };
+        if ::service_common::iam_authorization::wildcard_match(pattern, index_name, true) {
+            return if allowed {
+                AutoCreate::Allowed
+            } else {
+                AutoCreate::Refused(format!(
+                    "no such index [{index_name}] and [{AUTO_CREATE_INDEX_SETTING}] contains \
+                     [-{pattern}] which forbids automatic creation of the index"
+                ))
+            };
+        }
+    }
+    AutoCreate::Refused(format!(
+        "no such index [{index_name}] and [{AUTO_CREATE_INDEX_SETTING}] ([{value}]) doesn't \
+         match"
+    ))
+}
+
 /// The `IndexSchema` section an index's field mappings live in: `UpdateIndex`
 /// carries "any changes to mappings, settings, and semantic enrichment
 /// configuration", and it is the mapped fields under this one whose types are
@@ -4896,6 +5036,15 @@ pub struct Domain {
     /// The index templates this domain holds, keyed by their name — unique on the domain,
     /// so the name IS the key. See [`IndexTemplate`].
     pub index_templates: BTreeMap<String, IndexTemplate>,
+    /// The cluster-wide settings this domain's cluster holds, as its own settings API
+    /// wrote them. See [`ClusterSettings`].
+    pub cluster_settings: ClusterSettings,
+    /// The ingest pipelines this domain holds, keyed by their id — unique on the cluster,
+    /// so the id IS the key. See [`IngestPipeline`].
+    pub ingest_pipelines: BTreeMap<String, IngestPipeline>,
+    /// The index-management policies this domain holds, keyed by their policy id —
+    /// unique on the cluster, so the id IS the key. See [`IsmPolicy`].
+    pub ism_policies: BTreeMap<String, IsmPolicy>,
     pub identity_center_options: Option<IdentityCenterOptions>,
     /// Stored in the `DomainConfig` form; `DomainStatus` reports the
     /// `AutoTuneOptionsOutput` projection of it.
@@ -4992,6 +5141,35 @@ pub struct Domain {
 }
 
 impl Domain {
+    /// The value this domain's cluster holds for the setting `name`, or `None` when it
+    /// holds none.
+    ///
+    /// The scopes are consulted in [`CLUSTER_SETTING_SCOPES`] order, so a transient value
+    /// overrides the persistent one for the same setting — the ONE lookup every reader of a
+    /// cluster setting goes through, so no two of them can read the same setting
+    /// differently.
+    #[must_use]
+    pub fn cluster_setting(&self, name: &str) -> Option<&str> {
+        for scope in CLUSTER_SETTING_SCOPES {
+            let held = if scope == SETTINGS_TRANSIENT {
+                &self.cluster_settings.transient
+            } else {
+                &self.cluster_settings.persistent
+            };
+            if let Some(value) = held.get(name) {
+                return Some(value.as_str());
+            }
+        }
+        None
+    }
+
+    /// Whether this cluster lets a write CREATE the index `index_name` names, from the
+    /// `action.auto_create_index` setting it holds ([`auto_create_index`]).
+    #[must_use]
+    pub fn auto_creates_index(&self, index_name: &str) -> AutoCreate {
+        auto_create_index(self.cluster_setting(AUTO_CREATE_INDEX_SETTING), index_name)
+    }
+
     /// The schema an index named `index_name` is CREATED with on this domain when the
     /// create itself names none: the schema of the matching index template, the
     /// highest-priority one where several match, and `None` where no template matches.
@@ -5624,6 +5802,17 @@ impl Domain {
         });
         let announced =
             |host: &str| announced_domain_endpoint(host, &self.domain_name, local_endpoint);
+        // Whether this domain publishes an ADDRESS for its data plane at all. `Endpoint` is
+        // "the domain-specific endpoint used to submit index, search, and data upload
+        // requests", and `Endpoints`/`EndpointV2` are that same address for a domain reached
+        // inside a VPC or over both address families — none of which exists before the
+        // cluster behind it does. A domain still being provisioned
+        // ([`Self::cluster_is_up`]) therefore publishes none of the three, so the standard
+        // readiness signal — a caller polling for the presence of an endpoint — is the
+        // signal it looks like, rather than an address that answers nothing. They appear on
+        // every later read, including while a configuration change is in flight: the running
+        // cluster stays reachable through one.
+        let publishes_address = self.cluster_is_up();
         DomainStatus {
             domain_id: self.domain_id.clone(),
             domain_name: self.domain_name.clone(),
@@ -5634,22 +5823,22 @@ impl Domain {
             // search, and data upload requests" — the PUBLIC one, which a domain
             // provisioned inside a VPC does not have: it is reached on the hosts
             // `Endpoints` below carries instead.
-            endpoint: vpc_access_endpoints
-                .is_none()
+            endpoint: (publishes_address && vpc_access_endpoints.is_none())
                 .then(|| announced(&self.endpoint)),
             // `EndpointV2` is the dual-stack PUBLIC endpoint, which a domain whose
             // `IPAddressType` is `dualstack` is provisioned beside its IPv4 one
             // ([`Self::public_endpoint_v2`]); a VPC-access domain has no public host of
             // either version and reports its dual-stack host in `Endpoints` below,
             // under `vpcv2`.
-            endpoint_v2: self
-                .public_endpoint_v2()
+            endpoint_v2: publishes_address
+                .then(|| self.public_endpoint_v2())
+                .flatten()
                 .map(|host| announced(&host)),
             // "The key-value pair that exists if the OpenSearch Service domain uses VPC
             // endpoints": present for a VPC-access domain and absent for a public one.
             // A service-managed VPC endpoint is a resource of its own, reported by
             // `DescribeVpcEndpoints` rather than here.
-            endpoints: vpc_access_endpoints,
+            endpoints: publishes_address.then_some(vpc_access_endpoints).flatten(),
             // The dual-stack hosted zone is a Route 53 zone of the service's own,
             // published by a part of AWS this emulator does not model, so its id stays
             // absent rather than being invented.

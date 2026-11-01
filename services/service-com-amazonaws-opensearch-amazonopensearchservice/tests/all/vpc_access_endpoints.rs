@@ -278,6 +278,19 @@ fn assert_rule(status: &Value, row: &Row, name: &str, case: &str) -> Vec<(String
     published
 }
 
+/// Assert `status` publishes NO address at all — what a domain still being provisioned
+/// reports, whatever access mode it was created with: the endpoint index and search requests
+/// go to does not exist until the cluster behind it does.
+fn assert_no_published_address(status: &Value, case: &str) {
+    for member in ["Endpoint", "EndpointV2", "Endpoints"] {
+        assert!(
+            status[member].is_null(),
+            "case {case:?}: a domain still Creating publishes no {member}, got {:?}",
+            status[member]
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_domain_publishes_the_hosts_its_access_mode_gives_it() {
     let emulator = Emulator::new();
@@ -293,25 +306,21 @@ async fn a_domain_publishes_the_hosts_its_access_mode_gives_it() {
             "case {case:?}: expected 200 from CreateDomain, got {} with {:?}",
             created.status, created.body
         );
-        let minted = assert_rule(&created.body["DomainStatus"], row, &name, case);
+        // A domain is still being provisioned when the create answers, so it publishes no
+        // address yet; the hosts its access mode gives it appear once it is up.
+        assert_no_published_address(&created.body["DomainStatus"], case);
+        tokio::time::sleep(SETTLE_WAIT).await;
 
-        // The read reports the persisted record, not a body synthesised from the
-        // request: the create's answer and every later read publish the same hosts.
         let read = emulator.describe(&name).await;
         assert_eq!(
             read.status, 200,
             "case {case:?}: expected 200 from DescribeDomain, got {} with {:?}",
             read.status, read.body
         );
-        let described = assert_rule(&read.body["DomainStatus"], row, &name, case);
-        assert_eq!(
-            described, minted,
-            "case {case:?}: expected the created hosts {minted:?}, got {described:?}"
-        );
+        let minted = assert_rule(&read.body["DomainStatus"], row, &name, case);
 
-        // A read does not change what the next caller sees, and the configuration
-        // settling does not move the hosts either.
-        tokio::time::sleep(SETTLE_WAIT).await;
+        // A read does not change what the next caller sees: the hosts a domain publishes
+        // are the same on every later read.
         let settled = emulator.describe(&name).await;
         let settled = assert_rule(&settled.body["DomainStatus"], row, &name, case);
         assert_eq!(
@@ -319,7 +328,6 @@ async fn a_domain_publishes_the_hosts_its_access_mode_gives_it() {
             "case {case:?}: the hosts a domain publishes are stable across reads: {minted:?} \
              then {settled:?}"
         );
-
         if let Some((_, host)) = minted
             .iter()
             .find(|(key, _)| key == ENDPOINTS_KEY_VPC)
@@ -363,8 +371,10 @@ async fn moving_a_domain_into_a_vpc_moves_where_its_hosts_are_published() {
         "case {:?}: expected 200 from CreateDomain, got {} with {:?}",
         public.case, created.status, created.body
     );
-    assert_rule(&created.body["DomainStatus"], &public, name, public.case);
+    assert_no_published_address(&created.body["DomainStatus"], public.case);
     tokio::time::sleep(SETTLE_WAIT).await;
+    let up = emulator.describe(name).await;
+    assert_rule(&up.body["DomainStatus"], &public, name, public.case);
 
     let vpc_options = json!({
         "SubnetIds": ["subnet-00000000000000009"],

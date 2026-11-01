@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 
-use super::domain_lifecycle::{Answer, Emulator, DEFAULT_ACCESS_KEY_ID, PREFIX, REGION};
+use super::domain_lifecycle::{Answer, Emulator, DEFAULT_ACCESS_KEY_ID, PREFIX, REGION, SETTLE_WAIT};
 
 /// The endpoint a client on the machine this emulator runs on reaches it at: a loopback
 /// address, which names no service, so it is the emulator's OWN endpoint.
@@ -116,6 +116,26 @@ async fn describe_batch_at(emulator: &Emulator, host: &str, name: &str) -> Answe
         Some(json!({ "DomainNames": [name] })),
     )
     .await
+}
+
+/// The public address the control plane publishes for a domain that is UP, read through
+/// `DescribeDomain` at the emulator's own endpoint.
+///
+/// A domain is still being provisioned when its create answers and publishes no address at
+/// all then, so every suite below reads the address it uses here — after waiting the
+/// provisioning span out — rather than off the create's own answer.
+async fn published_endpoint(emulator: &Emulator, domain: &str, case: &str) -> String {
+    let read = describe_at(emulator, LOCAL_ENDPOINT, domain).await;
+    read.body["DomainStatus"]["Endpoint"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a published Endpoint for {domain:?} once it is up, got \
+                 {:?}",
+                read.body
+            )
+        })
+        .to_string()
 }
 
 /// Every address a `DomainStatus` publishes for the domain's data plane, as
@@ -275,6 +295,14 @@ async fn every_published_domain_address_is_served_from_the_endpoint_that_read_it
             "case {case:?}: expected 200 from CreateDomain, got {} with {:?}",
             created.status, created.body
         );
+        // A domain still being provisioned publishes no address at all: the endpoint it is
+        // reached on appears only once the cluster behind it is up.
+        assert!(
+            published_addresses(&created.body["DomainStatus"], case).is_empty(),
+            "case {case:?}: a domain still Creating publishes no address, got {:?}",
+            created.body["DomainStatus"]
+        );
+        tokio::time::sleep(SETTLE_WAIT).await;
 
         let local = describe_at(&emulator, LOCAL_ENDPOINT, row.domain).await;
         assert_eq!(
@@ -307,11 +335,6 @@ async fn every_published_domain_address_is_served_from_the_endpoint_that_read_it
             published_addresses(&again.body["DomainStatus"], case),
             addresses,
             "case {case:?}: expected two reads to publish the same addresses"
-        );
-        assert_eq!(
-            published_addresses(&created.body["DomainStatus"], case),
-            addresses,
-            "case {case:?}: expected the create's own answer to publish the same addresses"
         );
         let batch = describe_batch_at(&emulator, LOCAL_ENDPOINT, row.domain).await;
         assert_eq!(
@@ -547,16 +570,10 @@ async fn the_access_policy_decides_the_sessions_of_the_roles_it_names() {
         "case \"CreateDomain with an access policy\": expected 200, got {} with {:?}",
         created.status, created.body
     );
-    let address = created.body["DomainStatus"]["Endpoint"]
-        .as_str()
-        .unwrap_or_else(|| {
-            panic!(
-                "case \"CreateDomain with an access policy\": expected a published endpoint, got \
-                 {:?}",
-                created.body
-            )
-        })
-        .to_string();
+    let address = {
+        tokio::time::sleep(SETTLE_WAIT).await;
+        published_endpoint(&emulator, domain, "CreateDomain with an access policy").await
+    };
     let domain_arn = created.body["DomainStatus"]["ARN"]
         .as_str()
         .unwrap_or_default()
@@ -804,6 +821,9 @@ async fn each_access_policy_statement_decides_the_callers_it_names() {
     let account = ::engine::emulator_account_id();
     given_session(&emulator, READER_ROLE, SESSION, READER_KEY);
 
+    // Every row's domain is created first and the provisioning span waited out ONCE: a domain
+    // publishes no address until the cluster behind it is up, and the address is what each
+    // row's request is sent to.
     for row in POLICY_ROWS {
         let case = row.case;
         let domain_arn = format!("arn:aws:es:{REGION}:{account}:domain/{}", row.domain);
@@ -827,10 +847,13 @@ async fn each_access_policy_statement_decides_the_callers_it_names() {
             "case {case:?}: expected 200 from CreateDomain, got {} with {:?}",
             created.status, created.body
         );
-        let address = created.body["DomainStatus"]["Endpoint"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+    }
+    tokio::time::sleep(SETTLE_WAIT).await;
+
+    for row in POLICY_ROWS {
+        let case = row.case;
+        let domain_arn = format!("arn:aws:es:{REGION}:{account}:domain/{}", row.domain);
+        let address = published_endpoint(&emulator, row.domain, case).await;
 
         let answer = at_address(&emulator, &address, READER_KEY, "GET", "/", None).await;
         assert_eq!(
@@ -917,10 +940,13 @@ async fn a_refresh_reports_the_shards_of_the_indexes_it_ran_on() {
         }),
     )
     .await;
-    let address = created.body["DomainStatus"]["Endpoint"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    assert_eq!(
+        created.status, 200,
+        "case \"CreateDomain(refresh-target)\": expected 200, got {} with {:?}",
+        created.status, created.body
+    );
+    tokio::time::sleep(SETTLE_WAIT).await;
+    let address = published_endpoint(&emulator, domain, "CreateDomain(refresh-target)").await;
 
     let mut total_everywhere = 0;
     let mut successful_everywhere = 0;

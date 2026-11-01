@@ -34,6 +34,36 @@ pub const ACTION_CLUSTER_HEALTH: &str = "cluster:monitor/health";
 /// The action a read of the cluster's own banner asks for.
 pub const ACTION_CLUSTER_STATE: &str = "cluster:monitor/state";
 
+/// The action a read of the cluster's nodes asks for.
+pub const ACTION_NODES_INFO: &str = "cluster:monitor/nodes/info";
+
+/// The action a read of the cluster's own settings asks for.
+pub const ACTION_GET_CLUSTER_SETTINGS: &str = "cluster:monitor/settings";
+
+/// The action updating those settings asks for.
+pub const ACTION_UPDATE_CLUSTER_SETTINGS: &str = "cluster:admin/settings/update";
+
+/// The action writing an ingest pipeline asks for.
+pub const ACTION_PUT_PIPELINE: &str = "cluster:admin/ingest/pipeline/put";
+
+/// The action reading one asks for.
+pub const ACTION_GET_PIPELINE: &str = "cluster:admin/ingest/pipeline/get";
+
+/// The action deleting one asks for.
+pub const ACTION_DELETE_PIPELINE: &str = "cluster:admin/ingest/pipeline/delete";
+
+/// The action running one over a document without storing it asks for.
+pub const ACTION_SIMULATE_PIPELINE: &str = "cluster:admin/ingest/pipeline/simulate";
+
+/// The action writing an index-management policy asks for.
+pub const ACTION_PUT_ISM_POLICY: &str = "cluster:admin/opendistro/ism/policy/write";
+
+/// The action reading one asks for.
+pub const ACTION_GET_ISM_POLICY: &str = "cluster:admin/opendistro/ism/policy/get";
+
+/// The action deleting one asks for.
+pub const ACTION_DELETE_ISM_POLICY: &str = "cluster:admin/opendistro/ism/policy/delete";
+
 /// The action a write of one document asks for.
 pub const ACTION_INDEX_DOCUMENT: &str = "indices:data/write/index";
 
