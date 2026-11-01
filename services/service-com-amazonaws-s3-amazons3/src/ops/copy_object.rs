@@ -611,7 +611,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // current version is a delete marker, Amazon S3 behaves as if the object was
         // deleted. To copy a different version, use the versionId query parameter."
         let Some(source_bucket) = store.bucket(&source.bucket) else {
-            return Err(CopyObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+            // The refusal is about the COPY SOURCE bucket — the one `x-amz-copy-source`
+            // names — and not about the destination this request addresses, so it names
+            // that bucket itself rather than leaving the envelope to be named by the
+            // request's address (see [`crate::scaffolded::Scaffolded::naming_bucket`]).
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                CopyObjectErrorModeled::NoSuchBucket(NoSuchBucket {}),
+            )
+            .naming_bucket(&source.bucket));
         };
         let held = match source.version_id.as_deref() {
             None => source_bucket.object(&source.key).cloned(),

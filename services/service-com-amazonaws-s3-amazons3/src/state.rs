@@ -29,6 +29,9 @@ use std::time::{Duration, SystemTime};
 
 use md5::{Digest, Md5};
 
+// The bucket a request ADDRESSES, which is what a bucket-scoped refusal that did not name
+// a bucket itself is named by — see `state/addressed_bucket.rs`.
+pub(crate) mod addressed_bucket;
 pub mod aws_published;
 // What a bucket's stored notification configuration DOES when an object changes — which
 // configured destinations are notified, what each notification carries, and the

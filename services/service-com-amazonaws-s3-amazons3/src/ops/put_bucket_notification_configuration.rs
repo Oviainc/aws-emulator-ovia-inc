@@ -263,10 +263,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let bucket_region = {
             let store = state.lock();
             let Some(record) = store.bucket(&input.bucket) else {
-                return Err(
-                    PutBucketNotificationConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {})
-                        .into(),
-                );
+                // Named here rather than left to the serializer's default: this handler
+                // AWAITS (the destinations are resolved against the services that own
+                // them), and a handler that may be resumed on another worker thread cannot
+                // rely on the request-scoped note the default reads
+                // ([`crate::state::addressed_bucket`]).
+                return Err(crate::scaffolded::Scaffolded::Modeled(
+                    PutBucketNotificationConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}),
+                )
+                .naming_bucket(&input.bucket));
             };
             record.region.clone()
         };
@@ -340,10 +345,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .put_notification_configuration(&input.bucket, configuration)
             .is_none()
         {
-            return Err(
-                PutBucketNotificationConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {})
-                    .into(),
-            );
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                PutBucketNotificationConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}),
+            )
+            // Named here for the reason the lookup above gives: this refusal is answered
+            // AFTER an await, so it names its bucket itself.
+            .naming_bucket(&input.bucket));
         }
         drop(store);
 

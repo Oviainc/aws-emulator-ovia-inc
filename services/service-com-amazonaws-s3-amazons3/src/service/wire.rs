@@ -1215,6 +1215,27 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // before this request's handler can record its own pair, so no response can ever
         // be named by another request's id (see [`crate::state::request_ids`]).
         crate::state::request_ids::forget_any_unanswered();
+        // The BUCKET this request addresses, recorded for the one thing that needs it once
+        // the handler has returned: the `BucketName` a bucket-scoped error document names
+        // the bucket by when the refusal did not name one itself
+        // ([`crate::state::addressed_bucket`]). Recorded for EVERY request this service
+        // reads, before anything here can refuse one, so the slot a response reads is
+        // always its own request's — a request that addresses no bucket (`GET /`) records
+        // nothing rather than leaving the previous one's note behind.
+        //
+        // It is the bucket of the request's address in either form: the first label of the
+        // host for a virtual-hosted-style request ([`super::addressed_in_host`]), else the
+        // first segment of the path, which is the `{Bucket}` label every bucket-scoped
+        // route binds. A name LONGER than a bucket name may be
+        // ([`super::BUCKET_NAME_CHARS`]) names no bucket at all and is not recorded: the
+        // element is a bucket's name, not an echo of arbitrary request text.
+        let addressed_bucket = self
+            .addressed_in_host(request)
+            .or_else(|| {
+                super::first_path_segment(request_path(request.uri())).map(str::to_string)
+            })
+            .filter(|name| name.chars().count() <= *super::BUCKET_NAME_CHARS.end());
+        crate::state::addressed_bucket::remember(addressed_bucket.as_deref());
         // A request whose body IS an XML document is refused here when that document
         // carries a character XML cannot hold, before any codec reads it. See
         // [`xml_charset_violation`].

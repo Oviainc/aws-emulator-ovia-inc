@@ -76,6 +76,15 @@
 //! addresses attaches the name through [`Scaffolded::naming`] (or the
 //! `naming_bucket`/`naming_annotation` shorthands) and the serializer above writes it after
 //! the message, whichever channel the refusal travels on.
+//!
+//! A refusal that attaches none, and whose code is one of [`BUCKET_SCOPED_ERROR_CODES`], is
+//! about the bucket the REQUEST addressed — those codes state a condition of that bucket
+//! and of nothing else — so the serializer names it from the request's own address
+//! ([`crate::state::addressed_bucket`]), which is what makes the rule hold for every
+//! operation that answers one of those codes rather than only for the handlers that spell
+//! it out. An explicit name always wins, and is required where the refusal is about a
+//! bucket OTHER than the addressed one (a copy's source bucket) or is answered after an
+//! await — see [`Scaffolded::naming_bucket`].
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -421,6 +430,71 @@ pub fn documented_error_message(code: &str) -> Option<&'static str> {
         .map(|(_, message)| *message)
 }
 
+/// The wire error codes a refusal of which MUST name the bucket it is about
+/// ([`Scaffolded::naming_bucket`]).
+///
+/// Each one states a condition of a bucket — the bucket itself, or one of the bucket-level
+/// subresources a `?`-addressed operation reads and writes — so the bucket is what the
+/// refusal is ABOUT, and S3's document for it carries a `<BucketName>` beside the code and
+/// the message. A client that fans one operation out over many buckets, or that logs and
+/// retries per bucket, reads which bucket failed from there, and an SDK error object
+/// surfaces it as `BucketName`.
+///
+/// Source: the elements S3's own error document carries for these conditions (Amazon S3 API
+/// Reference, *Error responses*, whose `<Error>` document is `Code`, `Message`, the
+/// condition's own contextual elements, `RequestId` and `HostId`). It cannot come from the
+/// model: every error shape in `com.amazonaws.s3` declares NO members at all
+/// (`smithy_query(query="shape",shape="NoSuchBucket,BucketAlreadyOwnedByYou,…",
+/// model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`
+/// reports `members: {}` for each), which is the same reason the `<Message>` above is a
+/// catalog here rather than a member a handler fills — and why the name is attached to the
+/// refusal itself ([`RefusedResource`]) instead.
+///
+/// Three families are deliberately NOT here, because the condition each states is not a
+/// bucket's:
+///
+/// * the OBJECT-scoped not-found codes ([`crate::state::NO_SUCH_KEY_CODE`],
+///   [`crate::state::NO_SUCH_VERSION_CODE`], `NoSuchUpload`,
+///   [`crate::state::NO_SUCH_OBJECT_LOCK_CONFIGURATION_CODE`]), whose document names the
+///   key, the version or the upload that was not there;
+/// * the AUTHENTICATION and AUTHORIZATION refusals
+///   ([`crate::state::ACCESS_DENIED_CODE`], the SigV4 refusals `service::sigv4` words),
+///   which state something about the CALLER and are answered identically whichever bucket
+///   was addressed; and
+/// * the request-shape refusals ([`crate::state::INVALID_ARGUMENT_CODE`],
+///   [`crate::state::MALFORMED_XML_CODE`], the scaffold's `NotImplemented`), which state
+///   something about the request document.
+///
+/// Sorted by code, so a new row is easy to place;
+/// `tests/all/bucket_error_envelope.rs` drives a request per row through the router and
+/// fails if a row has none — which is what keeps a handler that answers one of these from
+/// being written, or left, without [`Scaffolded::naming_bucket`].
+pub const BUCKET_SCOPED_ERROR_CODES: &[&str] = &[
+    // The bucket name is taken (by another account), and the bucket named is the one the
+    // caller asked for.
+    "BucketAlreadyExists",
+    // The bucket exists and the caller already owns it.
+    "BucketAlreadyOwnedByYou",
+    crate::state::BUCKET_NOT_EMPTY_CODE,
+    crate::state::NO_SUCH_BUCKET_CODE,
+    crate::state::NO_SUCH_BUCKET_POLICY_CODE,
+    crate::state::NO_SUCH_CORS_CONFIGURATION_CODE,
+    crate::state::NO_SUCH_LIFECYCLE_CONFIGURATION_CODE,
+    crate::state::NO_SUCH_PUBLIC_ACCESS_BLOCK_CONFIGURATION_CODE,
+    crate::state::NO_SUCH_TAG_SET_CODE,
+    crate::state::NO_SUCH_WEBSITE_CONFIGURATION_CODE,
+    crate::state::OBJECT_LOCK_CONFIGURATION_NOT_FOUND_CODE,
+    crate::state::OWNERSHIP_CONTROLS_NOT_FOUND_CODE,
+    crate::state::REPLICATION_CONFIGURATION_NOT_FOUND_CODE,
+];
+
+/// Whether an error document carrying `code` is about the bucket the request addressed, so
+/// a refusal that named no resource of its own is named by it — see
+/// [`BUCKET_SCOPED_ERROR_CODES`].
+pub fn names_its_bucket(code: &str) -> bool {
+    BUCKET_SCOPED_ERROR_CODES.contains(&code)
+}
+
 /// Whether an error shape declares its OWN message member, in which case the handler's
 /// value is what goes on the wire and nothing is written for it here.
 ///
@@ -632,7 +706,8 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
 
 /// Every error this service puts on the wire is serialized through here, which is what
 /// makes "an S3 error document always carries a `<Message>`" one rule rather than one per
-/// operation.
+/// operation — and the same for the `<BucketName>` a bucket-scoped document names its
+/// bucket in.
 ///
 /// The three synthetic channels serialize their own message member unchanged. A MODELED
 /// error gets the documented message for its wire code written first — `<Code>` then
@@ -642,25 +717,55 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
 /// A refusal that NAMES a resource is serialized as the refusal it wraps and then the
 /// member naming that resource, which is the order S3's error document carries them in
 /// (`<Message>` then `<BucketName>`) — whichever channel the refusal itself travels on.
+///
+/// A refusal that names NO resource and whose code is one of
+/// [`BUCKET_SCOPED_ERROR_CODES`] is about the bucket the REQUEST addressed, and is named by
+/// it ([`crate::state::addressed_bucket`]): those codes state a condition of the addressed
+/// bucket, so the envelope's name is the request's own address and the handler has nothing
+/// to add.
+///
+/// [`Scaffolded::naming_bucket`] is what the two cases that default cannot serve must use,
+/// and an explicit name always wins, so the member is written exactly once:
+///
+/// * a refusal about a bucket OTHER than the one addressed — a copy whose SOURCE bucket is
+///   not there (`ops/copy_object.rs`, `ops/upload_part_copy.rs`), where the addressed
+///   bucket is the destination and exists; and
+/// * a refusal answered by a handler that AWAITS, which may be resumed on another worker
+///   thread and so cannot read the request-scoped note
+///   (`ops/put_bucket_notification_configuration.rs`).
+///
+/// It is also what names a resource that is not a bucket at all ([`RefusedResource`]).
 impl<E: OperationError> SerializableStruct for Scaffolded<E> {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        // The request-scoped note is spent HERE, at the top, whether or not this refusal
+        // ends up using it: a refusal that names its own resource, and one whose code is
+        // not bucket-scoped, must not leave a note behind for a later response on this
+        // thread to name itself by. Taking it first is also what keeps the `Naming` arm's
+        // recursive call from writing a second `<BucketName>` — the note is already gone by
+        // the time the wrapped refusal is serialized.
+        let addressed = crate::state::addressed_bucket::addressed();
         match self {
-            Self::NotImplemented(e) => e.serialize_members(s),
-            Self::ValidationException(e) => e.serialize_members(s),
-            Self::Unmodeled(e) => e.serialize_members(s),
+            Self::NotImplemented(e) => e.serialize_members(s)?,
+            Self::ValidationException(e) => e.serialize_members(s)?,
+            Self::Unmodeled(e) => e.serialize_members(s)?,
             Self::Modeled(e) => {
                 if !models_its_own_message(e.variant_schema()) {
                     if let Some(message) = documented_error_message(e.shape_name()) {
                         s.write_string(&DOCUMENTED_MESSAGE, message)?;
                     }
                 }
-                e.as_serializable().serialize_members(s)
+                e.as_serializable().serialize_members(s)?;
             }
             Self::Naming(refusal, resource) => {
                 refusal.serialize_members(s)?;
-                s.write_string(resource.member(), resource.name())
+                s.write_string(resource.member(), resource.name())?;
+                return Ok(());
             }
         }
+        if let Some(bucket) = addressed.filter(|_| names_its_bucket(self.shape_name())) {
+            s.write_string(&BUCKET_NAME, bucket.as_str())?;
+        }
+        Ok(())
     }
 }
 

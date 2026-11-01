@@ -404,7 +404,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a different version, use the versionId query parameter" — the same resolution
         // `CopyObject` performs for the same member.
         let Some(source_bucket) = store.bucket(&source.bucket) else {
-            return Err(UploadPartCopyErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+            // The refusal is about the COPY SOURCE bucket, not the destination this request
+            // addresses, so it names that bucket itself — the same way `CopyObject` names
+            // it for the same condition (see
+            // [`crate::scaffolded::Scaffolded::naming_bucket`]).
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                UploadPartCopyErrorModeled::NoSuchBucket(NoSuchBucket {}),
+            )
+            .naming_bucket(&source.bucket));
         };
         let held = match source.version_id.as_deref() {
             None => source_bucket.object(&source.key).cloned(),
