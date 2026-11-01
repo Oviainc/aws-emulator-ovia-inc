@@ -23,3 +23,5 @@ mod on_demand_evaluation;
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/workload_access_tokens.rs"]
+mod workload_access_tokens;

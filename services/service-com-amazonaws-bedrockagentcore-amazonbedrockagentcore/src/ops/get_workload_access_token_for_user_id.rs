@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkloadAccessTokenForUserId
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkloadAccessTokenForUserId`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkloadAccessTokenForUserId::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Obtains a workload access token for the named workload identity, acting on behalf of
+//! the user the request names. The token is MINTED here — never taken from the request —
+//! as a compact JWS whose claims come from the request and from this service's state, and
+//! the issuance is recorded in [`crate::state::IssuedWorkloadAccessTokens`] so this
+//! service can later say which workload and user a token it handed out stands for.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkloadAccessTokenForUserId` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkloadAccessTokenForUserIdErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkloadAccessTokenForUserId"))
+        // The issuing authority a token names is the AgentCore endpoint of the region the
+        // request was signed for, which is read off the request's SigV4 credential scope.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWorkloadAccessTokenForUserIdErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the shared engine does not carry this service's state".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        // The `jti` discriminator, so two tokens obtained for one workload and user
+        // inside the same second are still two distinct tokens.
+        let seq = store.next_seq();
+        let issued_at = ::std::time::SystemTime::now();
+        // The window AWS publishes no length for, so the store's own: a token obtained
+        // now stops resolving once the clock passes it, with no call needed to make it so.
+        let expires_at = issued_at + crate::state::WORKLOAD_ACCESS_TOKEN_TTL;
+        let token = crate::state::mint_workload_access_token(
+            &region,
+            &input.workload_name,
+            Some(&input.user_id),
+            issued_at,
+            expires_at,
+            seq,
+        );
+        // Obtaining a token is what this operation DOES, so the issuance is written: the
+        // registry is what lets this service resolve a token it minted back to the
+        // workload and user it names.
+        store.workload_access_tokens.record(
+            token.clone(),
+            crate::state::IssuedWorkloadAccessToken {
+                workload_name: input.workload_name.clone(),
+                user_id: Some(input.user_id.clone()),
+                issued_at,
+                expires_at,
+            },
+            issued_at,
+        );
+
+        Ok(GetWorkloadAccessTokenForUserIdOutput {
+            workload_access_token: token,
+        })
     }
 }

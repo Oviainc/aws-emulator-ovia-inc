@@ -17,6 +17,14 @@
 //! `GetCodeInterpreterSession` reports one of them back — its status read off the
 //! clock against the time-to-live the request asked for.
 //!
+//! The AgentCore *identity* plane keeps a third: every workload access token this
+//! service issued, in [`IssuedWorkloadAccessTokens`]. A token is MINTED by the call that
+//! asks for one ([`mint_workload_access_token`]) and recorded here with the workload it
+//! names, the user it acts for and the window it is valid in, so this service can later
+//! say which workload and user a token it handed out stands for rather than trusting the
+//! bytes a caller presents. The registry is bounded by the expiry of each record and by
+//! [`MAX_ISSUED_WORKLOAD_ACCESS_TOKENS`], both materialised on the WRITE path.
+//!
 //! # The store has an explicit ceiling
 //!
 //! `CreateEvent` and `IngestData` are the memory plane's growth sites, and a caller
@@ -91,6 +99,29 @@ pub const MAX_CODE_INTERPRETER_SESSIONS: usize = 256;
 /// The most `clientToken` records this emulator retains for one code interpreter.
 pub const MAX_IDEMPOTENCY_RECORDS_PER_CODE_INTERPRETER: usize = 1_000;
 
+/// The most workload access tokens this emulator holds issuances for at once.
+///
+/// An EMULATOR ceiling, not an AWS quota: every call that asks for a token appends one
+/// record, so without a ceiling a caller looping on the identity plane would grow the
+/// process heap without end. The issuance closest to its own expiry gives way first, so
+/// the tokens a live workflow just obtained are the ones that stay resolvable.
+pub const MAX_ISSUED_WORKLOAD_ACCESS_TOKENS: usize = 10_000;
+
+/// How long a workload access token this emulator issues stays valid.
+///
+/// AWS publishes no lifetime for a workload access token, so this window is the
+/// EMULATOR's own: short enough that a caller can observe one run out, long enough for a
+/// workflow that obtains a token and then spends it. The window is what the token's own
+/// `exp` claim carries and what [`IssuedWorkloadAccessTokens`] resolves it until.
+pub const WORKLOAD_ACCESS_TOKEN_TTL: Duration = Duration::from_secs(900);
+
+/// The region a request is treated as signed for when it carries no SigV4 credential
+/// scope to read one from (an anonymous call); the emulator's default region.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// This service's ARN service namespace, as every AgentCore ARN spells it.
+pub const ARN_SERVICE: &str = "bedrock-agentcore";
+
 /// `CodeInterpreterSessionStatus` for a session that is still inside its
 /// time-to-live, so it can run code (source: smithy_query
 /// query="shape" shape="CodeInterpreterSessionStatus", values READY | TERMINATED).
@@ -126,6 +157,8 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     /// event: the interpreter itself is created through the CONTROL plane, a different
     /// service.
     pub code_interpreters: HashMap<String, CodeInterpreterStore>,
+    /// Every workload access token this service issued and has not pruned.
+    pub workload_access_tokens: IssuedWorkloadAccessTokens,
 }
 
 impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
@@ -490,6 +523,101 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     }
 }
 
+/// What one workload access token this service issued stands for: the workload identity
+/// it was issued from, the user it acts on behalf of when the issuing call named one, and
+/// the window the issuance is valid in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuedWorkloadAccessToken {
+    /// The `workloadName` the issuing call named.
+    pub workload_name: String,
+    /// The user the token acts on behalf of, as the issuing call named it. `None` for a
+    /// token issued for the workload itself rather than for a user.
+    pub user_id: Option<String>,
+    /// When the token was issued, which is its own `iat`.
+    pub issued_at: SystemTime,
+    /// When the issuance stops being valid, which is its own `exp`.
+    pub expires_at: SystemTime,
+}
+
+/// Every workload access token this service issued and has not pruned, keyed by the
+/// token itself.
+#[derive(Default)]
+pub struct IssuedWorkloadAccessTokens {
+    issued: HashMap<String, IssuedWorkloadAccessToken>,
+}
+
+/// Reports how many issuances are held and nothing else. The KEY of this registry is the
+/// token, which is a bearer of the workload identity it names — so a derived rendering
+/// would put every outstanding token into whatever formatted it, a log line included. The
+/// issuances stay readable through [`IssuedWorkloadAccessTokens::issued`] by a caller that
+/// already holds the token.
+impl ::std::fmt::Debug for IssuedWorkloadAccessTokens {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("IssuedWorkloadAccessTokens")
+            .field("issued", &self.issued.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl IssuedWorkloadAccessTokens {
+    /// Record that this service issued `token` for `issued`.
+    ///
+    /// Prunes first: a record the clock has already expired is dropped, which is owed at
+    /// this instant whether or not anybody asked for a token, and at the ceiling the
+    /// record expiring soonest gives way, with the key breaking a tie so eviction is
+    /// deterministic even among issuances that share a whole-second expiry.
+    pub fn record(&mut self, token: String, issued: IssuedWorkloadAccessToken, now: SystemTime) {
+        self.prune(now);
+        while self.issued.len() >= MAX_ISSUED_WORKLOAD_ACCESS_TOKENS {
+            let soonest = self
+                .issued
+                .iter()
+                .min_by(|left, right| {
+                    (left.1.expires_at, left.0.as_str())
+                        .cmp(&(right.1.expires_at, right.0.as_str()))
+                })
+                .map(|(key, _)| key.clone());
+            match soonest {
+                Some(key) => {
+                    self.issued.remove(&key);
+                }
+                None => break,
+            }
+        }
+        self.issued.insert(token, issued);
+    }
+
+    /// What `token` was issued for, when this service issued it and the issuance has not
+    /// expired at `now`. `None` for a token this service did not issue, and for one the
+    /// clock has run out on.
+    ///
+    /// A READ: nothing is dropped here, so two callers asking about one token are
+    /// answered alike.
+    #[must_use]
+    pub fn issued(&self, token: &str, now: SystemTime) -> Option<&IssuedWorkloadAccessToken> {
+        self.issued.get(token).filter(|held| now < held.expires_at)
+    }
+
+    /// How many issuances the registry holds, expired records included until the next
+    /// write prunes them.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.issued.len()
+    }
+
+    /// Whether the registry holds no issuance at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.issued.is_empty()
+    }
+
+    /// Drop what the clock has already made unresolvable.
+    fn prune(&mut self, now: SystemTime) {
+        self.issued.retain(|_, held| now < held.expires_at);
+    }
+}
+
 /// The least recently written entry of `map`, by the sequence `seq_of` reads off a
 /// record, with the key breaking a tie so eviction is deterministic.
 fn least_recently_written<T>(
@@ -848,6 +976,99 @@ pub fn paginate_with<T, U>(
     let next_offset = offset.saturating_add(page.len());
     let next_token = (next_offset < items.len()).then(|| encode_next_token(kind, next_offset));
     (page, next_token)
+}
+
+/// The region this request was signed for, defaulting to [`DEFAULT_REGION`].
+///
+/// An ARN segment and an endpoint label admit `[a-z0-9-]+` only, so a scope region
+/// outside that grammar is not stamped into either, and a label longer than
+/// [`MAX_REGION_LABEL`] is no region this emulator reports back.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| {
+            !region.is_empty()
+                && region.len() <= MAX_REGION_LABEL
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The longest region label this emulator reads off a credential scope. Every published
+/// AWS region label is far shorter, so the bound keeps a caller from choosing how long
+/// the region segment of an ARN or an endpoint this service reports back is.
+const MAX_REGION_LABEL: usize = 32;
+
+/// The `iss` of a workload access token this service issues: the AgentCore endpoint of
+/// the region the request was signed for, which is the authority that issued it.
+pub fn workload_access_token_issuer(region: &str) -> String {
+    format!("https://{ARN_SERVICE}.{region}.amazonaws.com")
+}
+
+/// The workload identity a `workloadName` addresses, in the token vault's `default`
+/// directory — the same ARN the CONTROL plane mints for an identity of that name.
+pub fn workload_identity_arn(region: &str, workload_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("workload-identity-directory/default/workload-identity/{workload_name}"),
+    )
+}
+
+/// Mint a workload access token for `workload_name`, acting on behalf of `user_id` when
+/// the issuing call named one, valid from `issued_at` until `expires_at`.
+///
+/// The token is an UNSECURED JWS in compact serialization (RFC 7515 §6, "Using the
+/// Algorithm none"): `base64url(header) '.' base64url(claims) '.'`, with an empty
+/// signature segment. AWS signs its workload access tokens with a key pair whose public
+/// half the identity plane publishes; this emulator holds no such key pair, so it issues
+/// the form RFC 7515 defines for a JWS that carries no signature rather than filling the
+/// third segment with bytes that would only look like one.
+///
+/// Every claim is computed from the request and from this service's state: the issuing
+/// authority for the region the request was signed for, the workload identity the
+/// `workloadName` addresses as the audience, the user as the subject, the validity window
+/// the issuance was recorded with, and a `jti` taken from the engine-wide sequence so two
+/// tokens minted in one second are never the same token.
+pub fn mint_workload_access_token(
+    region: &str,
+    workload_name: &str,
+    user_id: Option<&str>,
+    issued_at: SystemTime,
+    expires_at: SystemTime,
+    seq: u64,
+) -> String {
+    let claims = ::serde_json::json!({
+        "iss": workload_access_token_issuer(region),
+        "aud": workload_identity_arn(region, workload_name),
+        "sub": user_id.unwrap_or(workload_name),
+        "workloadName": workload_name,
+        "iat": unix_seconds(issued_at),
+        "exp": unix_seconds(expires_at),
+        "jti": format!("{seq:016x}"),
+    });
+    let header = ::serde_json::json!({ "alg": UNSECURED_TOKEN_ALGORITHM, "typ": "JWT" });
+    // The segment coding is the tree's ONE base64url encoder, beside the reader that
+    // reads a minted token back, so the form this service issues cannot drift from the
+    // form that reader accepts.
+    format!(
+        "{}.{}.",
+        ::service_common::jwt::encode_base64url(header.to_string().as_bytes()),
+        ::service_common::jwt::encode_base64url(claims.to_string().as_bytes())
+    )
+}
+
+/// The `alg` of an unsecured JWS, which carries no signature (RFC 7515 §6).
+const UNSECURED_TOKEN_ALGORITHM: &str = "none";
+
+/// `time` as whole seconds since the epoch, which is how a token claim carries an instant
+/// (RFC 7519 §2's NumericDate).
+fn unix_seconds(time: SystemTime) -> i64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since_epoch| i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

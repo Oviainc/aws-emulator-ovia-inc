@@ -7,7 +7,8 @@ publish = false
 build = "build.rs"
 
 [dependencies]
-# The shared request-claim rule for a SigV4 signing name several services share.
+# The shared request-claim rule for a SigV4 signing name several services share, and the
+# tree's one base64url coding of a compact-JWS segment.
 service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
