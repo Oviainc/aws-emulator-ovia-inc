@@ -287,6 +287,9 @@ mod multiplex_listing;
 #[path = "all/multiplex_program_deletion.rs"]
 mod multiplex_program_deletion;
 
+#[path = "all/multiplex_program_idempotency_after_delete.rs"]
+mod multiplex_program_idempotency_after_delete;
+
 #[path = "all/multiplex_program_listing.rs"]
 mod multiplex_program_listing;
 

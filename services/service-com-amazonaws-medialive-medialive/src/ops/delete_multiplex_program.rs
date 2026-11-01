@@ -5,7 +5,10 @@
 //! "Delete a program from a multiplex." The named program leaves the multiplex it
 //! was created in, and the caller is answered with that program as it stood when
 //! the delete took it out: the multiplex's derived `ProgramCount` stops counting
-//! it, and every reader of that program answers not-found from then on.
+//! it, and every reader of that program answers not-found from then on. The
+//! `RequestId` that created the program is forgotten with it, so a later
+//! `CreateMultiplexProgram` presenting that spent token is answered as a first
+//! attempt is rather than with whatever program holds the name next.
 //!
 //! ## Shape of an operation
 //!

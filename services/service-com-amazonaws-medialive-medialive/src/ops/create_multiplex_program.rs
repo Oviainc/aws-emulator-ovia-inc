@@ -7,8 +7,9 @@
 //! and every value the response carries is read back out of the stored record or derived
 //! from the rest of the store, never built from the request in flight. A retry carrying
 //! the same `@idempotencyToken` `RequestId` to the SAME multiplex's endpoint answers with
-//! the program the first call created, for as long as that multiplex is one a program may
-//! be created in; the same token presented for another multiplex is a different create,
+//! the program the first call created, for as long as that program exists and that
+//! multiplex is one a program may be created in; deleting the program forgets the token
+//! with it, and the same token presented for another multiplex is a different create,
 //! because the multiplex is part of the endpoint the token was presented to. The
 //! `ProgramName` is the program's identity — the key it is stored
 //! at and the path segment the operations that name one program carry — so a request
@@ -213,8 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|refusal| refused(refusal, &input.multiplex_id, &input.program_name))?;
         // Bounded, evicting write: a caller-chosen token can neither accumulate
         // past the cap nor resolve to anything once the program it created is
-        // gone, nor once its multiplex is one no program may be created in any
-        // more (`multiplex_program_for_token`).
+        // gone — the delete forgets it (`remove_multiplex_program`), so a later
+        // program that reuses the name is never what a spent token answers with
+        // — nor once its multiplex is one no program may be created in any more
+        // (`multiplex_program_for_token`).
         state.record_multiplex_program_token(
             &input.multiplex_id,
             input.request_id,

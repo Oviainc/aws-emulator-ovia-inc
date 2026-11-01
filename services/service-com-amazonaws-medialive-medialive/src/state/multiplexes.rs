@@ -1940,12 +1940,35 @@ impl ComAmazonawsMedialiveMedialiveState {
         // own, so it is cleared here rather than left to whichever later call
         // first observes the program's absence.
         multiplex.clear_set_alerts(Some(program_name), now);
+        // A token never outlives the resource it minted: the program this
+        // request took out of the store is gone, so the `RequestId` that created
+        // it has no idempotency window left and a create presenting it again is
+        // answered exactly as a first attempt is — the rule the channel, input,
+        // network, multiplex, cluster, node, channel placement group, alarm
+        // template, alarm template group, EventBridge rule template and signal
+        // map tokens of this store follow too. It matters more here than for a
+        // resource with a minted id, because a program is identified by a
+        // caller-chosen NAME a later create may reuse: a surviving entry would
+        // not merely go stale, it would resolve to whichever program held the
+        // name next, a program a DIFFERENT request created with settings the
+        // replaying one never asked for.
+        self.multiplex_program_tokens
+            .forget(&multiplex_program_key(multiplex_id, program_name));
         Ok(program)
     }
 
     /// Record `token`, as presented for the multiplex `multiplex_id`, as having
     /// created the program `program_name`, evicting the oldest token first if
     /// that would push the map past [`MAX_MULTIPLEX_PROGRAM_TOKENS`].
+    ///
+    /// What is recorded AGAINST the token is the program's whole identity — the
+    /// multiplex together with the name, the one
+    /// [`multiplex_program_key`] every refusal about a program names it by —
+    /// because that is what [`super::IdempotencyTokens::forget`] drops a token
+    /// by when the program goes away ([`Self::remove_multiplex_program`]). A
+    /// name on its own names a program of every multiplex and of none, so
+    /// recording it alone would make one multiplex's delete forget another
+    /// multiplex's live token.
     pub fn record_multiplex_program_token(
         &mut self,
         multiplex_id: &str,
@@ -1954,7 +1977,7 @@ impl ComAmazonawsMedialiveMedialiveState {
     ) {
         self.multiplex_program_tokens.record(
             multiplex_program_token_key(multiplex_id, &token),
-            program_name,
+            &multiplex_program_key(multiplex_id, program_name),
             MAX_MULTIPLEX_PROGRAM_TOKENS,
         );
     }
@@ -1967,8 +1990,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// replay can only ever surface a program of the multiplex the request
     /// named.
     ///
-    /// A program's own delete removes it from the multiplex, which is what ends
-    /// its token's window.
+    /// A program's own delete removes it from the multiplex AND forgets the
+    /// token that created it ([`Self::remove_multiplex_program`]), which is what
+    /// ends that token's window: the entry is gone, so a later program of the
+    /// same name — created by a different request, with settings the replaying
+    /// one never asked for — can never be what a spent token resolves to.
     ///
     /// The multiplex's LIVENESS is part of the lookup too, through the same
     /// [`MultiplexRecord::accepts_programs`] the insert resolves the multiplex
@@ -1983,9 +2009,15 @@ impl ComAmazonawsMedialiveMedialiveState {
         multiplex_id: &str,
         request_id: &str,
     ) -> Option<&str> {
+        // The recorded value is the program's whole identity (the multiplex and
+        // the name), and the entry was recorded under this same multiplex's
+        // key, so the name is what is left once that multiplex's half is taken
+        // off; an entry naming any other multiplex is not this token's program.
         let program_name = self
             .multiplex_program_tokens
-            .created(&multiplex_program_token_key(multiplex_id, request_id))?;
+            .created(&multiplex_program_token_key(multiplex_id, request_id))?
+            .strip_prefix(multiplex_id)?
+            .strip_prefix(MULTIPLEX_PROGRAM_KEY_SEPARATOR)?;
         let program = self
             .multiplexes
             .get(multiplex_id)

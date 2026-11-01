@@ -48,7 +48,11 @@ pub(crate) async fn delete_program(
 /// the order it reports them (`smithy_query(query="operation",
 /// operation="ListMultiplexPrograms")`: GET
 /// `/prod/multiplexes/{MultiplexId}/programs`).
-async fn listed_names(router: &MultiServiceRouter, case: &str, multiplex_id: &str) -> Vec<String> {
+pub(crate) async fn listed_names(
+    router: &MultiServiceRouter,
+    case: &str,
+    multiplex_id: &str,
+) -> Vec<String> {
     let (status, body) = call(
         router,
         "GET",
