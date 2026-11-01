@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccessKeyLastUsed
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccessKeyLastUsed`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccessKeyLastUsed::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports when an access key the account holds was last USED to make a signed call, and
+//! which service and Region that call went to, beside the name of the IAM user that owns
+//! the key.
+//!
+//! A credential's use is not a property of the credential: it is a fact about the CALLS
+//! made with it, and the account already keeps those — every call a service of this
+//! account serves is recorded as a management event, carrying the access key id it was
+//! signed with, the serving service and the Region it was served in
+//! ([`crate::service::management_events`], whose log is shared by every recording
+//! service). So this operation DERIVES its answer from that record rather than from a
+//! second copy of it: the most recent recorded call made with the key. A key the account
+//! holds that no recorded call was made with has never been used, which the modelled
+//! members state as a null `LastUsedDate` and `N/A` for the service and the
+//! Region.
+//!
+//! A pure READ — nothing here writes, so a later caller sees exactly what this one did —
+//! decided first against the caller's own identity-based policies and the permissions
+//! boundary that caps them ([`crate::state::authorization`]).
+//!
+//! LIMITATION, stated so the answer is not mistaken for more than it is: the usage this
+//! reports is the usage the account RECORDED, so a call served by a service that does not
+//! record management events is not reported here, and a use older than the log's retention
+//! window is no longer among the records to report.
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +84,71 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// What `AccessKeyLastUsed$ServiceName` and `AccessKeyLastUsed$Region` carry for a key
+/// that has not been used: both members are REQUIRED, and their documentation states that
+/// "the value of this field is \"N/A\"" when "an access key exists but has not been used
+/// since IAM started tracking this information"
+/// (`smithy_query(query="doc",shape="AccessKeyLastUsed",member="ServiceName")`).
+const NEVER_USED: &str = "N/A";
+
+/// The suffix CloudTrail's `eventSource` carries after the service's own namespace: a
+/// record names the service that served a call as `<endpoint-prefix>.amazonaws.com`
+/// (`service_common::management_events::ServedApiCall::event_source`), while
+/// `AccessKeyLastUsed$ServiceName` names that service by the namespace alone (`iam`).
+const EVENT_SOURCE_SUFFIX: &str = ".amazonaws.com";
+
+/// The service namespace `event_source` names — the `<prefix>` of its
+/// `<prefix>.amazonaws.com` form, and the whole value for a source not in that form,
+/// since no namespace is invented for one here.
+fn service_namespace(event_source: &str) -> &str {
+    event_source
+        .strip_suffix(EVENT_SOURCE_SUFFIX)
+        .unwrap_or(event_source)
+}
+
+/// One recorded USE of an access key: when the call was served, by which service, in
+/// which Region.
+struct RecordedUse {
+    /// The instant the call was served, as the record stamped it.
+    at: ::std::time::SystemTime,
+    /// The service namespace the call was made to ([`service_namespace`]).
+    service_name: String,
+    /// The Region the call was served in, as the record carries it.
+    region: String,
+}
+
+/// What the account's record of its calls says about `access_key_id`: `Some(Some(use))`
+/// for the most recent call recorded as signed with it, `Some(None)` for a log that was
+/// READ and holds no such call — the key has not been used — and `None` for a log this
+/// process cannot reach at all, which says nothing about the key either way and is a
+/// server failure rather than an answer about usage.
+///
+/// "Most recent" is by the instant the record was stamped with, with the log's own
+/// ordinal breaking a tie between two calls served in the same millisecond — so the use
+/// reported is the latest one whatever order the records were written in. That is why the
+/// whole log is walked rather than scanned backwards to the first match: the log's order
+/// is the order calls were RECORDED, which a recorder stamping an instant of its own
+/// (a call it served earlier, replayed state) need not have in the order of their
+/// instants, and the rule is about the instants. A READ of the shared log: nothing is
+/// written.
+fn last_recorded_use<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    access_key_id: &str,
+) -> Option<Option<RecordedUse>> {
+    let log = crate::service::management_events::management_event_log(engine)?;
+    let held = log.lock();
+    let used = held
+        .iter()
+        .filter(|event| event.call.access_key_id.as_deref() == Some(access_key_id))
+        .max_by_key(|event| (event.event_time, event.seq))
+        .map(|event| RecordedUse {
+            at: event.event_time,
+            service_name: service_namespace(&event.call.event_source).to_string(),
+            region: event.call.aws_region.clone(),
+        });
+    Some(used)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -80,9 +160,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iam-awsidentitymanageme
 // here — hence the `GetAccessKeyLastUsedError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iam#GetAccessKeyLastUsed")]
+//
+// This operation lists no error of its own, so the enum would be UNINHABITED. Two shapes
+// the SERVICE models — and which its other access-key operations declare — are widened in
+// through `extra_errors`: `NoSuchEntityException`, because an access key id the account
+// holds no key under names no key to report on, which is the answer `DeleteAccessKey` and
+// `UpdateAccessKey` give the same id; and `ServiceFailureException`, so an engine that
+// cannot hand back this service's store has a modelled server failure to answer with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.iam#GetAccessKeyLastUsed",
+    extra_errors = ["NoSuchEntityException", "ServiceFailureException"]
+)]
 #[derive(Debug)]
 pub enum GetAccessKeyLastUsedErrorModeled {
+    NoSuchEntityException(NoSuchEntityException),
+    ServiceFailureException(ServiceFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -136,18 +228,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccessKeyLastUsed` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccessKeyLastUsedErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAccessKeyLastUsedErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A read: the operation "retrieves information about when the specified access key
+        // was last used" and writes nothing, so asking changes nothing a later caller
+        // sees.
+        let store = state.lock();
+
+        // The IAM user that owns the key the request addresses. An access key is
+        // reachable only through that user, so an id this account holds no key under and
+        // one whose owner it no longer holds are the same answer.
+        let owner = store
+            .access_keys
+            .get(&input.access_key_id)
+            .and_then(|record| store.users.get(&record.user_key));
+
+        // IAM authorizes its own API: the signing principal's identity-based policies,
+        // within the boundary that caps them, are evaluated before anything is reported.
+        // The decision is made on the ARN of the user whose key is asked about, and the
+        // refusal names that user. A request naming an access key id the account holds no
+        // key under addresses no entity to decide on, so it is decided against every
+        // resource ([`crate::state::authorization::ACCOUNT_WIDE_RESOURCE`]) while the
+        // refusal names the key as the request carried it — and the lookup above is
+        // answered only afterwards, because a caller that may not read this account's key
+        // usage learns that it may not, never what the usage was.
+        let (resource, named_as) = match owner {
+            Some(user) => (user.arn.clone(), format!("user {}", user.user_name)),
+            None => (
+                crate::state::authorization::ACCOUNT_WIDE_RESOURCE.to_string(),
+                format!("access key {}", input.access_key_id),
+            ),
+        };
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_ACCESS_KEY_LAST_USED,
+            &resource,
+            &named_as,
+        )?;
+
+        // An id no key of this account carries names nothing to report on, which is the
+        // answer the access-key family gives such an id, worded as they word it.
+        let Some(user) = owner else {
+            return Err(GetAccessKeyLastUsedErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The Access Key with id {} cannot be found.",
+                        input.access_key_id
+                    )),
+                },
+            )
+            .into());
+        };
+        // Reported in the case the user was created with, not the case the request
+        // happened to spell, since IAM names "are not distinguished by case".
+        let user_name = user.user_name.clone();
+        // The usage lives in a different store — the account's event history — and
+        // nothing else needs the IAM state to answer this call.
+        drop(store);
+
+        // When the key was last used, and where: the most recent call the account
+        // recorded as signed with it. The record of THIS call is written after the
+        // handler answers, so a caller asking about the very key it signed with is told
+        // about the last call before this one.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccessKeyLastUsed"))
+        // A record of the account's calls this process cannot reach is not the same fact
+        // as a key nothing was recorded against, and must not be answered as one: it is
+        // reported as the modelled server failure, exactly as an unreachable IAM store
+        // is above.
+        let Some(recorded) = last_recorded_use(&*self.engine, &input.access_key_id) else {
+            return Err(GetAccessKeyLastUsedErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the account's management event log is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let (last_used_date, service_name, region) = match recorded {
+            Some(used) => (
+                Some(::aws_smithy_types::DateTime::from(used.at)),
+                used.service_name,
+                used.region,
+            ),
+            // "This field is null" when "an access key exists but has not been used",
+            // and the two required members carry `N/A` for that same case.
+            None => (None, NEVER_USED.to_string(), NEVER_USED.to_string()),
+        };
+
+        Ok(GetAccessKeyLastUsedOutput {
+            user_name: Some(user_name),
+            access_key_last_used: Some(AccessKeyLastUsed {
+                last_used_date,
+                service_name,
+                region,
+            }),
+        })
     }
 }
+

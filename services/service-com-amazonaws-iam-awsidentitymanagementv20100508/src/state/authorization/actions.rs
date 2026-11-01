@@ -394,6 +394,9 @@ pub const UPDATE_ACCESS_KEY: &str = "iam:UpdateAccessKey";
 /// `iam:DeleteAccessKey`.
 pub const DELETE_ACCESS_KEY: &str = "iam:DeleteAccessKey";
 
+/// `iam:GetAccessKeyLastUsed`.
+pub const GET_ACCESS_KEY_LAST_USED: &str = "iam:GetAccessKeyLastUsed";
+
 /// `iam:CreateLoginProfile`.
 pub const CREATE_LOGIN_PROFILE: &str = "iam:CreateLoginProfile";
 

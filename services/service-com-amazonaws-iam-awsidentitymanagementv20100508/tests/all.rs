@@ -15,6 +15,8 @@
 mod access_denied_message_wording;
 #[path = "all/access_key_deletion.rs"]
 mod access_key_deletion;
+#[path = "all/access_key_last_used.rs"]
+mod access_key_last_used;
 #[path = "all/access_key_listing.rs"]
 mod access_key_listing;
 #[path = "all/access_key_status.rs"]
