@@ -21,6 +21,8 @@ mod asset_instances;
 mod asset_scoped_capacity_configuration;
 #[path = "all/availability_zone_identity.rs"]
 mod availability_zone_identity;
+#[path = "all/blocking_instance_asset_scope.rs"]
+mod blocking_instance_asset_scope;
 #[path = "all/blocking_instances.rs"]
 mod blocking_instances;
 #[path = "all/capacity_task_cancellation.rs"]

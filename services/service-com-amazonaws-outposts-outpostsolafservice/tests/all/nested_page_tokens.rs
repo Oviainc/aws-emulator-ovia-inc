@@ -36,6 +36,8 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::state::page_token_report;
 
+use service_com_amazonaws_outposts_outpostsolafservice::ops::types::AssetInstance;
+
 use crate::blocking_instances::{record as record_instances, running};
 use crate::capacity_task_lifecycle::{pool, settle_capacity_task, start_ok};
 use crate::site_and_outpost_lifecycle::{
@@ -176,6 +178,7 @@ async fn a_nested_page_token_is_a_boundary_of_its_own_parents_list_only() {
     // of its Outpost, so the configuration standing on the Outpost afterwards names
     // more than one instance type and `GetOutpostInstanceTypes` has a report to page.
     let mut tasks: Vec<String> = Vec::new();
+    let mut named_assets: Vec<String> = Vec::new();
     for outpost_id in [&one, &another] {
         let asset_id = a_compute_asset(&outposts, outpost_id).await;
         tasks.push(
@@ -183,12 +186,13 @@ async fn a_nested_page_token_is_a_boundary_of_its_own_parents_list_only() {
                 &outposts,
                 outpost_id,
                 &json!({
-                    "AssetId": asset_id,
+                    "AssetId": &asset_id,
                     "InstancePools": [pool("m5.4xlarge", 1), pool("c5.4xlarge", 1)],
                 }),
             )
             .await,
         );
+        named_assets.push(asset_id);
     }
     let (task_of_one, task_of_another) = (tasks[0].clone(), tasks[1].clone());
     settle_capacity_task();
@@ -199,9 +203,22 @@ async fn a_nested_page_token_is_a_boundary_of_its_own_parents_list_only() {
     )
     .await;
     // The instances running on each Outpost, recorded after the tasks were started so
-    // the capacity they hold is no part of what those tasks were weighed against.
-    for (name, outpost_id) in [("one", &one), ("another", &another)] {
-        record_instances(&outposts, outpost_id, &running(), name);
+    // the capacity they hold is no part of what those tasks were weighed against. Each
+    // Outpost's run on the compute unit its own task named, so they are instances that
+    // task would need stopped — a task scoped to one asset is held up by nothing running
+    // on another ([`crate::blocking_instance_asset_scope`] states that scope).
+    for (name, outpost_id, asset_id) in [
+        ("one", &one, &named_assets[0]),
+        ("another", &another, &named_assets[1]),
+    ] {
+        let instances: Vec<AssetInstance> = running()
+            .into_iter()
+            .map(|instance| AssetInstance {
+                asset_id: Some(asset_id.clone()),
+                ..instance
+            })
+            .collect();
+        record_instances(&outposts, outpost_id, &instances, name);
     }
 
     let blocking = |outpost_id: &str, task_id: &str| {

@@ -1203,12 +1203,32 @@ impl FamilyCapacity<'_> {
     }
 }
 
-/// Whether a capacity task that excludes `exclude` would need `instance` STOPPED —
-/// so the capacity that instance holds is capacity the task can free.
+/// Whether hardware whose recorded `AssetId` is `asset` — or an instance recorded as
+/// running on that hardware — is within the SCOPE a capacity task that named `scope`
+/// configures: the ONE asset the task named (`StartCapacityTask$AssetId`, "the ID of
+/// the Outpost asset"), or every asset of the Outpost for a task that named none.
+/// Hardware whose asset was never recorded is within no task's named scope.
 ///
-/// Two conditions, both from what AWS documents for the list of a task's blocking
+/// Stated once here because every rule read off a task's scope asks it: which hardware
+/// the requested configuration is weighed against, how much of that hardware's capacity
+/// the task could have, and which instances it would need stopped
+/// ([`instance_can_be_stopped`]) — capacity outside the scope is capacity the task
+/// neither configures nor frees.
+pub fn in_capacity_task_scope(scope: Option<&str>, asset: Option<&str>) -> bool {
+    scope.is_none_or(|named| asset == Some(named))
+}
+
+/// Whether a capacity task scoped to `scope` ([`in_capacity_task_scope`]) that excludes
+/// `exclude` would need `instance` STOPPED — so the capacity that instance holds is
+/// capacity the task can free.
+///
+/// Three conditions, all from what AWS documents for the list of a task's blocking
 /// instances:
 ///
+/// * it runs on hardware the task configures. The list is there "to free up capacity to
+///   run the capacity task", and a task may name one asset of the Outpost, so stopping
+///   an instance running on another of that Outpost's assets frees no capacity the task
+///   could use — it is not an instance the task would need stopped.
 /// * it belongs to "the account that initiated the capacity task". A capacity task is
 ///   started by the caller of `StartCapacityTask`, and every request this emulator
 ///   serves is the one emulator account's (`engine::emulator_account_id`, the account
@@ -1226,8 +1246,13 @@ impl FamilyCapacity<'_> {
 /// `ListBlockingInstancesForCapacityTask` recommends stopping, and how much of the
 /// hardware's capacity a task could have
 /// ([`ComAmazonawsOutpostsOutpostsolafserviceState::capacity_verdict`]).
-pub fn instance_can_be_stopped(instance: &AssetInstance, exclude: &ExcludedInstances<'_>) -> bool {
-    instance.account_id.as_deref() == Some(::engine::emulator_account_id())
+pub fn instance_can_be_stopped(
+    instance: &AssetInstance,
+    scope: Option<&str>,
+    exclude: &ExcludedInstances<'_>,
+) -> bool {
+    in_capacity_task_scope(scope, instance.asset_id.as_deref())
+        && instance.account_id.as_deref() == Some(::engine::emulator_account_id())
         && !exclude.names(instance)
 }
 
@@ -3857,7 +3882,7 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         // Which hardware the configuration is asked of: the asset the request named,
         // or all of the Outpost's when it named none. Read once, because every pool
         // is asked of the same hardware.
-        let in_scope = |asset: Option<&str>| asset_id.is_none_or(|named| asset == Some(named));
+        let in_scope = |asset: Option<&str>| in_capacity_task_scope(asset_id, asset);
         let hardware: Vec<&ComputeAttributes> = record
             .iter()
             .flat_map(|record| record.assets.iter())
@@ -3939,7 +3964,7 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
                 continue;
             };
             held = held.saturating_add(i64::from(vcpus));
-            if !instance_can_be_stopped(instance, &exclude) {
+            if !instance_can_be_stopped(instance, asset_id, &exclude) {
                 held_unstoppable = held_unstoppable.saturating_add(i64::from(vcpus));
             }
         }

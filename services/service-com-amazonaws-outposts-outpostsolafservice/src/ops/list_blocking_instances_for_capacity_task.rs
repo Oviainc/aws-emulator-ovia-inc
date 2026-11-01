@@ -4,10 +4,11 @@
 //! IMPLEMENTED: reports the Amazon EC2 instances recorded as running on the Outpost the
 //! `OutpostIdentifier` names — resolved from either the bare id or the full ARN the
 //! modelled label pattern accepts — that the capacity task the route names would need
-//! stopped: the ones belonging to the account that initiated the task, less every
-//! instance that task's `InstancesToExclude` names, in the Outpost's own recorded
-//! order, cut into pages of at most `MaxResults` with the modelled `NextToken` the next
-//! page resumes from.
+//! stopped: the ones running on the hardware that task configures (the one asset it
+//! named, or every asset of the Outpost when it named none) and belonging to the
+//! account that initiated the task, less every instance that task's
+//! `InstancesToExclude` names, in the Outpost's own recorded order, cut into pages of at
+//! most `MaxResults` with the modelled `NextToken` the next page resumes from.
 //!
 //! A read, and one that writes NOTHING: it answers from
 //! [`crate::state::OutpostRecord::instances`], so a caller that lists a task's blocking
@@ -263,9 +264,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Which instances a task would need stopped is the rule
                 // `crate::state::instance_can_be_stopped` states, and the same one
                 // the dry-run capacity verdict reads: an instance this task could
-                // stop is one it recommends stopping.
+                // stop is one it recommends stopping. The task's own scope is part of
+                // that rule — a task may configure ONE asset of the Outpost, and an
+                // instance running on another of its assets holds no capacity such a
+                // task could use — so the scope the task recorded is what the rule is
+                // asked under.
                 .filter(|(_, instance)| {
-                    crate::state::instance_can_be_stopped(instance, &exclude)
+                    crate::state::instance_can_be_stopped(
+                        instance,
+                        task.asset_id.as_deref(),
+                        &exclude,
+                    )
                 })
                 .map(|(position, instance)| (position as u64, projection(instance))),
             after,
