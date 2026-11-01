@@ -47,6 +47,8 @@ mod region_isolation;
 mod region_segment_rule;
 #[path = "all/resource_arn_validation.rs"]
 mod resource_arn_validation;
+#[path = "all/resource_not_found_message.rs"]
+mod resource_not_found_message;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

@@ -1,0 +1,563 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! Every `ResourceNotFoundException` this service answers is worded the same way.
+//!
+//! The rule under test: the error's required `Message` is not free text — it is the
+//! `ResourceType` the error carries, the fixed words `" was not found: "`, the `ResourceId`,
+//! and a terminating `.` (smithy_query: shape ResourceNotFoundException, whose three members
+//! are all required). The two variable parts come from the request and from state, and they
+//! are exactly the error's other two members, so the sentence and the fields report the same
+//! two facts. `ResourceType` is what the request named and this service could not find: the
+//! kind of resource (`Connector` or `Challenge`) for a call addressed AT that resource, and
+//! the name of the input member that referenced it on `CreateChallenge`, whose own resource
+//! is the challenge it creates rather than the connector it was handed.
+//!
+//! Every case drives the service the way a client does, one HTTP request per call through the
+//! same `MultiServiceRouter` the emulator boots. The rows differ along what the rule
+//! generalises over: which operation raises the error, which resource kind the ARN names, HOW
+//! the ARN came to name nothing (never created, deleted, owner torn down, an id under a live
+//! owner), the partition and Region segments of the ARN, the resource ids, and how many other
+//! records are stored when the call arrives. The five recorded read paths are five of the
+//! rows.
+
+use serde_json::json;
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::{self, label, new_router, Answer};
+use service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state;
+
+/// A region that is NOT the emulator default, so nothing here can pass by a hardcoded one.
+const REGION: &str = "eu-west-2";
+
+/// The canonical emulator account id every ARN of this service carries.
+const ACCOUNT: &str = "000000000000";
+
+/// The two values `ResourceType` carries for a resource kind, from the service's own
+/// vocabulary rather than respelled here.
+const RESOURCE_TYPE_CONNECTOR: &str = state::RESOURCE_TYPE_CONNECTOR;
+const RESOURCE_TYPE_CHALLENGE: &str = state::RESOURCE_TYPE_CHALLENGE;
+
+/// What `CreateChallenge`'s 404 names instead: the input member that referenced the connector
+/// (smithy_query: operation CreateChallenge), because the resource that call acts on is the
+/// challenge it creates.
+const MISSING_MEMBER_CONNECTOR_ARN: &str = "ConnectorArn";
+
+/// Private-CA ARNs matching `CertificateAuthorityArn`'s own pattern. Rows name different CAs,
+/// so no assertion can pass by echoing one recorded value.
+const CA_ARNS: &[&str] = &[
+    "arn:aws:acm-pca:eu-west-2:000000000000:certificate-authority/11111111-2222-3333-4444-555555555555",
+    "arn:aws:acm-pca:eu-west-2:000000000000:certificate-authority/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "arn:aws:acm-pca:eu-west-2:000000000000:certificate-authority/0123456f-89ab-cdef-0123-456789abcdef",
+    "arn:aws:acm-pca:eu-west-2:000000000000:certificate-authority/deadbeef-0000-1111-2222-333344445555",
+];
+
+/// The sentence the rule requires, spelled here independently of the service's own helper so
+/// a change to either side is a failure rather than a tautology.
+fn expected_message(resource_type: &str, resource_id: &str) -> String {
+    format!("{resource_type} was not found: {resource_id}.")
+}
+
+/// A connector ARN of exactly the form `ConnectorArn`'s own pattern requires.
+fn connector_arn(partition: &str, region: &str, connector_id: &str) -> String {
+    format!("arn:{partition}:pca-connector-scep:{region}:{ACCOUNT}:connector/{connector_id}")
+}
+
+/// A challenge ARN: its connector's ARN plus the challenge segment `ChallengeArn`'s own
+/// pattern requires.
+fn challenge_arn(connector_arn: &str, challenge_id: &str) -> String {
+    format!("{connector_arn}/challenge/{challenge_id}")
+}
+
+/// Which operation a row drives. Every operation of this service that models
+/// `ResourceNotFoundException` and identifies its resource by ARN is here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    GetConnector,
+    ListChallengeMetadata,
+    CreateChallenge,
+    DeleteConnector,
+    GetChallengeMetadata,
+    GetChallengePassword,
+    DeleteChallenge,
+    ListTagsForResource,
+    TagResource,
+    UntagResource,
+}
+
+impl Op {
+    /// One call of this operation, naming `arn` as the resource it is about.
+    async fn call(self, router: &MultiServiceRouter, arn: &str) -> Answer {
+        let encoded = label(arn);
+        match self {
+            Self::GetConnector => {
+                harness::call(router, REGION, "GET", &format!("/connectors/{encoded}"), None).await
+            }
+            Self::ListChallengeMetadata => {
+                harness::call(
+                    router,
+                    REGION,
+                    "GET",
+                    &format!("/challengeMetadata?ConnectorArn={encoded}"),
+                    None,
+                )
+                .await
+            }
+            Self::CreateChallenge => {
+                harness::call(
+                    router,
+                    REGION,
+                    "POST",
+                    "/challenges",
+                    Some(json!({ "ConnectorArn": arn })),
+                )
+                .await
+            }
+            Self::DeleteConnector => {
+                harness::call(
+                    router,
+                    REGION,
+                    "DELETE",
+                    &format!("/connectors/{encoded}"),
+                    None,
+                )
+                .await
+            }
+            Self::GetChallengeMetadata => {
+                harness::call(
+                    router,
+                    REGION,
+                    "GET",
+                    &format!("/challengeMetadata/{encoded}"),
+                    None,
+                )
+                .await
+            }
+            Self::GetChallengePassword => {
+                harness::call(
+                    router,
+                    REGION,
+                    "GET",
+                    &format!("/challengePasswords/{encoded}"),
+                    None,
+                )
+                .await
+            }
+            Self::DeleteChallenge => {
+                harness::call(
+                    router,
+                    REGION,
+                    "DELETE",
+                    &format!("/challenges/{encoded}"),
+                    None,
+                )
+                .await
+            }
+            Self::ListTagsForResource => {
+                harness::call(router, REGION, "GET", &format!("/tags/{encoded}"), None).await
+            }
+            Self::TagResource => {
+                harness::call(
+                    router,
+                    REGION,
+                    "POST",
+                    &format!("/tags/{encoded}"),
+                    Some(json!({ "Tags": { "owner": "fixture" } })),
+                )
+                .await
+            }
+            Self::UntagResource => {
+                harness::call(
+                    router,
+                    REGION,
+                    "DELETE",
+                    &format!("/tags/{encoded}?tagKeys=owner"),
+                    None,
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// Every operation a connector ARN can be handed to, with the `ResourceType` its 404 carries.
+const CONNECTOR_OPS: &[(Op, &str)] = &[
+    (Op::GetConnector, RESOURCE_TYPE_CONNECTOR),
+    (Op::ListChallengeMetadata, RESOURCE_TYPE_CONNECTOR),
+    (Op::DeleteConnector, RESOURCE_TYPE_CONNECTOR),
+    (Op::ListTagsForResource, RESOURCE_TYPE_CONNECTOR),
+    (Op::TagResource, RESOURCE_TYPE_CONNECTOR),
+    (Op::UntagResource, RESOURCE_TYPE_CONNECTOR),
+    // The create names the input member it was handed, not the resource kind.
+    (Op::CreateChallenge, MISSING_MEMBER_CONNECTOR_ARN),
+];
+
+/// Every operation a challenge ARN can be handed to, likewise.
+const CHALLENGE_OPS: &[(Op, &str)] = &[
+    (Op::GetChallengeMetadata, RESOURCE_TYPE_CHALLENGE),
+    (Op::GetChallengePassword, RESOURCE_TYPE_CHALLENGE),
+    (Op::DeleteChallenge, RESOURCE_TYPE_CHALLENGE),
+    (Op::ListTagsForResource, RESOURCE_TYPE_CHALLENGE),
+    (Op::TagResource, RESOURCE_TYPE_CHALLENGE),
+    (Op::UntagResource, RESOURCE_TYPE_CHALLENGE),
+];
+
+/// How the ARN under test came to name no record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Missing {
+    /// Nothing was ever created under it.
+    NeverCreated,
+    /// The resource was created and then deleted, and its teardown has come due.
+    Deleted,
+    /// (Challenges only) the owning connector was deleted, taking the challenge with it.
+    OwnerDeleted,
+    /// (Challenges only) the owning connector is there and serving; the challenge id names
+    /// nothing under it.
+    UnknownUnderLiveOwner,
+}
+
+/// One row: an ARN that names nothing, and how it got that way.
+#[derive(Debug)]
+struct Row {
+    name: &'static str,
+    how: Missing,
+    /// The partition in a hand-built ARN. `ConnectorArn`'s pattern allows `aws` and any
+    /// `aws-<suffix>`, so a row can vary it.
+    partition: &'static str,
+    /// The Region segment of a hand-built ARN.
+    region: &'static str,
+    /// The connector uuid of a hand-built ARN.
+    connector_id: &'static str,
+    /// The challenge uuid of a hand-built challenge ARN.
+    challenge_id: &'static str,
+    /// How many OTHER connectors (each with a challenge) are stored when the call arrives, so
+    /// no refusal can come from an empty store.
+    siblings: usize,
+}
+
+const CONNECTOR_ROWS: &[Row] = &[
+    Row {
+        name: "connector never created, empty store",
+        how: Missing::NeverCreated,
+        partition: "aws",
+        region: REGION,
+        connector_id: "fa9ce23c-aedb-47ef-94d6-505cf953adba",
+        challenge_id: "",
+        siblings: 0,
+    },
+    Row {
+        name: "connector never created, other records stored",
+        how: Missing::NeverCreated,
+        partition: "aws",
+        region: REGION,
+        connector_id: "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb",
+        challenge_id: "",
+        siblings: 2,
+    },
+    Row {
+        name: "connector of another partition and region",
+        how: Missing::NeverCreated,
+        partition: "aws-us-gov",
+        region: "us-gov-west-1",
+        connector_id: "0123456f-89ab-cdef-0123-456789abcdef",
+        challenge_id: "",
+        siblings: 1,
+    },
+    Row {
+        name: "connector deleted and torn down",
+        how: Missing::Deleted,
+        partition: "aws",
+        region: REGION,
+        connector_id: "",
+        challenge_id: "",
+        siblings: 1,
+    },
+];
+
+const CHALLENGE_ROWS: &[Row] = &[
+    Row {
+        name: "challenge never created, empty store",
+        how: Missing::NeverCreated,
+        partition: "aws",
+        region: REGION,
+        connector_id: "fa9ce23c-aedb-47ef-94d6-505cf953adba",
+        challenge_id: "1b7f2991-f611-452a-9050-38557f08ec1d",
+        siblings: 0,
+    },
+    Row {
+        name: "challenge never created, another partition and region",
+        how: Missing::NeverCreated,
+        partition: "aws-us-gov",
+        region: "us-gov-west-1",
+        connector_id: "0123456f-89ab-cdef-0123-456789abcdef",
+        challenge_id: "99999999-8888-7777-6666-555555555555",
+        siblings: 2,
+    },
+    Row {
+        name: "challenge id nothing was created under a serving connector",
+        how: Missing::UnknownUnderLiveOwner,
+        partition: "aws",
+        region: REGION,
+        connector_id: "",
+        challenge_id: "22222222-3333-4444-5555-666666666666",
+        siblings: 1,
+    },
+    Row {
+        name: "challenge deleted",
+        how: Missing::Deleted,
+        partition: "aws",
+        region: REGION,
+        connector_id: "",
+        challenge_id: "",
+        siblings: 0,
+    },
+    Row {
+        name: "challenge whose connector was torn down",
+        how: Missing::OwnerDeleted,
+        partition: "aws",
+        region: REGION,
+        connector_id: "",
+        challenge_id: "",
+        siblings: 2,
+    },
+];
+
+/// Create a connector from `ca_arn`, settle it into `ACTIVE`, and answer its ARN.
+async fn active_connector(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    case: &str,
+    ca_arn: &str,
+) -> String {
+    let created = harness::call(
+        router,
+        REGION,
+        "POST",
+        "/connectors",
+        Some(json!({ "CertificateAuthorityArn": ca_arn })),
+    )
+    .await;
+    assert_eq!(
+        created.status, 202,
+        "case {case:?}: expected 202 from CreateConnector, got {} / {:?}",
+        created.status, created.body
+    );
+    let arn = created.body["ConnectorArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a ConnectorArn in {:?}", created.body))
+        .to_string();
+    harness::release_pending(engine, &arn);
+    arn
+}
+
+/// Mint one challenge under `connector_arn` and answer its ARN.
+async fn new_challenge(router: &MultiServiceRouter, case: &str, connector_arn: &str) -> String {
+    let created = Op::CreateChallenge.call(router, connector_arn).await;
+    assert_eq!(
+        created.status, 202,
+        "case {case:?}: expected 202 from CreateChallenge on {connector_arn:?}, got {} / {:?}",
+        created.status, created.body
+    );
+    created.body["Challenge"]["Arn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a Challenge Arn in {:?}", created.body))
+        .to_string()
+}
+
+/// Fill the store with `count` settled connectors, each holding one challenge, so no refusal
+/// below is answered out of an empty store.
+async fn seed_siblings(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    case: &str,
+    count: usize,
+) {
+    for index in 0..count {
+        let arn = active_connector(router, engine, case, CA_ARNS[index % CA_ARNS.len()]).await;
+        new_challenge(router, case, &arn).await;
+    }
+}
+
+/// Delete `arn` and let the clock make its teardown due, so the record is gone.
+async fn tear_down_connector(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    case: &str,
+    arn: &str,
+) {
+    let accepted = Op::DeleteConnector.call(router, arn).await;
+    assert_eq!(
+        accepted.status, 202,
+        "case {case:?}: expected 202 from DeleteConnector on {arn:?}, got {} / {:?}",
+        accepted.status, accepted.body
+    );
+    harness::release_pending(engine, arn);
+}
+
+/// Assert one answer is the 404 the rule requires, with the sentence and the fields agreeing.
+fn assert_not_found(answer: &Answer, case: &str, operation: &str, arn: &str, resource_type: &str) {
+    assert_eq!(
+        (answer.status, answer.error_type.as_str()),
+        (404, "ResourceNotFoundException"),
+        "case {case:?} on {operation}: expected 404 ResourceNotFoundException for {arn:?}, got \
+         {} / {:?}",
+        answer.status,
+        answer.body
+    );
+    assert_eq!(
+        answer.body["ResourceId"],
+        json!(arn),
+        "case {case:?} on {operation}: expected the requested ARN as ResourceId, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.body["ResourceType"],
+        json!(resource_type),
+        "case {case:?} on {operation}: expected ResourceType {resource_type:?}, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.message(),
+        expected_message(resource_type, arn),
+        "case {case:?} on {operation}: expected AWS's not-found sentence, got {:?}",
+        answer.message()
+    );
+    // The sentence reports the SAME two facts as the fields it is built from, whatever they
+    // are: no operation may word one and field the other.
+    let fielded = expected_message(
+        answer.body["ResourceType"].as_str().unwrap_or_default(),
+        answer.body["ResourceId"].as_str().unwrap_or_default(),
+    );
+    assert_eq!(
+        answer.message(),
+        fielded,
+        "case {case:?} on {operation}: the Message must agree with ResourceType/ResourceId, got \
+         {:?}",
+        answer.body
+    );
+}
+
+/// The whole rule on a connector ARN that names nothing, row by operation.
+#[tokio::test]
+async fn every_operation_words_a_missing_connector_the_aws_way() {
+    for row in CONNECTOR_ROWS {
+        let case = row.name;
+        for (op, resource_type) in CONNECTOR_OPS {
+            let (router, engine) = new_router();
+            seed_siblings(&router, &engine, case, row.siblings).await;
+
+            let arn = match row.how {
+                Missing::NeverCreated => {
+                    connector_arn(row.partition, row.region, row.connector_id)
+                }
+                Missing::Deleted => {
+                    let arn =
+                        active_connector(&router, &engine, case, CA_ARNS[row.siblings % CA_ARNS.len()])
+                            .await;
+                    new_challenge(&router, case, &arn).await;
+                    tear_down_connector(&router, &engine, case, &arn).await;
+                    arn
+                }
+                other => panic!("case {case:?}: {other:?} is not a connector row"),
+            };
+
+            let answer = op.call(&router, &arn).await;
+            assert_not_found(&answer, case, &format!("{op:?}"), &arn, resource_type);
+        }
+    }
+}
+
+/// The same rule on a challenge ARN that names nothing.
+#[tokio::test]
+async fn every_operation_words_a_missing_challenge_the_aws_way() {
+    for row in CHALLENGE_ROWS {
+        let case = row.name;
+        for (op, resource_type) in CHALLENGE_OPS {
+            let (router, engine) = new_router();
+            seed_siblings(&router, &engine, case, row.siblings).await;
+
+            let arn = match row.how {
+                Missing::NeverCreated => challenge_arn(
+                    &connector_arn(row.partition, row.region, row.connector_id),
+                    row.challenge_id,
+                ),
+                Missing::UnknownUnderLiveOwner => {
+                    let owner =
+                        active_connector(&router, &engine, case, CA_ARNS[row.siblings % CA_ARNS.len()])
+                            .await;
+                    challenge_arn(&owner, row.challenge_id)
+                }
+                Missing::Deleted => {
+                    let owner =
+                        active_connector(&router, &engine, case, CA_ARNS[row.siblings % CA_ARNS.len()])
+                            .await;
+                    let arn = new_challenge(&router, case, &owner).await;
+                    let deleted = Op::DeleteChallenge.call(&router, &arn).await;
+                    assert_eq!(
+                        deleted.status, 202,
+                        "case {case:?}: expected 202 from DeleteChallenge, got {} / {:?}",
+                        deleted.status, deleted.body
+                    );
+                    arn
+                }
+                Missing::OwnerDeleted => {
+                    let owner =
+                        active_connector(&router, &engine, case, CA_ARNS[row.siblings % CA_ARNS.len()])
+                            .await;
+                    let arn = new_challenge(&router, case, &owner).await;
+                    tear_down_connector(&router, &engine, case, &owner).await;
+                    arn
+                }
+            };
+
+            let answer = op.call(&router, &arn).await;
+            assert_not_found(&answer, case, &format!("{op:?}"), &arn, resource_type);
+        }
+    }
+}
+
+/// The rule holds wherever this error is raised, not only for a record that is gone:
+/// `GetChallengePassword` answers the same 404 — same sentence, same fields — for a STORED
+/// challenge whose connector has been accepted for teardown and so has no password to hand
+/// out, while the readers that still report that record answer 200.
+#[tokio::test]
+async fn a_challenge_whose_connector_is_not_serving_gets_the_same_sentence() {
+    // Rows differ in how many challenges the connector holds and which of them is asked for,
+    // so the sentence cannot come from there being exactly one.
+    for (count, asked) in [(1usize, 0usize), (2, 1), (3, 0), (3, 2)] {
+        let case = format!("{count} challenges, asking for #{asked}");
+        let (router, engine) = new_router();
+        let owner = active_connector(&router, &engine, &case, CA_ARNS[count % CA_ARNS.len()]).await;
+
+        let mut challenges = Vec::new();
+        for _ in 0..count {
+            challenges.push(new_challenge(&router, &case, &owner).await);
+        }
+        let arn = challenges[asked].clone();
+
+        let accepted = Op::DeleteConnector.call(&router, &owner).await;
+        assert_eq!(
+            accepted.status, 202,
+            "case {case:?}: expected 202 from DeleteConnector, got {} / {:?}",
+            accepted.status, accepted.body
+        );
+        // Pin the teardown window, so the record is still stored while it is read.
+        harness::hold_pending(&engine, &owner);
+
+        let password = Op::GetChallengePassword.call(&router, &arn).await;
+        assert_not_found(
+            &password,
+            &case,
+            "GetChallengePassword",
+            &arn,
+            RESOURCE_TYPE_CHALLENGE,
+        );
+
+        let metadata = Op::GetChallengeMetadata.call(&router, &arn).await;
+        assert_eq!(
+            metadata.status, 200,
+            "case {case:?}: the metadata of a stored challenge must still be reported, got {} / \
+             {:?}",
+            metadata.status, metadata.body
+        );
+    }
+}

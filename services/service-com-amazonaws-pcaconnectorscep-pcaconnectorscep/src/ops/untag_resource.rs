@@ -294,12 +294,10 @@ fn invalid_state(resource_arn: &str, connector_arn: &str, status: &str) -> Untag
 /// Reserved for an ARN that could name one of this service's resources: a value that is not
 /// such an ARN is refused by [`validation`] before any lookup.
 fn not_found(resource_arn: &str) -> UntagResourceError {
-    let resource_type = crate::state::resource_type_of(resource_arn);
-    UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("{resource_type} {resource_arn} could not be found"),
-        resource_id: resource_arn.to_string(),
-        resource_type: resource_type.to_string(),
-    })
+    UntagResourceErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        crate::state::resource_type_of(resource_arn),
+        resource_arn,
+    ))
     .into()
 }
 

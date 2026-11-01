@@ -176,11 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// with `Status` `DELETING`. An ARN naming another Region's connector lands here too: that
 /// connector does not exist in this Region.
 fn not_found(connector_arn: &str) -> GetConnectorError {
-    GetConnectorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("Connector {connector_arn} could not be found"),
-        resource_id: connector_arn.to_string(),
-        resource_type: crate::state::RESOURCE_TYPE_CONNECTOR.to_string(),
-    })
+    GetConnectorErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        crate::state::RESOURCE_TYPE_CONNECTOR,
+        connector_arn,
+    ))
     .into()
 }
 

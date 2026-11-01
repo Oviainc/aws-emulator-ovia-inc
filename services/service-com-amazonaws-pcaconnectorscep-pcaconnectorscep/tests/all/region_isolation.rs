@@ -32,6 +32,11 @@ const ACCOUNT: &str = "000000000000";
 const RESOURCE_TYPE_CONNECTOR: &str = state::RESOURCE_TYPE_CONNECTOR;
 const RESOURCE_TYPE_CHALLENGE: &str = state::RESOURCE_TYPE_CHALLENGE;
 
+/// What `CreateChallenge`'s 404 names instead: the call creates a challenge, so the thing
+/// that was not found is the input member that referenced the connector, not the resource
+/// the call acts on.
+const MISSING_MEMBER_CONNECTOR_ARN: &str = "ConnectorArn";
+
 /// The status a settled connector reports.
 const STATUS_ACTIVE: &str = state::STATUS_ACTIVE;
 
@@ -383,7 +388,7 @@ async fn every_operation_refuses_an_arn_of_another_region() {
             case,
             "CreateChallenge",
             &connector_arn,
-            RESOURCE_TYPE_CONNECTOR,
+            MISSING_MEMBER_CONNECTOR_ARN,
         );
         assert_not_found(
             &list_tags(&router, foreign, &connector_arn).await,

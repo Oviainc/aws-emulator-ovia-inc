@@ -339,15 +339,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The name of this operation's input member that references the connector the challenge is
+/// created under (smithy_query: operation CreateChallenge).
+///
+/// It is what this call's `ResourceNotFoundException` carries as its `ResourceType`, and the
+/// word its `Message` opens with: the resource this call creates is the challenge, so the
+/// thing that was not found is not the resource it acts on but the parameter that named it,
+/// and that is what the error discriminates on.
+const MISSING_MEMBER_CONNECTOR_ARN: &str = "ConnectorArn";
+
 /// No connector is stored under this ARN in the Region the request was signed for — HTTP 404
 /// `ResourceNotFoundException`, which is also what a well-formed ARN that was never created
 /// answers.
 fn not_found(connector_arn: &str) -> CreateChallengeError {
-    CreateChallengeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("Connector {connector_arn} could not be found"),
-        resource_id: connector_arn.to_string(),
-        resource_type: crate::state::RESOURCE_TYPE_CONNECTOR.to_string(),
-    })
+    CreateChallengeErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        MISSING_MEMBER_CONNECTOR_ARN,
+        connector_arn,
+    ))
     .into()
 }
 

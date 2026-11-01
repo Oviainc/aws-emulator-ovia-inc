@@ -197,12 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// such an ARN is refused by [`validation`] before any lookup, so no 404 ever invents a
 /// `ResourceType` for a string that named nothing.
 fn not_found(resource_arn: &str) -> ListTagsForResourceError {
-    let resource_type = crate::state::resource_type_of(resource_arn);
-    ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("{resource_type} {resource_arn} could not be found"),
-        resource_id: resource_arn.to_string(),
-        resource_type: resource_type.to_string(),
-    })
+    ListTagsForResourceErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        crate::state::resource_type_of(resource_arn),
+        resource_arn,
+    ))
     .into()
 }
 

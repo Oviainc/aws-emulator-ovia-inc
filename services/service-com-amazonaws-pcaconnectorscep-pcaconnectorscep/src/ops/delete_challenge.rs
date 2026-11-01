@@ -199,11 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// No challenge is stored under this ARN — HTTP 404 `ResourceNotFoundException`, carrying the
 /// ARN as `ResourceId` and the kind of resource it names as `ResourceType`.
 fn not_found(challenge_arn: &str) -> DeleteChallengeError {
-    DeleteChallengeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("Challenge {challenge_arn} could not be found"),
-        resource_id: challenge_arn.to_string(),
-        resource_type: crate::state::RESOURCE_TYPE_CHALLENGE.to_string(),
-    })
+    DeleteChallengeErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        crate::state::RESOURCE_TYPE_CHALLENGE,
+        challenge_arn,
+    ))
     .into()
 }
 

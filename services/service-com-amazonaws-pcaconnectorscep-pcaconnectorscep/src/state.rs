@@ -20,7 +20,7 @@ use ::aws_smithy_schema_server::envelope;
 
 use crate::ops::types::{
     Challenge, ChallengeMetadata, ChallengeMetadataSummary, Connector, ConnectorSummary,
-    MobileDeviceManagement, OpenIdConfiguration,
+    MobileDeviceManagement, OpenIdConfiguration, ResourceNotFoundException,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service, from the model's
@@ -718,6 +718,28 @@ pub fn resource_type_of(resource_arn: &str) -> &'static str {
         RESOURCE_TYPE_CHALLENGE
     } else {
         RESOURCE_TYPE_CONNECTOR
+    }
+}
+
+/// The ONE `ResourceNotFoundException` this service answers with, for every operation that
+/// models it.
+///
+/// All three members of the shape are required (smithy_query: shape
+/// ResourceNotFoundException), and the `Message` is not free text: it is the `ResourceType`
+/// word, the fixed words `" was not found: "`, the `ResourceId`, and a terminating `.`. The
+/// two variable parts are the error's other two members, so a caller reads the same two
+/// facts out of the sentence and out of the fields.
+///
+/// `resource_type` is what the request named and this service could not find: the kind of
+/// resource (`Connector` or `Challenge`, as [`resource_type_of`] decides it) for a call
+/// addressed AT that resource, and the name of the input member that referenced it for a
+/// call that creates a different resource, since there the missing thing is the caller's
+/// parameter rather than the resource this call acts on.
+pub fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("{resource_type} was not found: {resource_id}."),
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
     }
 }
 
