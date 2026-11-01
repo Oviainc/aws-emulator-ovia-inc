@@ -41,12 +41,12 @@ use crate::node_lifecycle::{cluster, created as created_node, delete_node, node_
 use crate::wire::{call, error_code, error_message, medialive};
 
 /// The token every row spends and then retries with.
-const TOKEN: &str = "token-a";
+pub(crate) const TOKEN: &str = "token-a";
 
 /// A token this account never spends on anything, which is what each row's
 /// refusal is compared against: the FIRST attempt the rule says a retry is
 /// answered exactly like.
-const NEVER_SPENT: &str = "token-never-spent";
+pub(crate) const NEVER_SPENT: &str = "token-never-spent";
 
 /// The program every doomed multiplex already holds, and the `ProgramNumber` it
 /// was created with.
@@ -68,13 +68,13 @@ enum Spent {
 /// One refusal, as a client reads it: the status, the error code and the
 /// message, so two answers can be compared as a whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Refusal {
-    status: u16,
-    code: String,
-    message: String,
+pub(crate) struct Refusal {
+    pub(crate) status: u16,
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
-fn refusal_of(status: u16, body: &Value) -> Refusal {
+pub(crate) fn refusal_of(status: u16, body: &Value) -> Refusal {
     Refusal {
         status,
         code: error_code(status, body),
@@ -335,7 +335,7 @@ fn script_uri(cluster_id: &str) -> String {
 }
 
 /// `CreateNodeRegistrationScript` on one cluster: its status and body.
-async fn create_script(
+pub(crate) async fn create_script(
     router: &MultiServiceRouter,
     cluster_id: &str,
     body: Value,
@@ -345,7 +345,7 @@ async fn create_script(
 
 /// `DeleteCluster` (`DELETE /prod/clusters/{ClusterId}`), asserted to have been
 /// accepted with the modelled 202.
-async fn delete_cluster(router: &MultiServiceRouter, case: &str, cluster_id: &str) {
+pub(crate) async fn delete_cluster(router: &MultiServiceRouter, case: &str, cluster_id: &str) {
     let (status, deleting) = call(
         router,
         "DELETE",

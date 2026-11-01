@@ -335,6 +335,9 @@ mod node_name_uniqueness;
 #[path = "all/node_registration_script.rs"]
 mod node_registration_script;
 
+#[path = "all/node_registration_script_token_liveness_scope.rs"]
+mod node_registration_script_token_liveness_scope;
+
 #[path = "all/node_settings_update.rs"]
 mod node_settings_update;
 

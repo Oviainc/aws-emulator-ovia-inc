@@ -64,7 +64,12 @@ async fn create_script(
 /// (`smithy_query(query="operation", operation="CreateNodeRegistrationScript")`:
 /// code 200), unlike the `201` the resource creates answer with — nothing is
 /// created here.
-async fn issued(router: &MultiServiceRouter, case: &str, cluster_id: &str, body: Value) -> String {
+pub(crate) async fn issued(
+    router: &MultiServiceRouter,
+    case: &str,
+    cluster_id: &str,
+    body: Value,
+) -> String {
     let (status, response) = create_script(router, cluster_id, body).await;
     assert_eq!(
         status, 200,
