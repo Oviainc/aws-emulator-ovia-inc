@@ -155,10 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::trimmed_name(&input.name)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        // `ParameterNotFound` carries NO message: its `message` member is optional and
+        // Parameter Store words none for a name it holds no parameter for, so the error
+        // code is the whole of what this refusal says.
         let not_found = || {
-            DeleteParameterErrorModeled::ParameterNotFound(ParameterNotFound {
-                message: Some(format!("Parameter {name} not found")),
-            })
+            DeleteParameterErrorModeled::ParameterNotFound(ParameterNotFound { message: None })
         };
 
         // "You can't enter the Amazon Resource Name (ARN) for a parameter, only the

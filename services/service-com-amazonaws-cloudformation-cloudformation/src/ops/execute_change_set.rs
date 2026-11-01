@@ -224,7 +224,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is written under the lock and the lock is RELEASED with this block:
         // the calls that create or delete the stack's resources run after it, and each of
         // those reaches another service's own handler, which takes that service's lock.
-        let (stack_id, region, declared, previous_resources, provenance, refused_deployment) = {
+        let (
+            stack_id,
+            region,
+            declared,
+            previous_resources,
+            provenance,
+            refused_deployment,
+            role_in_force,
+        ) = {
             let mut store = state.lock();
             store.settle(now);
             // What a `Fn::ImportValue` in the change set's template resolves against: the
@@ -311,13 +319,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // decided against below.
             let planned_changes = change_set.changes.clone();
             // "DO_NOTHING - if the stack creation fails, do nothing. This is equivalent to
-            // specifying true for the DisableRollback parameter."
-            let disable_rollback = input.disable_rollback.or_else(|| {
-                change_set
-                    .on_stack_failure
-                    .as_deref()
-                    .map(|on_failure| on_failure == ON_STACK_FAILURE_DO_NOTHING)
-            });
+            // specifying true for the DisableRollback parameter." The deployment
+            // configuration the change set was created with states the same thing through
+            // its own `DisableRollback` member
+            // ([`crate::state::stored_rollback_disabled`]), so the execution runs with
+            // rollback disabled when any of them states it.
+            let disable_rollback = input
+                .disable_rollback
+                .or_else(|| {
+                    crate::state::stored_rollback_disabled(change_set.deployment_config.as_ref())
+                })
+                .or_else(|| {
+                    change_set
+                        .on_stack_failure
+                        .as_deref()
+                        .map(|on_failure| on_failure == ON_STACK_FAILURE_DO_NOTHING)
+                })
+                .or_else(|| {
+                    // Nothing stated it: the mode the change set runs in decides, which is
+                    // the last thing consulted ([`crate::state::mode_disables_rollback`]).
+                    crate::state::mode_disables_rollback(crate::state::stored_deployment_mode(
+                        change_set.deployment_config.as_ref(),
+                    ))
+                    .then_some(true)
+                });
 
             // The stack the change set belongs to. An operation already in flight on it is
             // exactly the case `InvalidChangeSetStatusException` documents ("the stack
@@ -442,6 +467,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack.tags = tags;
             stack.notification_arns = notification_arns;
             stack.role_arn = role_arn;
+            // The same role, kept for the deployment below: it is what the calls this
+            // execution makes in the services that own the stack's resources are made
+            // under ([`crate::state::service_role`]).
+            let role_in_force = stack.role_arn.clone();
             stack.rollback_configuration = rollback_configuration;
             stack.deployment_config = deployment_config;
             stack.resource_types = resource_types;
@@ -541,6 +570,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 previous_resources,
                 provenance,
                 refused_deployment,
+                role_in_force,
             )
         };
 
@@ -550,13 +580,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it no longer declares is deleted there — unless CLOUDFORMATION itself refused the
         // deployment, in which case nothing is asked of any of those services at all.
         let refused_anything = refused_deployment.is_some();
-        let materialised = crate::state::provisioning::reconcile(
-            ctx,
-            &region,
-            &provenance,
-            declared,
-            &previous_resources,
-            refused_deployment,
+        // The calls below are the STACK's, made under the service role in force on it
+        // ("CloudFormation always uses this role for all future operations on the stack"),
+        // so a call that role is denied is not made at all
+        // ([`crate::state::service_role`]). The same role governs the rollback below.
+        let role =
+            crate::state::service_role::ServiceRole::of(&*self.engine, role_in_force.as_deref());
+        let materialised = crate::state::service_role::acting_as(
+            ::std::sync::Arc::clone(&role),
+            crate::state::provisioning::reconcile(
+                ctx,
+                &region,
+                &provenance,
+                declared,
+                &previous_resources,
+                refused_deployment,
+            ),
         )
         .await;
 
@@ -670,9 +709,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // unwind `CreateStack` performs, since the clock already owes the rolled-back
         // status.
         if let Some((resources, held, policies)) = unwind {
-            let deleted =
-                crate::state::provisioning::unwind(ctx, &region, &resources, &held, policies)
-                    .await;
+            let deleted = crate::state::service_role::acting_as(
+                ::std::sync::Arc::clone(&role),
+                crate::state::provisioning::unwind(ctx, &region, &resources, &held, policies),
+            )
+            .await;
             let mut store = state.lock();
             if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
                 // A resource whose owning service accepted the delete and still holds it

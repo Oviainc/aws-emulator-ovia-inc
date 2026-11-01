@@ -61,6 +61,8 @@ mod denied_replacement_identity;
 mod detect_resource_drift;
 #[path = "all/drift_and_resource_reads.rs"]
 mod drift_and_resource_reads;
+#[path = "all/duplicate_resource_identifiers.rs"]
+mod duplicate_resource_identifiers;
 #[path = "all/dynamic_reference_names.rs"]
 mod dynamic_reference_names;
 #[path = "all/dynamic_references.rs"]
@@ -237,6 +239,8 @@ mod scratch;
 mod search_indexing_pipeline_outputs;
 #[path = "all/section_loop_expansion.rs"]
 mod section_loop_expansion;
+#[path = "all/service_role_permissions.rs"]
+mod service_role_permissions;
 #[path = "all/stack_delete_failure_reason.rs"]
 mod stack_delete_failure_reason;
 #[path = "all/stack_event_timeline.rs"]

@@ -27,6 +27,8 @@ mod parameter_deletion_visibility;
 mod parameter_history;
 #[path = "all/parameter_metadata.rs"]
 mod parameter_metadata;
+#[path = "all/parameter_not_found_payload.rs"]
+mod parameter_not_found_payload;
 #[path = "all/parameter_store.rs"]
 mod parameter_store;
 #[path = "all/parameters_by_path.rs"]

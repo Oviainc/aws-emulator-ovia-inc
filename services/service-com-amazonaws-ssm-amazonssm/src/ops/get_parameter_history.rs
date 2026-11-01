@@ -212,9 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // variant for, so it travels on the validation channel.
         let name = trimmed_name(&input.name).map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        // `ParameterNotFound` carries NO message: its `message` member is optional and
+        // Parameter Store words none for a name it holds no parameter for, so the error
+        // code is the whole of what this refusal says.
         let not_found = || {
             GetParameterHistoryErrorModeled::ParameterNotFound(ParameterNotFound {
-                message: Some(format!("Parameter {name} not found")),
+                message: None,
             })
         };
 

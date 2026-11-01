@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that put the resources back run after it, and each of those reaches another
         // service's own handler.
-        let (stack_id, region, declared, against, outstanding, provenance) = {
+        let (stack_id, region, declared, against, outstanding, provenance, role_arn) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -338,6 +338,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 against,
                 outstanding,
                 stack.provenance(),
+                // The role the resumed rollback's own calls are made under: the one in
+                // force on the stack, which this request may have just replaced.
+                stack.role_arn.clone(),
             )
         };
 
@@ -345,15 +348,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stack lives in: each is declared again in the service that owns it, against what
         // that service is still holding, so a change the failed rollback could not put back
         // is asked for again and nothing the rollback is not resuming is created or deleted.
-        let reverted = crate::state::provisioning::reconcile(
-            ctx,
-            &region,
-            &provenance,
-            declared,
-            &against,
-            // A resumed rollback puts back a configuration this stack already deployed, so
-            // there is nothing for CloudFormation to refuse about it.
-            None,
+        let role = crate::state::service_role::ServiceRole::of(&*self.engine, role_arn.as_deref());
+        let reverted = crate::state::service_role::acting_as(
+            role,
+            crate::state::provisioning::reconcile(
+                ctx,
+                &region,
+                &provenance,
+                declared,
+                &against,
+                // A resumed rollback puts back a configuration this stack already
+                // deployed, so there is nothing for CloudFormation to refuse about it.
+                None,
+            ),
         )
         .await;
 

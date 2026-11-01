@@ -328,6 +328,11 @@ pub mod wait_conditions;
 /// reports otherwise.
 pub mod stabilising;
 
+/// The permissions a stack operation runs under: the identity policies of the stack's
+/// service role, which decide the calls a deployment makes in the services that own the
+/// stack's resources.
+pub mod service_role;
+
 /// The stack sets this account and Region holds, and the stack instances each one carries,
 /// which `ListStackInstances` reports summaries of, plus the operations performed on each,
 /// which `ListStackSetOperations` reports summaries of.
@@ -461,6 +466,14 @@ pub const MAX_DRIFT_DETECTIONS: usize = 200;
 /// resources are ready to serve traffic before completing the operation. This is the
 /// default. You do not need to specify this value explicitly."
 pub const DEPLOYMENT_MODE_STANDARD: &str = "STANDARD";
+
+/// `DeploymentConfig$Mode` for an operation that completes once the configuration is
+/// applied.
+///
+/// `DeploymentConfigMode`: "EXPRESS — Complete the stack operation when resource
+/// configuration is applied, without waiting for resources to become ready to serve
+/// traffic. Resources continue becoming ready in the background."
+pub const DEPLOYMENT_MODE_EXPRESS: &str = "EXPRESS";
 
 /// The most LIVE stacks this emulator holds.
 ///
@@ -4786,6 +4799,9 @@ impl ComAmazonawsCloudformationCloudformationState {
                     region: stack.region.clone(),
                     stack_id: stack.stack_id.clone(),
                     provenance: stack.provenance(),
+                    // The role the rollback's own calls are made under, which is the one in
+                    // force on the stack ([`service_role`]).
+                    role_arn: stack.role_arn.clone(),
                     rollback,
                 })
             })
@@ -7018,6 +7034,49 @@ pub fn stored_deployment_config(
     })
 }
 
+/// Whether the request itself asks for rollback to be DISABLED, or `None` where it asks
+/// for neither — the operation's own default then stands
+/// ([`mode_disables_rollback`] is that default where nothing else decides it).
+///
+/// TWO members of a stack operation say this one thing, in the same words: the operation's
+/// own `DisableRollback` ("Preserve the state of previously provisioned resources when an
+/// operation fails") and `DeploymentConfig$DisableRollback` ("Specifies whether to disable
+/// rollback of the stack if the stack operation fails"). So a request that states it in
+/// either place has said it, and the ONE reading of that pair lives here rather than per
+/// operation: a request stating it in the deployment configuration alone must not be read
+/// as a request that asked for nothing.
+pub fn rollback_disabled(
+    disable_rollback: Option<bool>,
+    deployment_config: Option<&crate::ops::types::DeploymentConfig>,
+) -> Option<bool> {
+    disable_rollback.or_else(|| deployment_config.and_then(|config| config.disable_rollback))
+}
+
+/// [`rollback_disabled`] for the deployment configuration a change set was CREATED with,
+/// which the execution of that change set runs under.
+pub fn stored_rollback_disabled(config: Option<&StoredDeploymentConfig>) -> Option<bool> {
+    config.and_then(|config| config.disable_rollback)
+}
+
+/// Whether the MODE an operation runs in disables its rollback by itself — the default for
+/// an operation whose request states the flag nowhere and names no failure action.
+///
+/// A failed [`DEPLOYMENT_MODE_EXPRESS`] operation keeps what it provisioned: the recorded
+/// behaviour of such an operation is the stack left in its failed status with the resources
+/// that were created still there, while the same template deployed in
+/// [`DEPLOYMENT_MODE_STANDARD`], and in `EXPRESS` with `DisableRollback` stated false, is
+/// rolled back — so the member's documented default ("Default: `false`") is the default of
+/// the standard mode. It is the LAST thing consulted: a flag or a failure action the request
+/// states is what that request asked for, whichever mode it runs in.
+pub fn mode_disables_rollback(mode: Option<&str>) -> bool {
+    mode == Some(DEPLOYMENT_MODE_EXPRESS)
+}
+
+/// The `Mode` one stored deployment configuration names, for [`mode_disables_rollback`].
+pub fn stored_deployment_mode(config: Option<&StoredDeploymentConfig>) -> Option<&str> {
+    config.and_then(|config| config.mode.as_deref())
+}
+
 /// Stored deployment configuration as the modelled member, with the documented defaults
 /// filled in.
 ///
@@ -7203,6 +7262,9 @@ pub struct DueRollback {
     /// The stack's identity and tags, which a resource the rollback re-declares is created
     /// carrying ([`provisioning::StackProvenance`]).
     pub provenance: provisioning::StackProvenance,
+    /// The service role in force on the stack, whose permissions decide the calls this
+    /// rollback makes in the services that own its resources ([`service_role`]).
+    pub role_arn: Option<String>,
     pub rollback: OwedRollback,
 }
 
@@ -7241,15 +7303,22 @@ pub async fn settle_due_rollbacks<Eng: Send + Sync + 'static>(
     };
     for owed in due {
         let outstanding = owed.rollback.clone();
-        let reverted = provisioning::reconcile(
-            ctx,
-            &owed.region,
-            &owed.provenance,
-            outstanding.previous.clone(),
-            &outstanding.applied,
-            // A rollback puts back a configuration this stack already deployed, so there is
-            // nothing for CloudFormation to refuse about it.
-            None,
+        // The rollback's calls are the STACK's, made under its service role: a role denied
+        // the call that would put a resource back cannot make it, which is what leaves the
+        // stack in `UPDATE_ROLLBACK_FAILED` below.
+        let role = service_role::ServiceRole::of(engine, owed.role_arn.as_deref());
+        let reverted = service_role::acting_as(
+            role,
+            provisioning::reconcile(
+                ctx,
+                &owed.region,
+                &owed.provenance,
+                outstanding.previous.clone(),
+                &outstanding.applied,
+                // A rollback puts back a configuration this stack already deployed, so
+                // there is nothing for CloudFormation to refuse about it.
+                None,
+            ),
         )
         .await;
         let mut store = state.lock();

@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that delete the stack's resources run after it, and each of those reaches
         // another service's own handler, which takes that service's lock.
-        let (stack_id, region, resources, held, deletion_mode) = {
+        let (stack_id, region, resources, held, deletion_mode, role_arn) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -376,6 +376,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // resource an owning service refuses to delete fails the stack or is
                 // abandoned.
                 stack.deletion_mode.clone(),
+                // The role the deletion's calls are made under, which is the one in force
+                // on the stack ([`crate::state::service_role`]).
+                stack.role_arn.clone(),
             )
         };
 
@@ -384,16 +387,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that own them. What a resource one of those services REFUSES to delete does to
         // this deletion is the deletion mode's choice
         // ([`crate::state::on_refused_resource_deletion`]).
-        let deleted = crate::state::provisioning::delete(
-            ctx,
-            &region,
-            &resources,
-            &held,
-            crate::state::on_refused_resource_deletion(deletion_mode.as_deref()),
-            // The stack is being deleted, which is the event each resource's
-            // `DeletionPolicy` governs: "preserve, and in some cases, backup a resource when
-            // its stack is deleted".
-            crate::state::provisioning::Policies::Honoured,
+        let role = crate::state::service_role::ServiceRole::of(&*self.engine, role_arn.as_deref());
+        let deleted = crate::state::service_role::acting_as(
+            role,
+            crate::state::provisioning::delete(
+                ctx,
+                &region,
+                &resources,
+                &held,
+                crate::state::on_refused_resource_deletion(deletion_mode.as_deref()),
+                // The stack is being deleted, which is the event each resource's
+                // `DeletionPolicy` governs: "preserve, and in some cases, backup a resource
+                // when its stack is deleted".
+                crate::state::provisioning::Policies::Honoured,
+            ),
         )
         .await;
 

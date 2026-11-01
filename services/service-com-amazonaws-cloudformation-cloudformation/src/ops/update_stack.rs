@@ -294,6 +294,26 @@ impl PreviousValues {
     }
 }
 
+/// What THIS update asks for about the rollback of its own failure, or `None` where it asks
+/// for nothing — the setting in force on the stack then stands.
+///
+/// The two members that state it, read as one ([`crate::state::rollback_disabled`]), and
+/// then the default of the mode the update runs in
+/// ([`crate::state::mode_disables_rollback`]): a stated flag is what the request asked for
+/// whichever mode it names, and only an update that states neither is answered by the mode.
+fn disables_rollback(input: &UpdateStackInput) -> Option<bool> {
+    crate::state::rollback_disabled(input.disable_rollback, input.deployment_config.as_ref())
+        .or_else(|| {
+            crate::state::mode_disables_rollback(
+                input
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|config| config.mode.as_deref()),
+            )
+            .then_some(true)
+        })
+}
+
 /// The resource actions an update PLANS, as the stack policy in force is asked about them.
 ///
 /// Computed from the resource-level plan [`crate::state::computed_changes`] answers for the
@@ -640,6 +660,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If you don't specify a value, CloudFormation uses the role that was previously
         // associated with the stack."
         let role_arn = input.role_arn.clone().or(previous.role_arn.clone());
+        // The same role, kept for the deployment below: it is what the calls this update
+        // makes in the services that own the stack's resources are made under
+        // ([`crate::state::service_role`]).
+        let role_in_force = role_arn.clone();
         let rollback_configuration = match input.rollback_configuration.as_ref() {
             Some(configuration) => {
                 crate::state::stored_rollback_configuration(Some(configuration))
@@ -828,7 +852,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // fails": the request's own `DisableRollback` where it carries one, else the
             // value in force on the stack — the same reading the deploying path gives that
             // member, so a denied update and a failed one answer it alike.
-            if !input.disable_rollback.unwrap_or(stack.disable_rollback) {
+            if !disables_rollback(&input).unwrap_or(stack.disable_rollback) {
                 stack.begin_update_rollback(failed_at, reason);
             }
             return Ok(UpdateStackOutput {
@@ -923,7 +947,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack.role_arn = role_arn;
             stack.rollback_configuration = rollback_configuration;
             stack.deployment_config = deployment_config;
-            if let Some(disable_rollback) = input.disable_rollback {
+            // Either member of the request that says so disables the rollback of this
+            // update, and an update that states neither is answered by the mode it runs in
+            // ([`disables_rollback`]); a request that asks for nothing leaves the setting in
+            // force on the stack exactly as it is. It is RECORDED on the stack because that
+            // is where the failure path reads it back: a wait that runs out fails this
+            // operation on the clock, with no call of the client's to consult
+            // ([`crate::state::StoredStack::begin_owed_update_rollback`]).
+            if let Some(disable_rollback) = disables_rollback(&input) {
                 stack.disable_rollback = disable_rollback;
             }
             if let Some(retain_except_on_create) = input.retain_except_on_create {
@@ -989,13 +1020,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // CLOUDFORMATION itself refused the deployment, in which case nothing is asked of
         // any of those services at all.
         let refused_anything = refused_deployment.is_some();
-        let materialised = crate::state::provisioning::reconcile(
-            ctx,
-            &region,
-            &provenance,
-            declared,
-            &previous_resources,
-            refused_deployment,
+        // The calls below are the STACK's, made under its service role: "CloudFormation
+        // uses the role's credentials to make calls on your behalf", so the role in force
+        // on the stack decides them ([`crate::state::service_role`]).
+        let role = crate::state::service_role::ServiceRole::of(&*self.engine, role_in_force.as_deref());
+        let materialised = crate::state::service_role::acting_as(
+            role,
+            crate::state::provisioning::reconcile(
+                ctx,
+                &region,
+                &provenance,
+                declared,
+                &previous_resources,
+                refused_deployment,
+            ),
         )
         .await;
 

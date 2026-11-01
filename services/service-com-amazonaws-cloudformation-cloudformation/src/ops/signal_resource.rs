@@ -336,9 +336,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // own them, with the store UNLOCKED: each delete reaches another service's own
         // handler, exactly as the create's did.
         if let Some((resources, held, policies)) = unwind {
-            let deleted =
-                crate::state::provisioning::unwind(ctx, &region, &resources, &held, policies)
-                    .await;
+            // The removal's calls are the stack's, made under its service role
+            // ([`crate::state::service_role`]), read back under a lock of its own: the
+            // block above released the store before these calls are made.
+            let role_arn = {
+                let store = state.lock();
+                store
+                    .resolve(&region, &stack_id)
+                    .and_then(|stack| stack.role_arn.clone())
+            };
+            let role =
+                crate::state::service_role::ServiceRole::of(&*self.engine, role_arn.as_deref());
+            let deleted = crate::state::service_role::acting_as(
+                role,
+                crate::state::provisioning::unwind(ctx, &region, &resources, &held, policies),
+            )
+            .await;
             let mut store = state.lock();
             if let Some(stack) = store.resolve_mut(&region, &stack_id) {
                 // A resource whose owning service accepted the delete and still holds it

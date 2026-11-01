@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that put the resources back — or delete them — run after it, and each of
         // those reaches another service's own handler, which takes that service's lock.
-        let (stack_id, region, operation_id, provenance, work, held, policies) = {
+        let (stack_id, region, operation_id, provenance, work, held, policies, role_arn) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -275,6 +275,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // What that rollback does with the `DeletionPolicy` of the resources the
                 // failed operation created.
                 stack.rolled_back_resource_policies(),
+                // The role the rollback's calls are made under, which is the one in force
+                // on the stack ([`crate::state::service_role`]).
+                stack.role_arn.clone(),
             )
         };
 
@@ -282,18 +285,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack_id: Some(stack_id.clone()),
             operation_id: Some(operation_id),
         };
+        // Every call this rollback makes is the stack's, made under its service role
+        // ("CloudFormation always uses this role for all future operations on the stack").
+        let role = crate::state::service_role::ServiceRole::of(&*self.engine, role_arn.as_deref());
         match work {
             // No last known stable state: "this operation will delete a stack if it doesn't
             // contain a last known stable state" — what the failed create had provisioned is
             // removed again in the services that own it, re-asked while one of them has not
             // let a resource go yet, exactly as a failed create's own rollback removes it.
             crate::state::RequestedRollback::Discard(resources) => {
-                let deleted = crate::state::provisioning::unwind(
-                    ctx,
-                    &region,
-                    &resources,
-                    &held,
-                    policies,
+                let deleted = crate::state::service_role::acting_as(
+                    role,
+                    crate::state::provisioning::unwind(
+                        ctx,
+                        &region,
+                        &resources,
+                        &held,
+                        policies,
+                    ),
                 )
                 .await;
                 let mut store = state.lock();
@@ -325,15 +334,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // operation is declared again in the services that own the resources, against
             // what that operation left there.
             crate::state::RequestedRollback::Revert(plan) => {
-                let reverted = crate::state::provisioning::reconcile(
-                    ctx,
-                    &region,
-                    &provenance,
-                    plan.previous.clone(),
-                    &plan.applied,
-                    // A rollback puts back a configuration this stack already deployed, so
-                    // there is nothing for CloudFormation to refuse about it.
-                    None,
+                let reverted = crate::state::service_role::acting_as(
+                    role,
+                    crate::state::provisioning::reconcile(
+                        ctx,
+                        &region,
+                        &provenance,
+                        plan.previous.clone(),
+                        &plan.applied,
+                        // A rollback puts back a configuration this stack already deployed,
+                        // so there is nothing for CloudFormation to refuse about it.
+                        None,
+                    ),
                 )
                 .await;
                 let mut store = state.lock();

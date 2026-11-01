@@ -1413,9 +1413,13 @@ pub struct StackScope<'a> {
 ///
 /// A name the template builds with an intrinsic function is evaluated first (the common
 /// `TopicName: !Ref TopicName` case), against the stack's parameters and pseudo
-/// parameters: a NAME is resolved before any resource has an identity, so one that refers
-/// to ANOTHER resource is not resolvable here and that resource takes the generated name.
-/// (What a later round does resolve is an IDENTIFIER built from another resource's — see
+/// parameters — and against the resources of the same template that are created BEFORE
+/// this one: the resources are named in creation order ([`creation_order`]), so a name
+/// built from a `Ref` to another resource of the template resolves to that resource's own
+/// physical id, exactly as CloudFormation resolves it. A resource takes the generated name
+/// only where its declaration names it nowhere, or names it from something this module
+/// cannot resolve at all (a resource of a dependency cycle, which no stack could deploy).
+/// (What a later round resolves is an IDENTIFIER built from another resource's — see
 /// [`resolve_dependent_identities`] — not the name it was computed from.)
 ///
 /// Every record starts out NOT materialised: this function computes the identity
@@ -1440,16 +1444,22 @@ pub fn provision(
     budget: &mut Budget,
 ) -> Vec<StoredResource> {
     let mut names: Vec<(&DeclaredResource, String)> = Vec::new();
+    let mut identities: BTreeMap<String, StoredResource> = BTreeMap::new();
+    // CREATION order, so the resources a declaration references are already named when its
+    // own name is evaluated: that is the order CloudFormation creates them in, and a
+    // resource it has created has the identity a `Ref` to it resolves to.
     for declared in creation_order(template) {
         if !is_created(declared, scope, budget) {
             continue;
         }
-        names.push((declared, physical_name(declared, scope, budget)));
-    }
-
-    let mut identities: BTreeMap<String, StoredResource> = BTreeMap::new();
-    for (declared, name) in &names {
-        let (physical_resource_id, attributes) = return_values(declared, name, scope, budget);
+        let name = {
+            let named_so_far = Scope {
+                resources: &identities,
+                ..*scope
+            };
+            physical_name(declared, &named_so_far, budget)
+        };
+        let (physical_resource_id, attributes) = return_values(declared, &name, scope, budget);
         identities.insert(
             declared.logical_id.clone(),
             StoredResource {
@@ -1467,6 +1477,7 @@ pub fn provision(
                 deletion_policy: declared_deletion_policy(declared),
             },
         );
+        names.push((declared, name));
     }
     // The few types whose own identifier is built from ANOTHER resource's had nothing to
     // resolve against above, so they are recomputed once the rest are known.
@@ -2244,6 +2255,12 @@ fn hyphenated(segment: &str) -> String {
 /// is also what that type's `Ref` returns); where none is declared, "CloudFormation
 /// generates a unique physical ID and uses that ID for the resource name", in the form
 /// `<stack name>-<logical id>-<unique id>`.
+///
+/// The name is the property's EVALUATED value: `naming` is the scope the deployment has
+/// reached, which carries the resources created before this one ([`provision`]), so a name
+/// stated as a `Ref` or an `Fn::Sub` over one of them is the identifier that resource
+/// really carries. A declaration whose name property resolves to nothing at all is one that
+/// named the resource nowhere, and such a resource takes the generated name.
 ///
 /// A type whose owning API spells its name member with the resource's FULL noun rather
 /// than the type's last segment is read through [`declared_name_property`] first, so the

@@ -25,7 +25,10 @@
 //! ## Parameters nobody created
 //!
 //! A name this Region and account hold no parameter for is the modelled
-//! `ParameterNotFound`, including the AWS-managed `/aws/...` namespace (the public
+//! `ParameterNotFound` — the error code alone, with NO message: the shape's `message` is an
+//! optional member and Parameter Store words none for this refusal, so nothing here invents
+//! a sentence for it. The same holds for every read and delete of this slice that reports a
+//! name it holds no parameter for. This includes the AWS-managed `/aws/...` namespace (the public
 //! AMI-alias parameters, say). No caller can create one — `PutParameter` refuses a name
 //! prefixed with `aws` or `ssm` — and this emulator seeds none: their values are AWS's
 //! own published catalog data (an AMI id for a Region and a release), which nothing here
@@ -213,10 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::trimmed_name(&input.name)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        // `ParameterNotFound` carries NO message: the member is optional and the service
+        // sends none for a name it holds no parameter for, so a client comparing the whole
+        // error payload reads the code alone (see the module docs).
         let not_found = || {
-            GetParameterErrorModeled::ParameterNotFound(ParameterNotFound {
-                message: Some(format!("Parameter {name} not found")),
-            })
+            GetParameterErrorModeled::ParameterNotFound(ParameterNotFound { message: None })
         };
 
         // A name this service could never have stored (an ARN of another service, say)

@@ -154,6 +154,13 @@
 //! credentials an operation minted), so no signature of the caller's could be produced
 //! here.
 //!
+//! What the call is signed with is not what DECIDES it, though. A stack operation acts as
+//! the stack's service role — "CloudFormation uses the role's credentials to make calls on
+//! your behalf" — so the permissions that role carries are what say whether the change this
+//! call asks for may be made at all, and a call that role is denied is never sent
+//! ([`super::service_role`], asked in [`call_json_rpc`] and [`call_query`] before either
+//! writes a request).
+//!
 //! Nor is there state for a credential to select. Every service of this emulator reaches
 //! its store by TYPE out of the ONE `InMemoryEngine` the router builds and hands to all of
 //! them (`AGENTS.md`: "`engine` is deliberately ONE crate shared by every service crate
@@ -806,9 +813,13 @@ pub async fn reconcile(
                 ));
                 let applied = match provisioner_for(&resource.resource_type) {
                     Some(provisioner) => {
-                        provisioner
-                            .update(ctx, region, &resource, &deployed_properties)
-                            .await
+                        // The call is the stack's, made under its service role and about
+                        // THIS resource ([`super::service_role`]).
+                        super::service_role::on_resource(
+                            super::service_role::target_of(&resource),
+                            provisioner.update(ctx, region, &resource, &deployed_properties),
+                        )
+                        .await
                     }
                     None => Ok(None),
                 };
@@ -873,9 +884,11 @@ pub async fn reconcile(
             let retagged = match provisioner_for(&resource.resource_type) {
                 Some(provisioner) => {
                     let tags = stack.tags_for(&resource.logical_id);
-                    provisioner
-                        .retag(ctx, region, &resource, &deployed_properties, &tags)
-                        .await
+                    super::service_role::on_resource(
+                        super::service_role::target_of(&resource),
+                        provisioner.retag(ctx, region, &resource, &deployed_properties, &tags),
+                    )
+                    .await
                 }
                 None => Ok(()),
             };
@@ -941,7 +954,11 @@ pub async fn reconcile(
                     properties: deployed_properties,
                     ..resource.clone()
                 };
-                provisioner.create(ctx, region, &asked, &tags).await
+                super::service_role::on_resource(
+                    super::service_role::target_of(&asked),
+                    provisioner.create(ctx, region, &asked, &tags),
+                )
+                .await
             }
             // No provisioner for this type: nothing is asked of any service, and the
             // resource stays DECLARED-ONLY — which the stack still records as a resource it
@@ -1639,9 +1656,11 @@ async fn delete_pass(
             .then(|| final_snapshot_identifier(resource));
         let deleted = match owner {
             Some(provisioner) => {
-                provisioner
-                    .delete(ctx, region, resource, final_snapshot.as_deref())
-                    .await
+                super::service_role::on_resource(
+                    super::service_role::target_of(resource),
+                    provisioner.delete(ctx, region, resource, final_snapshot.as_deref()),
+                )
+                .await
             }
             None => Ok(()),
         };
@@ -2034,6 +2053,25 @@ fn handler_failure_reason(owner: Option<Provisioner>, refusal: &Refusal) -> Stri
 }
 
 
+/// The refusal the stack's SERVICE ROLE answers a call of `operation` on `signing_name`
+/// with, or `None` where nothing refuses it — so a call the role's policies deny is never
+/// made ([`super::service_role`]).
+///
+/// The refusal is CLOUDFORMATION's, not the owning service's: the call was not made, so
+/// there is no answer of that service's to report. Its code is the one an unauthorized call
+/// is classified under ([`handler_error_code`]'s `AccessDenied` class, which is what tells a
+/// client whether the failed resource is worth retrying) rather than the particular spelling
+/// the called service would have used, and its message is the sentence AWS words such a
+/// refusal with, naming the principal, the action and the resource. `operation` is `None` for
+/// a wire this cannot read an operation name off, which is judged by nothing.
+fn denied_by_the_service_role(signing_name: &str, operation: Option<&str>) -> Option<Refusal> {
+    let message = super::service_role::refusal(signing_name, operation?)?;
+    Some(Refusal {
+        code: super::service_role::ACCESS_DENIED.to_string(),
+        message,
+    })
+}
+
 /// Call one awsJson operation of another emulated service in-process and read its
 /// answer document. `Err(refusal)` is the service's own refusal: its code, and the message
 /// it worded.
@@ -2054,6 +2092,13 @@ pub(super) async fn call_json_rpc(
     target: &str,
     request: &Value,
 ) -> Result<Value, Refusal> {
+    // The call is made under the stack's service role, so what that role is DENIED is not
+    // made at all: the operation an awsJson request invokes is the part of its `X-Amz-Target`
+    // after the service shape's name ([`super::service_role::refusal`]).
+    if let Some(denied) = denied_by_the_service_role(signing_name, target.rsplit('.').next())
+    {
+        return Err(denied);
+    }
     let body = serde_json::to_vec(request).map_err(|error| Refusal {
         code: "SerializationException".to_string(),
         message: error.to_string(),
@@ -2100,6 +2145,11 @@ pub(super) async fn call_query(
     action: &str,
     parameters: &[(String, String)],
 ) -> Result<String, Refusal> {
+    // Under the stack's service role, exactly as [`call_json_rpc`] is: an awsQuery request
+    // names the operation it invokes in its `Action` parameter.
+    if let Some(denied) = denied_by_the_service_role(signing_name, Some(action)) {
+        return Err(denied);
+    }
     let mut body = format!("Action={action}&Version={version}");
     for (name, value) in parameters {
         body.push('&');

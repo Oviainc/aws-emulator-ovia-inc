@@ -547,9 +547,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         stack.notification_arns = input.notification_ar_ns.clone().unwrap_or_default();
         stack.role_arn = input.role_arn.clone();
         stack.timeout_in_minutes = input.timeout_in_minutes;
-        stack.disable_rollback = input
-            .disable_rollback
-            .unwrap_or(input.on_failure.as_deref() == Some(ON_FAILURE_DO_NOTHING));
+        // "Specifies whether to disable rollback of the stack if the stack operation
+        // fails" is what BOTH `DisableRollback` and `DeploymentConfig$DisableRollback`
+        // say, so the create runs with rollback disabled when either states it
+        // ([`crate::state::rollback_disabled`]). A create that states neither is answered
+        // by the failure action it asked for ("DO_NOTHING … is equivalent to specifying
+        // true for the DisableRollback parameter"), and only a create that states none of
+        // the three by the default of the mode it runs in.
+        stack.disable_rollback = crate::state::rollback_disabled(
+            input.disable_rollback,
+            input.deployment_config.as_ref(),
+        )
+        .unwrap_or_else(|| match input.on_failure.as_deref() {
+            Some(on_failure) => on_failure == ON_FAILURE_DO_NOTHING,
+            None => crate::state::mode_disables_rollback(
+                input
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|config| config.mode.as_deref()),
+            ),
+        });
         stack.enable_termination_protection =
             input.enable_termination_protection.unwrap_or(false);
         stack.retain_except_on_create = input.retain_except_on_create;
@@ -769,13 +786,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Fn::ImportValue` naming an export nothing publishes — is passed that refusal, so
         // nothing is asked of any owning service and the stack records CloudFormation's own
         // diagnostic rather than a summary of resources that tried and failed.
-        let materialised = crate::state::provisioning::reconcile(
-            ctx,
-            &region,
-            &provenance,
-            declared,
-            &[],
-            refused_deployment,
+        // Every call below is made under the stack's service role: "CloudFormation uses
+        // the role's credentials to make calls on your behalf", so a call that role is
+        // denied is not made at all ([`crate::state::service_role`]). The same role governs
+        // the rollback further down, which is the same stack's work.
+        let role =
+            crate::state::service_role::ServiceRole::of(&*self.engine, input.role_arn.as_deref());
+        let materialised = crate::state::service_role::acting_as(
+            ::std::sync::Arc::clone(&role),
+            crate::state::provisioning::reconcile(
+                ctx,
+                &region,
+                &provenance,
+                declared,
+                &[],
+                refused_deployment,
+            ),
         )
         .await;
 
@@ -859,9 +885,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // REFUSES changes it, and then to the failed status for that unwind rather than to
         // one that claims the resources are gone.
         if let Some((resources, held, policies)) = unwind {
-            let deleted =
-                crate::state::provisioning::unwind(ctx, &region, &resources, &held, policies)
-                    .await;
+            let deleted = crate::state::service_role::acting_as(
+                role,
+                crate::state::provisioning::unwind(ctx, &region, &resources, &held, policies),
+            )
+            .await;
             let mut store = state.lock();
             if let Some(stack) = store.resolve_mut(&region, &stack_id) {
                 // A resource whose owning service accepted the delete and still holds it
