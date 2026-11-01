@@ -8,9 +8,12 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
-# The shared wording of a boundary constraint refusal
-# (`service_common::aws_validation_refusal`), so this service does not carry its
-# own copy of how AWS states one.
+# `service-common` carries two readers this crate needs.
+# `aws_validation_refusal`: the shared wording of a boundary constraint refusal, so
+# this service does not carry its own copy of how AWS states one.
+# `arn::region_label`: the ONE statement of the Region grammar, applied to the
+# caller-supplied signing region before it reaches the AUTHORITY of the endpoint the
+# in-process EC2 read is addressed at (`src/state.rs`, `ec2_client`).
 service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -28,12 +31,24 @@ tracing = { workspace = true }
 # Opaque, URL-safe encoding for the `ListMonitors` pagination cursors this
 # service vends.
 hex = { workspace = true }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): a probe's source is a VPC SUBNET, which is EC2's
+# resource, so every `sourceArn` a write names is resolved against EC2
+# (`src/state.rs`, `resolve_source_subnet`) rather than assumed from its shape.
+# Only the generated client is needed — the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The Amazon EC2 service, mounted BESIDE this one in
+# `tests/all/probe_source_subnet_resolution.rs`: the subnets a probe's `sourceArn`
+# resolves against are that service's resources, so the suite creates them through
+# its own API over the in-process callback. DEV-ONLY: `src/` names no other
+# service's crate, it reaches EC2 through the SDK client above.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

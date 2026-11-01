@@ -28,6 +28,12 @@
 //! its tags ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is refused with the
 //! modelled 400 `ValidationException` and creates nothing.
 //!
+//! Each inline probe's source is a VPC subnet, which is Amazon EC2's resource,
+//! so every `sourceArn` the list carries is resolved against EC2
+//! ([`crate::state::resolve_source_subnet`]): an entry naming a subnet EC2 holds
+//! none for is the modelled 400 `ValidationException` and creates nothing, and
+//! the `vpcId` each stored probe reports is the VPC EC2 holds its subnet in.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -188,6 +194,21 @@ fn output_for(monitor: &crate::state::Monitor) -> CreateMonitorOutput {
     }
 }
 
+/// What EC2 answered about the source subnet of the probe at `position` in the
+/// request's own `probes` list.
+///
+/// [`crate::state::SourceSubnet::Unresolved`] for a position past the ceiling
+/// that bounds the resolution (see `handle`): such a probe can never be stored,
+/// so EC2 was not asked about it and the source rule is refused on nothing for
+/// it.
+fn source_at(
+    sources: &[crate::state::SourceSubnet],
+    position: usize,
+) -> &crate::state::SourceSubnet {
+    static UNRESOLVED: crate::state::SourceSubnet = crate::state::SourceSubnet::Unresolved;
+    sources.get(position).unwrap_or(&UNRESOLVED)
+}
+
 /// The `CreateMonitor` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -279,6 +300,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(validation)?;
         }
 
+        // Each inline probe's `sourceArn` is "The ARN of the subnet": the
+        // source is a VPC subnet, which is EC2's resource, so which subnet each
+        // one names is resolved against EC2, in request order, rather than taken
+        // on trust from the ARN's shape. Asked BEFORE this service's store is
+        // locked, because each is an in-process call into another service.
+        //
+        // How many of those calls one request can make is bounded HERE, before
+        // the work, by the ceiling on how many probes ONE monitor may hold
+        // ([`crate::state::MAX_PROBES_PER_MONITOR`]) rather than only by the
+        // count check further down: a request asking for more probes than the
+        // ceiling is refused as a whole, so no probe past it can be stored
+        // whatever EC2 would have said about it and nothing past it is asked
+        // about. A longer list therefore cannot turn one request into an
+        // unbounded number of in-process calls. A probe past the ceiling has no
+        // answer of its own ([`source_at`]).
+        let mut sources: Vec<crate::state::SourceSubnet> =
+            Vec::with_capacity(specs.len().min(crate::state::MAX_PROBES_PER_MONITOR));
+        for spec in specs.iter().take(crate::state::MAX_PROBES_PER_MONITOR) {
+            sources.push(crate::state::resolve_source_subnet(ctx, &region, &spec.source_arn).await);
+        }
+
         let mut store = state.lock();
         store.prune_client_tokens(now);
         // The transitions the clock already owed the monitor this request names,
@@ -335,6 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::validate_probe_spec(
                 spec,
                 &crate::state::element_path("probes", position + 1),
+                source_at(&sources, position),
             )
             .map_err(validation)?;
         }
@@ -367,6 +410,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 now,
                 &crate::state::element_path("probes", position + 1),
+                source_at(&sources, position),
             )
             .map_err(validation)?;
             probes.insert(probe.probe_id.clone(), probe);

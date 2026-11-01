@@ -23,6 +23,19 @@
 //! Every value a handler reports is read back out of these records; nothing is
 //! echoed straight from a request without being stored first.
 //!
+//! ## Facts this service RESOLVES rather than holds
+//!
+//! A probe's source is a VPC SUBNET, which is not a resource of this service:
+//! which subnets the account holds, and which VPC each one sits in, are facts of
+//! Amazon EC2's own inventory. So every operation that takes a `sourceArn`
+//! resolves it there ([`resolve_source_subnet`]) — reached the way any emulated
+//! service reaches another, through the in-process callback
+//! ([`smithy_server_runtime::OperationContext::callback`]) — and refuses a probe
+//! whose source EC2 holds no subnet for, while the `vpcId` a probe reports is
+//! read off what EC2 answered rather than invented. Every refusal built there is
+//! grounded in what EC2 REPORTED: an emulator with no EC2 to ask knows nothing
+//! about the subnet, and nothing is what it refuses on.
+//!
 //! ## How a refusal this service authors is stated
 //!
 //! A rule the model states in prose but its constraints cannot express is
@@ -333,12 +346,13 @@ pub fn arn_resource_id(arn: &str) -> &str {
 /// The subnet id a probe's `sourceArn` names, when it names a VPC subnet of this
 /// account at all; `None` for anything else.
 ///
-/// AWS resolves `sourceArn` against the caller's VPC subnets and refuses a probe
-/// whose source is not one, so this is the structural half of that lookup an
-/// emulator holding no EC2 inventory can perform: the ARN must be an
+/// The STRUCTURAL half of resolving a `sourceArn`: the ARN must be an
 /// [`SUBNET_ARN_SERVICE`] ARN of this emulator's account
 /// ([`::engine::emulator_account_id`]) whose resource is a
-/// [`SUBNET_ARN_RESOURCE_TYPE`] with a well-formed EC2 id.
+/// [`SUBNET_ARN_RESOURCE_TYPE`] with a well-formed EC2 id. The id it answers is
+/// what the EXISTENCE half ([`resolve_source_subnet`]) looks up, since AWS
+/// resolves `sourceArn` against the subnets the caller's account really holds
+/// and refuses a probe whose source is not one of them.
 pub fn subnet_id_of(source_arn: &str) -> Option<&str> {
     // arn : partition : service : region : account : resource
     let mut segments = source_arn.splitn(6, ':');
@@ -364,6 +378,182 @@ pub fn subnet_id_of(source_arn: &str) -> Option<&str> {
         return None;
     }
     Some(subnet_id)
+}
+
+/// What Amazon EC2 — which owns the account's VPC subnets — says about the
+/// subnet a probe's `sourceArn` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceSubnet {
+    /// EC2 reports the subnet, in the VPC its record states (`None` for a record
+    /// that states none, which is nothing to report rather than an id naming no
+    /// VPC).
+    Held { vpc_id: Option<String> },
+    /// EC2 reports that the account holds NO subnet with that id, so the ARN
+    /// names a subnet that does not exist.
+    Absent,
+    /// Nothing is known about it: there is no EC2 to ask, it answered something
+    /// else, or the request named no source subnet to resolve (an operation that
+    /// cannot set one). A refusal is grounded in what EC2 REPORTED rather than
+    /// assumed from silence, so nothing is refused on this.
+    Unresolved,
+}
+
+impl SourceSubnet {
+    /// The VPC the source subnet sits in, as EC2 reports it — what a stored probe
+    /// reports as its `vpcId` (`Probe$vpcId`: "The ID of the source VPC
+    /// subnet"). `None` whenever the subnet was not resolved, so no probe reports
+    /// a VPC that nothing created.
+    pub fn vpc_id(&self) -> Option<String> {
+        match self {
+            Self::Held { vpc_id } => vpc_id.clone(),
+            Self::Absent | Self::Unresolved => None,
+        }
+    }
+}
+
+/// The prefix of every EC2 error code that says a value names no subnet of the
+/// account: `InvalidSubnetID.NotFound` for an id no subnet carries, and
+/// `InvalidSubnetID.Malformed` for a value that is not a subnet id at all. Both
+/// say the same thing about a probe's source.
+const SUBNET_ID_REFUSAL_PREFIX: &str = "InvalidSubnetID.";
+
+/// The EC2 client this service resolves a probe's source subnet through: an AWS
+/// SDK client over the in-process callback into this same emulator, or `None`
+/// when the request's own signing region is not a Region LABEL.
+///
+/// The callback is the framework's documented seam for calling another emulated
+/// service: it routes in process, so no network client is configured here.
+/// `region` is the request's own signing region, which is where the subnet a
+/// probe of that region is sourced from lives.
+///
+/// That region is CALLER-SUPPLIED text ([`request_region`]), and here it ends up
+/// in an endpoint URL's AUTHORITY rather than in a response, so it is read as a
+/// Region label (`service_common::arn::region_label`, the one place this tree
+/// states that grammar) instead of being interpolated as given: a value carrying
+/// a host or path delimiter would name an authority the caller chose rather than
+/// the peer service this emulator asks. Such a request reaches no EC2, which is
+/// nothing known about the subnet ([`SourceSubnet::Unresolved`]) and so refuses
+/// nothing.
+fn ec2_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> Option<::aws_sdk_ec2::Client> {
+    let Some(region) = ::service_common::arn::region_label(region) else {
+        ::tracing::warn!(
+            "the request names no Region label, so EC2 cannot be asked about a probe's \
+             source subnet"
+        );
+        return None;
+    };
+    let config = ::aws_sdk_ec2::Config::builder()
+        .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_ec2::config::Region::new(region.to_string()))
+        .endpoint_url(format!(
+            "https://{SUBNET_ARN_SERVICE}.{region}.amazonaws.com"
+        ))
+        // The transport is in-process: there is nothing to retry, time out or
+        // watch for a stalled stream, and each of those would need a sleep
+        // implementation this client is not given. The same goes for caching the
+        // identity: the credentials are handed over directly.
+        .retry_config(::aws_sdk_ec2::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_ec2::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_ec2::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_ec2::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    Some(::aws_sdk_ec2::Client::from_conf(config))
+}
+
+/// Resolve a probe's `sourceArn` against the subnets the account really holds.
+///
+/// `ProbeInput$sourceArn` is "The ARN of the subnet", and which subnets exist —
+/// and which VPC each one sits in — is a fact of Amazon EC2's own inventory
+/// rather than of the string a caller supplied. So every operation that TAKES a
+/// `sourceArn` resolves the subnet id the ARN names ([`subnet_id_of`]) against
+/// EC2, through the in-process callback, and refuses an id EC2 holds no subnet
+/// for ([`validate_probe_spec`]). An ARN that names no subnet of this account at
+/// all carries no id to look up and is refused on the ARN itself.
+///
+/// Grounded in what EC2 ANSWERED: a read that resolves without reporting the
+/// subnet, and a read EC2 refuses because the id names no subnet of the account
+/// ([`SUBNET_ID_REFUSAL_PREFIX`]), both say the subnet does not exist. Any other
+/// failure is this emulator failing to ask rather than EC2 reporting a bad
+/// subnet, so it says nothing ([`SourceSubnet::Unresolved`]) and nothing is
+/// refused on it — as does a request this emulator cannot ask EC2 for at all
+/// ([`ec2_client`]).
+///
+/// Called with NO lock of this service's store held — it is an in-process request
+/// to another service, which reaches its own store.
+pub async fn resolve_source_subnet(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    source_arn: &str,
+) -> SourceSubnet {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let Some(subnet_id) = subnet_id_of(source_arn) else {
+        return SourceSubnet::Unresolved;
+    };
+    // No client is built for a request whose signing region is not a Region
+    // label: the endpoint that would be formatted from it is an authority the
+    // caller chose, so EC2 is not asked at all ([`ec2_client`]).
+    let Some(client) = ec2_client(ctx, region) else {
+        return SourceSubnet::Unresolved;
+    };
+    let answer = client
+        .describe_subnets()
+        .subnet_ids(subnet_id)
+        .send()
+        .await;
+    let error = match answer {
+        Ok(output) => {
+            let reported = output
+                .subnets()
+                .iter()
+                .find(|subnet| subnet.subnet_id() == Some(subnet_id));
+            return match reported {
+                Some(subnet) => SourceSubnet::Held {
+                    vpc_id: subnet.vpc_id().map(str::to_string),
+                },
+                // A read that resolved but reports no subnet for the id says the
+                // same thing the refusal below does.
+                None => SourceSubnet::Absent,
+            };
+        }
+        Err(error) => error,
+    };
+    let code = error
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::code)
+        .unwrap_or_default()
+        .to_string();
+    if code.starts_with(SUBNET_ID_REFUSAL_PREFIX) {
+        return SourceSubnet::Absent;
+    }
+    ::tracing::debug!(
+        %subnet_id,
+        error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+        "the source subnet a probe named could not be resolved against EC2"
+    );
+    SourceSubnet::Unresolved
+}
+
+/// What this service states for a `sourceArn` that names no subnet of this
+/// account: the AWS sentence for that class, naming the subnet by the id the
+/// ARN carried ([`arn_resource_id`]) so the caller is told which of its values
+/// resolved to nothing.
+///
+/// One sentence for both halves of the resolution — an ARN that is no subnet ARN
+/// of this account, and a well-formed one whose subnet the account does not hold
+/// — because both say the same thing about the source: there is no such subnet.
+pub fn subnet_not_found_message(source_arn: &str) -> String {
+    format!(
+        "The specified subnet {} does not exist or could not be found.",
+        arn_resource_id(source_arn)
+    )
 }
 
 /// The state a monitor is in the instant it is stored: `INACTIVE` when it holds
@@ -690,8 +880,8 @@ pub struct ProbeSpec {
     pub tags: BTreeMap<String, String>,
 }
 
-/// Turn a [`ProbeSpec`] into the record the store keeps, applying the two rules
-/// the model documents but its constraints cannot express.
+/// Turn a [`ProbeSpec`] into the record the store keeps, applying the rules the
+/// model documents but its constraints cannot express.
 ///
 /// * `destination` is "the destination IP address … either `IPV4` or `IPV6`", so
 ///   a destination that is not an IP literal is refused and the stored
@@ -699,11 +889,17 @@ pub struct ProbeSpec {
 /// * `destinationPort` "is required only if the `protocol` is `TCP` and must be
 ///   a number between `1` and `65536`", so TCP without a port, and a port of
 ///   `0` (which the shape's `@range(min: 0)` admits), are refused.
+/// * `sourceArn` is "The ARN of the subnet", so an ARN that names anything other
+///   than a VPC subnet of this account ([`subnet_id_of`]), and one naming a
+///   subnet the account does not hold (`source`), are refused — the shape's
+///   `@pattern("^arn:.*$")` admits any ARN at all.
 ///
 /// `Err` carries a message naming the offending member.
-/// * `sourceArn` is "The ARN of the subnet", so an ARN that names anything other
-///   than a VPC subnet of this account ([`subnet_id_of`]) is refused — the
-///   shape's `@pattern("^arn:.*$")` admits any ARN at all.
+///
+/// `source` is what the account's own inventory said about the subnet that ARN
+/// names ([`resolve_source_subnet`]), which the handler resolved before taking
+/// this store's lock; it is also where the stored `vpcId` is read from, so a
+/// probe reports the VPC its source subnet really sits in.
 ///
 /// `probe_path` is where this probe sits in the REQUEST, for the clause a
 /// refusal states; see [`validate_probe_spec`].
@@ -713,8 +909,9 @@ pub fn build_probe(
     region: &str,
     now: SystemTime,
     probe_path: &str,
+    source: &SourceSubnet,
 ) -> Result<Probe, String> {
-    let address_family = validate_probe_spec(&spec, probe_path)?;
+    let address_family = validate_probe_spec(&spec, probe_path, source)?;
     Ok(Probe {
         probe_arn: probe_arn(region, &probe_id),
         probe_id,
@@ -724,7 +921,7 @@ pub fn build_probe(
         protocol: spec.protocol,
         packet_size: spec.packet_size,
         address_family: address_family.to_string(),
-        vpc_id: None,
+        vpc_id: source.vpc_id(),
         state: PROBE_STATE_PENDING.to_string(),
         activates_at: now
             .checked_add(ACTIVATION_AFTER)
@@ -751,12 +948,21 @@ pub fn build_probe(
 /// list ([`element_path`]), and the EMPTY path for `UpdateProbe`, which binds a
 /// probe's members at the top level of its own input. Only the operation holding
 /// the request knows where its probe sat, so it supplies it.
-pub fn validate_probe_spec(spec: &ProbeSpec, probe_path: &str) -> Result<&'static str, String> {
-    if subnet_id_of(&spec.source_arn).is_none() {
-        return Err(format!(
-            "The specified subnet {} does not exist or could not be found.",
-            arn_resource_id(&spec.source_arn)
-        ));
+///
+/// `source` is what the account's own subnet inventory said about the subnet the
+/// spec's `sourceArn` names ([`resolve_source_subnet`]): a well-formed ARN whose
+/// subnet the account does not hold names a subnet that does not exist, which is
+/// the same refusal as an ARN that names no subnet of this account at all
+/// ([`subnet_not_found_message`]). An operation that binds no `sourceArn` of its
+/// own, and so names no subnet to resolve, passes
+/// [`SourceSubnet::Unresolved`] and is refused on nothing.
+pub fn validate_probe_spec(
+    spec: &ProbeSpec,
+    probe_path: &str,
+    source: &SourceSubnet,
+) -> Result<&'static str, String> {
+    if subnet_id_of(&spec.source_arn).is_none() || *source == SourceSubnet::Absent {
+        return Err(subnet_not_found_message(&spec.source_arn));
     }
     let Some(address_family) = address_family_of(&spec.destination) else {
         return Err(stated_requirement(
@@ -915,10 +1121,11 @@ pub struct Probe {
     pub packet_size: Option<i32>,
     /// Derived from `destination` by [`address_family_of`].
     pub address_family: String,
-    /// The VPC of the source subnet. AWS reads it from the subnet named by
-    /// `source_arn`; a subnet ARN does not carry its VPC id and this emulator
-    /// holds no EC2 subnets, so no stored probe reports one rather than
-    /// reporting a VPC that nothing created.
+    /// The VPC of the source subnet (`Probe$vpcId`: "The ID of the source VPC
+    /// subnet"). A subnet ARN does not carry its VPC id, so this is READ OFF
+    /// what EC2 answered when the create resolved the subnet
+    /// ([`resolve_source_subnet`]) and is `None` otherwise — a probe never
+    /// reports a VPC that nothing created.
     pub vpc_id: Option<String>,
     pub state: String,
     /// When the clock owes this probe its `PENDING` -> `ACTIVE` transition. See

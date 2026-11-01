@@ -39,6 +39,8 @@ mod monitor_state_follows_probe_activation;
 mod probe_report_projection;
 #[path = "all/probe_rules_precede_count_ceilings.rs"]
 mod probe_rules_precede_count_ceilings;
+#[path = "all/probe_source_subnet_resolution.rs"]
+mod probe_source_subnet_resolution;
 #[path = "all/probe_subnet_identity.rs"]
 mod probe_subnet_identity;
 #[path = "all/probe_tag_writes_move_the_monitor.rs"]

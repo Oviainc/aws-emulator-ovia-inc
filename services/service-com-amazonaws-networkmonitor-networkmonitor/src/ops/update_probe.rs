@@ -15,6 +15,12 @@
 //! actually changed — the operation is `@idempotent`, so a repeat of the same
 //! update leaves the record exactly as it was.
 //!
+//! `UpdateProbeInput` binds no `sourceArn`
+//! (`smithy_query(query="operation",operation="UpdateProbe")`), so an update
+//! names no source subnet: the merged record keeps the `sourceArn` the create
+//! already resolved against Amazon EC2, and this operation resolves nothing of
+//! its own ([`crate::state::SourceSubnet::Unresolved`]).
+//!
 //! `state` is the documented activate/deactivate toggle, so only the states a
 //! CALLER may ask for ([`crate::state::SETTABLE_PROBE_STATES`]) are accepted:
 //! the modelled `ProbeState` enum also carries the values the SERVICE assigns
@@ -309,7 +315,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // probe exactly as it was. This operation binds a probe's members at
         // the top level of its own input, so a refusal's clause names them
         // unprefixed (`destination`, not `probe.destination`).
-        let address_family = crate::state::validate_probe_spec(&merged, "").map_err(validation)?;
+        //
+        // It binds no `sourceArn`, so the merged record's source is the one the
+        // create resolved against Amazon EC2 and this call names no subnet to
+        // resolve: the source rule is refused on nothing here.
+        let address_family = crate::state::validate_probe_spec(
+            &merged,
+            "",
+            &crate::state::SourceSubnet::Unresolved,
+        )
+        .map_err(validation)?;
 
         // `modifiedAt` moves only when a stored value actually changed, so a
         // repeat of the same update (the model marks this operation

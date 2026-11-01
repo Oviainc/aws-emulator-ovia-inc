@@ -13,6 +13,12 @@
 //! ([`crate::state::validate_probe_spec`]), so a malformed probe is refused by
 //! the clause naming the member it got wrong.
 //!
+//! The probe's source is a VPC subnet, which is Amazon EC2's resource, so
+//! `probe.sourceArn` is resolved against EC2
+//! ([`crate::state::resolve_source_subnet`]): an ARN naming a subnet EC2 holds
+//! none for is the modelled 400 `ValidationException` and attaches nothing, and
+//! the `vpcId` the stored probe reports is the VPC EC2 holds that subnet in.
+//!
 //! The tags the request assigns the probe (`tags` and `probe.tags`) are a
 //! caller's own, so a key in the namespace AWS reserves for its tags
 //! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is refused with the modelled 400
@@ -247,6 +253,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             packet_size: input.probe.packet_size,
             tags,
         };
+        // `probe.sourceArn` is "The ARN of the subnet": the source is a VPC
+        // subnet, which is EC2's resource, so which subnet it names is resolved
+        // against EC2 rather than taken on trust from the ARN's shape. Asked
+        // BEFORE this service's store is locked, because it is an in-process
+        // call into another service.
+        let source = crate::state::resolve_source_subnet(ctx, &region, &spec.source_arn).await;
 
         let mut store = state.lock();
         store.prune_client_tokens(now);
@@ -279,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so a malformed probe is refused for what it says.
         // `crate::state::build_probe` below applies the same rules when it
         // writes the record.
-        crate::state::validate_probe_spec(&spec, &crate::state::member_path("probe"))
+        crate::state::validate_probe_spec(&spec, &crate::state::member_path("probe"), &source)
             .map_err(validation)?;
         // Only once the probe stands on its own is the request judged on the
         // COUNT ceilings: a probe occupies a slot in its monitor and a slot in
@@ -304,6 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             now,
             &crate::state::member_path("probe"),
+            &source,
         )
         .map_err(validation)?;
         let probe_id = probe.probe_id.clone();
