@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteUniqueId
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteUniqueId`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes records from the match index of a rule-based matching workflow — the index
+//! `GenerateMatchId` writes and `GetMatchId` reads, persisted in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::match_index`] —
+//! so a deleted record stops resolving to the group it belonged to.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteUniqueId::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `uniqueIds` is @required and HEADER-serialized, which means an EMPTY list cannot be
+//! told from an absent one on the wire: both arrive as no header at all, and both earn
+//! the refusal an absent @required member earns (HTTP 400 `ValidationException`,
+//! [`crate::state::messages::batch_delete_unique_id_missing_unique_ids`]), taken before
+//! the store is touched so a refused call changes nothing.
+//!
+//! Every id the request names is answered for: one the workflow holds a record for
+//! (and, when `inputSource` is given, holds it from THAT source) is removed and
+//! reported on `deleted`, and one it holds no such record for is reported on `errors`
+//! with the modelled `VALIDATION_ERROR`. `disconnectedUniqueIds` is then derived from
+//! the index that remains: a record that SURVIVED in a group a deletion took a member
+//! from, and that no rule of the workflow joins to another record any more, is no
+//! longer connected to anything.
+//!
+//! The deletion is applied inside the call, so the status is `COMPLETED`: nothing is
+//! left running behind the response, which is what the other modelled value
+//! (`ACCEPTED`) would claim.
+//!
+//! The work is bounded by the same maxima as the writer's — at most
+//! [`crate::state::MAX_INDEXED_RECORDS_PER_WORKFLOW`] indexed records, and the modelled
+//! rule, matching-key, input-source and schema-field maxima — plus the ids the request
+//! itself carries, each of which is looked up once in an ordered index and answered on
+//! exactly one of the two lists, so the response is the size of the request rather than
+//! a multiple of it. Nothing here GROWS the store: a call only removes records from it.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +169,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteUniqueId` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteUniqueIdErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteUniqueId"))
+        // An access record for the ATTEMPT, emitted before any refusal can return, so a
+        // call that is refused is recorded too. Request metadata only: a `uniqueId`
+        // identifies a customer record, so the ids themselves are not logged.
+        ::tracing::info!(
+            operation = "BatchDeleteUniqueId",
+            workflow_name = %input.workflow_name,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            unique_ids = input.unique_ids.len(),
+            "unique id deletion requested"
+        );
+
+        // `uniqueIds` is @required and bound to a HEADER, so a list of no elements is
+        // indistinguishable on the wire from no header at all: there is no header value
+        // that spells the empty list. Both are the absent @required member, refused with
+        // that violation class's own message — and refused HERE, before the store is
+        // reached, so a rejected call mutates nothing.
+        if input.unique_ids.is_empty() {
+            return Err(BatchDeleteUniqueIdErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    crate::state::messages::batch_delete_unique_id_missing_unique_ids(),
+                ),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchDeleteUniqueIdErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // The workflow has to exist: a name the store does not hold is a 404, and
+        // nothing is removed for it.
+        let workflow = store
+            .matching_workflows
+            .get(&input.workflow_name)
+            .cloned()
+            .ok_or_else(|| {
+                BatchDeleteUniqueIdErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::messages::BATCH_DELETE_UNIQUE_ID_WORKFLOW_NOT_FOUND
+                                .to_string(),
+                        ),
+                    },
+                )
+            })?;
+
+        // The unique ids this operation deletes are the records a RULE-BASED workflow
+        // has indexed — the same index `GenerateMatchId` writes and `GetMatchId` reads —
+        // so a workflow of any other `resolutionType` holds nothing this operation is
+        // defined over, exactly as it serves neither of those two.
+        if workflow.resolution_techniques.resolution_type != crate::state::RULE_MATCHING {
+            return Err(BatchDeleteUniqueIdErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::messages::batch_delete_unique_id_not_rule_based(
+                    &workflow.workflow_name,
+                    &workflow.resolution_techniques.resolution_type,
+                )),
+            })
+            .into());
+        }
+
+        // "The unique IDs to delete" is a SET: an id the request repeats names one
+        // record, so it is answered once rather than deleted once and then reported as
+        // an error for not being there any more. The first occurrence keeps its place,
+        // so both answer lists read in request order.
+        let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        let requested: Vec<String> = input
+            .unique_ids
+            .iter()
+            .filter(|unique_id| seen.insert(unique_id.as_str()))
+            .cloned()
+            .collect();
+
+        let mut deleted: Vec<DeletedUniqueId> = Vec::new();
+        let mut errors: Vec<DeleteUniqueIdError> = Vec::new();
+        // The groups a deletion took a member from, which are the only groups whose
+        // surviving records can have lost their connection.
+        let mut affected_groups: Vec<String> = Vec::new();
+
+        for unique_id in requested {
+            // `inputSource` is "the input source for the batch delete unique ID
+            // operation", so a request that names one deletes only the records that
+            // arrived from it: a record of this `uniqueId` held from ANOTHER source is
+            // not this call's record and is left alone.
+            let targeted = store
+                .match_index
+                .get(&workflow.workflow_name)
+                .and_then(|indexed| indexed.get(&unique_id))
+                .filter(|record| {
+                    input
+                        .input_source
+                        .as_deref()
+                        .is_none_or(|source| record.input_source_arn == source)
+                })
+                .map(|record| record.match_id.clone());
+
+            match targeted {
+                Some(match_id) => {
+                    store.forget_indexed_record(&workflow.workflow_name, &unique_id);
+                    if !affected_groups.contains(&match_id) {
+                        affected_groups.push(match_id);
+                    }
+                    deleted.push(DeletedUniqueId { unique_id });
+                }
+                // The workflow holds no record this call may delete under that id, so
+                // that id's deletion could not complete — which is what the modelled
+                // `VALIDATION_ERROR` reports ("invalid input parameters or data"),
+                // rather than the `SERVICE_ERROR` an internal failure would.
+                None => errors.push(DeleteUniqueIdError {
+                    unique_id,
+                    error_type: crate::state::DELETE_UNIQUE_ID_VALIDATION_ERROR.to_string(),
+                }),
+            }
+        }
+
+        // Derived from the index that REMAINS, never from the request: a record that
+        // survived in a group this call took a member from, and that no rule of the
+        // workflow joins to another indexed record any more, is disconnected. A record
+        // of an untouched group cannot have lost a connection, so none is considered.
+        let survivors: Vec<String> = store
+            .match_index
+            .get(&workflow.workflow_name)
+            .into_iter()
+            .flat_map(|indexed| indexed.values())
+            .filter(|record| affected_groups.contains(&record.match_id))
+            .map(|record| record.unique_id.clone())
+            .collect();
+        let disconnected_unique_ids: Vec<String> = survivors
+            .into_iter()
+            .filter(|unique_id| !store.is_still_connected(&workflow.workflow_name, unique_id))
+            .collect();
+
+        // An access record for the mutation, so a harness can attribute a change of the
+        // match index. Counts and the resource name only: a `uniqueId` identifies a
+        // customer record, so no id is logged.
+        ::tracing::info!(
+            operation = "BatchDeleteUniqueId",
+            workflow_name = %workflow.workflow_name,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            deleted = deleted.len(),
+            errors = errors.len(),
+            disconnected = disconnected_unique_ids.len(),
+            indexed = store.indexed_record_count(&workflow.workflow_name),
+            "unique ids deleted"
+        );
+
+        Ok(BatchDeleteUniqueIdOutput {
+            // The deletion is applied by the time this answers, so it is COMPLETED;
+            // nothing is deferred for the other modelled value to describe.
+            status: crate::state::DELETE_UNIQUE_ID_COMPLETED.to_string(),
+            errors,
+            deleted,
+            disconnected_unique_ids,
+        })
     }
 }

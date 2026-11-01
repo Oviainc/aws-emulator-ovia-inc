@@ -1322,6 +1322,45 @@ pub mod messages {
     /// constant, derived from no other.
     pub const GET_MATCH_ID_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
 
+    /// `BatchDeleteUniqueId`'s `ResourceNotFoundException$message` (HTTP 404) when the
+    /// `workflowName` @httpLabel names no matching workflow. This operation's own
+    /// constant, spelled with the resource type the API uses and in the same form as
+    /// the recorded [`GET_MATCHING_WORKFLOW_NOT_FOUND`].
+    pub const BATCH_DELETE_UNIQUE_ID_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
+
+    /// `BatchDeleteUniqueId`'s `ValidationException$message` (HTTP 400) when the
+    /// workflow it names is not a RULE_MATCHING one.
+    ///
+    /// Composed from the request, exactly as [`generate_match_id_not_rule_based`] and
+    /// [`get_match_id_not_rule_based`] are: the unique ids this operation deletes are
+    /// the records a RULE-BASED workflow has indexed, so a workflow of any other
+    /// `resolutionType` holds nothing this operation is defined over.
+    pub fn batch_delete_unique_id_not_rule_based(
+        workflow_name: &str,
+        resolution_type: &str,
+    ) -> String {
+        format!(
+            "BatchDeleteUniqueId requires a rule-based matching workflow: MatchingWorkflow \
+             {workflow_name} has resolutionTechniques.resolutionType {resolution_type}, not \
+             RULE_MATCHING"
+        )
+    }
+
+    /// `BatchDeleteUniqueId`'s `ValidationException$message` (HTTP 400) when the
+    /// request carries no unique id to delete.
+    ///
+    /// `uniqueIds` is @required and HEADER-serialized
+    /// (`smithy_query(query="operation",operation="BatchDeleteUniqueId")`), so an EMPTY
+    /// list arrives as an absent header — there is no header that spells "a list of no
+    /// elements" — and the refusal is the one an absent @required member earns:
+    /// `1 validation error detected: Value null at 'uniqueIds' failed to satisfy
+    /// constraint: Member must not be null`. It is RECORDED behaviour, and it is built
+    /// through the framework's own rendering of that violation class rather than
+    /// written out, so this refusal and the boundary validator's cannot drift.
+    pub fn batch_delete_unique_id_missing_unique_ids() -> String {
+        ::aws_smithy_schema_server::constraints::missing_member_message(super::UNIQUE_IDS_MEMBER)
+    }
+
     /// `GenerateMatchId`'s `ValidationException$message` (HTTP 400) when the workflow
     /// it names is not a RULE_MATCHING one.
     ///
@@ -1493,11 +1532,10 @@ pub mod messages {
     /// optimistic-concurrency refusal the member's own doc implies ("a unique
     /// identifier for the CURRENT revision of the policy").
     ///
-    /// Not recorded. Built from the request: it names the token the caller sent, which
-    /// is what tells them their copy of the policy is out of date and must be re-read.
-    pub fn stale_policy_token(token: &str) -> String {
-        format!("The policy token {token} is not the current revision of this resource's policy")
-    }
+    /// RECORDED from AWS: the text is FIXED and carries nothing of the request. In
+    /// particular it does not echo the token the caller sent, which is a value a write
+    /// mints per revision, so one refusal reads the same as every other.
+    pub const STALE_POLICY_TOKEN: &str = "Policy put request failed. Incorrect token.";
 
     /// `PutPolicy`'s `ValidationException$message` (HTTP 400) when `policy` is not a
     /// JSON document.
@@ -1620,6 +1658,73 @@ pub const MIN_RECORDS_PER_CALL: usize = 1;
 /// The upper bound of the modelled `records` `length` range — see
 /// [`MIN_RECORDS_PER_CALL`].
 pub const MAX_RECORDS_PER_CALL: usize = 1;
+
+/// The member `BatchDeleteUniqueId` takes the ids to delete on
+/// (`BatchDeleteUniqueIdInput$uniqueIds`), as the validation envelope spells a member
+/// path. Named here because the refusal of a request that carries none states it.
+pub const UNIQUE_IDS_MEMBER: &str = "uniqueIds";
+
+/// `DeleteUniqueIdStatus$COMPLETED` — "the status of the batch delete unique ID
+/// operation" when the deletion is DONE by the time the call answers
+/// (`smithy_query(query="shape",shape="DeleteUniqueIdStatus")` → `COMPLETED |
+/// ACCEPTED`).
+///
+/// This emulator's real-time match index lives in memory and is updated inside the
+/// call, so a `BatchDeleteUniqueId` that returns has already applied every deletion it
+/// reports: nothing is left running behind the response, which is what the other value
+/// (`ACCEPTED`) would claim.
+pub const DELETE_UNIQUE_ID_COMPLETED: &str = "COMPLETED";
+
+/// `DeleteUniqueIdErrorType$VALIDATION_ERROR` — the per-id error type whose own doc is
+/// "the deletion operation couldn't complete because of invalid input parameters or
+/// data" (`smithy_query(query="shape",shape="DeleteUniqueIdError")`).
+///
+/// The type reported for a `uniqueId` the workflow holds no record for: the request
+/// names data that is not there, so that id's deletion cannot complete. The other
+/// value, `SERVICE_ERROR`, is "an internal service-side problem", which is not what a
+/// request naming an unknown record is.
+pub const DELETE_UNIQUE_ID_VALIDATION_ERROR: &str = "VALIDATION_ERROR";
+
+/// The order this service STATES the `IdNamespaceType` value set in when it refuses a
+/// value outside it.
+///
+/// A service states an enum's value set in its own published order, which is not the
+/// order that set reaches a refusal in (the order the MODEL declares the enum's members
+/// in): `IdNamespaceType` is declared `SOURCE, TARGET`
+/// (`smithy_query(query="shape",shape="IdNamespaceType")`), and the refusal of a value
+/// outside it lists the set in THIS order. It is FIXED text — no member of the request
+/// and nothing in the store varies it.
+///
+/// It holds exactly the values the model declares for that enum, reordered and nothing
+/// else, which the `enum_value_set_order` suite pins against
+/// `crate::ops::types::ID_NAMESPACE_TYPE_VALUES`.
+pub const ID_NAMESPACE_TYPE_VALUE_SET: [&str; 2] = ["TARGET", "SOURCE"];
+
+/// Every enum value set this service publishes an order for.
+///
+/// One row per enum whose stated order is known to differ from its declaration order;
+/// a value set absent from this table is stated as the model declares it, because this
+/// service has shown no other order for it.
+const PUBLISHED_ENUM_VALUE_SETS: &[&[&str]] = &[&ID_NAMESPACE_TYPE_VALUE_SET];
+
+/// The order this service states `values` in, when `values` is the value set of an
+/// enum whose order it publishes ([`PUBLISHED_ENUM_VALUE_SETS`]); `None` for any other
+/// value set.
+///
+/// An enum is recognised by its value SET rather than by the member that carried the
+/// rejected value, so every member targeting one enum — of any operation, at any depth
+/// — states that enum's set in the one order, and a set this service publishes no
+/// order for keeps the order it was presented in. The match is on membership and size,
+/// never on position, so a model revision that reordered its own declaration of the
+/// same enum would still be stated in the published order.
+pub fn published_enum_value_set(values: &[String]) -> Option<&'static [&'static str]> {
+    PUBLISHED_ENUM_VALUE_SETS.iter().copied().find(|published| {
+        published.len() == values.len()
+            && published
+                .iter()
+                .all(|value| values.iter().any(|presented| presented == value))
+    })
+}
 
 /// What the comparison value of a matching key joins its fields' values with.
 ///
@@ -2206,6 +2311,61 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
     /// [`MAX_MATCHING_WORKFLOWS`] self-healing.
     pub fn release_match_index(&mut self, workflow_name: &str) {
         self.match_index.remove(workflow_name);
+    }
+
+    /// Forget the ONE record `unique_id` names in `workflow_name`'s index, and report
+    /// it as it was stored — `None` when the workflow had indexed no such record.
+    ///
+    /// The per-record counterpart of [`Self::release_match_index`], and the only way a
+    /// record leaves the index while its workflow lives: `BatchDeleteUniqueId` is
+    /// "Deletes multiple unique IDs in a matching workflow"
+    /// (`smithy_query(query="doc",shape="BatchDeleteUniqueId")`), so what it removes is
+    /// the indexed record, after which no reader of the index resolves that record any
+    /// more. A workflow left holding nothing drops its (now empty) index entry, so the
+    /// map stays bounded by the workflows that actually hold a record.
+    pub fn forget_indexed_record(
+        &mut self,
+        workflow_name: &str,
+        unique_id: &str,
+    ) -> Option<IndexedRecord> {
+        let indexed = self.match_index.get_mut(workflow_name)?;
+        let removed = indexed.remove(unique_id);
+        if indexed.is_empty() {
+            self.match_index.remove(workflow_name);
+        }
+        removed
+    }
+
+    /// Is the record `unique_id` names in `workflow_name` still joined to another
+    /// record of that workflow by one of its rules?
+    ///
+    /// Asked of a record that SURVIVED a deletion, to decide whether it is still
+    /// connected to anything: a record no rule of the workflow joins to any OTHER
+    /// indexed record stands alone, which is what makes it a disconnected one. The
+    /// comparison is the same rule walk every other answer in this module comes from
+    /// ([`Self::resolve_by_rules`]), with the record itself excluded, and the
+    /// normalization is the one its own input source asks for, so a record's
+    /// connectedness is judged exactly as its matching was.
+    pub fn is_still_connected(&self, workflow_name: &str, unique_id: &str) -> bool {
+        let Some(record) = self
+            .match_index
+            .get(workflow_name)
+            .and_then(|indexed| indexed.get(unique_id))
+        else {
+            return false;
+        };
+        let Some(workflow) = self.matching_workflows.get(workflow_name) else {
+            return false;
+        };
+        let normalize = normalization_for_source(workflow, &record.input_source_arn);
+        self.resolve_by_rules(
+            workflow_name,
+            workflow,
+            &record.record_attribute_map,
+            normalize,
+            Some(unique_id),
+        )
+        .is_some()
     }
 
     /// Every record of `workflow_name` that belongs to the group `match_id`, in

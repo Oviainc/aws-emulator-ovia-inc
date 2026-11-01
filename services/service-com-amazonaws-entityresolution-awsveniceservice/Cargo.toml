@@ -8,6 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `addresses_modeled_http_route`: the one reader that decides which operation a request
+# ADDRESSES when the REST router's required-header discrimination matched no route.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

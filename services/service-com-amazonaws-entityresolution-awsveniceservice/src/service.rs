@@ -21,11 +21,14 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. Edited here: a request that carries no value for a `@required`
+//!   `@httpHeader` member matches no route at all, because the REST router reads
+//!   such a member as a route discriminator, so it is matched against the route
+//!   the operation's own `@http` binding gives it and that operation serves it.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. Edited here: an enumerated type's value set is stated
+//!   in the order THIS service states it in, which is not the order the set reaches
+//!   the seam in; every other refusal keeps the framework's own wording.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -41,9 +44,43 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Operation, Refusal, Refused, Service,
+    Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The operation the model's own routing table names for `req`.
+fn modeled_operation<'d>(
+    definition: &'d dyn ErasedServiceDefinition,
+    req: &aws_smithy_runtime_api::http::Request,
+) -> Option<&'d dyn ErasedOperation> {
+    let key = definition.protocol().routing_key(req).ok()?;
+    definition.routing_table().get(key)
+}
+
+/// The same violation with its enum value set in the order this service STATES that
+/// enum's values in.
+///
+/// A refusal of a value outside an enumerated type names the values that type admits,
+/// and the order it names them in is the SERVICE's: the order a value set reaches this
+/// seam in is the order the model happens to declare that enum's members in, while the
+/// service has its own published order for the sets it publishes one for
+/// ([`crate::state::published_enum_value_set`]). The enum is recognised by its value
+/// SET, so one enum is stated the same way for every member targeting it, in any
+/// operation and at any depth; a set this service publishes no order for, and every
+/// other violation kind, is returned unchanged.
+fn in_stated_enum_order(violation: &Violation) -> Violation {
+    let ViolationKind::EnumValue(values) = &violation.kind else {
+        return violation.clone();
+    };
+    let Some(stated) = crate::state::published_enum_value_set(values) else {
+        return violation.clone();
+    };
+    Violation {
+        kind: ViolationKind::EnumValue(stated.iter().map(|value| (*value).to_string()).collect()),
+        ..violation.clone()
+    }
+}
 
 /// The `com-amazonaws-entityresolution-awsveniceservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +89,13 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// `BatchDeleteUniqueId`, built from the SAME shared engine the generated entry
+    /// threads into every operation, so this instance and the rest of the service read
+    /// one store. Held because [`Service::override_operation`] hands back a BORROW of an
+    /// operation, and this is the one operation of this service whose route the REST
+    /// router keys on a `@required` `@httpHeader` member (see
+    /// [`EmulatedService::header_keyed_operation`]).
+    batch_delete_unique_id: crate::ops::batch_delete_unique_id::BatchDeleteUniqueId<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,8 +104,46 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            batch_delete_unique_id:
+                crate::ops::batch_delete_unique_id::BatchDeleteUniqueId::new(engine),
         }
+    }
+
+    /// The operation of this service whose own `@http` route `req` ADDRESSES, among the
+    /// ones whose route the REST router keys on a `@required` `@httpHeader` member, or
+    /// `None` when `req` addresses none of them.
+    ///
+    /// The framework's REST router treats such a member as a route DISCRIMINATOR: it
+    /// rejects a candidate route whose `@required` header bindings are absent from the
+    /// request, which is how an S3-class model tells several operations apart on ONE
+    /// method + URI template by the shape of the request. This service overloads no
+    /// route — every method + URI template it publishes names exactly one operation — so
+    /// for a request that binds no value for such a member the rule can only misfire:
+    /// the request matches NO route and is answered "unknown operation" (HTTP 501, a
+    /// status no operation here models) instead of reaching the operation the model
+    /// binds to its method and path, which models `ValidationException` for exactly this
+    /// mistake.
+    ///
+    /// `BatchDeleteUniqueId$uniqueIds` is the one such member this model declares
+    /// (`@required` + `@httpHeader "uniqueIds"`,
+    /// `smithy_query(query="operation",operation="BatchDeleteUniqueId")`); every other
+    /// operation binds its `@required` members to the path or the body, so its route
+    /// always resolves and it is never reached this way. And a LIST bound to a header is
+    /// exactly where the misfire is reachable through a legitimate call: a list of no
+    /// elements has no header form at all, so a caller that submits one sends no header.
+    /// No method or URI template is written out here: the candidate is matched through
+    /// the shared reader (`service_common::addresses_modeled_http_route`) against the
+    /// route its OWN input schema's `@http` binding gives it, so this seam cannot drift
+    /// from the model and the operation can only ever serve the route the model binds to
+    /// it.
+    fn header_keyed_operation(
+        &self,
+        req: &aws_smithy_runtime_api::http::Request,
+    ) -> Option<&dyn ErasedOperation> {
+        let schema = <crate::ops::batch_delete_unique_id::BatchDeleteUniqueId<Eng> as Operation>::INPUT_SCHEMA;
+        service_common::addresses_modeled_http_route(req, schema)
+            .then_some(&self.batch_delete_unique_id as &dyn ErasedOperation)
     }
 }
 
@@ -87,26 +169,55 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // The model's own routing table is asked FIRST and is left to resolve every
+        // request it can name. What it cannot name is a request that binds no value for
+        // a `@required` `@httpHeader` member of the operation the model binds to its
+        // method and path: the REST router reads such a member as a route discriminator
+        // and matches no route at all, so the request would be answered "unknown
+        // operation" (HTTP 501) although the operation is implemented and models a
+        // client-input error for exactly this mistake. Such a request is therefore
+        // matched against the route the candidate operation's own `@http` binding gives
+        // it ([`EmulatedService::header_keyed_operation`]), and that operation then
+        // answers it from the request's OWN values — refusing the absent member as an
+        // absent `@required` member of the same operation bound to the path or the body
+        // already is.
+        if modeled_operation(self.definition(), req).is_some() {
+            return None;
+        }
+        self.header_keyed_operation(req)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // wording.
+        //
+        // ONE thing this service states differently: an enumerated type's value
+        // set is listed in the order the service publishes for that enum
+        // ([`in_stated_enum_order`]) rather than the order the set reaches this
+        // seam in. The code, the envelope, the member paths, the echoed value and
+        // every other requirement stay the framework's, so nothing else can drift.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        let restated: Vec<Violation> = violations.iter().map(in_stated_enum_order).collect();
+        // A refusal this service states exactly as the framework already does keeps
+        // the framework's own rendering rather than being re-rendered here, so the
+        // blast radius stays on the rule above.
+        if restated == *violations {
+            return None;
+        }
+        Some(Refused {
+            // The code a constraint refusal carries on this service's restJson1
+            // envelope — the same one the framework's default picks, supplied here
+            // because a chosen message must travel with its matching code.
+            code: "ValidationException".to_string(),
+            // The same envelope the framework renders (`1 validation error
+            // detected: …`), built from the restated violations so the clause
+            // wording stays in the one place that owns it.
+            message: aws_smithy_schema_server::constraints::envelope(&restated)?,
+        })
     }
 
     fn override_routing_error(

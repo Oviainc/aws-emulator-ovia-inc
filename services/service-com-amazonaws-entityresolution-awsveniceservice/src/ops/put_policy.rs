@@ -231,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|policy| policy.token.as_str());
             if current != Some(token.as_str()) {
                 return Err(PutPolicyErrorModeled::ConflictException(ConflictException {
-                    message: Some(crate::state::messages::stale_policy_token(token)),
+                    message: Some(crate::state::messages::STALE_POLICY_TOKEN.to_string()),
                 })
                 .into());
             }

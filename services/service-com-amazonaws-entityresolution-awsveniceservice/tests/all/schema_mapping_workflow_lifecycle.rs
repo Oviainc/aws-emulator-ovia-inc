@@ -97,6 +97,19 @@ impl Emulator {
         self.call_in_region(REGION, method, path, body).await
     }
 
+    /// The same call carrying extra request HEADERS, which is the only way to drive an
+    /// operation whose input members are `@httpHeader`-bound: the value is sent
+    /// verbatim, so a suite can cover the wire forms a list-valued header takes.
+    pub(crate) async fn call_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        headers: &[(&str, String)],
+    ) -> Reply {
+        self.dispatch(REGION, method, path, body, headers).await
+    }
+
     /// The same call, signed for `region` and addressed to that region's endpoint:
     /// what a client configured for another Region sends. A region-scoped ARN is read
     /// from this scope, so this is how a suite covers more than one of them.
@@ -107,16 +120,33 @@ impl Emulator {
         path: &str,
         body: Option<&Value>,
     ) -> Reply {
+        self.dispatch(region, method, path, body, &[]).await
+    }
+
+    /// The one place a request is built and dispatched, so every call above — with or
+    /// without extra headers, in any region — travels the same path.
+    async fn dispatch(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        headers: &[(&str, String)],
+    ) -> Reply {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(value).expect("a request body serializes")
         });
-        let request = http::Request::builder()
+        let mut builder = http::Request::builder()
             .method(method)
             .uri(format!(
                 "https://entityresolution.{region}.amazonaws.com{path}"
             ))
             .header("authorization", signed_for(region))
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, value);
+        }
+        let request = builder
             .body(bytes::Bytes::from(payload))
             .expect("a well-formed request");
 
