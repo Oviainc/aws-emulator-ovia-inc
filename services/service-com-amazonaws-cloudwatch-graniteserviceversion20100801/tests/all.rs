@@ -143,6 +143,8 @@ mod metric_stream_value_rules;
 mod metric_streams;
 #[path = "all/metrics_and_alarms.rs"]
 mod metrics_and_alarms;
+#[path = "all/metrics_scalar_exclusion.rs"]
+mod metrics_scalar_exclusion;
 #[path = "all/missing_series_alarms.rs"]
 mod missing_series_alarms;
 #[path = "all/not_found_messages.rs"]
