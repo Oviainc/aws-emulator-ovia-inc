@@ -316,6 +316,10 @@ async fn a_task_page_token_only_resumes_its_own_listing() {
         "?NextToken=ff".to_string(),
         // Well-formed hex, but not a cursor this operation ever minted.
         format!("?NextToken={}", hex::encode("1\u{1f}x")),
+        // The same, with all three fields a minted cursor carries: the shape alone is
+        // not what makes a token one this service issued (see
+        // `crate::task_page_token_minting` for that rule's own table).
+        format!("?NextToken={}", hex::encode("0\u{1f}\u{1f}")),
     ] {
         let response = list(&polly, &mismatched).await;
         assert_eq!(

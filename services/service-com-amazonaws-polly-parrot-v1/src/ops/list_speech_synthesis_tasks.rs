@@ -14,9 +14,12 @@
 //! that names it gets at most that many tasks and a `NextToken` while a further one
 //! exists, and a request that names none gets every matching task in one response with
 //! no `NextToken`. The model declares no default page size, so the report a caller did
-//! not bound is not truncated at one. A `NextToken` that names no position — the empty
+//! not bound is not truncated at one. A `NextToken` that names NO position — the empty
 //! one the model admits — is no token at all
-//! ([`crate::state::requested_page_token`]), so it is answered with the first page.
+//! ([`crate::state::requested_page_token`]), so it is answered with the first page; a
+//! `NextToken` that names one is honoured only when it carries this store's
+//! authenticator over the position it names ([`crate::state::PageTokenKey`]), so a
+//! position a caller chose is refused rather than served.
 //!
 //! One response still materialises at most [`REPORT_MATERIALISATION_CEILING`] tasks —
 //! not a page size, but the window this handler will ever build in memory at once, so
@@ -156,17 +159,38 @@ const CURSOR_SEPARATOR: char = '\u{1f}';
 /// next page skip or repeat a task. The filter travels with it because a position
 /// under one filter means nothing under another; [`decode_task_cursor`] refuses such
 /// a token rather than serving a silently wrong page.
-fn encode_task_cursor(created_millis: i64, task_id: &str, status: Option<&str>) -> String {
-    crate::state::encode_page_token(&format!(
-        "{created_millis}{CURSOR_SEPARATOR}{task_id}{CURSOR_SEPARATOR}{}",
-        status.unwrap_or_default()
-    ))
+///
+/// The token is minted under this store's page-token key, so what comes back is a token
+/// this service ISSUED and not merely one of the right shape.
+fn encode_task_cursor(
+    key: &crate::state::PageTokenKey,
+    created_millis: i64,
+    task_id: &str,
+    status: Option<&str>,
+) -> String {
+    crate::state::encode_page_token(
+        key,
+        &format!(
+            "{created_millis}{CURSOR_SEPARATOR}{task_id}{CURSOR_SEPARATOR}{}",
+            status.unwrap_or_default()
+        ),
+    )
 }
 
 /// The order key a `NextToken` resumes after, or `None` if this service did not mint
 /// the token or minted it for a different `Status` filter.
-fn decode_task_cursor(token: &str, status: Option<&str>) -> Option<(i64, String)> {
-    let cursor = crate::state::decode_page_token(token)?;
+///
+/// The first test is the one the caller cannot pass by construction: the token must
+/// carry this store's authenticator over the cursor it travels with
+/// ([`crate::state::decode_page_token`]), so a hand-built token of the right shape names
+/// no position at all. Only then does the cursor's own content decide, and a cursor
+/// minted under another `Status` filter is refused too.
+fn decode_task_cursor(
+    key: &crate::state::PageTokenKey,
+    token: &str,
+    status: Option<&str>,
+) -> Option<(i64, String)> {
+    let cursor = crate::state::decode_page_token(key, token)?;
     let mut fields = cursor.split(CURSOR_SEPARATOR);
     let created_millis = fields.next()?.parse::<i64>().ok()?;
     let task_id = fields.next()?.to_string();
@@ -229,24 +253,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A token that names a position must be one this service minted, for this
-        // request's filter; anything else is refused before any state is read, so a
-        // garbage or foreign token can never read as "first page". The message is the
-        // service's fixed one for this code, so it says nothing about the token the
-        // caller sent. A token that names NO position — the empty one the model admits,
-        // which is what a bare `?NextToken=` binds to — is no token at all, exactly as
-        // this service's other reads take it, so it starts at the first page.
-        let after = match crate::state::requested_page_token(input.next_token.as_deref()) {
-            Some(token) => Some(
-                decode_task_cursor(token, input.status.as_deref()).ok_or_else(|| {
-                    ListSpeechSynthesisTasksErrorModeled::InvalidNextTokenException(
-                        crate::service::errors::invalid_next_token(),
-                    )
-                })?,
-            ),
-            None => None,
-        };
-
         // The page bound the CALLER asked for, and the only one there is. `None` means
         // the caller bounded nothing, so the whole matching report is owed in one
         // response, up to the ceiling on what one response materialises. The boundary
@@ -270,6 +276,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // status it filters on and the status it reports are the same one.
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
+        // The key this store mints and recognises its own page tokens under. Copied out
+        // before the task store is borrowed, so the same call can check the token it was
+        // handed and then read the tasks.
+        let page_token_key = guard.page_token_key();
+
+        // A token that names a position must be one this service minted, for this
+        // request's filter; anything else is refused before any task is read, so a
+        // garbage, forged or foreign token can never read as "first page". The message is
+        // the service's fixed one for this code, so it says nothing about the token the
+        // caller sent. A token that names NO position — the empty one the model admits,
+        // which is what a bare `?NextToken=` binds to — is no token at all, exactly as
+        // this service's other reads take it, so it starts at the first page.
+        let after = match crate::state::requested_page_token(input.next_token.as_deref()) {
+            Some(token) => Some(
+                decode_task_cursor(&page_token_key, token, input.status.as_deref()).ok_or_else(
+                    || {
+                        ListSpeechSynthesisTasksErrorModeled::InvalidNextTokenException(
+                            crate::service::errors::invalid_next_token(),
+                        )
+                    },
+                )?,
+            ),
+            None => None,
+        };
         // The task store as of NOW, exactly as `GetSpeechSynthesisTask` reads it: a task
         // whose retention window has run out is no longer held, and a transition the
         // clock ALREADY owed a task it still holds is materialised while one not yet due
@@ -308,7 +338,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = if has_further_page {
             matching.last().map(|last| {
                 let (created_millis, task_id) = order_key(last);
-                encode_task_cursor(created_millis, task_id, input.status.as_deref())
+                encode_task_cursor(
+                    &page_token_key,
+                    created_millis,
+                    task_id,
+                    input.status.as_deref(),
+                )
             })
         } else {
             None
@@ -334,30 +369,51 @@ mod tests {
     /// is rejected rather than read as "start from the beginning".
     #[test]
     fn task_cursors_round_trip_and_reject_foreign_tokens() {
+        let key = crate::state::PageTokenKey::new();
         for (millis, task_id, status) in [
             (0_i64, "a", None),
             (1_761_000_000_000, "task-1", None),
             (1_761_000_000_001, "TASK_2", Some("completed")),
             (i64::MAX, "z", Some("inProgress")),
         ] {
-            let token = encode_task_cursor(millis, task_id, status);
+            let token = encode_task_cursor(&key, millis, task_id, status);
             assert_eq!(
-                decode_task_cursor(&token, status),
+                decode_task_cursor(&key, &token, status),
                 Some((millis, task_id.to_string())),
                 "cursor ({millis}, {task_id:?}, {status:?}): token {token:?} did not round-trip"
             );
             // The same position under a different filter is not the same cursor.
             let other = Some("failed");
             assert_eq!(
-                decode_task_cursor(&token, other),
+                decode_task_cursor(&key, &token, other),
                 None,
                 "cursor ({millis}, {task_id:?}, {status:?}): must not resume filter {other:?}"
             );
+            // The same cursor minted under another store's key is not this store's
+            // token, whatever filter it is presented with.
+            let foreign =
+                encode_task_cursor(&crate::state::PageTokenKey::new(), millis, task_id, status);
+            assert_eq!(
+                decode_task_cursor(&key, &foreign, status),
+                None,
+                "cursor ({millis}, {task_id:?}, {status:?}): a token of another key must be refused"
+            );
         }
 
-        for garbage in ["not-hex", "abc", "ff", "fffe", &::hex::encode("1")] {
+        // Shape failures, and well-formed three-field cursors nothing authenticated:
+        // the position a forger would most like to be served (the first page) and one
+        // far in the future (an empty page).
+        for garbage in [
+            "not-hex",
+            "abc",
+            "ff",
+            "fffe",
+            &::hex::encode("1"),
+            &::hex::encode(format!("0{CURSOR_SEPARATOR}{CURSOR_SEPARATOR}")),
+            &::hex::encode(format!("99999999999999{CURSOR_SEPARATOR}z{CURSOR_SEPARATOR}")),
+        ] {
             assert_eq!(
-                decode_task_cursor(garbage, None),
+                decode_task_cursor(&key, garbage, None),
                 None,
                 "garbage token {garbage:?}: expected no cursor"
             );

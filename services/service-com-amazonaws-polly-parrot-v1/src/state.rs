@@ -22,6 +22,10 @@
 //!   every task read reaches the store through
 //!   [`ComAmazonawsPollyParrotV1State::retained_synthesis_tasks`], which materialises
 //!   what the clock already owes it.
+//!
+//! The state also carries the secret the paginated reads mint their `NextToken`s under
+//! ([`PageTokenKey`]), which is what lets a read tell a continuation token this service
+//! issued from one a caller built.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -273,6 +277,11 @@ pub struct ComAmazonawsPollyParrotV1State {
     /// Speech synthesis tasks by `TaskId`. Ordered for the same reason as the
     /// lexicons: `ListSpeechSynthesisTasks` pages deterministically over it.
     pub synthesis_tasks: BTreeMap<String, StoredSynthesisTask>,
+    /// The secret this store's `NextToken`s are authenticated under. PRIVATE, and
+    /// reached only through [`ComAmazonawsPollyParrotV1State::page_token_key`]: a key a
+    /// caller could read or replace would no longer tell a token this service minted
+    /// from one it did not.
+    page_token_key: PageTokenKey,
 }
 
 impl ComAmazonawsPollyParrotV1State {
@@ -319,6 +328,17 @@ impl ComAmazonawsPollyParrotV1State {
         self.lexicons.remove(&LexiconKey::new(region, name))
     }
 
+    /// The key the paginated reads of this store mint and recognise their `NextToken`s
+    /// under. Copied out rather than borrowed, so a read can check the token it was
+    /// handed and go on to borrow the task store in the same call.
+    ///
+    /// `pub(crate)`: only this crate's own paginated read needs the key, and a key
+    /// anything else could copy out would no longer tell a token this service minted
+    /// from one it did not.
+    pub(crate) fn page_token_key(&self) -> PageTokenKey {
+        self.page_token_key
+    }
+
     /// Materialise everything the CLOCK already owes the task store at `now`, and
     /// answer the tasks that are left.
     ///
@@ -355,6 +375,8 @@ impl Default for ComAmazonawsPollyParrotV1State {
             // catalog that only appears after some other call would report an
             // empty voice list to the first caller.
             voices: VOICE_CATALOG.to_vec(),
+            // One key per store, from the system's randomness: see `PageTokenKey`.
+            page_token_key: PageTokenKey::new(),
         }
     }
 }
@@ -455,21 +477,33 @@ pub fn is_task_id(task_id: &str) -> bool {
 // Pagination tokens
 // ---------------------------------------------------------------------------
 
-/// Encode a page cursor as an opaque `NextToken`.
+/// The secret this service's page tokens are authenticated under — the shared one every
+/// paginated read of this emulator uses, so no two services disagree about what makes a
+/// continuation token one the service ISSUED.
 ///
-/// Hex rather than the bare cursor so the token is opaque to a caller (it must be
-/// round-tripped, not constructed) and so a corrupted one is *detectable*:
-/// [`decode_page_token`] rejects anything that is not hex of UTF-8, which is what
-/// lets the paginated reads answer `InvalidNextTokenException` instead of silently
-/// restarting from the first page.
-pub fn encode_page_token(cursor: &str) -> String {
-    ::hex::encode(cursor)
+/// A continuation token carries the position itself (there is no page kept on the side to
+/// look up), so only the authenticator over that position tells a token this store minted
+/// from one a caller wrote. A token minted under another store's key — another emulator
+/// process, a restarted one — names no position here either.
+pub use ::service_common::page_tokens::PageTokenKey;
+
+/// Encode `cursor` as an opaque `NextToken` this store can later recognise as its own:
+/// the authenticated bytes of the cursor, hex-encoded.
+///
+/// Hex is this service's spelling for an opaque token — it is what makes the value one a
+/// caller round-trips rather than constructs, and a corrupted one detectable — while the
+/// authenticator inside makes a token the service did NOT mint detectable too, which is
+/// what lets a paginated read answer `InvalidNextTokenException` instead of silently
+/// serving a page from a position the caller chose.
+pub fn encode_page_token(key: &PageTokenKey, cursor: &str) -> String {
+    ::hex::encode(key.mint(cursor))
 }
 
-/// Decode a `NextToken` produced by [`encode_page_token`]; `None` for any token
-/// this service did not mint.
-pub fn decode_page_token(token: &str) -> Option<String> {
-    String::from_utf8(::hex::decode(token).ok()?).ok()
+/// The cursor a `NextToken` carries, or `None` for any token THIS store did not mint —
+/// one that is not hex, one too short to carry an authenticator, one whose authenticator
+/// does not match the cursor it travels with, and one whose cursor is not UTF-8.
+pub fn decode_page_token(key: &PageTokenKey, token: &str) -> Option<String> {
+    key.cursor_of(&::hex::decode(token).ok()?)
 }
 
 /// The position a request's `NextToken` names, or `None` when it names none.
@@ -983,24 +1017,90 @@ mod tests {
         );
     }
 
-    /// A page token round-trips, and anything else is rejected rather than read as
-    /// "start from the beginning".
+    /// The secret behind the tokens is not in a rendering of the key, nor of the state
+    /// that holds it: a minted token is the caller's, the key never leaves the process.
     #[test]
-    fn page_tokens_round_trip_and_reject_garbage() {
-        for cursor in ["", "A", "MyLexicon", "zzzz"] {
-            let token = encode_page_token(cursor);
+    fn a_debug_rendering_carries_no_page_token_key_material() {
+        let state = ComAmazonawsPollyParrotV1State::default();
+        let key = state.page_token_key();
+        let rendered = format!("{key:?} {state:?}");
+        assert!(
+            rendered.contains("PageTokenKey(..)"),
+            "the key must render redacted, got {rendered:?}"
+        );
+        // A minted token is the caller's to hold; the secret behind it is not, so no
+        // rendering may carry the bytes a second token could be minted with.
+        let token = encode_page_token(&key, "a cursor");
+        assert!(
+            !rendered.contains(&token),
+            "case {token:?}: a rendering must not carry key material"
+        );
+    }
+
+    /// A page token round-trips under the key that minted it, and anything that key did
+    /// not mint is rejected rather than read as "start from the beginning" — including
+    /// a well-formed token of another key, and a minted token with a byte changed.
+    #[test]
+    fn page_tokens_round_trip_and_reject_tokens_this_store_did_not_mint() {
+        let key = PageTokenKey::new();
+        let other = PageTokenKey::new();
+        for cursor in ["", "A", "MyLexicon", "zzzz", "1761000000000\u{1f}task\u{1f}"] {
+            let token = encode_page_token(&key, cursor);
             assert_eq!(
-                decode_page_token(&token).as_deref(),
+                decode_page_token(&key, &token).as_deref(),
                 Some(cursor),
                 "cursor {cursor:?}: token {token:?} did not round-trip"
             );
+            assert_eq!(
+                decode_page_token(&other, &token),
+                None,
+                "cursor {cursor:?}: token {token:?} must not decode under another key"
+            );
+
+            // The same cursor with an authenticator the caller made up: the shape is
+            // exactly a minted token's, so only the authenticator can refuse it.
+            let forged = ::hex::encode(
+                [
+                    &[0_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES][..],
+                    cursor.as_bytes(),
+                ]
+                .concat(),
+            );
+            assert_eq!(
+                decode_page_token(&key, &forged),
+                None,
+                "cursor {cursor:?}: forged token {forged:?} must not decode"
+            );
+
+            // Every single-byte change to a minted token, in the authenticator and in
+            // the cursor.
+            let minted = ::hex::decode(&token).expect("a minted token is hex");
+            for index in 0..minted.len() {
+                let mut tampered = minted.clone();
+                tampered[index] ^= 0x01;
+                let tampered = ::hex::encode(tampered);
+                assert_eq!(
+                    decode_page_token(&key, &tampered),
+                    None,
+                    "cursor {cursor:?}: byte {index} flipped ({tampered:?}) must not decode"
+                );
+            }
         }
-        // Not hex at all, odd-length hex, and hex of bytes that are not UTF-8.
-        for garbage in ["not-hex", "abc", "ff", "fffe"] {
+
+        // Not hex at all, odd-length hex, hex too short to carry an authenticator, and
+        // hex of bytes that are not UTF-8.
+        for garbage in [
+            "not-hex",
+            "abc",
+            "ff",
+            "fffe",
+            &::hex::encode("1\u{1f}x\u{1f}"),
+            &::hex::encode([0xff_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES + 1]),
+        ] {
             assert!(
-                decode_page_token(garbage).is_none(),
+                decode_page_token(&key, garbage).is_none(),
                 "garbage token {garbage:?}: expected no cursor, got {:?}",
-                decode_page_token(garbage)
+                decode_page_token(&key, garbage)
             );
         }
     }

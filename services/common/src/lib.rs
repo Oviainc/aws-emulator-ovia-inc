@@ -316,6 +316,9 @@ pub mod management_events;
 /// template request with, and the mapping skeleton the other does.
 pub mod model_mapping_template;
 pub mod network;
+/// The ONE way a service tells a continuation token it ISSUED from one a caller built,
+/// for every paginated read whose `NextToken` carries the position inside it.
+pub mod page_tokens;
 /// A floating-point member of a response rendered the way AWS renders one — with a
 /// fractional part — which the framework's XML writer drops for a whole value.
 pub mod query_decimal_floats;
