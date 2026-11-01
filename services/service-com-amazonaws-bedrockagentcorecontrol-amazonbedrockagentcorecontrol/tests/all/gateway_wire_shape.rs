@@ -251,6 +251,9 @@ async fn every_reported_date_time_member_is_an_rfc3339_string() {
         &format!("/gateways/{gateway_id}/targets/{target_id}/"),
         REGION,
         Some(&json!({
+            // `credentialProviderConfigurations` is `@required` on the response, so an
+            // update that defines none is refused before it reports any wire form.
+            "credentialProviderConfigurations": [{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
             "targetConfiguration": {
                 "mcp": {"openApiSchema": {"inlinePayload": "{\"openapi\":\"3.1.0\"}"}}
             }

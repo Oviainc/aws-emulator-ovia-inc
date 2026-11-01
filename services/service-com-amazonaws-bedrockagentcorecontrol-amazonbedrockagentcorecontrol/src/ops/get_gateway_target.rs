@@ -195,20 +195,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
             GetGatewayTargetErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    crate::state::ACTION_RETRIEVE,
-                    crate::state::RESOURCE_GATEWAY,
-                ),
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
             )
         })?;
         // A target id naming no target OF THIS GATEWAY is the same modelled 404 as
         // an unknown gateway: the target is addressed only through its gateway.
         let target = gateway.targets.get(&input.target_id).ok_or_else(|| {
             GetGatewayTargetErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    crate::state::ACTION_RETRIEVE,
-                    crate::state::RESOURCE_GATEWAY_TARGET,
-                ),
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_TARGET),
             )
         })?;
 

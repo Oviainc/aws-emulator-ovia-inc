@@ -14,13 +14,14 @@
 //! 1. `UpdateGatewayTarget` (`PUT /gateways/{gatewayIdentifier}/targets/{targetId}/`)
 //!    REPLACES the stored target's configuration with the members the request carries: a
 //!    configurable member the request omits is cleared, `name` excepted (optional on the
-//!    request, `@required` on every response, so it keeps the stored one) and
-//!    `credentialProviderConfigurations` excepted (`@required` with one entry on every
-//!    response, so it falls back to the gateway's own IAM role). The target's identity — its
-//!    id, its gateway's ARN and its creation instant — is untouched, and the update's own
-//!    response reports exactly what a later read does. The rows differ along which member
-//!    changes, the kind of value it takes (a string, a union of a different shape, a list, a
-//!    nested structure), and along clearing a member rather than setting one.
+//!    request, `@required` on every response, so it keeps the stored one). The target's
+//!    identity — its id, its gateway's ARN and its creation instant — is untouched, and the
+//!    update's own response reports exactly what a later read does. The rows differ along
+//!    which member changes, the kind of value it takes (a string, a union of a different
+//!    shape, a list, a nested structure), and along clearing a member rather than setting
+//!    one. `credentialProviderConfigurations` is carried by EVERY row: it is optional on
+//!    the request and `@required` on the response, so an update that defines none is
+//!    refused rather than defaulted (`gateway_target_update_validation.rs`).
 //! 2. An updated target is not ready again at once: the update answers 202 reporting
 //!    `UPDATING`, a caller acting straight after still sees that status, and the clock owes
 //!    the transition back to `READY`.
@@ -221,9 +222,12 @@ fn baseline_create_body(name: &str) -> Value {
     })
 }
 
-/// The credential provider a target reports when the request carries none: the gateway's own
-/// IAM role (`CredentialProviderType`'s `GATEWAY_IAM_ROLE`, from
-/// `smithy_query(query="shape",shape="CredentialProviderType")`).
+/// The credential provider a row names when the change it is about is not the credential
+/// provider itself: the gateway's own IAM role (`CredentialProviderType`'s
+/// `GATEWAY_IAM_ROLE`, from `smithy_query(query="shape",shape="CredentialProviderType")`).
+///
+/// Every `UpdateGatewayTarget` body needs one: the member is optional on the request and
+/// `@required` with one entry on the response, so a body that defines none is refused.
 fn gateway_iam_role_providers() -> Value {
     json!([{"credentialProviderType": "GATEWAY_IAM_ROLE"}])
 }
@@ -306,6 +310,9 @@ fn rows() -> Vec<Row> {
             update: json!({
                 "name": "mcpservertarget",
                 "description": "now an MCP server endpoint",
+                "credentialProviderConfigurations": [
+                    {"credentialProviderType": "GATEWAY_IAM_ROLE"}
+                ],
                 "targetConfiguration": {
                     "mcp": {
                         "mcpServer": {
@@ -331,9 +338,9 @@ fn rows() -> Vec<Row> {
                         }
                     }),
                 ),
-                // Every optional member the request omitted is cleared, and the two the model
-                // makes `@required` on the response fall back: the stored name is kept, and
-                // the credential provider becomes the gateway's own IAM role.
+                // Every optional member the request omitted is cleared, and the one the
+                // model makes `@required` on the response keeps what the request defined:
+                // the stored name is kept, and the credential provider is the one above.
                 ("metadataConfiguration", Value::Null),
                 ("privateEndpoint", Value::Null),
                 ("certificateConfigurations", Value::Null),
@@ -346,6 +353,9 @@ fn rows() -> Vec<Row> {
         Row {
             case: "an HTTP passthrough configuration and nothing else, clearing the rest",
             update: json!({
+                "credentialProviderConfigurations": [
+                    {"credentialProviderType": "GATEWAY_IAM_ROLE"}
+                ],
                 "targetConfiguration": {
                     "http": {
                         "passthrough": {
@@ -384,6 +394,9 @@ fn rows() -> Vec<Row> {
             case: "a description at the shortest length the model admits",
             update: json!({
                 "description": "x".repeat(DESCRIPTION_MIN_LEN),
+                "credentialProviderConfigurations": [
+                    {"credentialProviderType": "GATEWAY_IAM_ROLE"}
+                ],
                 "targetConfiguration": openapi_configuration("{\"openapi\":\"3.0.1\"}"),
             }),
             expected: vec![
@@ -395,6 +408,9 @@ fn rows() -> Vec<Row> {
             case: "a description at the longest length the model admits",
             update: json!({
                 "description": "y".repeat(DESCRIPTION_MAX_LEN),
+                "credentialProviderConfigurations": [
+                    {"credentialProviderType": "GATEWAY_IAM_ROLE"}
+                ],
                 "targetConfiguration": openapi_configuration("{\"openapi\":\"3.0.2\"}"),
             }),
             expected: vec![
@@ -405,6 +421,9 @@ fn rows() -> Vec<Row> {
         Row {
             case: "a Lambda configuration, which no mounted Lambda contradicts",
             update: json!({
+                "credentialProviderConfigurations": [
+                    {"credentialProviderType": "GATEWAY_IAM_ROLE"}
+                ],
                 "targetConfiguration": {
                     "mcp": {
                         "lambda": {
@@ -560,6 +579,7 @@ async fn an_updated_target_settles_from_updating_back_to_ready() {
     );
 
     let update = json!({
+        "credentialProviderConfigurations": gateway_iam_role_providers(),
         "targetConfiguration": openapi_configuration("{\"openapi\":\"3.0.3\"}"),
     });
     let updated = update_target(&router, &gateway_id, &target_id, &update).await;
@@ -603,6 +623,7 @@ async fn a_description_past_its_published_bound_is_refused() {
 
     let update = json!({
         "description": "z".repeat(DESCRIPTION_MAX_LEN + 1),
+        "credentialProviderConfigurations": gateway_iam_role_providers(),
         "targetConfiguration": openapi_configuration("{\"openapi\":\"3.0.0\"}"),
     });
     let refused = update_target(&router, &gateway_id, &target_id, &update).await;
@@ -635,7 +656,8 @@ async fn an_update_of_something_that_is_not_there_is_the_modelled_404() {
     let created = create_target(&router, &gateway_id, &baseline_create_body("presenttarget")).await;
     let present_target = text(&created.body, "targetId");
 
-    // (case, gatewayIdentifier, targetId, the resource the refusal names)
+    // (case, gatewayIdentifier, targetId, the sentence the refusal takes). The verb is
+    // "retrieve" for both resources: what failed is the lookup, not the update.
     let rows: [(&str, String, String, &str); 3] = [
         (
             "no such gateway",
@@ -648,7 +670,7 @@ async fn an_update_of_something_that_is_not_there_is_the_modelled_404() {
             "no such target on a stored gateway",
             gateway_id.clone(),
             ABSENT_TARGET_ID.to_string(),
-            "Failed to update target because it doesn't exist. Retry the request with a \
+            "Failed to retrieve target because it doesn't exist. Retry the request with a \
              different resource identifier.",
         ),
         (
@@ -662,6 +684,7 @@ async fn an_update_of_something_that_is_not_there_is_the_modelled_404() {
 
     for (case, gateway, target, message) in rows {
         let update = json!({
+            "credentialProviderConfigurations": gateway_iam_role_providers(),
             "targetConfiguration": openapi_configuration("{\"openapi\":\"3.0.0\"}"),
         });
         let refused = update_target(&router, &gateway, &target, &update).await;
@@ -730,6 +753,7 @@ async fn a_gateway_that_cannot_serve_the_change_refuses_the_update() {
 
         let update = json!({
             "description": "a change the gateway cannot serve",
+            "credentialProviderConfigurations": gateway_iam_role_providers(),
             "targetConfiguration": openapi_configuration("{\"openapi\":\"3.0.9\"}"),
         });
         let refused = update_target(&router, &gateway_id, &target_id, &update).await;

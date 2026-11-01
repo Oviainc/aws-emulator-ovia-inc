@@ -156,12 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is keyed by the `memoryId` the create minted; an id naming no
         // stored memory is the modelled 404 rather than an empty envelope.
         let record = store.memories.get(&input.memory_id).ok_or_else(|| {
-            GetMemoryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "no memory with id {} exists in this account",
-                    input.memory_id
-                )),
-            })
+            GetMemoryErrorModeled::ResourceNotFoundException(crate::state::memory_not_found(
+                Self::NAME,
+                &input.memory_id,
+            ))
         })?;
 
         // `view` chooses how much of an ENCRYPTED memory is decrypted for the
@@ -173,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = &input.view;
 
         Ok(GetMemoryOutput {
-            memory: record.memory(now),
+            memory: record.memory_read(now),
         })
     }
 }

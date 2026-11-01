@@ -188,7 +188,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetConfigurationBundleErrorModeled::ResourceNotFoundException(
                     crate::state::resource_not_found(
-                        crate::state::ACTION_RETRIEVE,
                         crate::state::RESOURCE_CONFIGURATION_BUNDLE,
                     ),
                 )
@@ -203,7 +202,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetConfigurationBundleErrorModeled::ResourceNotFoundException(
                     crate::state::resource_not_found(
-                        crate::state::ACTION_RETRIEVE,
                         crate::state::RESOURCE_CONFIGURATION_BUNDLE_VERSION,
                     ),
                 )

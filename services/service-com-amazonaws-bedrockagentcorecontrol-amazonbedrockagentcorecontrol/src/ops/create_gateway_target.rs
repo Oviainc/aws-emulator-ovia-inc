@@ -240,10 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
                 CreateGatewayTargetErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        crate::state::ACTION_RETRIEVE,
-                        crate::state::RESOURCE_GATEWAY,
-                    ),
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
                 )
             })?;
             // A target is served BY the gateway, so the gateway has to be ready
@@ -311,10 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.expire_deleted_gateways(now);
         let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
             CreateGatewayTargetErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    crate::state::ACTION_RETRIEVE,
-                    crate::state::RESOURCE_GATEWAY,
-                ),
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
             )
         })?;
         let gateway_id = gateway.gateway_id.clone();

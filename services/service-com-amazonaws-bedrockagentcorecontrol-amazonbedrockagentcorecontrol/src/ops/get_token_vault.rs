@@ -167,10 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialised here and two reads of an untouched vault answer alike.
         let record = store.token_vaults.get(&token_vault_id).ok_or_else(|| {
             GetTokenVaultErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    crate::state::ACTION_RETRIEVE,
-                    crate::state::RESOURCE_TOKEN_VAULT,
-                ),
+                crate::state::resource_not_found(crate::state::RESOURCE_TOKEN_VAULT),
             )
         })?;
 

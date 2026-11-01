@@ -1720,7 +1720,42 @@ pub struct ContentConfiguration {
     pub level: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#Memory")]
+/// The extraction health a read of a memory reports, for the memory and for each of its
+/// strategies: how many of its long-term memory extraction jobs have FAILED.
+///
+/// The model declares neither this shape nor the `extractionHealth` members that carry it;
+/// the recorded service answers a memory read with both. Its schema therefore comes from
+/// [`agentcore_schema_and_codec!`] under a namespace of its own — see
+/// `types/date_time_wire.rs` for why a member the model does not declare cannot go through
+/// `#[smithy_macros::smithy(shape = ...)]`.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryExtractionHealth {
+    pub failed_memory_extraction_job_count: i32,
+}
+
+agentcore_schema_and_codec!(
+    MemoryExtractionHealth,
+    MEMORY_EXTRACTION_HEALTH_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol.recorded#MemoryExtractionHealth",
+    "com.amazonaws.bedrockagentcorecontrol.recorded",
+    "MemoryExtractionHealth",
+    (
+        M_FAILED_MEMORY_EXTRACTION_JOB_COUNT,
+        failed_memory_extraction_job_count,
+        "failedMemoryExtractionJobCount",
+        0,
+        req,
+        integer
+    ),
+);
+
+/// `Memory`, the resource every memory operation reports. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because of `extraction_health`, which the on-disk model declares no member for.
+///
+/// The member list below is the model's, member for member — same shape ids, same wire
+/// names, same order, same shape types (`smithy_query(query="shape", shape="Memory")`) —
+/// followed by that one recorded member.
 #[derive(Debug, Clone)]
 pub struct Memory {
     pub arn: String,
@@ -1739,9 +1774,109 @@ pub struct Memory {
     pub namespace_keys: Option<Vec<NamespaceKeyEntry>>,
     pub stream_delivery_resources: Option<StreamDeliveryResources>,
     pub managed_by_resource_arn: Option<String>,
+    pub extraction_health: Option<MemoryExtractionHealth>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#MemoryStrategy")]
+agentcore_schema_and_codec!(
+    Memory,
+    MEMORY_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#Memory",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "Memory",
+    (M_ARN, arn, "arn", 0, req, string),
+    (M_ID, id, "id", 1, req, string),
+    (M_NAME, name, "name", 2, req, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (
+        M_ENCRYPTION_KEY_ARN,
+        encryption_key_arn,
+        "encryptionKeyArn",
+        4,
+        opt,
+        string
+    ),
+    (
+        M_MEMORY_EXECUTION_ROLE_ARN,
+        memory_execution_role_arn,
+        "memoryExecutionRoleArn",
+        5,
+        opt,
+        string
+    ),
+    (
+        M_EVENT_EXPIRY_DURATION,
+        event_expiry_duration,
+        "eventExpiryDuration",
+        6,
+        req,
+        integer
+    ),
+    (M_STATUS, status, "status", 7, req, string),
+    (
+        M_FAILURE_REASON,
+        failure_reason,
+        "failureReason",
+        8,
+        opt,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 9, req, timestamp),
+    (M_UPDATED_AT, updated_at, "updatedAt", 10, req, timestamp),
+    (
+        M_STRATEGIES,
+        strategies,
+        "strategies",
+        11,
+        opt,
+        list_of_struct(MemoryStrategy)
+    ),
+    (
+        M_INDEXED_KEYS,
+        indexed_keys,
+        "indexedKeys",
+        12,
+        opt,
+        list_of_struct(IndexedKey)
+    ),
+    (
+        M_NAMESPACE_KEYS,
+        namespace_keys,
+        "namespaceKeys",
+        13,
+        opt,
+        list_of_struct(NamespaceKeyEntry)
+    ),
+    (
+        M_STREAM_DELIVERY_RESOURCES,
+        stream_delivery_resources,
+        "streamDeliveryResources",
+        14,
+        opt,
+        struct_of(StreamDeliveryResources)
+    ),
+    (
+        M_MANAGED_BY_RESOURCE_ARN,
+        managed_by_resource_arn,
+        "managedByResourceArn",
+        15,
+        opt,
+        string
+    ),
+    (
+        M_EXTRACTION_HEALTH,
+        extraction_health,
+        "extractionHealth",
+        16,
+        opt,
+        recorded(
+            "com.amazonaws.bedrockagentcorecontrol.recorded",
+            struct_of(MemoryExtractionHealth)
+        )
+    ),
+);
+
+/// One strategy of a memory, reported inside [`Memory`]. Hand-built for the same reason
+/// `Memory` is: `extraction_health` is a member the on-disk model does not declare.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryStrategy {
     pub strategy_id: String,
@@ -1756,7 +1891,74 @@ pub struct MemoryStrategy {
     pub status: Option<String>,
     pub memory_record_schema: Option<MemoryRecordSchema>,
     pub record_expiry_duration_days: Option<i32>,
+    pub extraction_health: Option<MemoryExtractionHealth>,
 }
+
+agentcore_schema_and_codec!(
+    MemoryStrategy,
+    MEMORY_STRATEGY_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#MemoryStrategy",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "MemoryStrategy",
+    (M_STRATEGY_ID, strategy_id, "strategyId", 0, req, string),
+    (M_NAME, name, "name", 1, req, string),
+    (M_DESCRIPTION, description, "description", 2, opt, string),
+    (
+        M_CONFIGURATION,
+        configuration,
+        "configuration",
+        3,
+        opt,
+        struct_of(StrategyConfiguration)
+    ),
+    (M_TYPE, r#type, "type", 4, req, string),
+    (
+        M_NAMESPACES,
+        namespaces,
+        "namespaces",
+        5,
+        req,
+        list_of_string
+    ),
+    (
+        M_NAMESPACE_TEMPLATES,
+        namespace_templates,
+        "namespaceTemplates",
+        6,
+        req,
+        list_of_string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 7, opt, timestamp),
+    (M_UPDATED_AT, updated_at, "updatedAt", 8, opt, timestamp),
+    (M_STATUS, status, "status", 9, opt, string),
+    (
+        M_MEMORY_RECORD_SCHEMA,
+        memory_record_schema,
+        "memoryRecordSchema",
+        10,
+        opt,
+        struct_of(MemoryRecordSchema)
+    ),
+    (
+        M_RECORD_EXPIRY_DURATION_DAYS,
+        record_expiry_duration_days,
+        "recordExpiryDurationDays",
+        11,
+        opt,
+        integer
+    ),
+    (
+        M_EXTRACTION_HEALTH,
+        extraction_health,
+        "extractionHealth",
+        12,
+        opt,
+        recorded(
+            "com.amazonaws.bedrockagentcorecontrol.recorded",
+            struct_of(MemoryExtractionHealth)
+        )
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#StrategyConfiguration")]
 #[derive(Debug, Clone, Default)]

@@ -27,6 +27,14 @@
 //! `SerializableStruct`/`DeserializableStruct` pair — plus the one chain call the codegen
 //! omits, which [`agentcore_member_schema!`] attaches for the `date_time` member kind.
 //!
+//! A STRUCTURE THAT CARRIES A MEMBER THE MODEL DOES NOT DECLARE needs these macros for a
+//! second reason: `#[smithy_macros::smithy(shape = ...)]` refuses a field that corresponds
+//! to no member of the shape, so a response member the recorded service carries and the
+//! on-disk model does not know cannot be declared with the derive at all. The `recorded`
+//! member kind below is that member: same encoding as any other, with its shape id in a
+//! namespace of its own so it can neither claim to be modelled nor collide with a member
+//! the model may declare later.
+//!
 //! WHAT IS DELIBERATELY ABSENT.
 //!
 //! * Constraint traits (`@length`, `@pattern`, …). The validating walk that enforces them
@@ -66,6 +74,9 @@ macro_rules! agentcore_shape_type {
     (date_time) => {
         ::aws_smithy_schema::ShapeType::Timestamp
     };
+    (timestamp) => {
+        ::aws_smithy_schema::ShapeType::Timestamp
+    };
     (integer) => {
         ::aws_smithy_schema::ShapeType::Integer
     };
@@ -93,9 +104,30 @@ macro_rules! agentcore_shape_type {
 /// `@timestampFormat("date-time")` chain call it cannot.
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `integer`, `date_time`, `list_of_string`, `map_of_string`,
-/// `list_of_struct(T)`, `list_of_union(T)`, `struct_of(T)` or `union_of(T)`.
+/// string-encoded), `integer`, `timestamp` (a plain `timestamp` shape, which the protocol
+/// renders in its own default form), `date_time`, `list_of_string`, `map_of_string`,
+/// `list_of_struct(T)`, `list_of_union(T)`, `struct_of(T)` or `union_of(T)`, or
+/// `recorded("<namespace>", <kind>)` for a member the model does not declare at all.
 macro_rules! agentcore_member_schema {
+    // A member the model does not declare, which the recorded service carries on the
+    // wire: its shape id sits in the namespace given here rather than the service's own,
+    // where it can neither claim to be modelled nor collide with a member the model may
+    // declare later. Its encoding is the one its `$kind` names, like any other member.
+    (
+        $ns:literal, $local:literal, $wire:literal, $idx:literal,
+        recorded($rns:literal, $kind:tt $(($inner:ty))?)
+    ) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!($rns, "#", $local, "$", $wire),
+                $rns,
+                $wire,
+            ),
+            agentcore_shape_type!($kind),
+            $wire,
+            $idx,
+        )
+    };
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
             ::aws_smithy_schema::ShapeId::from_static(
@@ -128,10 +160,18 @@ macro_rules! agentcore_member_schema {
 /// list of structures (or unions) writes each element against the element shape's own
 /// `SCHEMA`, and a map writes the key and the value against the member schema.
 macro_rules! agentcore_write_member {
+    // A member the model does not declare writes exactly like the kind it wraps; only its
+    // shape id differs (see `agentcore_member_schema!`).
+    ($s:ident, $m:expr, $v:expr, recorded($rns:literal, $($kind:tt)+)) => {
+        agentcore_write_member!($s, $m, $v, $($kind)+);
+    };
     ($s:ident, $m:expr, $v:expr, string) => {
         $s.write_string($m, $v.as_str())?;
     };
     ($s:ident, $m:expr, $v:expr, date_time) => {
+        $s.write_timestamp($m, $v)?;
+    };
+    ($s:ident, $m:expr, $v:expr, timestamp) => {
         $s.write_timestamp($m, $v)?;
     };
     ($s:ident, $m:expr, $v:expr, integer) => {
@@ -185,8 +225,12 @@ macro_rules! agentcore_write_member {
 /// the entry of `read_struct`, `read_list` and `read_map` and refuses a body nesting deeper
 /// than its `MAX_DEPTH`, which the protocol boundary renders as a client refusal.
 macro_rules! agentcore_read_member {
+    ($d:ident, $m:expr, recorded($rns:literal, $($kind:tt)+)) => {
+        agentcore_read_member!($d, $m, $($kind)+)
+    };
     ($d:ident, $m:expr, string) => { $d.read_string($m)? };
     ($d:ident, $m:expr, date_time) => { $d.read_timestamp($m)? };
+    ($d:ident, $m:expr, timestamp) => { $d.read_timestamp($m)? };
     ($d:ident, $m:expr, integer) => { $d.read_integer($m)? };
     ($d:ident, $m:expr, list_of_string) => {{
         let mut __out: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();

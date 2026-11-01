@@ -175,10 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.gateway_identifier)
             .ok_or_else(|| {
                 DeleteGatewayErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        crate::state::ACTION_DELETE,
-                        crate::state::RESOURCE_GATEWAY,
-                    ),
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
                 )
             })?;
 

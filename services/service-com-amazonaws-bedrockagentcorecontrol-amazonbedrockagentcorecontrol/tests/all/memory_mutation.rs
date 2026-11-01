@@ -504,10 +504,12 @@ async fn strategies_are_added_modified_and_removed_with_the_statuses_the_clock_o
 
     let added = strategy_by_name(&updated, "episodes");
     let added_id = text(&added, "strategyId");
+    // An update answers with the strategy it added already ACTIVE: the strategy is usable
+    // when the call returns, so the clock owes it no transition of its own.
     assert_eq!(
         text(&added, "status"),
-        "CREATING",
-        "case \"an added strategy\": a strategy an update mints is CREATING, got {added}"
+        "ACTIVE",
+        "case \"an added strategy\": a strategy an update mints is ACTIVE, got {added}"
     );
     assert_eq!(
         text(&added, "type"),

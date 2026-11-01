@@ -74,7 +74,8 @@ use crate::ops::types::{
     HarnessSystemContentBlock, HarnessTool, HarnessTruncationConfiguration, HarnessVersionSummary,
     HttpTargetConfiguration, IndexedKey, InferenceTargetConfiguration, KmsConfiguration,
     LifecycleConfiguration,
-    McpTargetConfiguration, Memory, MemoryStrategy, MetadataConfiguration, NamespaceKeyEntry,
+    McpTargetConfiguration, Memory, MemoryExtractionHealth, MemoryStrategy, MetadataConfiguration,
+    NamespaceKeyEntry,
     NetworkConfiguration, PrivateEndpoint, ProtocolConfiguration, RequestHeaderConfiguration,
     ResourceNotFoundException,
     ConsolidationConfiguration, CustomConfigurationInput, CustomConsolidationConfiguration,
@@ -181,6 +182,26 @@ pub fn field_validation_failed(member: &str, why: &str) -> ValidationException {
     }
 }
 
+/// The modelled validation error for a request that did not DEFINE a member
+/// this service needs, in the form this service's recorded refusals take
+/// ("Credential provider configurations is not defined").
+///
+/// `member_prose` is the member's name as the sentence spells it. Nothing from
+/// the request is echoed — the member is missing, so there is no value to quote
+/// — which makes the sentence the same for every body that leaves it out.
+/// `reason` says a field failed validation, and there is no `fieldList`: no
+/// value the request carried broke a constraint.
+pub fn member_not_defined(member_prose: &str) -> ValidationException {
+    ValidationException {
+        message: format!("{member_prose} is not defined"),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: None,
+    }
+}
+
+/// `credentialProviderConfigurations` as [`member_not_defined`] spells it.
+pub const CREDENTIAL_PROVIDER_CONFIGURATIONS_PROSE: &str = "Credential provider configurations";
+
 /// The modelled validation error a gateway operation gets while the gateway is
 /// in a status that cannot serve it: the operation and the status it found,
 /// in the form this service's recorded refusals take ("Cannot perform operation
@@ -204,38 +225,50 @@ pub fn gateway_status_conflict(operation: &str, status: &str) -> ValidationExcep
 /// ("Failed to retrieve gateway because it doesn't exist. Retry the request
 /// with a different resource identifier.").
 ///
-/// `action` is what the operation was doing to the MISSING resource — `retrieve`
-/// for one being read, including one read as the parent a request addresses
-/// through — and `resource` is that resource's own noun. The identifier the
-/// request named is NOT echoed: it is the caller's own value, and the remedy
-/// does not depend on it.
+/// The verb is "retrieve" whatever the operation was doing: what failed is the
+/// LOOKUP of the resource, which every operation performs the same way, so the
+/// sentence does not vary with the caller's intent — an update, a delete and a
+/// read of a missing resource are all refused in these same words. `resource` is
+/// the missing resource's own noun. The identifier the request named is NOT
+/// echoed: it is the caller's own value, and the remedy does not depend on it.
 ///
 /// Shared by the handlers rather than written per operation, so one resource
 /// cannot be reported missing in two different sentences by two operations.
-pub fn resource_not_found(action: &str, resource: &str) -> ResourceNotFoundException {
+pub fn resource_not_found(resource: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!(
-            "Failed to {action} {resource} because it doesn't exist. Retry the request with a \
+            "Failed to retrieve {resource} because it doesn't exist. Retry the request with a \
              different resource identifier."
         )),
     }
 }
 
-/// The `action` [`resource_not_found`] takes for a resource being READ: a
-/// `Get…` of it, and a read of the parent a `Create…`, `List…` or any other
-/// request addresses through.
-pub const ACTION_RETRIEVE: &str = "retrieve";
-
-/// The `action` for a resource a `Delete…` could not find.
-pub const ACTION_DELETE: &str = "delete";
-
-/// The `action` for a resource an `Update…` could not find.
-pub const ACTION_UPDATE: &str = "update";
+/// The modelled not-found error for a MEMORY this service does not hold, which
+/// the memory family words in its own sentence rather than through
+/// [`resource_not_found`]: what could not be found, the operation that was
+/// asking, and the identifier it asked for ("Resource not found during
+/// GetMemory: Failed to retrieve memory item for ID: <memoryId>").
+///
+/// `operation` is the asking operation's own name and `memory_id` the id the
+/// request carried, so every memory operation reports a missing memory in the
+/// one sentence with its own two values filled in.
+pub fn memory_not_found(operation: &str, memory_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Resource not found during {operation}: Failed to retrieve memory item for ID: \
+             {memory_id}"
+        )),
+    }
+}
 
 /// The resource nouns [`resource_not_found`] names, as the recorded refusals
 /// word them: a gateway, and a target OF a gateway.
 pub const RESOURCE_GATEWAY: &str = "gateway";
 pub const RESOURCE_GATEWAY_TARGET: &str = "target";
+
+/// The resource noun for one STRATEGY of a memory, which a request addresses by
+/// `memoryStrategyId` through the memory that holds it.
+pub const RESOURCE_MEMORY_STRATEGY: &str = "memory strategy";
 
 /// How many gateways this emulator will hold, and how many targets one gateway
 /// will hold.
@@ -1059,8 +1092,14 @@ pub struct MemoryRecord {
     /// slept on: a read materialises the transition the clock already made due.
     pub settles_at: SystemTime,
     pub strategies: Vec<MemoryStrategy>,
-    /// The `strategyId`s the mutation in flight MINTED: each is `CREATING` until
-    /// [`settles_at`](Self::settles_at) passes, `ACTIVE` afterwards.
+    /// The `strategyId`s the CREATE of this memory minted: each is `CREATING`
+    /// until [`settles_at`](Self::settles_at) passes, `ACTIVE` afterwards — a
+    /// strategy created WITH the memory is provisioned for as long as the memory
+    /// is.
+    ///
+    /// An UPDATE adds no id here and clears what it finds: the strategy an
+    /// update adds is reported `ACTIVE` by the update itself, so nothing the
+    /// memory holds is `CREATING` once an update of it has been accepted.
     pub creating_strategy_ids: BTreeSet<String>,
     /// The `strategyId`s a mutation REMOVED, each with the instant its removal
     /// comes due: the strategy is `DELETING` until then and is reported by no
@@ -1089,8 +1128,8 @@ impl MemoryRecord {
 
     /// The status one of this memory's strategies reports at `now`: `DELETING`
     /// while the removal a mutation started is still owed, `CREATING` while the
-    /// strategy a mutation minted is still owed its transition, `ACTIVE`
-    /// afterwards.
+    /// strategy the memory's own create minted is still owed its transition,
+    /// `ACTIVE` afterwards.
     fn strategy_status_at(&self, strategy_id: &str, now: SystemTime) -> &'static str {
         if self.deleting_strategy_ids.contains_key(strategy_id) {
             MEMORY_STRATEGY_STATUS_DELETING
@@ -1202,7 +1241,41 @@ impl MemoryRecord {
             // Set only on a memory another resource (a harness) manages, and no
             // operation of this service creates one, so a memory carries none.
             managed_by_resource_arn: None,
+            // Carried only by a READ of the memory ([`Self::memory_read`]).
+            extraction_health: None,
         }
+    }
+
+    /// This memory as a READ of it reports it ([`Self::memory`]), plus the
+    /// extraction health such a read carries at BOTH levels: on the memory and
+    /// inside every strategy it reports.
+    ///
+    /// The model declares no member for it; the recorded service answers a
+    /// memory read with one at each level, so a client can ask whether
+    /// long-term extraction is succeeding for the memory as a whole and for one
+    /// strategy of it.
+    pub fn memory_read(&self, now: SystemTime) -> Memory {
+        let mut memory = self.memory(now);
+        for strategy in memory.strategies.iter_mut().flatten() {
+            strategy.extraction_health = Some(extraction_health());
+        }
+        memory.extraction_health = Some(extraction_health());
+        memory
+    }
+}
+
+/// The extraction health a memory read reports, for the memory and for each of
+/// its strategies: how many of its long-term memory extraction jobs FAILED.
+///
+/// A memory extraction job is started and listed on the memory DATA plane
+/// (`StartMemoryExtractionJob`, `ListMemoryExtractionJobs`), not here, so this
+/// control plane's store holds no job of any memory and no operation of it can
+/// fail one: the count every read reports is therefore zero, for the same reason
+/// a memory reports no `failureReason`. It is built in one place rather than per
+/// handler, so the memory level and the strategy level cannot disagree.
+pub fn extraction_health() -> MemoryExtractionHealth {
+    MemoryExtractionHealth {
+        failed_memory_extraction_job_count: 0,
     }
 }
 
@@ -1641,6 +1714,8 @@ pub fn memory_strategy(
         status: None,
         memory_record_schema: prepared.memory_record_schema,
         record_expiry_duration_days: prepared.record_expiry_duration_days,
+        // Carried only by a READ of the memory ([`MemoryRecord::memory_read`]).
+        extraction_health: None,
     }
 }
 
@@ -4522,13 +4597,16 @@ fn s3_client(
     ::aws_sdk_s3::Client::from_conf(config)
 }
 
-/// The credential a gateway target reports when the caller configured none: the
+/// The credential a gateway target reports when the CREATE configured none: the
 /// gateway's own IAM role.
 ///
-/// `credentialProviderConfigurations` is optional on the request and `@required`
-/// with at least one entry on every response that reports a target, so the
-/// stored target carries this one rather than an empty list the wire cannot
-/// render.
+/// `credentialProviderConfigurations` is optional on `CreateGatewayTarget` and
+/// `@required` with at least one entry on every response that reports a target,
+/// so the stored target carries this one rather than an empty list the wire
+/// cannot render. `UpdateGatewayTarget` has no such fallback: it replaces the
+/// target's whole configuration, so a body that defines none is refused
+/// ([`member_not_defined`]) instead of being given a default the caller did not
+/// ask for.
 pub fn effective_credential_provider_configurations(
     requested: Option<Vec<CredentialProviderConfiguration>>,
 ) -> Vec<CredentialProviderConfiguration> {

@@ -207,7 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled 404 rather than an empty envelope.
         let record = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
             GetGatewayErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
-                crate::state::ACTION_RETRIEVE,
                 crate::state::RESOURCE_GATEWAY,
             ))
         })?;

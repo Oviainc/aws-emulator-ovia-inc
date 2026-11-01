@@ -23,10 +23,11 @@
 //!    services can be mounted together.)
 //! 3. A request addressing a resource that is not there is refused with the operation's
 //!    modelled `ResourceNotFoundException` (HTTP 404), worded as this service words a
-//!    resource that does not exist: what could not be carried out, the resource it was
-//!    for, and the remedy — and nothing of the identifier the caller sent. The rows
-//!    differ along the operation, the action it was carrying out, and WHICH resource of
-//!    the request is missing: the gateway, or a target of a gateway that is there.
+//!    resource that does not exist: the FAILED RETRIEVE of it, the resource it was for,
+//!    and the remedy — and nothing of the identifier the caller sent. The rows differ
+//!    along the operation (read, update, delete, create-through, list-through) and WHICH
+//!    resource of the request is missing — the gateway, or a target of a gateway that is
+//!    there — because the sentence varies with neither: what failed is the lookup.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -420,10 +421,13 @@ async fn a_resource_that_is_not_there_is_refused_in_this_services_words() {
     /// An id inside `TargetId`'s pattern `^[0-9a-zA-Z]{10}$` that names no target.
     const ABSENT_TARGET: &str = "abcd123456";
 
-    /// What a `ResourceNotFoundException` of this service says, per action and resource.
-    fn expected(action: &str, resource: &str) -> String {
+    /// What a `ResourceNotFoundException` of this service says for `resource`.
+    ///
+    /// The verb is "retrieve" on EVERY operation: what failed is the lookup, so the
+    /// sentence does not vary with what the caller was trying to do.
+    fn expected(resource: &str) -> String {
         format!(
-            "Failed to {action} {resource} because it doesn't exist. Retry the request with a \
+            "Failed to retrieve {resource} because it doesn't exist. Retry the request with a \
              different resource identifier."
         )
     }
@@ -435,58 +439,81 @@ async fn a_resource_that_is_not_there_is_refused_in_this_services_words() {
 
     let update_body = gateway_body("notfoundgate");
     let (_, target_body) = &target_bodies()[0];
+    // An `UpdateGatewayTarget` body that is itself VALID, so these rows reach the lookup
+    // the refusal is about rather than the body validation that precedes it.
+    let target_update_body = json!({
+        "name": "openapi",
+        "targetConfiguration": {
+            "mcp": {"openApiSchema": {"inlinePayload": "{\"openapi\":\"3.0.0\"}"}}
+        },
+        "credentialProviderConfigurations": [{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
+    });
 
     // (case, method, uri, body, expected message) — one row per operation that addresses
     // one of these resources, so the wording cannot be one operation's.
-    let rows: [(&str, &str, String, Option<&Value>, String); 7] = [
+    let rows: [(&str, &str, String, Option<&Value>, String); 9] = [
         (
             "GetGateway on a gateway that is not there",
             "GET",
             format!("/gateways/{ABSENT_GATEWAY}/"),
             None,
-            expected("retrieve", "gateway"),
+            expected("gateway"),
         ),
         (
             "UpdateGateway on a gateway that is not there",
             "PUT",
             format!("/gateways/{ABSENT_GATEWAY}/"),
             Some(&update_body),
-            expected("update", "gateway"),
+            expected("gateway"),
         ),
         (
             "DeleteGateway on a gateway that is not there",
             "DELETE",
             format!("/gateways/{ABSENT_GATEWAY}/"),
             None,
-            expected("delete", "gateway"),
+            expected("gateway"),
         ),
         (
             "ListGatewayTargets for a gateway that is not there",
             "GET",
             format!("/gateways/{ABSENT_GATEWAY}/targets/"),
             None,
-            expected("retrieve", "gateway"),
+            expected("gateway"),
         ),
         (
             "CreateGatewayTarget on a gateway that is not there",
             "POST",
             format!("/gateways/{ABSENT_GATEWAY}/targets/"),
             Some(target_body),
-            expected("retrieve", "gateway"),
+            expected("gateway"),
         ),
         (
             "GetGatewayTarget on a gateway that is not there",
             "GET",
             format!("/gateways/{ABSENT_GATEWAY}/targets/{ABSENT_TARGET}/"),
             None,
-            expected("retrieve", "gateway"),
+            expected("gateway"),
         ),
         (
             "GetGatewayTarget for a target the gateway does not hold",
             "GET",
             format!("/gateways/{gateway_id}/targets/{ABSENT_TARGET}/"),
             None,
-            expected("retrieve", "target"),
+            expected("target"),
+        ),
+        (
+            "UpdateGatewayTarget on a gateway that is not there",
+            "PUT",
+            format!("/gateways/{ABSENT_GATEWAY}/targets/{ABSENT_TARGET}/"),
+            Some(&target_update_body),
+            expected("gateway"),
+        ),
+        (
+            "UpdateGatewayTarget for a target the gateway does not hold",
+            "PUT",
+            format!("/gateways/{gateway_id}/targets/{ABSENT_TARGET}/"),
+            Some(&target_update_body),
+            expected("target"),
         ),
     ];
 

@@ -172,10 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which would say the gateway is there and holds nothing.
         let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
             ListGatewayTargetsErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    crate::state::ACTION_RETRIEVE,
-                    crate::state::RESOURCE_GATEWAY,
-                ),
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
             )
         })?;
 

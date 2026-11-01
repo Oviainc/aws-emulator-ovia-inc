@@ -424,10 +424,9 @@ fn invalid(invalid: ValidationException) -> UpdateMemoryError {
 /// hold: a `memoryStrategyId` the request names is a resource reference, so an
 /// unknown one is reported in the one sentence this service gives a missing
 /// resource.
-fn no_such_strategy(action: &str) -> UpdateMemoryError {
+fn no_such_strategy() -> UpdateMemoryError {
     UpdateMemoryErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
-        action,
-        "memory strategy",
+        crate::state::RESOURCE_MEMORY_STRATEGY,
     ))
     .into()
 }
@@ -545,7 +544,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cloned()
             .ok_or_else(|| {
                 UpdateMemoryErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(crate::state::ACTION_RETRIEVE, "memory"),
+                    crate::state::memory_not_found(Self::NAME, &input.memory_id),
                 )
             })?;
 
@@ -580,7 +579,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !held(&record, &one.memory_strategy_id)
                 || deleting.contains_key(&one.memory_strategy_id)
             {
-                return Err(no_such_strategy(crate::state::ACTION_DELETE));
+                return Err(no_such_strategy());
             }
             // Each removal gets its OWN deadline, so a later update of this
             // memory cannot defer it by re-arming the record's transition.
@@ -592,13 +591,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         for one in to_modify {
             if deleting.contains_key(&one.memory_strategy_id) {
-                return Err(no_such_strategy(crate::state::ACTION_UPDATE));
+                return Err(no_such_strategy());
             }
             let strategy = record
                 .strategies
                 .iter_mut()
                 .find(|strategy| strategy.strategy_id == one.memory_strategy_id)
-                .ok_or_else(|| no_such_strategy(crate::state::ACTION_UPDATE))?;
+                .ok_or_else(no_such_strategy)?;
             apply_strategy_modification(strategy, one, now).map_err(invalid)?;
         }
 
@@ -629,12 +628,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|strategy| strategy.strategy_id.clone())
             .collect();
-        let mut created_ids: ::std::collections::BTreeSet<String> =
-            ::std::collections::BTreeSet::new();
         for one in prepared {
             let strategy_id = store.mint_memory_strategy_id(&one.name, now, &minted_ids);
             minted_ids.insert(strategy_id.clone());
-            created_ids.insert(strategy_id.clone());
             record
                 .strategies
                 .push(crate::state::memory_strategy(one, strategy_id, now));
@@ -684,14 +680,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.namespace_keys = Some(namespace_keys);
         }
 
-        // An updated memory is not active again until the clock says so, and the
-        // strategies this request minted are `CREATING` (and the ones it removed
-        // `DELETING`) for exactly as long.
+        // An updated memory is not active again until the clock says so, and a
+        // strategy this request removed is `DELETING` for exactly as long.
+        //
+        // A strategy this request ADDED is not: an update answers with the
+        // strategy it added already `ACTIVE`, so the strategy is usable the
+        // moment the call returns and the clock owes it no transition. No
+        // strategy the memory still holds is `CREATING` once an update of it has
+        // been accepted, including one minted by the create that is still inside
+        // its own span — the update is what made the memory's configuration
+        // current, so the ids that span belonged to are cleared with it.
         record.updated_at = now;
         record.transient_status = crate::state::MEMORY_STATUS_UPDATING.to_string();
         record.settled_status = crate::state::MEMORY_STATUS_ACTIVE.to_string();
         record.settles_at = now + crate::state::MEMORY_SETTLE_DELAY;
-        record.creating_strategy_ids = created_ids;
+        record.creating_strategy_ids.clear();
 
         let output = UpdateMemoryOutput {
             memory: Some(record.memory(now)),

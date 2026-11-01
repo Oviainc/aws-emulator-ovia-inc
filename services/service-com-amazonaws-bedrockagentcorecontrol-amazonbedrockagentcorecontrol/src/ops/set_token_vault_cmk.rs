@@ -180,10 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .set_kms_configuration(&token_vault_id, input.kms_configuration, now)
             .ok_or_else(|| {
                 SetTokenVaultCMKErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        crate::state::ACTION_UPDATE,
-                        crate::state::RESOURCE_TOKEN_VAULT,
-                    ),
+                    crate::state::resource_not_found(crate::state::RESOURCE_TOKEN_VAULT),
                 )
             })?;
 

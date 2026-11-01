@@ -39,6 +39,8 @@ mod gateway_mutation;
 mod gateway_target_listing;
 #[path = "all/gateway_target_mutation.rs"]
 mod gateway_target_mutation;
+#[path = "all/gateway_target_update_validation.rs"]
+mod gateway_target_update_validation;
 #[path = "all/gateway_wire_shape.rs"]
 mod gateway_wire_shape;
 #[path = "all/harness.rs"]
@@ -51,6 +53,8 @@ mod harness_version_listing;
 mod memory_lifecycle;
 #[path = "all/memory_mutation.rs"]
 mod memory_mutation;
+#[path = "all/memory_update_and_read_projection.rs"]
+mod memory_update_and_read_projection;
 #[path = "all/registry_lifecycle.rs"]
 mod registry_lifecycle;
 #[path = "all/service_claim.rs"]

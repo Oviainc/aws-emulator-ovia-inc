@@ -190,10 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(crate::state::registry_id_from_identifier(&input.registry_id))
             .ok_or_else(|| {
                 GetRegistryErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        crate::state::ACTION_RETRIEVE,
-                        crate::state::RESOURCE_REGISTRY,
-                    ),
+                    crate::state::resource_not_found(crate::state::RESOURCE_REGISTRY),
                 )
             })?;
 

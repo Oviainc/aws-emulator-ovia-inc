@@ -247,7 +247,9 @@ async fn an_id_naming_no_vault_is_refused_and_changes_nothing() {
     ];
 
     for (case, token_vault_id) in rows {
-        // (the operation, its route's answer, the wording that operation's refusal takes)
+        // (the operation, its route's answer, the wording that operation's refusal takes —
+        // the SAME sentence for both, because what failed is the lookup and not what the
+        // caller was trying to do)
         let calls: [(&str, (u16, Value), &str); 2] = [
             (
                 "SetTokenVaultCMK",
@@ -256,8 +258,8 @@ async fn an_id_naming_no_vault_is_refused_and_changes_nothing() {
                     &json!({"tokenVaultId": token_vault_id, "kmsConfiguration": keeper.clone()}),
                 )
                 .await,
-                "Failed to update token vault because it doesn't exist. Retry the request with a \
-                 different resource identifier.",
+                "Failed to retrieve token vault because it doesn't exist. Retry the request with \
+                 a different resource identifier.",
             ),
             (
                 "GetTokenVault",

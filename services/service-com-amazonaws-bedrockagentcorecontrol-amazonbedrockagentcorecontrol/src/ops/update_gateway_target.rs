@@ -215,6 +215,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
+        // The REQUEST is validated before any resource is resolved, so a body
+        // this operation cannot act on is reported as the malformed request it
+        // is whatever the path names: a missing gateway or target would
+        // otherwise answer "retry with a different resource identifier" for a
+        // request no identifier can make valid.
+        //
+        // `credentialProviderConfigurations` is optional on the request and
+        // `@required` with exactly one entry on this operation's own response
+        // (`smithy_query operation=UpdateGatewayTarget`), and the update
+        // REPLACES the target's whole configuration, so a body that defines
+        // none leaves nothing to report and is refused rather than defaulted.
+        let Some(credential_provider_configurations) = input
+            .credential_provider_configurations
+            .filter(|configured| !configured.is_empty())
+        else {
+            return Err(UpdateGatewayTargetErrorModeled::ValidationException(
+                crate::state::member_not_defined(
+                    crate::state::CREDENTIAL_PROVIDER_CONFIGURATIONS_PROSE,
+                ),
+            )
+            .into());
+        };
+
         // Everything that can be decided from stored state alone is decided
         // first, and the store guard is DROPPED before the cross-service call
         // below: a lock is not held across an await, and the Lambda the new
@@ -227,10 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.expire_deleted_gateways(now);
             let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
                 UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        crate::state::ACTION_RETRIEVE,
-                        crate::state::RESOURCE_GATEWAY,
-                    ),
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
                 )
             })?;
             // A target is served BY the gateway, so the gateway has to be ready
@@ -251,10 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // an update reconfigures a stored target, it does not mint one.
             if !gateway.targets.contains_key(&input.target_id) {
                 return Err(UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        crate::state::ACTION_UPDATE,
-                        crate::state::RESOURCE_GATEWAY_TARGET,
-                    ),
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_TARGET),
                 )
                 .into());
             }
@@ -288,10 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.gateway_identifier)
             .ok_or_else(|| {
                 UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        crate::state::ACTION_RETRIEVE,
-                        crate::state::RESOURCE_GATEWAY,
-                    ),
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
                 )
             })?;
         let status = gateway.status_at(now).to_string();
@@ -304,10 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let gateway_arn = gateway.gateway_arn.clone();
         let record = gateway.targets.get_mut(&input.target_id).ok_or_else(|| {
             UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    crate::state::ACTION_UPDATE,
-                    crate::state::RESOURCE_GATEWAY_TARGET,
-                ),
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_TARGET),
             )
         })?;
 
@@ -322,14 +333,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.metadata_configuration = input.metadata_configuration;
         record.private_endpoint = input.private_endpoint;
         record.certificate_configurations = input.certificate_configurations;
-        // `credentialProviderConfigurations` is optional on the request and
-        // `@required` with one entry on every response that reports a target, so a
-        // request carrying none leaves the target on the same default
-        // `CreateGatewayTarget` stores for one: the gateway's own IAM role.
-        record.credential_provider_configurations =
-            crate::state::effective_credential_provider_configurations(
-                input.credential_provider_configurations,
-            );
+        // `credentialProviderConfigurations` is what the body defined, refused
+        // above when it defined none: the update replaces the stored list with
+        // it rather than falling back to a default.
+        record.credential_provider_configurations = credential_provider_configurations;
         // `name` is optional on the request and `@required` on every response, so
         // a request naming none keeps the stored name rather than clearing a
         // member the wire cannot render without.
