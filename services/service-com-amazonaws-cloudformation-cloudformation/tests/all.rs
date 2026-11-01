@@ -125,6 +125,8 @@ mod hook_result_invocations;
 mod iam_capability_gate;
 #[path = "all/iam_identity_resources.rs"]
 mod iam_identity_resources;
+#[path = "all/import_stacks_to_stack_set.rs"]
+mod import_stacks_to_stack_set;
 #[path = "all/include_transform.rs"]
 mod include_transform;
 #[path = "all/independent_gate_ready_set.rs"]

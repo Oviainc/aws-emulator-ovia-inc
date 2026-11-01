@@ -33,6 +33,11 @@
 //! too: a client addressing this emulator through an endpoint of its own still names its
 //! bucket in the first path segment, and the host is not what the object is read from.
 //!
+//! A member whose own model admits the direct `s3://<bucket>/<key>` form beside those two
+//! ([`addressed_object`]) reads its object through the SAME addressing, so no operation
+//! spells an Amazon S3 address of its own; [`read`] is likewise the one read of a
+//! caller-addressed object, bounded by what that object is for.
+//!
 //! ## What the read refuses
 //!
 //! An object Amazon S3 will not hand over — a key or a bucket it does not hold, a read it
@@ -104,9 +109,36 @@ pub async fn fetch(
     region: &str,
     url: &str,
 ) -> Result<String, String> {
+    let object = object(url)?;
+    read(
+        ctx,
+        region,
+        &object,
+        super::TEMPLATE_BODY_MAX_BYTES,
+        &super::template_body_too_long(),
+    )
+    .await
+}
+
+/// The TEXT of one Amazon S3 object, read from this emulator's own Amazon S3 through the
+/// in-process callback — the one read of a caller-addressed object this service makes.
+///
+/// `max_bytes` is the ceiling the caller holds the object to and `too_long` the refusal past
+/// it: an object a request addresses is caller-sized, so every read of one is bounded by what
+/// the object is FOR — a template body by the documented `TemplateBody` maximum, a list of
+/// identifiers by how many of them the operation may be given.
+///
+/// `Err(message)` is the `ValidationError` message the operation answers: the URL is the
+/// caller's own, so an object Amazon S3 will not hand over is the REQUEST's problem.
+pub async fn read(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    object: &Object,
+    max_bytes: usize,
+    too_long: &str,
+) -> Result<String, String> {
     use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
-    let object = object(url)?;
     let read = super::provisioner::s3_client(ctx, region)
         .get_object()
         .bucket(&object.bucket)
@@ -118,28 +150,27 @@ pub async fn fetch(
             // The object the caller's own URL addressed was not handed over, under the code
             // Amazon S3 named for it (`NoSuchKey` for a key it does not hold, `NoSuchBucket`
             // for a bucket it does not hold).
-            unreadable_object(&object, error.code().unwrap_or(UNIDENTIFIED_FAILURE))
+            unreadable_object(object, error.code().unwrap_or(UNIDENTIFIED_FAILURE))
         })?;
     // The length the object REPORTS, before a single byte of it is held.
     if read
         .content_length()
-        .is_some_and(|length| length > super::TEMPLATE_BODY_MAX_BYTES as i64)
+        .is_some_and(|length| length > max_bytes as i64)
     {
-        return Err(super::template_body_too_long());
+        return Err(too_long.to_string());
     }
     let body = read
         .body
         .collect()
         .await
-        .map_err(|_| unreadable_object(&object, UNIDENTIFIED_FAILURE))?
+        .map_err(|_| unreadable_object(object, UNIDENTIFIED_FAILURE))?
         .into_bytes();
-    if body.len() > super::TEMPLATE_BODY_MAX_BYTES {
-        return Err(super::template_body_too_long());
+    if body.len() > max_bytes {
+        return Err(too_long.to_string());
     }
-    // A template body is text; an object that is not valid UTF-8 carries no template body
-    // this service could read, so it is not the body this reference addressed.
-    String::from_utf8(body.to_vec())
-        .map_err(|_| unreadable_object(&object, UNIDENTIFIED_FAILURE))
+    // What the reference addressed is TEXT; an object that is not valid UTF-8 carries none, so
+    // it is not what this reference addressed.
+    String::from_utf8(body.to_vec()).map_err(|_| unreadable_object(object, UNIDENTIFIED_FAILURE))
 }
 
 /// The bucket, key and object version a `TemplateURL` addresses.
@@ -155,11 +186,36 @@ pub fn object(template_url: &str) -> Result<Object, String> {
     if parsed.scheme() != HTTPS_SCHEME {
         return Err(UNSUPPORTED_URL.to_string());
     }
+    hosted_object(&parsed).ok_or_else(|| NOT_A_READABLE_OBJECT.to_string())
+}
+
+/// The Amazon S3 object `url` addresses, for a member whose OWN model constrains which
+/// schemes it may carry: the `s3://<bucket>/<key>` form beside the two http(s) addressing
+/// styles [`object`] reads.
+///
+/// `None` for text that addresses no object at all, so the caller words that refusal for the
+/// member it is about — the scheme itself is the boundary's to refuse where the model carries
+/// the pattern that states it.
+pub fn addressed_object(url: &str) -> Option<Object> {
+    // `s3://<bucket>/<key>` is read by the ONE reading of that spelling this crate holds
+    // ([`super::template::s3_uri_parts`]), so an object addressed that way is the same object
+    // here as everywhere else a URI may carry it.
+    if let Some((bucket, key, version)) = super::template::s3_uri_parts(url) {
+        return Some(Object {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version: version.map(str::to_string),
+        });
+    }
+    hosted_object(&::url::Url::parse(url).ok()?)
+}
+
+/// The bucket and key an http(s) URL names in either documented Amazon S3 addressing style,
+/// or `None` for one that carries no bucket and key at all.
+fn hosted_object(parsed: &::url::Url) -> Option<Object> {
     // The host is read for the BUCKET it names and for nothing else: nothing here connects
     // to it.
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| NOT_A_READABLE_OBJECT.to_string())?;
+    let host = parsed.host_str()?;
     // Virtual-hosted addressing puts the bucket in the labels BEFORE the S3 service label
     // (a bucket name may itself carry dots, so every label before it belongs to it);
     // path-style addressing — the S3 label first, or a host naming no S3 label at all —
@@ -172,7 +228,7 @@ pub fn object(template_url: &str) -> Result<Object, String> {
     let (bucket, key) = match service_label {
         Some(0) | None => match path.split_once('/') {
             Some((bucket, key)) => (bucket.to_string(), key.to_string()),
-            None => return Err(NOT_A_READABLE_OBJECT.to_string()),
+            None => return None,
         },
         // Taken rather than indexed: the bucket is every label BEFORE the service one, and
         // nothing here slices caller-supplied text by position.
@@ -190,19 +246,25 @@ pub fn object(template_url: &str) -> Result<Object, String> {
     // client's own `PutObject` URL carried too.
     let key = decoded(&key);
     if bucket.is_empty() || key.is_empty() {
-        return Err(NOT_A_READABLE_OBJECT.to_string());
+        return None;
     }
-    Ok(Object {
+    Some(Object {
         bucket,
         key,
-        // "To retrieve a specific version, you must use the versionId subresource": the
-        // query the URL carries, already decoded by the URL reader. A query naming anything
-        // else addresses the object's current version.
-        version: parsed
-            .query_pairs()
-            .find(|(name, _)| name == VERSION_ID)
-            .map(|(_, value)| value.into_owned()),
+        version: version_of(parsed),
     })
+}
+
+/// The object VERSION a URL addresses, where it addresses one.
+///
+/// "To retrieve a specific version, you must use the versionId subresource": the query the URL
+/// carries, already decoded by the URL reader. A query naming anything else addresses the
+/// object's current version.
+fn version_of(parsed: &::url::Url) -> Option<String> {
+    parsed
+        .query_pairs()
+        .find(|(name, _)| name == VERSION_ID)
+        .map(|(_, value)| value.into_owned())
 }
 
 /// One percent-decoding of a URL path, through the crate's existing encoder.

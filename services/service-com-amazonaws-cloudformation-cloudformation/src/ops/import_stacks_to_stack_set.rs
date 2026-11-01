@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportStacksToStackSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportStacksToStackSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: brings stacks that ALREADY EXIST under a StackSet this administrator account
+//! and Region holds. Each stack the request names becomes one stack instance of that StackSet
+//! — "a reference to a stack in a target account within a Region" — in the account and Region
+//! the stack's own id names, and the whole import is ONE StackSet operation, whose id this
+//! call answers with and which `DescribeStackSetOperation` and
+//! `ListStackSetOperationResults` monitor from there.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportStacksToStackSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing is deployed: the stacks are already deployed, so the import writes the association
+//! and the operation record and leaves every stack exactly as it is. The operation is RUNNING
+//! when the call answers and reaches `SUCCEEDED` one status-transition span later, which is
+//! when its instances become `CURRENT` — the same clock every other StackSet operation of this
+//! service runs on.
+//!
+//! The stacks are named either inline, as `StackIds`, or by reference, as a `StackIdsUrl`
+//! addressing an Amazon S3 object that lists them; the reference says WHERE the list is, not
+//! what it means, so the object is read from this emulator's own Amazon S3 and the import then
+//! does exactly what the same ids submitted inline make it do
+//! ([`crate::state::template_url`]).
 //!
 //! ## Shape of an operation
 //!
@@ -99,6 +108,103 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::{self, StoredStackInstance};
+
+/// How many stacks ONE import may name.
+///
+/// `ImportStacksToStackSet`: "Use the stack import operation to import up to 10 stacks into a
+/// new StackSet"; `StackIds`: "You import up to 10 stacks per StackSet at a time." The model
+/// carries no `@length` for the list, so the handler is what holds a request to the documented
+/// maximum — and it is the ceiling the list a `StackIdsUrl` object carries is held to as well,
+/// since the two name the same thing.
+const MAX_IMPORTED_STACKS: usize = 10;
+
+/// How many bytes of a `StackIdsUrl` object are read.
+///
+/// The object lists at most [`MAX_IMPORTED_STACKS`] stack ids, so this is that many ids at a
+/// generous size each: a caller chooses the object, so the read is bounded before a byte of it
+/// is held, and an object larger than any list of that many ids could be is refused rather
+/// than read.
+const MAX_STACK_IDS_OBJECT_BYTES: usize = MAX_IMPORTED_STACKS * 1_024;
+
+/// The refusal for a request that names BOTH ways of listing the stacks.
+///
+/// The RULE comes from the model: "Specify either StackIds or StackIdsUrl." Entirely fixed
+/// text — the request's own shape is what is wrong — worded as this service words the same
+/// either-or about a template (`CreateStackSet`'s `TemplateBody`/`TemplateURL`).
+const BOTH_STACK_ID_SOURCES: &str = "You cannot specify both StackIds and StackIdsUrl";
+
+/// The refusal for a request that names NEITHER, likewise from "Specify either StackIds or
+/// StackIdsUrl."
+const NO_STACK_ID_SOURCE: &str = "Either StackIds or StackIdsUrl must be specified";
+
+/// The refusal for a request that names a way to list the stacks but lists NONE: there is no
+/// stack to import, which is a different mistake from naming no list at all.
+const NO_STACK_IDS: &str = "You must specify at least one value for StackIds";
+
+/// The refusal for a `StackIdsUrl` that addresses no Amazon S3 object at all, worded about the
+/// member the request named, the way the same refusal about a `TemplateURL` is.
+const NOT_A_READABLE_STACK_ID_LIST: &str =
+    "StackIdsUrl must reference a valid S3 object to which you have access.";
+
+/// The refusal for a `StackIdsUrl` object past [`MAX_STACK_IDS_OBJECT_BYTES`].
+fn stack_ids_object_too_long() -> String {
+    format!(
+        "StackIdsUrl must reference an S3 object no larger than {MAX_STACK_IDS_OBJECT_BYTES} \
+         bytes"
+    )
+}
+
+/// One stack this import brings under the StackSet, as the instance it becomes needs it.
+struct ImportedStack {
+    /// The stack's own id, which the resulting instance reports as its `StackId`.
+    stack_id: String,
+    /// The account the stack lives in — the instance's `Account`, read off the stack's own id.
+    account: String,
+    /// The Region the stack is deployed in — the instance's `Region`, which is the Region the
+    /// imported stack really lives in rather than the administrator's.
+    region: String,
+}
+
+/// The Region and account an `arn:aws:cloudformation:<region>:<account>:stack/<name>/<id>`
+/// names, or `None` for text that is not such an id.
+///
+/// "By specifying the stack ID of the stack you intend to import": a stack id carries the
+/// Region the stack lives in, which is what makes a stack of ANOTHER Region importable at all —
+/// this service's store is read through a Region ([`crate::state`]), so the Region a stack is
+/// resolved in is the one its own id names rather than the administrator's. The account is
+/// likewise the stack's own, since the imported stack is "in the same account as the source
+/// stack or in a different administrator account".
+fn stack_id_scope(stack_id: &str) -> Option<(&str, &str)> {
+    let mut segments = stack_id.split(':');
+    let prefix = segments.next()?;
+    let _partition = segments.next()?;
+    let service = segments.next()?;
+    let region = segments.next()?;
+    let account = segments.next()?;
+    let resource = segments.next()?;
+    let names_a_stack = prefix == "arn"
+        && service == crate::state::ARN_NAMESPACE
+        && resource.starts_with("stack/")
+        && !region.is_empty()
+        && !account.is_empty();
+    names_a_stack.then_some((region, account))
+}
+
+/// The stack ids one `StackIdsUrl` object lists.
+///
+/// "The Amazon S3 URL which contains list of stack ids to be inputted": the object is a list of
+/// identifiers, in the form a client writes such a list — one per line, or separated by commas
+/// — so the entries are read between those separators and the blank ones (a trailing newline,
+/// a blank line) list no stack.
+fn listed_stack_ids(listed: &str) -> Vec<String> {
+    listed
+        .split(['\n', '\r', ','])
+        .map(str::trim)
+        .filter(|stack_id| !stack_id.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -174,18 +280,286 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportStacksToStackSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportStacksToStackSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportStacksToStackSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to import into, so
+            // nothing was written and 501 is the only honest answer.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ImportStacksToStackSet",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        // "Specify either StackIds or StackIdsUrl": the two name the same list, so a request
+        // naming both or neither is wrong whatever the store holds and is refused HERE. The
+        // object a reference addresses is read with the store UNLOCKED, before anything is
+        // resolved, the way every other object this service reads by reference is.
+        let named = match (&input.stack_ids, &input.stack_ids_url) {
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    BOTH_STACK_ID_SOURCES,
+                ))
+            }
+            (Some(stack_ids), None) => stack_ids.clone(),
+            (None, Some(url)) => {
+                let object = crate::state::template_url::addressed_object(url).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(NOT_A_READABLE_STACK_ID_LIST)
+                })?;
+                let listed = crate::state::template_url::read(
+                    ctx,
+                    &region,
+                    &object,
+                    MAX_STACK_IDS_OBJECT_BYTES,
+                    &stack_ids_object_too_long(),
+                )
+                .await
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                listed_stack_ids(&listed)
+            }
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    NO_STACK_ID_SOURCE,
+                ))
+            }
+        };
+        // "You import up to 10 stacks per StackSet at a time": the ceiling is on the list the
+        // request SUBMITS, so it is read before the entries are collapsed below, and a longer
+        // list is the modelled `LimitExceededException` ("the quota for the resource has
+        // already been reached"), refused before the store is read at all.
+        if named.len() > MAX_IMPORTED_STACKS {
+            return Err(ImportStacksToStackSetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Limit for imported stacks exceeded: no more than \
+                         {MAX_IMPORTED_STACKS} stacks can be imported into a StackSet at a time"
+                    )),
+                },
+            )
+            .into());
+        }
+        // "The IDs of the stacks you are importing into a StackSet": the same id twice names
+        // the same stack, so the list is read over its DISTINCT entries — the one reading of
+        // that this service shares with every other stack-set request that takes a list.
+        let stack_ids = stack_sets::distinct(named);
+        if stack_ids.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                NO_STACK_IDS,
+            ));
+        }
+        // "The list of OU ID's to which the imported stacks must be mapped as deployment
+        // targets", each once: a repeated OU names the same target.
+        let organizational_unit_ids =
+            stack_sets::distinct(input.organizational_unit_ids.clone().unwrap_or_default());
+        // "The operation ID also functions as an idempotency token": the caller's when it
+        // named one, otherwise the one CloudFormation assigns the operation.
+        let operation_id = input
+            .operation_id
+            .clone()
+            .unwrap_or_else(crate::state::new_operation_id);
+        let now = ::std::time::SystemTime::now();
+
+        // ONE critical section: nothing below reads a caller-sized document or calls another
+        // service — the stacks being imported are already deployed, so an import writes the
+        // association and the operation record and deploys nothing.
+        let mut store = state.lock();
+        // The only write a read of the store makes: materialising the status transitions the
+        // clock had already made due.
+        store.settle(now);
+
+        let Some(stack_set) = store.resolve_stack_set(&region, &input.stack_set_name) else {
+            return Err(ImportStacksToStackSetErrorModeled::StackSetNotFoundException(
+                StackSetNotFoundException {
+                    message: Some(crate::state::stack_set_does_not_exist(
+                        &input.stack_set_name,
+                    )),
+                },
+            )
+            .into());
+        };
+        // "Only one operation can be performed for a stack set at a given time": the refusal
+        // names the StackSet it is about and the operation that still holds it.
+        if let Some(in_flight) = stack_set.operation_in_flight() {
+            return Err(
+                ImportStacksToStackSetErrorModeled::OperationInProgressException(
+                    OperationInProgressException {
+                        message: Some(stack_sets::operation_in_progress_message(
+                            &stack_set.stack_set_arn,
+                            &in_flight.operation_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "The specified operation ID already exists": the same id names the operation that
+        // already ran on this StackSet, so this request is not performed a second time.
+        if stack_set.operation(&operation_id).is_some() {
+            return Err(
+                ImportStacksToStackSetErrorModeled::OperationIdAlreadyExistsException(
+                    OperationIdAlreadyExistsException {
+                        message: Some(stack_sets::operation_id_already_exists(&operation_id)),
+                    },
+                )
+                .into(),
+            );
+        }
+        // An organizational unit is a target of the ORGANIZATION a service-managed StackSet
+        // deploys through — "[Service-managed permissions] The organization root ID or
+        // organizational unit (OU) IDs" — so a request mapping imported stacks to OUs against a
+        // StackSet under any other permission model is refused for that reason, naming the
+        // model the StackSet carries, in the wording this service gives that refusal
+        // everywhere ([`stack_sets::RequestedTargets::accounts_in`]).
+        if !organizational_unit_ids.is_empty()
+            && stack_set.permission_model != stack_sets::permission_model::SERVICE_MANAGED
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "StackSets with {} permission model can only have accounts as target",
+                stack_set.permission_model
+            )));
+        }
+        // The StackSet holds at most `MAX_INSTANCES_PER_STACK_SET` instances, and this import
+        // adds one per stack: the write past that ceiling is refused on the modelled channel
+        // rather than reclaiming an instance underneath it.
+        if stack_set
+            .instances
+            .len()
+            .saturating_add(stack_ids.len())
+            > stack_sets::MAX_INSTANCES_PER_STACK_SET
+        {
+            return Err(ImportStacksToStackSetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Limit for stack instances exceeded: no more than {} stack \
+                         instances can exist in one StackSet",
+                        stack_sets::MAX_INSTANCES_PER_STACK_SET
+                    )),
+                },
+            )
+            .into());
+        }
+        let stack_set_id = stack_set.stack_set_id.clone();
+        let administration_role_arn = stack_set.administration_role_arn.clone();
+        let execution_role_name = stack_set.execution_role_name.clone();
+        // The account and Region pairs this StackSet already holds an instance for, indexed in
+        // ONE pass so the check below costs a lookup per imported stack rather than a scan.
+        let mut held: ::std::collections::BTreeSet<(String, String)> = stack_set
+            .instances
+            .iter()
+            .map(|instance| (instance.account.clone(), instance.region.clone()))
+            .collect();
+
+        // Each stack the request named, resolved in the Region ITS OWN id names: "the
+        // specified stack ARN doesn't exist or stack doesn't exist corresponding to the ARN in
+        // input" is the modelled `StackNotFoundException`, so text that is not a stack ARN at
+        // all names no stack either, and a stack whose deletion has completed is no longer a
+        // stack to import. The whole request is refused rather than half of it carried out, so
+        // nothing is imported when one id names no stack.
+        let mut imported: Vec<ImportedStack> = Vec::new();
+        for named_id in &stack_ids {
+            let not_found = || {
+                ImportStacksToStackSetErrorModeled::StackNotFoundException(
+                    StackNotFoundException {
+                        message: Some(crate::state::stack_does_not_exist(named_id)),
+                    },
+                )
+            };
+            // "By specifying the stack ID of the stack you intend to import": the member
+            // carries stack IDs, so an entry that is not one is refused rather than resolved as
+            // a NAME of the administrator's own Region.
+            let (stack_region, named_account) = stack_id_scope(named_id).ok_or_else(not_found)?;
+            let stack = store
+                .resolve(stack_region, named_id)
+                .filter(|stack| stack.is_live())
+                .ok_or_else(not_found)?;
+            // The account is the stack's OWN, read off the id this store minted for it rather
+            // than off the request's text, which the resolution above has already matched it
+            // against.
+            let account = stack_id_scope(&stack.stack_id)
+                .map_or_else(|| named_account.to_string(), |(_, account)| account.to_string());
+            // "A stack instance refers to a stack in a specific account and Region", and an
+            // account and Region pair carries at most ONE instance of a StackSet: a pair the
+            // StackSet already holds an instance for — or one two stacks of this request would
+            // both land on — is refused on the modelled channel rather than leaving the stack
+            // the held instance points at with nothing pointing at it.
+            if !held.insert((account.clone(), stack.region.clone())) {
+                return Err(
+                    ImportStacksToStackSetErrorModeled::InvalidOperationException(
+                        InvalidOperationException {
+                            message: Some(format!(
+                                "Stack instance in account {account} and Region {} already \
+                                 exists",
+                                stack.region
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            imported.push(ImportedStack {
+                stack_id: stack.stack_id.clone(),
+                account,
+                region: stack.region.clone(),
+            });
+        }
+
+        // Which OU an imported stack's instance is associated with: the one the request mapped
+        // the stacks to. A request naming SEVERAL asks which of them each imported account sits
+        // under, which is organization membership this emulator holds none of — the real service
+        // serves that, so it is answered as work nobody has written rather than over an OU
+        // nothing says this account belongs to.
+        let organizational_unit_id = match organizational_unit_ids.as_slice() {
+            [] => None,
+            [only] => Some(only.clone()),
+            _ => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "ImportStacksToStackSet",
+                ))
+            }
+        };
+
+        let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) else {
+            return Err(ImportStacksToStackSetErrorModeled::StackSetNotFoundException(
+                StackSetNotFoundException {
+                    message: Some(crate::state::stack_set_does_not_exist(
+                        &input.stack_set_name,
+                    )),
+                },
+            )
+            .into());
+        };
+        for entry in &imported {
+            let mut instance = StoredStackInstance::new(
+                entry.account.clone(),
+                entry.region.clone(),
+                operation_id.clone(),
+            );
+            // "The ID of the stack instance": the stack that already exists, which is what
+            // makes this an import rather than a deployment.
+            instance.stack_id = Some(entry.stack_id.clone());
+            // "RUNNING: The operation in the specified account and Region is currently in
+            // progress" — the import is answered in flight and the instance reaches
+            // `CURRENT`/`SUCCEEDED` when the operation concludes.
+            instance.detailed_status = stack_sets::detailed_status::RUNNING.to_string();
+            instance.organizational_unit_id = organizational_unit_id.clone();
+            stack_set.record_instance(instance);
+        }
+        // The operation this call started, which `DescribeStackSetOperation` monitors: RUNNING
+        // now, SUCCEEDED once the clock makes its conclusion due. The import CREATES the
+        // instances of the StackSet, which is the `StackSetOperationAction` the model has for
+        // it — it declares no action of its own.
+        let mut operation = stack_sets::StoredStackSetOperation::running(
+            operation_id.clone(),
+            stack_sets::operation_action::CREATE,
+            now,
+        );
+        operation.preferences = input
+            .operation_preferences
+            .as_ref()
+            .map(stack_sets::stored_preferences);
+        operation.administration_role_arn = administration_role_arn;
+        operation.execution_role_name = execution_role_name;
+        stack_set.record_operation(operation);
+
+        Ok(ImportStacksToStackSetOutput {
+            operation_id: Some(operation_id),
+        })
     }
 }
