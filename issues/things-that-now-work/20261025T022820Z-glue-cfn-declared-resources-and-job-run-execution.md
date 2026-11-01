@@ -1,16 +1,16 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: glue.deploy-glue-database-cfn-behaves glue.deploy-glue-database-via-cloudformation-behaves glue.deploy-crawler-via-cloudformation glue.deploy-job-missing-output-permission-rejected glue.e2e-glue-tsd-database-tables-schema-lifecycle glue__s3.glue-job-bookmark-delta-then-reset-reprocesses-every-file glue__s3.glue-workflow-runs-its-second-trigger-only-after-the-first-job-succeeds
+Issue-Trace-Ids: glue.deploy-glue-database-cfn-behaves glue.deploy-glue-database-via-cloudformation-behaves glue.deploy-crawler-via-cloudformation glue.deploy-job-missing-output-permission-rejected glue.e2e-glue-tsd-database-tables-schema-lifecycle
 Issue-Key: glue|GetDatabase|EntityNotFoundException
 Issue-Key: glue|GetCrawler|EntityNotFoundException
 Issue-Key: glue|StartJobRun|EntityNotFoundException
 Issue-Key: glue.e2e-glue-tsd-database-tables-schema-lifecycle|phase#7|AssertionError|raise AssertionError(f"[phase {i}/{len(self.phases)} {name}] {exc}") from exc
-Issue-Key: glue__s3.glue-job-bookmark-delta-then-reset-reprocesses-every-file|run#9|AssertionError|assert run1["JobRunState"] == "SUCCEEDED", (
-Issue-Key: glue__s3.glue-workflow-runs-its-second-trigger-only-after-the-first-job-succeeds|run#22|AssertionError|assert warmup["JobRunState"] == "SUCCEEDED", (
 Issue-Commit: e9591ea0ffea53e5939624d35a733297d20386ca
 
 # Glue: CloudFormation-declared AWS::Glue resources do not exist under their declared names, and a started job run executes no script
+
+> _Cause 1 below is FIXED and this report is closed for it. Cause 2 — a started job run executing no script — was NOT fixed: it is platform-blocked, so it is re-filed on its own, with its two replay keys and its two `glue__s3` trace ids, as `issues/things-that-do-not-work/20261025T022820Z-glue-job-runs-execute-no-script-so-no-side-effects.md`; those keys and trace ids are therefore no longer listed above, and the account of cause 2 is kept below only as the record of what this report bundled._
 
 > _Split out of `20261025T022820Z-glue-7-net-new-root-causes-gettables-expression.md`, which bundled seven root causes. Five of them are closed in that report (the `GetTables` `Expression` regular expression, the foreign-`CatalogId` refusal, the Glue job capacity defaults, the Region scoping of job definitions and their runs, and the `CreateCrawler` event-queue permission check). The two below were NOT closed and keep their replay keys here, so a later scan does not read them as working. They were identified against commit `e9591ea0ffea53e5939624d35a733297d20386ca`; the code base may have drifted._
 

@@ -2248,19 +2248,29 @@ fn hyphenated(segment: &str) -> String {
 /// A type whose owning API spells its name member with the resource's FULL noun rather
 /// than the type's last segment is read through [`declared_name_property`] first, so the
 /// name such a template asked for is still the name the resource carries.
+///
+/// A type whose owning API takes that name inside an INPUT STRUCTURE is read through
+/// [`declared_name_path`] before either convention, for the same reason: the name is a
+/// MEMBER of one of the type's properties rather than a property, and it is still the name
+/// the resource is created under.
 fn physical_name(
     declared: &DeclaredResource,
     naming: &Scope<'_>,
     budget: &mut Budget,
 ) -> String {
-    let declared_name = name_property_candidates(&declared.resource_type)
-        .into_iter()
-        .find_map(|property| {
-            declared
-                .properties
-                .get(&property)
-                .and_then(|value| text(value, naming, 0, budget))
-        });
+    let nested_name = declared_name_path(&declared.resource_type)
+        .and_then(|path| property_at(&declared.properties, path))
+        .and_then(|value| text(value, naming, 0, budget));
+    let declared_name = nested_name.or_else(|| {
+        name_property_candidates(&declared.resource_type)
+            .into_iter()
+            .find_map(|property| {
+                declared
+                    .properties
+                    .get(&property)
+                    .and_then(|value| text(value, naming, 0, budget))
+            })
+    });
     match declared_name {
         // The name the TEMPLATE supplied, exactly as it supplied it: it is the caller's,
         // and a name the owning service refuses is reported as the failure that service
@@ -2605,6 +2615,11 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Smithy model), which a generated name is already inside — every character one is
         // built from is printable — but may be longer than.
         "AWS::Glue::Job" => rules(255, Characters::AsGenerated),
+        // The same `NameString` bound AWS Glue holds every entity of its own to:
+        // `CreateDatabase.DatabaseInput$Name`, `CreateTable.TableInput$Name` and
+        // `CreateCrawler.Name` are all `@length(min: 1, max: 255)` with that same printable
+        // pattern (AWS Glue's own Smithy model).
+        GLUE_DATABASE | GLUE_TABLE | GLUE_CRAWLER => rules(255, Characters::AsGenerated),
         // Amazon EventBridge `PutRule.Name`: `RuleName`, `@length(min: 1, max: 64)` with
         // pattern `^[\.\-_A-Za-z0-9]+$` (EventBridge's own Smithy model), which a
         // generated name is already inside but may be longer than.
@@ -2969,6 +2984,32 @@ fn declared_name_property(resource_type: &str) -> Option<&'static str> {
         MSK_SERVERLESS_CLUSTER => Some("ClusterName"),
         _ => None,
     }
+}
+
+/// The nested member path a resource type states its NAME at, for a type whose owning API
+/// takes that name inside an INPUT STRUCTURE rather than as a member of the create's own
+/// request — so neither convention [`physical_name`] reads, nor the per-type property
+/// [`declared_name_property`] names, can reach it.
+///
+/// AWS Glue's `CreateDatabase` takes the database's name as `DatabaseInput$Name` and its
+/// `CreateTable` the table's as `TableInput$Name`, and `AWS::Glue::Database` and
+/// `AWS::Glue::Table` publish exactly those structures as their properties. The name inside
+/// is still the name the resource is CREATED under and the identifier every operation on it
+/// takes, so it is the physical id — read here, before the conventions, because a type
+/// naming itself this way carries no name property at all.
+fn declared_name_path(resource_type: &str) -> Option<&'static [&'static str]> {
+    match resource_type {
+        GLUE_DATABASE => Some(&["DatabaseInput", "Name"]),
+        GLUE_TABLE => Some(&["TableInput", "Name"]),
+        _ => None,
+    }
+}
+
+/// The value a declaration's properties carry at a nested member path, or `None` where the
+/// declaration carries no member at it ([`declared_name_path`]).
+fn property_at<'a>(properties: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter()
+        .try_fold(properties, |document, member| document.get(member))
 }
 
 /// The LABEL an AgentCore identifier derived from `name` carries: `name` reduced to the
@@ -5294,6 +5335,17 @@ pub const BACKUP_ARN_NAMESPACE: &str = "backup";
 /// value only Amazon Managed Grafana mints — so the id a stack's output reports for it is
 /// the one that service answered with.
 pub const GRAFANA_WORKSPACE: &str = "AWS::Grafana::Workspace";
+
+/// The three AWS Glue Data Catalog and crawler resource types a stack declares beside its
+/// job definitions (that service's model: `cloudFormationName: Glue`). Each is a type
+/// `super::provisioning` creates in AWS Glue itself, and each one's `Ref` returns the NAME
+/// the declaration states — a database's and a table's inside the input structure the
+/// owning API takes it in ([`declared_name_path`]), a crawler's as its own `Name` property
+/// — which is the identifier every AWS Glue operation on one of them addresses it by, so
+/// none of the three has a service-assigned identity.
+pub const GLUE_DATABASE: &str = "AWS::Glue::Database";
+pub const GLUE_TABLE: &str = "AWS::Glue::Table";
+pub const GLUE_CRAWLER: &str = "AWS::Glue::Crawler";
 
 /// An Amazon GuardDuty detector's resource type (the GuardDuty model:
 /// `cloudFormationName: GuardDuty`). This is a type `super::provisioning` creates in
@@ -7779,6 +7831,127 @@ mod tests {
             unknown.is_empty(),
             "case \"a type no arm carries\": expected no attributes, got {unknown:?}"
         );
+    }
+
+    /// The physical name the naming rules give one declaration, for the table below.
+    fn named(resource_type: &str, properties: Value) -> String {
+        let stack = StackScope {
+            region: "us-east-1",
+            stack_name: "a-stack",
+            stack_id: "a-stack-id",
+        };
+        let parameters = BTreeMap::new();
+        let parameter_types = BTreeMap::new();
+        let resources = BTreeMap::new();
+        let mappings = Value::Null;
+        let conditions = Value::Null;
+        let imports = BTreeMap::new();
+        let scope = Scope {
+            stack,
+            parameters: &parameters,
+            parameter_types: &parameter_types,
+            resources: &resources,
+            mappings: &mappings,
+            conditions: &conditions,
+            imports: &imports,
+        };
+        let mut budget = Budget::new();
+        let declared = DeclaredResource {
+            logical_id: "ARes".to_string(),
+            resource_type: resource_type.to_string(),
+            properties,
+            condition: None,
+            declaration: Value::Null,
+        };
+        physical_name(&declared, &scope, &mut budget)
+    }
+
+    /// A resource carries the name its declaration states, wherever the type states it:
+    /// through one of the conventions ([`name_property_candidates`]), through the type's own
+    /// unconventional name property ([`declared_name_property`]), or inside the INPUT
+    /// STRUCTURE its owning API takes that name in ([`declared_name_path`]) — and only a
+    /// declaration that names the resource NOWHERE gets a generated
+    /// `<stack>-<logical id>-<unique id>`.
+    ///
+    /// The rows span the forms a declaration can state it in: each of the three places, a
+    /// name written as an intrinsic rather than a literal, and a declaration that carries
+    /// the input structure but no name inside it.
+    #[test]
+    fn a_name_is_read_from_wherever_the_type_states_it() {
+        // (case, the type, the declared properties, the name it must carry — `None` for a
+        // declaration whose name CloudFormation generates).
+        let rows: Vec<(&str, &str, Value, Option<&str>)> = vec![
+            (
+                "the convention: the type's last segment plus Name",
+                SQS_QUEUE,
+                ::serde_json::json!({ "QueueName": "a-queue" }),
+                Some("a-queue"),
+            ),
+            (
+                "the convention: a plain Name",
+                GLUE_CRAWLER,
+                ::serde_json::json!({ "Name": "a-crawler" }),
+                Some("a-crawler"),
+            ),
+            (
+                "the type's own unconventional name property",
+                ECR_PUBLIC_REPOSITORY,
+                ::serde_json::json!({ "RepositoryName": "a-repository" }),
+                Some("a-repository"),
+            ),
+            (
+                "a name inside the input structure the owning API takes it in",
+                GLUE_DATABASE,
+                ::serde_json::json!({
+                    "DatabaseInput": { "Name": "a_database", "Description": "a description" }
+                }),
+                Some("a_database"),
+            ),
+            (
+                "the same for a table, beside the database property that is not its name",
+                GLUE_TABLE,
+                ::serde_json::json!({
+                    "DatabaseName": "a_database",
+                    "TableInput": { "Name": "a_table" }
+                }),
+                Some("a_table"),
+            ),
+            (
+                "a nested name written as an intrinsic, which is evaluated like any other",
+                GLUE_TABLE,
+                ::serde_json::json!({
+                    "TableInput": { "Name": { "Fn::Sub": "a_${AWS::Region}_table" } }
+                }),
+                Some("a_us-east-1_table"),
+            ),
+            (
+                "an input structure carrying no name, which names the resource nowhere",
+                GLUE_DATABASE,
+                ::serde_json::json!({ "DatabaseInput": { "Description": "a description" } }),
+                None,
+            ),
+            (
+                "a declaration with no properties at all",
+                GLUE_CRAWLER,
+                ::serde_json::json!({}),
+                None,
+            ),
+        ];
+
+        for (case, resource_type, properties, expected) in rows {
+            let actual = named(resource_type, properties);
+            match expected {
+                Some(declared) => assert_eq!(
+                    actual, declared,
+                    "case {case:?}: expected the declared name {declared:?}, got {actual:?}"
+                ),
+                None => assert!(
+                    actual.starts_with("a-stack-ARes-") && actual.len() > "a-stack-ARes-".len(),
+                    "case {case:?}: expected a generated <stack>-<logical id>-<unique id>, got \
+                     {actual:?}"
+                ),
+            }
+        }
     }
 
     /// [`published_attribute_names`] names exactly the attributes [`return_values`]

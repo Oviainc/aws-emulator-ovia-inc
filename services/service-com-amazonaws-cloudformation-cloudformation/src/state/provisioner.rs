@@ -470,7 +470,8 @@ use super::template::{
     ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EKS_ACCESS_ENTRY,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
-    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, GUARDDUTY_IP_SET,
+    ELASTIC_BEANSTALK_ENVIRONMENT, GLUE_CRAWLER, GLUE_DATABASE, GLUE_TABLE, GRAFANA_WORKSPACE,
+    GUARDDUTY_DETECTOR, GUARDDUTY_IP_SET,
     IAM_ACCESS_KEY,
     KINESIS_STREAM,
     KMS_ALIAS, KMS_KEY,
@@ -638,6 +639,17 @@ pub(super) enum Provisioner {
     /// makes and `DisassociateWebACL` removes.
     Wafv2WebAclAssociation,
     GlueJob,
+    /// `AWS::Glue::Database`: a database of the AWS Glue Data Catalog, which
+    /// `CreateDatabase` creates under the name its `DatabaseInput` states and
+    /// `DeleteDatabase` deletes.
+    GlueDatabase,
+    /// `AWS::Glue::Table`: a table IN one of those databases, which `CreateTable` creates
+    /// under the name its `TableInput` states and `DeleteTable` deletes — addressed by the
+    /// PAIR that service keys a table by, its own name and the database that holds it.
+    GlueTable,
+    /// `AWS::Glue::Crawler`: a crawler of that same catalog, which `CreateCrawler` creates
+    /// under the name the declaration states and `DeleteCrawler` deletes.
+    GlueCrawler,
     GrafanaWorkspace,
     GuardDutyDetector,
     /// `AWS::GuardDuty::IPSet`: a trusted IP list of one of those detectors, which
@@ -780,6 +792,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         WAFV2_REGEX_PATTERN_SET => Some(Provisioner::Wafv2RegexPatternSet),
         WAFV2_WEB_ACL_ASSOCIATION => Some(Provisioner::Wafv2WebAclAssociation),
         GLUE_JOB => Some(Provisioner::GlueJob),
+        GLUE_DATABASE => Some(Provisioner::GlueDatabase),
+        GLUE_TABLE => Some(Provisioner::GlueTable),
+        GLUE_CRAWLER => Some(Provisioner::GlueCrawler),
         GRAFANA_WORKSPACE => Some(Provisioner::GrafanaWorkspace),
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
         GUARDDUTY_IP_SET => Some(Provisioner::GuardDutyIpSet),
@@ -977,6 +992,16 @@ impl Provisioner {
             // (the job's name) set on the way out and the tag MAP that call takes merged
             // from the declaration's own and the stack's.
             Self::GlueJob => create_glue_job(ctx, region, resource, propagated).await,
+            // The two catalog types publish no `Tags` property at all — neither is a
+            // taggable resource, AWS Glue holding tags on the catalog entities its own
+            // tagging calls name — so no tags are propagated to one, and the declared
+            // document IS the create's request with the name CloudFormation decided set
+            // inside the input structure that call takes it in.
+            Self::GlueDatabase => create_glue_database(ctx, region, resource).await,
+            Self::GlueTable => create_glue_table(ctx, region, resource).await,
+            // A crawler IS taggable: its `Tags` property is the tag MAP `CreateCrawler`'s
+            // own `Tags` member takes, so it carries the stack's tags beside its own.
+            Self::GlueCrawler => create_glue_crawler(ctx, region, resource, propagated).await,
             // `AWS::Grafana::Workspace` publishes no `Tags` property either, so the type
             // is not taggable and no stack tags are propagated to it.
             Self::GrafanaWorkspace => create_workspace(ctx, region, resource).await,
@@ -1575,6 +1600,20 @@ impl Provisioner {
             Self::GlueJob => update_glue_job(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `UpdateDatabase` "updates an existing database definition" and takes the same
+            // `DatabaseInput` the create did, so a changed declaration is applied to the
+            // database the stack created rather than replacing it; `UpdateTable` is the same
+            // call for a table's `TableInput`, and every property of `AWS::Glue::Crawler`
+            // but its tags is a member of `UpdateCrawler`.
+            Self::GlueDatabase => update_glue_database(ctx, region, resource, declared)
+                .await
+                .map(Some),
+            Self::GlueTable => update_glue_table(ctx, region, resource, declared)
+                .await
+                .map(Some),
+            Self::GlueCrawler => update_glue_crawler(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // EventBridge Scheduler's `UpdateSchedule` "uses all values, including empty
             // values, specified in the request and overrides the existing schedule", which
             // is exactly what a declaration states about a schedule — so the document that
@@ -1787,6 +1826,12 @@ impl Provisioner {
             // carries.
             Self::Wafv2WebAclAssociation => disassociate_web_acl(ctx, region, resource).await,
             Self::GlueJob => delete_glue_job(ctx, region, physical_resource_id).await,
+            // A database is addressed by its name in the catalog its declaration names, and
+            // a table by that catalog, the database that holds it and its own name — so both
+            // deletes take the whole record rather than the id.
+            Self::GlueDatabase => delete_glue_database(ctx, region, resource).await,
+            Self::GlueTable => delete_glue_table(ctx, region, resource).await,
+            Self::GlueCrawler => delete_glue_crawler(ctx, region, physical_resource_id).await,
             Self::GrafanaWorkspace => {
                 delete_workspace(ctx, region, physical_resource_id).await
             }
@@ -2129,6 +2174,12 @@ impl Provisioner {
                 describe_web_acl_association(ctx, region, resource).await
             }
             Self::GlueJob => describe_glue_job(ctx, region, physical_resource_id).await,
+            // Read back by the same handles the deletes address the two catalog entities by,
+            // and reported as the type's own properties: a database's definition is the
+            // `DatabaseInput` property, a table's the `TableInput` one.
+            Self::GlueDatabase => describe_glue_database(ctx, region, resource).await,
+            Self::GlueTable => describe_glue_table(ctx, region, resource).await,
+            Self::GlueCrawler => describe_glue_crawler(ctx, region, physical_resource_id).await,
             Self::GrafanaWorkspace => {
                 describe_workspace(ctx, region, physical_resource_id).await
             }
@@ -24893,6 +24944,457 @@ async fn describe_glue_job(
         Err(refusal) if refusal.code == GLUE_ENTITY_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
+}
+
+// ---------------------------------------------------------------------------
+// AWS Glue: AWS::Glue::Database, AWS::Glue::Table, AWS::Glue::Crawler
+// ---------------------------------------------------------------------------
+
+/// The property an `AWS::Glue::Database` states the database's definition in, which is the
+/// `DatabaseInput` member `CreateDatabase` and `UpdateDatabase` take it as.
+const GLUE_DATABASE_INPUT_PROPERTY: &str = "DatabaseInput";
+
+/// The property an `AWS::Glue::Table` states the table's definition in, which is the
+/// `TableInput` member `CreateTable` and `UpdateTable` take it as.
+const GLUE_TABLE_INPUT_PROPERTY: &str = "TableInput";
+
+/// The member of either input structure that carries the entity's NAME. It is the name the
+/// entity is created under, which is this resource's physical id — `Ref` of either type
+/// returns it, and it is what every AWS Glue operation on the entity addresses it by — so
+/// CloudFormation sets it on the way out rather than passing the declaration's own through
+/// ([`super::template`] reads it to compute that id).
+const GLUE_INPUT_NAME_MEMBER: &str = "Name";
+
+/// The property both catalog types state the Data Catalog the entity belongs to in, which
+/// every AWS Glue catalog call takes ("If none is provided, the Amazon Web Services account
+/// ID is used by default") and which the delete and the read have to carry for the entity to
+/// be addressed in the same catalog the create made it in.
+const GLUE_CATALOG_ID_PROPERTY: &str = "CatalogId";
+
+/// The property an `AWS::Glue::Table` states the database that holds the table in — the
+/// other half of the pair AWS Glue keys a table by.
+const GLUE_DATABASE_NAME_PROPERTY: &str = "DatabaseName";
+
+/// The `AWS::Glue::Crawler` property that is the crawler's NAME, which is its identity:
+/// `CreateCrawler`, `UpdateCrawler`, `GetCrawler` and `DeleteCrawler` all take it as the
+/// request's own `Name`.
+const GLUE_CRAWLER_NAME_PROPERTY: &str = "Name";
+
+/// The `AWS::Glue::Crawler` property that is no member of `CreateCrawler`'s configuration:
+/// a crawler's tags are the tag MAP that call's own `Tags` member takes, and AWS Glue's
+/// `TagResource`/`UntagResource` afterwards, rather than part of what an update overwrites.
+const GLUE_CRAWLER_TAGS_PROPERTY: &str = "Tags";
+
+/// The one `AWS::Glue::Crawler` property that is not spelled as the matching AWS Glue member
+/// is: the type publishes `Schedule` as the `Schedule` STRUCTURE a crawler is REPORTED with
+/// (its `ScheduleExpression` and `State`), while `CreateCrawler` and `UpdateCrawler` take
+/// the cron EXPRESSION itself as their `Schedule` member.
+const GLUE_CRAWLER_SCHEDULE_PROPERTY: &str = "Schedule";
+const GLUE_SCHEDULE_EXPRESSION_MEMBER: &str = "ScheduleExpression";
+
+/// Create the Data Catalog database an `AWS::Glue::Database` declares, so a client that
+/// deployed the stack and then calls `glue GetDatabase` (or `CreateTable`, or `StartJobRun`
+/// over a job reading it) with the name the stack publishes reads the database back rather
+/// than an `EntityNotFoundException`.
+///
+/// The type's two properties ARE `CreateDatabase`'s own members — `CatalogId` and the whole
+/// `DatabaseInput` structure, named identically on both sides — so the resolved property
+/// document IS the request, with the one member CloudFormation decides set on the way out:
+/// the database's NAME, which is this resource's physical id ([`named_glue_input`]).
+///
+/// The type publishes no `Tags` property, so nothing is propagated to a database: a Data
+/// Catalog database is not a resource CloudFormation tags.
+async fn create_glue_database(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut request = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    named_glue_input(
+        &mut request,
+        GLUE_DATABASE_INPUT_PROPERTY,
+        &resource.physical_resource_id,
+    );
+    call_glue(ctx, region, "CreateDatabase", &Value::Object(request)).await?;
+    // `CreateDatabase` answers nothing, and the type publishes no `Fn::GetAtt` attribute of
+    // its own: the identity in force is the name the stack already computed.
+    Ok(Created::default())
+}
+
+/// Apply a changed `AWS::Glue::Database` declaration to the database the stack created.
+///
+/// `UpdateDatabase` "updates an existing database definition in a Data Catalog" and takes
+/// the same `DatabaseInput` the create did, against the `Name` the database is held under —
+/// so the declaration this deployment states IS that input, and the database keeps its
+/// identity.
+///
+/// That name is the one the resource is HELD under, not one this call could change: a
+/// declaration stating a different name computes a different physical id, which is a
+/// different resource ([`super::provisioning::is_same_resource`]), so the deployment creates
+/// it and deletes the one it replaced instead of reaching this arm at all. This is therefore
+/// only ever called where the declared name is unchanged, which is why setting it costs the
+/// declaration nothing.
+async fn update_glue_database(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let mut properties = declared.as_object().cloned().unwrap_or_else(Map::new);
+    named_glue_input(
+        &mut properties,
+        GLUE_DATABASE_INPUT_PROPERTY,
+        &resource.physical_resource_id,
+    );
+    let mut request = glue_catalog_scope(declared);
+    request.insert(
+        GLUE_INPUT_NAME_MEMBER.to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    request.insert(
+        GLUE_DATABASE_INPUT_PROPERTY.to_string(),
+        properties
+            .remove(GLUE_DATABASE_INPUT_PROPERTY)
+            .unwrap_or_else(|| Value::Object(Map::new())),
+    );
+    call_glue(ctx, region, "UpdateDatabase", &Value::Object(request)).await?;
+    Ok(Created::default())
+}
+
+/// Delete the database a stack created, addressed by its NAME in the catalog its declaration
+/// names — this resource's physical id.
+///
+/// A database AWS Glue no longer holds (`EntityNotFoundException`, judged on the CODE and
+/// never on a message that carries the request's own name) is already in the state the
+/// delete asks for.
+async fn delete_glue_database(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let mut request = glue_catalog_scope(&resource.properties);
+    request.insert(
+        GLUE_INPUT_NAME_MEMBER.to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    match call_glue(ctx, region, "DeleteDatabase", &Value::Object(request)).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == GLUE_ENTITY_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The database as AWS Glue reports it, for drift detection: its own read's `Database`
+/// document, reported under the property the type declares that definition in, beside the
+/// catalog it resides in. The `Database` shape's members are spelled exactly as
+/// `DatabaseInput`'s are, so a declared member is compared against the one AWS Glue holds.
+async fn describe_glue_database(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let mut request = glue_catalog_scope(&resource.properties);
+    request.insert(
+        GLUE_INPUT_NAME_MEMBER.to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    match call_glue(ctx, region, "GetDatabase", &Value::Object(request)).await {
+        Ok(answer) => {
+            let database = reported_member(&answer, "Database");
+            Ok(Some(serde_json::json!({
+                GLUE_CATALOG_ID_PROPERTY: reported_member(&database, GLUE_CATALOG_ID_PROPERTY),
+                GLUE_DATABASE_INPUT_PROPERTY: database,
+            })))
+        }
+        Err(refusal) if refusal.code == GLUE_ENTITY_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Create the catalog table an `AWS::Glue::Table` declares, in the database its declaration
+/// names, so a client reading the deployed catalog back through `glue GetTable` finds it
+/// under the name the stack publishes.
+///
+/// The type's properties ARE `CreateTable`'s own members — `CatalogId`, `DatabaseName`, the
+/// whole `TableInput` structure and `OpenTableFormatInput`, named identically on both sides
+/// — so the resolved property document IS the request, with the table's NAME (this
+/// resource's physical id) set inside that input on the way out.
+///
+/// The type publishes no `Tags` property, so nothing is propagated to a table.
+async fn create_glue_table(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut request = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    named_glue_input(
+        &mut request,
+        GLUE_TABLE_INPUT_PROPERTY,
+        &resource.physical_resource_id,
+    );
+    call_glue(ctx, region, "CreateTable", &Value::Object(request)).await?;
+    Ok(Created::default())
+}
+
+/// Apply a changed `AWS::Glue::Table` declaration to the table the stack created.
+///
+/// `UpdateTable` takes the same `TableInput` the create did, against the database that holds
+/// the table — so a declaration that states another schema, another location or other
+/// parameters reaches AWS Glue as that input, and the table keeps its identity.
+///
+/// The table's own name is the one it is HELD under, for the reason
+/// [`update_glue_database`] records: a renamed table is a different resource, which the
+/// deployment replaces rather than updates.
+async fn update_glue_table(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let mut properties = declared.as_object().cloned().unwrap_or_else(Map::new);
+    named_glue_input(
+        &mut properties,
+        GLUE_TABLE_INPUT_PROPERTY,
+        &resource.physical_resource_id,
+    );
+    let mut request = glue_table_scope(declared);
+    request.insert(
+        GLUE_TABLE_INPUT_PROPERTY.to_string(),
+        properties
+            .remove(GLUE_TABLE_INPUT_PROPERTY)
+            .unwrap_or_else(|| Value::Object(Map::new())),
+    );
+    call_glue(ctx, region, "UpdateTable", &Value::Object(request)).await?;
+    Ok(Created::default())
+}
+
+/// Delete the table a stack created, addressed by the pair AWS Glue keys a table by: the
+/// database its declaration names and the table's own name, which is this resource's
+/// physical id.
+///
+/// A table that service no longer holds (`EntityNotFoundException`, judged on the CODE) is
+/// already in the state the delete asks for — as is one whose database is already gone,
+/// which answers the same code.
+async fn delete_glue_table(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let mut request = glue_table_scope(&resource.properties);
+    request.insert(
+        GLUE_INPUT_NAME_MEMBER.to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    match call_glue(ctx, region, "DeleteTable", &Value::Object(request)).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == GLUE_ENTITY_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The table as AWS Glue reports it, for drift detection: its own read's `Table` document,
+/// reported under the property the type declares that definition in, beside the catalog and
+/// the database it lives in. The `Table` shape's members are spelled exactly as
+/// `TableInput`'s are.
+async fn describe_glue_table(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let mut request = glue_table_scope(&resource.properties);
+    request.insert(
+        GLUE_INPUT_NAME_MEMBER.to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    match call_glue(ctx, region, "GetTable", &Value::Object(request)).await {
+        Ok(answer) => {
+            let table = reported_member(&answer, "Table");
+            Ok(Some(serde_json::json!({
+                GLUE_CATALOG_ID_PROPERTY: reported_member(&table, GLUE_CATALOG_ID_PROPERTY),
+                GLUE_DATABASE_NAME_PROPERTY: reported_member(&table, GLUE_DATABASE_NAME_PROPERTY),
+                GLUE_TABLE_INPUT_PROPERTY: table,
+            })))
+        }
+        Err(refusal) if refusal.code == GLUE_ENTITY_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Create the crawler an `AWS::Glue::Crawler` declares, so a client that deployed the stack
+/// and then calls `glue GetCrawler` (or `StartCrawler`) with the name the stack publishes
+/// reads the crawler back rather than an `EntityNotFoundException`.
+///
+/// The type's properties ARE `CreateCrawler`'s own members — `Role`, `DatabaseName`,
+/// `Description`, `Targets`, `Classifiers`, `TablePrefix`, `SchemaChangePolicy`,
+/// `RecrawlPolicy`, `LineageConfiguration`, `LakeFormationConfiguration`, `Configuration`
+/// and `CrawlerSecurityConfiguration` are named identically on both sides — so the resolved
+/// property document is the request, with two members decided on the way out: the crawler's
+/// NAME (this resource's physical id, which is what "Ref returns the crawler name") and the
+/// `Schedule`, which the type publishes as the structure a crawler is REPORTED with while
+/// the call takes the cron expression inside it ([`glue_crawler_schedule`]).
+///
+/// `Tags` is the one member not carried verbatim: the crawler carries the tags the
+/// declaration asks for beside the ones CloudFormation gives the resource ([`tags_of`]), as
+/// the tag MAP `CreateCrawler`'s own `Tags` member takes. That set reaches AWS Glue on the
+/// CREATE alone, for the reason an `AWS::Glue::Job`'s does ([`create_glue_job`]): a
+/// crawler's tags are that service's own tagging calls rather than part of the configuration
+/// an update overwrites.
+async fn create_glue_crawler(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = glue_crawler_configuration(&resource.properties, &resource.physical_resource_id);
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert(
+            GLUE_CRAWLER_TAGS_PROPERTY.to_string(),
+            Value::Object(tags),
+        );
+    }
+    call_glue(ctx, region, "CreateCrawler", &Value::Object(request)).await?;
+    Ok(Created::default())
+}
+
+/// Apply a changed `AWS::Glue::Crawler` declaration to the crawler the stack created.
+///
+/// Every property of the type but its name and its tags is a member of `UpdateCrawler` too,
+/// so the declaration this deployment states IS that request, against the `Name` the crawler
+/// is held under.
+async fn update_glue_crawler(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let request = glue_crawler_configuration(declared, &resource.physical_resource_id);
+    call_glue(ctx, region, "UpdateCrawler", &Value::Object(request)).await?;
+    Ok(Created::default())
+}
+
+/// Delete the crawler a stack created, addressed by its NAME — this resource's physical id.
+///
+/// A crawler AWS Glue no longer holds (`EntityNotFoundException`, judged on the CODE and
+/// never on a message that carries the request's own name) is already in the state the
+/// delete asks for.
+async fn delete_glue_crawler(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ GLUE_CRAWLER_NAME_PROPERTY: physical_resource_id });
+    match call_glue(ctx, region, "DeleteCrawler", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == GLUE_ENTITY_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The crawler as AWS Glue reports it, for drift detection: the `Crawler` document its own
+/// read answers with, whose members are spelled exactly as the type's properties are — the
+/// `Schedule` structure included, which is why the type's own `Schedule` is compared against
+/// what that service reports rather than against the expression the create sent.
+async fn describe_glue_crawler(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ GLUE_CRAWLER_NAME_PROPERTY: physical_resource_id });
+    match call_glue(ctx, region, "GetCrawler", &request).await {
+        Ok(answer) => Ok(Some(reported_member(&answer, "Crawler"))),
+        Err(refusal) if refusal.code == GLUE_ENTITY_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The crawler configuration a declaration states, as the members `CreateCrawler` and
+/// `UpdateCrawler` both take: the declared document with the NAME CloudFormation decided,
+/// the tags lifted out (they are the create's own map, not part of the configuration) and
+/// the `Schedule` reduced to the cron expression those calls take.
+fn glue_crawler_configuration(declared: &Value, name: &str) -> Map<String, Value> {
+    let mut request = declared.as_object().cloned().unwrap_or_else(Map::new);
+    request.remove(GLUE_CRAWLER_TAGS_PROPERTY);
+    request.insert(
+        GLUE_CRAWLER_NAME_PROPERTY.to_string(),
+        Value::String(name.to_string()),
+    );
+    match request
+        .get(GLUE_CRAWLER_SCHEDULE_PROPERTY)
+        .and_then(glue_crawler_schedule)
+    {
+        Some(expression) => {
+            request.insert(GLUE_CRAWLER_SCHEDULE_PROPERTY.to_string(), expression);
+        }
+        // A `Schedule` structure carrying no expression states no schedule to run the
+        // crawler on, which is what a crawler with no `Schedule` member at all is.
+        None => {
+            request.remove(GLUE_CRAWLER_SCHEDULE_PROPERTY);
+        }
+    }
+    request
+}
+
+/// The cron EXPRESSION a declared `Schedule` states, which is what `CreateCrawler` and
+/// `UpdateCrawler` take as their `Schedule`: the structure's `ScheduleExpression` member,
+/// or the value itself where the declaration wrote the expression directly.
+fn glue_crawler_schedule(declared: &Value) -> Option<Value> {
+    match declared {
+        Value::Object(_) => declared.get(GLUE_SCHEDULE_EXPRESSION_MEMBER).cloned(),
+        other => Some(other.clone()),
+    }
+}
+
+/// Set the NAME CloudFormation decided inside the input structure the owning API takes the
+/// entity's definition in, leaving every other member the declaration states where it is —
+/// and making the structure where a declaration carries none, so the create still names the
+/// resource the stack published.
+fn named_glue_input(request: &mut Map<String, Value>, property: &str, name: &str) {
+    let mut input = request
+        .get(property)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(Map::new);
+    input.insert(
+        GLUE_INPUT_NAME_MEMBER.to_string(),
+        Value::String(name.to_string()),
+    );
+    request.insert(property.to_string(), Value::Object(input));
+}
+
+/// The catalog a request about one of the two catalog entities is scoped to: the
+/// `CatalogId` the declaration states, or nothing — which is that member's own documented
+/// default, the account's own catalog.
+fn glue_catalog_scope(declared: &Value) -> Map<String, Value> {
+    let mut request = Map::new();
+    if let Some(catalog) = declared_text(declared, GLUE_CATALOG_ID_PROPERTY) {
+        request.insert(
+            GLUE_CATALOG_ID_PROPERTY.to_string(),
+            Value::String(catalog),
+        );
+    }
+    request
+}
+
+/// The catalog AND the database a request about a TABLE is scoped to: the pair every AWS
+/// Glue call on a table takes beside the table's own name.
+fn glue_table_scope(declared: &Value) -> Map<String, Value> {
+    let mut request = glue_catalog_scope(declared);
+    if let Some(database) = declared_text(declared, GLUE_DATABASE_NAME_PROPERTY) {
+        request.insert(
+            GLUE_DATABASE_NAME_PROPERTY.to_string(),
+            Value::String(database),
+        );
+    }
+    request
 }
 
 /// Call one AWS Glue operation on the awsJson1_1 wire its model declares.

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCrawler
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCrawler`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCrawler::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the crawler the request names from this service's store, so a later
+//! `GetCrawler` or `ListCrawlers` no longer reports it. Removing the entry removes the
+//! WHOLE record — the crawler's tags are held on it.
+//!
+//! "Removes a specified crawler from the Glue Data Catalog, unless the crawler state is
+//! RUNNING": a name no crawler in this account has is the modelled
+//! `EntityNotFoundException`, and a crawler whose crawl is in progress is the modelled
+//! `CrawlerRunningException` with nothing removed — the same two refusals, worded the same
+//! way, that `UpdateCrawler` makes about the crawler it addresses.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +141,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCrawler` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCrawlerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCrawler"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error rather than invented as a shape the
+            // model does not declare for it — the same way `GetCrawler`, `CreateCrawler`
+            // and `UpdateCrawler` report it.
+            return Err(DeleteCrawlerErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue crawler store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `Name` is `@required` with `length 1..255` and a pattern, every one of them
+        // refused at the boundary, so identity is all this handler settles: the crawler is
+        // resolved, its state judged and the record removed under ONE guard, so no crawl
+        // can start between the judgement and the removal.
+        let mut store = state.lock();
+        let Some(entry) = store.crawlers.get(&input.name) else {
+            return Err(DeleteCrawlerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::crawler_not_found(&input.name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // "unless the crawler state is RUNNING": `READY` is the one modelled `CrawlerState`
+        // with no run in progress, so every other state refuses the delete and the crawler
+        // stays where it is. (`SchedulerTransitioningException` is the refusal of a crawler
+        // whose SCHEDULE is mid-transition, a state no write this service serves leaves one
+        // in, so nothing answers it.)
+        if entry.state != crate::state::CRAWLER_STATE_READY {
+            return Err(DeleteCrawlerErrorModeled::CrawlerRunningException(
+                CrawlerRunningException {
+                    message: Some(crate::state::messages::crawler_running(&input.name)),
+                },
+            )
+            .into());
+        }
+        store.crawlers.remove(&input.name);
+        ::tracing::info!(
+            operation = "DeleteCrawler",
+            crawler = %input.name,
+            "deleted a Glue crawler"
+        );
+
+        Ok(DeleteCrawlerOutput {})
     }
 }
