@@ -26,6 +26,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The Amazon S3 client this service resolves a submission's input asset with, over the
+# in-process callback into this same emulator (no network client feature is enabled: the
+# transport is the emulator's own): a job's work begins by reading that asset, so whether
+# the object store holds it is what the job's terminal outcome is settled on.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -42,6 +47,10 @@ percent-encoding = "2"
 # `tokio::time::sleep`; the feature is enabled here so the library target does not carry
 # it.
 tokio = { workspace = true, features = ["time"] }
+# The job-outcome suite mounts the Amazon S3 service beside this one on a single engine —
+# the way the assembled emulator runs them — and stages the asset a submission points at
+# in its store, because a job that cannot read its asset is the failure path under test.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

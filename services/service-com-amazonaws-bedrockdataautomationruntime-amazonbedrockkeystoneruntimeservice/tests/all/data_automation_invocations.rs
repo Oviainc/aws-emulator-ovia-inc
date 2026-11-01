@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_bedrockdataautomationruntime_amazonbedrockkeystoneruntimeservice as bda;
 use smithy_server_runtime::MultiServiceRouter;
 
-use bda::state::{AutomationJobStatus, Invocation, CREATED_FOR, IN_PROGRESS_FOR};
+use bda::state::{AutomationJobStatus, InputAsset, Invocation, CREATED_FOR, IN_PROGRESS_FOR};
 
 /// This service's sigv4 signing name (`OPERATIONS.md`): the credential scope the router
 /// routes on.
@@ -74,8 +74,8 @@ const JOB_STATUS_VALUES: &[&str] = &[
     "Success",
 ];
 
-/// One row of the submission table: the case name, the request body, the output S3 URI
-/// the readers must report back, and the tags the resource must then carry.
+/// One row of the submission table: the case name, the request body, the output prefix
+/// the submission names, and the tags the resource must then carry.
 type SubmissionCase = (
     &'static str,
     Value,
@@ -301,7 +301,7 @@ fn advance_to_materialises_only_the_transitions_the_clock_owes() {
 
     for (case, after, want_status, want_completion) in rows {
         let mut invocation = fixed_invocation();
-        invocation.advance_to(submitted + *after);
+        invocation.advance_to(submitted + *after, InputAsset::Available);
         assert_eq!(
             invocation.status, *want_status,
             "case {case:?}: expected {want_status:?} {after:?} after submission, got {:?}",
@@ -328,7 +328,7 @@ fn advance_to_materialises_only_the_transitions_the_clock_owes() {
     // Idempotence of the materialisation: once a transition is recorded, re-applying the
     // clock — even at an earlier instant — never moves the job back.
     let mut invocation = fixed_invocation();
-    invocation.advance_to(submitted + success_due);
+    invocation.advance_to(submitted + success_due, InputAsset::Available);
     let completed_at = invocation.job_completion_time;
     for case in ["re-read at the submission instant", "re-read far in the future"] {
         let now = if case.contains("submission") {
@@ -336,7 +336,7 @@ fn advance_to_materialises_only_the_transitions_the_clock_owes() {
         } else {
             submitted + Duration::from_secs(86_400)
         };
-        invocation.advance_to(now);
+        invocation.advance_to(now, InputAsset::Available);
         assert_eq!(
             invocation.status,
             AutomationJobStatus::Success,
@@ -434,7 +434,7 @@ async fn each_submission_is_persisted_and_reported_back_from_state() {
     ];
 
     let mut minted: Vec<String> = Vec::new();
-    for (case, body, want_output_uri, want_tags) in &rows {
+    for (case, body, want_output_prefix, want_tags) in &rows {
         let before = SystemTime::now();
         let arn = submit(&router, case, body.clone()).await;
         let after = SystemTime::now();
@@ -449,8 +449,9 @@ async fn each_submission_is_persisted_and_reported_back_from_state() {
         );
         assert_eq!(
             answer.body["outputConfiguration"]["s3Uri"].as_str(),
-            Some(*want_output_uri),
-            "case {case:?}: the reported outputConfiguration must be the one submitted, got {}",
+            Some(crate::support::job_metadata_uri(want_output_prefix, &arn).as_str()),
+            "case {case:?}: the reported outputConfiguration must be this job's own metadata \
+             location under the submitted prefix, got {}",
             answer.body
         );
         let status = answer.body["status"].as_str().unwrap_or_default();
@@ -545,7 +546,7 @@ async fn an_accepted_client_token_replays_the_one_invocation() {
         .await;
         assert_eq!(
             answer.body["outputConfiguration"]["s3Uri"].as_str(),
-            Some("s3://out-bucket/first/"),
+            Some(crate::support::job_metadata_uri("s3://out-bucket/first/", &first).as_str()),
             "case {token:?}: the stored job must stay the one the first call persisted, got {}",
             answer.body
         );

@@ -264,7 +264,7 @@ async fn a_retained_invocation_is_served_by_every_arn_keyed_operation() {
     );
     assert_eq!(
         status.body["outputConfiguration"]["s3Uri"].as_str(),
-        Some("s3://out-bucket/retained/"),
+        Some(crate::support::job_metadata_uri("s3://out-bucket/retained/", &arn).as_str()),
         "case a retained ARN on GetDataAutomationStatus: the record's own output \
          configuration must be reported, got {}",
         status.body

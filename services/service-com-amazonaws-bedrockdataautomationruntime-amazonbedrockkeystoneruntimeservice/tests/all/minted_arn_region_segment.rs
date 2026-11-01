@@ -236,7 +236,7 @@ async fn a_minted_invocation_arn_is_readable_back_whatever_region_was_signed_for
         );
         assert_eq!(
             status.body["outputConfiguration"]["s3Uri"].as_str(),
-            Some(output_s3_uri.as_str()),
+            Some(crate::support::job_metadata_uri(&output_s3_uri, &arn).as_str()),
             "case {case:?}: the reported outputConfiguration must be this record's own, got {}",
             status.body
         );

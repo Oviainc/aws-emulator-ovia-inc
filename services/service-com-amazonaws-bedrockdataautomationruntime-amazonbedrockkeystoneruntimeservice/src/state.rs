@@ -14,6 +14,12 @@
 //! the data-automation build-time service, which is emulated in this workspace, so
 //! [`unresolved_reference_refusal`] resolves such a reference against THAT service's
 //! store rather than recording it as opaque text.
+//!
+//! The ASSET a submission points at is not owned here either: it is an object of Amazon
+//! S3, which this emulator also serves, so the job's work — which begins by reading that
+//! asset — resolves it through the framework's in-process callback
+//! ([`resolve_input_asset`]), and the job's terminal outcome is settled on what that
+//! resolution established.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -499,6 +505,195 @@ pub fn invocation_quota_message() -> String {
 /// and refuses the submission when it cannot.
 pub const MAX_INVOCATIONS: usize = 1_000;
 
+/// What asking this emulator's own Amazon S3 about the asset a submission named
+/// established — the fact the job's terminal outcome is settled on
+/// ([`Invocation::advance_to`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputAsset {
+    /// The job may take the asset on: the object store answered for it, or NOTHING could
+    /// be established about it — no object store on this emulator to ask, or an answer
+    /// that was not the store reporting an absent object — so no job is failed on an
+    /// assumption.
+    Available,
+    /// The object store ITSELF answered that the location the submission named holds no
+    /// object, or that location addresses no object at all, so the job has nothing to
+    /// read and the work it was accepted for cannot be carried out.
+    Absent,
+}
+
+/// Why a job pointed at an asset the object store holds none of failed — its
+/// `errorMessage`.
+///
+/// This service's own fixed string, on the same footing as
+/// [`MISSING_PROJECT_OR_BLUEPRINTS`]: it carries NOTHING from the request, and what a
+/// client branches on is the `ClientError` status and the two error members being there
+/// at all. NO RECORDING covers a failed data-automation job, so a later one showing how
+/// AWS words this failure settles the wording — and would change only this constant.
+pub const INPUT_ASSET_ABSENT_MESSAGE: &str =
+    "The input asset could not be read from the Amazon S3 location the submission named.";
+
+/// The Amazon S3 error codes in which S3 reports that an object a request names is NOT
+/// THERE: a bucket it does not hold (`NoSuchBucket`), a key that bucket does not hold
+/// (`NoSuchKey`), and the code `HeadObject` models for either (`NotFound`, which a HEAD
+/// carries no body to spell out).
+///
+/// The code is required TOGETHER WITH the 404 status ([`object_is_absent`]), never the
+/// status alone, because a status is not evidence that S3 answered at all: a request that
+/// reached no S3 is a 404 too, and that is this emulator failing to ask rather than a
+/// verdict about the asset. The list is deliberately CLOSED and holds only the codes that
+/// say the object is absent — an answer reporting something ELSE about it establishes
+/// nothing and fails no job ([`InputAsset::Available`]).
+const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchBucket", "NoSuchKey", "NotFound"];
+
+/// Whether S3's answer to a read is S3 ITSELF saying it holds nothing at that address:
+/// HTTP 404 AND one of the codes it sends for a missing object ([`ABSENT_OBJECT_CODES`]).
+fn object_is_absent<E>(
+    error: &::aws_sdk_s3::error::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool
+where
+    E: ::aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    use ::aws_sdk_s3::error::ProvideErrorMetadata;
+
+    error
+        .raw_response()
+        .is_some_and(|response| response.status().as_u16() == 404)
+        && error
+            .code()
+            .is_some_and(|code| ABSENT_OBJECT_CODES.contains(&code))
+}
+
+/// The Amazon S3 object an `s3://` URI addresses: its bucket and its key.
+///
+/// The modelled `S3Uri` pattern admits a URI naming a bucket with nothing under it
+/// (`^s3://<bucket>(/…)?$`), and `inputConfiguration.s3Uri` names the ASSET to process —
+/// one object — so the first path segment is the bucket and everything after it is the
+/// key, and a URI carrying no key addresses a bucket rather than an asset.
+///
+/// `None` for a value that addresses no object of the store: no bucket, or no key under
+/// it.
+fn s3_object_address(uri: &str) -> Option<(&str, &str)> {
+    let rest = uri.trim().strip_prefix("s3://")?;
+    let (bucket, key) = rest.split_once('/')?;
+    (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key))
+}
+
+/// An Amazon S3 client over the in-process callback into this same emulator.
+///
+/// The ONE client this service reaches object storage with. The callback is the
+/// framework's documented seam for calling another emulated service: it routes in
+/// process, so no network client is configured here and this crate names no other
+/// service's crate. The `endpoint_url` below is therefore an ADDRESS the in-process
+/// router reads, never a host any resolver looks up — and the one value that reaches its
+/// authority is narrowed by [`arn_region`], the same grammar a minted ARN's region
+/// segment is held to, so a region outside it falls back to [`DEFAULT_REGION`] exactly as
+/// a request carrying no credential scope does.
+///
+/// The credentials are the emulator's own: they only sign this operation's in-process
+/// calls and are never put in a response or a log.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let region = arn_region(region);
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The in-process transport routes on the request's own path, and a virtual-host
+        // bucket name is not a host this emulator resolves, so the request addresses its
+        // bucket in the path.
+        .force_path_style(true)
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity: the credentials are handed
+        // over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Resolve the asset a submission named against this emulator's own Amazon S3 and report
+/// what that established.
+///
+/// A submission points at an asset already in object storage, and the job's work starts
+/// by READING it, so the resolution happens when the job runs rather than when the
+/// submission is accepted: this is called by the reporting read that finds the terminal
+/// transition due ([`Invocation::terminal_transition_due`]), and its answer is what that
+/// transition settles the outcome on. An asset created after the submission but before
+/// the job finishes is therefore there for the job, exactly as it would be in the real
+/// service.
+///
+/// The verdict is read from S3's own absent-object answer and never from an HTTP status
+/// alone ([`object_is_absent`]): with no Amazon S3 mounted to ask, nothing is known about
+/// the asset, so the job completes — a failure has to be GROUNDED in what the object
+/// store answered, never assumed. The one verdict that needs no answer is a URI that
+/// addresses no object at all ([`s3_object_address`]): it names no asset for any store to
+/// hold.
+///
+/// The read is a `HeadObject`, "the same options as a GET operation on an object" without
+/// its body: what the job has to establish is that the asset it was pointed at IS there,
+/// and nothing in this service extracts anything from an asset, so no asset's bytes are
+/// ever fetched or held.
+pub async fn resolve_input_asset(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    s3_uri: &str,
+) -> InputAsset {
+    use ::aws_sdk_s3::error::ProvideErrorMetadata;
+
+    let Some((bucket, key)) = s3_object_address(s3_uri) else {
+        return InputAsset::Absent;
+    };
+    match s3_client(ctx, region)
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+    {
+        // The asset is there. Only its METADATA was asked for, never its bytes.
+        Ok(_) => InputAsset::Available,
+        Err(error) => {
+            if object_is_absent(&error) {
+                return InputAsset::Absent;
+            }
+            // Any other answer is not S3 reporting an absent object, so it fails no job —
+            // and it is worth a warning, because a deployment with no object store to ask
+            // is one where this resolution does not run. The caller's own values are
+            // rendered with their escaped `Debug` form, so a key carrying a newline
+            // cannot forge a log line.
+            ::tracing::warn!(
+                bucket = ?bucket,
+                key = ?key,
+                code = ?error.code(),
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the input asset could not be resolved against this emulator's Amazon S3"
+            );
+            InputAsset::Available
+        }
+    }
+}
+
+/// The object key, relative to one job's own segment of the submitted output prefix, of
+/// the metadata document that job's output is addressed through.
+///
+/// A client discovers a finished job's results by reading this document — the documented
+/// flow is to poll the status and then read the job metadata the reported location names,
+/// which is what indexes the per-asset result files — so the location
+/// `GetDataAutomationStatus` reports is this object's
+/// ([`Invocation::output_metadata_s3_uri`]) and not the bare prefix the submission
+/// carried, which names no job.
+const JOB_METADATA_OBJECT: &str = "job_metadata.json";
+
 /// The `AutomationJobStatus` enum, as the model declares its values.
 ///
 /// Held as an enum rather than a string so the clock-driven progression in
@@ -546,8 +741,10 @@ pub struct Invocation {
     /// than being dropped at the handler boundary — reach the segment it delimits through
     /// [`Invocation::requested_timestamp_segment`].
     pub asset_processing_configuration: Option<AssetProcessingConfiguration>,
-    /// `outputConfiguration.s3Uri` as submitted; what `GetDataAutomationStatus`
-    /// reports as its `outputConfiguration`.
+    /// `outputConfiguration.s3Uri` as submitted: the PREFIX this job's output is written
+    /// under, which is what a submission names and what several jobs may share. It is
+    /// NOT what a reader reports — that is this job's own metadata location under it
+    /// ([`Invocation::output_metadata_s3_uri`]).
     pub output_s3_uri: String,
     /// `dataAutomationConfiguration.dataAutomationProjectArn`, when one was given.
     pub data_automation_project_arn: Option<String>,
@@ -563,9 +760,11 @@ pub struct Invocation {
     pub notification_configuration: Option<NotificationConfiguration>,
     /// Where the job is in its lifecycle. Advanced only by [`Invocation::advance_to`].
     pub status: AutomationJobStatus,
-    /// `errorType`, set only on a failure status.
+    /// `errorType`, set only on a failure status, and only by the terminal transition
+    /// that attributed the failure ([`Invocation::advance_to`]).
     pub error_type: Option<String>,
-    /// `errorMessage`, set only on a failure status.
+    /// `errorMessage`, set beside [`Invocation::error_type`] by the same transition and
+    /// for the same reason.
     pub error_message: Option<String>,
     /// When the submission was accepted.
     pub job_submission_time: SystemTime,
@@ -613,7 +812,9 @@ impl Invocation {
         }
     }
 
-    /// Materialise every lifecycle transition the clock already owes this job at `now`.
+    /// Materialise every lifecycle transition the clock already owes this job at `now`,
+    /// settling the terminal one on `asset` — what the job established about the asset it
+    /// was asked to process.
     ///
     /// The transitions are owed by the passage of time since the submission that
     /// started them, not by anyone reading the job, so applying them from a reporting
@@ -623,26 +824,62 @@ impl Invocation {
     /// transition became DUE, not the instant it was observed, so the derived
     /// `jobDurationInSeconds` does not depend on when a caller happened to poll.
     ///
-    /// What `Success` CLAIMS here: the invocation RECORD reached its terminal state. It
-    /// does not claim that analysis ran or that result objects exist under the submitted
-    /// `outputConfiguration.s3Uri` — those objects live in a service this crate does not
-    /// emulate, and nothing here writes them or synthesises analysis output (the
+    /// A job's work begins with READING the asset `inputConfiguration.s3Uri` names, so a
+    /// job pointed at an asset the object store holds none of cannot carry out the work it
+    /// was accepted for: it ends in the modelled failure status attributable to the
+    /// request (`ClientError`) carrying `errorType` and `errorMessage`, and never in
+    /// `Success`. A job whose asset IS there, or about which nothing could be established
+    /// ([`InputAsset`]), completes.
+    ///
+    /// What `Success` CLAIMS here: the invocation RECORD reached its terminal state, with
+    /// the asset it was pointed at in place. It does not claim that result objects exist
+    /// at [`Invocation::output_metadata_s3_uri`]: the document that location names indexes
+    /// per-asset extraction results, which are the output of a model nothing in this
+    /// process runs, so nothing here writes them or synthesises analysis output (the
     /// synchronous `InvokeDataAutomation`, which would have to RETURN such output, stays
-    /// a 501 for exactly that reason). This operation reports the lifecycle of the job
-    /// record, which is the control-plane fact the emulator does own.
-    pub fn advance_to(&mut self, now: SystemTime) {
+    /// a 501 for exactly that reason).
+    pub fn advance_to(&mut self, now: SystemTime, asset: InputAsset) {
         if self.status == AutomationJobStatus::Created
             && now >= self.job_submission_time + CREATED_FOR
         {
             self.status = AutomationJobStatus::InProgress;
         }
         if self.status == AutomationJobStatus::InProgress {
-            let completion_due = self.job_submission_time + CREATED_FOR + IN_PROGRESS_FOR;
+            let completion_due = self.completion_due();
             if now >= completion_due {
-                self.status = AutomationJobStatus::Success;
+                self.status = match asset {
+                    InputAsset::Available => AutomationJobStatus::Success,
+                    InputAsset::Absent => {
+                        // The failure CLASS is what the type reports: see
+                        // [`INPUT_ASSET_ABSENT_MESSAGE`] for why neither member is
+                        // spelled from anything else.
+                        self.error_type =
+                            Some(AutomationJobStatus::ClientError.as_wire().to_string());
+                        self.error_message = Some(INPUT_ASSET_ABSENT_MESSAGE.to_string());
+                        AutomationJobStatus::ClientError
+                    }
+                };
                 self.job_completion_time = Some(completion_due);
             }
         }
+    }
+
+    /// When this job's terminal transition falls due: one `Created` span and one
+    /// `InProgress` span after the submission was accepted
+    /// ([`CREATED_FOR`] + [`IN_PROGRESS_FOR`]).
+    fn completion_due(&self) -> SystemTime {
+        self.job_submission_time + CREATED_FOR + IN_PROGRESS_FOR
+    }
+
+    /// Whether the clock already owes this job its terminal transition and that
+    /// transition has not been materialised yet — so the outcome still has to be settled
+    /// ([`Invocation::advance_to`]).
+    ///
+    /// What a reporting read asks BEFORE it goes looking for the job's asset: a job whose
+    /// terminal transition is not due yet, and one that already reached a terminal status,
+    /// both need no answer about the asset, so neither costs a read of the object store.
+    pub fn terminal_transition_due(&self, now: SystemTime) -> bool {
+        !self.is_terminal() && now >= self.completion_due()
     }
 
     /// Whether the job has reached a status it can never leave. Only a terminal job is
@@ -654,6 +891,34 @@ impl Invocation {
             AutomationJobStatus::Success
                 | AutomationJobStatus::ClientError
                 | AutomationJobStatus::ServiceError
+        )
+    }
+
+    /// Whether the job has reached a terminal status, or the clock has already made one
+    /// due for it — the question eviction asks, which it must answer WITHOUT settling the
+    /// outcome: which terminal status a finished job carries rests on what its asset
+    /// established, and the admission path holds no answer about that.
+    pub fn is_terminal_at(&self, now: SystemTime) -> bool {
+        self.is_terminal() || self.terminal_transition_due(now)
+    }
+
+    /// Where this job's own metadata document sits: the submitted output prefix, this
+    /// job's `invocationId` under it, and [`JOB_METADATA_OBJECT`].
+    ///
+    /// The prefix a submission names is shared by every job submitted under it, so one
+    /// job's output lives under a segment of its OWN id and the metadata document at the
+    /// top of that segment is what the job's results are addressed through. The two are
+    /// joined by a single key separator, so a prefix written with a trailing separator, a
+    /// prefix written without one, and a URI naming the bucket root all address the same
+    /// location.
+    ///
+    /// Derived on every read and never stored: it is a function of two values the record
+    /// already holds.
+    pub fn output_metadata_s3_uri(&self) -> String {
+        format!(
+            "{}/{}/{JOB_METADATA_OBJECT}",
+            self.output_s3_uri.trim_end_matches('/'),
+            self.invocation_id
         )
     }
 
@@ -836,20 +1101,26 @@ impl ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeservice
 
     /// Make room for one more invocation, bounding the store at [`MAX_INVOCATIONS`].
     ///
-    /// At capacity it materialises what the clock owes each stored job and then evicts
-    /// the longest-submitted FINISHED one, repeating until there is room. `false` means
-    /// every retained job is still running. Private: admission goes through
-    /// [`Self::admit_invocation`], so freeing a slot and filling it cannot come apart.
+    /// At capacity it evicts the longest-submitted job that has FINISHED — one already in
+    /// a terminal status, or one whose terminal transition the clock has already made due
+    /// ([`Invocation::is_terminal_at`]) — repeating until there is room. `false` means
+    /// every retained job is still running. Nothing here MATERIALISES that transition:
+    /// which terminal status a finished job carries rests on what its asset established,
+    /// which only the reporting read that asks the object store can settle, so this
+    /// admission path reads the clock without writing an outcome it cannot ground.
+    /// Private: admission goes through [`Self::admit_invocation`], so freeing a slot and
+    /// filling it cannot come apart.
     fn reserve_invocation_slot(&mut self, now: SystemTime) -> bool {
         while self.invocations.len() >= MAX_INVOCATIONS {
             let evictable = self
                 .invocations
-                .values_mut()
-                .filter_map(|invocation| {
-                    invocation.advance_to(now);
-                    invocation
-                        .is_terminal()
-                        .then(|| (invocation.job_submission_time, invocation.invocation_arn.clone()))
+                .values()
+                .filter(|invocation| invocation.is_terminal_at(now))
+                .map(|invocation| {
+                    (
+                        invocation.job_submission_time,
+                        invocation.invocation_arn.clone(),
+                    )
                 })
                 .min_by_key(|(submitted, _)| *submitted);
             match evictable {

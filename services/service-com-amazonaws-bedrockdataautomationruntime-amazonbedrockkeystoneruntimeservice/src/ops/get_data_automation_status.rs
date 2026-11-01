@@ -7,10 +7,19 @@
 //! job (see [`crate::state::Invocation::advance_to`]) — a change that was due at the
 //! same instant whether or not anybody called.
 //!
-//! A reported `Success` says the invocation RECORD reached its terminal state; it does
-//! not claim that result objects exist under the submitted `outputConfiguration.s3Uri`,
-//! which lives in a service this crate does not emulate. Nothing here writes those
-//! objects or synthesises analysis output.
+//! The terminal transition is one of those, and WHICH terminal status it settles on rests
+//! on the asset the submission pointed at: a job's work starts by reading it, so the read
+//! that finds the transition due resolves that asset against this emulator's own Amazon S3
+//! ([`crate::state::resolve_input_asset`]) and the job ends in `Success`, or in the
+//! modelled `ClientError` with `errorType` and `errorMessage`, accordingly.
+//!
+//! The output location reported is the job's OWN metadata document under the submitted
+//! prefix ([`crate::state::Invocation::output_metadata_s3_uri`]), which is what a client
+//! reads a finished job's results through. A reported `Success` says the invocation RECORD
+//! reached its terminal state with its asset in place; it does not claim that the per-asset
+//! extraction results that document indexes exist, because they are the output of a model
+//! nothing in this process runs. Nothing here writes those objects or synthesises analysis
+//! output.
 //!
 //! ## Authorization
 //!
@@ -167,7 +176,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // Reached through the store's own reach-or-refuse step, so this operation and its
         // siblings answer an engine holding no store of this service's type identically
         // (`crate::state::store_or_unavailable_refusal`).
@@ -176,26 +184,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             GetDataAutomationStatusErrorModeled::InternalServerException,
         )?;
 
+        let now = ::std::time::SystemTime::now();
         // The modelled `@pattern` and `@length` on `invocationArn` are refused before
         // this handler runs, so an ARN that reaches here is well formed; one naming no
         // stored invocation is simply absent.
+        //
+        // Which asset this job has to be able to read, and only while its terminal
+        // transition is still owed: a job that has not got there yet, and one that already
+        // settled, need no answer about the asset, so neither costs a read of the object
+        // store. The guard is released before that read, so this service's store and
+        // another service's are never held at once.
+        let pending_asset = {
+            let store = state.lock();
+            // What an ARN naming nothing answers — shape, message and status — is this
+            // service's one rule, so it is resolved through the store's own
+            // resolve-or-refuse step (`crate::state::unknown_invocation_refusal`) rather
+            // than restated here.
+            let invocation = store.resolve_invocation(
+                &input.invocation_arn,
+                GetDataAutomationStatusErrorModeled::ResourceNotFoundException,
+            )?;
+            invocation
+                .terminal_transition_due(now)
+                .then(|| invocation.input_s3_uri.clone())
+        };
+        let asset = match pending_asset {
+            Some(input_s3_uri) => {
+                crate::state::resolve_input_asset(
+                    ctx,
+                    &crate::state::request_region(ctx.parts()),
+                    &input_s3_uri,
+                )
+                .await
+            }
+            // Nothing is owed that an answer about the asset could settle, so nothing is
+            // asked and nothing is assumed.
+            None => crate::state::InputAsset::Available,
+        };
+
         let mut store = state.lock();
-        // What an ARN naming nothing answers — shape, message and status — is this
-        // service's one rule, so it is resolved through the store's own resolve-or-refuse
-        // step (`crate::state::unknown_invocation_refusal`) rather than restated here.
         let invocation = store.resolve_invocation_mut(
             &input.invocation_arn,
             GetDataAutomationStatusErrorModeled::ResourceNotFoundException,
         )?;
 
-        invocation.advance_to(::std::time::SystemTime::now());
+        invocation.advance_to(now, asset);
 
         Ok(GetDataAutomationStatusOutput {
             status: Some(invocation.status.as_wire().to_string()),
             error_type: invocation.error_type.clone(),
             error_message: invocation.error_message.clone(),
+            // The job's OWN metadata location under the submitted prefix, derived from the
+            // stored record (`crate::state::Invocation::output_metadata_s3_uri`): the
+            // prefix itself names no job, so it is not what a reader reports.
             output_configuration: Some(OutputConfiguration {
-                s3_uri: invocation.output_s3_uri.clone(),
+                s3_uri: invocation.output_metadata_s3_uri(),
             }),
             job_submission_time: Some(crate::state::to_date_time(invocation.job_submission_time)),
             job_completion_time: invocation

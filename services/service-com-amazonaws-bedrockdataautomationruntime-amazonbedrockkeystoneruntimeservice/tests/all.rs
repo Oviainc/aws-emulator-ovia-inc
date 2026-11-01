@@ -17,6 +17,8 @@ mod asset_processing_configuration;
 mod control_plane_reference_resolution;
 #[path = "all/data_automation_invocations.rs"]
 mod data_automation_invocations;
+#[path = "all/job_output_location_and_outcome.rs"]
+mod job_output_location_and_outcome;
 #[path = "all/minted_arn_region_segment.rs"]
 mod minted_arn_region_segment;
 #[path = "all/refusal_echoes_no_request_value.rs"]

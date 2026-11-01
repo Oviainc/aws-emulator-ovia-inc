@@ -290,8 +290,9 @@ async fn an_accepted_submission_retains_the_processing_scope_it_asked_for() {
         );
         assert_eq!(
             read.body["outputConfiguration"]["s3Uri"].as_str(),
-            Some("s3://out-bucket/results/"),
-            "case {case:?}: the reader must report the submitted outputConfiguration, got {}",
+            Some(crate::support::job_metadata_uri("s3://out-bucket/results/", &arn).as_str()),
+            "case {case:?}: the reader must report this job's own output location under the \
+             submitted prefix, got {}",
             read.body
         );
     }
