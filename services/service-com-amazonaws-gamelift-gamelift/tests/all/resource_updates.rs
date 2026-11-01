@@ -92,7 +92,7 @@ fn changed_members<'a>(changes: &[(&'a str, Value)]) -> Vec<&'a str> {
 }
 
 /// The alias `DescribeAlias` reports for `selector`, an alias id or an alias ARN.
-async fn described_alias(gamelift: &GameLift, selector: &str) -> Value {
+pub(crate) async fn described_alias(gamelift: &GameLift, selector: &str) -> Value {
     let described = gamelift
         .ok("DescribeAlias", json!({"AliasId": selector}))
         .await;

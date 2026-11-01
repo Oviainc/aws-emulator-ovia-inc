@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alias_deletion.rs"]
 mod alias_deletion;
+#[path = "all/alias_update_isolation.rs"]
+mod alias_update_isolation;
 #[path = "all/aliases.rs"]
 mod aliases;
 #[path = "all/builds.rs"]
