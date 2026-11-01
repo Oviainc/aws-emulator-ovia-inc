@@ -188,23 +188,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        Ok(GetMonitorOutput {
-            monitor_arn: monitor.monitor_arn.clone(),
-            monitor_name: monitor.monitor_name.clone(),
-            state: monitor.state.clone(),
+        // This output is the superset of what every other monitor read path
+        // reports, so the five members it shares with them are read out of the
+        // record through the one projection they all share
+        // ([`crate::state::monitor_report`]) and only the members this operation
+        // adds are named here. `aggregationPeriod` is modelled required on this
+        // shape alone, so its value is named here too.
+        Ok(crate::state::monitor_report!(
+            GetMonitorOutput,
+            monitor,
             aggregation_period: monitor.aggregation_period,
-            tags: Some(
-                monitor
-                    .tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            ),
             // The stored probe map IS this list, so a probe cannot be attached
             // to the monitor and missing from what the monitor reports.
             probes: Some(monitor.probes.values().map(probe_of).collect()),
             created_at: ::aws_smithy_types::DateTime::from(monitor.created_at),
             modified_at: ::aws_smithy_types::DateTime::from(monitor.modified_at),
-        })
+        ))
     }
 }

@@ -1413,6 +1413,63 @@ impl Monitor {
     }
 }
 
+/// Project a STORED [`Monitor`] record onto one of the per-operation monitor
+/// response shapes — `CreateMonitorOutput`, `UpdateMonitorOutput` and the
+/// modelled `MonitorSummary` a listing vends, which are structurally identical,
+/// and `GetMonitorOutput`, which is their superset — named at the call site as
+/// `$out`.
+///
+/// ONE projection rather than a hand-written copy of the same member moves per
+/// operation: every member is read out of the record, so what `CreateMonitor`
+/// answers is what `UpdateMonitor` answers, what `GetMonitor` reads back and
+/// what `ListMonitors` summarises, and a change to how a monitor is reported
+/// lands in every read path at once — the rule the probe-side twin
+/// [`probe_report`] already follows.
+///
+/// The three summary shapes model the same five members
+/// (`smithy_query(query="shape",
+/// shape="CreateMonitorOutput,UpdateMonitorOutput,MonitorSummary")`), so the
+/// only thing that differs between those call sites is the type's name and the
+/// one-argument form projects all five. `GetMonitorOutput` models those five
+/// plus `probes`, `createdAt` and `modifiedAt`, and models `aggregationPeriod`
+/// as required rather than optional, so the longer form takes that member's
+/// value and the extra members from the call site and projects the rest the same
+/// way.
+macro_rules! monitor_report {
+    ($out:ident, $monitor:expr) => {{
+        let monitor: &$crate::state::Monitor = $monitor;
+        $crate::state::monitor_report!(
+            $out,
+            monitor,
+            aggregation_period: ::core::option::Option::Some(monitor.aggregation_period),
+        )
+    }};
+    (
+        $out:ident,
+        $monitor:expr,
+        aggregation_period: $aggregation_period:expr
+        $(, $member:ident: $value:expr)* $(,)?
+    ) => {{
+        let monitor: &$crate::state::Monitor = $monitor;
+        $out {
+            monitor_arn: monitor.monitor_arn.clone(),
+            monitor_name: monitor.monitor_name.clone(),
+            state: monitor.state.clone(),
+            aggregation_period: $aggregation_period,
+            tags: ::core::option::Option::Some(
+                monitor
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            $($member: $value,)*
+        }
+    }};
+}
+
+pub(crate) use monitor_report;
+
 /// Which stored resource the `resourceArn` of a tagging request names.
 ///
 /// The tagging operations address their target by ARN rather than by name

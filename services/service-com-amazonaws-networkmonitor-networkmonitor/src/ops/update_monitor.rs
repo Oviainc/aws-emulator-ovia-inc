@@ -136,21 +136,11 @@ fn validation(message: String) -> UpdateMonitorError {
     .into()
 }
 
-/// This operation's answer, read out of the STORED monitor record.
+/// This operation's answer, read out of the STORED monitor record through the
+/// one projection every monitor read path shares
+/// ([`crate::state::monitor_report`]).
 fn output_for(monitor: &crate::state::Monitor) -> UpdateMonitorOutput {
-    UpdateMonitorOutput {
-        monitor_arn: monitor.monitor_arn.clone(),
-        monitor_name: monitor.monitor_name.clone(),
-        state: monitor.state.clone(),
-        aggregation_period: Some(monitor.aggregation_period),
-        tags: Some(
-            monitor
-                .tags
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        ),
-    }
+    crate::state::monitor_report!(UpdateMonitorOutput, monitor)
 }
 
 

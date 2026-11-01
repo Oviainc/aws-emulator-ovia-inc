@@ -33,6 +33,8 @@ mod monitor_and_probe;
 mod monitor_lifecycle_and_front_door;
 #[path = "all/monitor_modified_at_follows_probe_writes.rs"]
 mod monitor_modified_at_follows_probe_writes;
+#[path = "all/monitor_report_projection.rs"]
+mod monitor_report_projection;
 #[path = "all/monitor_state_follows_probe_activation.rs"]
 mod monitor_state_follows_probe_activation;
 #[path = "all/probe_report_projection.rs"]

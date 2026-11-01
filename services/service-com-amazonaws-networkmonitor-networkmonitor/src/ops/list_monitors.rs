@@ -257,21 +257,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(end)
             .map(|monitor| crate::state::encode_page_token(&monitor.monitor_name));
 
+        // Each summary is read out of the stored record through the one
+        // projection every monitor read path shares
+        // ([`crate::state::monitor_report`]), so what a listing reports for a
+        // monitor is what `GetMonitor` reads back for it.
         let monitors: Vec<MonitorSummary> = matching[start..end]
             .iter()
-            .map(|monitor| MonitorSummary {
-                monitor_arn: monitor.monitor_arn.clone(),
-                monitor_name: monitor.monitor_name.clone(),
-                state: monitor.state.clone(),
-                aggregation_period: Some(monitor.aggregation_period),
-                tags: Some(
-                    monitor
-                        .tags
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
-                ),
-            })
+            .map(|monitor| crate::state::monitor_report!(MonitorSummary, monitor))
             .collect();
 
         Ok(ListMonitorsOutput {
