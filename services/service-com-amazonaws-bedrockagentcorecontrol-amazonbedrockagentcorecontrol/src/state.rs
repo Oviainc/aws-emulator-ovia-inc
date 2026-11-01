@@ -65,6 +65,7 @@ use crate::ops::types::{
     CreateBrowserProfileOutput, GetBrowserProfileOutput,
     RecordingConfig, ToolsFileSystemConfiguration,
     CreateGatewayTargetOutput, CredentialProviderConfiguration, CustomTransformConfiguration,
+    DeleteGatewayTargetOutput,
     FilesystemConfiguration, GatewayInterceptorConfiguration, GatewayPolicyEngineConfiguration,
     GatewayProtocolConfiguration, GatewaySummary, GetGatewayOutput, GetGatewayTargetOutput,
     GetConfigurationBundleOutput, GetRegistryOutput,
@@ -536,7 +537,7 @@ pub struct GatewayRecord {
     /// The instant an accepted deletion removes this record, once `DeleteGateway`
     /// has accepted one; `None` for a gateway nobody has deleted. Stored, never
     /// slept on: the removal is the clock's, materialised by
-    /// [`ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_gateways`]
+    /// [`ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_gateways_and_targets`]
     /// on the next call that reads the store.
     pub removal_due_at: Option<SystemTime>,
     pub tags: BTreeMap<String, String>,
@@ -697,9 +698,21 @@ pub struct GatewayTargetRecord {
     pub metadata_configuration: Option<MetadataConfiguration>,
     pub private_endpoint: Option<PrivateEndpoint>,
     pub certificate_configurations: Option<Vec<CertificateConfiguration>>,
+    /// The instant an accepted deletion removes this target, once
+    /// `DeleteGatewayTarget` has accepted one; `None` for a target nobody has
+    /// deleted. Stored, never slept on: the removal is the clock's, materialised
+    /// by
+    /// [`ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_gateways_and_targets`]
+    /// on the next call that reads the gateway store.
+    pub removal_due_at: Option<SystemTime>,
 }
 
 impl GatewayTargetRecord {
+    /// Whether a deletion has been accepted for this target: it reports
+    /// `DELETING` and the clock owes its removal.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
     /// The status this target reports at `now`, on the same clock-owed rule a
     /// gateway's status follows.
     pub fn status_at(&self, now: SystemTime) -> &str {
@@ -810,6 +823,20 @@ impl GatewayTargetRecord {
             authorization_data: created.authorization_data,
             protocol_type: created.protocol_type,
             certificate_configurations: created.certificate_configurations,
+        }
+    }
+
+    /// This target as `DeleteGatewayTarget`'s response envelope: the target the
+    /// deletion was accepted for, the gateway it was served by, and the status it
+    /// reports from now on.
+    pub fn delete_output(&self, gateway_arn: &str, now: SystemTime) -> DeleteGatewayTargetOutput {
+        DeleteGatewayTargetOutput {
+            gateway_arn: gateway_arn.to_string(),
+            target_id: self.target_id.clone(),
+            status: self.status_at(now).to_string(),
+            // Reported only for a status that HAS a reason; a deletion this
+            // emulator accepts has none.
+            status_reasons: None,
         }
     }
 
@@ -3143,15 +3170,16 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
 
     /// Remove every gateway whose deletion the clock has already made due, with
     /// the name it reserved, the targets on it and the idempotency records naming
-    /// it.
+    /// it — and, on the gateways that remain, every TARGET whose own deletion the
+    /// clock has made due.
     ///
-    /// `DeleteGateway` ACCEPTS the deletion (202) and reports the gateway
-    /// `DELETING`; the record itself goes when the span it owes passes, so a
-    /// caller polling the gateway sees `DELETING` and then the modelled 404. The
-    /// removal is owed by the CLOCK — it was due at this instant whether or not
-    /// anybody called — so every operation that reads the gateway store
+    /// `DeleteGateway` and `DeleteGatewayTarget` ACCEPT the deletion (202) and
+    /// report the resource `DELETING`; the record itself goes when the span it
+    /// owes passes, so a caller polling it sees `DELETING` and then the modelled
+    /// 404. The removal is owed by the CLOCK — it was due at this instant whether
+    /// or not anybody called — so every operation that reads the gateway store
     /// materialises it first, and nothing ever sleeps for it.
-    pub fn expire_deleted_gateways(&mut self, now: SystemTime) {
+    pub fn expire_deleted_gateways_and_targets(&mut self, now: SystemTime) {
         let due: Vec<String> = self
             .gateways
             .iter()
@@ -3163,6 +3191,11 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
                 self.gateway_names.remove(&record.name);
                 self.forget_gateway_client_tokens_for(&record.gateway_id);
             }
+        }
+        for gateway in self.gateways.values_mut() {
+            gateway
+                .targets
+                .retain(|_, target| target.removal_due_at.is_none_or(|at| now < at));
         }
     }
 

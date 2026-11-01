@@ -207,7 +207,7 @@ impl<Eng: Send + Sync + 'static> GatewayMcpSurface<Eng> {
         let now = SystemTime::now();
         let serving = {
             let mut store = store.lock();
-            store.expire_deleted_gateways(now);
+            store.expire_deleted_gateways_and_targets(now);
             store
                 .gateway_on_endpoint_host(region, gateway_id)
                 .map(|gateway| ServingGateway::of(gateway, now))

@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // A gateway whose deletion the clock has already made due is gone before
         // this read looks for it, so a removed gateway is listed no more.
-        store.expire_deleted_gateways(now);
+        store.expire_deleted_gateways_and_targets(now);
 
         // The token is opaque on the wire: it carries the gateway id the previous
         // page ended on, and the next page starts strictly after it.

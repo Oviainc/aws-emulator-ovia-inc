@@ -35,6 +35,8 @@ mod gateway_listings;
 mod gateway_mcp_endpoint;
 #[path = "all/gateway_mutation.rs"]
 mod gateway_mutation;
+#[path = "all/gateway_target_deletion.rs"]
+mod gateway_target_deletion;
 #[path = "all/gateway_target_listing.rs"]
 mod gateway_target_listing;
 #[path = "all/gateway_target_mutation.rs"]

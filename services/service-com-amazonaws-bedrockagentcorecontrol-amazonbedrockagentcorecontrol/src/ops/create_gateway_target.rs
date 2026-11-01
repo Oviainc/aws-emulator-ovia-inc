@@ -226,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             // A gateway whose deletion the clock has already made due is gone
             // before this call looks for it.
-            store.expire_deleted_gateways(now);
+            store.expire_deleted_gateways_and_targets(now);
             if let Some((gateway_id, Some(target_id))) =
                 store.replayed_gateway_result(Self::NAME, input.client_token.as_deref())
             {
@@ -305,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that it is still in the status that admits a target — a `DeleteGateway`
         // in between moves it to `DELETING`, and the clock may have made that
         // deletion due.
-        store.expire_deleted_gateways(now);
+        store.expire_deleted_gateways_and_targets(now);
         let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
             CreateGatewayTargetErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
@@ -339,6 +339,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             metadata_configuration: input.metadata_configuration,
             private_endpoint: input.private_endpoint,
             certificate_configurations: input.certificate_configurations,
+            // Nothing has deleted this target: `DeleteGatewayTarget` is what
+            // arms the clock-owed removal.
+            removal_due_at: None,
         };
         let output = record.create_output(&gateway_arn, now);
         if let Some(gateway) = store.gateways.get_mut(&gateway_id) {

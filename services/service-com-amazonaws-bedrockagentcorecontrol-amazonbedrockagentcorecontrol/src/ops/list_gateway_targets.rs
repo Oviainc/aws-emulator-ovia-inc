@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // A gateway whose deletion the clock has already made due is gone before
         // this read looks for it, and its targets with it.
-        store.expire_deleted_gateways(now);
+        store.expire_deleted_gateways_and_targets(now);
 
         // A target is addressed only through its gateway, so a listing for a
         // gateway that does not exist is the modelled 404 — never an empty page,

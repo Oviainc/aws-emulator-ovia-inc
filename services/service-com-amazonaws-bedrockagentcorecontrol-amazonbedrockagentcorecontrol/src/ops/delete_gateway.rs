@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // A gateway whose earlier deletion the clock has already made due is gone
         // before this call looks for it.
-        store.expire_deleted_gateways(now);
+        store.expire_deleted_gateways_and_targets(now);
 
         // `gatewayIdentifier` is the `gatewayId` the create minted, which is how
         // the store is keyed; an identifier naming no stored gateway is the

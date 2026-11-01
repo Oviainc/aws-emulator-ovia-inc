@@ -215,44 +215,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
-        // The REQUEST is validated before any resource is resolved, so a body
-        // this operation cannot act on is reported as the malformed request it
-        // is whatever the path names: a missing gateway or target would
-        // otherwise answer "retry with a different resource identifier" for a
-        // request no identifier can make valid.
+        // The resource the PATH addresses is resolved before the body is judged:
+        // a request naming a gateway or a target that is not there answers the
+        // modelled 404 whatever else the body leaves out — which is what a
+        // `DeleteGatewayTarget` followed by an update of the same target answers.
         //
-        // `credentialProviderConfigurations` is optional on the request and
-        // `@required` with exactly one entry on this operation's own response
-        // (`smithy_query operation=UpdateGatewayTarget`), and the update
-        // REPLACES the target's whole configuration, so a body that defines
-        // none leaves nothing to report and is refused rather than defaulted.
-        let Some(credential_provider_configurations) = input
-            .credential_provider_configurations
-            .filter(|configured| !configured.is_empty())
-        else {
-            return Err(UpdateGatewayTargetErrorModeled::ValidationException(
-                crate::state::member_not_defined(
-                    crate::state::CREDENTIAL_PROVIDER_CONFIGURATIONS_PROSE,
-                ),
-            )
-            .into());
-        };
-
         // Everything that can be decided from stored state alone is decided
-        // first, and the store guard is DROPPED before the cross-service call
+        // here, and the store guard is DROPPED before the cross-service call
         // below: a lock is not held across an await, and the Lambda the new
         // configuration names is resolved only for a request that would
         // otherwise be written.
-        {
+        let credential_provider_configurations = {
             let mut store = state.lock();
             // A gateway whose deletion the clock has already made due is gone
             // before this call looks for it, and its targets with it.
-            store.expire_deleted_gateways(now);
+            store.expire_deleted_gateways_and_targets(now);
             let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
                 UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
                     crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
                 )
             })?;
+            // A target id naming no target OF THIS GATEWAY is the modelled 404:
+            // an update reconfigures a stored target, it does not mint one. A
+            // target whose deletion `DeleteGatewayTarget` has already accepted is
+            // on its way out and is no longer there to reconfigure, so it is the
+            // same 404.
+            let target_present = gateway
+                .targets
+                .get(&input.target_id)
+                .is_some_and(|target| !target.is_deleting());
+            if !target_present {
+                return Err(UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_TARGET),
+                )
+                .into());
+            }
+
+            // `credentialProviderConfigurations` is optional on the request and
+            // `@required` with exactly one entry on this operation's own response
+            // (`smithy_query operation=UpdateGatewayTarget`), and the update
+            // REPLACES the target's whole configuration, so a body that defines
+            // none leaves nothing to report and is refused rather than defaulted.
+            let Some(credential_provider_configurations) = input
+                .credential_provider_configurations
+                .filter(|configured| !configured.is_empty())
+            else {
+                return Err(UpdateGatewayTargetErrorModeled::ValidationException(
+                    crate::state::member_not_defined(
+                        crate::state::CREDENTIAL_PROVIDER_CONFIGURATIONS_PROSE,
+                    ),
+                )
+                .into());
+            };
+
             // A target is served BY the gateway, so the gateway has to be ready
             // to serve it: while the gateway is still in the transient status the
             // clock owes a transition for (`CREATING`, `UPDATING`), or on its way
@@ -267,15 +282,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            // A target id naming no target OF THIS GATEWAY is the modelled 404:
-            // an update reconfigures a stored target, it does not mint one.
-            if !gateway.targets.contains_key(&input.target_id) {
-                return Err(UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_TARGET),
-                )
-                .into());
-            }
-        }
+            credential_provider_configurations
+        };
 
         // The cross-service check `CreateGatewayTarget` makes, for the same
         // reason: the gateway has to invoke the function a Lambda MCP target
@@ -299,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // still there, nor that the gateway is still in the status that admits the
         // change — a `DeleteGateway` in between moves it to `DELETING`, and the
         // clock may have made that deletion due.
-        store.expire_deleted_gateways(now);
+        store.expire_deleted_gateways_and_targets(now);
         let gateway = store
             .gateways
             .get_mut(&input.gateway_identifier)
@@ -316,11 +324,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let gateway_arn = gateway.gateway_arn.clone();
-        let record = gateway.targets.get_mut(&input.target_id).ok_or_else(|| {
-            UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_TARGET),
-            )
-        })?;
+        // A target whose deletion was accepted in between is on its way out and
+        // is no longer there to reconfigure, so it is the same modelled 404 a
+        // target id naming nothing gets.
+        let record = gateway
+            .targets
+            .get_mut(&input.target_id)
+            .filter(|record| !record.is_deleting())
+            .ok_or_else(|| {
+                UpdateGatewayTargetErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_TARGET),
+                )
+            })?;
 
         // Every configurable member of the target is replaced by what this
         // request carries, and a member the request omits is CLEARED: this is the

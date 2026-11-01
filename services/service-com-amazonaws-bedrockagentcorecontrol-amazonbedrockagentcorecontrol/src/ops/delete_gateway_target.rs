@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGatewayTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGatewayTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGatewayTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ACCEPTS one gateway target's deletion and records it in [`crate::state`]: the target
+//! reports `DELETING` at once and its record is removed from the gateway that served it
+//! when the span the clock owes it passes, after which `GetGatewayTarget` resolves to the
+//! modelled `ResourceNotFoundException` and `ListGatewayTargets` no longer reports it.
+//! That is how a client that deletes a target and polls for it to disappear finishes.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +162,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGatewayTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGatewayTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteGatewayTargetErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the gateway store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A gateway whose deletion the clock has already made due is gone before
+        // this call looks for it, its targets with it, and so is a target whose
+        // own earlier deletion has come due.
+        store.expire_deleted_gateways_and_targets(now);
+
+        // A target is addressed only through its gateway, so an identifier naming
+        // no stored gateway is the modelled 404 before the target is looked at.
+        let gateway = store
+            .gateways
+            .get_mut(&input.gateway_identifier)
+            .ok_or_else(|| {
+                DeleteGatewayTargetErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+                )
+            })?;
+        // A target is served BY the gateway, so the gateway has to be ready to
+        // serve the change: while the clock still owes it a transition
+        // (`CREATING`, `UPDATING`), or it is on its way out in `DELETING`, its
+        // targets cannot be removed one by one, and the caller is told which
+        // status to wait out. The refusal is worded by the ONE helper every
+        // operation this service refuses on gateway status shares, so they cannot
+        // drift.
+        let gateway_status = gateway.status_at(now).to_string();
+        if gateway_status != crate::state::STATUS_READY {
+            return Err(DeleteGatewayTargetErrorModeled::ValidationException(
+                crate::state::gateway_status_conflict(Self::NAME, &gateway_status),
+            )
+            .into());
+        }
+        let gateway_arn = gateway.gateway_arn.clone();
+        // A target id naming no target OF THIS GATEWAY is the same modelled 404 as
+        // an unknown gateway — which is also what a delete of an already-removed
+        // target answers.
+        let record = gateway.targets.get_mut(&input.target_id).ok_or_else(|| {
+            DeleteGatewayTargetErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_TARGET),
+            )
+        })?;
+
+        // The deletion is ACCEPTED here (202) and the target reports `DELETING`
+        // from now on; the record is removed when the span the clock owes passes,
+        // so a caller that deletes and then polls sees `DELETING` and then the
+        // modelled 404 rather than a target that vanished mid-call.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGatewayTarget"))
+        // `DeleteGatewayTarget` is `@idempotent`, so a repeat while the deletion
+        // is still under way reports that same target instead of re-arming the
+        // clock.
+        if !record.is_deleting() {
+            record.transient_status = crate::state::STATUS_DELETING.to_string();
+            record.settled_status = crate::state::STATUS_DELETING.to_string();
+            record.settles_at = now;
+            record.removal_due_at = Some(now + crate::state::GATEWAY_SETTLE_DELAY);
+            record.updated_at = now;
+        }
+        let output = record.delete_output(&gateway_arn, now);
+
+        // The gateway's configuration includes the targets it serves, so removing
+        // one touches the gateway too — the same bookkeeping `CreateGatewayTarget`
+        // and `UpdateGatewayTarget` do.
+        gateway.updated_at = now;
+
+        Ok(output)
     }
 }

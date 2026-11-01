@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `UpdateGatewayTarget`'s request validation: what it refuses about the BODY, and that it
-//! decides that before it resolves any resource the path names.
+//! `UpdateGatewayTarget`'s request validation: what it refuses about the BODY, and where
+//! that decision sits relative to the resource the path names.
 //!
 //! Each test drives the service the way the router does: an `http::Request` through
 //! [`MultiServiceRouter::dispatch`], so the wire protocol (`restJson1`), the boundary
@@ -13,12 +13,12 @@
 //! exactly one entry on the response, and the update REPLACES the target's whole
 //! configuration — so a body that defines none leaves the response nothing to report and is
 //! refused with the operation's modelled `ValidationException` (HTTP 400) in the words this
-//! service uses for a member a request did not define. That is REQUEST validation, so it is
-//! decided before the gateway and the target are looked up: the rows differ along what the
-//! path names (both resources there, a target that is not, a gateway that is not, a gateway
-//! that is not in the status that admits a change) and the answer is the same 400 for every
-//! one of them. A body that DOES define the member is served, and nothing a refused request
-//! carried is written.
+//! service uses for a member a request did not define. The resource the PATH addresses is
+//! resolved first, so that refusal is what a request naming a gateway and a target that are
+//! both THERE gets, while a path naming either one that is not is the modelled
+//! `ResourceNotFoundException` (404) whatever the body leaves out; a gateway that is there
+//! but not in the status that admits a change still gets the body's refusal. A body that
+//! DOES define the member is served, and nothing a refused request carried is written.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -174,10 +174,12 @@ async fn update_target(
     .await
 }
 
-/// A body that defines no credential provider configurations is refused 400, whatever the
-/// path names and whatever else the body carries — and nothing it asked for is written.
+/// A body that defines no credential provider configurations is refused 400 whenever the
+/// path addresses a target that IS there, whatever else the body carries — and nothing it
+/// asked for is written. A path naming a resource that is not there is the modelled 404
+/// first, since the resource is resolved before the body is judged.
 #[tokio::test]
-async fn an_update_that_defines_no_credential_providers_is_refused_before_any_lookup() {
+async fn an_update_that_defines_no_credential_providers_is_refused() {
     let router = router();
     let gateway_id = settled_gateway(&router, "novalidategate").await;
     let target_id = created_target(&router, &gateway_id, "novalidatetarget").await;
@@ -206,7 +208,7 @@ async fn an_update_that_defines_no_credential_providers_is_refused_before_any_lo
     );
 
     // (case, gatewayIdentifier, targetId, the body the row sends)
-    let rows: [(&str, String, String, Value); 6] = [
+    let rows: [(&str, String, String, Value); 4] = [
         (
             "a gateway and a target that are both there",
             gateway_id.clone(),
@@ -224,18 +226,6 @@ async fn an_update_that_defines_no_credential_providers_is_refused_before_any_lo
                 "metadataConfiguration": {"allowedRequestHeaders": ["x-after"]},
                 "certificateConfigurations": [{"s3": {"uri": "s3://certs/private-ca.pem"}}],
             }),
-        ),
-        (
-            "a targetId naming no target of a gateway that is there",
-            gateway_id.clone(),
-            ABSENT_TARGET_ID.to_string(),
-            json!({"targetConfiguration": openapi_configuration("{\"openapi\":\"3.1.0\"}")}),
-        ),
-        (
-            "a gatewayIdentifier naming no gateway",
-            ABSENT_GATEWAY_ID.to_string(),
-            ABSENT_TARGET_ID.to_string(),
-            json!({"targetConfiguration": openapi_configuration("{\"openapi\":\"3.1.0\"}")}),
         ),
         (
             "a gateway the clock still owes a transition",
@@ -270,6 +260,45 @@ async fn an_update_that_defines_no_credential_providers_is_refused_before_any_lo
             text(&refused, "message"),
             NOT_DEFINED,
             "case {case:?}: expected the fixed sentence {NOT_DEFINED:?}, got {}",
+            text(&refused, "message")
+        );
+    }
+
+    // The resource the path addresses is resolved BEFORE the body is judged, so a path
+    // naming one that is not there answers the modelled 404 even for a body this operation
+    // would otherwise refuse: an update of a target that is gone cannot be served whatever
+    // the body carries.
+    let absent_rows: [(&str, String, String, &str); 2] = [
+        (
+            "a targetId naming no target of a gateway that is there",
+            gateway_id.clone(),
+            ABSENT_TARGET_ID.to_string(),
+            "Failed to retrieve target because it doesn't exist. Retry the request with a \
+             different resource identifier.",
+        ),
+        (
+            "a gatewayIdentifier naming no gateway",
+            ABSENT_GATEWAY_ID.to_string(),
+            ABSENT_TARGET_ID.to_string(),
+            "Failed to retrieve gateway because it doesn't exist. Retry the request with a \
+             different resource identifier.",
+        ),
+    ];
+
+    for (case, gateway, target, message) in absent_rows {
+        let body = json!({"targetConfiguration": openapi_configuration("{\"openapi\":\"3.1.0\"}")});
+        let (status, refused) = update_target(&router, &gateway, &target, &body).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected HTTP 404 ResourceNotFoundException, got {status} {} \
+             ({refused})",
+            error_code(&refused)
+        );
+        assert_eq!(
+            text(&refused, "message"),
+            message,
+            "case {case:?}: the refusal names what it could not find, got {}",
             text(&refused, "message")
         );
     }

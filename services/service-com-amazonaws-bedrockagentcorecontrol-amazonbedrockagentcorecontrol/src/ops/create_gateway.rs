@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // A gateway whose deletion the clock has already made due is gone before
         // this call looks for it, so its name is free for the create below.
-        store.expire_deleted_gateways(now);
+        store.expire_deleted_gateways_and_targets(now);
 
         // A replayed request carrying the same `clientToken` answers with the
         // gateway that token first produced, rather than minting a second one.

@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // A gateway whose deletion the clock has already made due is gone before
         // this read looks for it, and its targets with it.
-        store.expire_deleted_gateways(now);
+        store.expire_deleted_gateways_and_targets(now);
 
         let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
             GetGatewayTargetErrorModeled::ResourceNotFoundException(

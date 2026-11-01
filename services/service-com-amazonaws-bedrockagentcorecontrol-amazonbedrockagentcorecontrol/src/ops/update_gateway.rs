@@ -247,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // A gateway whose deletion the clock has already made due is gone before
         // this call looks for it.
-        store.expire_deleted_gateways(now);
+        store.expire_deleted_gateways_and_targets(now);
 
         // The same prose rule `CreateGateway` carries, which the framework's
         // constraint walk cannot refuse: "If you specify CUSTOM_JWT as the
