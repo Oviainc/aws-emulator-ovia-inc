@@ -39,20 +39,28 @@ fn past_the_settle_span() -> Duration {
 }
 
 /// One answer from the hosting edge, reduced to what a visitor reads.
+///
+/// `pub(crate)` for the same reason as [`Hosted`]: a sibling suite in this test target
+/// asserting what the edge answers reads it through the same two types.
 #[derive(Debug)]
-struct Visited {
-    status: u16,
-    content_type: Option<String>,
-    body: Vec<u8>,
+pub(crate) struct Visited {
+    pub(crate) status: u16,
+    pub(crate) content_type: Option<String>,
+    pub(crate) body: Vec<u8>,
+    pub(crate) location: Option<String>,
 }
 
 /// A deployed branch: the emulator, the app and branch it was created on, and the host
 /// its site answers at.
-struct Hosted {
-    emulator: Emulator,
-    app_id: String,
-    branch_name: String,
-    host: String,
+///
+/// `pub(crate)` so a sibling suite — the one asserting how the app's rewrite and
+/// redirect rules resolve a request — drives the same edge through the same harness
+/// rather than standing a second one up beside it.
+pub(crate) struct Hosted {
+    pub(crate) emulator: Emulator,
+    pub(crate) app_id: String,
+    pub(crate) branch_name: String,
+    pub(crate) host: String,
 }
 
 impl Hosted {
@@ -62,17 +70,25 @@ impl Hosted {
     /// (`smithy_query(query="doc",shape="Branch",member="displayName")` /
     /// `(shape="App",member="defaultDomain")`), so the host is read out of those two
     /// members rather than assumed.
-    async fn new(name: &str, branch_request: &Value) -> Self {
+    pub(crate) async fn new(name: &str, branch_request: &Value) -> Self {
         let emulator = Emulator::new();
         let app_id = emulator.app_id_of_new_app(name).await;
+        Self::adopt(emulator, app_id, branch_request).await
+    }
+
+    /// The same harness over an app that ALREADY exists — one created with its own
+    /// configuration — so a suite asserting what that configuration does to the edge
+    /// drives the one harness rather than a second copy of it.
+    pub(crate) async fn adopt(emulator: Emulator, app_id: String, branch_request: &Value) -> Self {
         let created = emulator.create_branch(&app_id, branch_request).await;
         assert_eq!(
             created.status, 200,
-            "app {name:?}: expected HTTP 200 from CreateBranch, got {created:?}"
+            "app {app_id:?}: expected HTTP 200 from CreateBranch, got {created:?}"
         );
         let branch_name = string_member(&created.member("branch"), "branchName");
         let display_name = string_member(&created.member("branch"), "displayName");
-        let default_domain = string_member(&emulator.get_app(&app_id).await.member("app"), "defaultDomain");
+        let app = emulator.get_app(&app_id).await.member("app");
+        let default_domain = string_member(&app, "defaultDomain");
         let host = format!("{display_name}.{default_domain}");
         Self {
             emulator,
@@ -84,7 +100,7 @@ impl Hosted {
 
     /// Visit `path` on `host` exactly as a browser does: the method and the URL, and no
     /// credential of any kind.
-    async fn visit_host(&self, method: &str, host: &str, path: &str) -> Visited {
+    pub(crate) async fn visit_host(&self, method: &str, host: &str, path: &str) -> Visited {
         let request = http::Request::builder()
             .method(method)
             .uri(format!("https://{host}{path}"))
@@ -99,18 +115,23 @@ impl Hosted {
                 .get("content-type")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
+            location: response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
             body: response.into_body().to_vec(),
         }
     }
 
     /// Visit `path` on this branch's own host.
-    async fn visit(&self, path: &str) -> Visited {
+    pub(crate) async fn visit(&self, path: &str) -> Visited {
         self.visit_host("GET", &self.host, path).await
     }
 
     /// Deploy `files` as the zipped content of a reservation, and wait for the job the
     /// start call creates to settle. Answers the job's terminal status.
-    async fn deploy(&self, case: &str, files: &[(&str, &[u8])]) -> String {
+    pub(crate) async fn deploy(&self, case: &str, files: &[(&str, &[u8])]) -> String {
         let reserved = self
             .emulator
             .call(
@@ -236,7 +257,7 @@ fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// The terminal status of a deployment whose files were read and published.
-const SUCCEED: &str = "SUCCEED";
+pub(crate) const SUCCEED: &str = "SUCCEED";
 
 /// The terminal status of a deployment whose files could not be published.
 const FAILED: &str = "FAILED";

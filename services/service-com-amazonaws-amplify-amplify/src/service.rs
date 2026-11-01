@@ -82,7 +82,10 @@
 //!
 //! The edge READS: a request for a path the site carries is answered with those bytes
 //! and that file's own media type, a request for the root (or for a directory) with the
-//! site's root document, and anything else with a 404. The only state it touches is the
+//! site's root document, and anything else with a 404. Before any of that, the request
+//! path is resolved against the owning app's rewrite and redirect rules
+//! (`App$customRules`), which is what makes a rewritten path serve the object its target
+//! names (`crate::state::resolve_hosted_request`). The only state it touches is the
 //! settling the clock already owes the branch (`crate::state::AmplifyBranch::settle`),
 //! which publishes the site of a deployment whose job the clock has finished.
 
@@ -225,13 +228,16 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 
     /// Serve one request to a branch's hosting edge from what that branch's latest
-    /// successful deployment published.
+    /// successful deployment published, as the owning app's rewrite and redirect rules
+    /// resolve it.
     ///
-    /// A `GET` (or a `HEAD`, which is the same answer without the body) is answered with
-    /// the file the path names, the site's root document for the root or a directory,
-    /// and a 404 for a path the deployment did not publish — including every path of a
-    /// branch nothing has been deployed to yet. Any other method is refused: a hosting
-    /// edge serves a site, it does not take writes.
+    /// A `GET` (or a `HEAD`, which is the same answer without the body) is answered by
+    /// the first of the app's `customRules` whose `source` matches the path — a rewrite
+    /// with the object its `target` names, a redirect with that target as the `Location`
+    /// — and otherwise with the file the path names, the site's root document for the
+    /// root or a directory, and a 404 for a path neither a rule nor the deployment
+    /// answers, including every path of a branch nothing has been deployed to yet. Any
+    /// other method is refused: a hosting edge serves a site, it does not take writes.
     fn serve_hosted_site(&self, req: &RtRequest, host: &str) -> RtResponse {
         let method = req.method();
         if method != "GET" && method != "HEAD" {
@@ -241,35 +247,59 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             return plane_error(500, "InternalFailureException", SITE_STORE_MESSAGE);
         };
         let path = ::service_common::request_path(req.uri()).to_string();
-        let mut store = state.lock();
-        let Some(branch) = store.hosted_branch_mut(host) else {
-            return plane_error(404, "NotFound", SITE_NOT_FOUND_MESSAGE);
+        // The store is read, and what the clock owes the branch materialised, under the
+        // lock; the answer is BUILT after it is released, so no response construction
+        // happens while other callers are waiting on the one store.
+        let answer = {
+            let mut store = state.lock();
+            match store.hosted_visit(host, &path) {
+                Some(answer) => answer,
+                None => return plane_error(404, "NotFound", SITE_NOT_FOUND_MESSAGE),
+            }
         };
-        // What the clock already owes this branch — its jobs' status changes, and the
-        // site a finished deployment publishes — is materialised before the answer, so a
-        // visitor sees the deployment that has finished rather than the one before it.
-        branch.settle();
-        let served = crate::state::hosted_site_key(&path)
-            .and_then(|key| branch.site.get(&key).map(|file| (key, file.clone())));
-        let Some((key, content)) = served else {
-            return plane_error(404, "NotFound", SITE_NOT_FOUND_MESSAGE);
-        };
-        let length = content.len();
-        let mut resp = RtResponse::new(
-            StatusCode::try_from(200u16).expect("200 is a valid status"),
-            // A HEAD is the same answer as the GET without the body, so the length it
-            // reports is the file's.
-            if method == "HEAD" {
-                SdkBody::empty()
-            } else {
-                SdkBody::from(content)
-            },
-        );
-        resp.headers_mut()
-            .insert("content-type", crate::state::hosted_file_media_type(&key));
-        resp.headers_mut()
-            .insert("content-length", length.to_string());
-        resp
+        match answer {
+            crate::state::HostedAnswer::File { key, content } => {
+                let length = content.len();
+                let mut resp = RtResponse::new(
+                    StatusCode::try_from(200u16).expect("200 is a valid status"),
+                    // A HEAD is the same answer as the GET without the body, so the
+                    // length it reports is the file's.
+                    if method == "HEAD" {
+                        SdkBody::empty()
+                    } else {
+                        SdkBody::from(content)
+                    },
+                );
+                resp.headers_mut()
+                    .insert("content-type", crate::state::hosted_file_media_type(&key));
+                resp.headers_mut()
+                    .insert("content-length", length.to_string());
+                resp
+            }
+            crate::state::HostedAnswer::Redirect { redirect, location } => {
+                // Both halves of a redirect are converted falliably rather than
+                // asserted: the status is one of the two the redirect kind names, and
+                // the `Location` is built from the rule's target, which is caller text —
+                // a value no response can carry is answered as a path nothing resolves
+                // rather than taken as an invariant of this module.
+                let Ok(status) = StatusCode::try_from(redirect.status()) else {
+                    return plane_error(404, "NotFound", SITE_NOT_FOUND_MESSAGE);
+                };
+                let mut resp = RtResponse::new(status, SdkBody::empty());
+                if resp
+                    .headers_mut()
+                    .try_insert("location", location)
+                    .is_err()
+                {
+                    return plane_error(404, "NotFound", SITE_NOT_FOUND_MESSAGE);
+                }
+                resp.headers_mut().insert("content-length", "0");
+                resp
+            }
+            crate::state::HostedAnswer::NotFound => {
+                plane_error(404, "NotFound", SITE_NOT_FOUND_MESSAGE)
+            }
+        }
     }
 }
 

@@ -202,6 +202,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let updated_at = crate::state::now();
         let mut store = state.lock();
 
+        // The rewrite and redirect rules are walked for every request the app's hosting
+        // edge serves, so the list one app may carry is bounded — refused BEFORE
+        // anything is written, which leaves the app exactly as it was. `UpdateApp`
+        // models no limit error, so the refusal is its `BadRequestException`.
+        let supplied_rules = input.custom_rules.as_ref().map_or(0, Vec::len);
+        if supplied_rules > crate::state::MAX_CUSTOM_RULES_PER_APP {
+            return Err(UpdateAppErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::custom_rules_limit_message(
+                    &input.app_id,
+                    supplied_rules,
+                )),
+            })
+            .into());
+        }
+
         // `UpdateApp` updates an EXISTING app, so an unknown `appId` is a 404 rather
         // than an app created on the way.
         let app = &mut store

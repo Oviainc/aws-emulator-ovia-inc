@@ -227,6 +227,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The rewrite and redirect rules are walked for every request the app's hosting
+        // edge serves, so the list one app may carry is bounded the same way — before
+        // anything is stored.
+        let supplied_rules = input.custom_rules.as_ref().map_or(0, Vec::len);
+        if supplied_rules > crate::state::MAX_CUSTOM_RULES_PER_APP {
+            return Err(CreateAppErrorModeled::LimitExceededException(LimitExceededException {
+                message: Some(crate::state::custom_rules_limit_message(
+                    &input.name,
+                    supplied_rules,
+                )),
+            })
+            .into());
+        }
+
         let app_id = store.mint_app_id();
 
         let app = App {

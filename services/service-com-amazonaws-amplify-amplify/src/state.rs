@@ -20,7 +20,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ops::types::{App, BackendEnvironment, Branch, DomainAssociation, Job, Step, Webhook};
+use crate::ops::types::{
+    App, BackendEnvironment, Branch, CustomRule, DomainAssociation, Job, Step, Webhook,
+};
 
 /// One Amplify app as this service persists it: the modelled record it hands back,
 /// plus the branches, domain associations, webhooks and backend environments created
@@ -1317,25 +1319,38 @@ impl ComAmazonawsAmplifyAmplifyState {
         })
     }
 
-    /// The branch whose hosting edge answers at `host`, to serve from.
+    /// Resolve one hosting-edge visit: the branch `host` names, settled, with `path`
+    /// resolved against its app's rules and its own published files.
     ///
     /// A branch's site is served at `<displayName>.<app defaultDomain>`:
     /// `Branch$displayName` "is used as the default domain prefix"
     /// (`smithy_query(query="doc",shape="Branch",member="displayName")`) and
     /// `App$defaultDomain` is "the default domain for the Amplify app"
     /// (`smithy_query(query="doc",shape="App",member="defaultDomain")`). The match is
-    /// case-insensitive and ignores any port, because a host is.
+    /// case-insensitive and ignores any port, because a host is. `None` when no branch
+    /// of any app is hosted there.
     ///
     /// `&mut` because serving a request REPORTS on the branch, and reporting
     /// materialises what the clock already owes it ([`AmplifyBranch::settle`]) — never
-    /// anything else.
-    pub fn hosted_branch_mut(&mut self, host: &str) -> Option<&mut AmplifyBranch> {
+    /// anything else. The resolution happens HERE, where the rules and the files both
+    /// live, so a visit copies neither: the rules are configured on the APP
+    /// (`App$customRules`) and applied by the edge of each of its branches.
+    pub fn hosted_visit(&mut self, host: &str, path: &str) -> Option<HostedAnswer> {
         let host = hosted_site_host(host);
         self.apps.values_mut().find_map(|app| {
             let domain = app.app.default_domain.to_ascii_lowercase();
-            app.branches.values_mut().find(|branch| {
-                hosted_branch_host(&branch.branch.display_name, &domain) == host
-            })
+            let hosted = app.branches.iter().find_map(|(name, branch)| {
+                (hosted_branch_host(&branch.branch.display_name, &domain) == host)
+                    .then(|| name.clone())
+            })?;
+            // What the clock already owes this branch — its jobs' status changes, and
+            // the site a finished deployment publishes — is materialised before anything
+            // is read, so a visitor sees the deployment that has finished rather than
+            // the one before it.
+            app.branches.get_mut(&hosted)?.settle();
+            let rules = app.app.custom_rules.as_deref().unwrap_or_default();
+            let branch = app.branches.get(&hosted)?;
+            Some(resolve_hosted_request(rules, &branch.site, path))
         })
     }
 
@@ -1557,6 +1572,314 @@ pub fn hosted_site_key(path: &str) -> Option<String> {
 /// files cannot answer one extension differently.
 pub fn hosted_file_media_type(path: &str) -> &'static str {
     ::service_common::web_media_type::media_type_of_path(path)
+}
+
+/// The placeholder a rule's `source` captures a part of the request path with, and that
+/// its `target` substitutes that capture back into.
+///
+/// `CustomRule$source` is "The source pattern for a URL rewrite or redirect rule" and
+/// `target` "The target pattern" (`smithy_query(query="shape",shape="CustomRule")`): a
+/// PATTERN, not a path, and this is the one placeholder those patterns are written with.
+/// A source carrying none of it is a literal path, matched whole.
+pub const CUSTOM_RULE_PLACEHOLDER: &str = "<*>";
+
+/// How many rewrite and redirect rules one app may carry at once, past which a writer
+/// refuses the list.
+///
+/// CHOSEN, not a published quota, exactly as [`MAX_DOMAIN_ASSOCIATIONS_PER_APP`] is:
+/// `CustomRules` is modelled as a list with no length
+/// (`smithy_query(query="shape",shape="CustomRules")`), and the stored list is walked
+/// for EVERY request the hosting edge serves, so without a bound one app's
+/// configuration — and the work one visit does — would grow with nothing to cap it. It
+/// is far above the handful of rules a site's redirect configuration carries, and with
+/// each rule's `source` modelled at most 2048 characters it bounds what resolving one
+/// visit can cost.
+pub const MAX_CUSTOM_RULES_PER_APP: usize = 1000;
+
+/// The `message` a writer's refusal carries when a list would leave an app holding more
+/// than [`MAX_CUSTOM_RULES_PER_APP`] rules.
+///
+/// Built FROM THE REQUEST — the limit, the number of rules the list carries, and the
+/// identifier the request names the app by (its `appId` on an update; its `name` on a
+/// create, which is all a create has) — in the same `Number of … exceeds the limit of …`
+/// construction this crate's other quota refusal uses, because the model spells no
+/// message out for a bound it does not state.
+pub fn custom_rules_limit_message(app: &str, supplied: usize) -> String {
+    within_error_message_bound(format!(
+        "Number of custom rules ({supplied}) exceeds the limit of \
+         {MAX_CUSTOM_RULES_PER_APP} for app {app}"
+    ))
+}
+
+/// What one of an app's custom rules does to a request its `source` matches.
+///
+/// The five values are the ones `CustomRule$status` documents
+/// (`smithy_query(query="doc",shape="CustomRule",member="status")`): `200` "Represents a
+/// 200 rewrite rule", `301` "a 301 (moved permanently) redirect rule. This and all
+/// future requests should be directed to the target URL", `302` "a 302 temporary
+/// redirect rule", `404` "a 404 redirect rule" and `404-200` "a 404 rewrite rule".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomRuleStatus {
+    /// `200`: the request is answered, with status 200, from the object the target names.
+    Rewrite,
+    /// `301`: the visitor is sent to the target permanently.
+    MovedPermanently,
+    /// `302`: the visitor is sent to the target temporarily.
+    Found,
+    /// `404`: the request is answered as a request for a path the site does not carry.
+    NotFound,
+    /// `404-200`: a request the site carries NO file for is answered, with status 200,
+    /// from the object the target names — the rule a single-page app's catch-all is.
+    NotFoundRewrite,
+}
+
+/// What `status` makes a rule do, or `None` when it names nothing the member documents —
+/// including the rule that carries no status at all, which asks for none of the five
+/// behaviours and so leaves the request to be resolved as if the rule were not there.
+pub fn custom_rule_status(status: Option<&str>) -> Option<CustomRuleStatus> {
+    match status?.trim() {
+        "200" => Some(CustomRuleStatus::Rewrite),
+        "301" => Some(CustomRuleStatus::MovedPermanently),
+        "302" => Some(CustomRuleStatus::Found),
+        "404" => Some(CustomRuleStatus::NotFound),
+        "404-200" => Some(CustomRuleStatus::NotFoundRewrite),
+        _ => None,
+    }
+}
+
+/// What a hosting edge answers one request with, once the app's rules and the branch's
+/// published files have both been consulted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostedAnswer {
+    /// Serve these bytes with status 200, as the file published at `key` — which is also
+    /// the path the media type is read from, so a rewritten request carries the type of
+    /// the object that ANSWERED it.
+    File {
+        /// The site key the bytes are published at.
+        key: String,
+        /// The bytes to serve.
+        content: Vec<u8>,
+    },
+    /// Send the visitor to `location` with this redirect's status.
+    Redirect {
+        /// Which of the two documented redirects this is.
+        redirect: HostedRedirect,
+        /// The substituted target, as the `Location` the visitor follows.
+        location: String,
+    },
+    /// Neither a rule nor a published file answers this path.
+    NotFound,
+}
+
+/// Which redirect a rule answers with — the two [`CustomRuleStatus`] carries.
+///
+/// A kind rather than a number so the status an answer is built with can only ever be
+/// one of the two, whatever a rule's own `status` text said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostedRedirect {
+    /// `301`: "This and all future requests should be directed to the target URL".
+    Permanent,
+    /// `302`: a temporary redirect.
+    Temporary,
+}
+
+impl HostedRedirect {
+    /// The HTTP status this redirect answers with.
+    pub fn status(self) -> u16 {
+        match self {
+            Self::Permanent => 301,
+            Self::Temporary => 302,
+        }
+    }
+}
+
+/// Resolve one request path against an app's custom rules and a branch's published
+/// files.
+///
+/// The rules are walked IN ORDER and the FIRST one whose `source` matches the request
+/// path decides the answer, per the behaviour its `status` names
+/// ([`CustomRuleStatus`]); a rewrite's answer is the object the substituted `target`
+/// names, so the capture the `<*>` placeholder took out of the path is put back into the
+/// target. A `404-200` rule is considered only for a request the site carries no file
+/// for, which is what makes it the catch-all. When no rule decides, the request is
+/// answered from the file the path itself names, and is a 404 when the site carries
+/// none.
+///
+/// Two kinds of rule this edge cannot carry out are passed over rather than guessed at:
+/// one whose `condition` is set, because the condition names an attribute of the VISITOR
+/// ("such as a country code",
+/// `smithy_query(query="doc",shape="CustomRule",member="condition")`) that no request to
+/// this emulator carries, and one whose status names none of the documented behaviours.
+/// A rewrite whose target names another ORIGIN (an absolute URL) would have to be
+/// fetched from there, which this edge does not do, so it answers as a path with no
+/// object behind it; a REDIRECT to one is just a `Location`, and is sent as written
+/// unless the substituted target cannot be sent as one at all ([`redirect_to`]).
+pub fn resolve_hosted_request(
+    rules: &[CustomRule],
+    site: &BTreeMap<String, Vec<u8>>,
+    path: &str,
+) -> HostedAnswer {
+    let published = hosted_site_key(path).filter(|key| site.contains_key(key));
+    for rule in rules {
+        if rule.condition.as_deref().is_some_and(|value| !value.is_empty()) {
+            continue;
+        }
+        let Some(status) = custom_rule_status(rule.status.as_deref()) else {
+            continue;
+        };
+        if status == CustomRuleStatus::NotFoundRewrite && published.is_some() {
+            continue;
+        }
+        let Some(captured) = custom_rule_match(&rule.source, path) else {
+            continue;
+        };
+        let Some(target) = substituted_target(&rule.target, &captured) else {
+            continue;
+        };
+        return match status {
+            CustomRuleStatus::Rewrite | CustomRuleStatus::NotFoundRewrite => {
+                rewritten_file(site, &target)
+            }
+            CustomRuleStatus::MovedPermanently => redirect_to(HostedRedirect::Permanent, target),
+            CustomRuleStatus::Found => redirect_to(HostedRedirect::Temporary, target),
+            CustomRuleStatus::NotFound => HostedAnswer::NotFound,
+        };
+    }
+    match published {
+        Some(key) => published_file(site, &key),
+        None => HostedAnswer::NotFound,
+    }
+}
+
+/// The answer a redirect rule to `location` produces.
+///
+/// A target is caller text whose characters nothing constrains (`CustomRule$target` is
+/// modelled by its length alone), and a redirect carries it as a header value — so a
+/// target that cannot BE one names a destination no answer can send, and the rule is
+/// left uncarried-out rather than half-applied.
+fn redirect_to(redirect: HostedRedirect, location: String) -> HostedAnswer {
+    if !sendable_as_a_header_value(&location) {
+        return HostedAnswer::NotFound;
+    }
+    HostedAnswer::Redirect { redirect, location }
+}
+
+/// Whether `value` can be sent as a header value: non-empty, and every byte visible
+/// ASCII or a tab.
+pub fn sendable_as_a_header_value(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte == b'\t' || (0x20..0x7f).contains(&byte))
+}
+
+/// The answer a 200 (or `404-200`) rewrite to `target` produces: the object the target
+/// names within the site, or nothing when the site publishes no such object — including
+/// every target naming another origin, which this edge does not fetch from.
+fn rewritten_file(site: &BTreeMap<String, Vec<u8>>, target: &str) -> HostedAnswer {
+    if target.contains("://") {
+        return HostedAnswer::NotFound;
+    }
+    // A target is a pattern of the same shape as a request path, so it is read as one:
+    // its query string dropped, and a directory answered by the site's root document.
+    match hosted_site_key(::service_common::request_path(target)) {
+        Some(key) => published_file(site, &key),
+        None => HostedAnswer::NotFound,
+    }
+}
+
+/// The answer the file published at `key` produces, or [`HostedAnswer::NotFound`] when
+/// the site publishes none.
+fn published_file(site: &BTreeMap<String, Vec<u8>>, key: &str) -> HostedAnswer {
+    match site.get(key) {
+        Some(content) => HostedAnswer::File {
+            key: key.to_string(),
+            content: content.clone(),
+        },
+        None => HostedAnswer::NotFound,
+    }
+}
+
+/// What a rule's `source` pattern captures out of `path`, or `None` when it does not
+/// match it.
+///
+/// The pattern is the literal path around each [`CUSTOM_RULE_PLACEHOLDER`], and each
+/// placeholder captures a NON-EMPTY run of the request path: `/assets/<*>` matches
+/// `/assets/main.css` capturing `main.css`, and does not match `/assets/` — which names
+/// a directory, not something to substitute. Both the pattern and the path are compared
+/// from the site root, so a pattern written without the leading separator matches the
+/// same requests as one written with it.
+fn custom_rule_match(source: &str, path: &str) -> Option<Vec<String>> {
+    let source = from_site_root(source);
+    let path = from_site_root(path);
+    let mut parts = source.split(CUSTOM_RULE_PLACEHOLDER);
+    let leading = parts.next().unwrap_or_default();
+    let literals: Vec<&str> = parts.collect();
+    let mut remaining = path.strip_prefix(leading)?;
+    if literals.is_empty() {
+        return remaining.is_empty().then(Vec::new);
+    }
+    let mut captured = Vec::with_capacity(literals.len());
+    for (index, literal) in literals.iter().enumerate() {
+        if index + 1 == literals.len() {
+            // The last literal is the pattern's tail, so what the final placeholder
+            // captured is everything before it.
+            let value = if literal.is_empty() {
+                remaining
+            } else {
+                remaining.strip_suffix(literal)?
+            };
+            if value.is_empty() {
+                return None;
+            }
+            captured.push(value.to_string());
+        } else {
+            let at = first_occurrence_after_a_capture(remaining, literal)?;
+            captured.push(remaining[..at].to_string());
+            remaining = &remaining[at + literal.len()..];
+        }
+    }
+    Some(captured)
+}
+
+/// The index of the first occurrence of `literal` in `remaining` that leaves a non-empty
+/// capture before it, so a placeholder always stands for something.
+fn first_occurrence_after_a_capture(remaining: &str, literal: &str) -> Option<usize> {
+    remaining
+        .char_indices()
+        .skip(1)
+        .find(|(at, _)| remaining[*at..].starts_with(literal))
+        .map(|(at, _)| at)
+}
+
+/// A rule's `target` with each [`CUSTOM_RULE_PLACEHOLDER`] replaced by what the source's
+/// placeholders captured, in order, or `None` when the target carries more placeholders
+/// than the source captured.
+///
+/// A target asking for a capture the match did not produce cannot be substituted, so the
+/// rule decides nothing rather than being completed with a guess. A capture the target
+/// does not use is simply unused: a target is as specific as it is written.
+fn substituted_target(target: &str, captured: &[String]) -> Option<String> {
+    let mut out = String::with_capacity(target.len());
+    let mut values = captured.iter();
+    let mut parts = target.split(CUSTOM_RULE_PLACEHOLDER).peekable();
+    while let Some(part) = parts.next() {
+        out.push_str(part);
+        if parts.peek().is_some() {
+            out.push_str(values.next()?);
+        }
+    }
+    Some(out)
+}
+
+/// `value` as a path from the site root: exactly one leading separator, however it was
+/// written.
+fn from_site_root(value: &str) -> ::std::borrow::Cow<'_, str> {
+    if value.starts_with('/') {
+        ::std::borrow::Cow::Borrowed(value)
+    } else {
+        ::std::borrow::Cow::Owned(format!("/{value}"))
+    }
 }
 
 /// This service's own endpoint prefix (`smithy_query(query="service_info")`:
