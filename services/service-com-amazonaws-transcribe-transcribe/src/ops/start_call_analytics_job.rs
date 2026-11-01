@@ -352,7 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::resolve_media_objects(ctx, &region, &media_uris).await
             == crate::state::MediaVerdict::NoSuchObject
         {
-            return Err(bad_request(crate::state::MEDIA_URI_NAMES_NO_OBJECT));
+            return Err(bad_request(crate::state::URI_NAMES_NO_OBJECT));
         }
 
         // The clock is read HERE, after the cross-service read above and with nothing

@@ -433,9 +433,9 @@ async fn a_rebuild_replaces_the_content_the_reported_location_serves() {
 }
 
 /// A resource that holds no built content serves nothing at the location it used to:
-/// a rebuild whose content was to be READ from a caller-named file no object store
-/// serves reports no `DownloadUri` and leaves nothing behind, and a delete withdraws
-/// the content with the resource.
+/// a rebuild whose content was to be READ from a caller-named location no object store
+/// can be asked about reports no `DownloadUri` and leaves nothing behind, and a delete
+/// withdraws the content with the resource.
 #[tokio::test]
 async fn a_resource_with_no_built_content_serves_nothing() {
     let emulator = Emulator::new();
@@ -459,7 +459,13 @@ async fn a_resource_with_no_built_content_serves_nothing() {
             let case = format!("{} (rebuilt from a file)", row.case);
             let mut request = json!({
                 row.family.name_member: row.name,
-                row.family.file_member: "s3://DOC-EXAMPLE-BUCKET/my-vocab-file.txt",
+                // An `http(s)` location, which the member's own `@pattern` admits
+                // (`^(s3://|http(s*)://).+$`) and which addresses a HOST: this emulator
+                // resolves none, so no object store is asked about it and the rebuild
+                // loads nothing. An `s3://` location the store answers for with no
+                // object there is REFUSED outright instead, which is
+                // `crate::vocabulary_file_names_an_object`'s subject.
+                row.family.file_member: "https://example-bucket.s3.amazonaws.com/my-vocab-file.txt",
             });
             if row.family.update_takes_language_code {
                 request["LanguageCode"] = json!(row.language_code);
@@ -478,8 +484,8 @@ async fn a_resource_with_no_built_content_serves_nothing() {
                 .await;
             assert!(
                 reported.is_none(),
-                "case {case:?}: a resource whose file the object store does not hold \
-                 reports no DownloadUri (state {state:?}), got {reported:?}"
+                "case {case:?}: a resource whose content no object store could be asked \
+                 about reports no DownloadUri (state {state:?}), got {reported:?}"
             );
             assert_location_serves_nothing(&emulator, &uri, row.region, &case).await;
         } else {

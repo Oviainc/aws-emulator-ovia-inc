@@ -208,11 +208,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// EITHER produces the same record: the terms the request listed, or the terms the
     /// file holds — that file is an Amazon S3 object the caller uploaded before
     /// calling, and this emulator holds an Amazon S3 of its own, so the build READS it
-    /// in process ([`crate::state::resolve_vocabulary_file`]). So the vocabulary is
-    /// `READY` once the clock makes its build due, with its terms stored at the
-    /// location `GetVocabulary` reports as the `DownloadUri`, and only a file the
-    /// object store does not serve ends the build in the service's own modelled
-    /// `FAILED` state with a grounded `FailureReason` (see
+    /// in process ([`crate::state::resolve_vocabulary_file`]). Resolving that object is
+    /// part of VALIDATING the request: a URI the object store answers for with no
+    /// object there names a file that cannot be read, so the request is refused with
+    /// the modelled `BadRequestException` and NOTHING is created. A file this emulator
+    /// could get no answer about leaves the vocabulary `READY` once the clock makes its
+    /// build due, with its terms stored at the location `GetVocabulary` reports as the
+    /// `DownloadUri`, or in the service's own modelled `FAILED` state with a grounded
+    /// `FailureReason` when the read established nothing to build from (see
     /// [`crate::state::VocabularyRecord::advance_clock`]). Neither alternative, or
     /// both at once, is what the operation refuses.
     async fn handle(
@@ -267,7 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .await;
                 match verdict.into_build() {
                     Ok((terms, failure_due)) => (terms, Some(uri.to_string()), failure_due),
-                    Err(bytes) => {
+                    Err(crate::state::VocabularyFileRefusal::NoSuchObject) => {
+                        return Err(bad_request(crate::state::URI_NAMES_NO_OBJECT))
+                    }
+                    Err(crate::state::VocabularyFileRefusal::TooLarge(bytes)) => {
                         return Err(CreateVocabularyErrorModeled::LimitExceededException(
                             LimitExceededException {
                                 message: Some(crate::state::vocabulary_file_too_large_message(

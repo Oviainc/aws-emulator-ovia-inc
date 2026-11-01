@@ -234,7 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .await;
                 match verdict.into_build() {
                     Ok((terms, failure_due)) => (terms, Some(uri.to_string()), failure_due),
-                    Err(bytes) => {
+                    Err(crate::state::VocabularyFileRefusal::NoSuchObject) => {
+                        return Err(bad_request(crate::state::URI_NAMES_NO_OBJECT))
+                    }
+                    Err(crate::state::VocabularyFileRefusal::TooLarge(bytes)) => {
                         return Err(UpdateVocabularyErrorModeled::LimitExceededException(
                             LimitExceededException {
                                 message: Some(crate::state::vocabulary_file_too_large_message(

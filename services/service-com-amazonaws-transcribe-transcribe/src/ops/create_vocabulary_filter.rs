@@ -237,10 +237,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ContentSource::Inline(words) => (words.to_vec(), None),
             // This filter's words are READ from the object at that URI: it is an Amazon
             // S3 object the caller uploaded before calling, and this emulator holds an
-            // Amazon S3 of its own (`crate::state::resolve_vocabulary_file`). This
-            // family models no processing state, so a file the store does not serve
-            // leaves the record real and its words unloaded — and the only thing such a
-            // filter does not report is a file of its own to download
+            // Amazon S3 of its own (`crate::state::resolve_vocabulary_file`). Resolving
+            // that object is part of validating the request, so a URI the store answers
+            // for with no object there is refused and nothing is recorded; this family
+            // models no processing state, so a file this emulator could get no answer
+            // about leaves the record real and its words unloaded — and the only thing
+            // such a filter does not report is a file of its own to download
             // (`crate::state::VocabularyFilterRecord::download_uri`), since no
             // operation of this service reports a filter's words.
             crate::state::ContentSource::File(uri) => {
@@ -253,7 +255,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .await;
                 match verdict.into_build() {
                     Ok((words, _)) => (words, Some(uri.to_string())),
-                    Err(bytes) => {
+                    Err(crate::state::VocabularyFileRefusal::NoSuchObject) => {
+                        return Err(bad_request(crate::state::URI_NAMES_NO_OBJECT))
+                    }
+                    Err(crate::state::VocabularyFileRefusal::TooLarge(bytes)) => {
                         return Err(CreateVocabularyFilterErrorModeled::LimitExceededException(
                             LimitExceededException {
                                 message: Some(crate::state::vocabulary_file_too_large_message(

@@ -78,12 +78,14 @@
 //! seam, in the other direction: the caller uploaded that file to Amazon S3 before
 //! calling, this emulator holds an Amazon S3 of its own, so the file is READ from it in
 //! process ([`resolve_vocabulary_file`]) and its lines are the terms the build
-//! produces. The build therefore ends the way the object store's answer decides: a file
-//! the store serves settles the record `READY`, with those terms stored at the
-//! `DownloadUri` the reader reports, and only a file the store does not serve — nothing
-//! at that address, a read it refuses, no Amazon S3 to ask at all — ends the build in
-//! the service's own modelled `FAILED` state, with a `FailureReason` grounded in that
-//! answer (see [`VocabularyRecord::advance_clock`] and
+//! produces. Resolving that object is part of VALIDATING the request, so a request
+//! whose object the store answers for with nothing there is refused outright and no
+//! record is stored at all ([`URI_NAMES_NO_OBJECT`]). Past that, the build ends the way
+//! the read decides: a file the store serves settles the record `READY`, with those
+//! terms stored at the `DownloadUri` the reader reports, and a file nothing read — a
+//! read the store refuses, no Amazon S3 to ask at all, an object holding no terms or no
+//! text — ends the build in the service's own modelled `FAILED` state, with a
+//! `FailureReason` grounded in that answer (see [`VocabularyRecord::advance_clock`] and
 //! [`vocabulary_file_not_read_reason`]); the custom MEDICAL vocabulary family, whose
 //! terms can ONLY come from such a file, is built exactly the same way (see
 //! [`MedicalVocabularyRecord`]). The `DownloadUri` is where the BUILT vocabulary is
@@ -93,7 +95,7 @@
 //! [`MedicalVocabularyRecord::download_uri`]). A vocabulary FILTER whose words come
 //! from such a file is built from it the same way ([`VocabularyFilterRecord`]), and
 //! that family models no processing state at all, so the only thing a filter whose
-//! words the store did not serve does not report is its own `DownloadUri`, the file
+//! words nothing read does not report is its own `DownloadUri`, the file
 //! this service would have built.
 //! A Call Analytics category is the same kind of record: its
 //! rules are held here, where a Call Analytics job that applies the category would
@@ -712,14 +714,14 @@ pub const VOCABULARY_STATE_PENDING: &str = "PENDING";
 /// See [`VOCABULARY_STATE_PENDING`].
 pub const VOCABULARY_STATE_READY: &str = "READY";
 /// See [`VOCABULARY_STATE_PENDING`]. Where a vocabulary whose terms were to be read
-/// from a file the object store did not serve ends up, in EITHER family: the record is
-/// kept and the build carries a `FailureReason` grounded in what the store answered
-/// ([`vocabulary_file_not_read_reason`]).
+/// from a file nothing could read them out of ends up, in EITHER family: the record is
+/// kept and the build carries a `FailureReason` grounded in what this emulator
+/// established about the file ([`vocabulary_file_not_read_reason`]).
 pub const VOCABULARY_STATE_FAILED: &str = "FAILED";
 
 /// How long after the call that starts it a custom vocabulary's next state
 /// transition is owed (`PENDING` -> `READY` for a build that loaded its terms,
-/// `PENDING` -> `FAILED` for one whose file the object store did not serve).
+/// `PENDING` -> `FAILED` for one whose file nothing read any out of).
 ///
 /// A chosen span, not a documented one: Amazon Transcribe gives no processing-time
 /// guarantee for building a custom vocabulary. It is deliberately non-zero, so a
@@ -2581,6 +2583,11 @@ pub enum VocabularyFileVerdict {
     /// The store served the file: these are the terms it holds, in the order it lists
     /// them.
     Read(Vec<String>),
+    /// The object store ITSELF answered that there is no object at that address, or the
+    /// URI is of the Amazon S3 scheme and addresses no object of it at all
+    /// ([`s3_uri_addresses_no_object`]): the request named a file that is not there, so
+    /// it is refused and nothing is recorded ([`URI_NAMES_NO_OBJECT`]).
+    NoSuchObject,
     /// The file holds more bytes than a custom vocabulary may
     /// ([`MAX_VOCABULARY_CONTENT_BYTES`]), so it is refused rather than built from —
     /// the request's own modelled `LimitExceededException`, whose documentation covers
@@ -2588,28 +2595,46 @@ pub enum VocabularyFileVerdict {
     /// long ... use a smaller file and try your request again"). Nothing of it is
     /// stored.
     TooLarge(usize),
-    /// The terms were NOT read — nothing is stored at that address, the store refused
-    /// the read, there was no object store to ask, or the location is not one an object
-    /// store can be asked about. The text is the `FailureReason` the record carries
-    /// once its build ends ([`vocabulary_file_not_read_reason`]).
+    /// The terms were NOT read, and the store did not answer that the object is absent:
+    /// it refused the read, there was no object store to ask, the location is not one an
+    /// object store can be asked about, or the object it served holds no terms this
+    /// service could build from. The text is the `FailureReason` the record carries once
+    /// its build ends ([`vocabulary_file_not_read_reason`]).
     NotRead(String),
+}
+
+/// Why a create or update that names a file is REFUSED outright rather than recorded:
+/// what [`VocabularyFileVerdict::into_build`] hands back instead of a build.
+///
+/// Each operation answers it with its own modelled error — the request named a file
+/// that is not there, or one holding more than a custom vocabulary may — so the
+/// decision is single-homed here and only the error channel differs between the six.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VocabularyFileRefusal {
+    /// The object store answered that nothing is at that address
+    /// ([`VocabularyFileVerdict::NoSuchObject`]): a `BadRequestException` carrying
+    /// [`URI_NAMES_NO_OBJECT`].
+    NoSuchObject,
+    /// The file holds this many bytes, past the published ceiling: a
+    /// `LimitExceededException` carrying [`vocabulary_file_too_large_message`].
+    TooLarge(usize),
 }
 
 impl VocabularyFileVerdict {
     /// What a create or update records from this verdict: the terms the build loaded
     /// and the `FailureReason` the clock owes the record instead of a `READY` state —
-    /// or `Err(bytes)` for a file past the published ceiling, which each operation
-    /// refuses with its own modelled `LimitExceededException`
-    /// ([`vocabulary_file_too_large_message`]).
+    /// or the [`VocabularyFileRefusal`] that makes the request fail before anything is
+    /// recorded.
     ///
     /// Single-homed so the six operations that take a file (the two vocabulary
     /// operations, the two medical ones and the two filter ones) cannot disagree about
     /// what a verdict means for the record they store.
-    pub fn into_build(self) -> Result<(Vec<String>, Option<String>), usize> {
+    pub fn into_build(self) -> Result<(Vec<String>, Option<String>), VocabularyFileRefusal> {
         match self {
             Self::Read(terms) => Ok((terms, None)),
             Self::NotRead(reason) => Ok((Vec::new(), Some(reason))),
-            Self::TooLarge(bytes) => Err(bytes),
+            Self::NoSuchObject => Err(VocabularyFileRefusal::NoSuchObject),
+            Self::TooLarge(bytes) => Err(VocabularyFileRefusal::TooLarge(bytes)),
         }
     }
 }
@@ -2628,13 +2653,19 @@ impl VocabularyFileVerdict {
 /// established is stored on the record, so the clock-owed transition settles on it
 /// without any read having to resolve anything ([`settled_build`]).
 ///
-/// A refusal has to be GROUNDED in what the store answered: only an answer saying the
-/// address holds nothing or that the read is not permitted
-/// ([`location_is_unreadable`]) names the store's own code in the reason, and every
-/// other outcome says what this emulator established instead. The terms a built
-/// vocabulary holds are its CONTENT, so — unlike a custom language model's training
-/// data, which only has to be there ([`resolve_training_data`]) — a file nothing read
-/// leaves the build with nothing to produce, whatever the reason.
+/// The address is RESOLVED as part of validating the request: a location the object
+/// store itself answers for with an absent object ([`ABSENT_OBJECT_CODES`], the same
+/// list the media resolution refuses on), or an `s3://` URI that addresses no object at
+/// all ([`s3_uri_addresses_no_object`]), names a file that is not there, so the request
+/// is refused ([`VocabularyFileVerdict::NoSuchObject`]) and no resource is created or
+/// rebuilt. Everything else keeps the build: a refusal has to be GROUNDED in what the
+/// store answered, so an answer this emulator could not get (no object store to ask, a
+/// location no object store can be asked about) and an object whose CONTENT yields no
+/// terms leave the record to the one transition the clock owes it, carrying what this
+/// emulator established about the file ([`vocabulary_file_not_read_reason`]) — unlike a
+/// custom language model's training data, which only has to be there
+/// ([`resolve_training_data`]), the terms a built vocabulary holds are its content, so a
+/// file nothing read leaves the build with nothing to produce.
 ///
 /// HOW MUCH IS READ IS BOUNDED, and bounded TWICE, because the size of this read is the
 /// one thing a caller chooses: the published ceiling a custom vocabulary may hold
@@ -2654,8 +2685,13 @@ pub async fn resolve_vocabulary_file(
 
     // `Uri`'s own `@pattern` admits an `http(s)://` location too, which addresses a
     // HOST rather than an object, and this emulator resolves no hosts: there is no
-    // object store to ask about it.
+    // object store to ask about it. A URI of the S3 scheme that addresses no object of
+    // it needs no store to judge, exactly as a media location does not
+    // ([`s3_uri_addresses_no_object`]): it names no file for any store to hold.
     let Some((bucket, key)) = s3_object_address(uri) else {
+        if s3_uri_addresses_no_object(uri) {
+            return VocabularyFileVerdict::NoSuchObject;
+        }
         return VocabularyFileVerdict::NotRead(vocabulary_file_not_read_reason(
             member,
             uri,
@@ -2666,10 +2702,17 @@ pub async fn resolve_vocabulary_file(
     let read = match client.get_object().bucket(bucket).key(key).send().await {
         Ok(read) => read,
         Err(error) => {
+            // S3 itself saying it holds nothing at that address is what makes the file
+            // one the request may not name: the vocabulary is not created and the
+            // caller is told so synchronously.
+            if object_is_absent(&error) {
+                return VocabularyFileVerdict::NoSuchObject;
+            }
             let code = error.code().unwrap_or_default();
             if location_is_unreadable(code) {
-                // The store says the file is not there, or not readable by this
-                // account: the failure is grounded in its answer.
+                // The store answered about the file without saying it is absent — it
+                // refused the read — so the failure is grounded in that answer and the
+                // build is what carries it.
                 return VocabularyFileVerdict::NotRead(vocabulary_file_not_read_reason(
                     member,
                     uri,
@@ -4746,12 +4789,15 @@ pub enum MediaVerdict {
     Unknown,
 }
 
-/// The refusal a start request whose media names no stored object gets: "To make a
-/// StartMedicalTranscriptionJob request, you must first upload your media file into an
-/// Amazon S3 bucket; you can then specify the Amazon S3 location of the file using the
-/// Media parameter" — the same precondition every job family's start documents, so one
-/// wording answers for all of them.
-pub const MEDIA_URI_NAMES_NO_OBJECT: &str =
+/// The refusal a request that names an Amazon S3 object the store holds none of gets:
+/// "To make a StartMedicalTranscriptionJob request, you must first upload your media
+/// file into an Amazon S3 bucket; you can then specify the Amazon S3 location of the
+/// file using the Media parameter" — the same precondition every job family's start
+/// documents, and the same one a custom vocabulary's table file carries ("you must
+/// first upload a text file that contains your vocabulary table into an Amazon S3
+/// bucket"), so one wording answers for every member of this service that names an
+/// object: the file a request points at is not there.
+pub const URI_NAMES_NO_OBJECT: &str =
     "The URI that you provided doesn't point to an S3 object. Make sure that the object \
      exists and try your request again.";
 
@@ -4765,20 +4811,29 @@ pub const MEDIA_URI_NAMES_NO_OBJECT: &str =
 /// that reached no S3 is a 404 too, and that is this emulator failing to ask rather than
 /// a verdict about the object. The list is deliberately CLOSED, and holds only the codes
 /// that say the object is absent — the refusal this wording states
-/// ([`MEDIA_URI_NAMES_NO_OBJECT`]) is about an object that is not there, so a code
+/// ([`URI_NAMES_NO_OBJECT`]) is about an object that is not there, so a code
 /// reporting something else about it (a read that is not permitted, a refusal S3 adds
 /// later) answers [`MediaVerdict::Unknown`] and refuses nothing.
 const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchBucket", "NoSuchKey", "NoSuchVersion", "NotFound"];
 
-/// Whether S3's answer to a `HeadObject` is S3 ITSELF saying it holds nothing at that
+/// Whether S3's answer to a read is S3 ITSELF saying it holds nothing at that
 /// address: HTTP 404 AND one of the codes it sends for a missing one
 /// ([`ABSENT_OBJECT_CODES`]).
-fn object_is_absent(
+///
+/// One judgement for every read this service makes of a caller-named object, whichever
+/// operation of the object store asked: the `HeadObject` a job's media is resolved with
+/// ([`resolve_media_objects`]) and the `GetObject` a vocabulary's file is read with
+/// ([`resolve_vocabulary_file`]) answer an absent object the same way, so what "the
+/// object is not there" means cannot differ between them.
+fn object_is_absent<E>(
     error: &::aws_sdk_s3::error::SdkError<
-        ::aws_sdk_s3::operation::head_object::HeadObjectError,
+        E,
         ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
     >,
-) -> bool {
+) -> bool
+where
+    E: ::aws_sdk_s3::error::ProvideErrorMetadata,
+{
     use ::aws_sdk_s3::error::ProvideErrorMetadata;
 
     error
@@ -4796,7 +4851,7 @@ fn object_is_absent(
 /// file into an Amazon S3 bucket; you can then specify the Amazon S3 location of the
 /// file using the Media parameter", so a start naming an object the store does not hold
 /// is refused with the operation's modelled `BadRequestException`
-/// ([`MEDIA_URI_NAMES_NO_OBJECT`]) and nothing is persisted. S3 is reached the way any
+/// ([`URI_NAMES_NO_OBJECT`]) and nothing is persisted. S3 is reached the way any
 /// emulated service reaches another: through the in-process callback
 /// ([`smithy_server_runtime::OperationContext::callback`], see [`s3_client`] — no
 /// socket, no outbound request, no host resolution).

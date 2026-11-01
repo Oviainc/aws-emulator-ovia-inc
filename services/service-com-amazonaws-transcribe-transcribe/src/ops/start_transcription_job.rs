@@ -479,7 +479,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await;
         if media_verdict == crate::state::MediaVerdict::NoSuchObject {
-            return Err(bad_request(crate::state::MEDIA_URI_NAMES_NO_OBJECT));
+            return Err(bad_request(crate::state::URI_NAMES_NO_OBJECT));
         }
         // What the clock owes this job instead of a transcript, judged once here from
         // the media the request pointed at: a job the service found nothing wrong with

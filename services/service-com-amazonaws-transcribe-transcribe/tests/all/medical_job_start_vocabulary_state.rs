@@ -20,8 +20,11 @@
 //! (a key at the bucket root, a key under a nested prefix), what that file holds (one
 //! term per line, a tab-separated vocabulary table, CRLF line endings), both states that
 //! are not `READY`, and — for the state a build that loaded nothing settles in — each way
-//! a table file is not served (no object at that key, no such bucket, a URI naming a host
-//! rather than an object, an object holding no terms).
+//! a build loads no terms from a file the request may name (a URI naming a host rather
+//! than an object, which no object store is asked about, and an object the store does
+//! serve that holds no terms, only blank lines, or no text at all). A request whose
+//! object the store reports it does not hold never reaches a build at all: it is refused
+//! outright, which is `crate::vocabulary_file_names_an_object`'s subject.
 //!
 //! This family's terms can come from nowhere but the table file at its
 //! `VocabularyFileUri`, so every row runs on the harness that mounts the emulator's own
@@ -99,31 +102,26 @@ fn served_rows() -> Vec<Served> {
 }
 
 /// One row of [`unserved_rows`]: a name form, and the `VocabularyFileUri` its create
-/// names — one the object store does not serve a table file for, in each way a file is
-/// not served.
+/// names — one a build loads no terms from, in each way that can happen to a file the
+/// request may name.
 struct Unserved {
     case: &'static str,
     vocabulary: String,
     uri: String,
 }
 
-/// A bucket no `CreateBucket` of this suite ever creates.
-const ABSENT_BUCKET: &str = "example-vocabulary-tables-missing";
+/// The objects this suite stages for [`unserved_rows`]: the store ANSWERS for each of
+/// them, and there is still nothing to build from.
+const UNSERVED_OBJECTS: &[(&str, &[u8])] = &[
+    ("empty.txt", b""),
+    ("blank-lines.txt", b"\n\n   \n"),
+    ("not-text.bin", &[0xff, 0xfe, 0x00, 0x01]),
+];
 
-/// Each way a table file is NOT served, one per row, on name forms the served rows do
-/// not use.
+/// Each way a build loads no terms from a file the request may name, one per row, on
+/// name forms the served rows do not use.
 fn unserved_rows() -> Vec<Unserved> {
     vec![
-        Unserved {
-            case: "a key the bucket does not hold",
-            vocabulary: "absent-table".to_string(),
-            uri: format!("s3://{VOCABULARY_TABLE_BUCKET}/no-such-table.txt"),
-        },
-        Unserved {
-            case: "no such bucket",
-            vocabulary: "T".to_string(),
-            uri: format!("s3://{ABSENT_BUCKET}/terms.txt"),
-        },
         Unserved {
             case: "a URI naming a host rather than an object",
             vocabulary: "hosted.table_7".to_string(),
@@ -133,6 +131,16 @@ fn unserved_rows() -> Vec<Unserved> {
             case: "an object the store serves that holds no terms",
             vocabulary: "y".repeat(200),
             uri: format!("s3://{VOCABULARY_TABLE_BUCKET}/empty.txt"),
+        },
+        Unserved {
+            case: "an object the store serves that holds only blank lines",
+            vocabulary: "T".to_string(),
+            uri: format!("s3://{VOCABULARY_TABLE_BUCKET}/blank-lines.txt"),
+        },
+        Unserved {
+            case: "an object the store serves that is not UTF-8 text",
+            vocabulary: "absent-table".to_string(),
+            uri: format!("s3://{VOCABULARY_TABLE_BUCKET}/not-text.bin"),
         },
     ]
 }
@@ -276,11 +284,14 @@ async fn a_start_naming_a_medical_vocabulary_whose_build_did_not_produce_terms_i
         let case = unserved.case;
         let vocabulary = &unserved.vocabulary;
 
-        // The bucket the served rows use exists here too, holding one object that is
-        // empty: the store ANSWERS for it, and there is still nothing to build from.
-        transcribe
-            .given_object(VOCABULARY_TABLE_BUCKET, "empty.txt", &[])
-            .await;
+        // The bucket the served rows use exists here too, holding the objects the rows
+        // name: the store ANSWERS for each of them, and there is still nothing to build
+        // from.
+        for (key, bytes) in UNSERVED_OBJECTS {
+            transcribe
+                .given_object(VOCABULARY_TABLE_BUCKET, key, bytes)
+                .await;
+        }
         create(&transcribe, vocabulary, &unserved.uri)
             .await
             .ok(case);

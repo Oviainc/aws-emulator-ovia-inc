@@ -13,8 +13,13 @@
 //! that makes it usable ("If the state is READY, you can use the custom vocabulary in a
 //! StartTranscriptionJob request"), with those terms served at the `DownloadUri` its
 //! reader reports ("use this URI to view or download the custom vocabulary"), while a
-//! file the store does NOT serve loads no terms and ends the build in the service's own
-//! modelled `FAILED` state with a `FailureReason` naming the member and the URI.
+//! file nothing read loads no terms and ends the build in the service's own modelled
+//! `FAILED` state with a `FailureReason` naming the member and the URI. A request whose
+//! object the store reports it does not HOLD never reaches a build at all — it is
+//! refused outright and nothing is recorded, which is
+//! `crate::vocabulary_file_names_an_object`'s subject — so the rows that load no terms
+//! here are the ones no object store could be asked about or whose served object holds
+//! nothing to build from.
 //!
 //! The rows are a TABLE spanning what the rule generalises over: which family takes the
 //! file (`CreateVocabulary`, `CreateMedicalVocabulary` — whose terms can come from
@@ -23,9 +28,8 @@
 //! file is addressed (a key at the bucket root, a key under a nested prefix), what it
 //! holds (one term per line, a tab-separated vocabulary table, CRLF line endings and
 //! blank lines, a single term with no trailing newline, two hundred terms), and in
-//! WHICH way a file is not served (no object at that key, no such bucket, a URI naming
-//! only a bucket, an `http(s)` URI naming a host, an object holding no terms and one
-//! that is not text).
+//! WHICH way a build loads no terms (an `http(s)` URI naming a host, an object holding
+//! no terms and one that is not text).
 //!
 //! The suites after it pin the rest of the rule: the listings select on the state each
 //! build reached, a rebuild reads the file the UPDATE named, a file past the published
@@ -43,7 +47,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::media_object_resolution::{call, emulator, given_staged_media, s3, ABSENT_BUCKET, BUCKET, STAGED_KEYS};
+use crate::media_object_resolution::{call, emulator, given_staged_media, s3, BUCKET, STAGED_KEYS};
 use crate::transcription_jobs::Reply;
 
 /// How long a poll of a family's reader waits between two calls, and how many calls it
@@ -226,7 +230,7 @@ fn staged_uri(key: &str) -> String {
 }
 
 /// The rows. Every family is driven over a file the store serves and over each way a
-/// file is not served, so neither outcome is asserted for one family alone.
+/// build loads no terms, so neither outcome is asserted for one family alone.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -258,17 +262,10 @@ fn rows() -> Vec<Row> {
             terms: staged_terms("many-terms.txt"),
         },
         Row {
-            case: "a vocabulary whose key the bucket does not hold",
+            case: "a vocabulary whose URI names a host rather than an object",
             family: &VOCABULARY,
-            name: "absent-key",
-            uri: staged_uri("no-such-file.txt"),
-            terms: Vec::new(),
-        },
-        Row {
-            case: "a vocabulary whose file names no such bucket",
-            family: &VOCABULARY,
-            name: "absent-bucket",
-            uri: format!("s3://{ABSENT_BUCKET}/terms.txt"),
+            name: "hosted-file",
+            uri: "https://example.invalid/vocabulary-file.txt".to_string(),
             terms: Vec::new(),
         },
         Row {
@@ -293,20 +290,6 @@ fn rows() -> Vec<Row> {
             terms: staged_terms("single-term.txt"),
         },
         Row {
-            case: "a medical vocabulary whose key the bucket does not hold",
-            family: &MEDICAL_VOCABULARY,
-            name: "med-vocab-absent",
-            uri: staged_uri("no-such-table.txt"),
-            terms: Vec::new(),
-        },
-        Row {
-            case: "a medical vocabulary whose URI names only a bucket",
-            family: &MEDICAL_VOCABULARY,
-            name: "med-vocab-bucket-only",
-            uri: format!("s3://{FILE_BUCKET}"),
-            terms: Vec::new(),
-        },
-        Row {
             case: "a medical vocabulary whose URI names a host rather than an object",
             family: &MEDICAL_VOCABULARY,
             name: "med-vocab-hosted",
@@ -328,10 +311,10 @@ fn rows() -> Vec<Row> {
             terms: staged_terms("terms.txt"),
         },
         Row {
-            case: "a vocabulary filter whose key the bucket does not hold",
+            case: "a vocabulary filter whose file holds no words",
             family: &VOCABULARY_FILTER,
-            name: "blocked-absent",
-            uri: staged_uri("no-such-words.txt"),
+            name: "blocked-empty",
+            uri: staged_uri("empty.txt"),
             terms: Vec::new(),
         },
     ]
@@ -505,7 +488,7 @@ async fn a_file_backed_build_settles_on_what_the_object_store_served() {
             if row.family.has_build_state {
                 assert_eq!(
                     state, FAILED,
-                    "case {:?}: a file the object store did not serve loads no terms, \
+                    "case {:?}: a file nothing read loads no terms, \
                      expected {FAILED}, got {state:?} in {:?}",
                     row.case, read.body
                 );
@@ -522,7 +505,7 @@ async fn a_file_backed_build_settles_on_what_the_object_store_served() {
             let reported = reported_download_uri(&router, row.family, row.name).await;
             assert!(
                 reported.is_none(),
-                "case {:?}: a resource whose file the object store did not serve has \
+                "case {:?}: a resource whose file nothing read has \
                  nothing built to download (state {state:?}), got {reported:?}",
                 row.case
             );
@@ -546,10 +529,10 @@ async fn a_listing_selects_on_the_state_each_build_reached() {
             terms: staged_terms("terms.txt"),
         };
         let unserved = Row {
-            case: "a build the object store served no file for",
+            case: "a build whose served file holds no terms",
             family,
             name: "listed-failed",
-            uri: staged_uri("no-such-file.txt"),
+            uri: staged_uri("empty.txt"),
             terms: Vec::new(),
         };
         for row in [&served, &unserved] {
@@ -592,8 +575,8 @@ async fn a_listing_selects_on_the_state_each_build_reached() {
 /// A rebuild reads the file the UPDATE named: "This operation overwrites all existing
 /// information with your new values; you cannot append new terms onto an existing
 /// custom vocabulary." So the location serves the new file's terms, a rebuild from a
-/// file the store does not serve leaves nothing there, and one from a file it does
-/// serve builds again.
+/// file that loads no terms leaves nothing there, and one from a file the store serves
+/// builds again.
 #[tokio::test]
 async fn a_rebuild_reads_the_file_the_update_named() {
     let router = emulator();
@@ -641,19 +624,19 @@ async fn a_rebuild_reads_the_file_the_update_named() {
         );
         assert_location_serves(&router, &row, &other, "after the rebuild").await;
 
-        // Rebuilt from a file the store does NOT serve: nothing was loaded, so nothing
+        // Rebuilt from a file that loads NO terms: nothing was loaded, so nothing
         // is reported and the location the previous build left serves nothing.
         call(
             &router,
             family.update,
-            update_request(&row, &staged_uri("no-such-file.txt")),
+            update_request(&row, &staged_uri("empty.txt")),
         )
         .await
         .ok(row.case);
         let state = settled_state(&router, family, row.name).await;
         assert_eq!(
             state, FAILED,
-            "case {:?}: a rebuild from a file the store did not serve settles {FAILED}, \
+            "case {:?}: a rebuild from a file that loads no terms settles {FAILED}, \
              got {state:?}",
             row.case
         );

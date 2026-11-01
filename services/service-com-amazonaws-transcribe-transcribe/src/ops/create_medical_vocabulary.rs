@@ -185,12 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// Phrases flag and only accepts vocabularies in table format"). That file is an
     /// Amazon S3 object the caller uploaded before calling, and this emulator holds an
     /// Amazon S3 of its own, so the build READS it in process
-    /// ([`crate::state::resolve_vocabulary_file`]): a file the object store serves
-    /// settles the vocabulary `READY` once the clock makes its build due, with those
-    /// terms stored at the location `GetMedicalVocabulary` reports as the
-    /// `DownloadUri`, and only a file the store does not serve ends the build in the
-    /// service's own modelled `FAILED` state with a grounded `FailureReason` (see
-    /// [`crate::state::MedicalVocabularyRecord`]).
+    /// ([`crate::state::resolve_vocabulary_file`]): resolving that object is part of
+    /// VALIDATING the request, so a URI the object store answers for with no object
+    /// there is refused with the modelled `BadRequestException` and nothing is created;
+    /// a file the store serves settles the vocabulary `READY` once the clock makes its
+    /// build due, with those terms stored at the location `GetMedicalVocabulary`
+    /// reports as the `DownloadUri`, and a read that established nothing to build from
+    /// ends the build in the service's own modelled `FAILED` state with a grounded
+    /// `FailureReason` (see [`crate::state::MedicalVocabularyRecord`]).
     async fn handle(
         &self,
         input: Self::Input,
@@ -243,7 +245,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await;
         let (terms, failure_due) = match verdict.into_build() {
             Ok(build) => build,
-            Err(bytes) => {
+            Err(crate::state::VocabularyFileRefusal::NoSuchObject) => {
+                return Err(bad_request(crate::state::URI_NAMES_NO_OBJECT))
+            }
+            Err(crate::state::VocabularyFileRefusal::TooLarge(bytes)) => {
                 return Err(CreateMedicalVocabularyErrorModeled::LimitExceededException(
                     LimitExceededException {
                         message: Some(crate::state::vocabulary_file_too_large_message(

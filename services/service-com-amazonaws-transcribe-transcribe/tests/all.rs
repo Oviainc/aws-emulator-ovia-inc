@@ -163,6 +163,8 @@ mod vocabulary_download_content;
 mod vocabulary_download_isolation;
 #[path = "all/vocabulary_download_uri_state.rs"]
 mod vocabulary_download_uri_state;
+#[path = "all/vocabulary_file_names_an_object.rs"]
+mod vocabulary_file_names_an_object;
 #[path = "all/vocabulary_file_objects.rs"]
 mod vocabulary_file_objects;
 #[path = "all/vocabulary_file_uri.rs"]
