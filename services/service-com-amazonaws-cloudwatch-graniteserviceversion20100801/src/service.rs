@@ -23,7 +23,11 @@
 //! - `override_operation` — EDITED HERE: not a re-route. The key and the handler stay the
 //!   generated routing table's, but every operation is served through [`Metering`], so each
 //!   call this service answers is counted into the usage telemetry it publishes about its own
-//!   API; `PutMetricData` is served through [`ReportingDroppedEntities`], so an accepted call
+//!   API, and through [`QueryCompatibleErrors`], so whatever failure it answers names its
+//!   error class the way an `awsQueryCompatible` service names one — the qualified shape id in
+//!   the body and the legacy query code in the `x-amzn-query-error` header
+//!   ([`query_compatible_errors`]); `PutMetricData` is served through
+//!   [`ReportingDroppedEntities`], so an accepted call
 //!   whose entity this service could not hold says so in its response header, and
 //!   `GetMetricStatistics` through [`RefusingValuesOutsideAnEnum`], so a value outside an
 //!   enumerated type is refused as one of the parameter faults ITS model declares, and
@@ -51,6 +55,12 @@ use smithy_server_runtime::{
     OperationError, OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service,
 };
 use std::sync::Arc;
+
+pub mod query_compatible_errors;
+
+use query_compatible_errors::{
+    QueryCompatibleErrors, MISSING_PARAMETER, PARAMETER_VALUE, VALIDATION,
+};
 
 /// Run `work` without occupying an async worker.
 ///
@@ -83,13 +93,16 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// Each is built from the SAME shared engine
     /// as the generated table's and keyed by the routing key the protocol resolves, so the
     /// operation served is the modelled one, and each is METERED ([`Metering`]) like every
-    /// other operation of this service.
+    /// other operation of this service and answers a failure under the class this
+    /// `awsQueryCompatible` service names it under ([`QueryCompatibleErrors`]).
     overridden: OperationRoutingTable,
     /// Every OTHER modelled operation, served through the generated table and metered
     /// ([`Metering`] over [`TheModelledOperation`]): the call count this service publishes
     /// about its own API is owed by every operation, so the seam that counts a call is the one
-    /// every request passes through rather than a line in each handler.
-    metered: Metering<Eng, TheModelledOperation>,
+    /// every request passes through rather than a line in each handler. The whole chain sits
+    /// inside [`QueryCompatibleErrors`], for the same reason: naming the class of a failure is
+    /// owed by every answer, whichever layer built it.
+    metered: QueryCompatibleErrors<Metering<Eng, TheModelledOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -100,12 +113,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let mut overridden = OperationRoutingTable::new();
         overridden.add_operation(
             "PutMetricData",
-            Box::new(Metering::new(
+            Box::new(QueryCompatibleErrors::new(Metering::new(
                 Arc::clone(&engine),
                 ReportingDroppedEntities::new(crate::ops::put_metric_data::PutMetricData::new(
                     Arc::clone(&engine),
                 )),
-            )) as Box<dyn ErasedOperation>,
+            ))) as Box<dyn ErasedOperation>,
         );
         // `GetMetricStatistics` validates the SAME enumerated types as the retrieving read and
         // answers a value outside one as one of the parameter faults its model declares, which
@@ -114,7 +127,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         // validation code ([`scalar_enum_refusal`]).
         overridden.add_operation(
             "GetMetricStatistics",
-            Box::new(Metering::new(
+            Box::new(QueryCompatibleErrors::new(Metering::new(
                 Arc::clone(&engine),
                 RefusingValuesOutsideAnEnum::new(
                     crate::ops::get_metric_statistics::GetMetricStatistics::new(Arc::clone(
@@ -122,7 +135,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                     )),
                     parameter_fault_for,
                 ),
-            )) as Box<dyn ErasedOperation>,
+            ))) as Box<dyn ErasedOperation>,
         );
         // `PutMetricStream` judges the two members CloudWatch judges as parameter VALUES —
         // the IAM role the stream delivers through and the stream's own name — BEFORE the
@@ -130,16 +143,19 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         // constraint the walk would otherwise answer first ([`RefusingAValueFirst`]).
         overridden.add_operation(
             "PutMetricStream",
-            Box::new(Metering::new(
+            Box::new(QueryCompatibleErrors::new(Metering::new(
                 Arc::clone(&engine),
                 RefusingAValueFirst::new(
                     crate::ops::put_metric_stream::PutMetricStream::new(Arc::clone(&engine)),
                     crate::ops::put_metric_stream::parameter_value_refusal,
                 ),
-            )) as Box<dyn ErasedOperation>,
+            ))) as Box<dyn ErasedOperation>,
         );
         Self {
-            metered: Metering::new(Arc::clone(&engine), TheModelledOperation),
+            metered: QueryCompatibleErrors::new(Metering::new(
+                Arc::clone(&engine),
+                TheModelledOperation,
+            )),
             entry: crate::ServiceDefinition::new(engine),
             overridden,
         }
@@ -160,11 +176,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 ///
 /// * a `Dimensions` collection longer than its cap, named with the cap it broke
 ///   ([`dimension_cap_refusal`]);
+/// * a required value submitted EMPTY, which is a parameter the request supplied no value for
+///   ([`empty_required_value_refusal`]);
 /// * a value inside a LIST that is outside the enumerated type the list's member names — a
 ///   percentile passed in `Statistics`, whose place is `ExtendedStatistics` — named as the
 ///   request member path it arrived on and the value set the type declares;
 /// * a SCALAR member outside the enumerated type it is modelled as, which keeps the
-///   framework's own clause and carries this service's validation code
+///   framework's own clause and carries the request-validation class
 ///   ([`scalar_enum_refusal`]).
 ///
 /// Every other violation keeps the framework's code and wording: a scalar outside its own
@@ -182,17 +200,82 @@ fn parameter_fault(refusal: &Refusal) -> Option<Refused> {
     violations
         .iter()
         .find_map(dimension_cap_refusal)
+        .or_else(|| violations.iter().find_map(empty_required_value_refusal))
         .or_else(|| violations.iter().find_map(list_element_enum_refusal))
         .or_else(|| scalar_enum_refusal(violations))
+}
+
+/// The refusal of a value submitted EMPTY where the model admits no empty one, or `None` when
+/// `violation` is not one.
+///
+/// A parameter carrying no characters is a parameter the request supplied no VALUE for, and
+/// that is the fault CloudWatch answers: the missing-parameter class ([`MISSING_PARAMETER`],
+/// "An input parameter that is required is missing"), naming the request member path it was
+/// looked for at ([`crate::state::parameter_required_message`]) — not the length clause the
+/// model's own minimum would state, which tells a caller that supplied nothing to supply
+/// something longer.
+///
+/// It is keyed on the CLASS of violation and nothing else — a minimum length the submitted
+/// value broke by being empty — so it holds for every member of every operation whose model
+/// declares such a minimum, at any depth: the dimension name and value a metric is published
+/// with are the recorded case.
+fn empty_required_value_refusal(
+    violation: &aws_smithy_schema_server::Violation,
+) -> Option<Refused> {
+    let aws_smithy_schema_server::ViolationKind::MinLength(_) = violation.kind else {
+        return None;
+    };
+    if !violation.value.as_deref().is_some_and(str::is_empty) {
+        return None;
+    }
+    Some(Refused {
+        code: MISSING_PARAMETER.shape_name.to_string(),
+        message: crate::state::parameter_required_message(&crate::state::query_parameter_path(
+            &violation.path,
+        )),
+    })
+}
+
+/// The refusal of a value against a modelled `@pattern`, quoting the expression the way AWS
+/// quotes it — or `None` when nothing in `refusal` broke a pattern.
+///
+/// A `@pattern` is written in the model as a WHOLE-VALUE match: the `^` and the `$` are how
+/// Smithy turns a find into a total match, not part of the expression the service advertises.
+/// AWS states the requirement as that expression alone, so a client that lifts it out of the
+/// message and re-validates locally gets the one the service publishes
+/// ([`service_common::validation::unanchored`], the shared rendering). Everything else about
+/// the refusal — the envelope, the clause, the member path, the class — is the framework's and
+/// the shared renderer's, so this and the walk behind it cannot drift.
+///
+/// It holds for every member of this service whose model declares a `@pattern`, whatever the
+/// operation: the dataset identifier and the KMS key ARN the dataset operations take are the
+/// recorded cases, and a member modelled with a pattern later is stated the same way without
+/// another line here.
+fn unanchored_pattern_refusal(refusal: &Refusal) -> Option<Refused> {
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
+    if !violations.iter().any(|violation| {
+        matches!(
+            violation.kind,
+            aws_smithy_schema_server::ViolationKind::Pattern(_)
+        )
+    }) {
+        return None;
+    }
+    service_common::validation_message::aws_validation_refusal_with(
+        refusal,
+        service_common::validation::unanchored,
+    )
 }
 
 /// The refusal of a SCALAR member carrying a value outside the enumerated type it is modelled
 /// as, or `None` when no violation of the refusal is one.
 ///
 /// CloudWatch judges a request against its model before any handler runs and answers a value
-/// outside an enumerated type under its OWN validation code ([`VALIDATION_ERROR`], the code
+/// outside an enumerated type as the REQUEST-VALIDATION class ([`VALIDATION`], the class
 /// [`crate::scaffolded::Scaffolded::validation_error`] already answers this service's
-/// handler-side validation refusals with), so a client branches on one code whichever layer
+/// handler-side validation refusals under), so a client branches on one class whichever layer
 /// refused the request.
 ///
 /// Only the code and two RENDERINGS are this service's; the envelope, the clauses and the
@@ -221,7 +304,7 @@ fn scalar_enum_refusal(violations: &[aws_smithy_schema_server::Violation]) -> Op
         service_common::validation_message::aws_validation_refusal_withholding(&stated, |_| true)?
             .message;
     Some(Refused {
-        code: VALIDATION_ERROR.to_string(),
+        code: VALIDATION.shape_name.to_string(),
         message,
     })
 }
@@ -260,7 +343,9 @@ fn dimension_cap_refusal(violation: &aws_smithy_schema_server::Violation) -> Opt
         usize::try_from(declared).ok()?
     };
     Some(Refused {
-        code: INVALID_PARAMETER_VALUE.to_string(),
+        // The class's shape, as every refusal this file words names it — see
+        // [`enum_value_refusal`].
+        code: PARAMETER_VALUE.shape_name.to_string(),
         message: crate::state::collection_too_large_message(
             &crate::state::query_parameter_path(&violation.path),
             cap,
@@ -303,20 +388,14 @@ fn enum_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option
         member
     };
     Some(Refused {
-        code: INVALID_PARAMETER_VALUE.to_string(),
+        // The SHAPE of the class, which is what an awsJson error body names; the legacy query
+        // code a CloudWatch client branches on is reported in the header, by the wrapper every
+        // operation of this service is served through ([`QueryCompatibleErrors`]), so this
+        // refusal and the same class answered from a handler read alike.
+        code: PARAMETER_VALUE.shape_name.to_string(),
         message: crate::state::value_in_set_message(&parameter, allowed),
     })
 }
-
-/// The wire error code of the modelled `InvalidParameterValueException` ("The value of an
-/// input parameter is bad or out-of-range"): its `awsQueryError` code, which is what a client
-/// of this service branches on.
-const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
-
-/// The wire error code CloudWatch answers a request its model refuses with — the code this
-/// service's own validation refusals carry (`crate::scaffolded`), so a boundary refusal and a
-/// handler refusal of the same class read alike.
-const VALIDATION_ERROR: &str = "ValidationError";
 
 /// Whether `path` points at a request's `Dimensions` collection — of any operation, and at
 /// any depth, since a metric's dimension set is one shape wherever it is submitted.
@@ -338,17 +417,19 @@ const REFUSAL_STATUS: u16 = 400;
 /// refusal, or `None` when nothing in `violations` is one of the classes it words.
 ///
 /// `GetMetricStatistics` declares `InvalidParameterValueException` ("The value of an input
-/// parameter is bad or out-of-range", `awsQueryError` code [`INVALID_PARAMETER_VALUE`]) beside
+/// parameter is bad or out-of-range", the class [`PARAMETER_VALUE`]) beside
 /// the combination and missing-parameter faults, so a client of it branches on that code and
-/// the sentence is this service's own: the dimension cap first and then a value outside an
+/// the sentence is this service's own: the dimension cap first, then a required value supplied
+/// empty, then a value outside an
 /// enumerated type, in the SAME order as the service-wide seam ([`parameter_fault`]), so one
-/// operation cannot answer a request that breaks both differently from every other. An
-/// operation that declares none of those faults keeps the service's own validation code
+/// operation cannot answer a request that breaks two of them differently from every other. An
+/// operation that declares none of those faults keeps the request-validation class
 /// instead ([`scalar_enum_refusal`]).
 fn parameter_fault_for(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
     violations
         .iter()
         .find_map(dimension_cap_refusal)
+        .or_else(|| violations.iter().find_map(empty_required_value_refusal))
         .or_else(|| violations.iter().find_map(enum_value_refusal))
 }
 
@@ -524,10 +605,11 @@ const QUERY_MODE_HEADER: &str = "x-amzn-query-mode";
 ///
 /// Rendered from the SAME facts the per-operation sequence renders a modelled error from
 /// ([`OperationError`]), so a refusal answered ahead of that sequence and the same refusal
-/// answered from the handler are one response. The header is added HERE because the framework
-/// adds it inside the sequence this refusal precedes; `awsQueryCompatible` carries the legacy
-/// code in it rather than in the body, and the body's own code is the shape name on this
-/// service's protocol (`awsJson1_0`).
+/// answered from the handler are one response. The header is added HERE for the same reason
+/// the framework adds it inside the sequence this refusal precedes: a MODELLED error's legacy
+/// code is read off the error value itself, which only the layer holding that value can do.
+/// The body half of the class's name is completed on the way out, for every answer of this
+/// service alike ([`query_compatible_errors`]).
 fn modelled_error_response<E: OperationError>(
     protocol: &dyn ServerHttpProtocol,
     req: &aws_smithy_runtime_api::http::Request,
@@ -799,8 +881,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service requires are judged before the boundary walk.
         //
         // Every modelled key resolves here, because every call this service answers is counted
-        // into the usage telemetry it publishes about its own API ([`Metering`]): a key the two
-        // wrappers above do not claim is served by the generated table's own operation
+        // into the usage telemetry it publishes about its own API ([`Metering`]) and names the
+        // class of whatever failure it answers in full ([`QueryCompatibleErrors`]): a key the
+        // three wrappers above do not claim is served by the generated table's own operation
         // ([`TheModelledOperation`]), metered. A key the table does not name at all resolves to
         // `None`, exactly as it would in an unedited service, and falls through to the
         // framework's routing failure.
@@ -816,10 +899,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent required
-        // member, or a value outside a declared bound) to let this service reword it. Only
-        // the classes CloudWatch answers as one of its own PARAMETER faults are restated
-        // ([`parameter_fault`]); everything else keeps the framework's code and wording.
-        parameter_fault(refusal)
+        // member, or a value outside a declared bound) to let this service reword it. Two
+        // classes are restated: the ones CloudWatch answers as one of its own PARAMETER faults
+        // ([`parameter_fault`]), and a value that broke a modelled `@pattern`, whose
+        // requirement AWS quotes without the anchors the model wraps it in
+        // ([`unanchored_pattern_refusal`], which keeps the framework's own class). Everything
+        // else keeps the framework's code and wording.
+        parameter_fault(refusal).or_else(|| unanchored_pattern_refusal(refusal))
     }
 
     fn override_routing_error(

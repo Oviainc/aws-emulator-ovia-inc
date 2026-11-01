@@ -13,7 +13,7 @@
 //!   or as its `ActionsSuppressor`, cannot be deleted while that reference stands: the call is
 //!   refused and nothing is removed;
 //! * a name an alarm of another kind already holds is not a name a create may take: every
-//!   alarm writer refuses it with HTTP 400 `ValidationError` and leaves the alarm already
+//!   alarm writer refuses it with HTTP 400 under the request-validation class and leaves the alarm already
 //!   there untouched.
 
 use crate::harness::{build_router, call, error_code, error_message, ok};
@@ -269,7 +269,7 @@ async fn an_alarm_a_live_composite_alarm_references_cannot_be_deleted() {
         let (status, body) = call(&router, "DeleteAlarms", &json!({"AlarmNames": ["child"]})).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "ValidationError"),
+            (400, "ValidationException"),
             "case {case:?}: deleting an alarm a live composite alarm references must be \
              refused, got {status} with {body}"
         );
@@ -314,7 +314,7 @@ async fn an_alarm_a_live_composite_alarm_references_cannot_be_deleted() {
             // reference is released by deleting the composite alarm that holds it first.
             assert_eq!(
                 (together.0, error_code(&together.1).as_str()),
-                (400, "ValidationError"),
+                (400, "ValidationException"),
                 "case {case:?}: one call can delete no more than one composite alarm, got {:?}",
                 together
             );
@@ -357,8 +357,8 @@ async fn one_call_deletes_no_more_than_one_composite_alarm() {
         let (status, body) = call(&router, "DeleteAlarms", &json!({"AlarmNames": deleted})).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "ValidationError"),
-            "case {case:?}: expected HTTP 400 ValidationError, got {status} with {body}"
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException, got {status} with {body}"
         );
         let message = error_message(&body);
         assert!(
@@ -417,8 +417,8 @@ async fn a_name_an_alarm_of_another_kind_holds_is_refused_as_a_validation_error(
             let (status, body) = call(&router, writer_operation, &writer_request).await;
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (400, "ValidationError"),
-                "case {case:?}: expected HTTP 400 ValidationError, got {status} with {body}"
+                (400, "ValidationException"),
+                "case {case:?}: expected HTTP 400 ValidationException, got {status} with {body}"
             );
             let message = error_message(&body);
             assert_eq!(

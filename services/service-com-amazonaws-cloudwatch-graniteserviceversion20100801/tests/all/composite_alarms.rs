@@ -518,7 +518,7 @@ async fn a_composite_alarm_rule_may_reference_another_composite_alarm() {
     let (status, body) = call(&router, "DeleteAlarms", &json!({"AlarmNames": ["inner"]})).await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "ValidationError"),
+        (400, "ValidationException"),
         "an alarm another composite alarm's rule references cannot be deleted, got {body}"
     );
     // "this total can include no more than one composite alarm"
@@ -530,7 +530,7 @@ async fn a_composite_alarm_rule_may_reference_another_composite_alarm() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "ValidationError"),
+        (400, "ValidationException"),
         "one call can delete no more than one composite alarm, got {body}"
     );
     // Deleting the parent first releases the child.
@@ -622,8 +622,8 @@ async fn a_rule_naming_an_alarm_that_does_not_exist_is_refused_naming_it() {
         .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "ValidationError"),
-            "case {case:?}: expected HTTP 400 ValidationError, got {status} with {body}"
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException, got {status} with {body}"
         );
         assert_eq!(
             error_message(&body),
@@ -1013,8 +1013,8 @@ async fn a_rule_the_service_cannot_evaluate_is_refused() {
         let (status, body) = call(&router, "PutCompositeAlarm", request).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "ValidationError"),
-            "case {case:?}: expected HTTP 400 ValidationError, got {status} with {body}"
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException, got {status} with {body}"
         );
     }
     // Nothing a refused call named was stored.
@@ -1059,7 +1059,7 @@ async fn a_rule_the_service_cannot_evaluate_is_refused() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "ValidationError"),
+        (400, "ValidationException"),
         "a composite alarm cannot take the name of an existing alarm, got {body}"
     );
     // The same rule in the other direction: a metric alarm cannot take the name of an
@@ -1081,7 +1081,7 @@ async fn a_rule_the_service_cannot_evaluate_is_refused() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "ValidationError"),
+        (400, "ValidationException"),
         "a metric alarm cannot take the name of an existing composite alarm, got {body}"
     );
 }

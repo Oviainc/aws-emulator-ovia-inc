@@ -569,7 +569,14 @@ async fn an_event_outside_a_rule_s_reach_contributes_nothing_to_it() {
     )
     .await;
     assert_eq!(
-        (status, body.get("__type").and_then(Value::as_str)),
+        (
+            status,
+            body.get("__type")
+                .and_then(Value::as_str)
+                // The body names the error class in full, so the shape name is the part after
+                // the package it is named in.
+                .map(|named| named.rsplit('#').next().unwrap_or(named))
+        ),
         (400, Some("InvalidParameterValueException")),
         "case \"a window shorter than one period\": expected a 400 refusal, got {status} {body}"
     );

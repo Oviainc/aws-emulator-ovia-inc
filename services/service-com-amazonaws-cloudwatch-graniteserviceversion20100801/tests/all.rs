@@ -157,6 +157,8 @@ mod period_refusal_message;
 mod probe_counts;
 #[path = "all/put_metric_data_validation.rs"]
 mod put_metric_data_validation;
+#[path = "all/query_compatible_error_envelope.rs"]
+mod query_compatible_error_envelope;
 #[path = "all/query_form_metrics.rs"]
 mod query_form_metrics;
 #[path = "all/rds_alarm_action_delivery.rs"]

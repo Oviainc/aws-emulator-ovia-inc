@@ -41,8 +41,9 @@ const INVALID_VALUE: &str = "InvalidParameterValueException";
 /// with (`PutMetricStream`'s modelled `InvalidParameterCombinationException`, HTTP 400).
 const INVALID_COMBINATION: &str = "InvalidParameterCombinationException";
 
-/// The code this service answers a value its model refuses with.
-const VALIDATION_CODE: &str = "ValidationError";
+/// The class this service answers a value its model refuses with, as the body names it: the
+/// request-validation class, whose legacy query code travels in the header.
+const VALIDATION_CODE: &str = "ValidationException";
 
 /// The envelope the boundary walk states a modelled constraint in.
 const VALIDATION_ENVELOPE: &str = "1 validation error detected";

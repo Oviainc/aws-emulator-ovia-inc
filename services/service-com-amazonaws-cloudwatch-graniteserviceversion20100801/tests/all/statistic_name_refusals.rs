@@ -27,14 +27,14 @@ const NAMESPACE: &str = "MyApp/StatisticNames";
 /// only names `Statistics` accepts.
 pub const STATISTIC_VALUES: [&str; 5] = ["SampleCount", "Average", "Sum", "Minimum", "Maximum"];
 
-/// The error code a refusal the BOUNDARY validator makes carries: the `awsQueryError` code of
-/// the modelled `InvalidParameterValueException`, which is what a CloudWatch client branches
-/// on, stated by the service's own rewording seam.
-const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+/// The error class a refusal the BOUNDARY validator makes carries, as the body of the answer
+/// names it: the modelled `InvalidParameterValueException`, whose legacy `awsQueryError` code
+/// (`InvalidParameterValue`) is what a CloudWatch client branches on and travels in the
+/// `x-amzn-query-error` header.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValueException";
 
-/// The error code a refusal a HANDLER makes carries over this harness's wire: the modelled
-/// shape name, which is what the awsJson error envelope spells and what the
-/// `awsQueryCompatible` layer renders to a client as the code above.
+/// The error class a refusal a HANDLER makes carries over this harness's wire: the same
+/// modelled shape name, since the class is the same whichever layer refused the request.
 const INVALID_PARAMETER_VALUE_SHAPE: &str = "InvalidParameterValueException";
 
 /// What a refusal of element `position` (1-based) of `Statistics` says: the element's path,

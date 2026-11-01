@@ -19,9 +19,11 @@
 //!    more dimensions" — no unit).
 //! 2. A value outside the set the enumerated type its member targets declares is refused by
 //!    the validator of the OPERATION it arrived on: the read whose model declares this
-//!    service's parameter faults answers `InvalidParameterValue` naming the parameter and the
+//!    service's parameter faults answers `InvalidParameterValueException` naming the parameter
+//!    and the
 //!    whole accepted set as the service announces it, and the read whose model declares none of them keeps this service's
-//!    own validation code with the framework's counting clause naming the member path and that
+//!    own request-validation class with the framework's counting clause naming the member path
+//!    and that
 //!    set. (`GetMetricStatistics` models `InvalidParameterValueException`,
 //!    `InvalidParameterCombinationException`, `MissingRequiredParameterException` and
 //!    `InternalServiceFault`; `GetMetricData` models `InvalidNextToken` alone.)
@@ -550,14 +552,14 @@ async fn a_unit_outside_the_declared_set_is_refused_by_the_validator_of_the_read
             case: "the aggregating read, whose model declares the parameter faults",
             operation: "GetMetricStatistics",
             request,
-            code: "InvalidParameterValue",
+            code: "InvalidParameterValueException",
             message: parameter_in_set("Unit"),
         });
         rows.push(RefusalRow {
             case: "the retrieving read, whose model declares none of them",
             operation: "GetMetricData",
             request: data_request_with_unit_at(bucket, 1, value),
-            code: "ValidationError",
+            code: "ValidationException",
             message: request_validation_clause("metricDataQueries.1.member.metricStat.unit"),
         });
         // The same value further along the query list: the index in the member path is the
@@ -566,7 +568,7 @@ async fn a_unit_outside_the_declared_set_is_refused_by_the_validator_of_the_read
             case: "the retrieving read, the offending query third in the list",
             operation: "GetMetricData",
             request: data_request_with_unit_at(bucket, 3, value),
-            code: "ValidationError",
+            code: "ValidationException",
             message: request_validation_clause("metricDataQueries.3.member.metricStat.unit"),
         });
     }
@@ -606,3 +608,4 @@ async fn a_unit_outside_the_declared_set_is_refused_by_the_validator_of_the_read
         "a refused read must leave the stored datapoints alone, got {got:?} from {after}"
     );
 }
+

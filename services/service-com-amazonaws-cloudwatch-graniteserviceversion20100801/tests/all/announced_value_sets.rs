@@ -27,14 +27,14 @@ use crate::unit_read_identity::STANDARD_UNITS;
 /// The namespace every request in this suite names.
 const NAMESPACE: &str = "MyApp/AnnouncedSets";
 
-/// The wire error code a refusal the BOUNDARY validator makes carries: the `awsQueryError` code
-/// of the modelled `InvalidParameterValueException`, which is what a CloudWatch client branches
-/// on.
-const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+/// The error class a refusal the BOUNDARY validator makes carries, as the body of the answer
+/// names it: the modelled `InvalidParameterValueException`, whose legacy `awsQueryError` code
+/// (`InvalidParameterValue`) is what a CloudWatch client branches on and travels in the
+/// `x-amzn-query-error` header.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValueException";
 
 /// The same refusal made by a HANDLER, as this harness's `awsJson` envelope spells it: the
-/// modelled shape name, which the `awsQueryCompatible` layer renders to a client as the code
-/// above.
+/// same modelled shape name, since the class is the same whichever layer refused the request.
 const INVALID_PARAMETER_VALUE_SHAPE: &str = "InvalidParameterValueException";
 
 /// The 27 units a measurement may be expressed in, in the order the SERVICE announces them —

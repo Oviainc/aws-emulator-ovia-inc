@@ -3,7 +3,7 @@
 //! How `PutCompositeAlarm` DIAGNOSES an `AlarmRule` it cannot parse.
 //!
 //! The rule under test: where a rule carries a token at a position that can only start a
-//! TERM, the call is refused `400 ValidationError` and the message is CloudWatch's parse
+//! TERM, the call is refused `400` under the request-validation class and the message is CloudWatch's parse
 //! diagnosis — the `Error in AlarmRule [...]` envelope carrying `Unsupported token
 //! '<token>' at char <index>, must be: '(', 'NOT', AT_LEAST, TRUE or FALSE, ALARM, OK, or
 //! INSUFFICIENT_DATA`, where the token is the one the submitted rule carries at that
@@ -137,8 +137,8 @@ async fn a_rule_that_stops_making_sense_is_diagnosed_the_way_cloudwatch_diagnose
         .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "ValidationError"),
-            "case {case:?}: expected HTTP 400 ValidationError for {rule:?}, got {status} with \
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException for {rule:?}, got {status} with \
              {body}"
         );
         let expected = unsupported_token(token, *at_char);
@@ -186,7 +186,7 @@ async fn the_parse_diagnosis_is_told_apart_from_the_other_refusals_of_the_same_c
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "ValidationError"),
+        (400, "ValidationException"),
         "a rule naming an alarm that does not exist is refused, got {status} with {body}"
     );
     let message = error_message(&body);
@@ -210,7 +210,7 @@ async fn the_parse_diagnosis_is_told_apart_from_the_other_refusals_of_the_same_c
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "ValidationError"),
+        (400, "ValidationException"),
         "a rule that ends before the term it owes is refused, got {status} with {body}"
     );
     let message = error_message(&body);

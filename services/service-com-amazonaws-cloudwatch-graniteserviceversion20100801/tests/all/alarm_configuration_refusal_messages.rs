@@ -28,8 +28,10 @@ use crate::harness::{
     AlarmKind,
 };
 
-/// The wire error code CloudWatch refuses a configuration it would not create with.
-const REFUSAL_CODE: &str = "ValidationError";
+/// The error class CloudWatch refuses a configuration it would not create with, as the body
+/// of the answer names it: the request-validation class, whose legacy query code
+/// (`ValidationError`) travels in the `x-amzn-query-error` header instead.
+const REFUSAL_CODE: &str = "ValidationException";
 
 /// The refusal for an evaluation horizon longer than a day, which is the ceiling for a period
 /// shorter than an hour.

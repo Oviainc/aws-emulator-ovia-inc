@@ -35,6 +35,13 @@ const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 /// restated — `crate::EmulatedService`'s refusal override).
 const VALIDATION_CODE: &str = "ValidationException";
 
+/// The code a parameter supplied EMPTY is refused with: a parameter carrying no characters is
+/// a parameter the request gave no value for, which this service answers as the
+/// missing-parameter fault whatever member it arrived on (`crate::EmulatedService`'s refusal
+/// override) — still a 400 refusal of the name rather than a missing stream, which is what the
+/// row below is about.
+const MISSING_PARAMETER_CODE: &str = "MissingRequiredParameterException";
+
 /// The two states a metric stream can be in: "The state of the metric stream. The possible
 /// values are `running` and `stopped`." (`GetMetricStreamOutput$State`).
 const RUNNING: &str = "running";
@@ -142,8 +149,7 @@ async fn a_name_at_either_modelled_length_bound_is_refused_by_its_code_alone() {
     // created then deleted, a stored name in another case or with a suffix) is tabled in
     // `crate::not_found_messages`; the rows here are the lengths that table does not reach,
     // plus the one name this suite's own deletes leave behind.
-    let cases: Vec<(String, String, bool)> = vec![
-        (
+    let cases: Vec<(String, String, bool)> = vec![        (
             "a name created and then deleted".to_string(),
             "removed-stream".to_string(),
             true,
@@ -173,9 +179,18 @@ async fn a_name_at_either_modelled_length_bound_is_refused_by_its_code_alone() {
             "case {case:?}: a name outside the modelled length must be refused with HTTP 400, \
              got {status} {body}"
         );
+        // Both are a fault of the VALUE rather than a missing resource, and which of the two
+        // depends on the value alone: a name of no characters is a parameter the request gave
+        // no value for, so it is the missing-parameter fault; any other name outside the
+        // modelled length is the request-validation class.
+        let expected = if name.is_empty() {
+            MISSING_PARAMETER_CODE
+        } else {
+            VALIDATION_CODE
+        };
         assert_eq!(
             error_code(&body).as_str(),
-            VALIDATION_CODE,
+            expected,
             "case {case:?}: a name outside the modelled length is a value fault, not a missing \
              resource, got {body}"
         );

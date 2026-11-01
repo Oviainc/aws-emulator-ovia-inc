@@ -743,8 +743,9 @@ async fn a_request_outside_the_contract_is_refused() {
         ),
         (
             // `ScanBy` is a modelled enum, so the boundary validator refuses a value outside
-            // it before the handler runs — under this service's own validation code, the one
-            // every validation refusal it makes carries (`crate::metric_stream_scope` tables
+            // it before the handler runs — under the request-validation class, the one
+            // every validation refusal this service makes carries
+            // (`crate::metric_stream_scope` tables
             // that rule across the operations modelling such a member).
             "a ScanBy outside the enum",
             json!({
@@ -753,7 +754,7 @@ async fn a_request_outside_the_contract_is_refused() {
                 "EndTime": base + MINUTE,
                 "ScanBy": "ValueDescending",
             }),
-            "ValidationError",
+            "ValidationException",
         ),
         (
             "MaxDatapoints below one",

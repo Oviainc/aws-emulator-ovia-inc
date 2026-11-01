@@ -480,8 +480,8 @@ async fn an_expression_the_service_cannot_evaluate_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationError",
-            "case {expression:?}: expected ValidationError, got {body}"
+            "ValidationException",
+            "case {expression:?}: expected the request-validation class, got {body}"
         );
         let message = body
             .get("message")
@@ -531,8 +531,9 @@ async fn an_expression_the_service_cannot_evaluate_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationError",
-            "case {expression:?} returned as data: expected ValidationError, got {body}"
+            "ValidationException",
+            "case {expression:?} returned as data: expected the request-validation class, got \
+             {body}"
         );
 
         let mut queries = source_queries();
@@ -825,13 +826,13 @@ async fn an_oversized_expression_is_refused_rather_than_evaluated() {
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} with {body}"
         );
-        // The service's own refusal is `ValidationError`; the one bound the MODEL states
-        // (`MetricExpression` is at most 2048 characters) is refused by the boundary validator
-        // before the handler runs, under its own code.
+        // Both refusals — this service's own and the one the MODEL states
+        // (`MetricExpression` is at most 2048 characters, refused by the boundary validator
+        // before the handler runs) — are the one request-validation class.
         let code = error_code(&body);
-        assert!(
-            code == "ValidationError" || code == "ValidationException",
-            "case {case:?}: expected a 400 refusal, got {body}"
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?}: expected a 400 refusal of the request-validation class, got {body}"
         );
     }
 

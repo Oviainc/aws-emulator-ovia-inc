@@ -543,7 +543,7 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
                 "Namespace": NAMESPACE,
                 "Dimensions": dimensions(MAX_DIMENSIONS + 1),
             }),
-            code: "InvalidParameterValue",
+            code: "InvalidParameterValueException",
             message: MessageCheck::Exact(format!(
                 "The collection Dimensions must not have a size greater than {MAX_DIMENSIONS}."
             )),
@@ -555,7 +555,7 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
                 "Namespace": NAMESPACE,
                 "Dimensions": dimensions(MAX_FILTERS + 5),
             }),
-            code: "InvalidParameterValue",
+            code: "InvalidParameterValueException",
             // The published model declares this member `length 0..10` while the recorded
             // service enforces the per-metric 30, so a list in that band is refused HERE
             // although AWS appears to serve it: the model-side bound is the real gap, and it
@@ -568,7 +568,7 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
             case: "the over-long list on a read of one metric",
             operation: "GetMetricStatistics",
             request: statistics_request(at, json!({"Dimensions": dimensions(MAX_DIMENSIONS + 1)})),
-            code: "InvalidParameterValue",
+            code: "InvalidParameterValueException",
             message: MessageCheck::Exact(format!(
                 "The collection Dimensions must not have a size greater than {MAX_DIMENSIONS}."
             )),
@@ -584,7 +584,7 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
                     "Dimensions": dimensions(MAX_DIMENSIONS + 1),
                 }],
             }),
-            code: "InvalidParameterValue",
+            code: "InvalidParameterValueException",
             message: MessageCheck::Exact(format!(
                 "The collection MetricData.member.1.Dimensions must not have a size greater \
                  than {MAX_DIMENSIONS}."
@@ -594,7 +594,7 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
             case: "a percentile where the basic statistics belong",
             operation: "GetMetricStatistics",
             request: statistics_request(at, json!({"Statistics": ["p90"]})),
-            code: "InvalidParameterValue",
+            code: "InvalidParameterValueException",
             // The element's own request member path, down to the list's target shape, and the
             // value set its enumerated type declares — the set, not the submitted value, is
             // what locates the repair (`statistic_name_refusals`, which asserts the sentence
@@ -607,15 +607,16 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
             case: "another value outside the same list's enumerated type",
             operation: "GetMetricStatistics",
             request: statistics_request(at, json!({"Statistics": ["Sum", "Median"]})),
-            code: "InvalidParameterValue",
+            code: "InvalidParameterValueException",
             message: MessageCheck::Exact(
                 crate::statistic_name_refusals::value_in_set_message(2),
             ),
         },
         RefusalRow {
             // A SCALAR outside its enum keeps the framework's own CLAUSE — the value and the
-            // member path it arrived on — under this service's validation code, the one every
-            // validation refusal it makes carries (`crate::metric_stream_scope`). The read that
+            // member path it arrived on — under the request-validation class, the one every
+            // validation refusal this service makes carries (`crate::metric_stream_scope`). The
+            // read that
             // DOES model a parameter fault answers that instead, over its own enumerated
             // members (`crate::unit_read_identity`).
             case: "a scalar member outside its enum",
@@ -633,7 +634,7 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
                 "EndTime": at + 60.0,
                 "ScanBy": "ValueDescending",
             }),
-            code: "ValidationError",
+            code: "ValidationException",
             message: MessageCheck::Names(vec![FRAMEWORK_ENVELOPE, "'scanBy'"]),
         },
     ];

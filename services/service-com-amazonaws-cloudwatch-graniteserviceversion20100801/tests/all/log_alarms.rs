@@ -13,7 +13,7 @@
 //! * a newly configured alarm is `INSUFFICIENT_DATA` — nothing has evaluated it yet — and a
 //!   call that replaces an existing alarm overwrites its configuration and leaves its state;
 //! * a request that breaks one of the operation's documented value rules is refused with
-//!   HTTP 400 `ValidationError`, and the published bounds themselves are accepted.
+//!   HTTP 400 under the request-validation class, and the published bounds themselves are accepted.
 
 use crate::harness::{build_router, call, error_code, ok};
 use serde_json::{json, Value};
@@ -450,8 +450,8 @@ async fn a_request_that_breaks_a_documented_rule_is_refused_and_stores_nothing()
         let (status, body) = call(&router, "PutLogAlarm", &with(&name, members.clone())).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "ValidationError"),
-            "case {case:?}: expected HTTP 400 ValidationError, got {status} with {body}"
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException, got {status} with {body}"
         );
         let alarms = described_log_alarms(
             &router,
@@ -643,14 +643,14 @@ async fn one_name_names_one_alarm_whatever_kind_it_is() {
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "ValidationError"),
-            "case {case:?}: expected HTTP 400 ValidationError, got {status} with {body}"
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException, got {status} with {body}"
         );
     }
 
     // And a log alarm cannot take a name another kind holds either: a name already in use
-    // is a parameter this request cannot carry, which CloudWatch refuses as a
-    // `ValidationError`.
+    // is a parameter this request cannot carry, which CloudWatch refuses under the
+    // request-validation class.
     ok(&router, "PutMetricAlarm", &metric_alarm("taken-by-a-metric-alarm")).await;
     ok(
         &router,
@@ -665,8 +665,8 @@ async fn one_name_names_one_alarm_whatever_kind_it_is() {
         let (status, body) = call(&router, "PutLogAlarm", &minimal(name)).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "ValidationError"),
-            "case {case:?}: expected HTTP 400 ValidationError, got {status} with {body}"
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException, got {status} with {body}"
         );
     }
 }
@@ -769,8 +769,8 @@ async fn delete_alarms_removes_a_log_alarm_but_never_in_a_batch() {
         let (status, body) = call(&router, "DeleteAlarms", &json!({"AlarmNames": names})).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "ValidationError"),
-            "case {case:?}: expected HTTP 400 ValidationError, got {status} with {body}"
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException, got {status} with {body}"
         );
         let alarms = described_log_alarms(&router, &json!({"AlarmTypes": ["LogAlarm"]})).await;
         assert_eq!(

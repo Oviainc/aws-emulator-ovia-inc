@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! An alarm's actions are executed in the Region the alarm lives in, so every alarm writer
-//! refuses an action naming another Region with HTTP 400 `ValidationError` — "Invalid region
+//! refuses an action naming another Region with HTTP 400 under the request-validation class —
+//! "Invalid region
 //! `<action region>` specified. Only `<alarm region>` is supported." — and writes nothing.
 //!
 //! The rows span what the rule generalises over rather than repeating one recorded request:
@@ -206,8 +207,8 @@ async fn assert_refused(router: &MultiServiceRouter, row: &Row<'_>, request: &Va
     );
     assert_eq!(
         error_code(&body),
-        "ValidationError",
-        "case {case:?}: expected the ValidationError code, got {body}"
+        "ValidationException",
+        "case {case:?}: expected the request-validation class, got {body}"
     );
     assert_eq!(
         body.get("message").and_then(Value::as_str),
@@ -402,8 +403,8 @@ async fn an_update_carrying_a_foreign_region_action_leaves_the_stored_actions() 
         );
         assert_eq!(
             error_code(&update_body),
-            "ValidationError",
-            "case {case:?}: expected the ValidationError code, got {update_body}"
+            "ValidationException",
+            "case {case:?}: expected the request-validation class, got {update_body}"
         );
         assert_eq!(
             update_body.get("message").and_then(Value::as_str),

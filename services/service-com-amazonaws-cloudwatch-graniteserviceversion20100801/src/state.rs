@@ -448,6 +448,16 @@ pub fn one_of_required_message(first: &str, second: &str) -> String {
     format!("At least one of the parameters {first} and {second} must be specified.")
 }
 
+/// How CloudWatch states a parameter it needs that the request did not supply, naming the
+/// request member path it was looked for at.
+///
+/// Beside the other parameter sentences rather than in one handler, for the same reason they
+/// are: a parameter the boundary validator finds unsupplied
+/// (`Service::override_refusal`) and one a handler finds unsupplied have to read alike.
+pub fn parameter_required_message(parameter: &str) -> String {
+    format!("The parameter {parameter} is required.")
+}
+
 /// The request member path a refusal NAMES, built from the path the validating walk spells.
 ///
 /// The walk spells a member in lowerCamel and an element of a list as `<position>.member`

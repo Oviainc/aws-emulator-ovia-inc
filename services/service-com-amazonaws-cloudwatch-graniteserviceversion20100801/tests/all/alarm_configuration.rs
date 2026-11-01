@@ -26,8 +26,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{build_router, call, error_code, ok};
 
-/// The wire error code CloudWatch refuses a configuration it would not create with.
-const REFUSAL_CODE: &str = "ValidationError";
+/// The error class CloudWatch refuses a configuration it would not create with, as the body
+/// of the answer names it: the request-validation class, whose legacy query code
+/// (`ValidationError`) travels in the `x-amzn-query-error` header instead.
+const REFUSAL_CODE: &str = "ValidationException";
 
 /// The three action lists of an alarm, each a `ResourceList` of `length 0..5`
 /// (`smithy_query(query="operation",operation="PutMetricAlarm")`).

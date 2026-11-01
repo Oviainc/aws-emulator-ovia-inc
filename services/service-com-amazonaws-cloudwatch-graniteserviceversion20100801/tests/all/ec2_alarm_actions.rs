@@ -2,7 +2,8 @@
 
 //! The EC2-instance-action precondition on `PutMetricAlarm`: an EC2 instance action is
 //! accepted only on an alarm whose every watched metric is dimensioned by `InstanceId`,
-//! and any other request carrying one is refused with HTTP 400 `ValidationError` and
+//! and any other request carrying one is refused with HTTP 400 under the request-validation
+//! class and
 //! stores nothing.
 //!
 //! The rows span what the rule generalises over — which of the four EC2 actions, which
@@ -222,8 +223,8 @@ async fn an_ec2_instance_action_is_refused_when_the_metric_is_not_per_instance()
         );
         assert_eq!(
             error_code(&body),
-            "ValidationError",
-            "case {case:?}: expected the ValidationError code, got {body}"
+            "ValidationException",
+            "case {case:?}: expected the request-validation class, got {body}"
         );
         assert_eq!(
             body.get("message").and_then(Value::as_str),

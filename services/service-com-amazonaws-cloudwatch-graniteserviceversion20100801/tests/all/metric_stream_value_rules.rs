@@ -49,9 +49,10 @@ const INVALID_NAME: &str = "Invalid Name";
 /// How CloudWatch states a `RoleArn` that is not the ARN of an IAM role.
 const INVALID_ROLE_ARN: &str = "Invalid Role ARN";
 
-/// The code this service answers a value its MODEL refuses with — the other refusal class in
-/// play here, which rule 3 keeps for a request the two value rules accept.
-const VALIDATION_CODE: &str = "ValidationError";
+/// The class this service answers a value its MODEL refuses with — the other refusal class in
+/// play here, which rule 3 keeps for a request the two value rules accept. The body names the
+/// class; its legacy query code travels in the header.
+const VALIDATION_CODE: &str = "ValidationException";
 
 /// The clause the boundary walk's own refusal opens with, which pins such a refusal as the
 /// MODEL's rather than one of this service's fixed sentences.
