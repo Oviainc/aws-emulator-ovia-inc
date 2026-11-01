@@ -79,6 +79,8 @@ mod settings_update_writes_at_write_time;
 mod settings_write_stores_what_resolved;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stop_refusal_names_what_the_request_named.rs"]
+mod stop_refusal_names_what_the_request_named;
 #[path = "all/subscription_product_names_the_subscription.rs"]
 mod subscription_product_names_the_subscription;
 #[path = "all/the_sweep_reads_what_the_records_owe.rs"]
