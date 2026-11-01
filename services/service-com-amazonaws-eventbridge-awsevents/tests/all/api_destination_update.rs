@@ -14,8 +14,7 @@
 //!   advances;
 //! * the `ApiDestinationState` an update answers is COMPUTED from the connection
 //!   the destination now invokes through, not stored, so pointing a destination
-//!   at a connection that cannot authorize an invocation reports it as
-//!   `INACTIVE`;
+//!   at a connection that holds no authorization reports it as `INACTIVE`;
 //! * a request naming a resource this account does not hold is refused with the
 //!   modelled `ResourceNotFoundException` (HTTP 400) whose message names the CALL
 //!   that failed and the destination the REQUEST asked for, and every refused
@@ -576,9 +575,8 @@ async fn a_refused_update_changes_nothing_about_the_stored_destination() {
 }
 
 /// The state an update answers is COMPUTED from the connection the destination
-/// now invokes through: pointing it at a connection that cannot authorize an
-/// invocation yet reports `INACTIVE`, and the destination reaches `ACTIVE` when
-/// that connection does.
+/// now invokes through: pointing it at a connection that holds no authorization
+/// reports `INACTIVE`, and pointing it back at one that does reports `ACTIVE`.
 #[tokio::test]
 async fn the_state_an_update_answers_follows_the_connection_it_repoints_to() {
     let router = emulator();
@@ -592,9 +590,17 @@ async fn the_state_an_update_answers_follows_the_connection_it_repoints_to() {
         state::API_DESTINATION_STATE_ACTIVE
     );
 
-    // The second connection is still CREATING: it can authorize nothing yet.
-    let creating = given_connection(&router, "creating-connection", false).await;
-    let (status, updated) = update(&router, name, &json!({ "ConnectionArn": creating })).await;
+    // The second connection has had its authorization parameters stripped, so it
+    // holds nothing to authorize an invocation with.
+    let stripped = given_connection(&router, "stripped-connection", true).await;
+    let (status, body) = events(
+        &router,
+        "DeauthorizeConnection",
+        &json!({ "Name": "stripped-connection" }),
+    )
+    .await;
+    assert_eq!(status, 200, "DeauthorizeConnection answered {status} {body}");
+    let (status, updated) = update(&router, name, &json!({ "ConnectionArn": stripped })).await;
     assert_eq!(
         status, 200,
         "UpdateApiDestination answered {status} {updated}"
@@ -602,12 +608,33 @@ async fn the_state_an_update_answers_follows_the_connection_it_repoints_to() {
     assert_eq!(
         updated["ApiDestinationState"],
         json!(state::API_DESTINATION_STATE_INACTIVE),
-        "a destination repointed at a connection that is still creating is {}, got {updated}",
+        "a destination repointed at a deauthorized connection is {}, got {updated}",
         state::API_DESTINATION_STATE_INACTIVE
     );
 
+    // The deauthorization settling changes nothing: the state was already read
+    // off where that connection was headed.
     tokio::time::sleep(past_the_transition(state::CONNECTION_TRANSITION)).await;
-    let read = described(&router, "once the connection is authorized", name).await;
+    let read = described(&router, "once the deauthorization has settled", name).await;
+    assert_eq!(
+        read["ApiDestinationState"],
+        json!(state::API_DESTINATION_STATE_INACTIVE),
+        "a deauthorized connection keeps the destination {}, got {read}",
+        state::API_DESTINATION_STATE_INACTIVE
+    );
+
+    let (status, updated) = update(&router, name, &json!({ "ConnectionArn": authorized })).await;
+    assert_eq!(
+        status, 200,
+        "UpdateApiDestination answered {status} {updated}"
+    );
+    assert_eq!(
+        updated["ApiDestinationState"],
+        json!(state::API_DESTINATION_STATE_ACTIVE),
+        "repointed back at an authorized connection the destination is {}, got {updated}",
+        state::API_DESTINATION_STATE_ACTIVE
+    );
+    let read = described(&router, "repointed back", name).await;
     assert_eq!(
         read["ApiDestinationState"],
         json!(state::API_DESTINATION_STATE_ACTIVE),

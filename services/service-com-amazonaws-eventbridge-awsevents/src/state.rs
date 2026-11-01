@@ -1307,6 +1307,28 @@ impl ConnectionRecord {
         })
     }
 
+    /// The `ConnectionState` this connection has SETTLED on: the state its clock
+    /// already owes it while a transition is pending, and its current state once
+    /// it has settled — `None` when the transition the clock owes it REMOVES the
+    /// connection, so there is no state it comes to rest in at all.
+    ///
+    /// `CREATING`, `UPDATING` and `AUTHORIZING` say a change is in flight; they
+    /// do not say whether the connection ends up holding authorization. The state
+    /// the pending transition names is that outcome, already decided by the
+    /// credentials the connection holds — or by the token exchange that answered
+    /// ([`record_authorization`]) — and merely not materialised yet
+    /// ([`ComAmazonawsEventbridgeAwseventsState::settle_connections`] is what
+    /// materialises it). A reader that has no in-flight value of its own to
+    /// report reads off this rather than off the transient
+    /// ([`ComAmazonawsEventbridgeAwseventsState::api_destination_state`]).
+    pub fn settled_state(&self) -> Option<&str> {
+        match self.pending.as_ref().map(|pending| &pending.to) {
+            Some(ConnectionTransition::Removed) => None,
+            Some(ConnectionTransition::To { state, .. }) => Some(state.as_str()),
+            None => Some(self.state.as_str()),
+        }
+    }
+
     /// The `Connection` summary `ListConnections` reports: the members of the
     /// stored record the summary shape carries, read back from it — so a listing
     /// and `DescribeConnection` cannot disagree about any of them.
@@ -1865,10 +1887,10 @@ pub const MAX_API_DESTINATIONS: usize = 100;
 /// "An API destination ... is an HTTP invocation endpoint configured as a target
 /// for events" (`CreateApiDestination`): the endpoint, the method and the
 /// connection EventBridge authorizes the invocation with. Its `ApiDestinationState`
-/// is NOT stored — it follows the connection
+/// is NOT stored — it follows the authorization its connection settles on
 /// ([`ComAmazonawsEventbridgeAwseventsState::api_destination_state`]), so a
-/// connection that is deauthorized, deleted or still being created is reported
-/// through the destination that uses it.
+/// connection that is deauthorized or deleted is reported through the
+/// destination that uses it.
 #[derive(Debug, Clone)]
 pub struct ApiDestinationRecord {
     pub name: String,
@@ -3082,17 +3104,23 @@ impl ComAmazonawsEventbridgeAwseventsState {
     ///
     /// "The destination endpoint must support the authorization type specified
     /// for the connection" (`CreateApiDestination$ConnectionArn`): a destination
-    /// can be invoked only while its connection can authorize the invocation, so
-    /// the state is computed from the connection on every read rather than stored
-    /// and left behind by a later `DeauthorizeConnection` or `DeleteConnection`.
+    /// can be invoked only while its connection authorizes the invocation, so the
+    /// state is computed from the connection on every read rather than stored and
+    /// left behind by a later `DeauthorizeConnection` or `DeleteConnection`.
+    ///
+    /// `ApiDestinationState` is modelled `ACTIVE | INACTIVE` and has no value for
+    /// "settling", so what the destination reports is the authorization its
+    /// connection SETTLES on ([`ConnectionRecord::settled_state`]), not the
+    /// transient the connection is passing through: a connection on its way to
+    /// holding authorization leaves the destination `ACTIVE`, and only one that
+    /// ends up with none — never obtained, stripped, on its way out, or no such
+    /// connection at all — makes it `INACTIVE`.
     pub fn api_destination_state(&self, destination: &ApiDestinationRecord) -> String {
         let authorized = self
             .connection_by_arn(&destination.connection_arn)
-            .is_some_and(|connection| {
-                matches!(
-                    connection.state.as_str(),
-                    CONNECTION_STATE_AUTHORIZED | CONNECTION_STATE_ACTIVE
-                )
+            .and_then(ConnectionRecord::settled_state)
+            .is_some_and(|state| {
+                matches!(state, CONNECTION_STATE_AUTHORIZED | CONNECTION_STATE_ACTIVE)
             });
         if authorized {
             API_DESTINATION_STATE_ACTIVE.to_string()

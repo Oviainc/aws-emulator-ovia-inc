@@ -27,9 +27,10 @@
 //!   `RemoveTargets` or `DeleteRule` without `Force` is refused the same way, and
 //!   the rule survives every refused write;
 //! * a created API destination is a PERSISTED resource bound to ONE connection,
-//!   and its `ApiDestinationState` FOLLOWS that connection: a destination whose
-//!   connection is not authorized is `INACTIVE`, and one whose connection is
-//!   `AUTHORIZED` is `ACTIVE`;
+//!   and its `ApiDestinationState` FOLLOWS the authorization that connection
+//!   settles on: a destination whose connection holds (or is on its way to
+//!   holding) authorization is `ACTIVE`, and one whose connection ends up with
+//!   none is `INACTIVE`;
 //! * each resource's name is its identity (a second create is
 //!   `ResourceAlreadyExistsException`), each resource it points at has to exist
 //!   (`ResourceNotFoundException`), and a filter or setting the model does not
@@ -843,12 +844,13 @@ async fn a_created_api_destination_is_read_back_and_follows_its_connection() {
     }
 }
 
-/// The destination's state is COMPUTED from its connection: it is `INACTIVE`
-/// while the connection cannot authorize an invocation, and `ACTIVE` when it can.
+/// The destination's state is COMPUTED from the authorization its connection
+/// settles on: it is `ACTIVE` while that connection holds authorization and
+/// `INACTIVE` once it has none.
 #[tokio::test]
 async fn the_destination_state_tracks_the_connections_own_state() {
     let router = emulator();
-    // The connection is still CREATING: it cannot authorize anything yet.
+    // The connection is still CREATING, on its way to being authorized.
     let connection = given_connection(&router, "slow-connection", false).await;
     let name = "tracking-destination";
     let (status, created) = events(
@@ -868,13 +870,11 @@ async fn the_destination_state_tracks_the_connections_own_state() {
     );
     assert_eq!(
         created["ApiDestinationState"],
-        json!(state::API_DESTINATION_STATE_INACTIVE),
-        "a destination whose connection is still creating is {}, got {created}",
-        state::API_DESTINATION_STATE_INACTIVE
+        json!(state::API_DESTINATION_STATE_ACTIVE),
+        "a destination whose connection is settling into its authorization is {}, got {created}",
+        state::API_DESTINATION_STATE_ACTIVE
     );
 
-    // (case, what happens to the connection first, the state the destination
-    //  then reports)
     tokio::time::sleep(past_the_transition(state::CONNECTION_TRANSITION)).await;
     let (status, described) = events(&router, "DescribeApiDestination", &json!({ "Name": name })).await;
     assert_eq!(
