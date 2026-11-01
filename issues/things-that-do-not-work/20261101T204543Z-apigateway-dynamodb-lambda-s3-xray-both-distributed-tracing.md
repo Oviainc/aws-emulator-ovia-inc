@@ -1,0 +1,48 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: apigateway__dynamodb__lambda__s3__xray.apigw-lambda-ddb-s3-trace-tree-shape apigateway__dynamodb__lambda__s3__xray.apigw-trace-header-continuation-and-sampled-zero-rejects-recording
+Issue-Key: apigateway__dynamodb__lambda__s3__xray.apigw-lambda-ddb-s3-trace-tree-shape|_get_stage_json#10|Timeout|raise AssertionError(
+Issue-Key: apigateway__dynamodb__lambda__s3__xray.apigw-trace-header-continuation-and-sampled-zero-rejects-recording|_get_stage_json#12|Timeout|raise AssertionError(
+Issue-Commit: 8f015019990d45131c5e858500566f2ce48bb7da
+
+# apigateway__dynamodb__lambda__s3__xray: both distributed-tracing checks hang to the 60 s cap — a deployed, tracing-enabled REST stage with an AWS_PROXY Lambda integration never returns a response (1 cause)
+
+> _Note: this issue was identified against the code base at commit `8f015019990d45131c5e858500566f2ce48bb7da`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ExecuteApiInvoke
+
+## Description
+Cause 1 of 1: a GET to a freshly deployed REST API stage whose GET method has an AWS_PROXY integration onto a Mode=Active Lambda never produces an HTTP response at all, so every downstream X-Ray assertion in this group is unreachable. Both failing checks of this group (apigw-lambda-ddb-s3-trace-tree-shape and apigw-trace-header-continuation-and-sampled-zero-rejects-recording) hang in the same helper, `_get_stage_json` -> `_http_get`, and are cut off by the harness at the 60 s cap.
+
+AWS: recorded behavior only — the execute-api stage invoke is not a modeled Smithy operation; AWS documents the behaviour at https://docs.aws.amazon.com/xray/latest/devguide/xray-services-apigateway.html. A GET to `<rest-api-id>.execute-api.<region>.amazonaws.com/<stage>/<path>` on a deployed stage with an AWS_PROXY integration is answered HTTP 200 with the function's proxy response (the `body` string the handler returned, with its `headers`), within the stage's integration timeout. With the stage's `tracingEnabled=true` the edge stamps the invocation's `_X_AMZN_TRACE_ID` with `Root=1-<8 hex>-<24 hex>;Parent=<16 hex>;Sampled=1` — `Root` is continued verbatim when the caller supplied a syntactically valid one, regenerated with a current-epoch prefix when the caller supplied none or a malformed one, and `Sampled` is the caller's value when supplied. The resulting trace is a single tree whose one root document has `origin` `AWS::ApiGateway::Stage` and `name` `<api>/<stage>`, containing an aws-namespace `Lambda` subsegment that parents the `AWS::Lambda` segment, which in turn parents `AWS::Lambda::Function`; the handler's own `aws`-namespace subsegments nest under the function segment and X-Ray synthesises `inferred: true` `AWS::DynamoDB::Table` / `AWS::S3::Bucket` nodes hanging from them. With `tracingEnabled=false` no `AWS::ApiGateway::Stage` segment is produced and the `AWS::Lambda` segment becomes the root. The structural requirements are those shapes and the regexes `^1-[0-9a-f]{8}-[0-9a-f]{24}$` for Root and `^[0-9a-f]{16}$` for a span id; the concrete ids, api ids, function/table/bucket names and timestamps of any one run are per-run values and are not part of the contract.
+
+Emulator: the stage GET never returns. Verdict `mismatch`, detail `Error: Check timed out after 60.0s`, for both checks. No status code, no body, no `_X_AMZN_TRACE_ID` echo and no trace documents were ever observed, so neither the trace-tree shape (single root at the stage, Lambda's two-segment shape, the handler's subsegments, the inferred DynamoDB/S3 nodes, nested durations, the untraced-stage arm) nor the trace-context arms (Sampled=1 continuation, Sampled=0 work-but-no-recording, no-header generation, malformed-Root replacement) reach any verdict. `_get_stage_json` retries only 403/429/5xx for 90 s and never saw any response at all; the harness cap fires first.
+
+Why: a client fronting a Lambda with API Gateway gets no response whatsoever instead of its proxy response — not an error it can handle, a hang. Every instrumentation guarantee built on that path is unverifiable: trace-context propagation into the invocation environment, the edge minting a Parent span, request-level sampling (Sampled=0 must suppress recording without suppressing the work), the stage being the trace root, and the inferred downstream resource nodes. Callers and SDK retry/timeout logic are driven by a stalled socket rather than a status.
+
+Fix: the apigateway execute-api stage-invoke data plane — the deployed-stage request router and its AWS_PROXY integration invoker must serve the request and return the function's proxy response, and the trace-header propagation that handler owns must set the invocation's `_X_AMZN_TRACE_ID` (continuing a valid caller `Root`, regenerating an absent or malformed one, minting `Parent`, carrying `Sampled`) and emit the stage segment when the stage has `tracingEnabled=true`.
+
+Related open issues that look similar but do not carry these checks' replay keys, so this is filed separately and not as a duplicate: 20261024T043741Z-apigateway-dynamodb-lambda-s3-xray-both-x-ray-9c23a5.md, 20261025T080135Z-apigateway-dynamodb-lambda-s3-xray-both-end-to.md, 20261027T085253Z-apigateway-dynamodb-lambda-s3-xray-caller-trace-context.md, 20261027T205529Z-apigateway-dynamodb-lambda-s3-xray-the-traced-rest.md and 20261030T003023Z-apigateway-dynamodb-lambda-s3-xray-x-ray-trace-header-continuation-through-a-rest.md.
+
+Traces: apigateway__dynamodb__lambda__s3__xray.apigw-lambda-ddb-s3-trace-tree-shape, apigateway__dynamodb__lambda__s3__xray.apigw-trace-header-continuation-and-sampled-zero-rejects-recording.
+
+## Evidence
+Expected (real AWS):
+- `GET <stage-url>/x?ddb_sub_id=<16hex>&s3_sub_id=<16hex>&k=traced-probe` on the tracing-enabled stage returns HTTP 200 and the handler's JSON body, whose `raw_trace_header` matches `^Root=1-[0-9a-f]{8}-[0-9a-f]{24};Parent=[0-9a-f]{16};Sampled=1(;.*)?$`.
+- `BatchGetTraces([root])` then yields one tree: exactly one root document with `origin == "AWS::ApiGateway::Stage"` and `name` ending `/<stage>`; its nested `namespace: "aws"`, `name: "Lambda"` subsegment (with `aws.function_name == <function>`) parents the `AWS::Lambda` segment; `AWS::Lambda::Function.parent_id == AWS::Lambda.id`; the handler's two subsegments nest under the function segment with `namespace: "aws"`, `aws.operation` `PutItem`/`PutObject`, `aws.table_name`/`aws.bucket_name` set and `aws.request_id` equal to the request id the data-plane call returned to the handler; `AWS::DynamoDB::Table` and `AWS::S3::Bucket` documents carry `inferred: true` and hang from those subsegments; edges == n-1 with no dangling parent and no cycle.
+- `GET` with header `X-Amzn-Trace-Id: Root=<valid>;Sampled=1` returns 200 with that same `Root` continued and a freshly minted 16-hex `Parent`; with `Sampled=0` it returns 200 and still writes the DynamoDB item and S3 object while `BatchGetTraces`/`GetTraceSummaries` report nothing for that root; with no header, or with `Root=not-a-trace-id`, the edge generates its own `1-<8hex>-<24hex>` id (epoch prefix within 300 s of now) rather than failing.
+- On the `tracingEnabled=false` stage no `AWS::ApiGateway::Stage` segment appears and the `AWS::Lambda` segment has `parent_id` absent.
+
+Actual (emulator): verdict `mismatch` for both checks, detail `Error: Check timed out after 60.0s`. The stage GET inside `_get_stage_json`/`_http_get` never returns — no HTTP status, no body, no headers — so no trace header was observed, `BatchGetTraces` was never reached for a real root, and none of the assertions above produced a verdict. The failure is identical in both checks and in all four header arms of the continuation check (Sampled=1, Sampled=0, no header, malformed Root).
+
+## Steps to Reproduce
+1. Create an on-demand DynamoDB table with one `S` hash key `pk`, waited to ACTIVE, and a default-settings S3 bucket.
+2. Create an IAM role trusted by `lambda.amazonaws.com` with an inline policy granting `xray:PutTraceSegments`, `xray:PutTelemetryRecords`, `logs:*`, `dynamodb:PutItem` on the table and `s3:PutObject` on the bucket.
+3. Create a `python3.12` Lambda on that role with `TracingConfig={"Mode":"Active"}` and env `PROBE_TABLE`/`PROBE_BUCKET`, whose handler echoes `os.environ['_X_AMZN_TRACE_ID']` and its parsed `Root`/`Parent`/`Sampled`, does a `PutItem` and a `PutObject`, and sends aws-namespace subsegments to `AWS_XRAY_DAEMON_ADDRESS` over UDP. Wait for `State == Active`.
+4. Create a REST API, add a resource `/x` with a `GET` method (`authorizationType=NONE`) and an `AWS_PROXY` integration (`integrationHttpMethod=POST`) onto the function, and `lambda:AddPermission` for `apigateway.amazonaws.com`.
+5. `create_deployment` to a stage `traced`, then `update_stage` with `[{"op":"replace","path":"/tracingEnabled","value":"true"}]`; confirm `get_stage` reports `tracingEnabled: true`. Also deploy a stage `untraced` left at the default.
+6. `GET <stage-url>/x?ddb_sub_id=<16hex>&s3_sub_id=<16hex>&k=traced-probe` — observe the request never returns instead of answering 200 with the handler's proxy body.
+7. Repeat the GET with headers `X-Amzn-Trace-Id: Root=1-<8hex>-<24hex>;Sampled=1`, then `;Sampled=0`, then with no header, then with `Root=not-a-trace-id;Sampled=1` — all four never answer.
+8. `batch_get_traces(TraceIds=[<root>])` / `get_trace_summaries` can never be exercised against a real root, so the stage-rooted trace tree, the inferred DynamoDB/S3 nodes and the Sampled=0 suppression path are all unobservable.
