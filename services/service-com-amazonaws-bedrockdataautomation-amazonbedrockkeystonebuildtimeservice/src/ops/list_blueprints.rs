@@ -130,11 +130,10 @@ impl<Eng> ListBlueprints<Eng> {
     }
 }
 
-/// `resourceOwner` values, from `smithy_query(shape="ResourceOwner")`.
-const RESOURCE_OWNER_ACCOUNT: &str = "ACCOUNT";
-
-/// `blueprintStageFilter`'s wildcard, from `smithy_query(shape="BlueprintStageFilter")`.
-const STAGE_FILTER_ALL: &str = "ALL";
+// The two modelled filter values both listings of this service read, kept in
+// `crate::state` so `ListBlueprints` and `ListDataAutomationProjects` cannot drift
+// apart on what the model spells.
+use crate::state::{RESOURCE_OWNER_ACCOUNT, STAGE_FILTER_ALL};
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListBlueprints<Eng>
@@ -165,25 +164,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // `projectFilter` narrows the listing to the blueprints a Data Automation
-        // project references. No project can exist yet (the project operations are
-        // still scaffolded), so any project ARN named here is one that does not
+        // project references: a filter that names a project this store does not hold
+        // (or holds at another stage, since the filter's `projectStage` selects WHICH
+        // stage of the project to read from) references a resource that does not
         // exist — the modeled 404, never a silently unfiltered page.
-        //
-        // TODO(data-automation-project slice): when CreateDataAutomationProject
-        // and friends are implemented, replace this unconditional refusal with a
-        // real lookup: refuse only a project ARN the store does not hold, and
-        // otherwise narrow the page to the blueprints that project references.
-        if let Some(filter) = input.project_filter.as_ref() {
-            return Err(ListBlueprintsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "data automation project {} does not exist",
-                        filter.project_arn
-                    )),
-                },
-            )
-            .into());
-        }
+        let project_blueprints: Option<Vec<&str>> = match input.project_filter.as_ref() {
+            None => None,
+            Some(filter) => {
+                let project = store
+                    .projects
+                    .get(&filter.project_arn)
+                    .filter(|project| {
+                        filter
+                            .project_stage
+                            .as_deref()
+                            .is_none_or(|stage| stage == project.project_stage)
+                    })
+                    .ok_or_else(|| {
+                        ListBlueprintsError::Modeled(
+                            ListBlueprintsErrorModeled::ResourceNotFoundException(
+                                ResourceNotFoundException {
+                                    message: Some(format!(
+                                        "data automation project {} does not exist",
+                                        filter.project_arn
+                                    )),
+                                },
+                            ),
+                        )
+                    })?;
+                Some(
+                    project
+                        .blueprint_references()
+                        .map(|item| item.blueprint_arn.as_str())
+                        .collect(),
+                )
+            }
+        };
 
         let cursor = match input.next_token.as_deref() {
             None => None,
@@ -231,7 +247,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         stage == STAGE_FILTER_ALL || stage == record.blueprint_stage
                     })
                 })
-                .filter(|record| cursor.as_ref().is_none_or(|c| c.precedes(record)))
+                .filter(|record| {
+                    project_blueprints
+                        .as_ref()
+                        .is_none_or(|arns| arns.contains(&record.blueprint_arn.as_str()))
+                })
+                .filter(|record| cursor.as_ref().is_none_or(|c| c.precedes(*record)))
                 .collect()
         } else {
             Vec::new()
@@ -253,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = page
             .last()
             .filter(|_| matching.len() > page.len())
-            .map(|record| crate::state::PageCursor::after(record).to_token());
+            .map(|record| crate::state::PageCursor::after(*record).to_token());
 
         Ok(ListBlueprintsOutput {
             blueprints: page.iter().map(|record| record.to_summary()).collect(),

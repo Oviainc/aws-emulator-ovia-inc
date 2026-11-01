@@ -17,6 +17,8 @@ mod blueprint_lifecycle;
 mod blueprint_optimization;
 #[path = "all/data_automation_project_lifecycle.rs"]
 mod data_automation_project_lifecycle;
+#[path = "all/data_automation_project_listing.rs"]
+mod data_automation_project_listing;
 #[path = "all/data_automation_project_update.rs"]
 mod data_automation_project_update;
 #[path = "all/state_roundtrip.rs"]

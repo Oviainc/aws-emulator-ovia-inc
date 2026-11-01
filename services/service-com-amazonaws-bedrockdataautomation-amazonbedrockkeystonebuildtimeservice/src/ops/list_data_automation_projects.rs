@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataAutomationProjects
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataAutomationProjects`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataAutomationProjects::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +129,39 @@ impl<Eng> ListDataAutomationProjects<Eng> {
     }
 }
 
+// The two modelled filter values both listings of this service read, kept in
+// `crate::state` so `ListBlueprints` and `ListDataAutomationProjects` cannot drift
+// apart on what the model spells.
+use crate::state::{RESOURCE_OWNER_ACCOUNT, STAGE_FILTER_ALL};
+
+/// Whether a blueprint reference stored on a project is the blueprint revision
+/// `filter` names.
+///
+/// `blueprintArn` identifies the blueprint, and `blueprintVersion`/`blueprintStage`
+/// identify which revision of it: a reference that STATES a different one is a
+/// reference to another revision, while a reference that states none follows the
+/// blueprint's live state and so contradicts nothing the filter asks for.
+fn references_blueprint(item: &BlueprintItem, filter: &BlueprintFilter) -> bool {
+    item.blueprint_arn == filter.blueprint_arn
+        && revision_agrees(
+            filter.blueprint_version.as_deref(),
+            item.blueprint_version.as_deref(),
+        )
+        && revision_agrees(
+            filter.blueprint_stage.as_deref(),
+            item.blueprint_stage.as_deref(),
+        )
+}
+
+/// One member of a blueprint revision selector: the filter and the stored
+/// reference disagree only when both state a value and the values differ.
+fn revision_agrees(wanted: Option<&str>, stated: Option<&str>) -> bool {
+    match (wanted, stated) {
+        (Some(wanted), Some(stated)) => wanted == stated,
+        _ => true,
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListDataAutomationProjects<Eng>
 {
@@ -155,18 +179,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataAutomationProjects` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataAutomationProjectsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataAutomationProjects"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDataAutomationProjectsError::Modeled(
+                ListDataAutomationProjectsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        // A read: it only projects what is already stored.
+        let store = state.lock();
+
+        // `blueprintFilter` narrows the listing to the projects that reference one
+        // blueprint, so a filter naming a blueprint this store can tell does not
+        // exist references a resource that is not there: the modeled 404, never a
+        // page that answers as if the filter had simply matched nothing. A
+        // service-owned (public) blueprint ARN is not refused — this store holds no
+        // catalog of those, so its silence is no evidence about them.
+        let blueprint_filter = input.blueprint_filter.as_ref();
+        if let Some(filter) = blueprint_filter {
+            if store
+                .names_unknown_blueprint(&filter.blueprint_arn, filter.blueprint_stage.as_deref())
+            {
+                return Err(
+                    ListDataAutomationProjectsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(
+                                crate::state::BLUEPRINT_ARN_NOT_FOUND_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `libraryFilter` narrows the listing the same way, to the projects whose
+        // stored library configuration references one Data Automation library. This
+        // emulator stores no library RESOURCE yet, so absence of the library here is
+        // no evidence that it does not exist and the filter only narrows.
+        let library_filter = input.library_filter.as_ref();
+
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::PageCursor::from_token(token).ok_or_else(|| {
+                ListDataAutomationProjectsError::Modeled(
+                    ListDataAutomationProjectsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "nextToken is not a token this service issued".to_string(),
+                            ),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: "must be a nextToken returned by a previous \
+                                          ListDataAutomationProjects call"
+                                    .to_string(),
+                            }]),
+                        },
+                    ),
+                )
+            })?),
+        };
+
+        // `resourceOwner` selects whose projects to list and defaults to the
+        // caller's own account. Every project this emulator stores was created
+        // through CreateDataAutomationProject, so it is ACCOUNT-owned; SERVICE names
+        // the AWS-managed catalog, of which none is stored.
+        let owner = input
+            .resource_owner
+            .as_deref()
+            .unwrap_or(RESOURCE_OWNER_ACCOUNT);
+        let stage_filter = input.project_stage_filter.as_deref();
+
+        let matching: Vec<&crate::state::DataAutomationProjectRecord> =
+            if owner == RESOURCE_OWNER_ACCOUNT {
+                store
+                    .projects_in_order()
+                    .into_iter()
+                    .filter(|record| {
+                        stage_filter.is_none_or(|stage| {
+                            stage == STAGE_FILTER_ALL || stage == record.project_stage
+                        })
+                    })
+                    .filter(|record| {
+                        blueprint_filter.is_none_or(|filter| {
+                            record
+                                .blueprint_references()
+                                .any(|item| references_blueprint(item, filter))
+                        })
+                    })
+                    .filter(|record| {
+                        library_filter.is_none_or(|filter| {
+                            record
+                                .library_references()
+                                .any(|item| item.library_arn == filter.library_arn)
+                        })
+                    })
+                    .filter(|record| cursor.as_ref().is_none_or(|c| c.precedes(*record)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        // `maxResults` caps the page; absent, the server's own page limit does, so a
+        // listing never serialises more than one modeled-maximum page. The modeled
+        // range is 1..1000, so a value reaching this handler is in range; clamping
+        // to 1 at the bottom keeps a page honest if that ever changes.
+        let limit = input
+            .max_results
+            .unwrap_or(crate::state::PROJECT_PAGE_LIMIT)
+            .clamp(1, crate::state::PROJECT_PAGE_LIMIT) as usize;
+        let page = &matching[..limit.min(matching.len())];
+
+        // A token is handed back only when something is left AFTER this page, so the
+        // last page of a listing never carries one.
+        let next_token = page
+            .last()
+            .filter(|_| matching.len() > page.len())
+            .map(|record| crate::state::PageCursor::after(*record).to_token());
+
+        Ok(ListDataAutomationProjectsOutput {
+            projects: page.iter().map(|record| record.to_summary()).collect(),
+            next_token,
+        })
     }
 }

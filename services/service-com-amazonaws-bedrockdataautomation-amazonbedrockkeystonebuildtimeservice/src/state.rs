@@ -10,17 +10,19 @@
 //! `InvokeBlueprintOptimizationAsync` mints and `GetBlueprintOptimizationStatus`
 //! reports, plus
 //! the few helpers more than one of those handlers needs: minting a resource ARN,
-//! resolving the request's region, and the opaque `nextToken` codec used by the
-//! paginated list. Operation BEHAVIOUR stays in `src/ops/<operation>.rs`; only the
+//! resolving the request's region, and the listing order and opaque `nextToken`
+//! codec the paginated lists (`ListBlueprints`, `ListDataAutomationProjects`) share.
+//! Operation BEHAVIOUR stays in `src/ops/<operation>.rs`; only the
 //! shared records and their projections live here.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Blueprint, BlueprintOptimizationOutputConfiguration, BlueprintOptimizationSample,
-    BlueprintSummary, CustomOutputConfiguration, DataAutomationLibraryConfiguration,
-    DataAutomationProject, OverrideConfiguration, StandardOutputConfiguration, Tag,
+    Blueprint, BlueprintItem, BlueprintOptimizationOutputConfiguration,
+    BlueprintOptimizationSample, BlueprintSummary, CustomOutputConfiguration,
+    DataAutomationLibraryConfiguration, DataAutomationLibraryItem, DataAutomationProject,
+    DataAutomationProjectSummary, OverrideConfiguration, StandardOutputConfiguration, Tag,
 };
 
 /// The `blueprintStage` a blueprint takes when `CreateBlueprint` names none.
@@ -42,6 +44,29 @@ pub const ARN_SERVICE: &str = "bedrock";
 /// `@range(min: 1, max: 1000)`, so no caller can ask for more than this and an
 /// absent `maxResults` cannot serialise the whole store either.
 pub const BLUEPRINT_PAGE_LIMIT: i32 = 1_000;
+
+/// The largest page `ListDataAutomationProjects` serves, and the page size it uses
+/// when the request names no `maxResults`. The same value as
+/// [`BLUEPRINT_PAGE_LIMIT`] because it has the same source: both listings bind
+/// `maxResults` to the one modelled `MaxResults` shape
+/// (`smithy_query(operation="ListDataAutomationProjects")` -> `@range(min: 1, max:
+/// 1000)`), so neither can be asked for more than this and an absent `maxResults`
+/// cannot serialise the whole store either.
+pub const PROJECT_PAGE_LIMIT: i32 = BLUEPRINT_PAGE_LIMIT;
+
+/// The `resourceOwner` value naming the CALLER's own resources, which is what a
+/// listing reports when the request names no owner.
+///
+/// Source: `smithy_query(shape="ResourceOwner")` -> `["SERVICE", "ACCOUNT"]`; every
+/// resource this store holds was created through this service's own create
+/// operations, so it is ACCOUNT-owned.
+pub const RESOURCE_OWNER_ACCOUNT: &str = "ACCOUNT";
+
+/// The wildcard a stage filter takes to mean "every stage", shared by this
+/// service's stage filters: `smithy_query(shape="BlueprintStageFilter")` and
+/// `smithy_query(shape="DataAutomationProjectStageFilter")` both list it beside
+/// `DEVELOPMENT` and `LIVE`.
+pub const STAGE_FILTER_ALL: &str = "ALL";
 
 /// How many blueprints the store holds before `CreateBlueprint` refuses with the
 /// modelled `ServiceQuotaExceededException` (HTTP 402).
@@ -309,6 +334,49 @@ impl DataAutomationProjectRecord {
             kms_encryption_context: self.kms_encryption_context.clone(),
         }
     }
+
+    /// Project the record onto the modeled `DataAutomationProjectSummary` shape that
+    /// `ListDataAutomationProjects` returns.
+    ///
+    /// The summary carries no `status`, so a listing reports nothing a reader would
+    /// have to derive from the clock: `smithy_query(shape=
+    /// "DataAutomationProjectSummary")` is `projectArn`, `projectStage`,
+    /// `projectType`, `projectName` and `creationTime`.
+    pub fn to_summary(&self) -> DataAutomationProjectSummary {
+        DataAutomationProjectSummary {
+            project_arn: self.project_arn.clone(),
+            project_stage: Some(self.project_stage.clone()),
+            project_type: Some(self.project_type.clone()),
+            project_name: Some(self.project_name.clone()),
+            creation_time: self.creation_time,
+        }
+    }
+
+    /// Every blueprint reference this project's configuration carries: the custom
+    /// output configuration's blueprint list and the document fallbacks it names.
+    /// This is what a listing's blueprint filter narrows on — a project "uses" a
+    /// blueprint exactly when its stored configuration references it.
+    pub fn blueprint_references(&self) -> impl Iterator<Item = &BlueprintItem> {
+        let custom = self.custom_output_configuration.as_ref();
+        let direct = custom.and_then(|c| c.blueprints.as_ref());
+        let fallback = custom
+            .and_then(|c| c.document.as_ref())
+            .and_then(|d| d.fallback_blueprints.as_ref());
+        direct
+            .into_iter()
+            .flatten()
+            .chain(fallback.into_iter().flatten())
+    }
+
+    /// Every Data Automation library reference this project's configuration carries.
+    /// This is what a listing's library filter narrows on.
+    pub fn library_references(&self) -> impl Iterator<Item = &DataAutomationLibraryItem> {
+        self.data_automation_library_configuration
+            .as_ref()
+            .and_then(|config| config.libraries.as_ref())
+            .into_iter()
+            .flatten()
+    }
 }
 
 /// One snapshot of a blueprint's schema, taken by `CreateBlueprintVersion`.
@@ -343,16 +411,6 @@ pub struct BlueprintRecord {
 }
 
 impl BlueprintRecord {
-    /// The record's stable sort key: creation time, then ARN. Listing orders by
-    /// this so a page boundary is reproducible across calls.
-    pub fn order_key(&self) -> (i64, u32, &str) {
-        (
-            self.creation_time.secs(),
-            self.creation_time.subsec_nanos(),
-            self.blueprint_arn.as_str(),
-        )
-    }
-
     /// The highest version still stored for this blueprint, if any. This is what
     /// a summary reports; the number the next cut takes is [`Self::next_version`],
     /// which does not move back when a snapshot is released.
@@ -462,9 +520,13 @@ pub struct ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeservic
 impl ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState {
     /// Every stored blueprint in the listing order (`creationTime`, then ARN).
     pub fn blueprints_in_order(&self) -> Vec<&BlueprintRecord> {
-        let mut records: Vec<&BlueprintRecord> = self.blueprints.values().collect();
-        records.sort_by(|a, b| a.order_key().cmp(&b.order_key()));
-        records
+        in_listing_order(self.blueprints.values())
+    }
+
+    /// Every stored DataAutomationProject in the listing order (`creationTime`, then
+    /// ARN) — the order [`in_listing_order`] gives every listing of this service.
+    pub fn projects_in_order(&self) -> Vec<&DataAutomationProjectRecord> {
+        in_listing_order(self.projects.values())
     }
 
     /// Reserve the next blueprint-ARN sequence number, advancing the counter.
@@ -621,28 +683,67 @@ pub fn now_pair() -> (SystemTime, ::aws_smithy_types::DateTime) {
     (at, ::aws_smithy_types::DateTime::from(at))
 }
 
-/// A `ListBlueprints` page cursor: the sort key of the last item the previous
-/// page returned.
+/// A record this service's paginated listings order and page over: a blueprint, a
+/// DataAutomationProject. One order and one cursor for every listing, so two
+/// listings cannot disagree about where a page boundary falls.
+pub trait ListedResource {
+    /// The record's stable sort key: creation time, then ARN. Listings order by
+    /// this so a page boundary is reproducible across calls.
+    fn order_key(&self) -> (i64, u32, &str);
+}
+
+impl ListedResource for BlueprintRecord {
+    fn order_key(&self) -> (i64, u32, &str) {
+        (
+            self.creation_time.secs(),
+            self.creation_time.subsec_nanos(),
+            self.blueprint_arn.as_str(),
+        )
+    }
+}
+
+impl ListedResource for DataAutomationProjectRecord {
+    fn order_key(&self) -> (i64, u32, &str) {
+        (
+            self.creation_time.secs(),
+            self.creation_time.subsec_nanos(),
+            self.project_arn.as_str(),
+        )
+    }
+}
+
+/// Sort the records of one store map into the listing order.
+pub fn in_listing_order<'a, R: ListedResource + 'a>(
+    records: impl Iterator<Item = &'a R>,
+) -> Vec<&'a R> {
+    let mut records: Vec<&R> = records.collect();
+    records.sort_by(|a, b| a.order_key().cmp(&b.order_key()));
+    records
+}
+
+/// A page cursor for one of this service's listings: the sort key of the last item
+/// the previous page returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageCursor {
     pub secs: i64,
     pub subsec_nanos: u32,
-    pub blueprint_arn: String,
+    pub resource_arn: String,
 }
 
 impl PageCursor {
     /// The cursor just after `record`.
-    pub fn after(record: &BlueprintRecord) -> Self {
+    pub fn after<R: ListedResource>(record: &R) -> Self {
+        let (secs, subsec_nanos, resource_arn) = record.order_key();
         Self {
-            secs: record.creation_time.secs(),
-            subsec_nanos: record.creation_time.subsec_nanos(),
-            blueprint_arn: record.blueprint_arn.clone(),
+            secs,
+            subsec_nanos,
+            resource_arn: resource_arn.to_string(),
         }
     }
 
     /// Is `record` strictly after this cursor in the listing order?
-    pub fn precedes(&self, record: &BlueprintRecord) -> bool {
-        record.order_key() > (self.secs, self.subsec_nanos, self.blueprint_arn.as_str())
+    pub fn precedes<R: ListedResource>(&self, record: &R) -> bool {
+        record.order_key() > (self.secs, self.subsec_nanos, self.resource_arn.as_str())
     }
 
     /// Render as an opaque token. Base64 (the codec the wire protocols already
@@ -659,7 +760,7 @@ impl PageCursor {
     pub fn to_token(&self) -> String {
         ::aws_smithy_types::base64::encode(format!(
             "{}:{}:{}",
-            self.secs, self.subsec_nanos, self.blueprint_arn
+            self.secs, self.subsec_nanos, self.resource_arn
         ))
     }
 
@@ -671,14 +772,14 @@ impl PageCursor {
         let mut fields = decoded.splitn(3, ':');
         let secs = fields.next()?.parse().ok()?;
         let subsec_nanos = fields.next()?.parse().ok()?;
-        let blueprint_arn = fields.next()?;
-        if blueprint_arn.is_empty() {
+        let resource_arn = fields.next()?;
+        if resource_arn.is_empty() {
             return None;
         }
         Some(Self {
             secs,
             subsec_nanos,
-            blueprint_arn: blueprint_arn.to_string(),
+            resource_arn: resource_arn.to_string(),
         })
     }
 }
