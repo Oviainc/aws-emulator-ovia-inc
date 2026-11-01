@@ -251,7 +251,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
         // A task a client places belongs to no service, so there is no service tag set to
         // copy to it.
         if input.propagate_tags.as_deref() == Some(crate::state::PROPAGATE_TAGS_SERVICE) {
@@ -305,6 +304,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let cluster_arn = cluster.arn.clone();
+
+        // An entry names an instance by "The container instance ID or full ARN", and the id
+        // either form carries is a UUID, so an id of any other length names no container
+        // instance any account could hold — the entry is refused for its shape, ahead of
+        // being resolved against the cluster the call reached. The WHOLE call is refused:
+        // nothing is placed on the instances the other entries name either.
+        if let Some(message) = crate::state::container_instance_id_length_violation(
+            input.container_instances.iter().map(String::as_str),
+        ) {
+            return Err(StartTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // "If a revision isn't specified, the latest ACTIVE revision is used", and a
         // revision this call NAMES has to be one it may use: "You can't use an INACTIVE

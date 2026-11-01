@@ -233,17 +233,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The short name or full Amazon Resource Name (ARN) of the task set to update" —
-        // either form, and only a task set THIS service holds. A task set a
-        // `DeleteTaskSet` has already taken is not one to modify: the delete has had it,
-        // and the clock is only finishing the drain it started.
-        let Some(key) = guard
+        // either form, and only a task set THIS service holds. The task set is resolved
+        // WHATEVER status it stands in: a task set the store holds is not an absent one,
+        // so what its status does or does not allow is decided after it is found.
+        let Some(task_set) = guard
             .resolve_task_set(&cluster_name, &service_name, &input.task_set)
-            .filter(|task_set| !task_set.is_deleted())
-            .map(crate::state::TaskSetRecord::key)
+            .cloned()
         else {
             return Err(UpdateTaskSetErrorModeled::TaskSetNotFoundException(
                 TaskSetNotFoundException {
-                    message: Some(crate::state::task_set_not_found_message(
+                    message: Some(crate::state::task_set_does_not_exist_message(
                         &input.task_set,
                         &service_name,
                     )),
@@ -251,6 +250,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A task set that is being taken away — the drain a `DeleteTaskSet` or the delete
+        // of its service started — holds no percentage of the service any more, so the
+        // scale this call asks for is a parameter it cannot have, not a resource that is
+        // missing.
+        if let Some(message) = crate::state::task_set_status_not_updatable(&task_set.status) {
+            return Err(UpdateTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        let key = task_set.key();
 
         let updated = match guard.rescale_task_set(&key, &input.scale, &region, now) {
             Ok(Some(updated)) => updated,
@@ -258,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(None) => {
                 return Err(UpdateTaskSetErrorModeled::TaskSetNotFoundException(
                     TaskSetNotFoundException {
-                        message: Some(crate::state::task_set_not_found_message(
+                        message: Some(crate::state::task_set_does_not_exist_message(
                             &input.task_set,
                             &service_name,
                         )),

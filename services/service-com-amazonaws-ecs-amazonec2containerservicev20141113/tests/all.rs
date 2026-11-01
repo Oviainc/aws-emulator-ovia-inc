@@ -125,6 +125,8 @@ mod service_validation;
 mod services_by_namespace;
 #[path = "all/start_task.rs"]
 mod start_task;
+#[path = "all/start_task_container_instance_ids.rs"]
+mod start_task_container_instance_ids;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_set_reads.rs"]
@@ -155,3 +157,5 @@ mod task_set_deletion;
 mod task_sets;
 #[path = "all/task_state_reports.rs"]
 mod task_state_reports;
+#[path = "all/update_task_set_refusals.rs"]
+mod update_task_set_refusals;

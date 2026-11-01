@@ -292,7 +292,7 @@ async fn a_deleted_task_set_drains_away_and_is_then_reported_missing() {
         );
 
         // The drain is UNDER WAY, not done: the task set is still one the service holds,
-        // and a write to it is refused because the delete has already had it.
+        // and a write to it is refused on the status that drain put it in.
         let draining = describe_task_sets(
             &router,
             cluster,
@@ -327,11 +327,11 @@ async fn a_deleted_task_set_drains_away_and_is_then_reported_missing() {
         assert_eq!(
             (code.as_str(), message.as_str()),
             (
-                "TaskSetNotFoundException",
-                format!("Unable to find task set with id {id} on service {service_name}.").as_str()
+                "InvalidParameterException",
+                "Unable to update taskset with status = DRAINING"
             ),
-            "case {case:?}: a deleted task set is not one to update, got {code:?} with \
-             {message:?}"
+            "case {case:?}: a task set that is still there but draining is refused on its \
+             status, not reported absent, got {code:?} with {message:?}"
         );
 
         // The CLOCK finishes the drain, and from there the task set is gone: the request

@@ -1532,6 +1532,38 @@ pub fn task_set_not_found_message(reference: &str, service_name: &str) -> String
     )
 }
 
+/// `TaskSetNotFoundException$message` as `UpdateTaskSet` words the same condition, BUILT
+/// FROM THE REQUEST: Amazon ECS states this refusal per operation, and the sentence this
+/// one carries names the task set first and the service it was looked for in second. The
+/// id is the one the reference named ([`task_set_id_from_reference`]), so an ARN reference
+/// reads as the id it carries.
+pub fn task_set_does_not_exist_message(reference: &str, service_name: &str) -> String {
+    format!(
+        "TaskSet: {} does not exist in Service: {service_name}.",
+        task_set_id_from_reference(reference)
+    )
+}
+
+/// `InvalidParameterException$message` for a write to a task set whose STORED status does
+/// not take one: the status is read from state, so the caller is told which status stopped
+/// the write and can tell "wait for it" from "it is gone".
+pub fn task_set_status_not_updatable_message(status: &str) -> String {
+    format!("Unable to update taskset with status = {status}")
+}
+
+/// Why the task set in `status` cannot be scaled, or `None` when a task set in it can.
+///
+/// `TaskSet$status`: "PRIMARY: The task set is serving production traffic. ACTIVE: The
+/// task set isn't serving production traffic. DRAINING: The tasks in the task set are
+/// being stopped" — a task set in either of the first two is one of the service's
+/// deployment, so an update holds it at the percentage it asks for; a task set that is
+/// being taken away is not one to hold at any percentage, and is still PRESENT, so the
+/// refusal is about the parameter and not about a resource that is absent.
+pub fn task_set_status_not_updatable(status: &str) -> Option<String> {
+    (status != TASK_SET_PRIMARY && status != TASK_SET_ACTIVE)
+        .then(|| task_set_status_not_updatable_message(status))
+}
+
 /// `InvalidParameterException$message` when `DeleteTaskSet` is asked to delete the task
 /// set that is serving the service's production traffic without saying `force`.
 ///
@@ -8978,6 +9010,47 @@ pub fn is_container_instance_id(instance_id: &str) -> bool {
         && instance_id
             .chars()
             .all(|letter| matches!(letter, '0'..='9' | 'a'..='f' | '-'))
+}
+
+/// The two lengths a container-instance id has. An id Amazon ECS mints is a UUID, written
+/// either as the 32 hexadecimal digits alone (the form this store mints, see
+/// `next_container_instance_id`) or as the 36 characters the hyphenated form spells, so a
+/// value of any other length names no container instance of any account.
+pub const CONTAINER_INSTANCE_ID_LENGTHS: [usize; 2] = [32, 36];
+
+/// `InvalidParameterException$message` for a container-instance identifier whose id part
+/// is of neither length [`CONTAINER_INSTANCE_ID_LENGTHS`] holds: the whole sentence is
+/// fixed text, naming the two forms of the id rather than the value the request carried.
+pub fn container_instance_id_length_message() -> String {
+    let lengths: Vec<String> = CONTAINER_INSTANCE_ID_LENGTHS
+        .iter()
+        .map(usize::to_string)
+        .collect();
+    format!("instanceId length should be one of [{}]", lengths.join(","))
+}
+
+/// Whether `instance_id` is of a length a container-instance id has
+/// ([`CONTAINER_INSTANCE_ID_LENGTHS`]).
+pub fn is_container_instance_id_length(instance_id: &str) -> bool {
+    CONTAINER_INSTANCE_ID_LENGTHS.contains(&instance_id.chars().count())
+}
+
+/// The refusal a list of container-instance identifiers earns when one of its entries
+/// carries an id of neither length a container-instance id has, or `None` when every
+/// entry does.
+///
+/// Each entry is reduced to the id it names first ([`container_instance_id_from_reference`]),
+/// since "The container instance ID or full ARN" are both forms a member accepts and the
+/// length belongs to the id either way.
+pub fn container_instance_id_length_violation<'a>(
+    references: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    references
+        .into_iter()
+        .any(|reference| {
+            !is_container_instance_id_length(container_instance_id_from_reference(reference))
+        })
+        .then(container_instance_id_length_message)
 }
 
 /// Whether `principal_arn` is a principal an account setting may be written for, and a
