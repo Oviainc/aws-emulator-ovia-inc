@@ -54,9 +54,9 @@ use super::types::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-verifiedpermissions.json");
 
-/// The operation's MODELED errors. `InternalServerException` is a service-level
-/// error this operation's own `errors` list does not repeat, so it comes in
-/// through `extra_errors`.
+/// The operation's MODELED errors. `InternalServerException` and
+/// `ValidationException` are service-level errors this operation's own `errors`
+/// list does not repeat, so they come in through `extra_errors`.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#DeletePolicyStoreAlias",
     extra_errors = ["InternalServerException", "ValidationException"]

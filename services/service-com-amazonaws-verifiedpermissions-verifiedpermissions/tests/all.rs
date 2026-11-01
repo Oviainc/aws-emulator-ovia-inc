@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alias_name_prefix.rs"]
 mod alias_name_prefix;
+#[path = "all/alias_name_prefix_precedence.rs"]
+mod alias_name_prefix_precedence;
 #[path = "all/alias_region_scope.rs"]
 mod alias_region_scope;
 #[path = "all/batch_get_policy.rs"]
