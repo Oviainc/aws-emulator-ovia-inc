@@ -24,6 +24,13 @@
 #[path = "all/task_delete.rs"]
 mod task_delete;
 
+// `composite_model_property_update` is declared HERE, beside the suite above, for
+// the reason its note gives: the sorted list and the END of this file are both
+// where every concurrent iotsitewise change puts a declaration of its own. Fold it
+// into the list once the churn settles.
+#[path = "all/composite_model_property_update.rs"]
+mod composite_model_property_update;
+
 // `not_found_refusal_families` is declared HERE, beside the suite above, for the
 // reason its note gives: the sorted list and the END of this file are both where
 // every concurrent iotsitewise change puts a declaration of its own. Fold it into

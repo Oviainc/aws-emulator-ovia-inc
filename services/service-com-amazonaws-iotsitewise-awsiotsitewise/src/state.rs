@@ -1395,6 +1395,30 @@ impl AssetRecord {
         }
     }
 
+    /// EVERY place in `properties` the property a `CustomID` label names sits,
+    /// in list order, empty when this asset holds no such property.
+    ///
+    /// A property id names ONE property of an asset — one definition, one time
+    /// series ([`AssetRecord::time_series_properties`]) and one alias binding —
+    /// but the flat list carries one INSTANCE of it per composite model that
+    /// contributes it, because two composite models may reuse the same component
+    /// model and each instance sits under its own path. A write to the property
+    /// therefore lands on every instance of it, so no two views of one asset can
+    /// report different aliases, notification states or units for one property
+    /// id; a read answers from the first ([`AssetRecord::property`]).
+    pub fn property_positions(&self, label: &str) -> Vec<usize> {
+        let Some(first) = self.property_position(label) else {
+            return Vec::new();
+        };
+        let id = self.properties[first].id.as_str();
+        self.properties
+            .iter()
+            .enumerate()
+            .filter(|(_, property)| property.id == id)
+            .map(|(at, _)| at)
+            .collect()
+    }
+
     /// The asset property `label` names, resolved the way every `CustomID` member
     /// is — the same lookup as [`AssetRecord::property_position`], for a caller
     /// that wants the property rather than where it sits.
@@ -4400,15 +4424,22 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         let Some(asset) = self.assets.get_mut(asset_id) else {
             return false;
         };
-        let Some(at) = asset.property_position(property_id) else {
+        // Every instance of the property that id names, so a definition two
+        // composite models contribute cannot end up reporting the binding under
+        // one of them and none under the other: the id names one property and
+        // one stream, hence one binding.
+        let positions = asset.property_positions(property_id);
+        let Some(&first) = positions.first() else {
             return false;
         };
-        let property = &mut asset.properties[at];
+        let property = &asset.properties[first];
         let resolved_property_id = property.id.clone();
         let property_data_type = property.data_type.clone();
         let property_data_type_spec = property.data_type_spec.clone();
-        let previous = property.alias.take();
-        property.alias = alias.clone();
+        let previous = property.alias.clone();
+        for at in positions {
+            asset.properties[at].alias = alias.clone();
+        }
         if previous != alias {
             asset.last_update_date = now;
         }
@@ -4468,8 +4499,11 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                     || held_by_property != resolved_property_id;
                 if displaced {
                     if let Some(asset) = self.assets.get_mut(&held_by_asset) {
-                        if let Some(at) = asset.property_position(&held_by_property) {
-                            asset.properties[at].alias = None;
+                        let positions = asset.property_positions(&held_by_property);
+                        if !positions.is_empty() {
+                            for at in positions {
+                                asset.properties[at].alias = None;
+                            }
                             asset.last_update_date = now;
                         }
                     }

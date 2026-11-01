@@ -251,7 +251,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Both ids are `CustomID`s: a raw id, or `externalId:<externalId>`. The asset
         // resolves through the shared resolver every other handler uses; the property
-        // resolves within that asset's materialised property list.
+        // resolves over EVERY property that asset carries — the ones materialised
+        // from its model's own definitions and the ones the model's composite models
+        // contribute — which is the same lookup every read of an
+        // `(assetId, propertyId)` pair makes, so this write reaches exactly the
+        // property those reads report.
         let asset_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
             not_found(crate::state::asset_not_found_message(&input.asset_id))
         })?;
@@ -351,15 +355,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(asset) = store.assets.get_mut(&asset_id) else {
             return Err(store_moved(&asset_id, &property_id));
         };
-        let Some(at) = asset.property_position(&property_id) else {
+        // Written to EVERY instance of the property that id names: an asset
+        // carries one instance per composite model that contributes the
+        // definition, and the id names one property, so no view of the asset may
+        // report two different notification states or units for it.
+        let positions = asset.property_positions(&property_id);
+        if positions.is_empty() {
             return Err(store_moved(&asset_id, &property_id));
-        };
-        let property = &mut asset.properties[at];
-        property.notification = Some(PropertyNotification {
-            topic,
-            state: notification_state,
-        });
-        property.unit = unit;
+        }
+        for at in positions {
+            let property = &mut asset.properties[at];
+            property.notification = Some(PropertyNotification {
+                topic: topic.clone(),
+                state: notification_state.clone(),
+            });
+            property.unit = unit.clone();
+        }
         // The asset carries the property that just changed, so its last-update
         // instant moves with it. Written here as well as inside the alias helper,
         // because the members above change whether or not the alias binding does.
