@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLoadBalancerPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLoadBalancerPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists one policy on the load balancer the request names, under the
+//! `PolicyName` it names, of the base policy type it names and carrying the attributes it
+//! carries. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLoadBalancerPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What this call persists is read back through `DescribeLoadBalancers`, which reports a
+//! policy created here under the load balancer's `Policies.OtherPolicies` — "the policies
+//! other than the stickiness policies".
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLoadBalancerPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLoadBalancerPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLoadBalancerPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation's model declares no server-fault error, and a 501 would
+            // claim "not implemented", so an unreachable store is refused instead.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+        let region = crate::state::region_from_request(ctx.parts());
+
+        // "Policy names must consist of alphanumeric characters and dashes (-)" — a rule
+        // `PolicyName` documents rather than models, enforced through the helper every
+        // policy-creating operation shares.
+        if let Err(why) = crate::state::policy_name_rejection(&input.policy_name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(why));
+        }
+
+        // "The name of the base policy type": a policy type is the service's own
+        // resource, so a name no predefined policy type carries is this operation's
+        // policy-type failure rather than something to store. The refusal names the
+        // resource kind and the name the caller has to fix, as this service states a
+        // named resource it does not hold.
+        if !crate::state::is_known_policy_type(&input.policy_type_name) {
+            return Err(
+                CreateLoadBalancerPolicyErrorModeled::PolicyTypeNotFoundException(
+                    PolicyTypeNotFoundException {
+                        message: Some(format!(
+                            "There is no LoadBalancerPolicyType named '{}'",
+                            input.policy_type_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The attributes the policy is stored with, bounded before they are read so the
+        // work and the state one request can grow are bounded by a constant rather than
+        // by the caller.
+        let requested_attributes = input.policy_attributes.as_deref().unwrap_or_default();
+        if requested_attributes.len() > crate::state::MAX_POLICY_ATTRIBUTES_PER_POLICY {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "PolicyAttributes must carry at most {} attributes; got {}",
+                crate::state::MAX_POLICY_ATTRIBUTES_PER_POLICY,
+                requested_attributes.len()
+            )));
+        }
+        let mut attributes: Vec<crate::state::PolicyAttributeEntry> =
+            Vec::with_capacity(requested_attributes.len());
+        for attribute in requested_attributes {
+            // "The name of the attribute": an attribute carrying none names nothing the
+            // policy could be configured by, and the model constrains neither member.
+            let Some(name) = attribute
+                .attribute_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+            else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "PolicyAttributes.member.AttributeName must be a non-empty attribute \
+                     name"
+                        .to_string(),
+                ));
+            };
+            attributes.push(crate::state::PolicyAttributeEntry {
+                name: name.to_string(),
+                value: attribute.attribute_value.clone(),
+            });
+        }
+
+        let mut guard = state.lock();
+        // A load balancer is a regional resource, so the name is resolved in the region
+        // this request is signed for; a name no record holds there is not found.
+        let Some(record) = guard
+            .load_balancers_in_mut(&region)
+            .and_then(|records| records.get_mut(&input.load_balancer_name))
+        else {
+            return Err(
+                CreateLoadBalancerPolicyErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{}'",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "This name must be unique within the set of policies for this load balancer":
+        // the name is taken by ANY policy of this load balancer, whatever created it, and
+        // a request that repeats a taken name is this conflict rather than a no-op.
+        if record.policies.contains_key(&input.policy_name) {
+            return Err(
+                CreateLoadBalancerPolicyErrorModeled::DuplicatePolicyNameException(
+                    DuplicatePolicyNameException {
+                        message: Some(crate::state::duplicate_policy_name_message(
+                            &input.policy_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if record.policies.len() >= crate::state::MAX_POLICIES_PER_LOAD_BALANCER {
+            return Err(
+                CreateLoadBalancerPolicyErrorModeled::TooManyPoliciesException(
+                    TooManyPoliciesException {
+                        message: Some(format!(
+                            "Load Balancer '{}' already holds the maximum of {} policies",
+                            input.load_balancer_name,
+                            crate::state::MAX_POLICIES_PER_LOAD_BALANCER
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        record.policies.insert(
+            input.policy_name.clone(),
+            crate::state::PolicyRecord {
+                name: input.policy_name.clone(),
+                kind: crate::state::PolicyKind::Other {
+                    policy_type_name: input.policy_type_name.clone(),
+                    attributes,
+                },
+            },
+        );
+
+        // The modelled output carries no members: what this call persisted is read back
+        // through `DescribeLoadBalancers`, which reports the stored policy's name under
+        // the load balancer's `Policies.OtherPolicies`.
+        Ok(CreateLoadBalancerPolicyOutput {})
     }
 }

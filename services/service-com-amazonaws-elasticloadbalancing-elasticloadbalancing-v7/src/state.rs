@@ -376,7 +376,68 @@ pub enum PolicyKind {
     /// whose cookie goes stale after `cookie_expiration_period` seconds — 0 meaning "the
     /// duration of the browser session", the documented default.
     LbCookieStickiness { cookie_expiration_period: i64 },
+    /// Created by `CreateAppCookieStickinessPolicy`: application-controlled session
+    /// stickiness, whose sticky session follows the application cookie named by
+    /// `cookie_name` ("The name of the application cookie used for stickiness").
+    AppCookieStickiness { cookie_name: String },
+    /// Created by `CreateLoadBalancerPolicy`: a policy of one of the policy types this
+    /// service predefines ([`POLICY_TYPE_NAMES`]), carrying the attributes the create
+    /// named. `Policies$OtherPolicies` is "the policies other than the stickiness
+    /// policies", and the two stickiness members are the policies created by the two
+    /// stickiness operations, so a policy stored under this variant is one a describe
+    /// reports there.
+    Other {
+        policy_type_name: String,
+        attributes: Vec<PolicyAttributeEntry>,
+    },
 }
+
+/// One attribute of a stored policy, as `PolicyAttribute` carries it: "The name of the
+/// attribute" and "The value of the attribute", the value left unreported where the
+/// request named none.
+///
+/// Persisted by `CreateLoadBalancerPolicy` so the policy a caller created is stored whole
+/// — which is what `DescribeLoadBalancerPolicies` reports as a policy's
+/// `PolicyAttributeDescriptions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyAttributeEntry {
+    pub name: String,
+    pub value: Option<String>,
+}
+
+/// The policy types Elastic Load Balancing predefines for a Classic load balancer — the
+/// `PolicyTypeName`s `DescribeLoadBalancerPolicyTypes` reports and
+/// `CreateLoadBalancerPolicy` accepts as "the name of the base policy type".
+///
+/// Source: the policy types the Classic Load Balancer documentation publishes for that
+/// operation (application- and duration-based stickiness, back-end server
+/// authentication, public key, SSL negotiation and Proxy Protocol). The model declares
+/// `PolicyTypeName` a plain string with no enum, so nothing has refused a name no policy
+/// type carries by the time a handler runs; [`is_known_policy_type`] is that rule.
+pub const POLICY_TYPE_NAMES: &[&str] = &[
+    "AppCookieStickinessPolicyType",
+    "BackendServerAuthenticationPolicyType",
+    "LBCookieStickinessPolicyType",
+    "ProxyProtocolPolicyType",
+    "PublicKeyPolicyType",
+    "SSLNegotiationPolicyType",
+];
+
+/// Whether `policy_type_name` names one of the policy types this service predefines.
+///
+/// A policy's base type is the service's own, not the caller's: a create naming a type
+/// outside [`POLICY_TYPE_NAMES`] earns `PolicyTypeNotFoundException`.
+pub fn is_known_policy_type(policy_type_name: &str) -> bool {
+    POLICY_TYPE_NAMES.contains(&policy_type_name)
+}
+
+/// The largest `PolicyAttributes` list one `CreateLoadBalancerPolicy` request may carry.
+///
+/// AWS publishes no quota for the member, so this is a bound the emulator chooses: it
+/// keeps the state one request can grow finite while staying comfortably above the
+/// attribute count of the largest predefined policy type, whose protocol and cipher
+/// attributes a caller sets one per attribute.
+pub const MAX_POLICY_ATTRIBUTES_PER_POLICY: usize = 200;
 
 /// One policy of a load balancer, as a policy-creating operation persists it and
 /// `DescribeLoadBalancers` reports it.
@@ -412,6 +473,17 @@ pub fn policy_name_rejection(name: &str) -> Result<(), String> {
         )),
         None => Ok(()),
     }
+}
+
+/// How this service states `DuplicatePolicyNameException` — "A policy with the specified
+/// name already exists for this load balancer" — naming the policy name the caller has to
+/// change.
+///
+/// Here, once, because a policy name is unique across the WHOLE policy set of one load
+/// balancer: every policy-creating operation refuses a taken name, and all of them state
+/// that refusal the same way.
+pub fn duplicate_policy_name_message(policy_name: &str) -> String {
+    format!("Policy Name [{policy_name}] already exists.")
 }
 
 /// A load balancer's health-check configuration.

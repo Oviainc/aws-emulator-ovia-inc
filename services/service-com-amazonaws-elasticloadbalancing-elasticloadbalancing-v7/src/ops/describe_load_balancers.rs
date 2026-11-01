@@ -252,6 +252,13 @@ const DEFAULT_PAGE_SIZE: i32 = 400;
 
 /// Project a record's stored policies onto the modelled `Policies`.
 ///
+/// EVERY policy the record holds is reported, each in the member whose documentation
+/// names the operation that created it: `LBCookieStickinessPolicies` is "the stickiness
+/// policies created using CreateLBCookieStickinessPolicy", `AppCookieStickinessPolicies`
+/// the ones created using `CreateAppCookieStickinessPolicy`, and `OtherPolicies` "the
+/// policies other than the stickiness policies" — the ones `CreateLoadBalancerPolicy`
+/// created, reported by name because `OtherPolicies` targets the `PolicyNames` list.
+///
 /// Each list is reported in `PolicyName` order (the store's own key order), and every
 /// member is reported — as an empty list where the record holds no policy of that kind —
 /// because AWS reports the structure for every load balancer. The `match` is exhaustive
@@ -259,25 +266,30 @@ const DEFAULT_PAGE_SIZE: i32 = 400;
 /// which list it belongs in.
 fn policies(record: &crate::state::LoadBalancer) -> Policies {
     let mut lb_cookie_stickiness: Vec<LBCookieStickinessPolicy> = Vec::new();
+    let mut app_cookie_stickiness: Vec<AppCookieStickinessPolicy> = Vec::new();
+    let mut other_policies: Vec<String> = Vec::new();
     for policy in record.policies.values() {
-        match policy.kind {
+        match &policy.kind {
             crate::state::PolicyKind::LbCookieStickiness {
                 cookie_expiration_period,
             } => lb_cookie_stickiness.push(LBCookieStickinessPolicy {
                 policy_name: Some(policy.name.clone()),
-                cookie_expiration_period: Some(cookie_expiration_period),
+                cookie_expiration_period: Some(*cookie_expiration_period),
             }),
+            crate::state::PolicyKind::AppCookieStickiness { cookie_name } => {
+                app_cookie_stickiness.push(AppCookieStickinessPolicy {
+                    policy_name: Some(policy.name.clone()),
+                    cookie_name: Some(cookie_name.clone()),
+                })
+            }
+            crate::state::PolicyKind::Other { .. } => other_policies.push(policy.name.clone()),
         }
     }
 
     Policies {
-        // `CreateAppCookieStickinessPolicy` is still a scaffold, so no record holds an
-        // application-controlled stickiness policy yet.
-        app_cookie_stickiness_policies: Some(Vec::new()),
+        app_cookie_stickiness_policies: Some(app_cookie_stickiness),
         lb_cookie_stickiness_policies: Some(lb_cookie_stickiness),
-        // "The policies other than the stickiness policies": `CreateLoadBalancerPolicy`
-        // is still a scaffold, so no record holds one.
-        other_policies: Some(Vec::new()),
+        other_policies: Some(other_policies),
     }
 }
 

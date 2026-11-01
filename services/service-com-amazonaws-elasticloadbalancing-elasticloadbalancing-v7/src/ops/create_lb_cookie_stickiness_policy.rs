@@ -209,9 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateLBCookieStickinessPolicyErrorModeled::DuplicatePolicyNameException(
                     DuplicatePolicyNameException {
-                        message: Some(format!(
-                            "Load Balancer '{}' already holds a policy named '{}'",
-                            input.load_balancer_name, input.policy_name
+                        message: Some(crate::state::duplicate_policy_name_message(
+                            &input.policy_name,
                         )),
                     },
                 )

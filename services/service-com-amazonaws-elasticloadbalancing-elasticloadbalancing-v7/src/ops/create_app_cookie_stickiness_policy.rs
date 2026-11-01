@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAppCookieStickinessPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAppCookieStickinessPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists one application-controlled stickiness policy on the load
+//! balancer the request names, under the `PolicyName` it names, following the application
+//! cookie its `CookieName` names. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAppCookieStickinessPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What this call persists is read back through `DescribeLoadBalancers`, which reports it
+//! under the load balancer's `Policies.AppCookieStickinessPolicies` — "the stickiness
+//! policies created using CreateAppCookieStickinessPolicy".
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +151,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAppCookieStickinessPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppCookieStickinessPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAppCookieStickinessPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation's model declares no server-fault error, and a 501 would
+            // claim "not implemented", so an unreachable store is refused instead.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+        let region = crate::state::region_from_request(ctx.parts());
+
+        // "Policy names must consist of alphanumeric characters and dashes (-)" — a rule
+        // `PolicyName` documents rather than models, enforced through the helper every
+        // policy-creating operation shares.
+        if let Err(why) = crate::state::policy_name_rejection(&input.policy_name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(why));
+        }
+
+        // "The name of the application cookie used for stickiness": the sticky session
+        // follows THAT cookie, so an empty name names no cookie to follow. The model
+        // declares the member a plain required string, so nothing has refused it yet.
+        if input.cookie_name.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "CookieName must name the application cookie the stickiness follows"
+                    .to_string(),
+            ));
+        }
+
+        let mut guard = state.lock();
+        // A load balancer is a regional resource, so the name is resolved in the region
+        // this request is signed for; a name no record holds there is not found.
+        let Some(record) = guard
+            .load_balancers_in_mut(&region)
+            .and_then(|records| records.get_mut(&input.load_balancer_name))
+        else {
+            return Err(
+                CreateAppCookieStickinessPolicyErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{}'",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "This name must be unique within the set of policies for this load balancer":
+        // the name is taken by ANY policy of this load balancer, whatever created it, and
+        // a request that repeats a taken name is this conflict rather than a no-op.
+        if record.policies.contains_key(&input.policy_name) {
+            return Err(
+                CreateAppCookieStickinessPolicyErrorModeled::DuplicatePolicyNameException(
+                    DuplicatePolicyNameException {
+                        message: Some(crate::state::duplicate_policy_name_message(
+                            &input.policy_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if record.policies.len() >= crate::state::MAX_POLICIES_PER_LOAD_BALANCER {
+            return Err(
+                CreateAppCookieStickinessPolicyErrorModeled::TooManyPoliciesException(
+                    TooManyPoliciesException {
+                        message: Some(format!(
+                            "Load Balancer '{}' already holds the maximum of {} policies",
+                            input.load_balancer_name,
+                            crate::state::MAX_POLICIES_PER_LOAD_BALANCER
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        record.policies.insert(
+            input.policy_name.clone(),
+            crate::state::PolicyRecord {
+                name: input.policy_name.clone(),
+                kind: crate::state::PolicyKind::AppCookieStickiness {
+                    cookie_name: input.cookie_name.clone(),
+                },
+            },
+        );
+
+        // The modelled output carries no members: what this call persisted is read back
+        // through `DescribeLoadBalancers`, which reports the stored policy under the load
+        // balancer's `Policies.AppCookieStickinessPolicies`.
+        Ok(CreateAppCookieStickinessPolicyOutput {})
     }
 }
