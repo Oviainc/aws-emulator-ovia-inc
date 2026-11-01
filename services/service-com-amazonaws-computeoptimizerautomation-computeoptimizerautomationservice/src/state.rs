@@ -790,6 +790,19 @@ pub fn caller_identity_arn<Eng: Send + Sync + 'static>(
 pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
     "The request tied to this token is different!";
 
+/// The message every `IdempotencyTokenInUseException` of this service carries —
+/// the sentence the shape itself documents
+/// (`smithy_query(query="shape",shape="IdempotencyTokenInUseException")`),
+/// FIXED and derived from nothing in the request.
+///
+/// The ledger is service-wide, so this is the other outcome of a token already
+/// spent ([`TokenOutcome::TokenInUse`]) beside
+/// [`IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE`]: every operation of this service
+/// that accepts a `clientToken` words that refusal from here, so the body a
+/// caller parses is the same whichever operation first claimed the token and
+/// whichever one re-presents it.
+pub const IDEMPOTENCY_TOKEN_IN_USE_MESSAGE: &str = "The specified client token is already in use.";
+
 /// The `InvalidParameterValueException` message for a request whose
 /// `ruleRevision` is not the rule's current one.
 ///
@@ -818,6 +831,20 @@ pub fn tag_limit_exceeded_message() -> String {
 /// account id the request carried.
 pub fn account_limit_exceeded_message() -> String {
     format!("The request would exceed the limit of {MAX_ENROLLED_ACCOUNTS} accounts")
+}
+
+/// The `ServiceQuotaExceededException` message for a create that would leave
+/// `account_id` holding more than [`MAX_RULES_PER_ACCOUNT`] automation rules.
+///
+/// States the BOUND, which is the one fact a caller past it needs, and the
+/// account the quota is counted per — the caller's own account, which is what
+/// makes the bound actionable when the same credentials automate several of
+/// them. It echoes nothing the request carried.
+pub fn rule_quota_exceeded_message(account_id: &str) -> String {
+    format!(
+        "The request would exceed the quota of {MAX_RULES_PER_ACCOUNT} automation rules for \
+         account {account_id}."
+    )
 }
 
 /// The `EnrollmentStatus` values `UpdateEnrollmentConfiguration` accepts from a

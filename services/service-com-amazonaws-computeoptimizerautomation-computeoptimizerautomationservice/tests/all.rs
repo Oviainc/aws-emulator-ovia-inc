@@ -119,6 +119,8 @@ mod rule_projection;
 mod rule_value_validation;
 #[path = "all/schedule_expression_forms.rs"]
 mod schedule_expression_forms;
+#[path = "all/shared_error_wording.rs"]
+mod shared_error_wording;
 #[path = "all/shared_page_walk.rs"]
 mod shared_page_walk;
 #[path = "all/state_roundtrip.rs"]

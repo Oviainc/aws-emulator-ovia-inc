@@ -308,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateAutomationRuleErrorModeled::IdempotencyTokenInUseException(
                         IdempotencyTokenInUseException {
-                            message: Some("The specified client token is already in use.".into()),
+                            message: Some(crate::state::IDEMPOTENCY_TOKEN_IN_USE_MESSAGE.into()),
                         },
                     )
                     .into(),
@@ -324,11 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateAutomationRuleErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "The request would exceed the quota of {} automation rules for \
-                             account {account_id}.",
-                            crate::state::MAX_RULES_PER_ACCOUNT
-                        )),
+                        message: Some(crate::state::rule_quota_exceeded_message(&account_id)),
                     },
                 )
                 .into(),

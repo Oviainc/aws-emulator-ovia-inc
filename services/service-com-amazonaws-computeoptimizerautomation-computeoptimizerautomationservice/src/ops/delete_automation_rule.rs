@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenOutcome::TokenInUse => {
                 return Err(DeleteAutomationRuleErrorModeled::IdempotencyTokenInUseException(
                     IdempotencyTokenInUseException {
-                        message: Some("The specified client token is already in use.".into()),
+                        message: Some(crate::state::IDEMPOTENCY_TOKEN_IN_USE_MESSAGE.into()),
                     },
                 )
                 .into());
