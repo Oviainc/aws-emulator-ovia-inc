@@ -1,0 +1,46 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: firehose__kinesis__s3.cfn-deploy-kinesis-firehose-s3-stack-positive firehose__kinesis__s3.cfn-firehose-role-trust-policy-from-template-positive firehose__kinesis__s3.cfn-stack-update-firehose-s3-prefix-positive firehose__kinesis__s3.cfn-deploy-firehose-missing-s3-permission-negative
+Issue-Key: firehose__kinesis__s3.cfn-deploy-kinesis-firehose-s3-stack-positive|_poll_until#13|Timeout|last = probe()
+Issue-Key: firehose__kinesis__s3.cfn-firehose-role-trust-policy-from-template-positive|_poll_until#28|Timeout|last = probe()
+Issue-Key: firehose__kinesis__s3.cfn-stack-update-firehose-s3-prefix-positive|_poll_until#10|Timeout|last = probe()
+Issue-Key: firehose__kinesis__s3.cfn-deploy-firehose-missing-s3-permission-negative|_poll_until#15|Timeout|last = probe()
+Issue-Commit: 82a9e97b43fb811c245308aabae5044dc3bd73ae
+
+# firehose__kinesis__s3: CloudFormation-deployed Kinesis→Firehose→S3 stacks never deliver a record (positive, trust-policy, prefix-update and missing-permission variants all stall)
+
+> _Note: this issue was identified against the code base at commit `82a9e97b43fb811c245308aabae5044dc3bd73ae`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateDeliveryStream
+
+## Description
+One net-new root cause, grounded in four failing checks that the replay report did NOT mark as owned or already-filed.
+
+Related open issue: 20261029T175617Z-firehose-kinesis-s3-4-net-new-root-causes.md describes this same family (its Cause 2) but the replay no longer binds these four checks to it — the suite reports them as unowned failures, so they are filed here with their current replay keys. Also related, and not covering them: 20261026T074043Z-firehose-kinesis-s3-a-kinesisstreamassource-delivery-stream-never.md (API-driven KDS source ingestion).
+
+=== Cause 1 of 1: a CloudFormation-provisioned AWS::KinesisFirehose::DeliveryStream with KinesisStreamAsSource has no live data path, so no record put to the stack's Kinesis stream ever becomes an S3 object, and a stack UPDATE of the destination Prefix has no observable effect ===
+AWS: recorded behavior only for the data path (Smithy models the control plane: CreateDeliveryStream accepts KinesisStreamSourceConfiguration and (Extended)S3DestinationConfiguration and errors only with InvalidArgumentException/InvalidKMSResourceException/LimitExceededException/ResourceInUseException, all HTTP 400; DescribeDeliveryStream returns DeliveryStreamDescription with Source.KinesisStreamSourceDescription and Destinations[].S3DestinationDescription). AWS behavior the recordings show: a stack declaring AWS::Kinesis::Stream, AWS::S3::Bucket, AWS::Logs::LogGroup/LogStream, AWS::IAM::Role (trusting firehose.amazonaws.com, Action sts:AssumeRole, with the kinesis read actions and s3:PutObject) and AWS::KinesisFirehose::DeliveryStream reaches CREATE_COMPLETE with a WORKING data path — DescribeDeliveryStream reports DeliveryStreamStatus ACTIVE and the role ARNs CFN wired in, a kinesis:PutRecord payload appears, after the BufferingHints window (IntervalInSeconds 60 / SizeInMBs 1), as an object under the configured Prefix; after an UpdateStack that changes the Prefix parameter, subsequent records land under the NEW prefix and not the old one; and the sibling stream whose role omits s3:PutObject delivers nothing and instead gets a Firehose delivery-error log event in its CloudWatch log stream whose JSON carries "errorCode":"S3.AccessDenied" (fixed text; the log group/stream names and the record markers are values from the stack and the request).
+Emulator: all four variants poll the destination bucket and are killed at the harness budget (`Error: Check timed out after 60.0s`) with nothing ever delivered — the plain positive deploy, the trust-policy-from-template positive, the prefix-update positive, and the missing-s3:PutObject negative (whose POSITIVE control, the fully-permissioned sibling stream in the same stack, also never delivers, so the negative can prove nothing either). No verdict is ever produced; the stream exists in the control plane but nothing reads the source stream and nothing writes to S3, and no S3.AccessDenied delivery-error event is emitted to CloudWatch Logs for the under-permissioned sibling.
+Why: an IaC pipeline validated against the emulator is told its stack is healthy while the Kinesis→Firehose→S3 data path is dead: records are silently lost, a Prefix change cannot be verified, and the diagnostic a client relies on to detect a missing s3:PutObject (the S3.AccessDenied delivery error in CloudWatch Logs) never appears. Clients also hang rather than fail, because the resource reports ACTIVE.
+Fix: the CloudFormation resource provider for AWS::KinesisFirehose::DeliveryStream (create and update of KinesisStreamSourceConfiguration and the S3 destination configuration) must register the created/updated stream with the Firehose ingestion and delivery workers, and those workers must consume the source Kinesis stream, authorize the destination RoleARN against S3 before the PutObject, write under the CURRENT destination Prefix, and emit the delivery-error event (errorCode S3.AccessDenied) to the configured CloudWatchLoggingOptions log stream when the role is not authorized.
+Traces: firehose__kinesis__s3.cfn-deploy-kinesis-firehose-s3-stack-positive, firehose__kinesis__s3.cfn-firehose-role-trust-policy-from-template-positive, firehose__kinesis__s3.cfn-stack-update-firehose-s3-prefix-positive, firehose__kinesis__s3.cfn-deploy-firehose-missing-s3-permission-negative.
+
+## Evidence
+Cause 1 — all four checks report the same failure mode, `Error: Check timed out after 60.0s`, while polling the destination S3 prefix for a marker put to the stack's Kinesis stream:
+
+- firehose__kinesis__s3.cfn-deploy-kinesis-firehose-s3-stack-positive — after CREATE_COMPLETE, DescribeDeliveryStream must report ACTIVE and `_poll_until(_find_marker_in_bucket(bucket, "records/", marker), timeout_s=240)` must find the marker. Expected: the PutRecord payload present in an object under records/. Actual: no object under records/ ever; the check is killed at 60 s.
+- firehose__kinesis__s3.cfn-firehose-role-trust-policy-from-template-positive — same poll under records/ via the CFN-created role (trust statement Effect=Allow, Principal.Service=firehose.amazonaws.com, Action=["sts:AssumeRole"]). Expected: marker delivered via that role. Actual: timed out at 60 s with the prefix empty.
+- firehose__kinesis__s3.cfn-stack-update-firehose-s3-prefix-positive — deploy with S3Prefix="before/", PutRecord, poll before/; then UpdateStack with S3Prefix="after/", PutRecord, poll after/, and assert the post-update marker is ABSENT under before/. Expected: before/ then after/ receive their respective markers. Actual: timed out at 60 s; nothing delivered, so the prefix change is unobservable.
+- firehose__kinesis__s3.cfn-deploy-firehose-missing-s3-permission-negative — the GoodRole/GoodDeliveryStream (good/ prefix) positive control is polled first to calibrate latency, then bad/ must stay empty, then the BadLogStream must contain an event matching `"errorCode"\s*:\s*"([^"]+)"` equal to `S3.AccessDenied`. Expected: good/ receives its marker, bad/ stays empty, and the CloudWatch log event names errorCode S3.AccessDenied. Actual: the positive control never delivers, so the check times out at 60 s before the absence window or the error-code assertion is ever reached, and no delivery-error event is logged.
+
+Note: the 60 s value is the harness budget for this run, not a requirement; the requirement is that delivery occurs within the stream's buffering window.
+
+## Steps to Reproduce
+1. Clone the repo and boot the emulator (run_behavioral_suite).
+2. CreateStack with a template containing: AWS::Kinesis::Stream (ShardCount 1), AWS::S3::Bucket, AWS::Logs::LogGroup + two AWS::Logs::LogStream, two AWS::IAM::Role trusting firehose.amazonaws.com via sts:AssumeRole (one with the kinesis read actions + full S3 actions including s3:PutObject, one identical but WITHOUT s3:PutObject), and two AWS::KinesisFirehose::DeliveryStream resources of DeliveryStreamType KinesisStreamAsSource, each with KinesisStreamSourceConfiguration (Fn::GetAtt SourceStream.Arn + its role) and S3DestinationConfiguration (bucket ARN, Prefix good/ resp. bad/, BufferingHints IntervalInSeconds 60 / SizeInMBs 1, CloudWatchLoggingOptions enabled). Capabilities CAPABILITY_IAM, CAPABILITY_NAMED_IAM. Wait for CREATE_COMPLETE.
+3. DescribeDeliveryStream on the good stream: status is ACTIVE and the Source/Destination RoleARNs match the stack's role ARN.
+4. kinesis PutRecord a unique marker payload to the stack's stream, then ListObjectsV2/GetObject under the good/ (or records/) prefix — nothing ever arrives, for as long as you poll.
+5. GetLogEvents on the bad stream's CloudWatch log stream — no event carrying "errorCode":"S3.AccessDenied" is ever written, even though BadRole lacks s3:PutObject.
+6. UpdateStack changing the destination Prefix parameter (before/ -> after/), PutRecord again, and poll both prefixes — both stay empty, so the update's effect cannot be observed.
