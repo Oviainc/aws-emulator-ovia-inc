@@ -221,10 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // same answer `CreateSubnet` gives an IPv4 block outside the published subnet
             // block size — and it is worded at the one site for that code.
             Err(state::CidrProblem::PrefixLength) => {
-                return Err(state::invalid_subnet_range(
-                    requested_cidr,
-                    state::SubnetRangeProblem::Ipv6BlockSize,
-                ))
+                return Err(state::invalid_subnet_range(requested_cidr))
             }
         };
 
@@ -273,10 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
             })
         else {
-            return Err(state::invalid_subnet_range(
-                &ipv6_cidr_block,
-                state::SubnetRangeProblem::OutsideVpc(&vpc_id),
-            ));
+            return Err(state::invalid_subnet_range(requested_cidr));
         };
         let ipv6_address_attribute = vpc_association.ipv6_address_attribute.clone();
         let ip_source = vpc_association.ip_source.clone();
@@ -284,11 +278,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "A subnet CIDR block must not overlap the CIDR block of an existing subnet in
         // the VPC" (`CreateSubnet`) — the conflict is per VPC and per family, so the same
         // block under another VPC is not one.
-        if let Some(conflicting) = store
+        let conflicts = store
             .subnets
-            .iter()
-            .filter(|(_, subnet)| subnet.vpc_id.as_deref() == Some(vpc_id.as_str()))
-            .find(|(_, subnet)| {
+            .values()
+            .filter(|subnet| subnet.vpc_id.as_deref() == Some(vpc_id.as_str()))
+            .any(|subnet| {
                 subnet
                     .ipv6_cidr_block_association_set
                     .iter()
@@ -306,13 +300,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .filter_map(|association| association.ipv6_cidr_block.as_deref())
                     .any(|held| state::ipv6_cidr_blocks_overlap(held, &ipv6_cidr_block))
-            })
-            .map(|(subnet_id, _)| subnet_id.clone())
-        {
-            return Err(state::invalid_subnet_conflict(
-                &ipv6_cidr_block,
-                &conflicting,
-            ));
+            });
+        if conflicts {
+            // The block the REQUEST asked for: the canonical form above is what the store
+            // compares and keeps.
+            return Err(state::invalid_subnet_conflict(requested_cidr));
         }
 
         // How many association records this store keeps for one subnet is a ceiling of the

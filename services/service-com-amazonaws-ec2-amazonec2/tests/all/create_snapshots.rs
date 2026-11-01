@@ -945,18 +945,20 @@ async fn a_request_that_cannot_be_served_is_refused_and_stores_nothing() {
         );
     }
 
-    // The refusal of an unresolvable instance id names the id the request sent, so the
-    // caller can tell which one it was.
-    let (_, body) = op(
-        &router,
-        "CreateSnapshots",
-        &instance_spec(UNKNOWN_INSTANCE_ID),
-    )
-    .await;
-    assert!(
-        error_message(&body).contains(UNKNOWN_INSTANCE_ID),
-        "the refusal names the instance id the request sent, got {body}"
-    );
+    // This operation words EVERY instance id it cannot resolve the one way: the fixed
+    // sentence that reports the id could not be read, which names no value at all — so a
+    // well-formed id the account holds no instance for gets exactly the same answer as a
+    // value outside the id form.
+    let unreadable = "Unable to unobfuscate ID.";
+    for id in [UNKNOWN_INSTANCE_ID, "not-an-instance", "i-00000000000000000"] {
+        let (_, body) = op(&router, "CreateSnapshots", &instance_spec(id)).await;
+        assert_eq!(
+            error_message(&body),
+            unreadable,
+            "case {id:?}: expected the operation's one sentence for an id it cannot resolve, \
+             got {body}"
+        );
+    }
 
     // Once the request is one this emulator CAN serve, the same instance is snapshotted.
     let (status, body) = op(&router, "CreateSnapshots", &instance_spec(&instance_id)).await;

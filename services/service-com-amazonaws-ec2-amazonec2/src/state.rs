@@ -12860,6 +12860,18 @@ pub fn invalid_security_group_rule_id_not_found<E>(
 /// real id is always named in full.
 pub const MAX_ECHOED_COIP_POOL_ID_CHARS: usize = 128;
 
+/// A `CoipPoolId` from the REQUEST as a refusal may name it: its first
+/// [`MAX_ECHOED_COIP_POOL_ID_CHARS`] characters.
+///
+/// The ONE place this surface's id is cut down to length, so both sentences it is quoted in
+/// bound the echo the same way.
+fn echoed_pool_id(pool_id: &str) -> String {
+    pool_id
+        .chars()
+        .take(MAX_ECHOED_COIP_POOL_ID_CHARS)
+        .collect()
+}
+
 /// The sentence EC2's customer-owned-IP surface answers for a `CoipPoolId` it could not
 /// resolve to a pool of the account.
 ///
@@ -12869,11 +12881,17 @@ pub const MAX_ECHOED_COIP_POOL_ID_CHARS: usize = 128;
 /// built from the request, and only the first [`MAX_ECHOED_COIP_POOL_ID_CHARS`] characters
 /// of it are named.
 pub fn coip_pool_does_not_exist_message(pool_id: &str) -> String {
-    let echoed: String = pool_id
-        .chars()
-        .take(MAX_ECHOED_COIP_POOL_ID_CHARS)
-        .collect();
-    format!("The pool ID '{echoed}' does not exist.")
+    format!("The pool ID '{}' does not exist.", echoed_pool_id(pool_id))
+}
+
+/// The sentence the same surface answers for a value that is no `CoipPoolId` at all: this
+/// class's verdict about the id the request sent, in the shape
+/// [`coip_pool_does_not_exist_message`] words its own.
+///
+/// The id and nothing else: the form a pool id has is not part of what the service sends
+/// back for a value outside it.
+pub fn coip_pool_id_is_invalid_message(pool_id: &str) -> String {
+    format!("The pool ID '{}' is invalid.", echoed_pool_id(pool_id))
 }
 
 /// Refuse a request that named an address-pool id no pool of the account has, the way
@@ -12927,15 +12945,16 @@ pub fn coip_pool_id_does_not_exist<E>(pool_id: &str) -> crate::scaffolded::Scaff
 ///
 /// The form itself is [`coip_pool_id_is_well_formed`], so the one reader of the id decides
 /// what a pool id is and this function only words the refusal.
+///
+/// An address pool is one of the kinds this service words with a sentence of its OWN rather
+/// than out of the shared [`invalid_id_message`] template — the surface's
+/// [`coip_pool_id_is_invalid_message`], which names the pool id from the request and nothing
+/// about the form that was expected.
 pub fn invalid_pool_id_malformed<E>(pool_id: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_POOL_ID_MALFORMED,
         400,
-        format!(
-            "{}. A customer-owned address pool id is '{COIP_POOL_ID_PREFIX}' followed by \
-             8 or 17 hexadecimal digits",
-            invalid_id_message(pool_id)
-        ),
+        coip_pool_id_is_invalid_message(pool_id),
     )
 }
 
@@ -14860,20 +14879,19 @@ pub const ATTACHMENT_LIMIT_EXCEEDED: &str = "AttachmentLimitExceeded";
 /// `InvalidVolume.ZoneMismatch`.
 ///
 /// "The volume and instance must be within the same Availability Zone"
-/// (`AttachVolumeRequest$VolumeId`), so the refusal names both resources and the zone each
-/// one is in — which is what the caller has to change.
+/// (`AttachVolumeRequest$VolumeId`), so the refusal names the two resources the REQUEST
+/// named and states that they are not in one zone. Which zone each one is in is state the
+/// caller can read off the resources themselves, and is not part of the wording.
 pub fn invalid_volume_zone_mismatch<E>(
     volume_id: &str,
-    volume_zone: &str,
     instance_id: &str,
-    instance_zone: &str,
 ) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_VOLUME_ZONE_MISMATCH,
         400,
         format!(
-            "The volume '{volume_id}' is in availability zone '{volume_zone}' and the \
-             instance '{instance_id}' is in availability zone '{instance_zone}'"
+            "The volume '{volume_id}' is not in the same availability zone as instance \
+             '{instance_id}'"
         ),
     )
 }
@@ -15479,17 +15497,43 @@ pub fn invalid_volume_id_not_found<E>(volume_id: &str) -> crate::scaffolded::Sca
 /// while an instance still holds one (EC2 API error codes, "VolumeInUse").
 pub const VOLUME_IN_USE: &str = "VolumeInUse";
 
-/// Refuse a request that named a volume an instance still holds an attachment of, where
-/// the operation requires one that holds none: HTTP 400 `VolumeInUse`.
+/// Refuse an ATTACH of a volume something already holds, where the request cannot be served
+/// because of that: HTTP 400 `VolumeInUse`.
 ///
-/// "The volume must be in the available state (not attached to an instance)"
-/// (`DeleteVolume`) — so the refusal names the volume the request named and the instance
-/// that holds it, which is what the caller has to detach first.
-pub fn volume_in_use<E>(volume_id: &str, instance_id: &str) -> crate::scaffolded::Scaffolded<E> {
+/// The attach side's own sentence: it names the volume the request named and reports that an
+/// instance already holds it, without naming which one. The DELETE side, which refuses
+/// because the volume still holds attachments at all, names the holders as the set they are
+/// ([`volume_in_use`]) — two wordings of one code, as EC2's per-operation validators have.
+pub fn volume_already_attached<E>(volume_id: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         VOLUME_IN_USE,
         400,
-        format!("Volume {volume_id} is currently attached to {instance_id}"),
+        format!("{volume_id} is already attached to an instance"),
+    )
+}
+
+/// Refuse a request that needs the volume it named to hold NO attachment while something
+/// still holds one: HTTP 400 `VolumeInUse`, naming every holder as the set it is.
+///
+/// "The volume must be in the available state (not attached to an instance)"
+/// (`DeleteVolume`) — so the refusal names the volume the request named and what has to let
+/// go of it first. A volume can be held by more than one resource at once (a Multi-Attach
+/// enabled one is attached to up to [`MULTI_ATTACH_INSTANCE_LIMIT`] instances), and the
+/// service renders that collection as a SET: brace-wrapped, its members separated by `, `,
+/// which is the form the recorded refusal of this code carries for the one holder it had.
+/// The holders come from the attachments the volume holds at the instant of the call, in the
+/// order the store holds them, so a volume two instances hold names both.
+///
+/// The DELETE side's wording. The attach side words the same code its own way
+/// ([`volume_already_attached`]), which is what the recordings of the two operations carry.
+pub fn volume_in_use<E>(volume_id: &str, holders: &[String]) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        VOLUME_IN_USE,
+        400,
+        format!(
+            "Volume {volume_id} is currently attached to {{{}}}",
+            holders.join(", ")
+        ),
     )
 }
 
@@ -18488,14 +18532,15 @@ pub const INVALID_VPC_RANGE: &str = "InvalidVpc.Range";
 
 /// Refuse a VPC CIDR block whose size is outside the published VPC block size: HTTP 400
 /// [`INVALID_VPC_RANGE`].
+///
+/// The message is the fixed sentence this class carries plus the block the REQUEST asked
+/// for: the published block size the value misses is what the error CODE stands for, and
+/// restating it in the wording is detail the service does not send.
 pub fn invalid_vpc_range<E>(cidr_block: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_VPC_RANGE,
         400,
-        format!(
-            "The CIDR '{cidr_block}' is invalid. The allowed block size is between a \
-             /{MIN_VPC_IPV4_PREFIX} netmask and /{MAX_VPC_IPV4_PREFIX} netmask."
-        ),
+        format!("The CIDR '{cidr_block}' is invalid."),
     )
 }
 
@@ -21346,51 +21391,38 @@ impl ComAmazonawsEc2Amazonec2State {
 
 /// Refuse a subnet CIDR block that overlaps one already in the VPC: HTTP 400
 /// `InvalidSubnet.Conflict`.
-pub fn invalid_subnet_conflict<E>(cidr_block: &str, subnet_id: &str) -> Scaffolded<E> {
+///
+/// The message names the block the REQUEST asked for and nothing else: the id of the subnet
+/// that already holds an overlapping block is state of the account the refusal does not
+/// report, so a client reading the wording sees the value it sent and no identifier it did
+/// not ask about.
+pub fn invalid_subnet_conflict<E>(cidr_block: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_SUBNET_CONFLICT,
         400,
-        format!("The CIDR '{cidr_block}' conflicts with another subnet ('{subnet_id}')"),
+        format!("The CIDR '{cidr_block}' conflicts with another subnet"),
     )
-}
-
-/// Which of the subnet range rules a CIDR block fails, for the one refusal below.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubnetRangeProblem<'a> {
-    /// The block's SIZE is outside the published subnet block size
-    /// ([`MIN_SUBNET_IPV4_PREFIX`]..=[`MAX_SUBNET_IPV4_PREFIX`]).
-    BlockSize,
-    /// The block parses and is of a permitted size, but lies outside the CIDR block of the
-    /// VPC the subnet would sit in.
-    OutsideVpc(&'a str),
-    /// The block is an IPv6 block of a size other than the one an IPv6 subnet may have
-    /// ([`SUBNET_IPV6_PREFIX_LENGTH`]) — the IPv6 counterpart of [`Self::BlockSize`],
-    /// separate because the two families publish different sizes.
-    Ipv6BlockSize,
 }
 
 /// Refuse a subnet CIDR block the subnet's range rules do not admit: HTTP 400
 /// `InvalidSubnet.Range`, whichever rule it fails — a block of a size the service does not
-/// permit, or one outside its VPC's own block. ONE wording site for that code, the way
-/// [`invalid_vpc_range`] is the one site for a VPC's.
-pub fn invalid_subnet_range<E>(
-    cidr_block: &str,
-    problem: SubnetRangeProblem<'_>,
-) -> Scaffolded<E> {
-    let message = match problem {
-        SubnetRangeProblem::BlockSize => format!(
-            "The CIDR '{cidr_block}' is invalid. The allowed block size is between a \
-             /{MIN_SUBNET_IPV4_PREFIX} netmask and /{MAX_SUBNET_IPV4_PREFIX} netmask."
-        ),
-        SubnetRangeProblem::OutsideVpc(vpc_id) => {
-            format!("The CIDR '{cidr_block}' is not within the CIDR block of VPC '{vpc_id}'")
-        }
-        SubnetRangeProblem::Ipv6BlockSize => format!(
-            "The CIDR '{cidr_block}' is invalid. The allowed block size for an IPv6 subnet \
-             is /{SUBNET_IPV6_PREFIX_LENGTH}."
-        ),
-    };
-    Scaffolded::service_error(INVALID_SUBNET_RANGE, 400, message)
+/// permit (the published IPv4 subnet block size
+/// [`MIN_SUBNET_IPV4_PREFIX`]..=[`MAX_SUBNET_IPV4_PREFIX`], or the one size an IPv6 subnet
+/// block may have, [`SUBNET_IPV6_PREFIX_LENGTH`]) and one outside the block of the VPC the
+/// subnet would sit in. ONE wording site for that code, the way [`invalid_vpc_range`] is the
+/// one site for a VPC's.
+///
+/// ONE sentence too, whichever rule the block fails: the service states that the block is not
+/// valid and names the block from the request. WHICH rule it missed is what the error code
+/// stands for, and neither the published size nor the VPC whose block it is outside of is
+/// part of the message ([`invalid_vpc_range`], the same class one resource up, words it the
+/// same way).
+pub fn invalid_subnet_range<E>(cidr_block: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SUBNET_RANGE,
+        400,
+        format!("The CIDR '{cidr_block}' is invalid."),
+    )
 }
 
 /// EC2's error code for a request that would take a resource past the number of CIDR
@@ -42919,6 +42951,19 @@ pub const CUSTOMER_GATEWAY_BGP_ASN_EXTENDED: ::std::ops::RangeInclusive<i64> =
 /// prose rather than as a `@length` the boundary validator could apply.
 pub const MAX_CUSTOMER_GATEWAY_DEVICE_NAME_CHARS: usize = 255;
 
+/// Refuse an ASN a customer gateway member does not take: HTTP 400 `InvalidParameterValue`,
+/// naming the member and the value the request sent.
+///
+/// The service classifies an ASN outside the range its member publishes as a FORMAT problem
+/// — the value is not one that member can carry — so the wording states that and not the
+/// range: the range is the member's published documentation, which a refusal does not
+/// repeat. One site for both members, so the two cannot drift.
+fn invalid_asn_format<E>(parameter: &str, asn: i64) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Value ({asn}) for parameter {parameter} is invalid. Invalid Format."
+    ))
+}
+
 /// The ASN a customer gateway create asks for, as the gateway reports it: the member the
 /// request named it in, holding each to the range that member publishes, or
 /// [`DEFAULT_CUSTOMER_GATEWAY_BGP_ASN`] when it named neither.
@@ -42941,23 +42986,13 @@ pub fn customer_gateway_bgp_asn<E>(
         (Some(asn), None) => {
             let asn = i64::from(asn);
             if !CUSTOMER_GATEWAY_BGP_ASN.contains(&asn) {
-                return Err(invalid_parameter_value(format!(
-                    "Value ({asn}) for parameter bgpAsn is invalid. Valid values: {min} to \
-                     {max}.",
-                    min = CUSTOMER_GATEWAY_BGP_ASN.start(),
-                    max = CUSTOMER_GATEWAY_BGP_ASN.end(),
-                )));
+                return Err(invalid_asn_format("bgpAsn", asn));
             }
             Ok((Some(asn.to_string()), None))
         }
         (None, Some(asn)) => {
             if !CUSTOMER_GATEWAY_BGP_ASN_EXTENDED.contains(&asn) {
-                return Err(invalid_parameter_value(format!(
-                    "Value ({asn}) for parameter bgpAsnExtended is invalid. Valid values: \
-                     {min} to {max}.",
-                    min = CUSTOMER_GATEWAY_BGP_ASN_EXTENDED.start(),
-                    max = CUSTOMER_GATEWAY_BGP_ASN_EXTENDED.end(),
-                )));
+                return Err(invalid_asn_format("bgpAsnExtended", asn));
             }
             Ok((None, Some(asn.to_string())))
         }

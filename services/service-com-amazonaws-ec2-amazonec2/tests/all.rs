@@ -17,6 +17,13 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The FIXED TEXT of a refusal's message, per class: the sentence the service words that error
+// class with, with only the variable parts it interpolates from the request and the store —
+// no restatement of the rule the value missed, no identifier out of the account's own state,
+// and the holder set of a `VolumeInUse` rendered as the set it is. Declared beside
+// `prefix_lists` for the reason the note above gives.
+#[path = "all/refusal_fixed_text.rs"]
+mod refusal_fixed_text;
 // What `GetManagedPrefixListEntries` reports: the entry set of the one prefix list a request
 // names — a list the account created or one the Region publishes — in CIDR order, how it
 // pages, which version it reports and what it refuses. Declared beside `prefix_lists` for the

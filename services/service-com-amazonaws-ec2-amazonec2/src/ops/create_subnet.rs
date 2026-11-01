@@ -220,10 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The same rule as a VPC's own block, one resource down: a block whose size
                 // the subnet range rules do not admit is `InvalidSubnet.Range`, not an
                 // unreadable value.
-                return Err(state::invalid_subnet_range(
-                    requested_cidr,
-                    state::SubnetRangeProblem::BlockSize,
-                ))
+                return Err(state::invalid_subnet_range(requested_cidr))
             }
         };
 
@@ -301,27 +298,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter_map(|association| association.cidr_block.as_deref())
             .any(|associated| state::ipv4_cidr_block_contains(associated, &cidr_block));
         if !within_vpc {
-            return Err(state::invalid_subnet_range(
-                &cidr_block,
-                state::SubnetRangeProblem::OutsideVpc(&input.vpc_id),
-            ));
+            return Err(state::invalid_subnet_range(requested_cidr));
         }
         // "A subnet CIDR block must not overlap the CIDR block of an existing subnet in the
         // VPC" (`CreateSubnet`) — the conflict is per VPC, so the same block in another VPC
         // is not one.
-        if let Some(conflicting) = store
+        let conflicts = store
             .subnets
-            .iter()
-            .filter(|(_, subnet)| subnet.vpc_id.as_deref() == Some(input.vpc_id.as_str()))
-            .find(|(_, subnet)| {
+            .values()
+            .filter(|subnet| subnet.vpc_id.as_deref() == Some(input.vpc_id.as_str()))
+            .any(|subnet| {
                 subnet
                     .cidr_block
                     .as_deref()
                     .is_some_and(|held| state::ipv4_cidr_blocks_overlap(held, &cidr_block))
-            })
-            .map(|(subnet_id, _)| subnet_id.clone())
-        {
-            return Err(state::invalid_subnet_conflict(&cidr_block, &conflicting));
+            });
+        if conflicts {
+            // The block the REQUEST asked for, which is what the caller has to change —
+            // the canonical form above is what the store compares and keeps.
+            return Err(state::invalid_subnet_conflict(requested_cidr));
         }
 
         // A count ceiling first, then the byte budget: a record count on its own admits

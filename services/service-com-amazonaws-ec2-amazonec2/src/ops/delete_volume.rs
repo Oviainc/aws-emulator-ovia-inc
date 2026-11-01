@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            dry_run_operation, internal_error, invalid_volume_id_malformed,
+            dry_run_operation, incorrect_state_of, internal_error, invalid_volume_id_malformed,
             invalid_volume_id_not_found, require_service_state, volume_id_is_well_formed,
             volume_in_use, VolumeRecord,
         };
@@ -184,16 +184,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The volume must be in the available state (not attached to an instance)"
         // (`DeleteVolume`) — so an attachment the volume still holds refuses the delete, and
-        // the refusal names what has to be detached first. The parenthesis is what that
-        // state means here: a volume that is still `creating` holds no attachment and is
-        // deletable, which is what the service does for a delete that follows the create at
-        // once; no `IncorrectState` refusal is made for the transient state on its own.
-        if let Some(attachment) = record.attachments_at(now).first() {
-            let holder = VolumeRecord::managed_resource_of(attachment)
-                .or(attachment.instance_id.as_deref())
-                .unwrap_or_default()
-                .to_string();
-            return Err(volume_in_use(&input.volume_id, &holder));
+        // the refusal names what has to be detached first: every holder, as the set the
+        // service renders them as. The parenthesis is what that state means here: a volume
+        // that is still `creating` holds no attachment and is deletable, which is what the
+        // service does for a delete that follows the create at once; no `IncorrectState`
+        // refusal is made for the transient state on its own.
+        let held = record.attachments_at(now);
+        if !held.is_empty() {
+            // Only an attachment that NAMES what holds it can be a member of the set the
+            // refusal renders. A volume whose attachments name nothing gives the caller
+            // nothing to let go of it, so it is refused for the state it is in instead — the
+            // reading `AttachVolume` makes of the same case.
+            let holders: Vec<String> = held
+                .iter()
+                .filter_map(|attachment| {
+                    VolumeRecord::managed_resource_of(attachment)
+                        .or(attachment.instance_id.as_deref())
+                        .map(str::to_string)
+                })
+                .collect();
+            return if holders.is_empty() {
+                Err(incorrect_state_of(
+                    "Volume",
+                    &input.volume_id,
+                    record.state_at(now),
+                ))
+            } else {
+                Err(volume_in_use(&input.volume_id, &holders))
+            };
         }
 
         // The request is one that would have succeeded, so a dry run stops HERE: "If you

@@ -1071,23 +1071,21 @@ async fn a_create_refuses_a_value_outside_what_it_publishes_and_writes_nothing()
             "an ASN below what BgpAsn publishes",
             vec![param("BgpAsn", "0")],
             INVALID_PARAMETER_VALUE,
-            "Value (0) for parameter bgpAsn is invalid. Valid values: 1 to 2147483647."
+            "Value (0) for parameter bgpAsn is invalid. Invalid Format."
                 .to_string(),
         ),
         (
             "an ASN below what BgpAsnExtended publishes",
             vec![param("BgpAsnExtended", "2147483647")],
             INVALID_PARAMETER_VALUE,
-            "Value (2147483647) for parameter bgpAsnExtended is invalid. Valid values: \
-             2147483648 to 4294967295."
+            "Value (2147483647) for parameter bgpAsnExtended is invalid. Invalid Format."
                 .to_string(),
         ),
         (
             "an ASN above what BgpAsnExtended publishes",
             vec![param("BgpAsnExtended", "4294967296")],
             INVALID_PARAMETER_VALUE,
-            "Value (4294967296) for parameter bgpAsnExtended is invalid. Valid values: \
-             2147483648 to 4294967295."
+            "Value (4294967296) for parameter bgpAsnExtended is invalid. Invalid Format."
                 .to_string(),
         ),
         (

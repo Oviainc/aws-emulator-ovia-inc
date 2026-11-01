@@ -405,7 +405,8 @@ const DEFAULT_MAX_RESULTS: usize = 100;
 /// The smallest page size `MaxResults` may ask for, the bottom of the same published range.
 const MIN_MAX_RESULTS: usize = 1;
 
-/// The filter names this operation supports, in the order the model enumerates them.
+/// The filter names this operation supports, in the order the service itself enumerates
+/// them.
 ///
 /// `DescribeNetworkInsightsAnalysesRequest$Filters` names them itself: "The filters. The
 /// following are the possible values: path-found - A Boolean value that indicates whether a
@@ -416,11 +417,18 @@ const MIN_MAX_RESULTS: usize = 1;
 /// smithy_query(query="doc",shape="DescribeNetworkInsightsAnalysesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
 /// ```
 ///
+/// The ORDER is the service's own, not the model's bullet list: asked to filter on a name it
+/// does not know, the service enumerates the catalog it supports in the refusal
+/// ([`crate::state::invalid_filter`]) with `status` first, which is what the recorded
+/// refusal of this operation carries — the same order the sibling access-scope analyses
+/// describe is recorded enumerating its own pair in
+/// ([`crate::ops::describe_network_insights_access_scope_analyses`]).
+///
 /// Both are members of the analysis this operation reports
 /// (`NetworkInsightsAnalysis$NetworkPathFound` and `$Status`), and each must be answered by
 /// [`filter_values`]. Nothing else — no `tag:` family, no id — is in the documented set, so
 /// every other name is refused.
-const ANALYSIS_FILTERS: [&str; 2] = ["path-found", "status"];
+const ANALYSIS_FILTERS: [&str; 2] = ["status", "path-found"];
 
 /// The values the EC2 filter `name` compares against this analysis.
 ///

@@ -499,44 +499,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// Resolve the instance whose volumes `CreateSnapshots` is asked to snapshot, or refuse the
-/// id: HTTP 400 `InvalidInstanceID.Malformed`, in one of the two wordings that code carries.
+/// id: HTTP 400 `InvalidInstanceID.Malformed`, in this operation's own wording.
 ///
 /// EC2's per-operation validators do NOT agree about an instance id they cannot resolve, and
-/// this operation's is the strict one: a well-formed id that names no instance of the
-/// account is answered `InvalidInstanceID.Malformed` — the instance ID is malformed — rather
-/// than reported as not found, the same answer `CreateReplaceRootVolumeTask` is recorded
-/// making for the same id in the same recorded unit (the evidence on
-/// [`crate::scaffolded::Scaffolded::instance_id_is_malformed`], which is the one place both
-/// wordings of this code live). A value that is not an instance id at all is refused one
-/// step earlier, by the id space itself, with the echoed-value message
-/// [`crate::scaffolded::Scaffolded::invalid_instance_id_malformed`] carries.
+/// this one answers the SAME refusal for every id it cannot resolve to an instance of the
+/// account — whether the value is outside the id form altogether or inside it and held by
+/// nothing. EC2 ids reach the service obfuscated, and what this operation reports is that
+/// the id could not be read:
+/// [`crate::scaffolded::Scaffolded::instance_id_could_not_be_unobfuscated`], a fixed sentence
+/// naming no value.
 ///
-/// So the choice belongs to the OPERATION rather than to the id, which is why this lives
-/// here and not in [`crate::state::require_known_instance`] — the shared helper the
-/// operations that DO draw the malformed/not-found distinction keep using. The resolved
-/// record is handed back, so the handler reads the instance ONCE rather than looking it up
-/// again behind an unreachable branch.
-///
-/// Neither of those two wordings is what AWS answered the one recorded refusal of THIS
-/// operation, whose text the corpus withholds: the refusal's status and error code are
-/// AWS's, its text is this service's, and the wordings here are the ones EC2's recordings
-/// carry for this code on the operations beside it.
+/// That is a fact of the OPERATION and not of the id, which is why this lives here and not in
+/// [`crate::state::require_known_instance`]: the operations beside it word the same code
+/// differently for the same id — `CreateReplaceRootVolumeTask` answers "The instance ID
+/// '<id>' is malformed" for a well-formed id that names nothing, and
+/// `CreateInstanceExportTask` reports it as not existing, each on its own recorded refusal.
+/// The resolved record is handed back, so the handler reads the instance ONCE rather than
+/// looking it up again behind an unreachable branch.
 fn require_instance_with_volumes<'a, E>(
     store: &'a crate::state::ComAmazonawsEc2Amazonec2State,
     instance_id: &str,
 ) -> Result<&'a crate::state::InstanceRecord, crate::scaffolded::Scaffolded<E>> {
-    // A value that is not an instance id at all never reaches this operation's resolver: it
-    // is refused by the id space itself, with the echoed-value message every EC2 id space
-    // answers for one.
+    // A value outside the instance id form names no instance in any account, so it is not
+    // looked up at all; one inside it is, and an account holding no instance for it is
+    // answered the same way.
     if !crate::state::instance_id_is_well_formed(instance_id) {
-        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_malformed(
-            instance_id,
-        ));
+        return Err(crate::scaffolded::Scaffolded::instance_id_could_not_be_unobfuscated());
     }
     store
         .instances
         .get(instance_id)
-        .ok_or_else(|| crate::scaffolded::Scaffolded::instance_id_is_malformed(instance_id))
+        .ok_or_else(crate::scaffolded::Scaffolded::instance_id_could_not_be_unobfuscated)
 }
 
 /// One volume of the instance this call snapshots: everything a snapshot of it reports

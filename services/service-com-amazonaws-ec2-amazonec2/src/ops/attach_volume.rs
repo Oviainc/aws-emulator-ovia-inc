@@ -204,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             incorrect_state_of, instance_id_is_well_formed, invalid_volume_id_malformed,
             invalid_volume_zone_mismatch, require_instance_record, require_service_state,
             require_volume, require_volume_mut, system_time_to_date_time,
-            volume_id_is_well_formed, volume_in_use,
+            volume_already_attached, volume_id_is_well_formed,
         };
 
         // Both resources carry their own Availability Zone, so nothing here depends on the
@@ -282,9 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if volume_zone != instance_zone {
             return Err(invalid_volume_zone_mismatch(
                 &input.volume_id,
-                &volume_zone,
                 &input.instance_id,
-                &instance_zone,
             ));
         }
         // The volume's state as of this instant, and the attachments it holds: one whose
@@ -303,24 +301,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // attach it twice to the same instance, or take it past the number of instances it
         // may be attached to at once.
         let multi_attach = volume.view.multi_attach_enabled == Some(true);
-        if held
+        // WHICH refusal applies is decided by the instances holding the volume at this
+        // instant, read off the attachments the volume holds rather than off the request:
+        // whether the instance the request names is already one of them, and whether any
+        // instance holds it at all. An attachment to an Amazon Web Services-managed resource
+        // names no instance ("if the volume is attached to an Amazon Web Services-managed
+        // resource, this parameter returns null"), so it answers neither question.
+        let held_by_named_instance = held
             .iter()
-            .any(|attachment| attachment.instance_id.as_deref() == Some(&*input.instance_id))
-        {
-            return Err(volume_in_use(&input.volume_id, &input.instance_id));
+            .any(|attachment| attachment.instance_id.as_deref() == Some(&*input.instance_id));
+        if held_by_named_instance {
+            return Err(volume_already_attached(&input.volume_id));
         }
         if !held.is_empty() && !multi_attach {
-            // The instance the caller has to detach the volume from first, where there is
-            // one: an attachment to an Amazon Web Services-managed resource names no
-            // instance at all ("if the volume is attached to an Amazon Web Services-managed
-            // resource, this parameter returns null"), so such a volume is refused for the
-            // state it is in instead.
-            return match held
+            // A volume whose only holder is a managed resource names nobody the caller can
+            // detach it from, so it is refused for the state it is in instead.
+            let held_by_an_instance = held
                 .iter()
-                .find_map(|attachment| attachment.instance_id.clone())
-            {
-                Some(holder) => Err(volume_in_use(&input.volume_id, &holder)),
-                None => Err(incorrect_state_of("Volume", &input.volume_id, volume_state)),
+                .any(|attachment| attachment.instance_id.is_some());
+            return if held_by_an_instance {
+                Err(volume_already_attached(&input.volume_id))
+            } else {
+                Err(incorrect_state_of("Volume", &input.volume_id, volume_state))
             };
         }
         if multi_attach && held.len() >= MULTI_ATTACH_INSTANCE_LIMIT {

@@ -56,14 +56,20 @@ use super::wire::{child, child_text, document, is_long_id, param, Param};
 /// was signed for, so it is read back out of that ARN below.
 const REGION: &str = "us-west-2";
 
-/// The filter names this operation supports, in the order the model enumerates them.
+/// The filter names this operation supports, in the order the SERVICE enumerates them in
+/// the refusal that names the catalog.
 ///
 /// `DescribeNetworkInsightsAnalysesRequest$Filters` documents them itself: "The filters. The
 /// following are the possible values: path-found - A Boolean value that indicates whether a
 /// feasible path is found. status - The status of the analysis (running | succeeded |
-/// failed)". The suite exercises both entries, including `path-found`, which the issue this
-/// slice was filed under never mentioned.
-const SUPPORTED_FILTERS: [&str; 2] = ["path-found", "status"];
+/// failed)". The ORDER here is the service's own rather than that bullet list — `status`
+/// first, the way the recorded `InvalidFilter` refusal of this operation enumerates them and
+/// the way the sibling access-scope analyses describe enumerates its own pair. The suite
+/// exercises both entries, including `path-found`, which the issue this slice was filed
+/// under never mentioned. `pub(super)` so the suite that pins this refusal's WORDING over
+/// the whole family of fixed-text refusals ([`super::refusal_fixed_text`]) names the catalog
+/// from the one place this test target holds it.
+pub(super) const SUPPORTED_FILTERS: [&str; 2] = ["status", "path-found"];
 
 /// A well-formed path id the account holds no path under.
 const UNKNOWN_PATH_ID: &str = "nip-0ffffffffffffffff";

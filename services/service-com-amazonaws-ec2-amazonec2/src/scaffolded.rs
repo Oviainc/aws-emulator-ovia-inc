@@ -365,6 +365,20 @@ impl<E> Scaffolded<E> {
         )
     }
 
+    /// `InvalidInstanceID.Malformed` (HTTP 400), in the wording of an operation whose
+    /// validator refuses every instance id it could not read.
+    ///
+    /// A THIRD wording of this code beside the two above, and a named constructor rather
+    /// than a literal at the call site for the same reason: which of the three an operation
+    /// answers is a fact of that operation, recorded by its caller. EC2 ids reach the
+    /// service obfuscated, and the operations that word this refusal report only that the
+    /// id could not be read — the sentence is fixed, naming neither the value the request
+    /// sent nor the form that was expected, which is the recorded answer
+    /// `crate::ops::create_snapshots` gets for an instance id it cannot resolve.
+    pub fn instance_id_could_not_be_unobfuscated() -> Self {
+        Self::service_error("InvalidInstanceID.Malformed", 400, "Unable to unobfuscate ID.")
+    }
+
     /// `InvalidID` (HTTP 400): the request named a resource id of a kind this
     /// operation cannot resolve at all.
     pub fn invalid_id(resource_id: &str) -> Self {

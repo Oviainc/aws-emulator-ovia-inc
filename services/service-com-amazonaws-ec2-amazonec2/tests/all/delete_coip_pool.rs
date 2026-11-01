@@ -282,25 +282,22 @@ async fn a_pool_id_that_resolves_to_no_pool_is_refused() {
             "case {case:?}: expected {expected_code:?}, got {body}"
         );
         let message = error_message(&body);
-        // Either refusal names the value the request sent; WHICH quotes carry it is the
-        // template's, not this row's — the service's unreadable-id sentence double-quotes
-        // the value it echoes and the not-found sentence single-quotes the pool it names.
-        let quoted = if expected_code == malformed {
-            format!("\"{pool_id}\"")
+        // Either refusal names the value the request sent, in the quoting of the ONE
+        // template this surface words a `CoipPoolId` it could not resolve with: the pool id
+        // single-quoted, with that class's own verdict after it.
+        let expected_message = if expected_code == malformed {
+            format!("The pool ID '{pool_id}' is invalid.")
         } else {
-            format!("'{pool_id}'")
+            format!("The pool ID '{pool_id}' does not exist.")
         };
         assert!(
-            message.contains(&quoted),
-            "case {case:?}: expected the message to name {quoted}, got {message:?}"
+            message.contains(&format!("'{pool_id}'")),
+            "case {case:?}: expected the message to name '{pool_id}', got {message:?}"
         );
-        if expected_code != malformed {
-            assert_eq!(
-                message,
-                format!("The pool ID '{pool_id}' does not exist."),
-                "case {case:?}: expected the surface's one sentence, got {message:?}"
-            );
-        }
+        assert_eq!(
+            message, expected_message,
+            "case {case:?}: expected the surface's sentence for its class, got {message:?}"
+        );
         assert_eq!(
             stored_pools(&engine),
             seeded.len(),

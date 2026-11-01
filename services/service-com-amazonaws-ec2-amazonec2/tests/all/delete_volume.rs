@@ -13,8 +13,9 @@
 //!    goes with it;
 //! 2. "The volume must be in the available state (not attached to an instance)"
 //!    (`DeleteVolume`): a volume something still holds an attachment of is refused with
-//!    `VolumeInUse` naming the volume and the holder that has to let go of it first, the
-//!    volume stays stored, and the same delete succeeds once nothing holds it;
+//!    `VolumeInUse` naming the volume and, as the brace-wrapped set the service renders them
+//!    as, every holder that has to let go of it first, the volume stays stored, and the same
+//!    delete succeeds once nothing holds it;
 //! 3. an id the account holds no volume for is refused BEFORE anything is removed — a value
 //!    outside the form EC2 issues ids in is a bad id (`InvalidVolumeID.Malformed`) and only
 //!    a well-formed id no volume of the account has is `InvalidVolume.NotFound` — and a
@@ -360,8 +361,8 @@ async fn a_delete_removes_the_volume_it_names_and_leaves_the_others_stored() {
 }
 
 /// RULE 2: a volume something still holds an attachment of cannot be deleted — the refusal
-/// is `VolumeInUse` naming the volume and the holder, the volume is still stored, and the
-/// same delete succeeds once the attachment is gone.
+/// is `VolumeInUse` naming the volume and its holders as a brace-wrapped set, the volume is
+/// still stored, and the same delete succeeds once the attachment is gone.
 ///
 /// The rows differ along WHAT holds the volume and which member names it: an instance, a
 /// second instance at another device, and an attachment to an Amazon Web Services-managed
@@ -435,8 +436,9 @@ async fn a_volume_something_still_holds_cannot_be_deleted() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Volume {volume_id} is currently attached to {holder}"),
-            "case {case:?}: expected the refusal to name the volume and its holder, got {body}"
+            format!("Volume {volume_id} is currently attached to {{{holder}}}"),
+            "case {case:?}: expected the refusal to name the volume and its holder set, got \
+             {body}"
         );
 
         // Nothing was removed: the volume is still the account's.

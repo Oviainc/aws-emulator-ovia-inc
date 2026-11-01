@@ -159,11 +159,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )))
             }
             Err(state::CidrProblem::PrefixLength) => {
+                // A block of a size the resource does not permit is refused with the
+                // sentence this service words that class with — the block from the request
+                // and the verdict, with the published size (`Ipv4CidrBlock`'s own
+                // documentation) not restated in the message.
                 return Err(state::invalid_parameter_value(format!(
-                    "The CIDR '{requested_cidr}' is invalid. The allowed block size is \
-                     between a /{min} netmask and /{max} netmask.",
-                    min = state::MIN_SECONDARY_NETWORK_IPV4_PREFIX,
-                    max = state::MAX_SECONDARY_NETWORK_IPV4_PREFIX,
+                    "The CIDR '{requested_cidr}' is invalid."
                 )))
             }
         };
