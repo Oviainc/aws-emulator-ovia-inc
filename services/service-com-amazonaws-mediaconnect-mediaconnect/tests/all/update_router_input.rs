@@ -124,8 +124,18 @@ fn standard(interface_arn: &str, protocol_configuration: Value) -> Value {
     }})
 }
 
+/// The STANDARD configuration a request carrying `protocol_configuration` and NO `Protocol`
+/// is STORED as: `StandardRouterInputConfiguration$Protocol` is implied by the variant of
+/// the required `ProtocolConfiguration`, so a read reports `protocol` whether or not the
+/// request named it.
+fn stored_standard(interface_arn: &str, protocol_configuration: Value, protocol: &str) -> Value {
+    let mut configuration = standard(interface_arn, protocol_configuration);
+    configuration["Standard"]["protocol"] = json!(protocol);
+    configuration
+}
+
 /// A FAILOVER configuration ingesting on `interface_arn`: "a list of exactly two protocol
-/// configurations for the failover input sources"
+/// configurations for the failover input sources. Both must use the same protocol type"
 /// (`smithy_query(query="shape",shape="FailoverRouterInputConfiguration")`).
 fn failover(interface_arn: &str, first_port: i64, second_port: i64) -> Value {
     json!({ "Failover": {
@@ -278,7 +288,9 @@ struct UpdateCase {
 /// from the channel output it was connected to.
 fn update_cases(targets: &Targets) -> Vec<UpdateCase> {
     let srt_listener = json!({ "SrtListener": { "port": 9000, "minimumLatencyMilliseconds": 120 } });
-    let other_standard = standard(&targets.other_interface_arn, srt_listener);
+    let other_standard = standard(&targets.other_interface_arn, srt_listener.clone());
+    let other_standard_stored =
+        stored_standard(&targets.other_interface_arn, srt_listener, "SRT_LISTENER");
     let other_failover = failover(&targets.interface_arn, 5100, 5102);
     let other_flow = mediaconnect_flow(
         Some(&targets.other_flow_arn),
@@ -353,8 +365,8 @@ fn update_cases(targets: &Targets) -> Vec<UpdateCase> {
         UpdateCase {
             case: "Configuration onto another interface and another protocol",
             create: standard_create(targets, "ri-update-standard"),
-            update: json!({ "configuration": other_standard.clone() }),
-            changed: vec![("configuration", other_standard)],
+            update: json!({ "configuration": other_standard }),
+            changed: vec![("configuration", other_standard_stored)],
         },
         UpdateCase {
             case: "a FAILOVER input reconfigured on new ports",
@@ -407,9 +419,10 @@ fn update_cases(targets: &Targets) -> Vec<UpdateCase> {
                 ("name", json!("ri-update-everything-renamed")),
                 (
                     "configuration",
-                    standard(
+                    stored_standard(
                         &targets.other_interface_arn,
                         json!({ "Rist": { "port": 4000, "recoveryLatencyMilliseconds": 200 } }),
+                        "RIST",
                     ),
                 ),
                 ("maximumBitrate", json!(20_000_000i64)),

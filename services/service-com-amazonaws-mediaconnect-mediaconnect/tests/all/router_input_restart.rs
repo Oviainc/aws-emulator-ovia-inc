@@ -211,12 +211,20 @@ pub(crate) fn configuration_rows(interface_arn: &str, flow_arn: &str) -> Vec<Con
                     "networkInterfaceArn": interface_arn,
                     "sourcePriorityMode": "PRIMARY_SECONDARY",
                     "primarySourceIndex": 0,
+                    // "A list of exactly two protocol configurations for the failover
+                    // input sources. Both must use the same protocol type"
+                    // (`smithy_query(query="shape",shape="FailoverRouterInputConfiguration"`,
+                    // member `ProtocolConfigurations`).
                     "protocolConfigurations": [
-                        union("Rtp", "rtp", json!({ "port": 5002 })),
                         union(
                             "Rist",
                             "rist",
                             json!({ "port": 4000, "recoveryLatencyMilliseconds": 200 }),
+                        ),
+                        union(
+                            "Rist",
+                            "rist",
+                            json!({ "port": 4002, "recoveryLatencyMilliseconds": 200 }),
                         ),
                     ],
                 }),
@@ -233,13 +241,11 @@ pub(crate) fn configuration_rows(interface_arn: &str, flow_arn: &str) -> Vec<Con
                 json!({
                     "networkInterfaceArn": interface_arn,
                     "mergeRecoveryWindowMilliseconds": 500,
+                    // The same pair rule the merge input sources carry ("...Both must use
+                    // the same protocol type").
                     "protocolConfigurations": [
                         union("Rtp", "rtp", json!({ "port": 5004 })),
-                        union(
-                            "Rist",
-                            "rist",
-                            json!({ "port": 4002, "recoveryLatencyMilliseconds": 300 }),
-                        ),
+                        union("Rtp", "rtp", json!({ "port": 5006 })),
                     ],
                 }),
             ),

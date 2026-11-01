@@ -274,7 +274,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| router_input.tier.clone());
         let maximum_bitrate = input.maximum_bitrate.unwrap_or(router_input.maximum_bitrate);
 
-        if let Some(configuration) = input.configuration.as_ref() {
+        // A replacement configuration is stored through the crate's one normalisation of an
+        // input configuration, the same one CreateRouterInput stores through: a STANDARD
+        // input's `Protocol` is implied by the variant of its `ProtocolConfiguration`, so the
+        // stored value reports the protocol that configuration configures and a request
+        // naming a different one is refused rather than stored self-contradicting, and a
+        // FAILOVER or MERGE input's protocol configurations must be the pair of one protocol
+        // type that an input ingesting two sources lists.
+        let requested_configuration = match input.configuration.clone() {
+            Some(configuration) => Some(
+                crate::state::normalized_router_input_configuration(configuration)
+                    .map_err(bad_request)?,
+            ),
+            None => None,
+        };
+
+        if let Some(configuration) = requested_configuration.as_ref() {
             // "Changing the type of the configuration is not supported"
             // (`UpdateRouterInput$Configuration`): the type is the variant of the
             // configuration union (`crate::state::router_input_type`), so a replacement of a
@@ -387,7 +402,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(name) = input.name.clone() {
             router_input.name = name;
         }
-        if let Some(configuration) = input.configuration.clone() {
+        if let Some(configuration) = requested_configuration {
             router_input.configuration = configuration;
         }
         router_input.tier = tier;

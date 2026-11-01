@@ -245,3 +245,5 @@ mod router_route_region_scope;
 mod flow_source_ingest_endpoint;
 #[path = "all/bridge_flow_output_capacity.rs"]
 mod bridge_flow_output_capacity;
+#[path = "all/router_input_configuration_consistency.rs"]
+mod router_input_configuration_consistency;

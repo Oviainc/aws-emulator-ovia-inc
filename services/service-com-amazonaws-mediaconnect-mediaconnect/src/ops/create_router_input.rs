@@ -247,6 +247,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(bad_request)?;
 
+        // What the request asks the input to INGEST is judged for its own consistency before
+        // anything is stored: a STANDARD input's `Protocol` is implied by the variant of its
+        // `ProtocolConfiguration`, so the stored configuration reports the protocol that
+        // configuration configures and a request naming a different one is refused, and a
+        // FAILOVER or MERGE input ingests a pair of sources, so its protocol configurations
+        // must be a pair of one protocol type. Both halves are the crate's one normalisation
+        // of an input configuration, which UpdateRouterInput stores a replacement through as
+        // well (`crate::state::normalized_router_input_configuration`), the input-side
+        // sibling of the one CreateRouterOutput stores its configuration through.
+        let configuration =
+            crate::state::normalized_router_input_configuration(input.configuration.clone())
+                .map_err(bad_request)?;
+
         // Tags are stored verbatim in a record nothing evicts, so the pairs and their count
         // are bounded before they are stored, through the same functions every other tag
         // write in this crate uses.
@@ -318,7 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through the one function every operation that stores a router input configuration
         // resolves it through
         // (`crate::state::ComAmazonawsMediaconnectMediaconnectState::router_input_configuration_rejection`).
-        if let Some(rejection) = store.router_input_configuration_rejection(&input.configuration) {
+        if let Some(rejection) = store.router_input_configuration_rejection(&configuration) {
             return Err(bad_request(rejection));
         }
 
@@ -355,7 +368,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::router_input_resource_fragment(&id),
         );
 
-        let configuration = input.configuration.clone();
         let ip_address = crate::state::router_input_has_own_address(&configuration)
             .then(|| crate::state::assigned_ingest_ip(suffix));
 

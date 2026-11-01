@@ -21,6 +21,7 @@ use crate::ops::types::{
     ContentQualityAnalysisFeatureConfiguration,
     DestinationConfiguration, EgressGatewayBridge, EncodingConfig, EncodingParameters, Encryption,
     Entitlement, FabricConfiguration, FailoverConfig, FailoverRouterInputIndexedStreamDetails,
+    FailoverRouterInputProtocolConfiguration,
     FailoverRouterInputStreamDetails, Flow, FlowTransitEncryption,
     FlowTransitEncryptionKeyConfiguration, Gateway,
     GatewayInstance,
@@ -42,16 +43,19 @@ use crate::ops::types::{
     MediaStreamOutputConfiguration, MediaStreamOutputConfigurationRequest,
     MediaStreamSourceConfiguration, MediaStreamSourceConfigurationRequest,
     MergeRouterInputIndexedStreamDetails,
+    MergeRouterInputProtocolConfiguration,
     MergeRouterInputStreamDetails, MonitoringConfig,
     NdiConfig, Offering, Output, Reservation, ResourceSpecification,
     RouterContentQualityAnalysisConfiguration, RouterInput,
-    RouterInputConfiguration, RouterInputMessage, RouterInputStreamDetails,
+    RouterInputConfiguration, RouterInputMessage, RouterInputProtocolConfiguration,
+    RouterInputStreamDetails,
     RouterInputTransitEncryption,
     RouterInputTransitEncryptionKeyConfiguration,
     RouterNetworkInterface, RouterNetworkInterfaceConfiguration,
     RouterOutput, RouterOutputConfiguration, RouterOutputMessage,
     RouterOutputProtocolConfiguration, RouterOutputStreamDetails, SetSourceRequest, Source,
     SourcePriority,
+    StandardRouterInputConfiguration,
     StandardRouterInputStreamDetails, StandardRouterOutputConfiguration,
     StandardRouterOutputStreamDetails, Transport, UpdateEncryption,
     UpdateFailoverConfig, VpcInterface,
@@ -4278,6 +4282,156 @@ pub fn default_router_content_quality_analysis_configuration()
     )
 }
 
+/// The `RouterInputProtocol` one entry of a router input's protocol configuration
+/// configures.
+///
+/// Each protocol-configuration union on the INPUT side carries one variant per protocol it
+/// admits — `RouterInputProtocolConfiguration` on a STANDARD configuration,
+/// `FailoverRouterInputProtocolConfiguration` and `MergeRouterInputProtocolConfiguration`
+/// on the two that configure a pair of sources — so the protocol a configuration uses IS
+/// its variant, named by the `RouterInputProtocol` enum
+/// (`smithy_query(query="shape",shape="RouterInputProtocol")`: RTP | RIST | SRT_CALLER |
+/// SRT_LISTENER). This trait is the crate's ONE mapping between the two on this side of the
+/// router — the counterpart of [`router_output_protocol`] — so a STANDARD create derives
+/// the `Protocol` it reports from it, and the pair rule
+/// ([`router_input_source_pair_rejection`]) compares two entries' protocol types through it.
+pub trait RouterInputProtocolVariant {
+    /// The `RouterInputProtocol` value this protocol configuration configures.
+    fn protocol(&self) -> &'static str;
+}
+
+impl RouterInputProtocolVariant for RouterInputProtocolConfiguration {
+    fn protocol(&self) -> &'static str {
+        match self {
+            Self::Rtp(_) => "RTP",
+            Self::Rist(_) => "RIST",
+            Self::SrtCaller(_) => "SRT_CALLER",
+            Self::SrtListener(_) => "SRT_LISTENER",
+        }
+    }
+}
+
+impl RouterInputProtocolVariant for FailoverRouterInputProtocolConfiguration {
+    fn protocol(&self) -> &'static str {
+        match self {
+            Self::Rtp(_) => "RTP",
+            Self::Rist(_) => "RIST",
+            Self::SrtCaller(_) => "SRT_CALLER",
+            Self::SrtListener(_) => "SRT_LISTENER",
+        }
+    }
+}
+
+impl RouterInputProtocolVariant for MergeRouterInputProtocolConfiguration {
+    fn protocol(&self) -> &'static str {
+        match self {
+            Self::Rtp(_) => "RTP",
+            Self::Rist(_) => "RIST",
+        }
+    }
+}
+
+/// How many protocol configurations a router input that ingests a PAIR of sources lists.
+///
+/// "A list of exactly two protocol configurations for the failover input sources"
+/// (`smithy_query(query="shape",shape="FailoverRouterInputConfiguration")`, member
+/// `ProtocolConfigurations`), and the same sentence for the merge input sources on
+/// `MergeRouterInputConfiguration$ProtocolConfigurations`. Neither list shape carries a
+/// length constraint, so the count is checked here instead of at the boundary — and it is
+/// the count every projection of such an input relies on
+/// ([`initial_router_input_stream_details`] reports one entry per listed source).
+pub const ROUTER_INPUT_SOURCE_PAIR_LEN: usize = 2;
+
+/// Why the protocol configurations `configurations`, listed by the member `member`, cannot
+/// configure a router input's pair of sources, or `None` when they can.
+///
+/// The two configurations that ingest a PAIR of sources document the same two rules for
+/// their list: "a list of exactly two protocol configurations … Both must use the same
+/// protocol type" — so a list of any other length names no pair at all, and two entries of
+/// different variants ([`RouterInputProtocolVariant`]) name no single protocol type. Named
+/// ONCE here, generic over the entry union, so the failover and the merge list are judged
+/// by the one rule rather than by two spellings of it.
+pub fn router_input_source_pair_rejection<Protocol: RouterInputProtocolVariant>(
+    member: &str,
+    configurations: &[Protocol],
+) -> Option<String> {
+    if configurations.len() != ROUTER_INPUT_SOURCE_PAIR_LEN {
+        return Some(format!(
+            "{member} must list exactly {ROUTER_INPUT_SOURCE_PAIR_LEN} protocol \
+             configurations, but it lists {}.",
+            configurations.len()
+        ));
+    }
+    let mut protocols = configurations.iter().map(RouterInputProtocolVariant::protocol);
+    let first = protocols.next()?;
+    let differing = protocols.find(|protocol| *protocol != first)?;
+    Some(format!(
+        "{member} must list protocol configurations that all use the same protocol type, \
+         but it lists a {first} and a {differing} configuration."
+    ))
+}
+
+/// The `RouterInputConfiguration` a request's configuration is STORED as, or the detail of
+/// why it cannot be stored as one.
+///
+/// A STANDARD input's `Protocol` is implied by the variant of its required
+/// `ProtocolConfiguration` ([`RouterInputProtocolVariant`]), so the stored configuration
+/// reports the protocol that configuration configures, and a request whose `Protocol` names
+/// a different one is refused rather than stored self-contradicting. A FAILOVER or MERGE
+/// input ingests a pair of sources, so its list of protocol configurations must be a pair of
+/// one protocol type ([`router_input_source_pair_rejection`]). The two configurations that
+/// take their content from another AWS resource carry no protocol member and no source list
+/// to reconcile, so each is stored as it arrived. Every operation that takes a configuration
+/// (CreateRouterInput, UpdateRouterInput) normalises it HERE, so no second spelling can
+/// drift from this one — the input-side counterpart of
+/// [`normalized_router_output_configuration`].
+pub fn normalized_router_input_configuration(
+    configuration: RouterInputConfiguration,
+) -> Result<RouterInputConfiguration, String> {
+    match configuration {
+        RouterInputConfiguration::Standard(standard) => {
+            let configured = standard.protocol_configuration.protocol();
+            if let Some(named) = standard
+                .protocol
+                .as_deref()
+                .filter(|protocol| !protocol.is_empty())
+            {
+                if named != configured {
+                    return Err(format!(
+                        "Configuration sets a {configured} protocol configuration, but \
+                         Protocol names {named}."
+                    ));
+                }
+            }
+            Ok(RouterInputConfiguration::Standard(
+                StandardRouterInputConfiguration {
+                    protocol: Some(configured.to_string()),
+                    ..standard
+                },
+            ))
+        }
+        RouterInputConfiguration::Failover(failover) => {
+            match router_input_source_pair_rejection(
+                "Configuration Failover ProtocolConfigurations",
+                &failover.protocol_configurations,
+            ) {
+                Some(rejection) => Err(rejection),
+                None => Ok(RouterInputConfiguration::Failover(failover)),
+            }
+        }
+        RouterInputConfiguration::Merge(merge) => {
+            match router_input_source_pair_rejection(
+                "Configuration Merge ProtocolConfigurations",
+                &merge.protocol_configurations,
+            ) {
+                Some(rejection) => Err(rejection),
+                None => Ok(RouterInputConfiguration::Merge(merge)),
+            }
+        }
+        other => Ok(other),
+    }
+}
+
 /// The `RouterInputStreamDetails` of an input configured by `configuration` that is not
 /// carrying a stream.
 ///
@@ -4287,7 +4441,8 @@ pub fn default_router_content_quality_analysis_configuration()
 /// media data plane, so no source address has been observed on an input — a failover and a
 /// merge input still report both of their indexed entries, because the model makes those
 /// two members required, and the index is the position the configuration lists the source
-/// at.
+/// at, which is a position every stored configuration of either kind has
+/// ([`ROUTER_INPUT_SOURCE_PAIR_LEN`]).
 pub fn initial_router_input_stream_details(
     configuration: &RouterInputConfiguration,
 ) -> RouterInputStreamDetails {
