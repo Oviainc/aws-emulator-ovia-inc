@@ -20,8 +20,13 @@
 //!    judged by the role THAT version carries;
 //! 2. **what the poller asks for** — the `(action, resource)` pairs the reads of that KIND
 //!    of event source are subject to ([`EVENT_SOURCE_ACCESS`]): the IAM action is the
-//!    source service's action namespace and the name of the call the poller makes, and the
-//!    resource is the `EventSourceArn` the request named;
+//!    source service's action namespace and the name of a call the poller makes ON the named
+//!    source, and the resource is the `EventSourceArn` the request named. The refusal names
+//!    the whole grant a reader of such a source is written, which is wider than that: an
+//!    account-wide enumeration of the service's sources is grantable on nothing narrower
+//!    than all of them, and a source-discovery read is one a mapping is accepted without, so
+//!    those are advice in the sentence rather than conditions of the decision
+//!    ([`Read::decided_on_source`]);
 //! 3. **what the role may do** — the identity-based documents the IAM store holds for it
 //!    (its inline policies and the default version of each managed policy attached to it),
 //!    read through IAM's own [`principal_policies`](IamState::principal_policies) accessor
@@ -81,6 +86,11 @@ enum Refusal {
     Shards {
         /// What that sentence calls the source.
         noun: &'static str,
+        /// What closes that sentence after the noun it ends on. The two shard sources word
+        /// this one error class differently at the end — one names where the grant is
+        /// written, the other stops at the noun — so the tail belongs to the source rather
+        /// than to a template shared between them.
+        tail: &'static str,
     },
     /// A QUEUE, whose reads are each a call of the queue's own API: one sentence naming the
     /// call the role may not make, and the service it would have been made to.
@@ -88,6 +98,43 @@ enum Refusal {
         /// How that sentence names the service.
         service: &'static str,
     },
+}
+
+/// ONE action the refusal of an event source's reads names.
+struct Read {
+    /// The action name, as both the refusal sentence lists it and the IAM action string
+    /// names it under the source service's namespace.
+    name: &'static str,
+    /// Whether the DECISION is made on this action, with the `EventSourceArn` as the
+    /// resource.
+    ///
+    /// `true` for the calls the poller has to make on the NAMED source to consume it, which
+    /// is what the wiring call authorizes: a role granted those on that source's ARN is
+    /// accepted. `false` for the rest of what the sentence lists — the wider grant AWS's own
+    /// managed execution-role policy carries, which includes an account-wide enumeration of
+    /// the service's sources that IAM scopes to no single one of them (its only grantable
+    /// resource is every source, so a grant of it on one source's ARN does not exist to be
+    /// found) and the source-discovery reads a mapping is accepted without. Those are advice
+    /// in the sentence, telling a customer the whole grant to write; holding a role to one
+    /// of them on the source would refuse a correctly scoped least-privilege policy.
+    decided_on_source: bool,
+}
+
+/// A call the poller makes on the named source, which the decision is made on.
+const fn polls(name: &'static str) -> Read {
+    Read {
+        name,
+        decided_on_source: true,
+    }
+}
+
+/// An action the refusal advises granting and no mapping is refused for the want of (see
+/// [`Read::decided_on_source`]).
+const fn advises(name: &'static str) -> Read {
+    Read {
+        name,
+        decided_on_source: false,
+    }
 }
 
 /// What reading ONE kind of event source takes, and how a role that may not do it is
@@ -99,12 +146,13 @@ struct EventSourceAccess {
     /// The IAM action namespace those actions are named in, which is the source service's
     /// own.
     namespace: &'static str,
-    /// The action NAMES a reader of this kind of source calls, in the order the refusal
-    /// reports them. Each list is the set of read actions AWS's own managed execution-role
-    /// policy for that event source grants (`AWSLambdaKinesisExecutionRole`,
-    /// `AWSLambdaDynamoDBExecutionRole`, `AWSLambdaSQSQueueExecutionRole`), which is what
-    /// Lambda's poller of that source calls.
-    actions: &'static [&'static str],
+    /// The actions the refusal of this kind of source names, in the order it reports them.
+    /// Each list is the set of read actions AWS's own managed execution-role policy for that
+    /// event source grants (`AWSLambdaKinesisExecutionRole`,
+    /// `AWSLambdaDynamoDBExecutionRole`, `AWSLambdaSQSQueueExecutionRole`), which is the
+    /// grant the sentence advises; which of them the DECISION is made on is each one's own
+    /// ([`Read::decided_on_source`]).
+    actions: &'static [Read],
     /// How a withheld read is worded.
     refusal: Refusal,
 }
@@ -117,50 +165,70 @@ struct EventSourceAccess {
 /// enhanced fan-out role. It is left to the change that implements consumer polling.
 const KINESIS_CONSUMER_SEGMENT: &str = "/consumer/";
 
-/// The reads each KIND of event source takes.
+/// What the refusal of each KIND of event source names, and which of it the decision is
+/// made on.
 ///
 /// Only the sources whose reads are plain resource-level calls on the source itself are
 /// here. An Amazon MSK cluster, an Amazon MQ broker and an Amazon DocumentDB change stream
 /// are reached through a cluster's or broker's own credentials and network, so what a role
 /// has to be granted for them is not a read of the named resource and their refusals are
 /// worded per source; those sources are left to the change that implements their polling.
+///
+/// A shard source is consumed by the SAME three calls whichever of the two services holds
+/// it — describe the source, open an iterator on a shard, get that shard's records — so
+/// those three are what a mapping onto one is decided on, and a role granted exactly them on
+/// the source is accepted. The other actions in a sentence are the rest of the grant AWS
+/// advises writing.
 const EVENT_SOURCE_ACCESS: &[EventSourceAccess] = &[
     EventSourceAccess {
         vendor: super::EVENT_SOURCE_VENDOR_KINESIS,
         namespace: super::EVENT_SOURCE_VENDOR_KINESIS,
         actions: &[
-            "GetRecords",
-            "GetShardIterator",
-            "DescribeStream",
-            "DescribeStreamSummary",
-            "ListShards",
-            "ListStreams",
+            polls("GetRecords"),
+            polls("GetShardIterator"),
+            polls("DescribeStream"),
+            advises("DescribeStreamSummary"),
+            advises("ListShards"),
+            advises("ListStreams"),
         ],
-        refusal: Refusal::Shards { noun: "stream" },
+        refusal: Refusal::Shards {
+            noun: "stream",
+            tail: ".",
+        },
     },
     EventSourceAccess {
         vendor: super::EVENT_SOURCE_VENDOR_DYNAMODB,
         namespace: super::EVENT_SOURCE_VENDOR_DYNAMODB,
         actions: &[
-            "GetRecords",
-            "GetShardIterator",
-            "DescribeStream",
-            "ListStreams",
+            polls("GetRecords"),
+            polls("GetShardIterator"),
+            polls("DescribeStream"),
+            advises("ListStreams"),
         ],
-        refusal: Refusal::Shards { noun: "stream" },
+        refusal: Refusal::Shards {
+            noun: "stream",
+            tail: " in IAM.",
+        },
     },
     EventSourceAccess {
         vendor: super::EVENT_SOURCE_VENDOR_QUEUE,
         namespace: super::EVENT_SOURCE_VENDOR_QUEUE,
-        actions: &["ReceiveMessage", "DeleteMessage", "GetQueueAttributes"],
+        actions: &[
+            polls("ReceiveMessage"),
+            polls("DeleteMessage"),
+            polls("GetQueueAttributes"),
+        ],
         refusal: Refusal::Call { service: "SQS" },
     },
 ];
 
 impl EventSourceAccess {
-    /// The FIRST of this entry's actions the role `role_arn` may not perform on `resource`,
-    /// or `None` when it may perform all of them — or when nothing of the kind can be shown
-    /// (see the module docs for the cases that show nothing).
+    /// The FIRST of the calls this entry is DECIDED on that the role `role_arn` may not
+    /// perform on `resource`, or `None` when it may perform all of them — or when nothing of
+    /// the kind can be shown (see the module docs for the cases that show nothing).
+    ///
+    /// The actions the sentence only ADVISES are not asked about
+    /// ([`Read::decided_on_source`]).
     fn withheld(&self, iam: &IamState, role_arn: &str, resource: &str) -> Option<&'static str> {
         // The role itself first: a value this account's IAM holds no role under says
         // nothing about what that role may do.
@@ -178,7 +246,7 @@ impl EventSourceAccess {
         let boundary = iam
             .permissions_boundary_document(role_arn)
             .map(|document| iam::prepare_documents(::std::slice::from_ref(&document)));
-        self.actions.iter().copied().find(|name| {
+        self.decided_actions().find(|name| {
             let action = format!("{}:{name}", self.namespace);
             let request = iam::Request::new(&action, resource, &[]);
             let stated = iam::identity_decision_prepared(&documents, &request);
@@ -201,13 +269,21 @@ impl EventSourceAccess {
         })
     }
 
+    /// The calls of this entry a mapping onto the source is decided on.
+    fn decided_actions(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.actions
+            .iter()
+            .filter(|read| read.decided_on_source)
+            .map(|read| read.name)
+    }
+
     /// The sentence Lambda refuses the mapping with, for an event source whose read
     /// `withheld` names is one the role may not make.
     fn message(&self, event_source_arn: &str, withheld: &str) -> String {
         match self.refusal {
-            Refusal::Shards { noun } => format!(
+            Refusal::Shards { noun, tail } => format!(
                 "Cannot access {noun} {event_source_arn}. Please ensure the role can perform \
-                 the {actions} Actions on your {noun}.",
+                 the {actions} Actions on your {noun}{tail}",
                 actions = self.action_list()
             ),
             Refusal::Call { service } => format!(
@@ -222,14 +298,14 @@ impl EventSourceAccess {
     fn action_list(&self) -> String {
         let mut listed = String::new();
         let last = self.actions.len().saturating_sub(1);
-        for (index, name) in self.actions.iter().enumerate() {
+        for (index, read) in self.actions.iter().enumerate() {
             if index > 0 {
                 listed.push_str(", ");
             }
             if index == last && last > 0 {
                 listed.push_str("and ");
             }
-            listed.push_str(name);
+            listed.push_str(read.name);
         }
         listed
     }
@@ -329,6 +405,87 @@ mod tests {
             assert_eq!(
                 read, stated,
                 "case {case:?}: expected reads stated to be {stated}, got {read}"
+            );
+        }
+    }
+
+    /// The whole sentence, which is the source's own: the action list it advises, and the
+    /// tail that one source ends on and the other does not.
+    #[test]
+    fn the_refusal_is_worded_as_the_source_words_that_error_class() {
+        // (the event source, the sentence AWS answers for it)
+        let rows: [(&str, &str); 2] = [
+            (
+                "arn:aws:kinesis:us-east-1:000000000000:stream/order-events",
+                "Cannot access stream arn:aws:kinesis:us-east-1:000000000000:stream/order-events. \
+                 Please ensure the role can perform the GetRecords, GetShardIterator, \
+                 DescribeStream, DescribeStreamSummary, ListShards, and ListStreams Actions on \
+                 your stream.",
+            ),
+            (
+                "arn:aws:dynamodb:us-east-1:000000000000:table/orders/stream/2026-10-23T11:46:49.000",
+                "Cannot access stream arn:aws:dynamodb:us-east-1:000000000000:table/orders/stream/\
+                 2026-10-23T11:46:49.000. Please ensure the role can perform the GetRecords, \
+                 GetShardIterator, DescribeStream, and ListStreams Actions on your stream in IAM.",
+            ),
+        ];
+        for (event_source, expected) in rows {
+            let access = access_of(event_source)
+                .unwrap_or_else(|| panic!("case {event_source:?}: no reads are stated for it"));
+            let message = access.message(event_source, "GetRecords");
+            assert_eq!(
+                message, expected,
+                "case {event_source:?}: expected {expected:?}, got {message:?}"
+            );
+        }
+    }
+
+    /// The decision is made on the calls the poller makes on the named source, and on those
+    /// only: the rest of the sentence is the grant it advises writing, asked of no source.
+    #[test]
+    fn only_the_calls_the_poller_makes_on_the_source_are_decided_on_it() {
+        for entry in EVENT_SOURCE_ACCESS {
+            let decided: Vec<&str> = entry.decided_actions().collect();
+            let listed: Vec<&str> = entry.actions.iter().map(|read| read.name).collect();
+            assert!(
+                !decided.is_empty(),
+                "case {:?}: expected at least one call decided on the source, got none of {listed:?}",
+                entry.vendor
+            );
+            for read in entry.actions {
+                let asked = decided.contains(&read.name);
+                assert_eq!(
+                    asked, read.decided_on_source,
+                    "case {:?}: expected {:?} to be decided on the source: {}, got {asked}",
+                    entry.vendor, read.name, read.decided_on_source
+                );
+            }
+        }
+    }
+
+    /// The three calls consuming a shard source takes are what a mapping onto either shard
+    /// source is decided on, so a role scoped to exactly them on the source is accepted.
+    #[test]
+    fn both_shard_sources_are_decided_on_the_same_three_calls() {
+        // (the event source, the calls a mapping onto it is decided on)
+        let rows: [(&str, [&str; 3]); 2] = [
+            (
+                "arn:aws:kinesis:us-east-1:000000000000:stream/order-events",
+                ["GetRecords", "GetShardIterator", "DescribeStream"],
+            ),
+            (
+                "arn:aws:dynamodb:us-east-1:000000000000:table/orders/stream/2026-10-23T11:46:49.000",
+                ["GetRecords", "GetShardIterator", "DescribeStream"],
+            ),
+        ];
+        for (event_source, expected) in rows {
+            let access = access_of(event_source)
+                .unwrap_or_else(|| panic!("case {event_source:?}: no reads are stated for it"));
+            let decided: Vec<&str> = access.decided_actions().collect();
+            assert_eq!(
+                decided,
+                expected.to_vec(),
+                "case {event_source:?}: expected {expected:?}, got {decided:?}"
             );
         }
     }

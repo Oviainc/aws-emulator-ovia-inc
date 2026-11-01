@@ -83,6 +83,8 @@ mod event_source_mapping_deletion;
 mod event_source_mapping_duplicate_source;
 #[path = "all/event_source_mapping_event_counts.rs"]
 mod event_source_mapping_event_counts;
+#[path = "all/event_source_mapping_least_privilege_role.rs"]
+mod event_source_mapping_least_privilege_role;
 #[path = "all/event_source_mapping_metrics_scope.rs"]
 mod event_source_mapping_metrics_scope;
 #[path = "all/event_source_mapping_paused_state_and_response_types.rs"]

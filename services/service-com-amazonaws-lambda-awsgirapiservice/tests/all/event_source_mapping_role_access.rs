@@ -67,10 +67,10 @@ const KINESIS_CONSUMER: &str =
 const UNCARRIED_MANAGED_POLICY: &str =
     "arn:aws:iam::aws:policy/service-role/AWSLambdaKinesisExecutionRole";
 
-/// The reads Lambda's poller of an Amazon Kinesis data stream makes, in the order the
-/// refusal lists them. Source: the actions AWS's own managed execution-role policy for that
-/// event source (`AWSLambdaKinesisExecutionRole`) grants on the stream.
-const KINESIS_READS: [&str; 6] = [
+/// The actions the refusal of an Amazon Kinesis data stream lists, in its order. Source:
+/// the actions AWS's own managed execution-role policy for that event source
+/// (`AWSLambdaKinesisExecutionRole`) grants.
+pub(crate) const KINESIS_READS: [&str; 6] = [
     "GetRecords",
     "GetShardIterator",
     "DescribeStream",
@@ -80,7 +80,7 @@ const KINESIS_READS: [&str; 6] = [
 ];
 
 /// The same, for an Amazon DynamoDB stream. Source: `AWSLambdaDynamoDBExecutionRole`.
-const DYNAMODB_READS: [&str; 4] = [
+pub(crate) const DYNAMODB_READS: [&str; 4] = [
     "GetRecords",
     "GetShardIterator",
     "DescribeStream",
@@ -107,7 +107,7 @@ fn form_encode(value: &str) -> String {
 
 /// Lambda over the SAME engine as IAM, so the gate resolves the execution role in the
 /// service that owns it — exactly what `core/router` assembles.
-fn router_with_iam() -> MultiServiceRouter {
+pub(crate) fn router_with_iam() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = router_on(&engine);
     router.register_service(
@@ -120,7 +120,11 @@ fn router_with_iam() -> MultiServiceRouter {
 
 /// One IAM call: IAM speaks `awsQuery`, so its parameters travel as a form body and its
 /// answer comes back as XML.
-async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -172,7 +176,7 @@ fn trust_policy() -> String {
 
 /// Create the role `name`, with the statements `statements` as its one inline policy when
 /// the row states any, and answer the ARN IAM persisted.
-async fn given_role(
+pub(crate) async fn given_role(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -213,7 +217,12 @@ async fn given_role(
 }
 
 /// Create a function of `name` running as `role_arn`.
-async fn create_function_as(router: &MultiServiceRouter, case: &str, name: &str, role_arn: &str) {
+pub(crate) async fn create_function_as(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    role_arn: &str,
+) {
     let package: Vec<u8> = (0..64u16)
         .map(|byte| u8::try_from(byte % 251).unwrap_or(0))
         .collect();
@@ -259,12 +268,18 @@ fn listed(actions: &[&str]) -> String {
         .collect()
 }
 
-/// How AWS words the refusal of a role that may not read a SHARD source: the source, and
-/// every read a reader of it makes.
-fn stream_refusal(event_source_arn: &str, actions: &[&str]) -> String {
+/// How AWS ends the Kinesis wording of this error class, after the noun of its last clause.
+pub(crate) const KINESIS_TAIL: &str = ".";
+
+/// How it ends the DynamoDB Streams wording of the same class: the tail is the source's own.
+pub(crate) const DYNAMODB_TAIL: &str = " in IAM.";
+
+/// How AWS words the refusal of a role that may not read a SHARD source: the source, every
+/// read a reader of it makes, and the tail that source's wording ends on.
+pub(crate) fn stream_refusal(event_source_arn: &str, actions: &[&str], tail: &str) -> String {
     format!(
         "Cannot access stream {event_source_arn}. Please ensure the role can perform the {} \
-         Actions on your stream.",
+         Actions on your stream{tail}",
         listed(actions)
     )
 }
@@ -275,7 +290,7 @@ fn queue_refusal(action: &str) -> String {
 }
 
 /// A statement allowing `actions` of `namespace` on `resource`.
-fn allow(namespace: &str, actions: &[&str], resource: &str) -> Value {
+pub(crate) fn allow(namespace: &str, actions: &[&str], resource: &str) -> Value {
     json!({
         "Effect": "Allow",
         "Action": actions
@@ -288,7 +303,7 @@ fn allow(namespace: &str, actions: &[&str], resource: &str) -> Value {
 
 /// The statement every one of these roles carries whatever else it does: the log writes a
 /// function makes, which say nothing about any event source.
-fn logs_only() -> Value {
+pub(crate) fn logs_only() -> Value {
     json!({
         "Effect": "Allow",
         "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
@@ -314,7 +329,7 @@ fn rows() -> Vec<Row> {
             case: "a kinesis stream, with only logs granted",
             event_source: KINESIS_SOURCE,
             statements: json!([logs_only()]),
-            refusal: Some(stream_refusal(KINESIS_SOURCE, &KINESIS_READS)),
+            refusal: Some(stream_refusal(KINESIS_SOURCE, &KINESIS_READS, KINESIS_TAIL)),
         },
         Row {
             // The positive control: exactly the six reads, on the stream itself.
@@ -343,9 +358,11 @@ fn rows() -> Vec<Row> {
             case: "a kinesis stream, with every read granted on another stream",
             event_source: KINESIS_SOURCE,
             statements: json!([allow("kinesis", &KINESIS_READS, OTHER_KINESIS_STREAM)]),
-            refusal: Some(stream_refusal(KINESIS_SOURCE, &KINESIS_READS)),
+            refusal: Some(stream_refusal(KINESIS_SOURCE, &KINESIS_READS, KINESIS_TAIL)),
         },
         Row {
+            // One of the three calls consuming the stream takes is absent, and those are
+            // what the mapping is decided on.
             case: "a kinesis stream, with one read short of the set",
             event_source: KINESIS_SOURCE,
             statements: json!([allow(
@@ -353,13 +370,13 @@ fn rows() -> Vec<Row> {
                 &[
                     "GetRecords",
                     "GetShardIterator",
-                    "DescribeStream",
                     "DescribeStreamSummary",
+                    "ListShards",
                     "ListStreams"
                 ],
                 KINESIS_SOURCE
             )]),
-            refusal: Some(stream_refusal(KINESIS_SOURCE, &KINESIS_READS)),
+            refusal: Some(stream_refusal(KINESIS_SOURCE, &KINESIS_READS, KINESIS_TAIL)),
         },
         Row {
             // IAM's deny precedence: an explicit `Deny` wins over the grant beside it.
@@ -373,14 +390,18 @@ fn rows() -> Vec<Row> {
                     "Resource": KINESIS_SOURCE,
                 },
             ]),
-            refusal: Some(stream_refusal(KINESIS_SOURCE, &KINESIS_READS)),
+            refusal: Some(stream_refusal(KINESIS_SOURCE, &KINESIS_READS, KINESIS_TAIL)),
         },
         Row {
             // The reads are the source service's own, so another service's are not them.
             case: "a dynamodb stream, with the kinesis reads granted instead",
             event_source: DYNAMODB_SOURCE,
             statements: json!([allow("kinesis", &KINESIS_READS, "*")]),
-            refusal: Some(stream_refusal(DYNAMODB_SOURCE, &DYNAMODB_READS)),
+            refusal: Some(stream_refusal(
+                DYNAMODB_SOURCE,
+                &DYNAMODB_READS,
+                DYNAMODB_TAIL
+            )),
         },
         Row {
             case: "a dynamodb stream, with every read granted on it",
@@ -432,7 +453,7 @@ fn rows() -> Vec<Row> {
 /// The `CreateEventSourceMapping` body for one row: a shard source also needs the
 /// `StartingPosition` the model makes "Required for Amazon Kinesis and Amazon DynamoDB
 /// Stream event sources".
-fn create_body(function: &str, event_source: &str) -> Value {
+pub(crate) fn create_body(function: &str, event_source: &str) -> Value {
     let mut body = json!({ "FunctionName": function, "EventSourceArn": event_source });
     if event_source.starts_with("arn:aws:kinesis:") || event_source.starts_with("arn:aws:dynamodb:")
     {
@@ -442,7 +463,7 @@ fn create_body(function: &str, event_source: &str) -> Value {
 }
 
 /// Assert `answer` is the modelled refusal carrying `expected`.
-fn assert_refused(case: &str, answer: &Answer, expected: &str) {
+pub(crate) fn assert_refused(case: &str, answer: &Answer, expected: &str) {
     assert_eq!(
         answer.status,
         400,
@@ -575,7 +596,7 @@ async fn re_targeting_a_mapping_is_held_to_the_same_grant() {
     assert_refused(
         case,
         &refused,
-        &stream_refusal(KINESIS_SOURCE, &KINESIS_READS),
+        &stream_refusal(KINESIS_SOURCE, &KINESIS_READS, KINESIS_TAIL),
     );
 
     // And the refusal changed nothing: the mapping still invokes the function it was
@@ -625,15 +646,16 @@ async fn a_permissions_boundary_caps_what_the_role_may_read() {
             true,
         ),
         (
+            // Short of `GetShardIterator`, one of the three calls the mapping is decided on.
             "a boundary allowing one read short of the set",
             json!([allow(
                 "kinesis",
                 &[
                     "GetRecords",
-                    "GetShardIterator",
                     "DescribeStream",
                     "DescribeStreamSummary",
-                    "ListShards"
+                    "ListShards",
+                    "ListStreams"
                 ],
                 "*"
             )]),
@@ -699,7 +721,11 @@ async fn a_permissions_boundary_caps_what_the_role_may_read() {
                 answer.text()
             );
         } else {
-            assert_refused(case, &answer, &stream_refusal(KINESIS_SOURCE, &KINESIS_READS));
+            assert_refused(
+                case,
+                &answer,
+                &stream_refusal(KINESIS_SOURCE, &KINESIS_READS, KINESIS_TAIL),
+            );
         }
     }
 }
