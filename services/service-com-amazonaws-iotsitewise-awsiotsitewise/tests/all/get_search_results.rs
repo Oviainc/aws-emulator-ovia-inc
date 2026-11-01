@@ -19,7 +19,8 @@
 //! are written in, which filter the search carried (datasets, time series, time
 //! intervals, two at once), and which workspace the search runs in. The sibling
 //! suites pin the refusals (a search that has not succeeded, a pair no search is
-//! stored under), the paging, and that reading results writes nothing.
+//! stored under), the paging — including that a `nextToken` names a page only of
+//! the search it was issued for — and that reading results writes nothing.
 //!
 //! The HTTP harness (`call`, `error_code`, `hex_token`, `is_modelled_id`,
 //! `router_with_engine`) is the asset suite's and the `StartSearch` /
@@ -629,6 +630,27 @@ fn assert_result(
     );
 }
 
+/// The `nextToken` a page must issue to resume at `segment` of the enumeration
+/// `answered`: the hex of that result's identity — the search that produced it (the
+/// workspace it ran in and its id) and the segment it reports (the series covered,
+/// the span covered of it and the dataset holding it).
+///
+/// Hand-rolled as an INDEPENDENT oracle rather than read back off the handler, so a
+/// token bound to the wrong thing cannot agree with itself and pass.
+fn resume_token(segment: &Segment, answered: Answered<'_>) -> String {
+    hex_token(&format!(
+        "{}|{}|{}|{}.{}|{}.{}|{}",
+        answered.workspace,
+        answered.search_id,
+        series_id(segment.series),
+        EPOCH + segment.start.0,
+        segment.start.1,
+        EPOCH + segment.end.0,
+        segment.end.1,
+        id(answered.catalog, segment.dataset),
+    ))
+}
+
 /// Every result of a 200 answer, asserted against `expected` in order.
 fn assert_page(case: &str, body: &Value, expected: &[(Segment, f64)], answered: Answered<'_>) {
     let reported = body["searchResults"]
@@ -698,6 +720,11 @@ async fn a_page_is_bounded_by_max_results_and_resumed_by_its_next_token() {
     ];
     let search_id = start_search(&router, WORKSPACE, "session", None).await;
     tokio::time::sleep(SEARCH_QUEUED_FOR + SEARCH_RUNS_FOR + SETTLED).await;
+    let answered = Answered {
+        workspace: WORKSPACE,
+        search_id: &search_id,
+        catalog: &catalog,
+    };
 
     // The rows differ along the page size: one result per page, an uneven split, a
     // page exactly as long as the enumeration, and a page longer than it.
@@ -720,22 +747,14 @@ async fn a_page_is_bounded_by_max_results_and_resumed_by_its_next_token() {
                 .iter()
                 .map(|segment| (*segment, 1.0))
                 .collect();
-            assert_page(
-                &case,
-                &body,
-                &expected,
-                Answered {
-                    workspace: WORKSPACE,
-                    search_id: &search_id,
-                    catalog: &catalog,
-                },
-            );
+            assert_page(&case, &body, &expected, answered);
             let reported = body.get("nextToken").and_then(Value::as_str);
             if end < ranked.len() {
                 assert_eq!(
                     reported,
-                    Some(hex_token(&end.to_string()).as_str()),
-                    "case {case:?}: the token must resume at result {end}, got {body}"
+                    Some(resume_token(&ranked[end], answered).as_str()),
+                    "case {case:?}: the token must resume at result {end} of this \
+                     search's own enumeration, got {body}"
                 );
             } else {
                 assert!(
@@ -753,12 +772,22 @@ async fn a_page_is_bounded_by_max_results_and_resumed_by_its_next_token() {
     }
 
     // A token this operation never issued is a bad request, not an empty page: text
-    // that is not one of its tokens, and an index at or past the end of the results
-    // it was issued for.
+    // that is not hex at all, hex of a bare ordinal (never a token this operation
+    // writes, in any spelling), hex of a resume point this enumeration holds no
+    // result at, and the uppercase spelling of a token it DID issue.
+    let issued = resume_token(&ranked[1], answered);
     for (case, token) in [
         ("not-a-token", "Zz".to_string()),
+        ("a-bare-ordinal", hex_token("1")),
+        ("a-padded-ordinal", hex_token("001")),
+        ("a-signed-ordinal", hex_token("+1")),
         ("past-the-end", hex_token("4")),
         ("far-past-the-end", hex_token("99")),
+        (
+            "a-segment-of-no-result-of-this-search",
+            resume_token(&UNSCOPED_VIBRATION, answered),
+        ),
+        ("another-hex-spelling-of-an-issued-token", issued.to_uppercase()),
     ] {
         let (status, body) = results(&router, WORKSPACE, &search_id, None, Some(&token)).await;
         assert_eq!(
@@ -917,4 +946,151 @@ async fn reading_results_writes_nothing() {
         before,
         "no number of reads may change the stored searches or segments, expected {before:?}"
     );
+}
+
+/// The searches the cross-enumeration suite pages, differing along what makes two
+/// enumerations different: how many results they hold, which datasets and which
+/// series those come from, whether a filter narrowed them, and which workspace the
+/// search ran in. Every statement below matches each of its results in full, so
+/// each one scores `1.0`.
+fn paged_searches() -> Vec<Row> {
+    let all = 1.0;
+    vec![
+        Row {
+            case: "four results, the whole searched workspace",
+            workspace: WORKSPACE,
+            query: "session",
+            filters: None,
+            expected: vec![
+                (PRESS_VIBRATION_EARLY, all),
+                (PRESS_VIBRATION_LATE, all),
+                (PRESS_TEMPERATURE, all),
+                (BOILER_TEMPERATURE, all),
+            ],
+        },
+        Row {
+            case: "three results, one dataset's segments",
+            workspace: WORKSPACE,
+            query: "compressor vibration",
+            filters: None,
+            expected: vec![
+                (PRESS_VIBRATION_EARLY, all),
+                (PRESS_VIBRATION_LATE, all),
+                (PRESS_TEMPERATURE, all),
+            ],
+        },
+        Row {
+            case: "two results, narrowed to one series by a filter",
+            workspace: WORKSPACE,
+            query: "session",
+            filters: Some(json!({ "timeSeriesIds": [TEMPERATURE_SERIES] })),
+            expected: vec![(PRESS_TEMPERATURE, all), (BOILER_TEMPERATURE, all)],
+        },
+        Row {
+            case: "one result, so no page is left to resume",
+            workspace: WORKSPACE,
+            query: "boiler",
+            filters: None,
+            expected: vec![(BOILER_TEMPERATURE, all)],
+        },
+        Row {
+            case: "a search of the other workspace",
+            workspace: OTHER_WORKSPACE,
+            query: "compressor vibration",
+            filters: None,
+            expected: vec![(NEIGHBOUR_VIBRATION, all)],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_token_names_a_page_only_of_the_search_it_was_issued_for() {
+    let (router, _engine, catalog) = seeded().await;
+    let searches = paged_searches();
+
+    // Every search is started first and the owed transitions waited out once.
+    let mut started = Vec::new();
+    for row in &searches {
+        started.push(start_search(&router, row.workspace, row.query, row.filters.as_ref()).await);
+    }
+    tokio::time::sleep(SEARCH_QUEUED_FOR + SEARCH_RUNS_FOR + SETTLED).await;
+
+    let answered = |at: usize| Answered {
+        workspace: searches[at].workspace,
+        search_id: started[at].as_str(),
+        catalog: &catalog,
+    };
+
+    // The first page of each search, one result long, and the token it issued: the
+    // identity of the result the NEXT page of THAT search resumes at, absent when
+    // the search has nothing left to resume.
+    let mut tokens: Vec<Option<String>> = Vec::new();
+    for (at, row) in searches.iter().enumerate() {
+        let (status, body) = results(&router, row.workspace, &started[at], Some(1), None).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected 200, got {status} {body}",
+            row.case
+        );
+        assert_page(row.case, &body, &row.expected[..1], answered(at));
+        let reported = body
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let expected = row
+            .expected
+            .get(1)
+            .map(|(segment, _)| resume_token(segment, answered(at)));
+        assert_eq!(
+            reported, expected,
+            "case {:?}: expected the token {expected:?} for this search's second \
+             result, got {reported:?} in {body}",
+            row.case
+        );
+        tokens.push(reported);
+    }
+
+    // The rule, over every pair: a token is honoured against the search that minted
+    // it, and against no other — not even one whose results include the very
+    // segment the token resumes at.
+    for (minted_by, token) in tokens.iter().enumerate() {
+        let Some(token) = token.as_deref() else {
+            continue;
+        };
+        for (against, row) in searches.iter().enumerate() {
+            let case = format!(
+                "token of {:?} replayed against {:?}",
+                searches[minted_by].case, row.case
+            );
+            let (status, body) =
+                results(&router, row.workspace, &started[against], Some(1), Some(token)).await;
+            if against == minted_by {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: its own search must honour it, got {status} {body}"
+                );
+                assert_page(&case, &body, &row.expected[1..2], answered(against));
+                continue;
+            }
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a token of another search names no page here, got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidRequestException",
+                "case {case:?}: a token this search never issued is a modelled bad \
+                 request, got {body}"
+            );
+            // And nothing of that search was consumed or hidden by the replay: its
+            // own first page still leads with its most relevant result.
+            let (status, fresh) =
+                results(&router, row.workspace, &started[against], Some(1), None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the search itself still answers, got {status} {fresh}"
+            );
+            assert_page(&case, &fresh, &row.expected[..1], answered(against));
+        }
+    }
 }

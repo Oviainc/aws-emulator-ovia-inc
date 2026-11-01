@@ -26,7 +26,9 @@
 //! as is a workspace this service does not hold.
 //!
 //! The page is bounded by `maxResults` ([`DEFAULT_MAX_RESULTS`] when the call names
-//! none) and resumed by the `nextToken` the previous page issued.
+//! none) and resumed by the `nextToken` the previous page issued, which carries the
+//! identity of the result to resume at ([`resume_key`]) — the search that produced
+//! it included — so a token names a page only of the enumeration that minted it.
 //!
 //! ## Shape of an operation
 //!
@@ -236,32 +238,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let ranked = ranked_results(&store, search);
 
-        // `nextToken` is the index of the first result of the next page, hex-encoded
-        // so the token stays opaque to the caller and matches the modelled
-        // `^[A-Za-z0-9+/=]+$`. A token is issued only for a result this page HAS, so
-        // an index at or past the end is one this operation never issued — including
-        // every index at all for a search that matched nothing.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                if resume >= ranked.len() {
-                    return Err(invalid_token());
-                }
-                resume
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..10000, which the runtime
-        // validates BEFORE this handler runs, so a value that arrives here is
-        // already in range and nothing is being coerced; `max(1)` only keeps the
-        // slice arithmetic below total.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(ranked.len());
+        // This enumeration's resume point is a RESULT'S OWN IDENTITY — the search
+        // that produced it and the segment it reports ([`resume_key`]) — and the
+        // page walk every paginated read of this service shares takes it from
+        // there: it resumes at the result the token names, refusing a token whose
+        // resume point is not in THIS enumeration rather than answering a page that
+        // silently skips its leading results; it cuts the page at `maxResults`,
+        // defaulting to [`DEFAULT_MAX_RESULTS`]; and it mints "the pagination token
+        // to use in a subsequent GetSearchResults call" from the result that
+        // follows the page, leaving it absent "when there are no more results".
+        let page = crate::state::page_of(
+            &ranked,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            resume_key,
+        )
+        .ok_or_else(invalid_token)?;
 
         Ok(GetSearchResultsOutput {
-            search_results: ranked[start..end].to_vec(),
-            // "Absent when there are no more results."
-            next_token: (end < ranked.len()).then(|| encode_token(end)),
+            search_results: ranked[page.start..page.end].to_vec(),
+            next_token: page.next_token,
         })
     }
 }
@@ -519,23 +516,29 @@ fn top_timestamp(segment: &crate::state::DataSegmentRecord) -> TimeInNanos {
     crate::state::timestamp_at_nanos(start + (end - start) / 2)
 }
 
-/// A `nextToken` for the result the next page resumes from: its index in the ranked
-/// enumeration, written out and hex-encoded so the token matches the modelled
-/// `^[A-Za-z0-9+/=]+$`.
-fn encode_token(resume: usize) -> String {
-    ::hex::encode(resume.to_string().as_bytes())
-}
-
-/// Decode a `nextToken` back into the index it resumes from.
-fn decode_token(token: &str) -> Result<usize, GetSearchResultsError> {
-    crate::state::decode_token_text(token)
-        .and_then(|resume| crate::state::token_number(&resume))
-        .ok_or_else(invalid_token)
+/// The text a `nextToken` resumes this enumeration from: a result's identity,
+/// which is the SEARCH that produced it (the workspace it ran in and its id, both
+/// of which the result itself reports) together with the segment it reports —
+/// the series covered, the span covered of it and the dataset holding it, the same
+/// total order [`result_key`] ranks equally relevant results by.
+///
+/// Binding the resume point to the search is what makes the token resumable only
+/// against the enumeration that minted it: a token issued while paging one search
+/// names a key no result of ANOTHER search carries, so it names no page there and
+/// is refused, rather than being honoured as a bare position and hiding that
+/// search's leading, most relevant results.
+fn resume_key(result: &SearchResult) -> String {
+    let (time_series_id, start, end, dataset_id) = result_key(result);
+    format!(
+        "{}|{}|{time_series_id}|{}.{}|{}.{}|{dataset_id}",
+        result.workspace_name, result.search_id, start.0, start.1, end.0, end.1,
+    )
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
-/// issued: text that is not one of its tokens, or an index at or past the end of
-/// the results it was issued for.
+/// issued: text that is not one of its tokens, or one whose resume point no result
+/// of the enumeration being read carries — including a token minted for a
+/// different search, and any token at all for a search that matched nothing.
 fn invalid_token() -> GetSearchResultsError {
     invalid_request("The nextToken is not a token this operation issued.".to_string())
 }
