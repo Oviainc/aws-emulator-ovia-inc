@@ -44,7 +44,7 @@ const FILTER: &str = "to-the-stream";
 /// A VPC flow log record in the DEFAULT format — "version account-id interface-id srcaddr
 /// dstaddr srcport dstport protocol packets bytes start end action log-status" — with every
 /// field supplied.
-const FULL_RECORD: &str = "2 123456789012 eni-0a1b2c3d4e5f60718 10.0.1.5 10.0.2.9 443 49152 \
+pub(crate) const FULL_RECORD: &str = "2 123456789012 eni-0a1b2c3d4e5f60718 10.0.1.5 10.0.2.9 443 49152 \
                            6 10 840 1700000000 1700000060 ACCEPT OK";
 
 /// The same format for an interval the interface captured no traffic in: every field the
@@ -54,7 +54,7 @@ const NODATA_RECORD: &str =
 
 /// A record of the same format whose `action` is the other value a flow log reports, used to
 /// show the filter pattern running against the TRANSFORMED event.
-const REJECTED_RECORD: &str = "2 123456789012 eni-0a1b2c3d4e5f60718 10.0.3.7 10.0.4.1 53 \
+pub(crate) const REJECTED_RECORD: &str = "2 123456789012 eni-0a1b2c3d4e5f60718 10.0.3.7 10.0.4.1 53 \
                                33000 17 2 160 1700000100 1700000160 REJECT OK";
 
 /// What a row expects at the destination for the one event it writes.
@@ -89,7 +89,7 @@ struct Row {
 
 /// The whole flow log record as `parseVPC` converts it: the camelCase field names, with the
 /// counters, ports, protocol number and window instants as JSON NUMBERS.
-fn full_record_document() -> Value {
+pub(crate) fn full_record_document() -> Value {
     json!({
         "version": 2,
         "accountId": "123456789012",
@@ -122,7 +122,7 @@ fn nodata_record_document() -> Value {
 }
 
 /// The same for the rejected record.
-fn rejected_record_document() -> Value {
+pub(crate) fn rejected_record_document() -> Value {
     json!({
         "version": 2,
         "accountId": "123456789012",
@@ -142,7 +142,7 @@ fn rejected_record_document() -> Value {
 }
 
 /// A one-processor chain naming `parseVPC`.
-fn parse_vpc() -> Value {
+pub(crate) fn parse_vpc() -> Value {
     json!([{"parseVPC": {}}])
 }
 

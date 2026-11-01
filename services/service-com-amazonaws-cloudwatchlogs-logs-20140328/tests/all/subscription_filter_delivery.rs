@@ -108,7 +108,7 @@ async fn write_line(emulator: &Emulator, case: &str, message: &str) -> i64 {
 }
 
 /// The filter each delivered record names, and the messages that record carries.
-fn delivered_by(case: &str, records: &[(String, Value)]) -> Vec<(String, Vec<String>)> {
+pub(crate) fn delivered_by(case: &str, records: &[(String, Value)]) -> Vec<(String, Vec<String>)> {
     records
         .iter()
         .map(|(_key, envelope)| {

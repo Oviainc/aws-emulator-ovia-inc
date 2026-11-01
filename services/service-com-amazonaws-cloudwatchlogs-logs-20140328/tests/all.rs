@@ -207,6 +207,8 @@ mod subscription_destination_plumbing;
 mod subscription_fan_out;
 #[path = "all/subscription_filter_delivery.rs"]
 mod subscription_filter_delivery;
+#[path = "all/subscription_filter_independence.rs"]
+mod subscription_filter_independence;
 #[path = "all/subscription_filters.rs"]
 mod subscription_filters;
 #[path = "all/syslog_configurations.rs"]

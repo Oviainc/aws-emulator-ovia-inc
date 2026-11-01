@@ -35,14 +35,14 @@ use crate::subscription_fan_out::{
 const LOGS_NAMESPACE: &str = "AWS/Logs";
 
 /// The two metrics of the delivery path under test, from the `AWS/Logs` metric table.
-const FORWARDED_LOG_EVENTS: &str = "ForwardedLogEvents";
-const DELIVERY_ERRORS: &str = "DeliveryErrors";
+pub(crate) const FORWARDED_LOG_EVENTS: &str = "ForwardedLogEvents";
+pub(crate) const DELIVERY_ERRORS: &str = "DeliveryErrors";
 
 /// The dimension names a LOG-GROUP-level subscription filter's delivery metrics carry, as the
 /// `AWS/Logs` table names them.
-const LOG_GROUP_NAME: &str = "LogGroupName";
-const DESTINATION_TYPE: &str = "DestinationType";
-const FILTER_NAME: &str = "FilterName";
+pub(crate) const LOG_GROUP_NAME: &str = "LogGroupName";
+pub(crate) const DESTINATION_TYPE: &str = "DestinationType";
+pub(crate) const FILTER_NAME: &str = "FilterName";
 
 /// The `StandardUnit` value for a datapoint in no unit, which is the unit the table gives both
 /// metrics.
@@ -133,7 +133,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// The dimension set of one filter's delivery series, as CloudWatch takes it.
-fn dimensions(group: &str, filter: &str, destination_type: &str) -> Value {
+pub(crate) fn dimensions(group: &str, filter: &str, destination_type: &str) -> Value {
     json!([
         {"Name": LOG_GROUP_NAME, "Value": group},
         {"Name": DESTINATION_TYPE, "Value": destination_type},
@@ -143,7 +143,7 @@ fn dimensions(group: &str, filter: &str, destination_type: &str) -> Value {
 
 /// The dimension NAMES and the `FilterName` value of every `AWS/Logs` series of `metric` that
 /// `ListMetrics` reports for the log group `group`.
-async fn listed_series(
+pub(crate) async fn listed_series(
     emulator: &Emulator,
     case: &str,
     metric: &str,
@@ -220,7 +220,7 @@ async fn datapoints(
 
 /// The `Sum` of one series over that window, `None` when it holds no datapoint, asserting
 /// that every datapoint it does hold carries [`UNIT_NONE`].
-async fn sum(
+pub(crate) async fn sum(
     emulator: &Emulator,
     case: &str,
     metric: &str,
@@ -362,7 +362,7 @@ async fn forwarded_log_events_counts_only_the_events_the_pattern_selected() {
 /// The `DestinationType` dimension value of the one series the log group `group` published,
 /// read off `ListMetrics` rather than assumed: the test asserts the dimension NAMES and the
 /// filter name, and takes the kind from what the service reported.
-async fn destination_type_of(emulator: &Emulator, case: &str, group: &str) -> String {
+pub(crate) async fn destination_type_of(emulator: &Emulator, case: &str, group: &str) -> String {
     let listed = emulator
         .cloudwatch(
             case,
