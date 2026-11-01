@@ -140,22 +140,22 @@ pub async fn call_in_region(
     }
 }
 
-/// Epoch milliseconds of an ISO 8601 timestamp member (`timestampFormat: date-time`),
-/// so two renderings of the same instant compare equal.
+/// Epoch milliseconds of an ISO 8601 timestamp member (`timestampFormat: date-time`).
+///
+/// Every timestamp member of this model targets one shape and that shape declares
+/// `date-time`, so the member is an ISO 8601 STRING on the wire and this fails on any
+/// other rendering: the suites that compare instants pin the form too.
 pub fn millis_of(value: &Value, member: &str) -> i64 {
     let found = value
         .get(member)
         .unwrap_or_else(|| panic!("{member} must be present in {value}"));
-    if let Some(text) = found.as_str() {
-        return DateTime::from_str(text, Format::DateTime)
-            .unwrap_or_else(|e| panic!("{member} {text:?} must parse as ISO 8601: {e}"))
-            .to_millis()
-            .unwrap_or_else(|e| panic!("{member} {text:?} must fit in epoch millis: {e}"));
-    }
-    let seconds = found
-        .as_f64()
-        .unwrap_or_else(|| panic!("{member} must be a timestamp, got {found}"));
-    (seconds * 1000.0).round() as i64
+    let text = found
+        .as_str()
+        .unwrap_or_else(|| panic!("{member} must be an ISO 8601 string, got {found}"));
+    DateTime::from_str(text, Format::DateTime)
+        .unwrap_or_else(|e| panic!("{member} {text:?} must parse as ISO 8601: {e}"))
+        .to_millis()
+        .unwrap_or_else(|e| panic!("{member} {text:?} must fit in epoch millis: {e}"))
 }
 
 /// Epoch milliseconds of an ISO 8601 literal written in a test table.
@@ -168,12 +168,10 @@ pub fn iso_millis(iso: &str) -> i64 {
 
 /// The wire form of a timestamp inside a JSON body.
 ///
-/// The vendored JSON codec picks its timestamp format off the generated schema,
-/// which carries no `@timestampFormat`, so a body timestamp is epoch seconds on
-/// this emulator. The tables are written in the ISO 8601 form the model declares
-/// and converted here, so the cases read as the API documents them while the
-/// request still speaks the codec's wire form.
+/// Every timestamp member of this model targets one shape and that shape carries
+/// `@timestampFormat("date-time")`, so a body timestamp is the ISO 8601 STRING the
+/// tables are written in. Kept as a seam so a table reads as the API documents it
+/// while the request still speaks the wire form.
 pub fn wire_time(iso: &str) -> Value {
-    let millis = iso_millis(iso);
-    json!(millis as f64 / 1000.0)
+    json!(iso)
 }

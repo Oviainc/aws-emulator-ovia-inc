@@ -1334,3 +1334,78 @@ async fn the_tracking_loop_works_end_to_end_across_requests() {
         listed.body
     );
 }
+
+/// RULE: a latest-position read that RESOLVED its tracker but holds no sample for the
+/// device states that there are no records for the device id it was given; the
+/// missing-named-resource sentence is reserved for a tracker the service cannot resolve
+/// by name. Both are `ResourceNotFoundException`, HTTP 404.
+///
+/// Rows span what the rule generalises over: which of the two lookups failed, and the
+/// shapes a device id with no samples can take next to one that has them (a never
+/// reported id, one differing only in case, one that is a prefix extension, one carrying
+/// the punctuation an `Id` admits).
+#[tokio::test]
+async fn a_position_read_states_which_lookup_failed() {
+    let router = emulator();
+    assert_eq!(
+        create_tracker(&router, json!({ "TrackerName": "fleet" }))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        batch_update(
+            &router,
+            "fleet",
+            json!([update("device-1", "2024-01-01T00:00:00Z", [-122.4, 37.8])]),
+        )
+        .await
+        .status,
+        200
+    );
+
+    // The sentence each lookup failure states, written out here rather than read from
+    // the crate so a reworded constant fails this test instead of moving with it.
+    const NO_RECORDS: &str = "records not found for given deviceId";
+    let unknown_tracker = |name: &str| {
+        format!("Resource of type \"Tracker\" with name \"{name}\" cannot be found.")
+    };
+
+    // The tracker exists; the device has no sample under it.
+    for device in ["unknown-device", "Device-1", "device-10", "device_1.a-b"] {
+        let got = get_device_position(&router, "fleet", device).await;
+        assert_eq!(
+            got.status, 404,
+            "case {device:?}: expected 404 for a device with no stored position, got {} {:?}",
+            got.status, got.body
+        );
+        assert_eq!(
+            got.error_code(),
+            "ResourceNotFoundException",
+            "case {device:?}: expected ResourceNotFoundException, got {:?}",
+            got.body
+        );
+        assert_eq!(
+            got.message(),
+            NO_RECORDS,
+            "case {device:?}: expected the no-records sentence, got {:?}",
+            got.message()
+        );
+    }
+
+    // The tracker itself cannot be resolved, whatever the device id.
+    for tracker in ["no-such-fleet", "Fleet"] {
+        let got = get_device_position(&router, tracker, "device-1").await;
+        assert_eq!(
+            got.status, 404,
+            "case {tracker:?}: expected 404 for an unknown tracker, got {} {:?}",
+            got.status, got.body
+        );
+        assert_eq!(
+            got.message(),
+            unknown_tracker(tracker),
+            "case {tracker:?}: expected the missing-tracker sentence, got {:?}",
+            got.message()
+        );
+    }
+}

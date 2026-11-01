@@ -390,3 +390,14 @@ pub fn wgs84_position(position: &[f64]) -> Result<[f64; 2], String> {
 /// the service" member.
 pub const BATCH_VALIDATION_ERROR: &str = "ValidationError";
 
+/// The `ResourceNotFoundException` sentence a position read states when it resolved
+/// its tracker but the device has no stored position under it.
+///
+/// A device is not a named resource of this API — it exists only as the key of the
+/// samples reported for it — so this is NOT the
+/// `Resource of type "<Type>" with name "<name>" cannot be found.` sentence that a
+/// tracker, a geofence collection or a route calculator the service cannot resolve by
+/// name is refused with. It is fixed text: the device id it concerns is already the
+/// request's own `DeviceId`.
+pub const NO_POSITION_RECORDS: &str = "records not found for given deviceId";
+

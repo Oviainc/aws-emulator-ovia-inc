@@ -197,7 +197,7 @@ fn at(value: &Value, pointer: &str) -> Value {
 /// a number is padded to a fixed width and an RFC-3339 string's
 /// fractional-second part to nine digits, after which either sorts
 /// lexicographically in the order the instants fall.
-fn timestamp_key(value: &Value) -> String {
+pub(crate) fn timestamp_key(value: &Value) -> String {
     if let Some(seconds) = value.as_f64() {
         return format!("{seconds:030.9}");
     }

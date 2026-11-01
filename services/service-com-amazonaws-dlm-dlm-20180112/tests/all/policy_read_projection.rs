@@ -26,6 +26,10 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_dlm_dlm_20180112::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+// The comparable timestamp key this crate's suites already share, so two renderings of
+// one instant order by the instant rather than by their spelling.
+use crate::lifecycle_policy_crud::timestamp_key;
+
 /// The region these requests are signed for.
 const REGION: &str = "eu-west-1";
 
@@ -756,14 +760,13 @@ async fn an_update_restamps_the_materialized_members() {
             at(read.policy(), "/StatusMessage")
         );
         // "The local date and time when the lifecycle policy was last modified": the
-        // update moved it, and both members are still `date-time` strings.
+        // update moved it, and both members are still `date-time` strings. Ordered
+        // through the suite's shared comparable key, because the `date-time` rendering
+        // trims trailing fractional zeros — so `"…:00.5Z"` sorts AFTER `"…:00.52Z"` as
+        // raw text while naming the earlier instant.
         assert!(
-            at(read.policy(), "/DateModified")
-                .as_str()
-                .unwrap_or_default()
-                >= at(read.policy(), "/DateCreated")
-                    .as_str()
-                    .unwrap_or_default(),
+            timestamp_key(&at(read.policy(), "/DateModified"))
+                >= timestamp_key(&at(read.policy(), "/DateCreated")),
             "case {case:?}: DateModified {:?} must not precede DateCreated {:?}",
             at(read.policy(), "/DateModified"),
             at(read.policy(), "/DateCreated")
