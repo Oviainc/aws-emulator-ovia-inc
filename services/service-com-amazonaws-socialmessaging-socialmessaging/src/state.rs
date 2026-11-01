@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    LinkedWhatsAppBusinessAccount, LinkedWhatsAppBusinessAccountIdMetaData,
+    AccessDeniedException, LinkedWhatsAppBusinessAccount, LinkedWhatsAppBusinessAccountIdMetaData,
     LinkedWhatsAppBusinessAccountSummary, Tag, WhatsAppBusinessAccountEventDestination,
     WhatsAppCallSettings, WhatsAppPhoneNumberDetail, WhatsAppPhoneNumberSummary,
 };
@@ -131,6 +131,58 @@ pub const ORIGINATION_PHONE_NUMBER_NOT_FOUND_MESSAGE: &str =
 /// ([`RESOURCE_NOT_FOUND_MESSAGE`]), so the rule — a not-found message is a constant, not
 /// a formatted one — holds with each path stating the constant it was recorded with.
 pub const DATASET_NOT_FOUND_MESSAGE: &str = "Id not found for account.";
+
+/// The message this service refuses a request that hands it a role of ANOTHER account
+/// with.
+///
+/// Constant, like every other error text this service states: neither the role, the
+/// destination it would write to, nor the account the request named is formatted into it,
+/// so the refusal says only that passing a role across an account boundary is not
+/// permitted — which is the whole of the decision.
+pub const CROSS_ACCOUNT_PASS_ROLE_MESSAGE: &str = "Cross-account pass role is not allowed.";
+
+/// Refuse a request that hands this service an IAM role belonging to another account.
+///
+/// A role an operation accepts is one the SERVICE will assume on the caller's behalf, so
+/// handing one over requires `iam:PassRole` on it and a principal can hold that only for a
+/// role in its own account: a role named in another account is refused outright, with the
+/// 403 `AccessDeniedException` the service models, whatever the rest of the request says.
+/// The decision is made from the REQUEST alone — the account the role ARN names against
+/// the calling account — so every operation that takes a role asks here BEFORE it resolves
+/// any resource the request references and before it writes anything, and a caller that
+/// may not pass the role never learns from the answer whether the resource exists.
+///
+/// `Ok` means only that no entry names another account: a destination with no role, and a
+/// role whose account field cannot be read at all, are both left to the rest of the
+/// handler, which is what refuses them.
+///
+/// The calling account is `engine::emulator_account_id()`: this emulator presents ONE
+/// account to every caller, so the account a request is made in is that one and nothing
+/// has to be read off the request's credentials. A later change that gave the emulator
+/// more than one account would supply the caller's account here instead.
+pub fn authorize_passed_roles(
+    destinations: &[WhatsAppBusinessAccountEventDestination],
+) -> Result<(), AccessDeniedException> {
+    for destination in destinations {
+        let Some(role_arn) = destination.role_arn.as_deref() else {
+            continue;
+        };
+        // The tree's one ARN parse, so this service cannot disagree with another about
+        // which account an ARN names.
+        let account = ::service_common::arn::parse(role_arn)
+            .map(|parsed| parsed.account)
+            .filter(|account| !account.is_empty());
+        let Some(account) = account else {
+            continue;
+        };
+        if account != ::engine::emulator_account_id() {
+            return Err(AccessDeniedException {
+                message: Some(CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string()),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// A WhatsApp Business Account linked to this account, as
 /// `AssociateWhatsAppBusinessAccount` stored it.

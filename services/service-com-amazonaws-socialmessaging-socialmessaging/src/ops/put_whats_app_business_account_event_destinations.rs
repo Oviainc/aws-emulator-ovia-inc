@@ -7,6 +7,11 @@
 //! here, so an id that names no linked account is the modelled
 //! `InvalidParametersException` (400).
 //!
+//! A destination's `roleArn` is a role the SERVICE would assume, so whether the caller
+//! may hand it over is decided from the request alone and therefore BEFORE the `id` is
+//! resolved: a role of another account is refused with `AccessDeniedException` (403), the
+//! shared decision in [`crate::state::authorize_passed_roles`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -67,6 +72,8 @@
 //!   are not valid.
 //! * `ThrottledRequestException` (HTTP 429) — The request was denied due to request
 //!   throttling.
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below):
+//!   You do not have sufficient access to perform this action.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -82,9 +89,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-socialmessaging-socialm
 // here — hence the `PutWhatsAppBusinessAccountEventDestinationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.socialmessaging#PutWhatsAppBusinessAccountEventDestinations")]
+//
+// `AccessDeniedException` — a shape this SERVICE declares as a common error, so every
+// operation in it carries it, though this operation's own `errors` list omits it — is
+// widened in through `extra_errors`, so a role this caller may not pass is refused with
+// the 403 the service models rather than with another status.
+#[smithy_macros::operation_error(
+    "com.amazonaws.socialmessaging#PutWhatsAppBusinessAccountEventDestinations",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum PutWhatsAppBusinessAccountEventDestinationsErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServiceException(InternalServiceException),
     InvalidParametersException(InvalidParametersException),
     ThrottledRequestException(ThrottledRequestException),
@@ -142,6 +158,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Whether the caller may hand this service a role is decided from the REQUEST
+        // alone, so it is decided first: ahead of resolving `id`, and ahead of any write,
+        // so a refused call leaves the store exactly as it found it and does not report
+        // whether the id names a linked account.
+        crate::state::authorize_passed_roles(&input.event_destinations).map_err(
+            PutWhatsAppBusinessAccountEventDestinationsErrorModeled::AccessDeniedException,
+        )?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutWhatsAppBusinessAccountEventDestinationsErrorModeled::InternalServiceException(
                 InternalServiceException {

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/conversion_events.rs"]
 mod conversion_events;
+#[path = "all/cross_account_pass_role.rs"]
+mod cross_account_pass_role;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/not_found_message.rs"]

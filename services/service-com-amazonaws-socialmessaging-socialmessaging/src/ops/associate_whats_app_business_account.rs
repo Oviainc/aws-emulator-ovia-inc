@@ -79,6 +79,8 @@
 //!   or more service quotas or limits.
 //! * `ThrottledRequestException` (HTTP 429) — The request was denied due to request
 //!   throttling.
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below):
+//!   You do not have sufficient access to perform this action.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -94,9 +96,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-socialmessaging-socialm
 // here — hence the `AssociateWhatsAppBusinessAccountError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.socialmessaging#AssociateWhatsAppBusinessAccount")]
+//
+// `AccessDeniedException` — a shape this SERVICE declares as a common error, so every
+// operation in it carries it, though this operation's own `errors` list omits it — is
+// widened in through `extra_errors`: a `waba` block may carry an event destination whose
+// `roleArn` this caller may not pass, and that refusal is the 403 the service models.
+#[smithy_macros::operation_error(
+    "com.amazonaws.socialmessaging#AssociateWhatsAppBusinessAccount",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum AssociateWhatsAppBusinessAccountErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     DependencyException(DependencyException),
     InvalidParametersException(InvalidParametersException),
     LimitExceededException(LimitExceededException),
@@ -156,6 +167,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{self as st, LinkedAccount, PendingSignup, PhoneNumberRecord};
         use std::time::SystemTime;
+
+        // A `waba` block may hand this service the role it writes events through. Whether
+        // the caller may hand that role over is decided from the REQUEST alone, so it is
+        // decided first: ahead of the signup lookup and ahead of every write, so a refused
+        // finalization neither consumes its token nor links an account.
+        let passed_roles = input
+            .setup_finalization
+            .as_ref()
+            .and_then(|setup| setup.waba.as_ref())
+            .and_then(|waba| waba.event_destinations.as_deref())
+            .unwrap_or_default();
+        st::authorize_passed_roles(passed_roles)
+            .map_err(AssociateWhatsAppBusinessAccountErrorModeled::AccessDeniedException)?;
 
         let invalid = |message: String| -> Self::Error {
             AssociateWhatsAppBusinessAccountErrorModeled::InvalidParametersException(
