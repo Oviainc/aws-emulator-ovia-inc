@@ -21,7 +21,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     call, call_as, create_domain, given_role, given_role_policy, given_session, role_arn,
-    session_arn, Answer, ACCOUNT,
+    session_arn, Answer, ACCOUNT, REGION,
 };
 
 /// The role every session below is assumed from, and the access key id of its session's
@@ -41,6 +41,18 @@ const OTHER_SESSION_NAME: &str = "other";
 const DOMAIN: &str = "authz";
 const REPOSITORY: &str = "releases";
 
+/// Which RESOURCE an addressed action is judged against: a CodeArtifact action acts on one
+/// resource type — `ListPackages` on the repository, `ListPackageVersions` on one package
+/// inside it — and the ARN of that resource is both what the decision is reached against and
+/// what the refusal names.
+#[derive(Debug, Clone, Copy)]
+enum Judged {
+    Repository,
+    /// The package the request addresses, as `(format, namespace, name)`. The namespace is a
+    /// SEGMENT of the package ARN's path, so a request that carries none leaves it empty.
+    Package(&'static str, &'static str, &'static str),
+}
+
 /// One request on the repository, as a client sends it: the operation whose action is being
 /// decided, and the HTTP method, URI and body that address it.
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +63,8 @@ struct Addressed {
     /// Whether the operation takes a body at all: its members travel in the query string,
     /// so the body a POST carries is the empty object its SDK sends.
     body: bool,
+    /// The resource this operation's action is judged against.
+    judged: Judged,
 }
 
 /// The repository-addressed operations these cases drive. Each is an operation whose input
@@ -63,30 +77,35 @@ const ADDRESSED: &[Addressed] = &[
         method: "GET",
         uri: "/v1/repository/endpoint?domain=authz&repository=releases&format=npm",
         body: false,
+        judged: Judged::Repository,
     },
     Addressed {
         operation: "DescribeRepository",
         method: "GET",
         uri: "/v1/repository?domain=authz&repository=releases",
         body: false,
+        judged: Judged::Repository,
     },
     Addressed {
         operation: "ListPackages",
         method: "POST",
         uri: "/v1/packages?domain=authz&repository=releases",
         body: true,
+        judged: Judged::Repository,
     },
     Addressed {
         operation: "GetRepositoryPermissionsPolicy",
         method: "GET",
         uri: "/v1/repository/permissions/policy?domain=authz&repository=releases",
         body: false,
+        judged: Judged::Repository,
     },
     Addressed {
         operation: "ListPackageVersions",
         method: "POST",
         uri: "/v1/package/versions?domain=authz&repository=releases&format=npm&package=left-pad",
         body: true,
+        judged: Judged::Package("npm", "", "left-pad"),
     },
 ];
 
@@ -202,6 +221,21 @@ fn no_identity_grant(session: &str, action: &str, repository: &str) -> String {
         "User: {session} is not authorized to perform: {action} on resource: {repository} \
          because no identity-based policy allows the {action} action"
     )
+}
+
+/// The ARN of the resource an addressed action is judged against, given the repository's own
+/// ARN: the repository itself, or the package inside it the request addressed
+/// (`package/<domain>/<repository>/<format>/<namespace>/<name>`, the package resource type of
+/// the IAM Service Authorization Reference, with the namespace segment empty where the
+/// request carries none).
+fn judged_arn(repository_arn: &str, judged: Judged) -> String {
+    match judged {
+        Judged::Repository => repository_arn.to_string(),
+        Judged::Package(format, namespace, name) => format!(
+            "arn:aws:codeartifact:{REGION}:{ACCOUNT}:package/{DOMAIN}/{REPOSITORY}/{format}/\
+             {namespace}/{name}"
+        ),
+    }
 }
 
 /// The repository ARN a decision about this repository is reached against — the ARN the
@@ -400,10 +434,11 @@ async fn a_resource_grant_reaches_the_principal_and_the_action_it_names_only() {
 }
 
 /// RULE: the refusal is IAM's whole sentence — the signing session's ARN, the
-/// service-qualified action of the operation refused, and the ARN of the repository the
-/// request addressed.
+/// service-qualified action of the operation refused, and the ARN of the resource that
+/// action acts on: the repository for a repository-scoped action, the addressed package for
+/// a package-scoped one.
 #[tokio::test]
-async fn the_refusal_names_the_session_the_action_and_the_repository_arn() {
+async fn the_refusal_names_the_session_the_action_and_the_judged_resource() {
     let (router, engine) = given_repository().await;
     given_role_policy(&engine, ROLE, None);
     // A repository policy that names a DIFFERENT principal: the refusal is still the
@@ -422,7 +457,7 @@ async fn the_refusal_names_the_session_the_action_and_the_repository_arn() {
             let expected = no_identity_grant(
                 &session_arn(ROLE, SESSION_NAME),
                 &format!("codeartifact:{case}"),
-                &arn,
+                &judged_arn(&arn, addressed.judged),
             );
             assert_eq!(
                 (answer.status, answer.code()),
@@ -464,6 +499,7 @@ async fn a_grant_takes_effect_and_is_withdrawn_on_the_next_call() {
         method: "GET",
         uri: "/v1/repository?domain=authz&repository=staging",
         body: false,
+        judged: Judged::Repository,
     };
     let names_the_role = resource_policy("Allow", &role_arn(ROLE), json!(["codeartifact:*"]));
 

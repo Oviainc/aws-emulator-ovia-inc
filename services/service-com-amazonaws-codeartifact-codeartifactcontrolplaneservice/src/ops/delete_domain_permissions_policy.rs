@@ -156,8 +156,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The authorization decision this call takes before anything is read or written: see
+        // [`crate::service::authorization`] for the rule and the documents it reads.
+        crate::service::authorization::authorize_domain_action(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.domain,
+            input.domain_owner.as_deref(),
+        )
+        .map_err(DeleteDomainPermissionsPolicyErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DeleteDomainPermissionsPolicyErrorModeled::InternalServerException(
@@ -190,10 +200,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // A domain that holds no policy has nothing to remove, which is the delete's goal
+        // already met: the call succeeds, whatever revision the caller named, and answers the
+        // envelope naming the domain the request targeted. The optimistic lock protects a
+        // policy that IS attached — a revision is stale against the record it was read from —
+        // so there is nothing for it to be stale against here, and a repeated (or raced)
+        // delete is not a failure.
+        if domain.policy.is_none() {
+            return Ok(DeleteDomainPermissionsPolicyOutput {
+                policy: Some(crate::state::deleted_policy(&domain.arn, None)),
+            });
+        }
+
         // The optimistic lock, exactly as the put applies it: a caller that named a
         // revision is deleting the policy it read, so a stale revision is refused and the
-        // policy stays attached. A domain holding no policy carries no revision, so a
-        // named revision cannot match it either.
+        // policy stays attached.
         if !crate::state::policy_revision_matches(
             domain.policy.as_ref(),
             input.policy_revision.as_deref(),
@@ -209,8 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Removed, and answered with the record as it was immediately before removal, so
-        // the very next read of this domain reports no policy. A domain that held none is
-        // not a failure: the answer is the envelope naming the domain the request targeted.
+        // the very next read of this domain reports no policy.
         let removed = domain.policy.take();
 
         Ok(DeleteDomainPermissionsPolicyOutput {

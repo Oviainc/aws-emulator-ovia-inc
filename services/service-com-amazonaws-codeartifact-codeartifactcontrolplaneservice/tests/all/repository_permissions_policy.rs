@@ -113,8 +113,13 @@ fn repository_arn(domain: &str, repository: &str) -> String {
 
 /// A policy document of exactly `total_len` characters: an Aspen policy whose single
 /// condition value is padded out. Used for the modelled maximum length.
+///
+/// The padding statement states an `Allow`, so that attaching it to the repository a row
+/// works in does not refuse that row's own later calls: a resource policy's explicit `Deny`
+/// is enforced on every call (`crate::repository_authorization` is the suite that pins that
+/// rule), and this row is about the document's LENGTH, not about a decision.
 fn padded_document(total_len: usize) -> String {
-    let prefix = r##"{"Version":"2012-10-17","Statement":[{"Sid":"Pad","Effect":"Deny","Principal":"*","Action":"codeartifact:*","Resource":"*","Condition":{"StringEquals":{"aws:PrincipalTag/pad":""##;
+    let prefix = r##"{"Version":"2012-10-17","Statement":[{"Sid":"Pad","Effect":"Allow","Principal":"*","Action":"codeartifact:*","Resource":"*","Condition":{"StringEquals":{"aws:PrincipalTag/pad":""##;
     let suffix = r##""}}}]}"##;
     let pad = total_len - prefix.len() - suffix.len();
     format!("{prefix}{}{suffix}", "p".repeat(pad))

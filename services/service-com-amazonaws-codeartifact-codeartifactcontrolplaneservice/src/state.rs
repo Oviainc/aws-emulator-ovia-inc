@@ -2500,6 +2500,34 @@ pub fn repository_arn(region: &str, domain: &str, repository: &str) -> String {
     )
 }
 
+/// The ARN of a PACKAGE inside a repository:
+/// `arn:aws:codeartifact:<region>:<owner>:package/<domain>/<repository>/<format>/<namespace>/<name>`.
+///
+/// The package resource type as the IAM Service Authorization Reference spells it for
+/// CodeArtifact — the ARN a statement names one package by, and therefore both the resource a
+/// package-scoped action is judged against and the resource a package-version event announces
+/// ([`package_version_events::VersionChange::package_arn`]). The namespace is a SEGMENT of
+/// the path, so a format whose packages carry none leaves it empty rather than dropping it:
+/// the path is positional, and the empty segment is what distinguishes "no namespace" from a
+/// namespace of that name.
+pub fn package_arn(
+    region: &str,
+    domain: &str,
+    repository: &str,
+    format: &str,
+    namespace: Option<&str>,
+    package: &str,
+) -> String {
+    ::engine::emulator_arn(
+        SERVICE_SIGNING_NAME,
+        region,
+        &format!(
+            "{PACKAGE_RESOURCE_TYPE}/{domain}/{repository}/{format}/{}/{package}",
+            namespace.unwrap_or_default()
+        ),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Refusal messages
 //

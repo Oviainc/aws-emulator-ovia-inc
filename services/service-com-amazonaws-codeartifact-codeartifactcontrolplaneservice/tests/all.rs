@@ -95,3 +95,11 @@ mod copy_from_upstream;
 mod service_rule_refusals;
 #[path = "all/package_group_listing.rs"]
 mod package_group_listing;
+#[path = "all/resource_policy_authorization.rs"]
+mod resource_policy_authorization;
+#[path = "all/policy_delete_idempotence.rs"]
+mod policy_delete_idempotence;
+#[path = "all/package_listing_filter_pairing.rs"]
+mod package_listing_filter_pairing;
+#[path = "all/package_version_publish_conflict.rs"]
+mod package_version_publish_conflict;

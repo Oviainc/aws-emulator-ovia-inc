@@ -567,30 +567,49 @@ async fn every_filter_selects_exactly_the_matching_packages() {
             format: Some("swift"),
             ..Filter::default()
         },
-        // `namespace`, a PREFIX match: the shorter prefix selects both Maven groupIds.
+        // `namespace`, a PREFIX match: the shorter prefix selects both Maven groupIds. Each
+        // row names the `format` whose component the namespace is — the filter's meaning is
+        // chosen by the format, so `ListPackages` requires one beside it
+        // (`crate::package_listing_filter_pairing` is the suite that pins that rule).
         Filter {
+            format: Some("maven"),
             namespace: Some("com.example"),
             ..Filter::default()
         },
         Filter {
+            format: Some("maven"),
             namespace: Some("com.example.tools"),
             ..Filter::default()
         },
         Filter {
+            format: Some("maven"),
             namespace: Some("com"),
             ..Filter::default()
         },
         Filter {
+            format: Some("npm"),
             namespace: Some("@"),
             ..Filter::default()
         },
         Filter {
+            format: Some("swift"),
+            namespace: Some("@"),
+            ..Filter::default()
+        },
+        Filter {
+            format: Some("generic"),
             namespace: Some("artifacts"),
             ..Filter::default()
         },
         // A namespace no package carries selects nothing — and in particular does NOT
         // select the formats that have no namespace at all.
         Filter {
+            format: Some("maven"),
+            namespace: Some("nope"),
+            ..Filter::default()
+        },
+        Filter {
+            format: Some("pypi"),
             namespace: Some("nope"),
             ..Filter::default()
         },

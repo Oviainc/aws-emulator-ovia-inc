@@ -54,9 +54,6 @@ pub const OPERATION_UPDATED: &str = "Updated";
 /// `operationType` for a version the repository no longer holds after the change.
 pub const OPERATION_DELETED: &str = "Deleted";
 
-/// The resource type a package's ARN names, as [`package_arn`] spells it.
-const PACKAGE_RESOURCE: &str = super::PACKAGE_RESOURCE_TYPE;
-
 /// How many changes one drain publishes.
 ///
 /// This module's OWN bound, the companion to [`MAX_PENDING_VERSION_EVENTS`]: that bounds
@@ -226,24 +223,19 @@ impl VersionChange {
     }
 
     /// The ARN of the PACKAGE this version belongs to — what the event names in
-    /// `resources`:
-    /// `arn:aws:codeartifact:<region>:<account>:package/<domain>/<repository>/<format>/<namespace>/<package>`.
+    /// `resources`.
     ///
-    /// The namespace is a SEGMENT of the path, so a package that has none leaves it empty
-    /// rather than dropping it: the path is positional, and an un-scoped npm package's ARN
-    /// therefore carries two consecutive separators.
+    /// Rendered by the service's one package-ARN rule
+    /// ([`crate::state::package_arn`]), which is also the resource a package-scoped action is
+    /// authorized against: an event and a refusal must name one package by one ARN.
     pub fn package_arn(&self) -> String {
-        ::engine::emulator_arn(
-            super::SERVICE_SIGNING_NAME,
+        super::package_arn(
             &self.region,
-            &format!(
-                "{PACKAGE_RESOURCE}/{}/{}/{}/{}/{}",
-                self.domain,
-                self.repository,
-                self.format,
-                self.namespace.as_deref().unwrap_or_default(),
-                self.package
-            ),
+            &self.domain,
+            &self.repository,
+            &self.format,
+            self.namespace.as_deref(),
+            &self.package,
         )
     }
 

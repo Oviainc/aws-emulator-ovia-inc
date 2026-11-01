@@ -542,14 +542,15 @@ async fn deleting_the_policy_is_locked_by_its_revision() {
              {nothing:?}"
         );
 
-        // ...but a caller that NAMES a revision is locking against the policy it read, and
-        // a domain holding none carries no revision for it to match.
+        // ...and a caller that NAMES a revision is locking against the policy it read, of
+        // which a domain holding none has none: the lock has nothing to be stale against, so
+        // the delete still has its goal met and answers the same bare envelope.
         let locked = delete_domain_policy(&router, domain, None, Some("1")).await;
         assert_eq!(
-            (locked.status, locked.code()),
-            (409, "ConflictException".to_string()),
-            "case {domain:?}: a revision named with no policy attached must conflict, got \
-             {locked:?}"
+            (locked.status, locked.body.clone()),
+            (200, nothing.body.clone()),
+            "case {domain:?}: a revision named with no policy attached must still delete \
+             nothing and succeed, got {locked:?}"
         );
 
         let written = put_domain_policy(&router, domain, None, document, None).await;

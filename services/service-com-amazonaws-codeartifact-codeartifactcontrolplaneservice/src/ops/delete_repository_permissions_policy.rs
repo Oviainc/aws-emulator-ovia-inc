@@ -227,10 +227,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // A repository that holds no policy has nothing to remove, which is the delete's goal
+        // already met: the call succeeds, whatever revision the caller named, and answers the
+        // envelope naming the repository the request targeted. The optimistic lock protects a
+        // policy that IS attached — a revision is stale against the record it was read from —
+        // so there is nothing for it to be stale against here, and a repeated (or raced)
+        // delete is not a failure.
+        if repository.policy.is_none() {
+            return Ok(DeleteRepositoryPermissionsPolicyOutput {
+                policy: Some(crate::state::deleted_policy(&repository.arn, None)),
+            });
+        }
+
         // The optimistic lock, exactly as the put applies it: a caller that named a
         // revision is deleting the policy it read, so a stale revision is refused and the
-        // policy stays attached. A repository holding no policy carries no revision, so a
-        // named revision cannot match it either.
+        // policy stays attached.
         if !crate::state::policy_revision_matches(
             repository.policy.as_ref(),
             input.policy_revision.as_deref(),
@@ -248,8 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The response is the policy as it was immediately before removal, and the
-        // removal is observable to the very next call. A repository that held none is not a
-        // failure: the answer is the envelope naming the repository the request targeted.
+        // removal is observable to the very next call.
         let removed = repository.policy.take();
 
         Ok(DeleteRepositoryPermissionsPolicyOutput {

@@ -203,14 +203,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The authorization decision this call takes before anything is read or written: see
-        // [`crate::service::authorization`] for the rule and the callers it does not bound.
-        crate::service::authorization::authorize_repository_action(
+        // [`crate::service::authorization`] for the rule and the documents it reads.
+        crate::service::authorization::authorize_package_action(
             &*self.engine,
             ctx,
             Self::NAME,
             &input.domain,
             input.domain_owner.as_deref(),
-            &input.repository,
+            &crate::service::authorization::AddressedPackage {
+                repository: &input.repository,
+                format: &input.format,
+                namespace: input.namespace.as_deref(),
+                package: &input.package,
+            },
         )
         .map_err(PublishPackageVersionErrorModeled::AccessDeniedException)?;
         // The store's own work holds this service's lock and contains no await, so the
@@ -555,9 +560,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PublishPackageVer
             // version's content is immutable, and it cannot be reopened as unfinished.
             Some(existing) => {
                 return Err(conflict(
-                    format!(
-                        "Package version {} {} is {} and cannot be published to.",
-                        input.package, input.package_version, existing.status
+                    cannot_update_existing_version_message(
+                        &input.format,
+                        &version_identity,
+                        &existing.status,
                     ),
                     &version_identity,
                     "package-version",
@@ -637,6 +643,31 @@ const VALIDATION_REASON_FIELD_FAILED: &str = crate::state::VALIDATION_REASON_FIE
 /// sentence names neither the package nor the repository.
 const PUBLISH_BLOCKED_BY_ORIGIN_MESSAGE: &str =
     "This package is configured to block new versions from being published.";
+
+/// The `ConflictException` message for a publish into a package version the repository
+/// already holds in a status that is not `Unfinished`.
+///
+/// Built from the request and from the stored record, because that is what a caller has to
+/// act on: the package FORMAT and the whole `<namespace>/<package>/<version>` path the
+/// version is addressed by (a bare version string identifies nothing —
+/// [`crate::state::package_version_resource_id`]), the status that blocks the publish, and
+/// the rule it follows — only a version still open for more assets can be updated, and
+/// `Unfinished` is the one status that is ("Once a package version’s status is set to
+/// Published, it cannot change back to Unfinished",
+/// `smithy_query(query="doc",shape="PublishPackageVersion")`). Without the status and that
+/// rule a caller cannot tell that the identical publish would have been accepted with
+/// `unfinished` set.
+fn cannot_update_existing_version_message(
+    format: &str,
+    version_identity: &str,
+    status: &str,
+) -> String {
+    format!(
+        "Cannot update existing {format} package version '{version_identity}' with status \
+         '{status}'. Only '{}' package versions can be updated.",
+        crate::state::PACKAGE_VERSION_STATUS_UNFINISHED
+    )
+}
 
 /// A `ResourceNotFoundException` (404) naming the resource that was addressed.
 fn not_found(message: String, resource_id: &str, resource_type: &str) -> PublishPackageVersionError {

@@ -83,7 +83,7 @@ pub fn authorize_token_mint<Eng: Send + Sync + 'static>(
             Decision::Allowed => {}
             // Nothing the store holds grants the action — but a grant it cannot READ may:
             // see the module docs.
-            Decision::NotStated if caller.unreadable_attachment => {}
+            Decision::NotStated if caller.unreadable_grants => {}
             Decision::NotStated => {
                 return Err(not_authorized(&caller.arn, &action, resource, false));
             }

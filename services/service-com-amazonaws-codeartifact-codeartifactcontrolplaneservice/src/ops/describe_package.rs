@@ -162,14 +162,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The authorization decision this call takes before anything is read or written: see
-        // [`crate::service::authorization`] for the rule and the callers it does not bound.
-        crate::service::authorization::authorize_repository_action(
+        // [`crate::service::authorization`] for the rule and the documents it reads.
+        crate::service::authorization::authorize_package_action(
             &*self.engine,
             ctx,
             Self::NAME,
             &input.domain,
             input.domain_owner.as_deref(),
-            &input.repository,
+            &crate::service::authorization::AddressedPackage {
+                repository: &input.repository,
+                format: &input.format,
+                namespace: input.namespace.as_deref(),
+                package: &input.package,
+            },
         )
         .map_err(DescribePackageErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {

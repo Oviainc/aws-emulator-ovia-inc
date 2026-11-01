@@ -169,6 +169,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The authorization decision this call takes before anything is read or written: see
+        // [`crate::service::authorization`] for the rule and the documents it reads. A domain
+        // that does not exist yet carries no resource policy, so the decision here is reached
+        // from the caller's identity-based policies alone.
+        crate::service::authorization::authorize_domain_action(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.domain,
+            None,
+        )
+        .map_err(CreateDomainErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateDomainErrorModeled::InternalServerException(
                 InternalServerException {

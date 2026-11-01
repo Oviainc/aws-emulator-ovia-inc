@@ -188,6 +188,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.repository,
         )
         .map_err(ListPackagesErrorModeled::AccessDeniedException)?;
+
+        // `namespace` filters on a component whose MEANING is chosen by the package format —
+        // "The namespace of a Maven package version is its groupId. The namespace of an npm or
+        // Swift package version is its scope. The namespace of a generic package is its
+        // namespace", and the formats that have no such component cannot be filtered on it at
+        // all (`smithy_query(query="operation",operation="ListPackages")`, member
+        // `namespace`). `format` is the member that chooses which of those the filter means,
+        // so a namespace filter without one addresses no definite set of packages and the
+        // request is refused rather than answered with a listing it did not ask for. Both
+        // members are optional on their own: a listing filtered by neither, or by `format`
+        // alone, is a complete request.
+        if input.namespace.is_some() && input.format.is_none() {
+            return Err(ListPackagesErrorModeled::ValidationException(
+                ValidationException {
+                    message: NAMESPACE_REQUIRES_FORMAT_MESSAGE.to_string(),
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
+                },
+            )
+            .into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListPackagesErrorModeled::InternalServerException(
                 InternalServerException {
@@ -297,4 +317,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The `ValidationException` message for a listing that filters on `namespace` without
+/// naming the `format` that gives the namespace its meaning.
+///
+/// Fixed text naming the two members: the refusal is about the pair, so there is no value
+/// from the request to put in it.
+const NAMESPACE_REQUIRES_FORMAT_MESSAGE: &str =
+    "PackageFormat cannot be null when PackageNamespace is not null";
 
