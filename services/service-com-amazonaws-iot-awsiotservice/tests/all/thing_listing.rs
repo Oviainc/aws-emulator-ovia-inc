@@ -24,7 +24,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_iot_awsiotservice::state::ComAmazonawsIotAwsiotserviceState;
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -135,7 +134,6 @@ impl Attributes {
 /// reached the way the production router reaches it.
 struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -143,21 +141,24 @@ impl Emulator {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(Arc::clone(&engine)));
-        Self { router, engine }
+        router.register_service(EmulatedService::new(engine));
+        Self { router }
     }
 
-    /// Record the thing types the fixture's things are created with.
+    /// Create the thing types the fixture's things are created with.
     ///
-    /// `CreateThing` refuses a `thingTypeName` the registry does not hold, and
-    /// `CreateThingType` — the operation that would record one — is still a scaffold
-    /// (its own issue), so the fixture seeds the type registry directly. Nothing about
-    /// `ListThings` is seeded: every thing below is created through the wire.
-    fn register_thing_types(&self, names: &[&str]) {
-        let state = self.engine.state::<ComAmazonawsIotAwsiotserviceState>();
-        let mut store = state.lock();
+    /// `CreateThing` refuses a `thingTypeName` the registry does not hold, so the
+    /// types are created first — through the wire, like everything else here, so the
+    /// fixture seeds no state directly.
+    async fn register_thing_types(&self, names: &[&str]) {
         for name in names {
-            store.thing_types.insert((*name).to_string());
+            let created = self
+                .call("POST", &format!("/thing-types/{name}"), Some(&json!({})))
+                .await;
+            assert_eq!(
+                created.status, 200,
+                "thing type {name}: CreateThingType must succeed, got {created:?}"
+            );
         }
     }
 
@@ -311,7 +312,7 @@ fn fixtures() -> Vec<Fixture> {
 /// listing must report them: `thingName` order.
 async fn registry() -> (Emulator, Vec<String>) {
     let emulator = Emulator::new();
-    emulator.register_thing_types(&[SENSOR_TYPE, GATEWAY_TYPE]);
+    emulator.register_thing_types(&[SENSOR_TYPE, GATEWAY_TYPE]).await;
     let mut names = Vec::new();
     for fixture in fixtures() {
         let created = emulator

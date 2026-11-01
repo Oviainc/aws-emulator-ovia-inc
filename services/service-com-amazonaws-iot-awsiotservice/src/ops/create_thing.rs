@@ -181,10 +181,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against it. `ResourceNotFoundException` ("The specified resource does not
         // exist", HTTP 404) is the modelled error for exactly this.
         if let Some(thing_type_name) = &requested.thing_type_name {
-            if !store.thing_types.contains(thing_type_name) {
+            let Some(thing_type) = store.thing_types.get(thing_type_name) else {
                 return Err(CreateThingErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(format!("Thing type {thing_type_name} does not exist")),
+                    },
+                )
+                .into());
+            };
+            // A DEPRECATED thing type still exists, so it is not a 404: it is a type
+            // nothing new may use. `ThingTypeMetadata$deprecated` is "Whether the
+            // thing type is deprecated. If true, no new things could be associated
+            // with this type", and `DeprecateThingType` states the same rule, so a
+            // create naming one is refused with the modelled
+            // `InvalidRequestException` ("The request is not valid", HTTP 400).
+            if thing_type.is_deprecated() {
+                return Err(CreateThingErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "Can not create new thing with deprecated thing type:{thing_type_name}"
+                        )),
                     },
                 )
                 .into());

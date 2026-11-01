@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateThingType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateThingType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateThingType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +146,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateThingType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateThingTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateThingTypeErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // Everything about the type that is NOT its name, in the form the registry
+        // keeps it and compares it: absent properties (or properties carrying no
+        // list) are the empty lists, which is what the type then has.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateThingType"))
+        // How MANY entries each of those lists may carry is bounded: neither
+        // `searchableAttributes` nor `mqtt5Configuration.propagatingAttributes` has a
+        // modelled maximum, and the record keeps what the writer sent so a reader can
+        // hand it back, so without the ceiling one request would choose how large a
+        // single record is. The refusal is the modelled `InvalidRequestException`
+        // ("The request is not valid", HTTP 400), naming the member and the limit.
+        let properties = input.thing_type_properties.unwrap_or_default();
+        let entry_counts = [
+            (
+                "searchableAttributes",
+                properties
+                    .searchable_attributes
+                    .as_ref()
+                    .map_or(0, Vec::len),
+            ),
+            (
+                "mqtt5Configuration.propagatingAttributes",
+                properties
+                    .mqtt5_configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.propagating_attributes.as_ref())
+                    .map_or(0, Vec::len),
+            ),
+        ];
+        for (member, count) in entry_counts {
+            if count > crate::state::MAX_THING_TYPE_PROPERTY_ENTRIES {
+                return Err(CreateThingTypeErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "a thing type's {member} may carry at most {} entries; this request carries {count}",
+                            crate::state::MAX_THING_TYPE_PROPERTY_ENTRIES
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        let requested = crate::state::ThingTypeConfiguration::from(properties);
+        // `Tag$Key` is `@required` and keys a resource's tag set, so the last value
+        // given for a key is the one the resource carries. How MANY tags one request
+        // may carry is bounded for the same reason the lists above are.
+        //
+        // Tags are NOT part of the configuration a repeat create is compared on
+        // ("metadata which can be used to manage the thing type"), so a repeat create
+        // of an existing type keeps the tags that type already carries, whatever this
+        // request sent: changing a resource's tags is what `TagResource` /
+        // `UntagResource` are for.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_THING_TYPE_TAGS {
+            return Err(CreateThingTypeErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "a thing type may carry at most {} tags; this request carries {}",
+                        crate::state::MAX_THING_TYPE_TAGS,
+                        requested_tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, Option<String>> = requested_tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let mut store = state.lock();
+
+        // What is already registered under this name decides the call, per the
+        // operation's own documentation: "If this call is made multiple times using
+        // the same thing type name and configuration, the call will succeed. If this
+        // call is made with the same thing type name but different configuration a
+        // ResourceAlreadyExistsException is thrown."
+        if let Some(existing) = store.thing_types.get(&input.thing_type_name) {
+            if existing.configuration != requested {
+                return Err(CreateThingTypeErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "Thing type {} already exists with a different configuration",
+                            existing.thing_type_name
+                        )),
+                        resource_id: Some(existing.thing_type_name.clone()),
+                        resource_arn: Some(existing.thing_type_arn.clone()),
+                    },
+                )
+                .into());
+            }
+            // The repeat create names the SAME type: it mints no new identity and
+            // writes nothing, and answers from the stored record — so a client that
+            // retried a create keeps the id and ARN it was handed the first time.
+            return Ok(CreateThingTypeOutput {
+                thing_type_name: Some(existing.thing_type_name.clone()),
+                thing_type_arn: Some(existing.thing_type_arn.clone()),
+                thing_type_id: Some(existing.thing_type_id.clone()),
+            });
+        }
+
+        // The store is one a CALLER grows, a thing type at a time, so the number of
+        // types an account can hold is bounded. The ceiling is read AFTER the
+        // conflict check, because a name already taken adds no record.
+        // `CreateThingType` models no `LimitExceededException`, so the refusal past
+        // the ceiling is the modelled `InvalidRequestException` (HTTP 400) naming the
+        // limit, never a 200 that records nothing.
+        if store.thing_types.len() >= crate::state::MAX_THING_TYPES {
+            return Err(CreateThingTypeErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "the maximum of {} thing types is already reached",
+                        crate::state::MAX_THING_TYPES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let thing_type_arn = crate::state::thing_type_arn(&region, &input.thing_type_name);
+        let thing_type = crate::state::RegisteredThingType::new(
+            input.thing_type_name,
+            store.mint_thing_type_id(),
+            thing_type_arn,
+            requested,
+            tags,
+            ::std::time::SystemTime::now(),
+        );
+
+        // The response is built from the record that is about to be persisted, so
+        // what this call reports and what the next `DescribeThingType` reads are one
+        // value, not two that could drift.
+        let output = CreateThingTypeOutput {
+            thing_type_name: Some(thing_type.thing_type_name.clone()),
+            thing_type_arn: Some(thing_type.thing_type_arn.clone()),
+            thing_type_id: Some(thing_type.thing_type_id.clone()),
+        };
+        store
+            .thing_types
+            .insert(thing_type.thing_type_name.clone(), thing_type);
+        Ok(output)
     }
 }

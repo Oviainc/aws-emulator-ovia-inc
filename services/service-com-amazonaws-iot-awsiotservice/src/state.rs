@@ -31,6 +31,13 @@
 //! identifier is recorded here on the call that creates it and read back by every
 //! later call.
 //!
+//! It also holds the account's THING TYPES, keyed by `thingTypeName` for the same
+//! reason: the name is the type's identity and the `@httpLabel` of
+//! `/thing-types/{thingTypeName}`. One record carries everything a reader hands
+//! back, so `DescribeThingType` after `CreateThingType` returns the created type
+//! member-for-member, and `CreateThing` resolves its `thingTypeName` against the
+//! same records.
+//!
 //! It also holds the account's TOPIC RULES, keyed by `ruleName` for the same reason
 //! the thing registry is keyed by `thingName`: the name is the rule's identity and
 //! the `@httpLabel` of `/rules/{ruleName}`. One record carries everything a reader
@@ -83,8 +90,9 @@ use crate::ops::types::{
     Action, AuthorizerDescription, AwsJobExecutionsRolloutConfig, AwsJobPresignedUrlConfig,
     CodeSigning, CommandParameter, CommandParameterValue, CommandPayload, CommandPreprocessor,
     GetCommandExecutionOutput, GetCommandOutput, JobExecution, JobExecutionStatusDetails,
-    OTAUpdateFile, OTAUpdateInfo, PackageVersionArtifact, S3Location, Sbom,
-    ThingGroupIndexingConfiguration, ThingIndexingConfiguration, TopicRule, TopicRulePayload,
+    Mqtt5Configuration, OTAUpdateFile, OTAUpdateInfo, PackageVersionArtifact, PropagatingAttribute,
+    S3Location, Sbom, ThingGroupIndexingConfiguration, ThingIndexingConfiguration, ThingTypeMetadata,
+    ThingTypeProperties, TopicRule, TopicRulePayload,
 };
 
 /// The shared index of which IoT COMMANDS exist, which the IoT Jobs data plane's
@@ -270,6 +278,231 @@ impl RegisteredThingGroup {
     }
 }
 
+/// One entry of a thing type's `mqtt5Configuration.propagatingAttributes`, as the
+/// registry keeps it.
+///
+/// The three members are the modelled `PropagatingAttribute`'s. The registry keeps
+/// its own record of them rather than the modelled struct because
+/// [`ThingTypeConfiguration`] has to be COMPARED — `CreateThingType` decides a
+/// repeat create by comparing configurations — and the generated wire type derives
+/// no equality.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PropagatingAttributeRecord {
+    /// `PropagatingAttribute$userPropertyKey` — "The key of the user property
+    /// key-value pair".
+    pub user_property_key: Option<String>,
+    /// `PropagatingAttribute$thingAttribute` — "The user-defined thing attribute that
+    /// is propagating for MQTT 5 message enrichment".
+    pub thing_attribute: Option<String>,
+    /// `PropagatingAttribute$connectionAttribute` — "The attribute associated with the
+    /// connection between a device and Amazon Web Services IoT Core".
+    pub connection_attribute: Option<String>,
+}
+
+impl PropagatingAttributeRecord {
+    /// The record as the modelled list entry a response carries.
+    fn to_modeled(&self) -> PropagatingAttribute {
+        PropagatingAttribute {
+            user_property_key: self.user_property_key.clone(),
+            thing_attribute: self.thing_attribute.clone(),
+            connection_attribute: self.connection_attribute.clone(),
+        }
+    }
+}
+
+impl From<PropagatingAttribute> for PropagatingAttributeRecord {
+    fn from(attribute: PropagatingAttribute) -> Self {
+        Self {
+            user_property_key: attribute.user_property_key,
+            thing_attribute: attribute.thing_attribute,
+            connection_attribute: attribute.connection_attribute,
+        }
+    }
+}
+
+/// What a thing type is configured with: everything about it that is NOT its name.
+///
+/// It is one value so that a repeat create can be decided by comparing it, which is
+/// what `CreateThingType` documents: "If this call is made multiple times using the
+/// same thing type name and configuration, the call will succeed. If this call is
+/// made with the same thing type name but different configuration a
+/// `ResourceAlreadyExistsException` is thrown."
+///
+/// The lists are plain `Vec`s because `ThingTypeProperties` reports them in the
+/// order they were given, and ORDER is part of the configuration: a type whose
+/// searchable attributes were given in a different order was configured differently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThingTypeConfiguration {
+    /// `ThingTypeProperties$thingTypeDescription` — "The description of the thing
+    /// type".
+    pub description: Option<String>,
+    /// `ThingTypeProperties$searchableAttributes` — "A list of searchable thing
+    /// attribute names".
+    pub searchable_attributes: Vec<String>,
+    /// The `propagatingAttributes` of `ThingTypeProperties$mqtt5Configuration` — "The
+    /// configuration to add user-defined properties to enrich MQTT 5 messages".
+    pub propagating_attributes: Vec<PropagatingAttributeRecord>,
+}
+
+impl From<ThingTypeProperties> for ThingTypeConfiguration {
+    fn from(properties: ThingTypeProperties) -> Self {
+        Self {
+            description: properties.thing_type_description,
+            searchable_attributes: properties.searchable_attributes.unwrap_or_default(),
+            propagating_attributes: properties
+                .mqtt5_configuration
+                .and_then(|configuration| configuration.propagating_attributes)
+                .unwrap_or_default()
+                .into_iter()
+                .map(PropagatingAttributeRecord::from)
+                .collect(),
+        }
+    }
+}
+
+/// One thing type in the registry, as this service persists it.
+#[derive(Debug, Clone)]
+pub struct RegisteredThingType {
+    /// The name the type was created under; also its key in the registry.
+    pub thing_type_name: String,
+    /// The id minted when the type was created — stable for its lifetime.
+    pub thing_type_id: String,
+    /// `arn:aws:iot:<region>:<account>:thingtype/<thingTypeName>`, minted on create.
+    pub thing_type_arn: String,
+    /// What the type is configured with; see [`ThingTypeConfiguration`].
+    pub configuration: ThingTypeConfiguration,
+    /// `Tag$Key` -> `Tag$Value` for the tags the create request carried. Tags are
+    /// NOT part of [`ThingTypeConfiguration`]: they are "metadata which can be used
+    /// to manage the thing type" rather than part of its configuration, so they do
+    /// not decide whether a repeat create is the same thing type.
+    pub tags: BTreeMap<String, Option<String>>,
+    /// When the type was created — `ThingTypeMetadata$creationDate`, "The date and
+    /// time when the thing type was created".
+    pub creation_date: SystemTime,
+    /// When the type was deprecated, for a type that IS deprecated —
+    /// `ThingTypeMetadata$deprecationDate`, "The date and time when the thing type
+    /// was deprecated". `None` is a type nobody has deprecated (or one whose
+    /// deprecation was undone), which is what makes this one field answer both
+    /// `deprecated` and `deprecationDate`: the flag is "If <b>true</b>, no new things
+    /// could be associated with this type", so it is true exactly when there is a
+    /// deprecation date.
+    pub deprecation_date: Option<SystemTime>,
+}
+
+impl RegisteredThingType {
+    /// A newly created thing type: the minted identity plus the requested
+    /// configuration and tags. A type is never created deprecated —
+    /// `DeprecateThingType` is the only call that deprecates one.
+    pub fn new(
+        thing_type_name: String,
+        thing_type_id: String,
+        thing_type_arn: String,
+        configuration: ThingTypeConfiguration,
+        tags: BTreeMap<String, Option<String>>,
+        creation_date: SystemTime,
+    ) -> Self {
+        Self {
+            thing_type_name,
+            thing_type_id,
+            thing_type_arn,
+            configuration,
+            tags,
+            creation_date,
+            deprecation_date: None,
+        }
+    }
+
+    /// Whether new things may still be associated with this type.
+    ///
+    /// `ThingTypeMetadata$deprecated` is "Whether the thing type is deprecated. If
+    /// <b>true</b>, no new things could be associated with this type", and a
+    /// deprecation is recorded as the instant it happened, so a type is deprecated
+    /// exactly while it has one.
+    pub fn is_deprecated(&self) -> bool {
+        self.deprecation_date.is_some()
+    }
+
+    /// The type's configuration as the modelled `ThingTypeProperties` a response
+    /// carries.
+    ///
+    /// A list is reported only when the type HAS entries for it, for the same reason
+    /// a thing group reports no `attributePayload` when it has no attributes: the
+    /// member is how the entries are carried, and a type created without any carries
+    /// none.
+    pub fn properties(&self) -> ThingTypeProperties {
+        ThingTypeProperties {
+            thing_type_description: self.configuration.description.clone(),
+            searchable_attributes: (!self.configuration.searchable_attributes.is_empty())
+                .then(|| self.configuration.searchable_attributes.clone()),
+            mqtt5_configuration: (!self.configuration.propagating_attributes.is_empty()).then(
+                || Mqtt5Configuration {
+                    propagating_attributes: Some(
+                        self.configuration
+                            .propagating_attributes
+                            .iter()
+                            .map(PropagatingAttributeRecord::to_modeled)
+                            .collect(),
+                    ),
+                },
+            ),
+        }
+    }
+
+    /// The type's `ThingTypeMetadata`: when it was created, and whether and when it
+    /// was deprecated.
+    pub fn metadata(&self) -> ThingTypeMetadata {
+        ThingTypeMetadata {
+            deprecated: self.is_deprecated(),
+            deprecation_date: self
+                .deprecation_date
+                .map(::aws_smithy_types::DateTime::from),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+        }
+    }
+}
+
+/// How many thing types this emulator keeps for the account.
+///
+/// AWS publishes a service quota on an account's thing types; the exact figure is
+/// not in the model, so this is the emulator's own ceiling on a store a caller can
+/// grow — the same reason [`MAX_POLICIES`] and [`MAX_TOPIC_RULES`] exist — and
+/// `CreateThingType` past it refuses with a modelled error rather than growing
+/// without bound.
+pub const MAX_THING_TYPES: usize = 1_000;
+
+/// How many tags one thing type may carry.
+///
+/// AWS IoT's tagging documentation publishes the limit as "You can add up to 50 tags
+/// to a resource"; `TagList` carries no modelled maximum, so without it one request
+/// would choose how large a single record is — the same reason
+/// [`MAX_POLICY_TAGS`] exists.
+pub const MAX_THING_TYPE_TAGS: usize = 50;
+
+/// How many entries one of a thing type's property lists —
+/// `ThingTypeProperties$searchableAttributes` and the `propagatingAttributes` of its
+/// `mqtt5Configuration` — may carry.
+///
+/// Neither list has a modelled maximum
+/// (`smithy_query(query="shape",shape="SearchableAttributes")`,
+/// `smithy_query(query="shape",shape="Mqtt5Configuration")`), and a record keeps what
+/// the writer sent so a reader can hand it back, so without this ceiling one request
+/// would choose how large a single record is — the same reason [`MAX_THING_TYPE_TAGS`]
+/// exists. It is far above any fleet-indexing configuration a thing type is given in
+/// practice, and it is what bounds the cost of one record beside the
+/// [`MAX_THING_TYPES`] bound on their number.
+pub const MAX_THING_TYPE_PROPERTY_ENTRIES: usize = 50;
+
+/// The ARN of a thing type:
+/// `arn:aws:iot:<region>:<account>:thingtype/<thingTypeName>`.
+///
+/// `thingtype` (one word, lowercase) is the resource type AWS IoT's thing-type ARNs
+/// use — the resource an `iot:DescribeThingType` policy statement names and what
+/// `CreateThingType$thingTypeArn` reports — beside `thing/` for a thing; the
+/// namespace and account segments are the ones [`thing_arn`] documents.
+pub fn thing_type_arn(region: &str, thing_type_name: &str) -> String {
+    ::emulator_server::emulator_arn("iot", region, &format!("thingtype/{thing_type_name}"))
+}
+
 /// Length of an account's IoT endpoint identifier.
 ///
 /// The identifier is one DNS label of lowercase alphanumerics (the AWS IoT
@@ -368,13 +601,20 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// `CreatePolicy` refuses past, and [`MAX_POLICY_DOCUMENT_BYTES`] /
     /// [`MAX_POLICY_TAGS`] bound what ONE record may cost.
     pub policies: BTreeMap<String, RegisteredPolicy>,
-    /// The names of the thing types that exist.
+    /// Every thing type that exists, keyed by `thingTypeName`.
     ///
-    /// `CreateThing` answers `ResourceNotFoundException` for a `thingTypeName` that
-    /// is not in here, which is the only reason this set exists yet: `CreateThingType`
-    /// / `DeleteThingType` are still scaffolds (their own issues), so the set is empty
-    /// until one of them is implemented and populates it.
-    pub thing_types: BTreeSet<String>,
+    /// The name is the type's identity — the model binds it as the `@httpLabel` of
+    /// `/thing-types/{thingTypeName}` on every single-type operation — so a
+    /// `BTreeMap` keyed by name is the registry itself. `BTreeMap` (not `HashMap`)
+    /// because `ListThingTypes` is `@paginated` and a page boundary is only
+    /// meaningful over a stable order.
+    ///
+    /// `CreateThing` resolves its `thingTypeName` against this registry, so a thing
+    /// may only name a type that was created here.
+    ///
+    /// A caller grows this store, so it is bounded: [`MAX_THING_TYPES`] is the
+    /// ceiling `CreateThingType` refuses past.
+    pub thing_types: BTreeMap<String, RegisteredThingType>,
     /// The names of the billing groups that exist, read by `CreateThing` for the
     /// same reason as [`ComAmazonawsIotAwsiotserviceState::thing_types`];
     /// `CreateBillingGroup` is still a scaffold and will populate it.
@@ -501,6 +741,26 @@ impl ComAmazonawsIotAwsiotserviceState {
                 .thing_groups
                 .values()
                 .any(|group| group.thing_group_id == candidate)
+            {
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint a `thingTypeId` no thing type in the registry is using.
+    ///
+    /// `ThingTypeId` is an opaque string in the model
+    /// (`smithy_query(query="shape",shape="ThingTypeId")`), and AWS IoT's thing-type
+    /// ids are version-4 UUIDs like a thing's, so that is what this mints; the loop
+    /// re-mints on the (astronomically unlikely) collision, so two `CreateThingType`
+    /// calls can never be handed the same id.
+    pub fn mint_thing_type_id(&self) -> String {
+        loop {
+            let candidate = fresh_uuid();
+            if !self
+                .thing_types
+                .values()
+                .any(|thing_type| thing_type.thing_type_id == candidate)
             {
                 return candidate;
             }
