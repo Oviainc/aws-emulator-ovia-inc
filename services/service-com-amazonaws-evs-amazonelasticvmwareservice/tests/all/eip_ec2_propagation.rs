@@ -123,8 +123,23 @@ pub(crate) async fn create_environment(
         initial_vlans[*member] = json!({ "cidr": format!("{}.{index}.0/28", network.base) });
     }
     initial_vlans["isHcxPublic"] = json!(true);
-    // "Required when isHcxPublic is set to true" (`hcxNetworkAclId` doc).
-    initial_vlans["hcxNetworkAclId"] = json!("acl-0123456789abcdef0");
+    // "Required when isHcxPublic is set to true" (`hcxNetworkAclId` doc), and the id names
+    // a network ACL of the caller's own account that the create resolves in Amazon EC2's
+    // own store: one of this VPC's own, minted by EC2 itself
+    // (`tests/all/hcx_network_acl_references.rs` owns that rule).
+    let (status, xml) = call_ec2(
+        router,
+        network.region,
+        "CreateNetworkAcl",
+        &[("VpcId", &vpc_id)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {name:?}: CreateNetworkAcl expected 200, got {status} {xml}"
+    );
+    initial_vlans["hcxNetworkAclId"] = json!(element(&xml, "networkAclId")
+        .unwrap_or_else(|| panic!("case {name:?}: no networkAclId in {xml}")));
 
     let (status, body) = call_in_region(
         router,

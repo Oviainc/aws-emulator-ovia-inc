@@ -88,6 +88,8 @@ mod error_wire_status;
 mod finished_record_retention;
 #[path = "all/hcx_eip_associations.rs"]
 mod hcx_eip_associations;
+#[path = "all/hcx_network_acl_references.rs"]
+mod hcx_network_acl_references;
 #[path = "all/host_deletion.rs"]
 mod host_deletion;
 #[path = "all/host_ec2_instances.rs"]

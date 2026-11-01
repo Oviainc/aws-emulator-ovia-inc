@@ -74,6 +74,9 @@ pub(crate) async fn create_public_hcx(router: &Emulator, name: &str) -> String {
     // "Required when isHcxPublic is set to true" (`hcxNetworkAclId` doc).
     vlans["hcxNetworkAclId"] = json!("acl-0123456789abcdef0");
     request["initialVlans"] = vlans;
+    // The id names a network ACL of the caller's own account, which the create resolves in
+    // Amazon EC2's own store (`tests/all/hcx_network_acl_references.rs` owns that rule).
+    router.register_hcx_network_acl(&request);
     let (status, body) = call(router, "CreateEnvironment", &request).await;
     assert_eq!(
         status, 200,

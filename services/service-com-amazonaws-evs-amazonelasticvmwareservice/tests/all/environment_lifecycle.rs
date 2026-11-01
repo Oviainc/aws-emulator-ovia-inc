@@ -18,7 +18,10 @@
 //!   registers the network it names ([`Emulator::fresh_network`]).
 //! * `dedicatedHostId` and `placementGroupId` cannot be used together in one
 //!   `HostInfoForCreate` (its own doc).
-//! * `hcxNetworkAclId` is required when `isHcxPublic` is true (its own doc).
+//! * `hcxNetworkAclId` is required when `isHcxPublic` is true (its own doc), and names a
+//!   network ACL the account holds in that VPC — read from Amazon EC2's own store, which
+//!   is why a test whose create carries it registers that list
+//!   ([`Emulator::register_hcx_network_acl`]).
 //! * An environment name is unique within the account and Region (`environmentName` doc).
 //! * `maxResults` is a real page bound and `nextToken` resumes exactly where the page
 //!   stopped; a token this service did not issue, or one issued more than 24 hours
@@ -108,6 +111,27 @@ impl Emulator {
         }
         body
     }
+
+    /// Write the network access control list `request`'s `initialVlans.hcxNetworkAclId`
+    /// names into the account's own Amazon EC2 store, inside the VPC that request deploys
+    /// into — and nothing at all for a request that names none.
+    ///
+    /// `CreateEnvironment` resolves that id against THAT store, in that VPC: a network ACL
+    /// is an Amazon EC2 resource of the caller's account that Amazon EVS does not create,
+    /// and a network ACL belongs to one VPC. So every suite whose create carries the member
+    /// and expects to be served registers the list it names here first, exactly as
+    /// [`register_network`] registers the VPC and the service access subnet.
+    /// `tests/all/hcx_network_acl_references.rs` owns that rule and mints its lists through
+    /// Amazon EC2's own writers.
+    pub(crate) fn register_hcx_network_acl(&self, request: &Value) {
+        let Some(network_acl_id) = request["initialVlans"]["hcxNetworkAclId"].as_str() else {
+            return;
+        };
+        let vpc_id = request["vpcId"]
+            .as_str()
+            .expect("a create request names the VPC it is deployed into");
+        register_network_acl(&self.engine, vpc_id, network_acl_id);
+    }
 }
 
 /// Write one VPC and one subnet inside it into the account's own Amazon EC2 store, at
@@ -179,6 +203,38 @@ pub(crate) fn register_route_server_peers(engine: &engine::InMemoryEngine, peer_
             },
         );
     }
+}
+
+/// Write one network access control list of `vpc_id` into the account's own Amazon EC2
+/// store, at the id given.
+///
+/// `CreateEnvironment` resolves the `initialVlans.hcxNetworkAclId` a request carries
+/// against THAT store, inside the VPC the environment is deployed into — a network ACL is
+/// an Amazon EC2 resource of the caller's account that Amazon EVS does not create, and it
+/// belongs to one VPC — so a test whose create carries the member and expects to be served
+/// registers the list it names here first, exactly as [`register_network`] registers the
+/// VPC. [`Emulator::register_hcx_network_acl`] does it for a request already built, and
+/// `tests/all/hcx_network_acl_references.rs` owns the rule and mints its lists through
+/// Amazon EC2's own writers.
+pub(crate) fn register_network_acl(
+    engine: &engine::InMemoryEngine,
+    vpc_id: &str,
+    network_acl_id: &str,
+) {
+    let ec2_state = ec2::state::service_state(engine)
+        .expect("the in-memory engine carries the account's EC2 store");
+    let mut store = ec2_state.lock();
+    store.network_acls.insert(
+        network_acl_id.to_string(),
+        ec2::ops::types::NetworkAcl {
+            network_acl_id: Some(network_acl_id.to_string()),
+            vpc_id: Some(vpc_id.to_string()),
+            is_default: Some(false),
+            associations: Some(Vec::new()),
+            entries: Some(ec2::state::default_network_acl_entries()),
+            ..Default::default()
+        },
+    );
 }
 
 /// The IPv4 CIDR block of the VPC [`register_network`] writes: every VLAN subnet block
@@ -823,6 +879,10 @@ async fn create_environment_enforces_the_documented_request_rules() {
         for (member, value) in overrides.as_object().expect("the overrides are an object") {
             request[member] = value.clone();
         }
+        // A row whose `initialVlans` names the HCX network ACL names a list of the
+        // account: the create resolves it in Amazon EC2's own store, so it is registered
+        // there first (`tests/all/hcx_network_acl_references.rs` owns that rule).
+        router.register_hcx_network_acl(&request);
 
         let (status, body) = call(&router, "CreateEnvironment", &request).await;
         assert_eq!(

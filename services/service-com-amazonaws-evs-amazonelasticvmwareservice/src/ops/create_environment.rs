@@ -100,11 +100,15 @@
 //!    part of the installation and the member is "Not supported when `vcfVersion` is
 //!    `SELF_DEPLOYED`".
 //!
-//! `initialVlans.hcxNetworkAclId` is NOT among them: a network access control list is an
-//! EC2 resource too, but the account's EC2 store holds no network ACL records at all, so
-//! that store can report neither that the id names one nor that it does not — and an
-//! unanswerable question refuses nothing, exactly as an unreadable store does
-//! ([`crate::state::ec2_resources`]).
+//! 15. The `initialVlans.hcxNetworkAclId` a request carries names a network access
+//!    control list the account holds IN that same VPC: it is "A unique ID for a network
+//!    access control list that the HCX VLAN uses" (`InitialVlans$hcxNetworkAclId` doc) —
+//!    an Amazon EC2 resource of the caller's own account, which Amazon EVS does not
+//!    create — and a network ACL belongs to one VPC, so it is judged exactly as rule 13
+//!    judges the service access security groups, from the same store
+//!    ([`crate::state::ec2_resources::network_acl_failures`]). Judged wherever the member
+//!    is SUPPLIED, public HCX VLAN or not, because the id is stored on the HCX VLAN and
+//!    reported back as `Vlan$networkAclId` either way.
 //!
 //! Supplying a parameter the chosen VCF mode does not support is NOT one of them.
 //! `SELF_DEPLOYED` "does not support" `licenseInfo`, `hosts`, `vcfHostnames`, `siteId`
@@ -624,6 +628,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &*self.engine,
                 &input.vpc_id,
                 &references,
+            ));
+
+            // The network access control list the HCX VLAN uses is one of the caller's own
+            // too: it is "A unique ID for a network access control list that the HCX VLAN
+            // uses" (`hcxNetworkAclId` doc), Amazon EVS creates no network ACL, and a
+            // network ACL belongs to ONE VPC — so a list of some other VPC cannot govern a
+            // VLAN subnet provisioned in this one. Resolved wherever the member is
+            // SUPPLIED, public HCX VLAN or not, because the id is stored on the HCX VLAN
+            // and reported back as `Vlan$networkAclId` either way; and, like the security
+            // groups, only once there IS a VPC to judge membership against.
+            let named_network_acls: Vec<crate::state::ec2_resources::NetworkAclReference<'_>> =
+                input
+                    .initial_vlans
+                    .hcx_network_acl_id
+                    .as_deref()
+                    .map(
+                        |network_acl_id| crate::state::ec2_resources::NetworkAclReference {
+                            member: HCX_NETWORK_ACL_MEMBER,
+                            network_acl_id,
+                        },
+                    )
+                    .into_iter()
+                    .collect();
+            failures.extend(crate::state::ec2_resources::network_acl_failures(
+                &*self.engine,
+                &input.vpc_id,
+                &named_network_acls,
             ));
         }
 
@@ -1186,6 +1217,11 @@ fn plan_vlans(initial: &InitialVlans) -> Vec<PlannedVlan<'_>> {
     ]
 }
 
+/// The input path of the member that names the network access control list the HCX VLAN
+/// uses, so the clause for its absence and the clause for an id the account's own Amazon
+/// EC2 store cannot resolve name the same member.
+const HCX_NETWORK_ACL_MEMBER: &str = "initialVlans.hcxNetworkAclId";
+
 /// Every rule the request's VLAN subnets break: the HCX network ACL the public HCX
 /// VLAN requires, and, per VLAN subnet, a parsable CIDR block of a size that VLAN is
 /// allowed ([`allowed_prefix_lens`], which narrows for a public one) and that overlaps
@@ -1199,7 +1235,7 @@ fn vlan_failures(
     // "Required when isHcxPublic is set to true" (`hcxNetworkAclId` doc).
     if initial.is_hcx_public && initial.hcx_network_acl_id.is_none() {
         failures.push(crate::state::field_failure(
-            "initialVlans.hcxNetworkAclId",
+            HCX_NETWORK_ACL_MEMBER,
             "is required when isHcxPublic is true",
         ));
     }

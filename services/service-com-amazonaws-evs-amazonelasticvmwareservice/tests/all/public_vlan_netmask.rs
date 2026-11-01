@@ -37,9 +37,10 @@ const PUBLIC_CAPABLE_MEMBER: &str = "hcx";
 const PUBLIC_CAPABLE_PATH: &str = "initialVlans.hcx";
 
 /// The network ACL id a public HCX VLAN needs ("Required when isHcxPublic is set to
-/// true", `hcxNetworkAclId` doc), in the modelled `^acl-[a-f0-9]{8}([a-f0-9]{9})?$`
-/// form. Supplied by every public row, so the only failure a public row can draw is
-/// the netmask under test.
+/// true", `hcxNetworkAclId` doc), in the form Amazon EC2's own id minter gives one. The
+/// id also has to name a network ACL the account holds in the environment's VPC, so
+/// every public row registers it there (`Emulator::register_hcx_network_acl`) and the
+/// only failure such a row can draw is the netmask under test.
 const HCX_NETWORK_ACL_ID: &str = "acl-0123456789abcdef0";
 
 /// The first address of the block every row gives the HCX VLAN: its own `/24` of the
@@ -180,6 +181,10 @@ async fn a_public_vlan_subnet_is_a_slash_28_and_a_private_one_the_whole_range() 
         let router = emulator();
         let mut request = router.create_request(None);
         request["initialVlans"] = initial_vlans(row);
+        // A public row names a network ACL of the account: the create resolves it in
+        // Amazon EC2's own store, so the one it names is registered there first and the
+        // netmask stays the only thing under test.
+        router.register_hcx_network_acl(&request);
         let case = row.case;
 
         let (status, body) = call(&router, "CreateEnvironment", &request).await;
@@ -273,6 +278,7 @@ async fn the_public_narrowing_reaches_only_the_vlan_that_is_public() {
     let case = "a public HCX /28 beside larger private blocks";
     let mut request = router.create_request(Some("public-hcx-mixed-sizes"));
     request["initialVlans"] = vlans;
+    router.register_hcx_network_acl(&request);
     let (status, body) = call(&router, "CreateEnvironment", &request).await;
     assert_eq!(
         status, 200,
@@ -317,6 +323,7 @@ async fn the_public_narrowing_reaches_only_the_vlan_that_is_public() {
     vlans[PUBLIC_CAPABLE_MEMBER] = json!({ "cidr": format!("{HCX_BLOCK_BASE}/27") });
     let mut request = router.create_request(Some("public-hcx-too-large"));
     request["initialVlans"] = vlans;
+    router.register_hcx_network_acl(&request);
     let (status, body) = call(&router, "CreateEnvironment", &request).await;
     assert_aggregated_refusal(
         "a public HCX /27 beside correct private blocks",

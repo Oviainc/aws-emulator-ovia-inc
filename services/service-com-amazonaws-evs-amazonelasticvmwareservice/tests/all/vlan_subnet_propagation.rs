@@ -255,7 +255,11 @@ impl Row {
         format!("{}.{index}.0/{}", self.base, self.vlan_prefix_len(index))
     }
 
-    /// The row's `initialVlans`.
+    /// The row's `initialVlans`. A row whose HCX VLAN is public still needs the network
+    /// ACL that VLAN uses — "Required when isHcxPublic is set to true"
+    /// (`hcxNetworkAclId` doc) — and that id names a network ACL of the caller's own
+    /// account, so the test creates one in the VPC through Amazon EC2 itself and sets it
+    /// here ([`create_network_acl`]).
     fn initial_vlans(&self) -> Value {
         let mut vlans = json!({});
         for (index, member) in VLAN_MEMBERS.iter().enumerate() {
@@ -263,8 +267,6 @@ impl Row {
         }
         if self.public_hcx {
             vlans["isHcxPublic"] = json!(true);
-            // "Required when isHcxPublic is set to true" (`hcxNetworkAclId` doc).
-            vlans["hcxNetworkAclId"] = json!("acl-0123456789abcdef0");
         }
         vlans
     }
@@ -311,6 +313,30 @@ fn rows() -> Vec<Row> {
             public_hcx: false,
         },
     ]
+}
+
+/// Create a network access control list of `vpc_id` through Amazon EC2 itself, and answer
+/// the `NetworkAclId` EC2 minted for it.
+///
+/// `CreateEnvironment` resolves the `initialVlans.hcxNetworkAclId` a request carries in
+/// Amazon EC2's own store, in the VPC the environment is deployed into, so a public HCX
+/// VLAN names a list the account really holds — minted here the way a caller would mint
+/// it. `tests/all/hcx_network_acl_references.rs` owns that rule.
+async fn create_network_acl(router: &MultiServiceRouter, row: &Row, vpc_id: &str) -> String {
+    let (status, xml) = call_ec2(
+        router,
+        row.region,
+        "CreateNetworkAcl",
+        &[("VpcId", vpc_id)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateNetworkAcl expected 200, got {status} {xml}",
+        case = row.case
+    );
+    element(&xml, "networkAclId")
+        .unwrap_or_else(|| panic!("case {case:?}: no networkAclId in {xml}", case = row.case))
 }
 
 /// Create the row's network through Amazon EC2 itself, and answer the VPC and service
@@ -368,6 +394,14 @@ async fn the_vlan_subnets_an_environment_provisions_exist_in_ec2_and_go_away_wit
              subnet, got {before:?}"
         );
 
+        let mut initial_vlans = row.initial_vlans();
+        if row.public_hcx {
+            // A public HCX VLAN uses a network ACL of the account, and the create resolves
+            // that id in Amazon EC2's own store: one of the VPC's own, minted by EC2.
+            initial_vlans["hcxNetworkAclId"] =
+                json!(create_network_acl(&router, &row, &vpc_id).await);
+        }
+
         let (status, created) = call_in_region(
             &router,
             row.region,
@@ -378,7 +412,7 @@ async fn the_vlan_subnets_an_environment_provisions_exist_in_ec2_and_go_away_wit
                 "serviceAccessSubnetId": service_access_subnet_id,
                 "vcfVersion": "SELF_DEPLOYED",
                 "termsAccepted": true,
-                "initialVlans": row.initial_vlans(),
+                "initialVlans": initial_vlans,
             }),
         )
         .await;

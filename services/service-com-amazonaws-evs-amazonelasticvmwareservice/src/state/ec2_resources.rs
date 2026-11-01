@@ -16,7 +16,8 @@
 //! Every other member of such a request that names an EC2 resource of the caller's
 //! network is resolved in that same store, and against the same VPC: the security groups
 //! that "allow traffic between the Amazon EVS control plane and your VPC"
-//! ([`security_group_failures`]) and the blocks the VLAN subnets are provisioned from
+//! ([`security_group_failures`]), the network access control list a VLAN subnet uses
+//! ([`network_acl_failures`]) and the blocks the VLAN subnets are provisioned from
 //! ([`vlan_placement_failures`]). The route server peers the environment's route server
 //! endpoints peer with are resolved there too, by id and not against a VPC, because a peer
 //! is identified account-wide ([`route_server_peer_failures`]).
@@ -215,6 +216,77 @@ pub fn security_group_failures<Eng: Send + Sync + 'static>(
                 .is_none_or(|held| held.vpc_id.as_deref() != Some(vpc_id))
         })
         .map(|group| invalid_security_group_clause(group.member, group.group_id, vpc_id))
+        .collect()
+}
+
+/// The clause stated for a network ACL id that is not a network access control list of the
+/// VPC the request named — because the account holds no list with that id, or because the
+/// list it holds belongs to another VPC.
+///
+/// `member` is the PATH of the member that named it, so the clause points at what the
+/// caller wrote. Stated in the same form as [`invalid_security_group_clause`], because it is
+/// the same kind of failure: a member naming a network resource of the VPC the environment
+/// is deployed into.
+pub fn invalid_network_acl_clause(
+    member: &str,
+    network_acl_id: &str,
+    vpc_id: &str,
+) -> ValidationExceptionField {
+    super::field_failure_stated(
+        member,
+        format!(
+            "The network ACL id {network_acl_id} given for {member} is not valid or does \
+             not exist in VPC {vpc_id}. Please verify the network ACL id exists in the VPC \
+             and is valid."
+        ),
+    )
+}
+
+/// One network access control list a request named, and the path of the member that named
+/// it, so a refusal names what the caller wrote.
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkAclReference<'a> {
+    /// The path of the member this id came from.
+    pub member: &'a str,
+    /// The `NetworkAclId` the request supplied.
+    pub network_acl_id: &'a str,
+}
+
+/// Every failure of the precondition that each network access control list a request names
+/// is a list OF the VPC the environment is deployed into.
+///
+/// A network ACL is an Amazon EC2 resource of the caller's own account that Amazon EVS does
+/// not create — every VPC comes with its default one and `CreateNetworkAcl` mints the rest —
+/// so an id that names no list of the account names nothing for a VLAN subnet to use,
+/// exactly as a `securityGroups` entry names no group ([`security_group_failures`]) and
+/// `vpcId` no VPC ([`network_failures`]). A network ACL belongs to ONE VPC
+/// (`NetworkAcl$VpcId`) and controls traffic of that VPC's subnets, so a list of some other
+/// VPC cannot be used by a VLAN subnet provisioned in this one — the same scope the security
+/// groups are judged at.
+///
+/// An unknown VPC leaves nothing to judge the lists against, so nothing is reported —
+/// [`invalid_vpc_clause`] is the clause for that — and so does an unreadable EC2 store.
+pub fn network_acl_failures<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    vpc_id: &str,
+    network_acls: &[NetworkAclReference<'_>],
+) -> Vec<ValidationExceptionField> {
+    let Some(state) = ec2_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    if !store.vpcs.contains_key(vpc_id) {
+        return Vec::new();
+    }
+    network_acls
+        .iter()
+        .filter(|acl| {
+            store
+                .network_acls
+                .get(acl.network_acl_id)
+                .is_none_or(|held| held.vpc_id.as_deref() != Some(vpc_id))
+        })
+        .map(|acl| invalid_network_acl_clause(acl.member, acl.network_acl_id, vpc_id))
         .collect()
 }
 
