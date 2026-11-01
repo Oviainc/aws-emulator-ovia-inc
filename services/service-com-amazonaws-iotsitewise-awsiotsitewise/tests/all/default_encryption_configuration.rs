@@ -10,12 +10,10 @@
 //! customer-managed-key encryption, the ARN of the key its identifier selected,
 //! in whichever of the identifier forms AWS KMS accepts it was given; an account
 //! no put has configured reports the service-owned-key default without storing
-//! anything; the configuration a put accepts is reported as being applied until
-//! the span the service settles a transition in has passed; and a request that
+//! anything; the configuration a put accepts is in force with the call, so the
+//! put's own answer and every read after it report it active; and a request that
 //! names an encryption type the model does not define, or an encryption type and
 //! a key identifier that do not go together, is refused rather than stored.
-
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -24,9 +22,8 @@ use service_com_amazonaws_iotsitewise_awsiotsitewise::ops::types::{
     CONFIGURATION_STATE_VALUES, ENCRYPTION_TYPE_VALUES,
 };
 use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{
-    ACTIVATION_DELAY, ARN_MAX_LENGTH, CONFIGURATION_STATE_ACTIVE,
-    CONFIGURATION_STATE_UPDATE_IN_PROGRESS, ENCRYPTION_TYPE_KMS_BASED,
-    ENCRYPTION_TYPE_SITEWISE_DEFAULT,
+    ARN_MAX_LENGTH, CONFIGURATION_STATE_ACTIVE, CONFIGURATION_STATE_UPDATE_IN_PROGRESS,
+    ENCRYPTION_TYPE_KMS_BASED, ENCRYPTION_TYPE_SITEWISE_DEFAULT,
 };
 
 use crate::asset_lifecycle::{call, error_code, router, REGION};
@@ -287,6 +284,11 @@ async fn every_encryption_type_and_key_identifier_form_reads_back() {
             CONFIGURATION_STATE_VALUES.contains(&state),
             "case {label:?}: the put reported the unmodelled state {state:?}"
         );
+        assert_eq!(
+            state, CONFIGURATION_STATE_ACTIVE,
+            "case {label:?}: the put reported state {state:?}, expected the configuration it \
+             applied to be in force"
+        );
         if let Some(arn) = kms_key_arn {
             assert!(
                 is_modelled_arn(arn),
@@ -312,15 +314,20 @@ async fn every_encryption_type_and_key_identifier_form_reads_back() {
             CONFIGURATION_STATE_VALUES.contains(&state),
             "case {label:?}: the describe reported the unmodelled state {state:?}"
         );
+        assert_eq!(
+            state, CONFIGURATION_STATE_ACTIVE,
+            "case {label:?}: the describe reported state {state:?}, expected the configuration \
+             the put applied to be in force"
+        );
     }
 }
 
-/// The configuration a put accepts is reported as still being applied, and the
-/// clock — not another call — is what moves it into force: the same describe
-/// reports it active once the span the service settles a transition in has
-/// passed, with the configuration itself unchanged.
+/// The configuration a put accepts is in force with the call: the put's own
+/// answer reports it active, a describe taken straight after reports the same
+/// thing, and the describe repeated reports it again — there is no state a
+/// client has to wait out, and no later call that moves it.
 #[tokio::test]
-async fn an_accepted_configuration_settles_into_force_on_the_clock() {
+async fn an_accepted_configuration_is_in_force_on_the_put_that_stored_it() {
     let router = router();
 
     let expected_arn = format!("arn:aws:kms:{REGION}:{ACCOUNT}:key/{KEY_ID}");
@@ -332,38 +339,29 @@ async fn an_accepted_configuration_settles_into_force_on_the_clock() {
     assert_eq!(status, 200, "put a KMS-based configuration: {status} {body}");
     let (_, _, state) = reported(&body);
     assert_eq!(
-        state, CONFIGURATION_STATE_UPDATE_IN_PROGRESS,
-        "the put of a fresh configuration reported state {state:?}, expected it to still be \
-         being applied"
-    );
-
-    let (_, body) = describe(&router).await;
-    let (_, _, state) = reported(&body);
-    assert_eq!(
-        state, CONFIGURATION_STATE_UPDATE_IN_PROGRESS,
-        "a describe taken straight after the put reported state {state:?}, expected the \
-         configuration to still be being applied"
-    );
-
-    // Comfortably past the span the service settles the owed transition in.
-    tokio::time::sleep(ACTIVATION_DELAY + Duration::from_millis(200)).await;
-
-    let (status, body) = describe(&router).await;
-    assert_eq!(status, 200, "describe after the settle: {status} {body}");
-    let (encryption_type, kms_key_arn, state) = reported(&body);
-    assert_eq!(
         state, CONFIGURATION_STATE_ACTIVE,
-        "after the settle the configuration reported state {state:?}: got {body}"
+        "the put of a fresh configuration reported state {state:?}, expected the configuration \
+         it applied to be in force"
     );
-    assert_eq!(
-        encryption_type, ENCRYPTION_TYPE_KMS_BASED,
-        "the settle changed the encryption type: got {body}"
-    );
-    assert_eq!(
-        kms_key_arn,
-        Some(expected_arn.as_str()),
-        "the settle changed the key: got {kms_key_arn:?}, expected {expected_arn:?}"
-    );
+
+    for attempt in 1..=3 {
+        let (status, body) = describe(&router).await;
+        assert_eq!(status, 200, "describe {attempt}: {status} {body}");
+        let (encryption_type, kms_key_arn, state) = reported(&body);
+        assert_eq!(
+            state, CONFIGURATION_STATE_ACTIVE,
+            "describe {attempt} reported state {state:?}: got {body}"
+        );
+        assert_eq!(
+            encryption_type, ENCRYPTION_TYPE_KMS_BASED,
+            "describe {attempt} changed the encryption type: got {body}"
+        );
+        assert_eq!(
+            kms_key_arn,
+            Some(expected_arn.as_str()),
+            "describe {attempt} changed the key: got {kms_key_arn:?}, expected {expected_arn:?}"
+        );
+    }
 }
 
 /// A put is the last word on the account's encryption: one naming the

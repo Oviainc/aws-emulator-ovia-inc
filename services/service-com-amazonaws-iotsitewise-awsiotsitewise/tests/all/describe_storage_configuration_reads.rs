@@ -4,12 +4,13 @@
 //!
 //! The rule these tests pin: the describe of the account-wide storage setting is
 //! a REPORTING operation, so it answers from the stored setting — the required
-//! members always filled, the documented default filled in for each member the
-//! setting does not name, and the instant the last put recorded — and it changes
-//! nothing a later caller sees: repeating it answers identically, an account no
-//! put has configured still reports no update date however often it is read, and
-//! the clock alone moves the status, so reads taken while a configuration is
-//! still being applied neither settle it early nor hold it back.
+//! members always filled, the state the account carries filled in for each
+//! member the setting does not name, and the instant the last put recorded — and
+//! it changes nothing a later caller sees: repeating it answers identically, an
+//! account no put has configured still reports no update date however often it
+//! is read, and the clock alone moves the status, so reads taken while a
+//! configuration is still being applied neither settle it early nor hold it
+//! back.
 //!
 //! The round trip through `PutStorageConfiguration` and the selections that
 //! operation refuses are covered by `storage_configuration.rs`; these tests are
@@ -51,6 +52,9 @@ const COLD_TIER: &str = "MULTI_LAYER_STORAGE";
 /// `values: ["ENABLED", "DISABLED"]` for each.
 const FEATURE_ON: &str = "ENABLED";
 
+/// The value that turns one of them off; see [`FEATURE_ON`] for the source.
+const FEATURE_OFF: &str = "DISABLED";
+
 /// The `ConfigurationState` a configuration in force reports.
 ///
 /// Source: `smithy_query(query="shape", shape="ConfigurationState")`, which
@@ -66,15 +70,20 @@ const BEING_APPLIED: &str = "UPDATE_IN_PROGRESS";
 /// (`storageType` — "IoT SiteWise saves your data into the hot tier"), data kept
 /// indefinitely there (`retentionPeriod` — "By default, your data is kept
 /// indefinitely in the hot tier"), NULL/NaN ingestion allowed
-/// (`disallowIngestNullNaN` — "By default the feature is allowed"), and nothing
-/// reported for the members whose documentation states no default.
+/// (`disallowIngestNullNaN` — "By default the feature is allowed"), each tier
+/// state as the account carries it — data streams no asset property owns
+/// accepted (`disassociatedDataStorage` — "ENABLED – IoT SiteWise accepts time
+/// series that aren't associated with asset properties", which is the ingest
+/// such an account takes) and the warm tier, a tier an account opts into, off —
+/// and nothing reported for the members that name a resource rather than a
+/// state.
 fn hot_tier_default() -> Value {
     json!({
         "storageType": HOT_TIER,
         "multiLayerStorage": Value::Null,
-        "disassociatedDataStorage": Value::Null,
+        "disassociatedDataStorage": FEATURE_ON,
         "retentionPeriod": { "unlimited": true },
-        "warmTier": Value::Null,
+        "warmTier": FEATURE_OFF,
         "warmTierRetentionPeriod": Value::Null,
         "disallowIngestNullNaN": false,
     })
@@ -122,9 +131,9 @@ fn rows() -> Vec<Row> {
             expected: json!({
                 "storageType": HOT_TIER,
                 "multiLayerStorage": Value::Null,
-                "disassociatedDataStorage": Value::Null,
+                "disassociatedDataStorage": FEATURE_ON,
                 "retentionPeriod": { "numberOfDays": 7 },
-                "warmTier": Value::Null,
+                "warmTier": FEATURE_OFF,
                 "warmTierRetentionPeriod": Value::Null,
                 "disallowIngestNullNaN": true,
             }),
@@ -160,7 +169,7 @@ fn rows() -> Vec<Row> {
             expected: json!({
                 "storageType": COLD_TIER,
                 "multiLayerStorage": multi_layer_storage("read-side-archive/deep", "Cold_Role-9"),
-                "disassociatedDataStorage": Value::Null,
+                "disassociatedDataStorage": FEATURE_ON,
                 "retentionPeriod": { "numberOfDays": 30, "unlimited": false },
                 "warmTier": FEATURE_ON,
                 "warmTierRetentionPeriod": { "numberOfDays": 90 },

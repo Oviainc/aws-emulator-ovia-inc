@@ -441,6 +441,12 @@ mod workspace_lifecycle;
 // Same reasoning: declared outside the sorted list, which is the stretch every
 // concurrent iotsitewise change edits. Fold it into the list once the churn
 // settles.
+#[path = "all/account_configuration_effective_state.rs"]
+mod account_configuration_effective_state;
+
+// Same reasoning: declared outside the sorted list, which is the stretch every
+// concurrent iotsitewise change edits. Fold it into the list once the churn
+// settles.
 #[path = "all/access_policy_lifecycle.rs"]
 mod access_policy_lifecycle;
 

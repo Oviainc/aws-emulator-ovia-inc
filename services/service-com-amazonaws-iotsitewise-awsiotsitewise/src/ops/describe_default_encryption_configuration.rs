@@ -165,11 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pure READ of the one stored setting: an account no put has configured
         // reports the service-owned-key default WITHOUT storing it, so the first
-        // read cannot change what a later caller sees, and a configuration still
-        // being applied reports that from the instant its put recorded.
-        let configuration = state
-            .lock()
-            .default_encryption_configuration(::std::time::SystemTime::now());
+        // read cannot change what a later caller sees, and the configuration a
+        // put stored is in force, so it is reported settled.
+        let configuration = state.lock().default_encryption_configuration();
         Ok(DescribeDefaultEncryptionConfigurationOutput {
             encryption_type: configuration.encryption_type,
             kms_key_arn: configuration.kms_key_arn,

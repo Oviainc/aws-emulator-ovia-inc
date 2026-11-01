@@ -8,9 +8,8 @@
 //! reach it through `crate::state`'s `default_encryption_configuration` /
 //! `set_default_encryption_configuration`, so neither keeps a copy of its own.
 //! A key identifier is read against the forms AWS KMS accepts for one and
-//! reported back as the key's ARN; the configuration a put accepts is in force
-//! from the instant the put records, so a read taken straight after it still
-//! observes the state the service reports while the change is applied.
+//! reported back as the key's ARN; the selection takes effect with the call, so
+//! this answer and every read after it report the configuration in force.
 //!
 //! ## Shape of an operation
 //!
@@ -221,15 +220,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The whole setting is replaced — a put is the last word on the account's
-        // encryption — and the configuration it accepts falls due at the span
-        // `crate::state::set_default_encryption_configuration` records, so this
-        // answer reports the state the configuration is in at the instant of the
-        // call.
-        let configuration = state.lock().set_default_encryption_configuration(
-            encryption_type,
-            kms_key_arn,
-            ::std::time::SystemTime::now(),
-        );
+        // encryption — and the selection it accepts is in force as soon as it is
+        // stored, so this answer reports the configuration the account now has,
+        // settled.
+        let configuration = state
+            .lock()
+            .set_default_encryption_configuration(encryption_type, kms_key_arn);
         Ok(PutDefaultEncryptionConfigurationOutput {
             encryption_type: configuration.encryption_type,
             kms_key_arn: configuration.kms_key_arn,

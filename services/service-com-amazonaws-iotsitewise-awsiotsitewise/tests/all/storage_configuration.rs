@@ -6,9 +6,10 @@
 //!
 //! The rule these tests pin: the storage configuration is one account-wide
 //! SETTING, so a put replaces it whole and a describe reports exactly what the
-//! last put stored, with the documented default filled in for each member the
-//! configuration does not name; an account no put has configured reports the
-//! hot-tier default without storing anything; the configuration a put accepts
+//! last put stored, with the state the account carries filled in for each member
+//! the configuration does not name — including both tier-state members, which
+//! every answer reports; an account no put has configured reports the hot-tier
+//! default without storing anything; the configuration a put accepts
 //! is reported as being applied until the span the service settles a transition
 //! in has passed, and the describe reports when the last put recorded it; a
 //! selection outside the rules the shapes state — a tier outside the modelled
@@ -97,14 +98,16 @@ pub(crate) fn reported(body: &Value) -> Value {
 }
 
 /// The configuration an account no put has configured reports: the hot tier,
-/// data kept indefinitely in it, and NULL/NaN ingestion allowed.
+/// data kept indefinitely in it, NULL/NaN ingestion allowed, data streams no
+/// asset property owns accepted, and the warm tier — a tier an account opts
+/// into — off.
 fn unconfigured() -> Value {
     json!({
         "storageType": STORAGE_TYPE_SITEWISE_DEFAULT,
         "multiLayerStorage": Value::Null,
-        "disassociatedDataStorage": Value::Null,
+        "disassociatedDataStorage": STORAGE_STATE_ENABLED,
         "retentionPeriod": { "unlimited": true },
-        "warmTier": Value::Null,
+        "warmTier": STORAGE_STATE_DISABLED,
         "warmTierRetentionPeriod": Value::Null,
         "disallowIngestNullNaN": DEFAULT_DISALLOW_INGEST_NULL_NAN,
     })
@@ -225,9 +228,9 @@ fn round_trip_cases() -> Vec<Case> {
             expected: json!({
                 "storageType": STORAGE_TYPE_SITEWISE_DEFAULT,
                 "multiLayerStorage": Value::Null,
-                "disassociatedDataStorage": Value::Null,
+                "disassociatedDataStorage": STORAGE_STATE_ENABLED,
                 "retentionPeriod": { "numberOfDays": 1 },
-                "warmTier": Value::Null,
+                "warmTier": STORAGE_STATE_DISABLED,
                 "warmTierRetentionPeriod": Value::Null,
                 "disallowIngestNullNaN": false,
             }),
@@ -242,9 +245,9 @@ fn round_trip_cases() -> Vec<Case> {
             expected: json!({
                 "storageType": STORAGE_TYPE_SITEWISE_DEFAULT,
                 "multiLayerStorage": Value::Null,
-                "disassociatedDataStorage": Value::Null,
+                "disassociatedDataStorage": STORAGE_STATE_ENABLED,
                 "retentionPeriod": { "numberOfDays": 3650, "unlimited": false },
-                "warmTier": Value::Null,
+                "warmTier": STORAGE_STATE_DISABLED,
                 "warmTierRetentionPeriod": Value::Null,
                 "disallowIngestNullNaN": true,
             }),
@@ -277,7 +280,7 @@ fn round_trip_cases() -> Vec<Case> {
             expected: json!({
                 "storageType": STORAGE_TYPE_MULTI_LAYER,
                 "multiLayerStorage": multi_layer_storage("plant-1-archive", "SiteWiseColdTier"),
-                "disassociatedDataStorage": Value::Null,
+                "disassociatedDataStorage": STORAGE_STATE_ENABLED,
                 "retentionPeriod": { "unlimited": true },
                 "warmTier": STORAGE_STATE_ENABLED,
                 "warmTierRetentionPeriod": Value::Null,
@@ -296,7 +299,7 @@ fn round_trip_cases() -> Vec<Case> {
             expected: json!({
                 "storageType": STORAGE_TYPE_MULTI_LAYER,
                 "multiLayerStorage": multi_layer_storage("plant-2-archive/prefix", "ColdRole_2"),
-                "disassociatedDataStorage": Value::Null,
+                "disassociatedDataStorage": STORAGE_STATE_ENABLED,
                 "retentionPeriod": { "numberOfDays": 30 },
                 "warmTier": STORAGE_STATE_ENABLED,
                 "warmTierRetentionPeriod": { "numberOfDays": 90 },
@@ -316,9 +319,9 @@ fn round_trip_cases() -> Vec<Case> {
             expected: json!({
                 "storageType": STORAGE_TYPE_MULTI_LAYER,
                 "multiLayerStorage": multi_layer_storage("plant-4-archive", "ColdRole_4"),
-                "disassociatedDataStorage": Value::Null,
+                "disassociatedDataStorage": STORAGE_STATE_ENABLED,
                 "retentionPeriod": { "unlimited": true },
-                "warmTier": Value::Null,
+                "warmTier": STORAGE_STATE_DISABLED,
                 "warmTierRetentionPeriod": { "numberOfDays": 7 },
                 "disallowIngestNullNaN": false,
             }),

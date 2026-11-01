@@ -194,9 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pure READ of the one stored setting: an account no put has
         // configured reports the hot-tier default WITHOUT storing it, so the
-        // first read cannot change what a later caller sees, and a
-        // configuration still being applied reports that from the instant its
-        // put recorded.
+        // first read cannot change what a later caller sees; each member the
+        // configuration does not name is reported with the state the account
+        // carries for it, and a configuration still being applied reports that
+        // from the instant its put recorded.
         let configuration = state
             .lock()
             .storage_configuration(::std::time::SystemTime::now());

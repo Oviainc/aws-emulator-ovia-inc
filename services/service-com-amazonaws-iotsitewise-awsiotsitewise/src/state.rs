@@ -8877,8 +8877,12 @@ pub fn is_modelled_arn(value: &str) -> bool {
 }
 
 /// The default encryption configuration a put stored: which encryption the
-/// account selected, the key it selected for it, and when the configuration the
-/// put accepted falls due to be in force.
+/// account selected and the key it selected for it.
+///
+/// The record keeps no due instant, because this setting owes no transition: a
+/// put of the account's default encryption takes effect with the call, so the
+/// configuration it stores is in force from its own response onwards (see
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::default_encryption_configuration`]).
 #[derive(Debug, Clone)]
 pub struct DefaultEncryptionRecord {
     /// The modelled `EncryptionType` the put named.
@@ -8886,32 +8890,20 @@ pub struct DefaultEncryptionRecord {
     /// The ARN of the KMS key the put selected (see [`kms_key_arn`]); `None`
     /// under [`ENCRYPTION_TYPE_SITEWISE_DEFAULT`], which uses no customer managed key.
     pub kms_key_arn: Option<String>,
-    /// When [`CONFIGURATION_STATE_UPDATE_IN_PROGRESS`] ->
-    /// [`CONFIGURATION_STATE_ACTIVE`] falls due: the instant of the put plus
-    /// [`ACTIVATION_DELAY`]. Stored rather than slept for, so nothing blocks and
-    /// a caller reading straight after the put still observes the state the
-    /// service reports while it applies the change.
-    pub active_at: SystemTime,
 }
 
 /// The `ConfigurationState` a configuration whose transition falls due at
 /// `active_at` reports at `now`: in force from that instant, and being applied
 /// until it.
 ///
-/// Every account-wide setting this service keeps settles the same way, so the
-/// one rule is read from here rather than restated per setting.
+/// Read by every account-wide setting whose change this service applies
+/// ASYNCHRONOUSLY — the one that reaches the caller settled is reported
+/// [`CONFIGURATION_STATE_ACTIVE`] without consulting the clock at all.
 pub fn configuration_state(active_at: SystemTime, now: SystemTime) -> &'static str {
     if now >= active_at {
         CONFIGURATION_STATE_ACTIVE
     } else {
         CONFIGURATION_STATE_UPDATE_IN_PROGRESS
-    }
-}
-
-impl DefaultEncryptionRecord {
-    /// The `ConfigurationState` this configuration reports at `now`.
-    pub fn state(&self, now: SystemTime) -> &'static str {
-        configuration_state(self.active_at, now)
     }
 }
 
@@ -8929,19 +8921,18 @@ pub struct DefaultEncryptionConfiguration {
 }
 
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
-    /// The default encryption configuration the account reports at `now`: the one
-    /// the last put stored, or the service-owned-key default while nothing has
+    /// The default encryption configuration the account reports: the one the
+    /// last put stored, or the service-owned-key default while nothing has
     /// stored any.
     ///
-    /// A pure READ: an unconfigured account is not materialised, and a
-    /// configuration still settling is reported from the instant its put already
-    /// recorded, so reading cannot change what a later caller sees.
-    pub fn default_encryption_configuration(
-        &self,
-        now: SystemTime,
-    ) -> DefaultEncryptionConfiguration {
-        let status = |state: &str| ConfigurationStatus {
-            state: state.to_string(),
+    /// The state is [`CONFIGURATION_STATE_ACTIVE`] either way, and reads no
+    /// clock: this setting takes effect with the put that stores it, so the
+    /// configuration reported is always the one in force. Nothing here is
+    /// materialised, so an unconfigured account stays unconfigured however
+    /// often it is read.
+    pub fn default_encryption_configuration(&self) -> DefaultEncryptionConfiguration {
+        let status = ConfigurationStatus {
+            state: CONFIGURATION_STATE_ACTIVE.to_string(),
             // No error: nothing in this emulator fails to apply a configuration,
             // so the modelled `error` details have nothing to report.
             error: None,
@@ -8950,12 +8941,12 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             Some(record) => DefaultEncryptionConfiguration {
                 encryption_type: record.encryption_type.clone(),
                 kms_key_arn: record.kms_key_arn.clone(),
-                status: status(record.state(now)),
+                status,
             },
             None => DefaultEncryptionConfiguration {
                 encryption_type: ENCRYPTION_TYPE_SITEWISE_DEFAULT.to_string(),
                 kms_key_arn: None,
-                status: status(CONFIGURATION_STATE_ACTIVE),
+                status,
             },
         }
     }
@@ -8965,21 +8956,18 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     ///
     /// The whole setting is replaced: a put is the last word on the account's
     /// encryption, so one naming the service-owned key drops the customer managed
-    /// key a previous put selected. The configuration the put accepted falls due
-    /// at [`ACTIVATION_DELAY`], the same span this service settles every other
-    /// transition the clock owes at.
+    /// key a previous put selected. The selection is in force as soon as it is
+    /// stored, so the answer reports it [`CONFIGURATION_STATE_ACTIVE`].
     pub fn set_default_encryption_configuration(
         &mut self,
         encryption_type: &str,
         kms_key_arn: Option<String>,
-        now: SystemTime,
     ) -> DefaultEncryptionConfiguration {
         self.default_encryption = Some(DefaultEncryptionRecord {
             encryption_type: encryption_type.to_string(),
             kms_key_arn,
-            active_at: now + ACTIVATION_DELAY,
         });
-        self.default_encryption_configuration(now)
+        self.default_encryption_configuration()
     }
 }
 
@@ -9339,6 +9327,21 @@ pub const STORAGE_STATE_DISABLED: &str = "DISABLED";
 /// disallowed if the value is true."
 pub const DEFAULT_DISALLOW_INGEST_NULL_NAN: bool = false;
 
+/// The `DisassociatedDataStorageState` an account carries while no put has named
+/// one: time series that aren't associated with asset properties are accepted.
+///
+/// This is the state the service ENFORCES for such an account — ingest
+/// addressed by the alias of a stream no asset property carries is accepted
+/// (see `crate::ops::batch_put_asset_property_value`) — so it is also the state
+/// a read of the configuration reports for the member.
+pub const DEFAULT_DISASSOCIATED_DATA_STORAGE: &str = STORAGE_STATE_ENABLED;
+
+/// The `WarmTierState` an account carries while no put has named one: the warm
+/// tier is a tier the account opts into, so nothing has provisioned it and the
+/// preconditions that require it are not met (see
+/// `crate::ops::create_bulk_import_job`).
+pub const DEFAULT_WARM_TIER: &str = STORAGE_STATE_DISABLED;
+
 /// What a caller selects a storage configuration with: the members
 /// `PutStorageConfiguration` carries, as ONE value, so the rules over them and
 /// the store that keeps them name a single thing rather than seven.
@@ -9530,8 +9533,8 @@ impl StorageConfigurationRecord {
 /// they read them from one place.
 #[derive(Debug, Clone)]
 pub struct StorageConfiguration {
-    /// The configuration in force, with the documented default filled in for
-    /// each member it does not name — see [`documented_defaults`].
+    /// The configuration in force, with the state the account carries filled in
+    /// for each member it does not name — see [`documented_defaults`].
     pub selection: StorageConfigurationSelection,
     /// The modelled `configurationStatus`.
     pub status: ConfigurationStatus,
@@ -9540,19 +9543,29 @@ pub struct StorageConfiguration {
     pub last_update_date: Option<SystemTime>,
 }
 
-/// `selection` with the documented default filled in for each member it leaves
-/// unnamed: hot-tier data is "kept indefinitely" when no `retentionPeriod` names
-/// a span, and NULL/NaN ingestion is allowed when no `disallowIngestNullNaN`
-/// disallows it. The members whose documentation states no default
-/// (`multiLayerStorage`, `disassociatedDataStorage`, `warmTier`, and the warm
-/// tier's own retention period) are reported only when the configuration names
-/// them.
+/// `selection` with the state the account carries filled in for each member it
+/// leaves unnamed: hot-tier data is "kept indefinitely" when no
+/// `retentionPeriod` names a span, NULL/NaN ingestion is allowed when no
+/// `disallowIngestNullNaN` disallows it, and each tier-state member carries the
+/// state the service enforces for an account that never named it
+/// ([`DEFAULT_DISASSOCIATED_DATA_STORAGE`] / [`DEFAULT_WARM_TIER`]). The members
+/// that name a RESOURCE rather than a state (`multiLayerStorage` and the warm
+/// tier's own retention period) have no such value and are reported only when
+/// the configuration names them.
 fn documented_defaults(selection: &StorageConfigurationSelection) -> StorageConfigurationSelection {
     StorageConfigurationSelection {
         retention_period: selection.retention_period.clone().or(Some(RetentionPeriod {
             number_of_days: None,
             unlimited: Some(true),
         })),
+        disassociated_data_storage: selection
+            .disassociated_data_storage
+            .clone()
+            .or_else(|| Some(DEFAULT_DISASSOCIATED_DATA_STORAGE.to_string())),
+        warm_tier: selection
+            .warm_tier
+            .clone()
+            .or_else(|| Some(DEFAULT_WARM_TIER.to_string())),
         disallow_ingest_null_na_n: selection
             .disallow_ingest_null_na_n
             .or(Some(DEFAULT_DISALLOW_INGEST_NULL_NAN)),
@@ -9600,11 +9613,14 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// storage, so one naming the hot tier alone drops the cold-tier destination
     /// an earlier put selected. The one member that does not go back is
     /// `disassociatedDataStorage` — "After the disassociatedDataStorage is
-    /// enabled, you can't disable it" — so a selection that would leave it
-    /// anything but enabled is refused here, under the same lock the write
-    /// takes, rather than in the handler where two puts could race past it. The
-    /// configuration the put accepts falls due at [`ACTIVATION_DELAY`], the span
-    /// this service settles every transition the clock owes at.
+    /// enabled, you can't disable it" — so a selection that would leave a state
+    /// a PUT enabled anything but enabled is refused here, under the same lock
+    /// the write takes, rather than in the handler where two puts could race
+    /// past it. That rule is read against what a put NAMED rather than against
+    /// the state [`documented_defaults`] reports for an account no put has
+    /// configured: nothing has enabled a feature such an account merely carries.
+    /// The configuration the put accepts falls due at [`ACTIVATION_DELAY`], the
+    /// span this service settles every transition the clock owes at.
     ///
     /// Read `selection` against [`check_storage_selection`] first: this stores
     /// what it is given.
@@ -9613,11 +9629,12 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         selection: StorageConfigurationSelection,
         now: SystemTime,
     ) -> Result<StorageConfiguration, String> {
-        let in_force = self.storage_configuration(now);
-        let enabled = |state: &StorageConfigurationSelection| {
-            state.disassociated_data_storage.as_deref() == Some(STORAGE_STATE_ENABLED)
-        };
-        if enabled(&in_force.selection) && !enabled(&selection) {
+        let enabled = |state: Option<&str>| state == Some(STORAGE_STATE_ENABLED);
+        let named_before = self
+            .storage
+            .as_ref()
+            .and_then(|record| record.selection.disassociated_data_storage.as_deref());
+        if enabled(named_before) && !enabled(selection.disassociated_data_storage.as_deref()) {
             return Err(format!(
                 "The disassociatedDataStorage is {STORAGE_STATE_ENABLED} and cannot be disabled; \
                  a put must keep naming {STORAGE_STATE_ENABLED}."
