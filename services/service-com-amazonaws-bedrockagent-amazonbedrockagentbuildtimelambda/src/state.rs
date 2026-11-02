@@ -75,6 +75,16 @@
 //! single projection. A job's status advances on the CLOCK alone, through
 //! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::materialise_due_transitions`],
 //! so every reader of the job observes the same progression.
+//!
+//! The documents pushed straight into a data source
+//! (`IngestKnowledgeBaseDocuments`, `GetKnowledgeBaseDocuments`) are backed by
+//! the
+//! [`documents`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::documents)
+//! map, keyed by the knowledge base, the data source and the document's own
+//! identity ([`DocumentKey`]), with [`DocumentRecord::to_detail`] and
+//! [`not_found_document_detail`] as the only two projections any document
+//! operation reports. A document's status advances on the CLOCK alone, through
+//! the same `materialise_due_transitions`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -84,12 +94,14 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::Document;
 
 use crate::ops::types::{
-    Agent, AgentSummary, CreateFlowOutput, CustomOrchestration, DataSource,
-    DataSourceConfiguration, FlowDefinition, FlowValidation, FlowVersionSummary, GetFlowOutput,
-    GuardrailConfiguration, ImageExtractionConfiguration, IngestionJob, IngestionJobStatistics,
-    KnowledgeBase, KnowledgeBaseConfiguration, MediaExtractionConfiguration, MemoryConfiguration,
-    PromptOverrideConfiguration, ServerSideEncryptionConfiguration, StorageConfiguration,
-    UpdateFlowOutput, VectorIngestionConfiguration,
+    Agent, AgentSummary, CreateFlowOutput, CustomDocumentIdentifier, CustomOrchestration,
+    DataSource, DataSourceConfiguration, DocumentContent, DocumentIdentifier, DocumentMetadata,
+    FlowDefinition, FlowValidation, FlowVersionSummary, GetFlowOutput, GuardrailConfiguration,
+    ImageExtractionConfiguration, IngestionJob, IngestionJobStatistics, KnowledgeBase,
+    KnowledgeBaseConfiguration, KnowledgeBaseDocumentDetail, MediaExtractionConfiguration,
+    MemoryConfiguration, PromptOverrideConfiguration, S3Location,
+    ServerSideEncryptionConfiguration, StorageConfiguration, UpdateFlowOutput,
+    VectorIngestionConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned, so it names no
@@ -1512,6 +1524,296 @@ impl IngestionJobRecord {
     }
 }
 
+/// The most documents one data source holds, and the most ingestion requests it
+/// remembers by their `@idempotencyToken`; past either
+/// `IngestKnowledgeBaseDocuments` answers the modelled
+/// `ServiceQuotaExceededException` instead of growing.
+///
+/// Amazon Bedrock publishes an adjustable quota on documents per data source,
+/// and this emulator models neither Service Quotas nor an account's
+/// adjustments — so this is the emulator's OWN bound on the store, set far above
+/// any workflow an emulator serves, and it is what stops the document state
+/// growing without end as documents are pushed in again and again. Each record
+/// is itself bounded by the modelled `@length` constraints on a document's
+/// content, which the boundary validator enforces before a handler runs.
+pub const DOCUMENT_QUOTA: usize = 1_000;
+
+/// How long after `IngestKnowledgeBaseDocuments` a document leaves `STARTING`
+/// for `IN_PROGRESS`.
+///
+/// CHOSEN, not documented: AWS publishes no duration for the ingestion of a
+/// document. It is deliberately non-zero so a caller that reads the document
+/// back immediately still observes the transient `STARTING` status the modelled
+/// `DocumentStatus` declares, and it matches [`INGESTION_JOB_START_SPAN`] so
+/// that documents and the ingestion jobs of the same data source converge on
+/// the same scale.
+pub const DOCUMENT_INGESTION_SPAN: Duration = INGESTION_JOB_START_SPAN;
+
+/// How long after a document reaches `IN_PROGRESS` it reaches `INDEXED`.
+///
+/// CHOSEN, not documented, and non-zero for the same reason as
+/// [`DOCUMENT_INGESTION_SPAN`]: `IN_PROGRESS` is a status the model declares, so
+/// a poller has to be able to observe it. It matches
+/// [`INGESTION_JOB_RUN_SPAN`] for the same reason.
+pub const DOCUMENT_INDEXING_SPAN: Duration = INGESTION_JOB_RUN_SPAN;
+
+/// The `DocumentStatus` a document operation reports for an identifier this
+/// store holds no document for, which the modelled member documents as
+/// "NOT_FOUND – The document wasn't found."
+pub const DOCUMENT_STATUS_NOT_FOUND: &str = "NOT_FOUND";
+
+/// The `ContentDataSourceType` of a document pushed into a custom data source.
+pub const CUSTOM_CONTENT_TYPE: &str = "CUSTOM";
+
+/// The `ContentDataSourceType` of a document ingested from an S3 data source.
+pub const S3_CONTENT_TYPE: &str = "S3";
+
+/// Every modelled `ContentDataSourceType` value, paired with the member of
+/// `DocumentContent` and of `DocumentIdentifier` that carries that kind's own
+/// details — the member the shapes document as the one "that corresponds to"
+/// the `dataSourceType` chosen.
+///
+/// Source: the `ContentDataSourceType` enum and the `DocumentContent` /
+/// `DocumentIdentifier` structures of this service's Smithy model
+/// (`smithy_query(query="shape",shape="ContentDataSourceType,DocumentContent,DocumentIdentifier")`).
+pub const DOCUMENT_CONTENT_MEMBERS: [(&str, &str); 2] = [
+    (CUSTOM_CONTENT_TYPE, "custom"),
+    (S3_CONTENT_TYPE, "s3"),
+];
+
+/// The member a document of this kind carries its own details in, or `None`
+/// when the kind is none the model declares.
+pub fn document_content_member(data_source_type: &str) -> Option<&'static str> {
+    DOCUMENT_CONTENT_MEMBERS
+        .iter()
+        .find(|(name, _)| *name == data_source_type)
+        .map(|(_, member)| *member)
+}
+
+/// The `ValidationException` message a document operation answers when a
+/// document names a kind of data source that is not the kind of the data source
+/// the request is addressed to, which `IngestKnowledgeBaseDocuments` documents
+/// as "The dataSourceType specified in the content for each document must match
+/// the type of the data source that you specify in the header".
+///
+/// The two kinds are comparable only where the data source's own kind is one a
+/// document's content can name — [`DOCUMENT_CONTENT_MEMBERS`] lists them — so a
+/// data source of any other kind takes a document of whichever kind its content
+/// names.
+///
+/// `path` is the member path the request carries the offending value at
+/// (`...content.dataSourceType`), so one template serves every document of
+/// every request.
+pub fn document_data_source_type_message(
+    path: &str,
+    document_type: &str,
+    data_source_id: &str,
+    data_source_type: &str,
+) -> String {
+    format!(
+        "{path} of {document_type} does not match the type {data_source_type} of data \
+         source {data_source_id}"
+    )
+}
+
+/// The `ValidationException` message a document operation answers when a
+/// document names a kind but carries none of that kind's own details — the
+/// member `DocumentContent` and `DocumentIdentifier` both document as the one to
+/// "include the field that corresponds to it".
+pub fn document_member_required_message(path: &str, member: &str, data_source_type: &str) -> String {
+    format!("{path}.{member} is required for a {path}.dataSourceType of {data_source_type}")
+}
+
+/// The `DocumentStatus` values a directly ingested document passes through,
+/// named as the model's `DocumentStatus` enum names them on the wire.
+///
+/// `IngestKnowledgeBaseDocuments` mints only [`DocumentStatus::Starting`]; the
+/// rest of the chain is owed by the clock. The modelled enum declares further
+/// values this slice never reaches — nothing here fails, is ignored, is only
+/// partially indexed or is being deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentStatus {
+    /// The ingestion carrying the document was submitted; it reaches
+    /// [`DocumentStatus::InProgress`] once [`DOCUMENT_INGESTION_SPAN`] has
+    /// elapsed.
+    Starting,
+    /// The document is being ingested; it reaches
+    /// [`DocumentStatus::Indexed`] once [`DOCUMENT_INDEXING_SPAN`] more has
+    /// elapsed.
+    InProgress,
+    /// The document was indexed — a terminal status, so the clock owes it
+    /// nothing more.
+    Indexed,
+}
+
+impl DocumentStatus {
+    /// The member value for the modelled `DocumentStatus` enum.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Starting => "STARTING",
+            Self::InProgress => "IN_PROGRESS",
+            Self::Indexed => "INDEXED",
+        }
+    }
+
+    /// The status the clock owes a document in this one next, and how long after
+    /// it reached this status that comes due. `None` for a terminal status.
+    fn owed_next(self) -> Option<(Duration, Self)> {
+        match self {
+            Self::Starting => Some((DOCUMENT_INGESTION_SPAN, Self::InProgress)),
+            Self::InProgress => Some((DOCUMENT_INDEXING_SPAN, Self::Indexed)),
+            Self::Indexed => None,
+        }
+    }
+}
+
+/// Which document of one data source a request names.
+///
+/// The modelled `DocumentIdentifier` and `DocumentContent` are both
+/// discriminated by `dataSourceType`: it names which sibling member carries the
+/// document's own id, so the kind together with that id is a document's
+/// identity within its data source.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DocumentKey {
+    /// A document of a custom data source, by the id the request gave it.
+    Custom(String),
+    /// A document of an S3 data source, by the URI it lives at.
+    S3(String),
+}
+
+impl DocumentKey {
+    /// The document `identifier` names, or `None` when it carries none of the
+    /// details the kind it names needs.
+    pub fn from_identifier(identifier: &DocumentIdentifier) -> Option<Self> {
+        match identifier.data_source_type.as_str() {
+            CUSTOM_CONTENT_TYPE => identifier
+                .custom
+                .as_ref()
+                .map(|custom| Self::Custom(custom.id.clone())),
+            S3_CONTENT_TYPE => identifier.s3.as_ref().map(|s3| Self::S3(s3.uri.clone())),
+            _ => None,
+        }
+    }
+
+    /// The document `content` is the content of, or `None` when it carries none
+    /// of the details the kind it names needs.
+    pub fn from_content(content: &DocumentContent) -> Option<Self> {
+        match content.data_source_type.as_str() {
+            CUSTOM_CONTENT_TYPE => content
+                .custom
+                .as_ref()
+                .map(|custom| Self::Custom(custom.custom_document_identifier.id.clone())),
+            S3_CONTENT_TYPE => content
+                .s3
+                .as_ref()
+                .map(|s3| Self::S3(s3.s3_location.uri.clone())),
+            _ => None,
+        }
+    }
+
+    /// This identity as the modelled `DocumentIdentifier` shape, which is what
+    /// every document detail reports it as.
+    pub fn to_identifier(&self) -> DocumentIdentifier {
+        match self {
+            Self::Custom(id) => DocumentIdentifier {
+                data_source_type: CUSTOM_CONTENT_TYPE.to_string(),
+                s3: None,
+                custom: Some(CustomDocumentIdentifier { id: id.clone() }),
+            },
+            Self::S3(uri) => DocumentIdentifier {
+                data_source_type: S3_CONTENT_TYPE.to_string(),
+                s3: Some(S3Location { uri: uri.clone() }),
+                custom: None,
+            },
+        }
+    }
+}
+
+/// One document ingested directly into a data source: the single source of
+/// truth for every document operation.
+#[derive(Debug, Clone)]
+pub struct DocumentRecord {
+    pub knowledge_base_id: String,
+    pub data_source_id: String,
+    /// Which document of the data source this is.
+    pub key: DocumentKey,
+    pub status: DocumentStatus,
+    /// A status the CLOCK owes this document, and the instant it comes due. A
+    /// reporting operation may materialise it once that instant has passed; it
+    /// never invents a transition of its own.
+    pub pending_status: Option<(SystemTime, DocumentStatus)>,
+    /// The content the ingestion carried, kept so a later read reports the
+    /// document the store holds rather than the request being served.
+    pub content: DocumentContent,
+    /// The metadata the ingestion associated with the content, if any.
+    pub metadata: Option<DocumentMetadata>,
+    pub updated_at: SystemTime,
+    pub client_token: Option<String>,
+}
+
+impl DocumentRecord {
+    /// A document an ingestion has just accepted: `STARTING`, with the first
+    /// transition the clock owes it already due.
+    pub fn starting(
+        knowledge_base_id: String,
+        data_source_id: String,
+        key: DocumentKey,
+        content: DocumentContent,
+        metadata: Option<DocumentMetadata>,
+        client_token: Option<String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            knowledge_base_id,
+            data_source_id,
+            key,
+            status: DocumentStatus::Starting,
+            pending_status: Some((now + DOCUMENT_INGESTION_SPAN, DocumentStatus::InProgress)),
+            content,
+            metadata,
+            updated_at: now,
+            client_token,
+        }
+    }
+
+    /// This record as the modelled `KnowledgeBaseDocumentDetail` shape: every
+    /// member is populated from the stored record, never from the request being
+    /// served.
+    pub fn to_detail(&self) -> KnowledgeBaseDocumentDetail {
+        KnowledgeBaseDocumentDetail {
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            data_source_id: self.data_source_id.clone(),
+            status: self.status.as_wire().to_string(),
+            identifier: self.key.to_identifier(),
+            // The modelled member documents a reason as appearing alongside the
+            // status `IGNORED`, which nothing here reaches.
+            status_reason: None,
+            updated_at: Some(to_date_time(self.updated_at)),
+        }
+    }
+}
+
+/// The detail a document operation reports for an identifier this store holds
+/// no document for: the identity it was asked about, and the status the model
+/// gives exactly that case.
+///
+/// Nothing is stored for it, so it has no instant at which it last changed and
+/// the `updatedAt` member stays absent.
+pub fn not_found_document_detail(
+    knowledge_base_id: &str,
+    data_source_id: &str,
+    key: &DocumentKey,
+) -> KnowledgeBaseDocumentDetail {
+    KnowledgeBaseDocumentDetail {
+        knowledge_base_id: knowledge_base_id.to_string(),
+        data_source_id: data_source_id.to_string(),
+        status: DOCUMENT_STATUS_NOT_FOUND.to_string(),
+        identifier: key.to_identifier(),
+        status_reason: None,
+        updated_at: None,
+    }
+}
+
 /// A `ListAgents` resume cursor, decoded back into the ordering it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageCursor {
@@ -1583,6 +1885,24 @@ pub struct ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// The key carries the whole scope the replay is read at, so one token
     /// reused for another data source cannot displace the job it already names.
     pub ingestion_job_client_tokens: HashMap<(String, String, String), String>,
+    /// Every document ingested directly into a data source, keyed by the
+    /// knowledge base, the data source and the document's own identity: a
+    /// document is identified within its data source, so the same id pushed
+    /// into two data sources is two documents.
+    pub documents: HashMap<(String, String, DocumentKey), DocumentRecord>,
+    /// `(knowledgeBaseId, dataSourceId, clientToken)` -> the documents that
+    /// request ingested, so a retried `IngestKnowledgeBaseDocuments` carrying
+    /// the same `@idempotencyToken` reports those documents again rather than
+    /// starting their ingestion a second time. The key carries the whole scope
+    /// the replay is read at, so one token reused for another data source
+    /// cannot displace the documents it already names.
+    ///
+    /// Bounded by [`DOCUMENT_QUOTA`] per knowledge base and data source, the
+    /// same bound the documents themselves take: this index grows once per
+    /// accepted request even when the request re-ingests documents the data
+    /// source already holds, so the ingestion checks
+    /// [`Self::document_token_count`] against that bound before it writes.
+    pub document_client_tokens: HashMap<(String, String, String), Vec<DocumentKey>>,
     /// Feeds id minting; never returned to a caller.
     id_sequence: u64,
 }
@@ -1788,6 +2108,46 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .count()
     }
 
+    /// The stored document `key` names, but only within this knowledge base and
+    /// data source: a document is identified by the triple, so one data source
+    /// never reports another's document.
+    pub fn document_of(
+        &self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+        key: &DocumentKey,
+    ) -> Option<&DocumentRecord> {
+        self.documents.get(&(
+            knowledge_base_id.to_string(),
+            data_source_id.to_string(),
+            key.clone(),
+        ))
+    }
+
+    /// How many documents this data source already holds, the count the
+    /// per-data-source bound is checked against.
+    pub fn document_count(&self, knowledge_base_id: &str, data_source_id: &str) -> usize {
+        self.documents
+            .values()
+            .filter(|record| {
+                record.knowledge_base_id == knowledge_base_id
+                    && record.data_source_id == data_source_id
+            })
+            .count()
+    }
+
+    /// How many ingestion tokens this data source already remembers, the count
+    /// the per-data-source bound on
+    /// [`Self::document_client_tokens`] is checked against.
+    pub fn document_token_count(&self, knowledge_base_id: &str, data_source_id: &str) -> usize {
+        self.document_client_tokens
+            .keys()
+            .filter(|(knowledge_base, data_source, _)| {
+                knowledge_base == knowledge_base_id && data_source == data_source_id
+            })
+            .count()
+    }
+
     /// How many data sources `knowledge_base_id` already holds, the count the
     /// per-knowledge-base bound is checked against.
     pub fn data_source_count(&self, knowledge_base_id: &str) -> usize {
@@ -1861,6 +2221,23 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                     job.text_ready_at = Some(due);
                 }
                 job.pending_status = next
+                    .owed_next()
+                    .map(|(span, after)| (due + span, after));
+            }
+        }
+        // A document's status is a CHAIN too, applied the same way: each
+        // transition at the instant it came due, and the next due that instant
+        // plus its own span.
+        for document in self.documents.values_mut() {
+            while let Some((due, next)) = document.pending_status {
+                if now < due {
+                    break;
+                }
+                document.status = next;
+                // The document changed when the clock made the change due, not
+                // when it was noticed.
+                document.updated_at = due;
+                document.pending_status = next
                     .owed_next()
                     .map(|(span, after)| (due + span, after));
             }
@@ -1940,7 +2317,8 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     }
 
     /// Forget a data source and everything keyed to it: the ingestion jobs that
-    /// ran for it, and the index that let a repeated create replay it.
+    /// ran for it, the documents ingested into it, and the indexes that let a
+    /// repeated create or ingestion replay them.
     pub fn remove_data_source(&mut self, data_source_id: &str) -> Option<DataSourceRecord> {
         let record = self.data_sources.remove(data_source_id)?;
         self.ingestion_jobs
@@ -1949,6 +2327,10 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .retain(|(_, data_source, _), _| data_source != data_source_id);
         self.data_source_client_tokens
             .retain(|_, id| id != data_source_id);
+        self.documents
+            .retain(|(_, data_source, _), _| data_source != data_source_id);
+        self.document_client_tokens
+            .retain(|(_, data_source, _), _| data_source != data_source_id);
         Some(record)
     }
 

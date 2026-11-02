@@ -29,6 +29,8 @@ mod flow_version_listing;
 mod immutable_configuration_members;
 #[path = "all/ingestion_job_lifecycle.rs"]
 mod ingestion_job_lifecycle;
+#[path = "all/knowledge_base_documents.rs"]
+mod knowledge_base_documents;
 #[path = "all/knowledge_base_lifecycle.rs"]
 mod knowledge_base_lifecycle;
 #[path = "all/managed_connector_defaults.rs"]

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetKnowledgeBaseDocuments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetKnowledgeBaseDocuments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetKnowledgeBaseDocuments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the documents of the data source the URI names: each identifier the
+//! request carries is answered from the stored document it names, or with the
+//! status the model gives an identifier nothing is stored for. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetKnowledgeBaseDocuments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetKnowledgeBaseDocumentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetKnowledgeBaseDocuments"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetKnowledgeBaseDocumentsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // The ONE write a report may perform: a status the clock had already
+        // made due, which was owed at this instant whether or not anyone asked
+        // for the documents.
+        state.materialise_due_transitions(now);
+
+        // The documents belong to one data source of one knowledge base, so
+        // both have to exist and neither may be on its way out of the store: a
+        // data source is identified by the pair, which makes an id of another
+        // knowledge base's data source as absent here as one nothing holds.
+        if state.live_knowledge_base(&input.knowledge_base_id).is_none() {
+            return Err(
+                GetKnowledgeBaseDocumentsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::knowledge_base_not_found_message(
+                            &input.knowledge_base_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if state
+            .live_data_source_of(&input.knowledge_base_id, &input.data_source_id)
+            .is_none()
+        {
+            return Err(
+                GetKnowledgeBaseDocumentsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::data_source_not_found_message(
+                            &input.data_source_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One detail per identifier asked about, in the order asked: the stored
+        // document's own detail when this data source holds it, and otherwise
+        // the detail the model gives an identifier nothing is stored for — a
+        // document this data source does not hold is not a missing RESOURCE,
+        // it is a document whose status is that it was not found.
+        let mut document_details = Vec::with_capacity(input.document_identifiers.len());
+        for (index, identifier) in input.document_identifiers.iter().enumerate() {
+            // An identifier names the kind of data source its document lives
+            // in, and that kind names which member carries the document's own
+            // id; an identifier carrying neither names no document at all,
+            // which is a bad request rather than a document that is missing.
+            let Some(key) = crate::state::DocumentKey::from_identifier(identifier) else {
+                let data_source_type = identifier.data_source_type.as_str();
+                // The modelled `ContentDataSourceType` admits only the kinds
+                // the table names, so a kind that reaches here has a member.
+                let member =
+                    crate::state::document_content_member(data_source_type).unwrap_or_default();
+                return Err(GetKnowledgeBaseDocumentsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::document_member_required_message(
+                            &format!("documentIdentifiers[{index}]"),
+                            member,
+                            data_source_type,
+                        )),
+                        field_list: None,
+                    },
+                )
+                .into());
+            };
+            document_details.push(
+                state
+                    .document_of(&input.knowledge_base_id, &input.data_source_id, &key)
+                    .map(crate::state::DocumentRecord::to_detail)
+                    .unwrap_or_else(|| {
+                        crate::state::not_found_document_detail(
+                            &input.knowledge_base_id,
+                            &input.data_source_id,
+                            &key,
+                        )
+                    }),
+            );
+        }
+
+        Ok(GetKnowledgeBaseDocumentsOutput {
+            document_details: Some(document_details),
+        })
     }
 }

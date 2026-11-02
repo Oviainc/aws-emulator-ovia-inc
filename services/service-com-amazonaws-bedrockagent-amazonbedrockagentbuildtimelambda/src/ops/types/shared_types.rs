@@ -1495,8 +1495,17 @@ pub struct CustomDocumentIdentifier {
     pub id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#KnowledgeBaseDocumentDetail")]
-#[derive(Debug, Clone, Default)]
+/// `KnowledgeBaseDocumentDetail`. Its schema and codec come from
+/// [`bedrock_agent_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `updatedAt` targets
+/// `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="KnowledgeBaseDocumentDetail")`), and the derive
+/// does not put that trait on a member schema — see `types/date_time_wire.rs` for that
+/// whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
+#[derive(Debug, Clone)]
 pub struct KnowledgeBaseDocumentDetail {
     pub knowledge_base_id: String,
     pub data_source_id: String,
@@ -1505,6 +1514,48 @@ pub struct KnowledgeBaseDocumentDetail {
     pub status_reason: Option<String>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+bedrock_agent_schema_and_codec!(
+    KnowledgeBaseDocumentDetail,
+    KNOWLEDGE_BASE_DOCUMENT_DETAIL_SCHEMA,
+    "com.amazonaws.bedrockagent#KnowledgeBaseDocumentDetail",
+    "com.amazonaws.bedrockagent",
+    "KnowledgeBaseDocumentDetail",
+    (
+        M_KNOWLEDGE_BASE_ID,
+        knowledge_base_id,
+        "knowledgeBaseId",
+        0,
+        req,
+        string
+    ),
+    (
+        M_DATA_SOURCE_ID,
+        data_source_id,
+        "dataSourceId",
+        1,
+        req,
+        string
+    ),
+    (M_STATUS, status, "status", 2, req, string),
+    (
+        M_IDENTIFIER,
+        identifier,
+        "identifier",
+        3,
+        req,
+        struct_of(DocumentIdentifier)
+    ),
+    (
+        M_STATUS_REASON,
+        status_reason,
+        "statusReason",
+        4,
+        opt,
+        string
+    ),
+    (M_UPDATED_AT, updated_at, "updatedAt", 5, opt, date_time),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#AgentKnowledgeBase")]
 #[derive(Debug, Clone)]

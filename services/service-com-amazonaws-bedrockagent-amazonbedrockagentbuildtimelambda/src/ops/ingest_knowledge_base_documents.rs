@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op IngestKnowledgeBaseDocuments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `IngestKnowledgeBaseDocuments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`IngestKnowledgeBaseDocuments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Ingests documents straight into the data source the URI names: each document
+//! is stored against this service's state and reported back as just accepted,
+//! and the clock alone carries it on to being indexed. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,231 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `IngestKnowledgeBaseDocuments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(IngestKnowledgeBaseDocumentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("IngestKnowledgeBaseDocuments"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                IngestKnowledgeBaseDocumentsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the bedrock-agent store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        // The documents are ingested into one data source of one knowledge
+        // base, so both have to exist and neither may be on its way out of the
+        // store: a data source is identified by the pair, which makes an id of
+        // another knowledge base's data source as absent here as one nothing
+        // holds.
+        if state.live_knowledge_base(&input.knowledge_base_id).is_none() {
+            return Err(
+                IngestKnowledgeBaseDocumentsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::knowledge_base_not_found_message(
+                            &input.knowledge_base_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let Some(data_source) =
+            state.live_data_source_of(&input.knowledge_base_id, &input.data_source_id)
+        else {
+            return Err(
+                IngestKnowledgeBaseDocumentsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::data_source_not_found_message(
+                            &input.data_source_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let data_source_type = data_source.data_source_configuration.r#type.clone();
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same request
+        // reports the documents it already ingested rather than starting their
+        // ingestion a second time. The index is keyed by the whole request
+        // scope, so the same token used for another data source names its own
+        // documents instead of displacing these.
+        let token_key = input.client_token.as_ref().map(|token| {
+            (
+                input.knowledge_base_id.clone(),
+                input.data_source_id.clone(),
+                token.clone(),
+            )
+        });
+        let replayed = token_key
+            .as_ref()
+            .and_then(|key| state.document_client_tokens.get(key))
+            .cloned();
+        if let Some(keys) = replayed {
+            let document_details = keys
+                .iter()
+                .map(|key| {
+                    state
+                        .document_of(&input.knowledge_base_id, &input.data_source_id, key)
+                        .map(crate::state::DocumentRecord::to_detail)
+                        .unwrap_or_else(|| {
+                            crate::state::not_found_document_detail(
+                                &input.knowledge_base_id,
+                                &input.data_source_id,
+                                key,
+                            )
+                        })
+                })
+                .collect();
+            return Ok(IngestKnowledgeBaseDocumentsOutput {
+                document_details: Some(document_details),
+            });
+        }
+
+        // Each document's content names the kind of data source it comes from.
+        // That kind is comparable with the data source's own kind only where
+        // the content can name it at all: `ContentDataSourceType` declares two
+        // kinds, so a data source of one of THOSE takes documents of that kind
+        // alone, while a data source of a kind no content can name leaves the
+        // content's kind nothing to disagree with. The kind also names which
+        // member carries the document's own details, so content that carries
+        // none of them identifies no document. Both are bad requests, and
+        // nothing is written for any document of a request carrying one.
+        let data_source_names_a_content_kind =
+            crate::state::document_content_member(&data_source_type).is_some();
+        let mut keys: Vec<crate::state::DocumentKey> = Vec::with_capacity(input.documents.len());
+        for (index, document) in input.documents.iter().enumerate() {
+            let path = format!("documents[{index}].content");
+            let content_type = document.content.data_source_type.as_str();
+            if data_source_names_a_content_kind && content_type != data_source_type {
+                return Err(
+                    IngestKnowledgeBaseDocumentsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::document_data_source_type_message(
+                                &format!("{path}.dataSourceType"),
+                                content_type,
+                                &input.data_source_id,
+                                &data_source_type,
+                            )),
+                            field_list: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let Some(key) = crate::state::DocumentKey::from_content(&document.content) else {
+                // The modelled `ContentDataSourceType` admits only the kinds
+                // the table names, so a kind that reaches here has a member.
+                let member =
+                    crate::state::document_content_member(content_type).unwrap_or_default();
+                return Err(
+                    IngestKnowledgeBaseDocumentsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::document_member_required_message(
+                                &path,
+                                member,
+                                content_type,
+                            )),
+                            field_list: None,
+                        },
+                    )
+                    .into(),
+                );
+            };
+            keys.push(key);
+        }
+
+        // The store is bounded: past its quota the ingestion is refused rather
+        // than adding another record, and `ServiceQuotaExceededException` is
+        // the modelled refusal for exactly that. TWO things this request would
+        // add count against the bound, and both are checked before anything is
+        // written: the documents it adds — re-ingesting one the data source
+        // already holds replaces it, so only the fresh ones count — and the
+        // token it would be remembered under, which the data source keeps even
+        // when the request adds no document at all. So neither a stream of new
+        // documents nor a stream of fresh tokens re-ingesting one document can
+        // grow this store without end.
+        let mut fresh: Vec<&crate::state::DocumentKey> = Vec::new();
+        for key in &keys {
+            if state
+                .document_of(&input.knowledge_base_id, &input.data_source_id, key)
+                .is_none()
+                && !fresh.contains(&key)
+            {
+                fresh.push(key);
+            }
+        }
+        let documents_after =
+            state.document_count(&input.knowledge_base_id, &input.data_source_id) + fresh.len();
+        // A request whose token this data source already remembers was served
+        // as a replay above, so a token still here is one more entry.
+        let tokens_after = state
+            .document_token_count(&input.knowledge_base_id, &input.data_source_id)
+            + usize::from(token_key.is_some());
+        let exceeded = if documents_after > crate::state::DOCUMENT_QUOTA {
+            Some(format!(
+                "data source {} of knowledge base {} cannot hold more than {} documents",
+                input.data_source_id,
+                input.knowledge_base_id,
+                crate::state::DOCUMENT_QUOTA
+            ))
+        } else if tokens_after > crate::state::DOCUMENT_QUOTA {
+            Some(format!(
+                "data source {} of knowledge base {} cannot remember more than {} ingestion \
+                 requests",
+                input.data_source_id,
+                input.knowledge_base_id,
+                crate::state::DOCUMENT_QUOTA
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = exceeded {
+            return Err(
+                IngestKnowledgeBaseDocumentsErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every document is stored as just accepted, so the clock owes each the
+        // same progression, and the details reported are the records just
+        // written rather than the request.
+        let mut document_details = Vec::with_capacity(keys.len());
+        for (key, document) in keys.iter().cloned().zip(input.documents) {
+            let record = crate::state::DocumentRecord::starting(
+                input.knowledge_base_id.clone(),
+                input.data_source_id.clone(),
+                key.clone(),
+                document.content,
+                document.metadata,
+                input.client_token.clone(),
+                now,
+            );
+            document_details.push(record.to_detail());
+            state.documents.insert(
+                (
+                    input.knowledge_base_id.clone(),
+                    input.data_source_id.clone(),
+                    key,
+                ),
+                record,
+            );
+        }
+        if let Some(key) = token_key {
+            state.document_client_tokens.insert(key, keys);
+        }
+
+        Ok(IngestKnowledgeBaseDocumentsOutput {
+            document_details: Some(document_details),
+        })
     }
 }
