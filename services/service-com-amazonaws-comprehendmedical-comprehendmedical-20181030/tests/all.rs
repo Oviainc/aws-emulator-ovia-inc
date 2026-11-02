@@ -15,6 +15,8 @@
 mod entities_detection_v2;
 #[path = "all/icd10_cm_inference.rs"]
 mod icd10_cm_inference;
+#[path = "all/ontology_candidate_ranking.rs"]
+mod ontology_candidate_ranking;
 #[path = "all/phi_detection.rs"]
 mod phi_detection;
 #[path = "all/phi_detection_job_describe.rs"]

@@ -6,8 +6,9 @@
 //! The rules under test are the ones that hold across all four operations rather than
 //! inside any one of them:
 //!
-//! * every `Id` of one response belongs to ONE document-wide sequence, shared by
-//!   entities and their attributes, counted from 1;
+//! * every `Id` of one response numbers a span of the document: the ids are unique
+//!   within the response, shared by entities and their attributes, counted from 1 and
+//!   rising with the offsets of the spans they number;
 //! * a mention is segmented at the concept's NAME: a subtype qualifier written in front
 //!   of it is reported as that entity's own `QUALITY` attribute, linked to the concepts
 //!   the qualifier names in its own right, and the entity keeps the concepts of the whole
@@ -146,13 +147,14 @@ const SHARED_NOTE: &str = "Patient is a 62-year-old male with a history of type 
                            on 03/14/2024. He takes metformin 500 mg orally twice daily. \
                            Reach him on 617-555-0199.";
 
-/// Every `Id` of one response is the next of ONE document-wide sequence counted from 1,
-/// shared by the entities and their attributes, as the modelled `Id` members document.
+/// Every `Id` of one response numbers a span of the document: the ids are unique within
+/// the response and rise with the offsets of the spans they number, entities and their
+/// attributes sharing the one sequence, as the modelled `Id` members document.
 ///
 /// The rows are all four synchronous operations, so an operation that restarted the
 /// sequence per entity — or numbered from 0 — fails here.
 #[tokio::test]
-async fn every_id_of_one_response_is_one_document_wide_sequence_counted_from_one() {
+async fn every_id_of_one_response_numbers_the_spans_in_the_order_they_are_written() {
     let router = router();
     for operation in ["DetectPHI", "InferICD10CM", "InferRxNorm", "InferSNOMEDCT"] {
         let answer = infer(&router, operation, SHARED_NOTE).await;
@@ -162,18 +164,37 @@ async fn every_id_of_one_response_is_one_document_wide_sequence_counted_from_one
             "case {operation}: the note names entities of every one of these \
              operations, got {answer}"
         );
-        let mut ids = Vec::new();
+        let mut spans: Vec<(i64, i64)> = Vec::new();
         for entity in &found {
-            ids.push(entity["Id"].as_i64().unwrap_or_default());
+            spans.push((
+                entity["BeginOffset"].as_i64().unwrap_or_default(),
+                entity["Id"].as_i64().unwrap_or_default(),
+            ));
             for attribute in attributes(entity) {
-                ids.push(attribute["Id"].as_i64().unwrap_or_default());
+                spans.push((
+                    attribute["BeginOffset"].as_i64().unwrap_or_default(),
+                    attribute["Id"].as_i64().unwrap_or_default(),
+                ));
             }
         }
-        let expected: Vec<i64> = (1..=ids.len() as i64).collect();
+        spans.sort_unstable();
+        let ids: Vec<i64> = spans.iter().map(|(_, id)| *id).collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
         assert_eq!(
-            ids, expected,
-            "case {operation}: the Ids of one response are 1..={}, got {ids:?} in {answer}",
-            ids.len()
+            unique.len(),
+            ids.len(),
+            "case {operation}: every Id of one response is unique, got {ids:?} in {answer}"
+        );
+        assert!(
+            ids.first().is_some_and(|first| *first >= 1),
+            "case {operation}: the sequence is counted from 1, got {ids:?} in {answer}"
+        );
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "case {operation}: the Ids must rise with the offsets of the spans they \
+             number, got {spans:?} in {answer}"
         );
     }
 }

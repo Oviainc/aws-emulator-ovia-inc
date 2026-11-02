@@ -540,13 +540,24 @@ async fn mentions_are_ordered_and_every_id_is_unique_and_increasing() {
         "entities must be reported in the order they are written, got {offsets:?}"
     );
 
-    let mut ids = Vec::new();
+    // `Id` numbers the spans of the document in the order they are WRITTEN, entities and
+    // their attributes sharing the one sequence, so the ids rise with the offsets rather
+    // than with the order the entity list nests them in.
+    let mut spans: Vec<(i64, i64)> = Vec::new();
     for entity in &found {
-        ids.push(entity["Id"].as_i64().unwrap_or_default());
+        spans.push((
+            entity["BeginOffset"].as_i64().unwrap_or_default(),
+            entity["Id"].as_i64().unwrap_or_default(),
+        ));
         for attribute in entity["Attributes"].as_array().cloned().unwrap_or_default() {
-            ids.push(attribute["Id"].as_i64().unwrap_or_default());
+            spans.push((
+                attribute["BeginOffset"].as_i64().unwrap_or_default(),
+                attribute["Id"].as_i64().unwrap_or_default(),
+            ));
         }
     }
+    spans.sort_unstable();
+    let ids: Vec<i64> = spans.iter().map(|(_, id)| *id).collect();
     let mut unique = ids.clone();
     unique.sort_unstable();
     unique.dedup();
@@ -556,8 +567,13 @@ async fn mentions_are_ordered_and_every_id_is_unique_and_increasing() {
         "every Id in one response is unique, got {ids:?}"
     );
     assert!(
+        ids.first().is_some_and(|first| *first >= 1),
+        "the first Id of one response is at least 1, got {ids:?}"
+    );
+    assert!(
         ids.windows(2).all(|pair| pair[0] < pair[1]),
-        "the Ids of one response increase monotonically, got {ids:?}"
+        "the Ids of one response increase with the offsets of the spans they number, got \
+         {spans:?}"
     );
     assert_offsets_delimit_their_text("several mentions", text, &answer);
 }

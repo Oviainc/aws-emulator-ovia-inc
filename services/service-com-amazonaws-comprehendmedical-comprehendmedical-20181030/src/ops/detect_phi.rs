@@ -99,16 +99,20 @@ use super::types::*;
 use std::sync::OnceLock;
 
 use crate::ops::infer_icd10_cm::{
-    character_offset, character_starts, lexicon_matches, span_confidence, term_confidence, tokenize,
-    Span, Token, FIRST_ID, WEIGHT_CUE, WEIGHT_PATTERN,
+    character_offset, character_starts, lexicon_matches, raised, span_confidence,
+    term_confidence, tokenize, Span, Token, FIRST_ID, WEIGHT_CUE, WEIGHT_PATTERN,
 };
 
-/// The version this emulator reports for the model behind the PHI pass.
+/// The version of the model THIS operation's analysis came from, which is what the
+/// modelled `ModelVersion` reports: "the version of the model used to analyze the
+/// documents. The version number looks like X.X.X".
 ///
-/// The modelled `ModelVersion` member documents the SHAPE of the value ("The version
-/// number looks like X.X.X"), not a particular version, so one constant is the single
-/// source for every response this operation serves.
-const MODEL_VERSION: &str = "0.1.0";
+/// The service runs one model per inference family and versions each of them on its own,
+/// so this constant is the protected-health-information model's own: it is declared here
+/// rather than shared, so moving one family's model version leaves the others where they
+/// are. A client that pins or logs the value for auditability reads the version of the
+/// model that produced the entities beside it.
+const MODEL_VERSION: &str = "1.1.0";
 
 /// The category every entity of this operation is in: the modelled `EntityType` member
 /// `PROTECTED_HEALTH_INFORMATION` (`super::types::ENTITY_TYPE_VALUES`), which is what
@@ -175,13 +179,26 @@ impl Evidence {
     /// same way but written out to different extents are reported with different
     /// confidences rather than one constant for the whole class. A lexicon match is
     /// weighted by how many tokens its written form spans before that.
-    fn score(self, matched: &str) -> f32 {
+    ///
+    /// `labelled` says that the record ALSO writes a field label of this span's own
+    /// identifier class in front of it. That is a second, independent piece of evidence
+    /// for the same detection — the characters take the class's written form AND the
+    /// record says which class the value is — so the detection is reported with more
+    /// confidence than the same form standing on its own.
+    fn score(self, matched: &str, labelled: bool) -> f32 {
         let base = match self {
             Self::Form => WEIGHT_PATTERN,
             Self::Context => WEIGHT_CUE,
             Self::Lexicon => term_confidence(matched.split_whitespace().count()),
         };
-        span_confidence(base, matched)
+        let confidence = span_confidence(base, matched);
+        // A span a cue PLACED already carries that cue as its evidence, so the label is
+        // not counted twice.
+        if labelled && self != Self::Context {
+            raised(confidence)
+        } else {
+            confidence
+        }
     }
 }
 
@@ -871,6 +888,7 @@ fn place(
     phi_type: &'static str,
     evidence: Evidence,
     text: &str,
+    tokens: &[Token],
 ) {
     for (start, end) in spans {
         if start >= end || overlaps(placed, start, end) {
@@ -886,10 +904,103 @@ fn place(
                 start,
                 end,
                 phi_type,
-                score: evidence.score(matched),
+                score: evidence.score(matched, labelled(text, tokens, start, phi_type)),
             },
         );
     }
+}
+
+/// The field labels a record writes a value of each identifier class under, lowercased.
+///
+/// Source: the field names a clinical note and a patient-registration form write in
+/// front of an identifier — what the label says is which class of value follows it — for
+/// the classes this pass reports, which are members of the modelled `EntitySubType`. The
+/// name, age, record-number and occupation classes are labelled by the cue vocabularies
+/// stated above, which is exactly what a label of those classes is.
+const CLASS_LABELS: &[(&str, &[&str])] = &[
+    (TYPE_NAME, NAME_CUES),
+    (TYPE_AGE, AGE_CUES),
+    (
+        TYPE_DATE,
+        &[
+            "date",
+            "dated",
+            "dob",
+            "birth",
+            "birthdate",
+            "admission",
+            "admitted",
+            "discharge",
+            "discharged",
+            "visit",
+            "followup",
+        ],
+    ),
+    (
+        TYPE_PHONE_OR_FAX,
+        &[
+            "phone",
+            "telephone",
+            "tel",
+            "cell",
+            "mobile",
+            "fax",
+            "pager",
+        ],
+    ),
+    (TYPE_EMAIL, &["email", "mail"]),
+    (TYPE_ID, ID_CUES),
+    (TYPE_URL, &["url", "website", "web", "site", "portal"]),
+    (
+        TYPE_ADDRESS,
+        &["address", "addr", "residence", "resides", "lives"],
+    ),
+    (TYPE_PROFESSION, OCCUPATION_CUES),
+];
+
+/// The words a field label is written with between itself and the value it names.
+const LABEL_FILLERS: &[&str] = &["of", "is", "no", "number", "at", "on", "the"];
+
+/// How many of those filler words stand between a label and its value at most.
+const LABEL_FILLER_LIMIT: usize = 2;
+
+/// Whether the record writes a field label of `phi_type`'s own identifier class in front
+/// of the value written at byte offset `start`.
+///
+/// A label and the value it names are written next to each other, separated by the
+/// punctuation a record writes a field with — a colon, an equals sign, a dash — and at
+/// most the filler words above, so the search stops at the first word that is neither.
+/// A value that starts inside a token rather than at one is not labelled: a label names
+/// the value WRITTEN AFTER it, so there is nothing for it to name in the middle of a
+/// word.
+fn labelled(text: &str, tokens: &[Token], start: usize, phi_type: &'static str) -> bool {
+    let Some(index) = tokens.iter().position(|token| token.start == start) else {
+        return false;
+    };
+    let names_class = |word: &str| {
+        CLASS_LABELS
+            .iter()
+            .filter(|(class, _)| *class == phi_type)
+            .any(|(_, labels)| labels.contains(&word))
+    };
+    let mut candidate = index;
+    for _ in 0..=LABEL_FILLER_LIMIT {
+        if candidate == 0 {
+            return false;
+        }
+        candidate -= 1;
+        if !follows(text, tokens, candidate, candidate + 1, " :=-", 3) {
+            return false;
+        }
+        let word = tokens[candidate].lower.as_str();
+        if names_class(word) {
+            return true;
+        }
+        if !LABEL_FILLERS.contains(&word) {
+            return false;
+        }
+    }
+    false
 }
 
 /// The span of the digit runs from `index` on, when their lengths fit `lengths` and each
@@ -1355,7 +1466,12 @@ fn digit_run_from(runs: &[(usize, usize)], byte: usize) -> Option<(usize, usize)
 
 /// Every age written in `text`: the NUMBER is the entity, and the unit or the cue beside
 /// it is what says the number counts the person's age.
-fn age_spans(text: &str, tokens: &[Token]) -> Vec<(usize, usize)> {
+///
+/// `pub(crate)` because an age is one of the spans of a clinical document whatever is
+/// being analysed: the ontology-linking operations of this crate place it through
+/// [`crate::ops::infer_icd10_cm::age_spans`] so that the time course of a condition is
+/// never read off a person's age, rather than carrying a second copy of this rule.
+pub(crate) fn age_spans(text: &str, tokens: &[Token]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     for index in 0..tokens.len() {
         let digits = leading_digits(&tokens[index]);
@@ -1689,7 +1805,7 @@ fn detect_phi(text: &str) -> Vec<Entity> {
             Evidence::Context,
         ),
     ] {
-        place(&mut placed, spans, phi_type, evidence, text);
+        place(&mut placed, spans, phi_type, evidence, text, &tokens);
     }
 
     // Character offsets, as both modelled offset members report, from the byte offsets

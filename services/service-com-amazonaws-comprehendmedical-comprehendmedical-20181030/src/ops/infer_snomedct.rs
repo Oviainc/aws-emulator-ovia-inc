@@ -108,27 +108,31 @@ use std::sync::OnceLock;
 // The generic clinical-text pass, stated once for every ontology-linking operation of
 // this service. See the module docs of `infer_icd10_cm` for why it lives there.
 use crate::ops::infer_icd10_cm::{
-    character_offset, character_starts, cue_governs, cue_trait_names, first_family_cues, is_count,
-    lexicon_matches, span_confidence, split_leading, subtype_qualifier_tokens, term_confidence,
-    tokenize, Span, Token, ACUITY_MODIFIERS, ATTRIBUTE_WINDOW_TOKENS, CONCEPT_CANDIDATE_LIMIT,
-    CONCEPT_RANK_DECAY, DIRECTION_MODIFIERS, FIRST_ID, QUALITY_MODIFIERS,
-    RELATIONSHIP_DISTANCE_PENALTY, WEIGHT_CUE, WEIGHT_MODIFIER, WEIGHT_PATTERN,
+    age_spans, candidate_scores, character_offset, character_starts, cue_governs, cue_trait_names,
+    first_family_cues, is_count, lexicon_matches, span_confidence, span_ids, split_leading,
+    subtype_qualifier_tokens, term_confidence, tokenize, Span, Token, ACUITY_MODIFIERS,
+    ATTRIBUTE_WINDOW_TOKENS, CONCEPT_CANDIDATE_LIMIT, DIRECTION_MODIFIERS, FIRST_ID,
+    QUALITY_MODIFIERS, RELATIONSHIP_DISTANCE_PENALTY, WEIGHT_CUE, WEIGHT_MODIFIER, WEIGHT_PATTERN,
     WEIGHT_RELATIONSHIP,
 };
 
-/// The version this emulator reports for the model behind the ontology linking.
+/// The version of the model THIS operation's analysis came from, which is what the
+/// modelled `ModelVersion` reports: "the version of the model used to analyze the
+/// documents, in the format n.n.n".
 ///
-/// The modelled `ModelVersion` member documents the SHAPE of the value ("in the format
-/// n.n.n"), not a particular version, so one constant is the single source for every
-/// response this operation serves.
-const MODEL_VERSION: &str = "0.1.0";
+/// The service runs one model per inference family and versions each of them on its own,
+/// so this constant is the SNOMED CT linking model's own: it is declared here rather than
+/// shared, so moving one family's model version leaves the others where they are. The
+/// inference families of this service report the same version today, which is why the
+/// value matches the one the other passes report.
+const MODEL_VERSION: &str = "1.1.0";
 
 /// The SNOMED CT revision the lexicon below is drawn from, which is what the modelled
 /// `SNOMEDCTDetails` reports: the edition, the language of its descriptions, and the
 /// release date of that edition.
 const DETAILS_EDITION: &str = "US";
 const DETAILS_LANGUAGE: &str = "en";
-const DETAILS_VERSION_DATE: &str = "2021-03-01";
+const DETAILS_VERSION_DATE: &str = "2021-09-01";
 
 // The modelled enum values this pass can produce, named once so no rule below can
 // invent a value outside the enum: `SNOMEDCTEntityCategory`, `SNOMEDCTEntityType`,
@@ -208,6 +212,14 @@ const CONCEPTS_DIABETES: &[Concept] = &[
         code: "46635009",
         description: "Diabetes mellitus type 1 (disorder)",
     },
+    Concept {
+        code: "11687002",
+        description: "Gestational diabetes mellitus (disorder)",
+    },
+    Concept {
+        code: "8801005",
+        description: "Secondary diabetes mellitus (disorder)",
+    },
 ];
 
 const CONCEPTS_DIABETES_TYPE_2: &[Concept] = &[
@@ -219,6 +231,18 @@ const CONCEPTS_DIABETES_TYPE_2: &[Concept] = &[
         code: "73211009",
         description: "Diabetes mellitus (disorder)",
     },
+    Concept {
+        code: "237599002",
+        description: "Insulin treated type 2 diabetes mellitus (disorder)",
+    },
+    Concept {
+        code: "422034002",
+        description: "Diabetic retinopathy associated with type 2 diabetes mellitus (disorder)",
+    },
+    Concept {
+        code: "46635009",
+        description: "Diabetes mellitus type 1 (disorder)",
+    },
 ];
 
 const CONCEPTS_DIABETES_TYPE_1: &[Concept] = &[
@@ -229,6 +253,14 @@ const CONCEPTS_DIABETES_TYPE_1: &[Concept] = &[
     Concept {
         code: "73211009",
         description: "Diabetes mellitus (disorder)",
+    },
+    Concept {
+        code: "420868002",
+        description: "Disorder due to type 1 diabetes mellitus (disorder)",
+    },
+    Concept {
+        code: "44054006",
+        description: "Diabetes mellitus type 2 (disorder)",
     },
 ];
 
@@ -246,6 +278,18 @@ const CONCEPTS_HYPERTENSION: &[Concept] = &[
         code: "59621000",
         description: "Essential hypertension (disorder)",
     },
+    Concept {
+        code: "31992008",
+        description: "Secondary hypertension (disorder)",
+    },
+    Concept {
+        code: "10725009",
+        description: "Benign hypertension (disorder)",
+    },
+    Concept {
+        code: "70272006",
+        description: "Malignant hypertension (disorder)",
+    },
 ];
 
 const CONCEPTS_HYPERLIPIDEMIA: &[Concept] = &[Concept {
@@ -261,6 +305,18 @@ const CONCEPTS_MYOCARDIAL_INFARCTION: &[Concept] = &[
     Concept {
         code: "57054005",
         description: "Acute myocardial infarction (disorder)",
+    },
+    Concept {
+        code: "401303003",
+        description: "Acute ST segment elevation myocardial infarction (disorder)",
+    },
+    Concept {
+        code: "401314000",
+        description: "Acute non-ST segment elevation myocardial infarction (disorder)",
+    },
+    Concept {
+        code: "1755008",
+        description: "Old myocardial infarction (disorder)",
     },
 ];
 
@@ -278,6 +334,14 @@ const CONCEPTS_HEART_FAILURE: &[Concept] = &[
         code: "42343007",
         description: "Congestive heart failure (disorder)",
     },
+    Concept {
+        code: "88805009",
+        description: "Chronic congestive heart failure (disorder)",
+    },
+    Concept {
+        code: "56675007",
+        description: "Acute heart failure (disorder)",
+    },
 ];
 
 const CONCEPTS_CONGESTIVE_HEART_FAILURE: &[Concept] = &[
@@ -288,6 +352,10 @@ const CONCEPTS_CONGESTIVE_HEART_FAILURE: &[Concept] = &[
     Concept {
         code: "84114007",
         description: "Heart failure (disorder)",
+    },
+    Concept {
+        code: "88805009",
+        description: "Chronic congestive heart failure (disorder)",
     },
 ];
 
@@ -301,10 +369,20 @@ const CONCEPTS_STROKE: &[Concept] = &[Concept {
     description: "Cerebrovascular accident (disorder)",
 }];
 
-const CONCEPTS_ASTHMA: &[Concept] = &[Concept {
-    code: "195967001",
-    description: "Asthma (disorder)",
-}];
+const CONCEPTS_ASTHMA: &[Concept] = &[
+    Concept {
+        code: "195967001",
+        description: "Asthma (disorder)",
+    },
+    Concept {
+        code: "304527002",
+        description: "Acute asthma (disorder)",
+    },
+    Concept {
+        code: "389145006",
+        description: "Allergic asthma (disorder)",
+    },
+];
 
 const CONCEPTS_COPD: &[Concept] = &[Concept {
     code: "13645005",
@@ -326,10 +404,20 @@ const CONCEPTS_INFLUENZA: &[Concept] = &[Concept {
     description: "Influenza (disorder)",
 }];
 
-const CONCEPTS_COUGH: &[Concept] = &[Concept {
-    code: "49727002",
-    description: "Cough (finding)",
-}];
+const CONCEPTS_COUGH: &[Concept] = &[
+    Concept {
+        code: "49727002",
+        description: "Cough (finding)",
+    },
+    Concept {
+        code: "11833005",
+        description: "Dry cough (finding)",
+    },
+    Concept {
+        code: "28743005",
+        description: "Productive cough (finding)",
+    },
+];
 
 const CONCEPTS_DYSPNEA: &[Concept] = &[Concept {
     code: "267036007",
@@ -1961,6 +2049,15 @@ struct Attribute {
     /// confidence falls off with.
     distance: usize,
     concepts: &'static [Concept],
+    /// Whether this attribute is a qualifier OF the entity's own written form — a subtype
+    /// split off the mention — rather than a mention of its own.
+    ///
+    /// Such a qualifier is written as part of the condition's name, so the concepts the
+    /// WHOLE mention names are concepts it could refer to as well: its candidate list
+    /// continues with the entity's own candidates after the qualifier-value concepts.
+    /// An attribute a lexicon of its own placed (a body site, a measured value) names
+    /// concepts of its own kind only.
+    qualifies_entity: bool,
 }
 
 /// One entity the pass placed: the stretch of text naming it, its lexicon entry, and the
@@ -2107,6 +2204,7 @@ fn measurement_attributes(
             score: WEIGHT_PATTERN,
             distance,
             concepts: &[],
+            qualifies_entity: false,
         });
         index = end;
     }
@@ -2156,6 +2254,7 @@ fn modifier_attributes(
             score: WEIGHT_MODIFIER,
             distance,
             concepts: &[],
+            qualifies_entity: false,
         });
     }
     attributes
@@ -2217,21 +2316,47 @@ fn attribute_traits(
         .collect()
 }
 
-/// The SNOMED CT concepts a lexicon entry is linked to, most likely first.
+/// The candidate list of one mention: the concepts its own lexicon entry names, then the
+/// concepts of `then` — the entity a qualifier belongs to — with nothing repeated and the
+/// whole list cut at [`CONCEPT_CANDIDATE_LIMIT`].
 ///
-/// The candidates of one entry are ordered most-likely-first, and the modelled
-/// `SNOMEDCTConcept$Score` reports the likelihood of the match, so each successive
-/// candidate reports a fixed share of the one in front of it and the list is strictly
-/// descending.
-fn concepts(entry: &'static [Concept], score: f32) -> Vec<SNOMEDCTConcept> {
-    entry
+/// The modelled concept lists are "the SNOMED concepts that the entity could refer to",
+/// so a qualifier written as part of a condition's name carries the qualifier-value
+/// concepts it names in its own right FIRST and then the concepts of the whole mention it
+/// qualifies, which that stretch of text could refer to as well.
+fn candidate_list(
+    own: &'static [Concept],
+    then: &'static [Concept],
+) -> Vec<&'static Concept> {
+    let mut candidates: Vec<&'static Concept> = Vec::with_capacity(CONCEPT_CANDIDATE_LIMIT);
+    for concept in own.iter().chain(then) {
+        if candidates.len() == CONCEPT_CANDIDATE_LIMIT {
+            break;
+        }
+        if candidates
+            .iter()
+            .any(|placed| placed.code == concept.code)
+        {
+            continue;
+        }
+        candidates.push(concept);
+    }
+    candidates
+}
+
+/// The SNOMED CT concepts a mention is linked to, most likely first.
+///
+/// The modelled `SNOMEDCTConcept$Score` reports the likelihood of the match, so the
+/// mention's confidence is divided between the candidates it could refer to (see
+/// [`candidate_scores`]) and the list is strictly descending.
+fn concepts(candidates: &[&'static Concept], score: f32) -> Vec<SNOMEDCTConcept> {
+    candidates
         .iter()
-        .take(CONCEPT_CANDIDATE_LIMIT)
-        .enumerate()
-        .map(|(rank, concept)| SNOMEDCTConcept {
+        .zip(candidate_scores(score, candidates.len()))
+        .map(|(concept, candidate_score)| SNOMEDCTConcept {
             code: Some(concept.code.to_string()),
             description: Some(concept.description.to_string()),
-            score: Some(score * CONCEPT_RANK_DECAY.powi(i32::try_from(rank).unwrap_or(i32::MAX))),
+            score: Some(candidate_score),
         })
         .collect()
 }
@@ -2276,6 +2401,13 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
         )
         .collect();
 
+    // The ages the document writes, placed before the attribute passes below so a number
+    // counting how old the person is is never read as a measured value, a quantity or the
+    // time course of a condition. An age is in none of the modelled SNOMED CT entity
+    // categories, so no entity reports it — but it is one of the spans this pass placed,
+    // so the id sequence counts it.
+    let ages = age_spans(text, &tokens, &mut covered);
+
     // A mention of a condition, a test, a treatment or a procedure is an entity of its
     // own. A body structure is the SITE of such an entity when it stands within the
     // attribute window of one in the same clause — that is what the modelled
@@ -2297,6 +2429,7 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
                     // qualifies, so nothing stands between the two.
                     distance: 0,
                     concepts: qualifier_concepts(&tokens, qualifier),
+                    qualifies_entity: true,
                 })
                 .collect(),
         })
@@ -2317,6 +2450,7 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
                     score,
                     distance,
                     concepts: term.concepts,
+                    qualifies_entity: false,
                 });
             }
             _ => loose_anatomy.push((span.clone(), term)),
@@ -2355,15 +2489,26 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
     // the pass works in.
     let starts = character_starts(text);
 
-    // `Id` is a monotonically increasing id unique within this response: every entity
-    // and every attribute takes the next one of ONE document-wide sequence, in the order
-    // they are written.
-    let next_id = std::cell::Cell::new(FIRST_ID);
-    let mint_id = || {
-        let id = next_id.get();
-        next_id.set(id + 1);
-        id
-    };
+    // `Id` is a monotonically increasing id unique within this response: the spans this
+    // pass placed are numbered in the order they are WRITTEN — entities, their attributes
+    // and the spans this operation reports no entity for sharing the one sequence (see
+    // [`span_ids`]) — so an attribute written in front of its entity carries the lower id.
+    let ids = span_ids(
+        entities
+            .iter()
+            .flat_map(|entity| {
+                std::iter::once(entity.span.start)
+                    .chain(
+                        entity
+                            .attributes
+                            .iter()
+                            .map(|attribute| attribute.span.start),
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .chain(ages.iter().map(|age| age.start)),
+    );
+    let id_of = |start: usize| ids.get(&start).copied().unwrap_or(FIRST_ID);
     let mut reported = Vec::with_capacity(entities.len());
     for entity in entities {
         let written = &text[entity.span.start..entity.span.end];
@@ -2371,7 +2516,8 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
             term_confidence(entity.term.term.split(' ').count()),
             written,
         );
-        let id = mint_id();
+        let id = id_of(entity.span.start);
+        let entity_concepts = entity.term.concepts;
         let traits = entity_traits(
             &tokens,
             &entity.span,
@@ -2384,12 +2530,23 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
         let attributes = attributes
             .into_iter()
             .map(|attribute| {
-                let attribute_id = mint_id();
+                let attribute_id = id_of(attribute.span.start);
                 let relationship_score = (WEIGHT_RELATIONSHIP
                     - RELATIONSHIP_DISTANCE_PENALTY * attribute.distance as f32)
                     .clamp(0.0, 1.0);
                 let part = &text[attribute.span.start..attribute.span.end];
                 let attribute_score = span_confidence(attribute.score, part);
+                // The concepts this stretch of text could refer to: its own, continued by
+                // the concepts of the entity it qualifies when it is a qualifier OF that
+                // entity's written form.
+                let candidates = candidate_list(
+                    attribute.concepts,
+                    if attribute.qualifies_entity {
+                        entity_concepts
+                    } else {
+                        &[]
+                    },
+                );
                 SNOMEDCTAttribute {
                     category: Some(attribute.category.to_string()),
                     r#type: Some(attribute.attribute_type.to_string()),
@@ -2401,11 +2558,9 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
                     end_offset: Some(character_offset(&starts, attribute.span.end)),
                     text: Some(part.to_string()),
                     traits: Some(attribute_traits(&tokens, &attribute.span, &family_cues)),
-                    // Only an attribute a lexicon placed names a concept of its own.
-                    snomedct_concepts: match attribute.concepts {
-                        [] => None,
-                        entry => Some(concepts(entry, attribute_score)),
-                    },
+                    // Only an attribute some lexicon of this pass placed names a concept.
+                    snomedct_concepts: (!candidates.is_empty())
+                        .then(|| concepts(&candidates, attribute_score)),
                 }
             })
             .collect();
@@ -2419,7 +2574,7 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
             end_offset: Some(character_offset(&starts, entity.span.end)),
             attributes: Some(attributes),
             traits: Some(traits),
-            snomedct_concepts: Some(concepts(entity.term.concepts, score)),
+            snomedct_concepts: Some(concepts(&candidate_list(entity_concepts, &[]), score)),
         });
     }
     reported

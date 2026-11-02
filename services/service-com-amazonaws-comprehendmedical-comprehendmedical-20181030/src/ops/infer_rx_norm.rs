@@ -106,9 +106,9 @@ use std::sync::OnceLock;
 // The generic clinical-text pass, stated once for every ontology-linking operation of
 // this service. See the module docs of `infer_icd10_cm` for why it lives there.
 use crate::ops::infer_icd10_cm::{
-    character_offset, character_starts, cue_governs, cue_trait_names, first_family_cues, is_count,
-    lexicon_matches, span_confidence, term_confidence, tokenize, Span, Token,
-    CONCEPT_CANDIDATE_LIMIT, CONCEPT_RANK_DECAY, FIRST_ID, RELATIONSHIP_DISTANCE_PENALTY,
+    candidate_scores, character_offset, character_starts, cue_governs, cue_trait_names,
+    first_family_cues, is_count, lexicon_matches, span_confidence, span_ids, term_confidence,
+    tokenize, Span, Token, CONCEPT_CANDIDATE_LIMIT, FIRST_ID, RELATIONSHIP_DISTANCE_PENALTY,
     WEIGHT_CUE, WEIGHT_MODIFIER, WEIGHT_PATTERN, WEIGHT_RELATIONSHIP,
 };
 // Two more rules of that pass that the SNOMED CT operation states: the distance between
@@ -116,12 +116,16 @@ use crate::ops::infer_icd10_cm::{
 // trait enums carry.
 use crate::ops::infer_snomedct::{token_distance, PAST_HISTORY_CUES};
 
-/// The version this emulator reports for the model behind the ontology linking.
+/// The version of the model THIS operation's analysis came from, which is what the
+/// modelled `ModelVersion` reports: "the version of the model used to analyze the
+/// documents, in the format n.n.n".
 ///
-/// The modelled `ModelVersion` member documents the SHAPE of the value ("in the format
-/// n.n.n"), not a particular version, so one constant is the single source for every
-/// response this operation serves.
-const MODEL_VERSION: &str = "0.1.0";
+/// The service runs one model per inference family and versions each of them on its own,
+/// so this constant is the RxNorm linking model's own: it is declared here rather than
+/// shared, so moving one family's model version leaves the others where they are. The
+/// inference families of this service report the same version today, which is why the
+/// value matches the one the other passes report.
+const MODEL_VERSION: &str = "1.1.0";
 
 // The modelled enum values this pass can produce, named once so no rule below can
 // invent a value outside the enum: `RxNormEntityCategory`, `RxNormEntityType`,
@@ -886,18 +890,18 @@ fn modelled_trait_names(
 
 /// The RxNorm concepts a lexicon entry is linked to, most likely first.
 ///
-/// The candidates of one entry are ordered most-likely-first, and the modelled
-/// `RxNormConcept$Score` reports the likelihood of the match, so each successive candidate
-/// reports a fixed share of the one in front of it and the list is strictly descending.
+/// The modelled `RxNormConcept$Score` reports the likelihood of the match, so the
+/// mention's confidence is divided between the concepts it could refer to (see
+/// [`candidate_scores`]) and the list is strictly descending.
 fn concepts(entry: &'static [(&'static str, &'static str)], score: f32) -> Vec<RxNormConcept> {
-    entry
+    let candidates: Vec<&(&str, &str)> = entry.iter().take(CONCEPT_CANDIDATE_LIMIT).collect();
+    candidates
         .iter()
-        .take(CONCEPT_CANDIDATE_LIMIT)
-        .enumerate()
-        .map(|(rank, (code, description))| RxNormConcept {
+        .zip(candidate_scores(score, candidates.len()))
+        .map(|((code, description), candidate_score)| RxNormConcept {
             code: Some((*code).to_string()),
             description: Some((*description).to_string()),
-            score: Some(score * CONCEPT_RANK_DECAY.powi(i32::try_from(rank).unwrap_or(i32::MAX))),
+            score: Some(candidate_score),
         })
         .collect()
 }
@@ -962,15 +966,21 @@ pub fn infer_rx_norm(text: &str) -> Vec<RxNormEntity> {
     // the pass works in.
     let starts = character_starts(text);
 
-    // `Id` is a monotonically increasing id unique within this response: every entity and
-    // every attribute takes the next one of ONE document-wide sequence, in the order they
-    // are written.
-    let next_id = std::cell::Cell::new(FIRST_ID);
-    let mint_id = || {
-        let id = next_id.get();
-        next_id.set(id + 1);
-        id
-    };
+    // `Id` is a monotonically increasing id unique within this response: the spans this
+    // pass placed are numbered in the order they are WRITTEN, entities and their
+    // attributes sharing the one sequence (see [`span_ids`]), so a part of a prescription
+    // written in front of the medication it belongs to carries the lower id.
+    let ids = span_ids(entities.iter().flat_map(|entity| {
+        std::iter::once(entity.span.start)
+            .chain(
+                entity
+                    .attributes
+                    .iter()
+                    .map(|attribute| attribute.span.start),
+            )
+            .collect::<Vec<_>>()
+    }));
+    let id_of = |start: usize| ids.get(&start).copied().unwrap_or(FIRST_ID);
     let mut reported = Vec::with_capacity(entities.len());
     for entity in entities {
         let written = &text[entity.span.start..entity.span.end];
@@ -978,14 +988,14 @@ pub fn infer_rx_norm(text: &str) -> Vec<RxNormEntity> {
             term_confidence(entity.medication.term.split(' ').count()),
             written,
         );
-        let id = mint_id();
+        let id = id_of(entity.span.start);
         let traits = entity_traits(&tokens, &entity.span, &family_cues);
         let mut attributes = entity.attributes;
         attributes.sort_by_key(|attribute| attribute.span.start);
         let attributes = attributes
             .into_iter()
             .map(|attribute| {
-                let attribute_id = mint_id();
+                let attribute_id = id_of(attribute.span.start);
                 let relationship_score = (WEIGHT_RELATIONSHIP
                     - RELATIONSHIP_DISTANCE_PENALTY * attribute.distance as f32)
                     .clamp(RELATIONSHIP_SCORE_FLOOR, WEIGHT_RELATIONSHIP);

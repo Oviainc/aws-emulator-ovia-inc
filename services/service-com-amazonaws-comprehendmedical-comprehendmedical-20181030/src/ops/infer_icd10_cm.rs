@@ -105,12 +105,16 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::OnceLock;
 
-/// The version this emulator reports for the model behind the ontology linking.
+/// The version of the model THIS operation's analysis came from, which is what the
+/// modelled `ModelVersion` reports: "the version of the model used to analyze the
+/// documents, in the format n.n.n".
 ///
-/// The modelled `ModelVersion` member documents the SHAPE of the value ("in the format
-/// n.n.n"), not a particular version, so one constant is the single source for every
-/// response this operation serves.
-const MODEL_VERSION: &str = "0.1.0";
+/// The service runs one model per inference family and versions each of them on its own,
+/// so this constant is the ICD-10-CM linking model's own: it is declared here rather than
+/// shared, so moving one family's model version leaves the others where they are. The
+/// inference families of this service report the same version today, which is why the
+/// value matches the one the PHI pass reports.
+const MODEL_VERSION: &str = "1.1.0";
 
 // The modelled enum values this pass can produce, named once so no rule below can
 // invent a value outside the enum: `ICD10CMEntityCategory`, `ICD10CMEntityType`,
@@ -171,13 +175,13 @@ pub(crate) const WEIGHT_RELATIONSHIP: f32 = 0.95;
 /// confidence: a modifier further from the mention is less likely to belong to it.
 pub(crate) const RELATIONSHIP_DISTANCE_PENALTY: f32 = 0.08;
 
-/// How much of the previous candidate's confidence the next ICD-10-CM candidate keeps.
+/// How much of the previous candidate's share of a mention the next candidate keeps.
 ///
-/// The candidates of one lexicon entry are ordered most-likely-first, and the modelled
-/// `ICD10CMConcept$Score` reports "the likelihood of the match", so each successive
-/// candidate reports this share of the one in front of it and the list is strictly
-/// descending.
-pub(crate) const CONCEPT_RANK_DECAY: f32 = 0.72;
+/// The candidates of one mention are ordered most-likely-first and every modelled
+/// ontology concept's `Score` reports "the likelihood of the match", so the candidates
+/// divide the mention's confidence between them in this ratio — see
+/// [`candidate_scores`].
+pub(crate) const CONCEPT_RANK_DECAY: f32 = 0.5;
 
 /// The most ontology candidates one entity reports.
 pub(crate) const CONCEPT_CANDIDATE_LIMIT: usize = 5;
@@ -195,9 +199,9 @@ pub(crate) const CUE_WINDOW_TOKENS: usize = 6;
 ///
 /// Every modelled `Id` member is "a monotonically increasing id unique within this
 /// response rather than a global unique identifier", and the service numbers the spans of
-/// one document from one, entities and their attributes sharing the single sequence — so
-/// a client that cross-references an attribute's `Id` against an entity's reads the same
-/// numbering the service produced.
+/// one document from one, in the order they are WRITTEN, entities and their attributes
+/// sharing the single sequence (see [`span_ids`]) — so a client that cross-references an
+/// attribute's `Id` against an entity's reads the same numbering the service produced.
 pub(crate) const FIRST_ID: i32 = 1;
 
 /// How high the confidence of any one detection of this crate's passes can be carried by
@@ -248,6 +252,40 @@ pub(crate) fn span_confidence(base: f32, matched: &str) -> f32 {
     let remaining = (1.0 - CONFIDENCE_GROUP_SHARE)
         .powi(i32::try_from(groups.saturating_sub(1)).unwrap_or(i32::MAX));
     (CONFIDENCE_CEILING - (CONFIDENCE_CEILING - base) * remaining).clamp(0.0, CONFIDENCE_CEILING)
+}
+
+/// `confidence` raised by ONE more piece of evidence for the same detection: the
+/// detection closes [`CONFIDENCE_GROUP_SHARE`] of what was left between what it had and
+/// [`CONFIDENCE_CEILING`], so corroborated evidence is reported with more confidence than
+/// the same single piece of evidence alone and nothing reports certainty.
+pub(crate) fn raised(confidence: f32) -> f32 {
+    let confidence = confidence.clamp(0.0, CONFIDENCE_CEILING);
+    (confidence + (CONFIDENCE_CEILING - confidence) * CONFIDENCE_GROUP_SHARE)
+        .clamp(0.0, CONFIDENCE_CEILING)
+}
+
+/// The score each of the `count` ontology candidates of one mention reports, in rank
+/// order, for a mention whose own confidence is `confidence`.
+///
+/// Every modelled ontology concept's `Score` reports "the likelihood of the match", so a
+/// candidate's score answers how likely it is that the mention refers to THAT concept
+/// rather than to one of the others it could refer to: the mention's confidence is
+/// divided between its candidates, each successive one keeping [`CONCEPT_RANK_DECAY`] of
+/// the share in front of it. The list is therefore strictly descending, the whole list
+/// adds up to the mention's own confidence, and the leading candidate of a long list
+/// scores well below a mention the ontology leaves no choice about.
+pub(crate) fn candidate_scores(confidence: f32, count: usize) -> Vec<f32> {
+    let shares: Vec<f32> = (0..count)
+        .map(|rank| CONCEPT_RANK_DECAY.powi(i32::try_from(rank).unwrap_or(i32::MAX)))
+        .collect();
+    let total: f32 = shares.iter().sum();
+    if total <= 0.0 {
+        return vec![0.0; count];
+    }
+    shares
+        .into_iter()
+        .map(|share| confidence * share / total)
+        .collect()
 }
 
 /// How many LEADING tokens of the normalized written form `term` are a subtype qualifier
@@ -340,12 +378,24 @@ const CONCEPTS_DIABETES_TYPE_2: &[Concept] = &[
         description: "Type 2 diabetes mellitus without complications",
     },
     Concept {
-        code: "E11.8",
-        description: "Type 2 diabetes mellitus with unspecified complications",
+        code: "E11.22",
+        description: "Type 2 diabetes mellitus with diabetic chronic kidney disease",
     },
     Concept {
         code: "E11.65",
         description: "Type 2 diabetes mellitus with hyperglycemia",
+    },
+    Concept {
+        code: "E11",
+        description: "Type 2 diabetes mellitus",
+    },
+    Concept {
+        code: "E11.0",
+        description: "Type 2 diabetes mellitus with hyperosmolarity",
+    },
+    Concept {
+        code: "E11.8",
+        description: "Type 2 diabetes mellitus with unspecified complications",
     },
     Concept {
         code: "E11.69",
@@ -359,12 +409,20 @@ const CONCEPTS_DIABETES_TYPE_1: &[Concept] = &[
         description: "Type 1 diabetes mellitus without complications",
     },
     Concept {
-        code: "E10.8",
-        description: "Type 1 diabetes mellitus with unspecified complications",
+        code: "E10.22",
+        description: "Type 1 diabetes mellitus with diabetic chronic kidney disease",
     },
     Concept {
         code: "E10.65",
         description: "Type 1 diabetes mellitus with hyperglycemia",
+    },
+    Concept {
+        code: "E10",
+        description: "Type 1 diabetes mellitus",
+    },
+    Concept {
+        code: "E10.8",
+        description: "Type 1 diabetes mellitus with unspecified complications",
     },
 ];
 
@@ -383,6 +441,19 @@ const CONCEPTS_HYPERTENSION: &[Concept] = &[
     Concept {
         code: "I10",
         description: "Essential (primary) hypertension",
+    },
+    Concept {
+        code: "I11.0",
+        description: "Hypertensive heart disease with heart failure",
+    },
+    Concept {
+        code: "I12.9",
+        description: "Hypertensive chronic kidney disease with stage 1 through stage 4 chronic \
+                      kidney disease, or unspecified chronic kidney disease",
+    },
+    Concept {
+        code: "I11.9",
+        description: "Hypertensive heart disease without heart failure",
     },
     Concept {
         code: "I15.9",
@@ -448,6 +519,14 @@ const CONCEPTS_HEART_FAILURE: &[Concept] = &[
         code: "I50.32",
         description: "Chronic diastolic (congestive) heart failure",
     },
+    Concept {
+        code: "I50.21",
+        description: "Acute systolic (congestive) heart failure",
+    },
+    Concept {
+        code: "I50.31",
+        description: "Acute diastolic (congestive) heart failure",
+    },
 ];
 
 const CONCEPTS_CORONARY_ARTERY_DISEASE: &[Concept] = &[Concept {
@@ -475,6 +554,18 @@ const CONCEPTS_ASTHMA: &[Concept] = &[
         code: "J45.901",
         description: "Unspecified asthma with (acute) exacerbation",
     },
+    Concept {
+        code: "J45.20",
+        description: "Mild intermittent asthma, uncomplicated",
+    },
+    Concept {
+        code: "J45.40",
+        description: "Moderate persistent asthma, uncomplicated",
+    },
+    Concept {
+        code: "J45.50",
+        description: "Severe persistent asthma, uncomplicated",
+    },
 ];
 
 const CONCEPTS_COPD: &[Concept] = &[
@@ -500,6 +591,14 @@ const CONCEPTS_PNEUMONIA: &[Concept] = &[
     Concept {
         code: "J12.9",
         description: "Viral pneumonia, unspecified",
+    },
+    Concept {
+        code: "J18.1",
+        description: "Lobar pneumonia, unspecified organism",
+    },
+    Concept {
+        code: "J13",
+        description: "Pneumonia due to Streptococcus pneumoniae",
     },
 ];
 
@@ -1559,6 +1658,71 @@ fn condition_mentions(
     .collect()
 }
 
+/// Every age written in the text, as the spans this pass places for them, with the
+/// tokens they cover marked placed.
+///
+/// An age counts how old the PERSON is: it is the `AGE` identifier class of this crate's
+/// protected-health-information pass (`crate::ops::detect_phi`, which states the written
+/// forms of that class and places them), not the time course of a medical condition, so
+/// an analysis whose entity vocabulary is medical reports no entity for it. The span is
+/// still PLACED: the tokens it covers are not read as the time of a condition or as a
+/// quantity of one, and the response-wide id sequence counts it like every other span the
+/// pass placed.
+pub(crate) fn age_spans(text: &str, tokens: &[Token], covered: &mut [bool]) -> Vec<Span> {
+    let mut placed = Vec::new();
+    for (start, _) in crate::ops::detect_phi::age_spans(text, tokens) {
+        let Some(index) = tokens.iter().position(|token| token.start == start) else {
+            continue;
+        };
+        if covered[index] {
+            continue;
+        }
+        // The unit the age is counted in, where the text writes one after the number, is
+        // part of the age expression rather than a time expression of its own.
+        let unit = index + 1;
+        let end = if unit < tokens.len()
+            && !covered[unit]
+            && tokens[unit].clause == tokens[index].clause
+            && TIME_UNITS.contains(&tokens[unit].lower.as_str())
+        {
+            unit + 1
+        } else {
+            index + 1
+        };
+        for token in &mut covered[index..end] {
+            *token = true;
+        }
+        placed.push(Span::of(tokens, index..end));
+    }
+    placed
+}
+
+/// The `Id` every span of one response carries, keyed by the span's byte start.
+///
+/// Every modelled `Id` member is "a monotonically increasing id unique within this
+/// response rather than a global unique identifier", and the analysis numbers the spans
+/// of ONE document in the order they are WRITTEN: an attribute written in front of the
+/// entity it belongs to therefore carries the LOWER id, and a span the pass placed but
+/// this operation's entity vocabulary does not report still takes its place in the
+/// sequence, which is why the id of a reported entity can skip.
+pub(crate) fn span_ids(starts: impl IntoIterator<Item = usize>) -> HashMap<usize, i32> {
+    let mut starts: Vec<usize> = starts.into_iter().collect();
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+        .into_iter()
+        .enumerate()
+        .map(|(rank, start)| {
+            (
+                start,
+                i32::try_from(rank)
+                    .unwrap_or(i32::MAX)
+                    .saturating_add(FIRST_ID),
+            )
+        })
+        .collect()
+}
+
 /// Every time expression in the tokens no mention covers: a count followed by a unit
 /// ("3 days", "two weeks", optionally "… ago"), a qualifier in front of a unit ("last
 /// year"), or a word that names a time on its own ("yesterday").
@@ -1797,6 +1961,9 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
                 }
             })
             .collect();
+    // The ages are placed before the time pass: an age counts how old the person is, so
+    // the tokens it covers are not read as the time course of a condition.
+    let ages = age_spans(text, &tokens, &mut covered);
     let times = time_expressions(&tokens, &mut covered);
 
     // A time expression is reported only in a clause that also carries a condition
@@ -1890,10 +2057,24 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
     let character_starts = character_starts(text);
     let character_offset = |byte: usize| character_offset(&character_starts, byte);
 
-    // `Id` is "a monotonically increasing id unique within this response": every entity
-    // and every attribute takes the next one of ONE document-wide sequence, in the order
-    // they are written, and the first one a response mints is 1.
-    let mut next_id = FIRST_ID;
+    // `Id` is "a monotonically increasing id unique within this response": the spans this
+    // pass placed are numbered in the order they are WRITTEN — entities, their attributes
+    // and the spans this operation reports no entity for sharing the one sequence (see
+    // [`span_ids`]) — so an attribute written in front of its entity carries the lower id.
+    let ids = span_ids(
+        placed
+            .iter()
+            .flat_map(|entry| match entry {
+                Placed::Condition {
+                    span, attributes, ..
+                } => std::iter::once(span.start)
+                    .chain(attributes.iter().map(|attribute| attribute.span.start))
+                    .collect::<Vec<_>>(),
+                Placed::Time { span } => vec![span.start],
+            })
+            .chain(ages.iter().map(|age| age.start)),
+    );
+    let id_of = |start: usize| ids.get(&start).copied().unwrap_or(FIRST_ID);
     let mut entities = Vec::with_capacity(placed.len());
     for entry in placed {
         match entry {
@@ -1907,8 +2088,7 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
                     term_confidence(condition.term.split(' ').count()),
                     written,
                 );
-                let id = next_id;
-                next_id += 1;
+                let id = id_of(span.start);
                 let mut traits = vec![ICD10CMTrait {
                     name: Some(condition.base_trait.to_string()),
                     score: Some(score),
@@ -1918,8 +2098,7 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
                 let attributes = attributes
                     .into_iter()
                     .map(|attribute| {
-                        let attribute_id = next_id;
-                        next_id += 1;
+                        let attribute_id = id_of(attribute.span.start);
                         let relationship_score = (WEIGHT_RELATIONSHIP
                             - RELATIONSHIP_DISTANCE_PENALTY * attribute.distance as f32)
                             .clamp(0.0, 1.0);
@@ -1943,17 +2122,21 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
                         }
                     })
                     .collect();
-                let concepts = condition
+                // The candidates the mention could refer to, most likely first and cut at
+                // the candidate limit, each carrying its own share of the mention's
+                // confidence.
+                let candidates: Vec<&Concept> = condition
                     .concepts
                     .iter()
                     .take(CONCEPT_CANDIDATE_LIMIT)
-                    .enumerate()
-                    .map(|(rank, concept)| ICD10CMConcept {
+                    .collect();
+                let concepts = candidates
+                    .iter()
+                    .zip(candidate_scores(score, candidates.len()))
+                    .map(|(concept, candidate_score)| ICD10CMConcept {
                         code: Some(concept.code.to_string()),
                         description: Some(concept.description.to_string()),
-                        score: Some(score * CONCEPT_RANK_DECAY.powi(
-                            i32::try_from(rank).unwrap_or(i32::MAX),
-                        )),
+                        score: Some(candidate_score),
                     })
                     .collect();
                 entities.push(ICD10CMEntity {
@@ -1970,8 +2153,7 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
                 });
             }
             Placed::Time { span } => {
-                let id = next_id;
-                next_id += 1;
+                let id = id_of(span.start);
                 let written = &text[span.start..span.end];
                 entities.push(ICD10CMEntity {
                     id: Some(id),
