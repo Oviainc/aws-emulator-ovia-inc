@@ -29,7 +29,7 @@ use crate::playback_configuration::{Emulator, Reply};
 /// The logging strategies this service accepts, from the model's
 /// `LoggingStrategy` enum (`smithy_query(query="shape",shape="LoggingStrategy")`
 /// → `VENDED_LOGS`, `LEGACY_CLOUDWATCH`).
-const LOGGING_STRATEGIES: [&str; 2] = ["VENDED_LOGS", "LEGACY_CLOUDWATCH"];
+pub(crate) const LOGGING_STRATEGIES: [&str; 2] = ["VENDED_LOGS", "LEGACY_CLOUDWATCH"];
 
 /// The documented bounds of `PercentEnabled` ("Valid values: 0 - 100").
 const PERCENT_BOUNDS: [i64; 2] = [0, 100];
@@ -44,7 +44,7 @@ const MAX_EVENT_TYPES_PER_LIST: usize = 100;
 const AD_BUFFET_MODE: &str = "INSERT_ALL";
 
 /// `PUT /configureLogs/playbackConfiguration` for one configuration.
-async fn configure_logs(emulator: &Emulator, name: &str, settings: &Value) -> Reply {
+pub(crate) async fn configure_logs(emulator: &Emulator, name: &str, settings: &Value) -> Reply {
     let mut body = settings.clone();
     body.as_object_mut()
         .expect("the row is an object")
@@ -71,7 +71,7 @@ async fn listed_item(emulator: &Emulator, name: &str) -> Value {
 /// The log settings the table spans: each row differs from the others in the
 /// percentage it enables, which strategies it names and in what order, and
 /// whether it carries the interaction-log settings.
-fn log_settings_table() -> Vec<(&'static str, Value)> {
+pub(crate) fn log_settings_table() -> Vec<(&'static str, Value)> {
     vec![
         (
             "the lower bound and no strategy named",
@@ -124,7 +124,7 @@ fn log_settings_table() -> Vec<(&'static str, Value)> {
 /// The `LogConfiguration` a configure-logs request leaves in force: the
 /// percentage it carried, the strategies it named (none at all when it named
 /// none) and the interaction-log settings it carried.
-fn expected_log_configuration(settings: &Value) -> Value {
+pub(crate) fn expected_log_configuration(settings: &Value) -> Value {
     let mut expected = json!({
         "PercentEnabled": settings["PercentEnabled"].clone(),
         "EnabledLoggingStrategies": settings

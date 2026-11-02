@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/configure_logs_scope.rs"]
+mod configure_logs_scope;
 #[path = "all/playback_configuration.rs"]
 mod playback_configuration;
 #[path = "all/playback_configuration_logging.rs"]
