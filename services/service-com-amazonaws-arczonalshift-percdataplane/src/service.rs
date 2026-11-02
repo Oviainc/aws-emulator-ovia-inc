@@ -24,9 +24,10 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — EDITED HERE. A request refused for violating a modelled
-//!   constraint is stated the way ARC states it: the framework's own envelope and
-//!   requirement, with the SUBMITTED VALUE left out of the clause and a `@pattern`
-//!   reported without the anchors a model writes to demand a whole-string match. See
+//!   constraint is stated the way ARC states it: the framework's own envelope, clause and
+//!   requirement — the submitted value quoted back included — with a `@pattern` reported
+//!   without the anchors a model writes to demand a whole-string match, and an
+//!   enumerated member's admissible set stated as the set the service advertises. See
 //!   "How this service words a refusal" below.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
@@ -44,36 +45,39 @@
 //!
 //! # How this service words a refusal
 //!
-//! The envelope and the requirement stay the framework's — `N validation error(s)
-//! detected: Value at '<member path>' failed to satisfy constraint: <requirement>`,
-//! rendered by [`aws_smithy_schema_server::constraints::Violation::message`] — so a
-//! constraint class the framework gains later cannot arrive with a sentence of this
-//! service's own. Two parts of the clause are ARC's, and both are rules rather than
-//! one recorded string:
+//! The envelope, the clause and the requirement are the framework's — `N validation
+//! error(s) detected: Value '<submitted>' at '<member path>' failed to satisfy
+//! constraint: <requirement>`, rendered by
+//! [`aws_smithy_schema_server::constraints::Violation::message`] — so a constraint class
+//! the framework gains later cannot arrive with a sentence of this service's own. The
+//! clause QUOTES BACK the value the request submitted, which is the only part of the
+//! message that identifies which input was refused and is built from the request rather
+//! than chosen; an absent `@required` member has no value to quote and keeps the
+//! framework's `Value null at '<member>'`.
 //!
-//! * the SUBJECT names the member and the requirement it failed and does NOT quote the
-//!   submitted value back ([`clause`]): the refusals recorded from this service — a
-//!   `zonalShiftId` outside `ZonalShiftId`'s `@pattern`, a `status` outside
-//!   `ZonalShiftStatus`'s value set — both state `Value at '<member>'` with no echo, and
-//!   an absent member keeps `Value null at '<member>'`, which is the only clause with no
-//!   value to leave out;
+//! Two parts of the clause are ARC's, and both are rules rather than one recorded string:
+//!
 //! * a `@pattern` is reported as the expression a value must satisfy, WITHOUT the
 //!   `^`/`$` anchors the model writes to make the match total ([`unanchored`]): that
 //!   anchoring is how Smithy turns a find into a whole-string match, not part of the
-//!   expression a client shows a user or matches on.
+//!   expression a client shows a user or matches on;
+//! * an enumerated member's admissible set is the set the SERVICE names, which the
+//!   public model reproduces for all but two of this service's enums
+//!   ([`NAMED_BY_THE_SERVICE`]): ARC names the zonal-shift statuses in an order of its
+//!   own, and its alarm-source enumeration carries a source the public model does not
+//!   publish, and the refusal states each as the service has it — so a client that reads
+//!   the admissible values out of the message sees what the service accepts there rather
+//!   than a narrower or differently ordered set.
 //!
-//! What stays the framework's, deliberately: the ORDER an enum's admissible set is
-//! listed in is the model's declaration order (`ZonalShiftStatus` =
-//! `[ACTIVE, EXPIRED, CANCELED]`). A recorded ARC refusal lists that set in another
-//! order, which no documented or model-stated rule produces and nothing in the request
-//! determines, so there is no rule to implement — only one recording's text to copy, and
-//! the set this emulator reports is the set the model declares.
+//! Both are properties of a SHAPE, so they hold for every member that reaches it and
+//! every operation that takes one, and neither depends on the request. Every other enum's
+//! set is the framework's: the model's values in the model's declaration order.
 //!
-//! Both rules above are the SAME two rules ~24 other service crates in this tree carry
+//! The `@pattern` rule above is the SAME rule ~24 other service crates in this tree carry
 //! inlined (`grep -rln 'fn unanchored' services/*/src`), and
-//! `services/common/src/validation.rs` ("Still to migrate here") is where they belong.
+//! `services/common/src/validation.rs` ("Still to migrate here") is where it belongs.
 //! Migrating all of them is one change of its own rather than a side effect of this
-//! service's issue, so they are inlined here with this note, exactly as that module asks.
+//! service's issue, so it is inlined here with this note, exactly as that module asks.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -115,39 +119,73 @@ fn without_end_anchor(pattern: &str) -> Option<&str> {
     (escapes % 2 == 0).then_some(body)
 }
 
-/// The same violation with a `@pattern` reported unanchored; every other class is
-/// untouched, so the requirement each one words stays the framework's.
+/// The two enumerations ARC NAMES differently from the enum its public model publishes,
+/// as (what the model declares, what the service names) pairs.
+///
+/// The declared set is what identifies the shape here: the walk hands this seam an enum
+/// violation's value SET, not the shape that declared it, and no other enum of this
+/// service declares either set below
+/// (`smithy_query(query="shape", shape="ZonalShiftStatus,AutoshiftExecutionStatus,\
+/// ZonalAutoshiftStatus,AutoshiftObserverNotificationStatus,ControlConditionType,\
+/// AppliedStatus,AutoshiftAppliedStatus,ShiftType,PracticeRunOutcome,\
+/// ConflictExceptionReason,ValidationExceptionReason")`). Each pair is a property of the
+/// SERVICE's own enumeration rather than of one request, so it is the same for every
+/// member that reaches the shape and for every operation that takes one:
+///
+/// * the zonal-shift status — ARC names it expired-first, not in the order the model
+///   declares, and a refusal about any member of that shape (`ListZonalShifts.status`
+///   and the status of a shift a read reports) names it that way;
+/// * the practice-run control-condition type — ARC's enumeration of alarm sources
+///   carries one the public model does not publish, and a refusal about a control
+///   condition's `type` (the outcome alarms and the blocking alarms of either
+///   practice-run configuration operation, both reaching `ControlCondition.type`) names
+///   the whole of it, so a client reading the admissible values out of the message is not
+///   told that source is inadmissible.
+const NAMED_BY_THE_SERVICE: [(&[&str], &[&str]); 2] = [
+    (
+        &["ACTIVE", "EXPIRED", "CANCELED"],
+        &["EXPIRED", "ACTIVE", "CANCELED"],
+    ),
+    (&["CLOUDWATCH"], &["CARNAVAL", "CLOUDWATCH"]),
+];
+
+/// The admissible set a refusal states for an enumerated member whose model-declared set
+/// is `declared`: the set ARC names for it, which for every enum but the two in
+/// [`NAMED_BY_THE_SERVICE`] is the model's own set in its declaration order.
+fn advertised(declared: &[String]) -> Vec<String> {
+    for (model_names, service_names) in NAMED_BY_THE_SERVICE {
+        if declared
+            .iter()
+            .map(String::as_str)
+            .eq(model_names.iter().copied())
+        {
+            return service_names.iter().map(|value| value.to_string()).collect();
+        }
+    }
+    declared.to_vec()
+}
+
+/// The same violation with a `@pattern` reported unanchored and an enum's admissible set
+/// stated as the set the service names; every other class is untouched, so the
+/// requirement each one words stays the framework's.
 fn as_stated(violation: &Violation) -> Violation {
-    match &violation.kind {
-        ViolationKind::Pattern(pattern) => Violation {
-            path: violation.path.clone(),
-            kind: ViolationKind::Pattern(unanchored(pattern).to_string()),
-            value: violation.value.clone(),
-        },
-        _ => violation.clone(),
+    let kind = match &violation.kind {
+        ViolationKind::Pattern(pattern) => ViolationKind::Pattern(unanchored(pattern).to_string()),
+        ViolationKind::EnumValue(declared) => ViolationKind::EnumValue(advertised(declared)),
+        other => other.clone(),
+    };
+    Violation {
+        path: violation.path.clone(),
+        kind,
+        value: violation.value.clone(),
     }
 }
 
-/// One violation's clause as ARC states it: the framework's own clause with the
-/// submitted value lifted out of its opening, so `Value '<what was sent>' at` becomes
-/// `Value at`.
-///
-/// The replaced text is built from the SAME two fields the framework's renderer
-/// interpolated, so it matches whatever the value holds — including the elided rendering
-/// a long value is stored as — and the one replacement is confined to this clause's own
-/// opening. A violation with no value to echo (an absent `@required` member) is left
-/// exactly as the framework words it: `Value null at '<member>' …`.
+/// One violation's clause as ARC states it: the framework's own clause — which quotes the
+/// submitted value back between `Value ` and ` at `, and states `Value null` for a member
+/// the request left out — over the violation this service restates ([`as_stated`]).
 fn clause(violation: &Violation) -> String {
-    let violation = as_stated(violation);
-    let clause = violation.message();
-    match violation.value.as_deref() {
-        Some(value) => clause.replacen(
-            &format!("Value '{value}' at '{}'", violation.path),
-            &format!("Value at '{}'", violation.path),
-            1,
-        ),
-        None => clause,
-    }
+    as_stated(violation).message()
 }
 
 /// `violations` as this service states them, or `None` when there is nothing to state.
@@ -225,9 +263,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this service
-        // reword it. ARC states such a refusal in the framework's own envelope with the
-        // submitted value left out of the clause and a `@pattern` reported without its
-        // anchors — see "How this service words a refusal" in the module docs. The code
+        // reword it. ARC states such a refusal in the framework's own envelope and clause
+        // — the submitted value quoted back included — with a `@pattern` reported without
+        // its anchors and an enum's admissible set stated as the set the service names;
+        // see "How this service words a refusal" in the module docs. The code
         // stays `ValidationException`, which is both what the framework would answer and
         // the shape this service's model declares (`@httpError` 400), because a client
         // branches on the code and `Refused` replaces the code and the message together.
@@ -273,7 +312,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clause, stated, unanchored};
+    use super::{advertised, clause, stated, unanchored};
     use smithy_server_runtime::{Violation, ViolationKind};
 
     /// The anchoring a model spells a `@pattern` with is dropped only when the `^…$`
@@ -311,10 +350,11 @@ mod tests {
         }
     }
 
-    /// A violation carrying a value is stated without it; one with none keeps the
-    /// framework's `Value null at …`, and the count and joining are the framework's.
+    /// A violation carrying a value states it, quoted, between `Value ` and ` at `; one
+    /// with none keeps the framework's `Value null at …`, and the count and joining are
+    /// the framework's.
     #[test]
-    fn a_clause_states_the_member_and_the_requirement_without_the_value() {
+    fn a_clause_quotes_the_submitted_value_back() {
         let outside_pattern = Violation {
             path: "zonalShiftId".to_string(),
             kind: ViolationKind::Pattern("^[A-Za-z0-9-]+$".to_string()),
@@ -327,32 +367,118 @@ mod tests {
         };
         assert_eq!(
             clause(&outside_pattern),
-            "Value at 'zonalShiftId' failed to satisfy constraint: Member must satisfy \
-             regular expression pattern: [A-Za-z0-9-]+",
-            "a present value is left out of the clause and the pattern is unanchored"
+            "Value 'bad_id_1' at 'zonalShiftId' failed to satisfy constraint: Member must \
+             satisfy regular expression pattern: [A-Za-z0-9-]+",
+            "the submitted value is quoted back and the pattern is unanchored"
         );
         assert_eq!(
             clause(&absent),
             "Value null at 'comment' failed to satisfy constraint: Member must not be null",
-            "an absent member has no value to leave out"
+            "an absent member has no value to quote"
         );
         assert_eq!(stated(&[]), None, "nothing to state");
         assert_eq!(
             stated(std::slice::from_ref(&outside_pattern)).as_deref(),
             Some(
-                "1 validation error detected: Value at 'zonalShiftId' failed to satisfy \
-                 constraint: Member must satisfy regular expression pattern: [A-Za-z0-9-]+"
+                "1 validation error detected: Value 'bad_id_1' at 'zonalShiftId' failed to \
+                 satisfy constraint: Member must satisfy regular expression pattern: \
+                 [A-Za-z0-9-]+"
             ),
             "one violation takes the singular envelope"
         );
         assert_eq!(
             stated(&[outside_pattern, absent]).as_deref(),
             Some(
-                "2 validation errors detected: Value at 'zonalShiftId' failed to satisfy \
-                 constraint: Member must satisfy regular expression pattern: [A-Za-z0-9-]+; \
-                 Value null at 'comment' failed to satisfy constraint: Member must not be null"
+                "2 validation errors detected: Value 'bad_id_1' at 'zonalShiftId' failed to \
+                 satisfy constraint: Member must satisfy regular expression pattern: \
+                 [A-Za-z0-9-]+; Value null at 'comment' failed to satisfy constraint: Member \
+                 must not be null"
             ),
             "several violations are counted and joined"
         );
+    }
+
+    /// Every enum this service's model declares, as a refusal states its set: the model's
+    /// values in the model's declaration order, except the zonal-shift status, which ARC
+    /// names expired-first, and the control-condition type, whose set also names the alarm
+    /// source the model does not publish. The declared rows are quoted from the model
+    /// (`smithy_query(query="shape", shape="ZonalShiftStatus,AutoshiftExecutionStatus,\
+    /// ZonalAutoshiftStatus,AutoshiftObserverNotificationStatus,ControlConditionType,\
+    /// AppliedStatus,ShiftType,PracticeRunOutcome")`), and cover enums no refusal recorded
+    /// from this service has named.
+    #[test]
+    fn an_enum_set_is_the_models_except_the_two_the_service_names_itself() {
+        let cases: [(&str, &[&str], &[&str]); 8] = [
+            (
+                "ZonalShiftStatus",
+                &["ACTIVE", "EXPIRED", "CANCELED"],
+                &["EXPIRED", "ACTIVE", "CANCELED"],
+            ),
+            (
+                "ControlConditionType",
+                &["CLOUDWATCH"],
+                &["CARNAVAL", "CLOUDWATCH"],
+            ),
+            (
+                "AutoshiftExecutionStatus",
+                &["ACTIVE", "COMPLETED"],
+                &["ACTIVE", "COMPLETED"],
+            ),
+            (
+                "ZonalAutoshiftStatus",
+                &["ENABLED", "DISABLED"],
+                &["ENABLED", "DISABLED"],
+            ),
+            (
+                "AutoshiftObserverNotificationStatus",
+                &["ENABLED", "DISABLED"],
+                &["ENABLED", "DISABLED"],
+            ),
+            (
+                "AppliedStatus",
+                &["APPLIED", "NOT_APPLIED"],
+                &["APPLIED", "NOT_APPLIED"],
+            ),
+            (
+                "ShiftType",
+                &[
+                    "ZONAL_SHIFT",
+                    "PRACTICE_RUN",
+                    "FIS_EXPERIMENT",
+                    "ZONAL_AUTOSHIFT",
+                ],
+                &[
+                    "ZONAL_SHIFT",
+                    "PRACTICE_RUN",
+                    "FIS_EXPERIMENT",
+                    "ZONAL_AUTOSHIFT",
+                ],
+            ),
+            (
+                "PracticeRunOutcome",
+                &[
+                    "FAILED",
+                    "INTERRUPTED",
+                    "PENDING",
+                    "SUCCEEDED",
+                    "CAPACITY_CHECK_FAILED",
+                ],
+                &[
+                    "FAILED",
+                    "INTERRUPTED",
+                    "PENDING",
+                    "SUCCEEDED",
+                    "CAPACITY_CHECK_FAILED",
+                ],
+            ),
+        ];
+        for (case, declared, expected) in cases {
+            let declared: Vec<String> = declared.iter().map(|v| v.to_string()).collect();
+            let actual = advertised(&declared);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
     }
 }

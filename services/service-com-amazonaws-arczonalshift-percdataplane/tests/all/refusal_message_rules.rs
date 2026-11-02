@@ -7,24 +7,31 @@
 //! ends, `@range` at both ends, an absent `@required` member) rather than over one
 //! recorded request:
 //!
-//! * the envelope and the requirement are the framework's — `N validation error(s)
-//!   detected: Value at '<member path>' failed to satisfy constraint: <requirement>`;
-//! * the clause does NOT quote the submitted value back: a present-but-invalid value is
-//!   stated as `Value at '<member>'`, and only an ABSENT member keeps `Value null at
-//!   '<member>'`, which is the one clause with no value to leave out;
+//! * the envelope, the clause and the requirement are the framework's — `N validation
+//!   error(s) detected: Value '<submitted>' at '<member path>' failed to satisfy
+//!   constraint: <requirement>`;
+//! * the clause QUOTES THE SUBMITTED VALUE BACK, taken from the request — the query
+//!   string, a URI label or the body, whichever carried the member — and only an ABSENT
+//!   member states `Value null at '<member>'`, having no value to quote;
 //! * a `@pattern` is reported as the expression a value must satisfy, WITHOUT the
 //!   `^`/`$` anchors the model writes to make the match total;
+//! * an enum's admissible set is the set the service names — the model's values in the
+//!   model's declaration order for all but two of this service's enums: the zonal-shift
+//!   statuses, which ARC names expired-first, and the practice-run control-condition
+//!   type, whose set carries an alarm source the public model does not publish;
 //! * the status is 400 and the code is `ValidationException` (`@httpError 400`) in every
 //!   case, and a value INSIDE a declared bound is not refused at all.
 //!
 //! Every expression and value set below is quoted from the model
 //! (`smithy_query(query="shape", shape="ZonalShiftId,ExpiresIn,ZonalShiftStatus,
-//! AutoshiftExecutionStatus,ZonalAutoshiftStatus,MaxResults,ResourceIdentifier,
-//! AvailabilityZone,ZonalShiftComment")`), and the rows cover members the issue that
-//! prompted this suite did not cite — `expiresIn`, `comment`, `awayFrom`, `maxResults`,
-//! `resourceIdentifier`, and the two enums other than `ZonalShiftStatus` — including
-//! members of operations that are still scaffolded, because a declared constraint is a
-//! property of the INPUT SHAPE and is refused before any handler runs.
+//! AutoshiftExecutionStatus,ZonalAutoshiftStatus,AutoshiftObserverNotificationStatus,
+//! ControlConditionType,MaxResults,ResourceIdentifier,AvailabilityZone,
+//! ZonalShiftComment")`), and the rows cover members the issue that prompted this suite
+//! did not cite — `expiresIn`, `comment`, `awayFrom`, `maxResults`,
+//! `resourceIdentifier`, the enums other than `ZonalShiftStatus`, and a `type` nested
+//! inside a list of structures — including members of operations that are still
+//! scaffolded, because a declared constraint is a property of the INPUT SHAPE and is
+//! refused before any handler runs.
 
 use super::zonal_shift_lifecycle::{call, emulator, encoded, error_code};
 
@@ -39,6 +46,22 @@ const EXPIRES_IN_PATTERN: &str = "([1-9][0-9]*)(m|h)";
 /// any lookup, so a row only needs an identifier the model accepts.
 const UNREGISTERED_ARN: &str = "arn:aws:eks:us-east-1:111111111111:cluster/absent";
 
+/// An alarm ARN inside `MetricIdentifier`'s `@length` 8..1024 and `@pattern` `^.*$`, so a
+/// row about a control condition's `type` varies only that member.
+const ALARM_ARN: &str = "arn:aws:cloudwatch:us-east-1:111111111111:alarm:outcome";
+
+/// The admissible set a refusal states for a `status` filtering zonal shifts: the
+/// published `ZonalShiftStatus` values, in the order ARC names them rather than the
+/// order the model declares them in.
+const ZONAL_SHIFT_STATUSES: &str =
+    "Member must satisfy enum value set: [EXPIRED, ACTIVE, CANCELED]";
+
+/// The admissible set a refusal states for a control condition's `type`: the published
+/// `ControlConditionType` value plus the alarm source ARC names that the public model
+/// does not publish.
+const CONTROL_CONDITION_TYPES: &str =
+    "Member must satisfy enum value set: [CARNAVAL, CLOUDWATCH]";
+
 /// One refused request and the clause ARC states for it.
 struct Row {
     /// What this row is a case of, named in every assertion.
@@ -50,7 +73,7 @@ struct Row {
     member: &'static str,
     /// The requirement half, as the framework words it for this constraint class.
     requirement: String,
-    /// What the request submitted: the value the clause must NOT quote back.
+    /// What the request submitted: the value the clause must quote back.
     submitted: String,
 }
 
@@ -78,8 +101,8 @@ impl Row {
     /// The whole message this row must be answered with.
     fn expected(&self) -> String {
         format!(
-            "1 validation error detected: Value at '{}' failed to satisfy constraint: {}",
-            self.member, self.requirement
+            "1 validation error detected: Value '{}' at '{}' failed to satisfy constraint: {}",
+            self.submitted, self.member, self.requirement
         )
     }
 }
@@ -92,6 +115,22 @@ fn start_body(away_from: &str, expires_in: &str, comment: &str) -> String {
         "awayFrom": away_from,
         "expiresIn": expires_in,
         "comment": comment,
+    })
+    .to_string()
+}
+
+/// A practice-run configuration body whose outcome alarms are the control conditions
+/// given, so a row varies exactly the `type` it is about. The list satisfies
+/// `OutcomeAlarms`'s `@length` 1..10.
+fn practice_run_body(outcome_alarm_types: &[&str]) -> String {
+    serde_json::json!({
+        "resourceIdentifier": UNREGISTERED_ARN,
+        "outcomeAlarms": outcome_alarm_types
+            .iter()
+            .map(|alarm_type| {
+                serde_json::json!({ "type": alarm_type, "alarmIdentifier": ALARM_ARN })
+            })
+            .collect::<Vec<_>>(),
     })
     .to_string()
 }
@@ -177,15 +216,16 @@ fn rows() -> Vec<Row> {
             "Member must have length less than or equal to 20",
             &too_long_away_from,
         ),
-        // An enum's value set, on a query member and on a body member, including the
-        // two enums the issue that prompted this suite did not cite.
+        // An enum's value set, on a query member, a body member and a member nested in a
+        // list of structures — including the enums the issue that prompted this suite did
+        // not cite, and both shapes whose set ARC names for itself.
         Row::new(
             "ListZonalShifts/status outside ZonalShiftStatus",
             "GET",
             "/zonalshifts?status=PENDING",
             "",
             "status",
-            "Member must satisfy enum value set: [ACTIVE, EXPIRED, CANCELED]",
+            ZONAL_SHIFT_STATUSES,
             "PENDING",
         ),
         Row::new(
@@ -205,6 +245,47 @@ fn rows() -> Vec<Row> {
             "zonalAutoshiftStatus",
             "Member must satisfy enum value set: [ENABLED, DISABLED]",
             "PAUSED",
+        ),
+        Row::new(
+            "UpdateAutoshiftObserverNotificationStatus/status outside its value set",
+            "PUT",
+            "/autoshift-observer-notification",
+            r#"{"status":"BOGUS"}"#,
+            "status",
+            "Member must satisfy enum value set: [ENABLED, DISABLED]",
+            "BOGUS",
+        ),
+        // An enum nested in a list of structures: the clause names the element's
+        // position, and the set stated is the one the service names for this member.
+        Row::new(
+            "CreatePracticeRunConfiguration/outcomeAlarms type outside its value set",
+            "POST",
+            "/configuration",
+            &practice_run_body(&["BOGUS_TYPE"]),
+            "outcomeAlarms.1.member.type",
+            CONTROL_CONDITION_TYPES,
+            "BOGUS_TYPE",
+        ),
+        Row::new(
+            "CreatePracticeRunConfiguration/outcomeAlarms type, second element",
+            "POST",
+            "/configuration",
+            &practice_run_body(&["CLOUDWATCH", "SOMETHING_ELSE"]),
+            "outcomeAlarms.2.member.type",
+            CONTROL_CONDITION_TYPES,
+            "SOMETHING_ELSE",
+        ),
+        Row::new(
+            "UpdatePracticeRunConfiguration/blockingAlarms type outside its value set",
+            "PATCH",
+            &format!("/configuration/{}", encoded(UNREGISTERED_ARN)),
+            &serde_json::json!({
+                "blockingAlarms": [{ "type": "NOT_AN_ALARM", "alarmIdentifier": ALARM_ARN }],
+            })
+            .to_string(),
+            "blockingAlarms.1.member.type",
+            CONTROL_CONDITION_TYPES,
+            "NOT_AN_ALARM",
         ),
         // `@range`, each end of the bound the model publishes, on both list operations
         // that page.
@@ -234,6 +315,15 @@ fn rows() -> Vec<Row> {
             "maxResults",
             "Member must have value less than or equal to 100",
             "1000",
+        ),
+        Row::new(
+            "ListAutoshifts/maxResults above its maximum",
+            "GET",
+            "/autoshifts?maxResults=101",
+            "",
+            "maxResults",
+            "Member must have value less than or equal to 100",
+            "101",
         ),
     ]
 }
@@ -265,7 +355,7 @@ async fn refusal_message(row: &Row) -> String {
 }
 
 #[tokio::test]
-async fn a_refused_value_is_stated_without_quoting_the_submitted_value_back() {
+async fn a_refused_value_is_quoted_back_in_the_clause() {
     for row in rows() {
         let message = refusal_message(&row).await;
         assert_eq!(
@@ -276,8 +366,8 @@ async fn a_refused_value_is_stated_without_quoting_the_submitted_value_back() {
             row.expected()
         );
         assert!(
-            !message.contains(&format!("Value '{}'", row.submitted)),
-            "case {:?}: the clause must not quote the submitted value back, got {message:?}",
+            message.contains(&format!("Value '{}' at '{}'", row.submitted, row.member)),
+            "case {:?}: the clause quotes the submitted value back, got {message:?}",
             row.case
         );
     }
@@ -312,7 +402,7 @@ async fn a_pattern_is_reported_without_the_anchors_the_model_spells_it_with() {
 
 #[tokio::test]
 async fn an_absent_required_member_keeps_the_only_clause_with_no_value_to_state() {
-    // The boundary of the no-echo rule: an absent member HAS no submitted value, so its
+    // The boundary of the quoting rule: an absent member HAS no submitted value, so its
     // clause stays the framework's `Value null at '<member>' …`.
     let (router, _engine) = emulator();
     let (status, body) = call(&router, "POST", "/zonalshifts", "{}").await;
@@ -341,7 +431,8 @@ async fn an_absent_required_member_keeps_the_only_clause_with_no_value_to_state(
 #[tokio::test]
 async fn several_violations_are_counted_and_joined_in_one_envelope() {
     // Two members outside their constraints in one request: the count is the framework's
-    // plural envelope, and EVERY clause drops its echo — not just the first.
+    // plural envelope, and EVERY clause quotes its own submitted value — not just the
+    // first.
     let (router, _engine) = emulator();
     let (status, body) = call(
         &router,
@@ -362,20 +453,16 @@ async fn several_violations_are_counted_and_joined_in_one_envelope() {
         "the envelope counts both violations, got {message:?}"
     );
     for clause in [
-        "Value at 'status' failed to satisfy constraint: Member must satisfy enum value set: \
-         [ACTIVE, EXPIRED, CANCELED]",
-        "Value at 'maxResults' failed to satisfy constraint: Member must have value greater \
-         than or equal to 1",
+        "Value 'PENDING' at 'status' failed to satisfy constraint: Member must satisfy enum \
+         value set: [EXPIRED, ACTIVE, CANCELED]",
+        "Value '0' at 'maxResults' failed to satisfy constraint: Member must have value \
+         greater than or equal to 1",
     ] {
         assert!(
             message.contains(clause),
             "the envelope states {clause:?}, got {message:?}"
         );
     }
-    assert!(
-        !message.contains("Value 'PENDING'") && !message.contains("Value '0'"),
-        "no clause quotes its submitted value back, got {message:?}"
-    );
 }
 
 #[tokio::test]
@@ -442,6 +529,18 @@ async fn a_value_inside_a_declared_bound_is_not_refused() {
             "PUT",
             format!("/managedresources/{}", encoded(UNREGISTERED_ARN)),
             r#"{"zonalAutoshiftStatus":"ENABLED"}"#.to_string(),
+        ),
+        (
+            "status inside AutoshiftObserverNotificationStatus",
+            "PUT",
+            "/autoshift-observer-notification".to_string(),
+            r#"{"status":"DISABLED"}"#.to_string(),
+        ),
+        (
+            "a control condition type inside the published value set",
+            "POST",
+            "/configuration".to_string(),
+            practice_run_body(&["CLOUDWATCH"]),
         ),
     ];
     for (case, method, uri, body_text) in accepted {
