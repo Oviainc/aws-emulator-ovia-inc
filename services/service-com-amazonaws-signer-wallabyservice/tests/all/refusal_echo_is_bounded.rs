@@ -22,6 +22,12 @@
 //! refuses it before a handler sees it, so it is quoted as it arrived. Neither is
 //! a refusal that quotes NO part of the request (a tagging `resourceArn` that is
 //! no ARN at all, a `nextToken`): there is nothing for a ceiling to bound.
+//!
+//! One refusal of this service cannot be driven from the table above, because
+//! reaching it takes state the oversized value itself had to be stored in: the 409
+//! a grant takes when it names a `statementId` the profile's policy ALREADY holds.
+//! It is driven on its own below, over the same size classes, together with the
+//! size range past which such an id never reaches that clause at all.
 
 use std::sync::Arc;
 
@@ -710,6 +716,171 @@ async fn both_refusals_of_one_platform_id_are_bounded_alike() {
              one of {} bytes",
             BOUND + 1_024,
             message.len()
+        );
+    }
+}
+
+/// The most bytes a statement id can have and still be STORED in a policy: the
+/// bound one profile's policy holds (20 480 bytes, spelled out rather than
+/// imported — `crate::state::permissions::MAX_POLICY_SIZE_BYTES`) less a kilobyte
+/// for the policy document around the one statement that carries the id.
+const STORABLE_STATEMENT_ID: usize = 20_480 - 1_024;
+
+/// The size classes of [`fillers`] a policy can hold a statement id in — derived
+/// from that one table so the two cannot drift apart.
+///
+/// The duplicate refusal exists only once the id is STORED, so a class past what a
+/// policy holds is driven by
+/// [`a_statement_id_past_the_policy_bound_is_never_quoted`] instead.
+fn statement_id_fillers() -> Vec<(&'static str, String)> {
+    fillers(Filler::AnyText)
+        .into_iter()
+        .filter(|(_, value)| value.len() <= STORABLE_STATEMENT_ID)
+        .collect()
+}
+
+/// A grant that names a `statementId` the profile's policy already holds states
+/// that id through the SAME ceiling as every row above.
+///
+/// This is the one refusal of the permissions slice the table cannot reach: the
+/// conflict exists only once the oversized id is in the policy, so each row stores
+/// it first and then names it again. The conflict is decided before the policy's
+/// byte bound, so the clause is reached with the caller's own id in hand — and the
+/// refusal is a refusal, so the policy it was judged against is left as it was.
+///
+/// Each row gets its own profile: one policy holds a bounded number of bytes and
+/// these ids are most of that bound.
+#[tokio::test]
+async fn a_duplicate_statement_id_is_quoted_up_to_one_ceiling() {
+    let router = emulator();
+
+    for (index, (size, statement_id)) in statement_id_fillers().into_iter().enumerate() {
+        let profile = format!("Echo_Duplicate_Profile_{index}");
+        seed_profile(&router, &profile).await;
+        let grant = Request {
+            method: "POST",
+            uri: format!("/signing-profiles/{profile}/permissions"),
+            body: Some(json!({
+                "statementId": statement_id,
+                "action": "signer:StartSigningJob",
+                "principal": ACCOUNT_ID,
+            })),
+        };
+
+        let stored = call(&router, &grant).await;
+        assert_eq!(
+            stored.status, 200,
+            "case {size:?}: expected the first grant to be stored (HTTP 200), got {} {:?}",
+            stored.status, stored.body
+        );
+        let revision = stored.body["revisionId"].as_str().unwrap_or_default().to_string();
+
+        let again = call(&router, &grant).await;
+        assert_eq!(
+            again.status, 409,
+            "case {size:?}: expected HTTP 409, got {} {:?}",
+            again.status, again.body
+        );
+        let expected = format!(
+            "statement id {} already exists in the permissions of profile {profile}",
+            quoted(&statement_id)
+        );
+        assert_eq!(
+            again.message(),
+            expected,
+            "case {size:?}: expected a message of {} bytes for an id of {} bytes, got one of {} \
+             bytes: {:?}",
+            expected.len(),
+            statement_id.len(),
+            again.message().len(),
+            again.message().chars().take(60).collect::<String>()
+        );
+
+        // The refused grant changed nothing: the policy still holds the one
+        // statement it was seeded with, at the revision that seeding minted.
+        let listed = call(
+            &router,
+            &Request {
+                method: "GET",
+                uri: format!("/signing-profiles/{profile}/permissions"),
+                body: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            listed.body["permissions"].as_array().map(Vec::len),
+            Some(1),
+            "case {size:?}: expected the refused duplicate to leave one statement, got {:?}",
+            listed.body["permissions"]
+        );
+        assert_eq!(
+            listed.body["revisionId"].as_str(),
+            Some(revision.as_str()),
+            "case {size:?}: expected the refused duplicate to leave the revision at {revision:?}, \
+             got {:?}",
+            listed.body["revisionId"]
+        );
+    }
+}
+
+/// A `statementId` larger than a whole policy may hold never reaches the
+/// duplicate-statement clause at all: the grant is refused for the policy's byte
+/// bound, and that refusal states sizes instead of quoting the value — so the
+/// error body is bounded over the WHOLE size range this member admits, not only up
+/// to the ceiling.
+#[tokio::test]
+async fn a_statement_id_past_the_policy_bound_is_never_quoted() {
+    /// The most bytes one profile's permission policy holds, spelled out rather
+    /// than imported (`crate::state::permissions::MAX_POLICY_SIZE_BYTES`): an id
+    /// longer than this cannot be in a policy, so no conflict can quote it.
+    const MAX_POLICY_SIZE_BYTES: usize = 20_480;
+
+    /// The fixed prose of the refusal, far longer than the sentence under test:
+    /// the point is that the message does not GROW with the request.
+    const PROSE: usize = 1_024;
+
+    let router = emulator();
+    let profile = "Echo_Oversized_Statement_Profile";
+    seed_profile(&router, profile).await;
+
+    for (size, statement_id) in [
+        (
+            "an id one byte past what a policy holds",
+            "s".repeat(MAX_POLICY_SIZE_BYTES + 1),
+        ),
+        ("an id of 64 KiB", "s".repeat(64 * 1024)),
+        ("a megabyte of id", "s".repeat(1024 * 1024)),
+    ] {
+        let answer = call(
+            &router,
+            &Request {
+                method: "POST",
+                uri: format!("/signing-profiles/{profile}/permissions"),
+                body: Some(json!({
+                    "statementId": statement_id,
+                    "action": "signer:StartSigningJob",
+                    "principal": ACCOUNT_ID,
+                })),
+            },
+        )
+        .await;
+        assert_eq!(
+            answer.status, 402,
+            "case {size:?}: expected HTTP 402, got {} {:?}",
+            answer.status,
+            answer.message().chars().take(60).collect::<String>()
+        );
+        assert!(
+            answer.message().len() <= PROSE,
+            "case {size:?}: expected a message within {PROSE} bytes for an id of {} bytes, got \
+             one of {} bytes",
+            statement_id.len(),
+            answer.message().len()
+        );
+        assert!(
+            !answer.message().contains(&statement_id[..256]),
+            "case {size:?}: expected the refusal to quote no part of the id, got {:?}",
+            answer.message().chars().take(60).collect::<String>()
         );
     }
 }

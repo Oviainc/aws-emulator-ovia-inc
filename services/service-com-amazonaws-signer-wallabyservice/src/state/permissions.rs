@@ -55,6 +55,31 @@ pub fn revision_mismatch_message(specified: &str, current: &str) -> String {
     )
 }
 
+/// The refusal prose for a grant naming a `statementId` the profile's policy
+/// already holds: a statement id identifies a statement WITHIN the policy, so the
+/// policy cannot hold two of them.
+///
+/// `statementId` is a bare string in the model, so the supplied value is quoted
+/// through the one ceiling this crate states for a request value a clause carries
+/// ([`super::stated_value`]); `profileName` is bounded by its modelled shape and
+/// is stated as it arrived.
+pub fn duplicate_statement_message(statement_id: &str, profile_name: &str) -> String {
+    format!(
+        "statement id {} already exists in the permissions of profile {profile_name}",
+        super::stated_value(statement_id)
+    )
+}
+
+/// The refusal prose for a call naming a `statementId` the profile's policy does
+/// not hold — the other half of the same question, so it is worded and bounded
+/// beside [`duplicate_statement_message`].
+pub fn statement_not_found_message(statement_id: &str, profile_name: &str) -> String {
+    format!(
+        "statement id {} does not exist in the permissions of profile {profile_name}",
+        super::stated_value(statement_id)
+    )
+}
+
 /// The request would carry a resource past a service limit: the modelled shape's
 /// own name.
 pub const ERROR_CODE_SERVICE_LIMIT_EXCEEDED: &str = "ServiceLimitExceededException";

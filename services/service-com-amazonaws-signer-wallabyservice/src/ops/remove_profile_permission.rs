@@ -136,14 +136,13 @@ fn policy_not_found(profile_name: &str) -> RemoveProfilePermissionError {
 /// The modelled 404 for a statement id the profile's permission policy does not
 /// hold.
 ///
-/// `statementId` is a bare string in the model, so it is quoted through the one
-/// ceiling this crate states for a request value a clause carries.
+/// The clause is worded where every clause of this slice is worded, so the one
+/// ceiling an unbounded request value is quoted through is applied there.
 fn statement_not_found(profile_name: &str, statement_id: &str) -> RemoveProfilePermissionError {
     RemoveProfilePermissionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!(
-            "statement id {} does not exist in the permissions of profile \
-             {profile_name}",
-            crate::state::stated_value(statement_id)
+        message: Some(crate::state::permissions::statement_not_found_message(
+            statement_id,
+            profile_name,
         )),
         code: Some(crate::state::ERROR_CODE_NOT_FOUND.to_string()),
     })

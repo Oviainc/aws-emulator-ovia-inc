@@ -320,16 +320,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A statement id identifies a statement WITHIN the policy, so the policy
-        // cannot hold two of them; replacing one means removing it first.
+        // cannot hold two of them; replacing one means removing it first. The
+        // clause is worded where every clause of this slice is worded, so the one
+        // ceiling an unbounded request value is quoted through is applied there.
         if store
             .profile_policy(&region, &input.profile_name)
             .is_some_and(|policy| policy.statements.contains_key(&input.statement_id))
         {
-            return Err(conflict(format!(
-                "statement id {} already exists in the permissions of profile {}",
-                crate::state::stated_value(&input.statement_id),
-                input.profile_name
-            )));
+            return Err(conflict(
+                crate::state::permissions::duplicate_statement_message(
+                    &input.statement_id,
+                    &input.profile_name,
+                ),
+            ));
         }
 
         let statement = crate::state::permissions::ProfilePermissionRecord {
