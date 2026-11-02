@@ -25,3 +25,5 @@ mod update_stack;
 mod usage_report_subscription;
 #[path = "all/user_pool.rs"]
 mod user_pool;
+#[path = "all/user_stack_associations.rs"]
+mod user_stack_associations;

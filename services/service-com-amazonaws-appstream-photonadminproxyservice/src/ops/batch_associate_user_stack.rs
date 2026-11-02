@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchAssociateUserStack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchAssociateUserStack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchAssociateUserStack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes one `(AuthenticationType, UserName, StackName)` edge per
+//! association it applies, so a later `DescribeUserStackAssociations` reports it and
+//! `BatchDisassociateUserStack` can remove it. An association naming a stack or a user
+//! this account does not hold is not applied and is reported in the result's `errors`
+//! list with the modelled error code for what was missing, so the rest of the batch is
+//! still applied and the call itself answers HTTP 200.
 //!
 //! ## Shape of an operation
 //!
@@ -138,20 +135,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchAssociateUserStack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchAssociateUserStackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchAssociateUserStack"))
+        // The only identities this service holds are its user pool's, which `CreateUser`
+        // and `DescribeUsers` admit for USERPOOL alone; an association naming any other
+        // authentication type names an identity source this emulator does not have, so
+        // the whole request is an incorrect combination rather than a per-item failure.
+        if let Some(association) = input.user_stack_associations.iter().find(|association| {
+            association.authentication_type != crate::state::USER_POOL_AUTHENTICATION_TYPE
+        }) {
+            return Err(
+                BatchAssociateUserStackErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(crate::state::authentication_type_not_user_pool_message(
+                            &association.authentication_type,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("BatchAssociateUserStack")
+        })?;
+        let mut state = state.lock();
+
+        // One entry per association this call could not apply. A batch reports its
+        // failures in the result rather than refusing the whole call, so an association
+        // that cannot be applied leaves the others applied.
+        let mut errors = Vec::new();
+        for association in input.user_stack_associations {
+            // The stack is the resource the user is being entitled to, so it is checked
+            // first: an association naming neither an existing stack nor an existing user
+            // is reported against the stack it asked for.
+            if !state.stacks.contains_key(&association.stack_name) {
+                let message = crate::state::resource_not_found_message(
+                    crate::state::STACK_KIND,
+                    &association.stack_name,
+                );
+                errors.push(crate::state::user_stack_association_error(
+                    association,
+                    crate::state::ASSOCIATION_ERROR_STACK_NOT_FOUND,
+                    message,
+                ));
+                continue;
+            }
+            let identity = (
+                association.authentication_type.clone(),
+                association.user_name.clone(),
+            );
+            if !state.users.contains_key(&identity) {
+                errors.push(crate::state::user_stack_association_error(
+                    association,
+                    crate::state::ASSOCIATION_ERROR_USER_NAME_NOT_FOUND,
+                    crate::state::USER_NOT_FOUND_MESSAGE,
+                ));
+                continue;
+            }
+
+            let key = crate::state::user_stack_association_key(&association);
+            // A NEW edge must not grow the store past its ceiling; a repeat of an edge
+            // already held inserts nothing, so it is never refused. This operation models
+            // no limit error, so the ceiling is reported as a per-item failure.
+            if !state.user_stack_associations.contains_key(&key)
+                && state.user_stack_associations.len() >= crate::state::MAX_RECORDS_PER_STORE
+            {
+                errors.push(crate::state::user_stack_association_error(
+                    association,
+                    crate::state::ASSOCIATION_ERROR_INTERNAL_ERROR,
+                    crate::state::limit_exceeded_message("user/stack associations"),
+                ));
+                continue;
+            }
+            // Keyed by the identity, so associating the same user with the same stack
+            // twice is idempotent rather than a second edge, and the stored value is the
+            // association exactly as this request gave it.
+            state.user_stack_associations.insert(key, association);
+        }
+
+        // The errors list is always reported: an empty one says every association in the
+        // batch was applied, which is a value rather than a missing member.
+        Ok(BatchAssociateUserStackOutput {
+            errors: Some(errors),
+        })
     }
 }

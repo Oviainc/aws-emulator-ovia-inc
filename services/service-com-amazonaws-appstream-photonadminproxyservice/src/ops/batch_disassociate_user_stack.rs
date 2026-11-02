@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDisassociateUserStack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDisassociateUserStack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDisassociateUserStack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the `(AuthenticationType, UserName, StackName)` edges it is
+//! given from this service's store, so a later `DescribeUserStackAssociations` no longer
+//! reports them. Removal is idempotent: an edge the store does not hold is already
+//! absent. An association naming a stack this account does not hold is reported in the
+//! result's `errors` list, and the rest of the batch is still removed.
 //!
 //! ## Shape of an operation
 //!
@@ -137,20 +133,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDisassociateUserStack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDisassociateUserStackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDisassociateUserStack"))
+        // Same rule as `batch_associate_user_stack.rs`: the only identities this service
+        // holds are its user pool's, so an association naming any other authentication
+        // type names an identity source this emulator does not have.
+        if let Some(association) = input.user_stack_associations.iter().find(|association| {
+            association.authentication_type != crate::state::USER_POOL_AUTHENTICATION_TYPE
+        }) {
+            return Err(
+                BatchDisassociateUserStackErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(crate::state::authentication_type_not_user_pool_message(
+                            &association.authentication_type,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("BatchDisassociateUserStack")
+        })?;
+        let mut state = state.lock();
+
+        // One entry per association this call could not apply; the others are still
+        // removed.
+        let mut errors = Vec::new();
+        for association in input.user_stack_associations {
+            // A stack the account does not hold is one no user can be disassociated
+            // from, so it is reported rather than silently accepted.
+            if !state.stacks.contains_key(&association.stack_name) {
+                let message = crate::state::resource_not_found_message(
+                    crate::state::STACK_KIND,
+                    &association.stack_name,
+                );
+                errors.push(crate::state::user_stack_association_error(
+                    association,
+                    crate::state::ASSOCIATION_ERROR_STACK_NOT_FOUND,
+                    message,
+                ));
+                continue;
+            }
+            // The identity is what the association is stored under, so removing it needs
+            // nothing but the key — and an edge the store does not hold is already
+            // absent, which is what this call asks for. The user pool is not consulted:
+            // an entitlement can be taken away from an identity the pool no longer holds.
+            state
+                .user_stack_associations
+                .remove(&crate::state::user_stack_association_key(&association));
+        }
+
+        // The errors list is always reported: an empty one says every association in the
+        // batch was removed, which is a value rather than a missing member.
+        Ok(BatchDisassociateUserStackOutput {
+            errors: Some(errors),
+        })
     }
 }

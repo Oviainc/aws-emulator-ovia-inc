@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUserStackAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUserStackAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeUserStackAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored user/stack associations matching the stack name or
+//! the user identity the request asks about, a page at a time. A request that names
+//! neither answers `InvalidParameterCombinationException` (HTTP 400). A read only ever
+//! reads the store, so it cannot change what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +110,13 @@ impl From<DescribeUserStackAssociationsErrorModeled> for DescribeUserStackAssoci
     }
 }
 
+/// The sentence a request naming neither of the two identities this read accepts is
+/// refused with. It restates the operation's own documented rule: "You must specify
+/// either or both of the following: The stack name / The user name (email address of the
+/// user associated with the stack) and the authentication type for the user".
+const MISSING_FILTER_MESSAGE: &str = "You must specify either the stack name, or the \
+     user name and the authentication type for the user.";
+
 /// The `DescribeUserStackAssociations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,20 +151,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUserStackAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUserStackAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUserStackAssociations"))
+        // "You must specify either or both of the following: The stack name / The user
+        // name … and the authentication type for the user": the user name alone does not
+        // name an identity, so a request carrying neither of those two asks for every
+        // association in the account, which this read does not answer.
+        let by_stack = input.stack_name.is_some();
+        let by_user = input.user_name.is_some() && input.authentication_type.is_some();
+        if !by_stack && !by_user {
+            return Err(
+                DescribeUserStackAssociationsErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(MISSING_FILTER_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The authentication type for the user who is associated with the stack. You
+        // must specify USERPOOL": the associations this operation reports are the
+        // account's user pool users', so any other authentication type names identities
+        // it does not manage.
+        if let Some(authentication_type) = input.authentication_type.as_deref() {
+            if authentication_type != crate::state::USER_POOL_AUTHENTICATION_TYPE {
+                return Err(
+                    DescribeUserStackAssociationsErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(
+                                crate::state::authentication_type_not_user_pool_message(
+                                    authentication_type,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `MaxResults` is "the maximum size of each page of results", so a page of fewer
+        // than one record is not a size this operation can answer with.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "MaxResults must be at least 1, was {max_results}"
+                )));
+            }
+            // Clamped to the page this read renders, so no request sizes the page it is
+            // answered with: a caller asking for more still sees every association by
+            // following the token.
+            Some(max_results) => usize::try_from(max_results)
+                .unwrap_or(crate::state::USER_STACK_ASSOCIATION_PAGE_SIZE)
+                .min(crate::state::USER_STACK_ASSOCIATION_PAGE_SIZE),
+            None => crate::state::USER_STACK_ASSOCIATION_PAGE_SIZE,
+        };
+
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("DescribeUserStackAssociations")
+        })?;
+        // A read: the guard is only ever read through, so a Describe can never change
+        // what a later caller sees.
+        let state = state.lock();
+
+        // Every member the request carries narrows the read — "either or both" — so a
+        // request naming a stack AND a user reports only that user's association with
+        // that stack.
+        let filter = crate::state::UserStackAssociationFilter {
+            stack_name: input.stack_name.as_deref(),
+            user_name: input.user_name.as_deref(),
+            authentication_type: input.authentication_type.as_deref(),
+        };
+        let page = state
+            .user_stack_associations_page(&filter, input.next_token.as_deref(), page_size)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(
+                    "NextToken is not a pagination token this service issued",
+                )
+            })?;
+
+        Ok(DescribeUserStackAssociationsOutput {
+            user_stack_associations: Some(page.associations),
+            next_token: page.next_token,
+        })
     }
 }

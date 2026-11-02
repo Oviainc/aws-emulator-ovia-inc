@@ -18,6 +18,11 @@
 //! `(AuthenticationType, UserName)` identity it allocates, and `DescribeUsers` renders
 //! the stored records of one authentication type back, a page at a time.
 //!
+//! Which users may reach which stacks lives here too: `BatchAssociateUserStack` writes
+//! one edge per association it applies, `BatchDisassociateUserStack` removes the edges it
+//! is given, and `DescribeUserStackAssociations` reports the edges matching the stack or
+//! the user identity it is asked about, a page at a time.
+//!
 //! Records hold the MODELLED sub-shapes (`StorageConnector`, `UserSetting`,
 //! `VpcConfig`, …) rather than copies of them, so what a Describe returns is literally
 //! what the Create persisted.
@@ -28,7 +33,8 @@ use crate::ops::types::{
     AccessEndpoint, AgentAccessConfig, ApplicationSettingsResponse, ComputeCapacityStatus,
     ContentRedirection, DomainJoinInfo, Fleet, FleetError, LastReportGenerationExecutionError,
     S3Location, Stack, StackError, StorageConnector, StreamingExperienceSettings,
-    UsageReportSubscription, User, UserSetting, VolumeConfig, VpcConfig,
+    UsageReportSubscription, User, UserSetting, UserStackAssociation, UserStackAssociationError,
+    VolumeConfig, VpcConfig,
 };
 
 /// The ARN namespace this service stamps on every resource ARN
@@ -61,13 +67,15 @@ pub const DESCRIBE_PAGE_SIZE: usize = 50;
 /// This is NOT AWS's service quota — AppStream's published stack and fleet limits are
 /// per-account and adjustable, and nothing here claims to reproduce them. It is the
 /// emulator's own memory ceiling: every successful `CreateStack`, `CreateFleet`,
-/// `AssociateFleet` and `CreateUser` inserts a record that lives until a caller deletes
-/// it, so without a ceiling a caller could grow the process until the host runs out of
-/// memory. Each of those handlers checks the store it writes against this ceiling before
-/// inserting, and a request that would cross it is refused with
-/// `LimitExceededException`, the modelled error AWS itself uses for "the requested limit
-/// exceeds the permitted limit for an account", so the refusal is one a real client
-/// already handles.
+/// `AssociateFleet`, `CreateUser` and `BatchAssociateUserStack` inserts a record that
+/// lives until a caller deletes it, so without a ceiling a caller could grow the process
+/// until the host runs out of memory. Each of those handlers checks the store it writes
+/// against this ceiling before inserting, and a request that would cross it is refused
+/// with `LimitExceededException`, the modelled error AWS itself uses for "the requested
+/// limit exceeds the permitted limit for an account", so the refusal is one a real client
+/// already handles. A batch operation, whose modelled result reports per-item failures
+/// instead of refusing the whole call, reports it as a per-item error
+/// ([`ASSOCIATION_ERROR_INTERNAL_ERROR`]) carrying that same sentence.
 pub const MAX_RECORDS_PER_STORE: usize = 1_000;
 
 /// The message a store at [`MAX_RECORDS_PER_STORE`] refuses a new record with; `store`
@@ -105,6 +113,34 @@ pub const USER_POOL_AUTHENTICATION_TYPE: &str = "USERPOOL";
 /// CONFIRMED by setting their own password from the welcome email, which no clock makes
 /// due, so this is where a created user stays until that happens.
 pub const USER_STATUS_UNCONFIRMED: &str = "UNCONFIRMED";
+
+/// AWS's sentence for a user pool identity that is not in the pool.
+///
+/// The mirror image of [`USER_ALREADY_EXISTS_MESSAGE`], and variable-part-free for the
+/// same reason: the sentence states that no user has that username without echoing the
+/// username back, so the refusal carries nothing from the request.
+pub const USER_NOT_FOUND_MESSAGE: &str = "A user with that username does not exist.";
+
+/// The `UserStackAssociationError.ErrorCode` a batch reports for an association naming a
+/// stack this account does not hold, one of `USER_STACK_ASSOCIATION_ERROR_CODE_VALUES`
+/// (`ops/types/shared_types.rs`).
+pub const ASSOCIATION_ERROR_STACK_NOT_FOUND: &str = "STACK_NOT_FOUND";
+
+/// The `ErrorCode` a batch reports for an association naming a user the pool does not
+/// hold.
+pub const ASSOCIATION_ERROR_USER_NAME_NOT_FOUND: &str = "USER_NAME_NOT_FOUND";
+
+/// The `ErrorCode` a batch reports for an association it could not apply for a reason on
+/// the service's side rather than in the request — here, the association store standing
+/// at [`MAX_RECORDS_PER_STORE`].
+pub const ASSOCIATION_ERROR_INTERNAL_ERROR: &str = "INTERNAL_ERROR";
+
+/// How many user/stack associations one `DescribeUserStackAssociations` page carries.
+///
+/// The model caps `UserStackAssociationList` at 25 members and that list is what a page
+/// of the read is rendered into, so a page holds at most 25 associations however large a
+/// `MaxResults` a request asks for.
+pub const USER_STACK_ASSOCIATION_PAGE_SIZE: usize = 25;
 
 /// The sentence a request refused for naming an authentication type the user pool
 /// operations do not manage carries; the only variable part is the value the request
@@ -437,6 +473,60 @@ impl UserRecord {
     }
 }
 
+/// The identity one user/stack association is stored under:
+/// `(AuthenticationType, UserName, StackName)`.
+///
+/// All three members are required on the modelled association, and together they are
+/// what a `BatchDisassociateUserStack` names to remove an edge, so they are the key.
+/// Ordering the authentication type and the user name before the stack name puts one
+/// user's associations in a contiguous range.
+pub type UserStackAssociationKey = (String, String, String);
+
+/// The key the given association is stored under.
+pub fn user_stack_association_key(association: &UserStackAssociation) -> UserStackAssociationKey {
+    (
+        association.authentication_type.clone(),
+        association.user_name.clone(),
+        association.stack_name.clone(),
+    )
+}
+
+/// The per-item failure a batch reports for one association it did not apply: the
+/// association as the request gave it, the modelled error code, and the sentence for that
+/// error class.
+pub fn user_stack_association_error(
+    association: UserStackAssociation,
+    error_code: &str,
+    error_message: impl Into<String>,
+) -> UserStackAssociationError {
+    UserStackAssociationError {
+        user_stack_association: Some(association),
+        error_code: Some(error_code.to_string()),
+        error_message: Some(error_message.into()),
+    }
+}
+
+/// Which associations a read reports: every member left `None` filters nothing, so a
+/// read asked only about a stack reports that stack's associations whoever the user is.
+#[derive(Debug, Default)]
+pub struct UserStackAssociationFilter<'a> {
+    pub stack_name: Option<&'a str>,
+    pub user_name: Option<&'a str>,
+    pub authentication_type: Option<&'a str>,
+}
+
+impl UserStackAssociationFilter<'_> {
+    /// Whether the association stored under `key` is one this filter reports.
+    fn matches(&self, key: &UserStackAssociationKey) -> bool {
+        let (authentication_type, user_name, stack_name) = key;
+        self.stack_name.is_none_or(|name| name == stack_name)
+            && self.user_name.is_none_or(|name| name == user_name)
+            && self
+                .authentication_type
+                .is_none_or(|kind| kind == authentication_type)
+    }
+}
+
 /// Per-service state for com-amazonaws-appstream-photonadminproxyservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
@@ -453,6 +543,14 @@ pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
     /// created under. `BTreeMap` so every page of a read walks a stable order, and so
     /// one authentication type's users form a contiguous range.
     pub users: BTreeMap<(String, String), UserRecord>,
+    /// User/stack associations by [`UserStackAssociationKey`] — one edge per user
+    /// entitled to one stack, written by `BatchAssociateUserStack` and removed by
+    /// `BatchDisassociateUserStack`.
+    ///
+    /// The stored value is the MODELLED association rather than a copy of its members, so
+    /// what `DescribeUserStackAssociations` renders is literally what the batch
+    /// persisted. `BTreeMap` so every page of a read walks a stable order.
+    pub user_stack_associations: BTreeMap<UserStackAssociationKey, UserStackAssociation>,
 }
 
 impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
@@ -520,6 +618,43 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
             .map(|(fleet, _)| fleet.clone())
             .collect()
     }
+
+    /// One page of the user/stack associations `filter` reports: the associations to
+    /// render, and the token that resumes after them. `None` means `next_token` is not a
+    /// token this service minted.
+    ///
+    /// The associations are read straight from the stored map in key order, so a page
+    /// renders exactly the records the store holds — there is no second lookup that could
+    /// miss one — and following the token walks every matching association exactly once
+    /// even when associations are added between calls.
+    pub fn user_stack_associations_page(
+        &self,
+        filter: &UserStackAssociationFilter<'_>,
+        next_token: Option<&str>,
+        page_size: usize,
+    ) -> Option<UserStackAssociationPage> {
+        let resume_at = match next_token {
+            Some(token) => Some(decode_association_cursor(token)?),
+            None => None,
+        };
+        let mut remaining = self
+            .user_stack_associations
+            .iter()
+            .filter(|(key, _)| resume_at.as_ref().is_none_or(|from| *key >= from))
+            .filter(|(key, _)| filter.matches(key));
+        // A page holds at least one record, so following the token always advances.
+        let associations: Vec<UserStackAssociation> = remaining
+            .by_ref()
+            .take(page_size.max(1))
+            .map(|(_, association)| association.clone())
+            .collect();
+        Some(UserStackAssociationPage {
+            next_token: remaining
+                .next()
+                .map(|(key, _)| encode_association_cursor(key)),
+            associations,
+        })
+    }
 }
 
 /// One page of a Describe: the names to render, and the opaque token that resumes after
@@ -541,6 +676,14 @@ pub struct UserPage {
     pub next_token: Option<String>,
 }
 
+/// One page of a `DescribeUserStackAssociations`: the associations to render, and the
+/// opaque token that resumes after them.
+#[derive(Debug)]
+pub struct UserStackAssociationPage {
+    pub associations: Vec<UserStackAssociation>,
+    pub next_token: Option<String>,
+}
+
 /// Encode a pagination cursor (the name of the first record of the next page).
 ///
 /// A real AppStream `NextToken` is opaque, so the cursor is hex-encoded rather than
@@ -553,6 +696,35 @@ fn encode_cursor(name: &str) -> String {
 /// The inverse of [`encode_cursor`]; `None` for a token this service did not mint.
 fn decode_cursor(token: &str) -> Option<String> {
     String::from_utf8(hex::decode(token).ok()?).ok()
+}
+
+/// The byte that joins the three parts of a user/stack association cursor.
+///
+/// A newline cannot appear in any of them: `Username`'s pattern admits only letters,
+/// marks, symbols, numbers and punctuation, and a stored stack's name only
+/// `[a-zA-Z0-9_.-]`, so the joined form parses back to exactly the key it was built from.
+const ASSOCIATION_CURSOR_SEPARATOR: char = '\n';
+
+/// Encode a user/stack association cursor: the key of the first record of the next page,
+/// hex-encoded for the same reason [`encode_cursor`] is.
+fn encode_association_cursor(key: &UserStackAssociationKey) -> String {
+    let (authentication_type, user_name, stack_name) = key;
+    encode_cursor(&format!(
+        "{authentication_type}{ASSOCIATION_CURSOR_SEPARATOR}{user_name}\
+         {ASSOCIATION_CURSOR_SEPARATOR}{stack_name}"
+    ))
+}
+
+/// The inverse of [`encode_association_cursor`]; `None` for a token this service did not
+/// mint.
+fn decode_association_cursor(token: &str) -> Option<UserStackAssociationKey> {
+    let decoded = decode_cursor(token)?;
+    let mut parts = decoded.splitn(3, ASSOCIATION_CURSOR_SEPARATOR);
+    Some((
+        parts.next()?.to_string(),
+        parts.next()?.to_string(),
+        parts.next()?.to_string(),
+    ))
 }
 
 /// Cut `all` (sorted, deduplicated record names) into the page that resumes at
