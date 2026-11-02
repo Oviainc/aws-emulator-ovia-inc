@@ -5,10 +5,11 @@
 //!
 //! `DeleteQueue` DOES model a `ConflictException`, but what the real service refuses with
 //! it is a queue that is still associated with something outside itself (a fleet, a
-//! limit) — associations this slice does not persist, since every
-//! `*QueueFleetAssociation` / `*QueueLimitAssociation` operation is still scaffolded. The
-//! jobs held under the queue are reached only through it, so they go with it rather than
-//! blocking the delete.
+//! limit). A queue's fleet associations are reached only through the queue
+//! (`.../queue-fleet-associations/{queueId}/{fleetId}`), so they go with it exactly as the
+//! jobs held under it do, and neither blocks the delete; a queue-limit association is not
+//! persisted by this slice, since every `*QueueLimitAssociation` operation is still
+//! scaffolded.
 //!
 //! ## Shape of an operation
 //!

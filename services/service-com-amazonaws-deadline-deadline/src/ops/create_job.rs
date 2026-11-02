@@ -401,6 +401,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             attachments: input.attachments,
             storage_profile_id: input.storage_profile_id,
             target_task_run_status: input.target_task_run_status,
+            // The job exists but the service has not assembled its tasks yet, so none of
+            // them can be scheduled: the run status reaches the submitted target when the
+            // clock-owed move to CREATE_COMPLETE materialises.
+            task_run_status: crate::state::TASK_RUN_STATUS_PENDING.to_string(),
             max_failed_tasks_count: input.max_failed_tasks_count,
             max_retries_per_task: input.max_retries_per_task,
             max_worker_count: input.max_worker_count,
@@ -414,6 +418,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ended_at: None,
             create_complete_due_at: Some(
                 ::std::time::Instant::now() + crate::state::JOB_CREATE_COMPLETE_AFTER,
+            ),
+            // The service places the created job against the fleets its queue schedules
+            // onto after answering, so that reconciliation is owed by the clock too (see
+            // `crate::state::JOB_RECONCILE_AFTER`).
+            reconcile_due_at: Some(
+                ::std::time::Instant::now() + crate::state::JOB_RECONCILE_AFTER,
             ),
         };
 

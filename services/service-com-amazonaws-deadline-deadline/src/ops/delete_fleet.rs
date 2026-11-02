@@ -3,13 +3,15 @@
 //! @op DeleteFleet
 //! Deletes a fleet from its farm in this service's store.
 //!
-//! `DeleteFleet` DOES model a `ConflictException`, but what the real service refuses with
-//! it is a fleet something outside it still depends on — a queue still associated with
-//! it, or a worker still registered to it. Neither is persisted by this slice: every
-//! `*QueueFleetAssociation` and every worker operation (`CreateWorker` / `DeleteWorker`)
-//! is still scaffolded, so no stored resource can hold a fleet back and the delete always
-//! removes it. A fleet whose create transition the clock has not made due yet is deleted
-//! the same way: that pending move is not something a caller has to wait out.
+//! `DeleteFleet` DOES model a `ConflictException`, and what the real service refuses with
+//! it is a fleet something outside it still depends on — a queue still associated with it,
+//! or a worker still registered to it. A queue's association is persisted by this slice
+//! (`CreateQueueFleetAssociation`), and deleting the fleet would leave it pointing at a
+//! fleet that no longer exists, so a fleet a queue is still associated with is refused and
+//! the association has to go first. A worker is not such a dependency: it is reached only
+//! through its fleet, so the registered workers go with the fleet rather than holding it
+//! back. A fleet whose create transition the clock has not made due yet is deleted the
+//! same way: that pending move is not something a caller has to wait out.
 //!
 //! `clientToken` is `@idempotencyToken` — the token the server uses to recognize retries
 //! of the same request — so a retried delete answers the success the first one gave
@@ -165,6 +167,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.farm(&input.farm_id).is_none() {
             return Err(DeleteFleetErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        // A queue that still has this fleet associated with it depends on the fleet: the
+        // association is reached through the queue, so removing the fleet would leave it
+        // naming one the store no longer holds. The queue in conflict is read from the
+        // store, and deleting the association releases the fleet.
+        let associated_queue = store
+            .queue_associated_with_fleet(&input.farm_id, &input.fleet_id)
+            .map(str::to_string);
+        if let Some(queue_id) = associated_queue {
+            return Err(DeleteFleetErrorModeled::ConflictException(
+                crate::state::fleet_associated_with_queue(&input.fleet_id, &queue_id),
             )
             .into());
         }

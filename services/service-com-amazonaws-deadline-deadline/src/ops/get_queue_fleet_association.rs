@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueueFleetAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQueueFleetAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQueueFleetAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the association between `queueId` and `fleetId` under `farmId` from this
+//! service's store.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +152,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQueueFleetAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueueFleetAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQueueFleetAssociation"))
+        // A read: it writes nothing, so a later caller sees exactly what it would have
+        // seen had this call never happened.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetQueueFleetAssociationErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        if store.farm(&input.farm_id).is_none() {
+            return Err(GetQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        if store.queue(&input.farm_id, &input.queue_id).is_none() {
+            return Err(GetQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+            )
+            .into());
+        }
+        // The association is identified by the pair of ids, so an unassociated pair is the
+        // association that can't be found: the resource reported missing is the
+        // association, named by the fleet the queue is not associated with.
+        let Some(association) =
+            store.queue_fleet_association(&input.farm_id, &input.queue_id, &input.fleet_id)
+        else {
+            return Err(GetQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION,
+                    &input.fleet_id,
+                ),
+            )
+            .into());
+        };
+
+        Ok(GetQueueFleetAssociationOutput {
+            queue_id: association.queue_id.clone(),
+            fleet_id: association.fleet_id.clone(),
+            status: association.status.clone(),
+            created_at: crate::state::timestamp(association.created_at),
+            created_by: association.created_by.clone(),
+            updated_at: association.updated_at.map(crate::state::timestamp),
+            updated_by: association.updated_by.clone(),
+        })
     }
 }

@@ -79,6 +79,47 @@ pub const JOB_LIFECYCLE_CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 /// compared on read.
 pub const JOB_CREATE_COMPLETE_AFTER: Duration = Duration::from_millis(500);
 
+/// `JobLifecycleStatus` a job reaches once the service has reconciled the created job
+/// against what its queue can schedule onto.
+pub const JOB_LIFECYCLE_UPDATE_SUCCEEDED: &str = "UPDATE_SUCCEEDED";
+
+/// `TaskRunStatus` a job carries while the service is still assembling it: the job exists
+/// but none of its tasks can be scheduled yet.
+///
+/// From `smithy_query(query="shape", shape="TaskRunStatus")`: `PENDING`, `READY`,
+/// `ASSIGNED`, `STARTING`, `SCHEDULED`, `INTERRUPTING`, `RUNNING`, `SUSPENDED`,
+/// `CANCELED`, `FAILED`, `SUCCEEDED`, `NOT_COMPATIBLE`.
+pub const TASK_RUN_STATUS_PENDING: &str = "PENDING";
+
+/// `TaskRunStatus` of a job whose tasks the service is free to hand to a worker.
+pub const TASK_RUN_STATUS_READY: &str = "READY";
+
+/// `TaskRunStatus` a job reaches when no fleet that could run its tasks is associated with
+/// its queue, so nothing can ever pick it up.
+pub const TASK_RUN_STATUS_NOT_COMPATIBLE: &str = "NOT_COMPATIBLE";
+
+/// How long after `CreateJob` the service's reconciliation of the job against the fleets
+/// its queue schedules onto comes due.
+///
+/// A created job is not where it ends up: the service places it against the queue's fleets
+/// after answering, so that move is owed by the clock rather than by any later call. AWS
+/// documents no duration for it, so this is the emulator's chosen span. It is the long one
+/// of this service's spans on purpose: a created job has to stay OBSERVABLE at the
+/// lifecycle status its creation settled it to — the status callers poll a fresh job for —
+/// for long enough that a client reading it every few seconds sees that status before this
+/// move takes the job past it. Nothing ever sleeps for it: the due instant is stored and
+/// compared on read.
+pub const JOB_RECONCILE_AFTER: Duration = Duration::from_secs(15);
+
+/// `QueueFleetAssociationStatus` a freshly created queue-fleet association carries.
+///
+/// From `smithy_query(query="shape", shape="QueueFleetAssociationStatus")`: `ACTIVE`,
+/// `STOPPED`, `STOP_SCHEDULING_AND_CANCEL_TASKS`, `STOP_SCHEDULING_AND_COMPLETE_TASKS`.
+/// An association is created scheduling the queue's work onto the fleet, and only
+/// `UpdateQueueFleetAssociation` moves it out of that status, so nothing here is owed by
+/// the clock.
+pub const QUEUE_FLEET_ASSOCIATION_STATUS_ACTIVE: &str = "ACTIVE";
+
 /// `BudgetStatus` a freshly created budget carries.
 ///
 /// From `smithy_query(query="shape", shape="BudgetStatus")`: `ACTIVE`, `INACTIVE`. A
@@ -103,6 +144,12 @@ pub const RESOURCE_TYPE_FLEET: &str = "fleet";
 pub const RESOURCE_TYPE_WORKER: &str = "worker";
 /// `resourceType` this service reports for a job in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_JOB: &str = "job";
+/// `resourceType` this service reports for a queue-fleet association in
+/// `ResourceNotFoundException`. The model documents the member only as "the type of the
+/// resource that couldn't be found" and enumerates no values, so a resource type is
+/// spelled the way the model spells that resource everywhere else — the shape
+/// `QueueFleetAssociation` names it `queueFleetAssociation`.
+pub const RESOURCE_TYPE_QUEUE_FLEET_ASSOCIATION: &str = "queueFleetAssociation";
 /// `resourceType` this service reports for a budget in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_BUDGET: &str = "budget";
 /// `resourceType` this service reports for a limit in `ResourceNotFoundException`. The
@@ -455,6 +502,39 @@ pub struct Queue {
     pub updated_at: Option<SystemTime>,
     pub updated_by: Option<String>,
     pub jobs: HashMap<String, Job>,
+    /// Every fleet associated with this queue, keyed by `fleetId`, exactly as the model's
+    /// paths nest the association
+    /// (`/2023-10-12/farms/{farmId}/queue-fleet-associations/{queueId}/{fleetId}`), so an
+    /// association is reachable only through its own queue and a queue holds at most one
+    /// of them per fleet.
+    pub fleet_associations: HashMap<String, QueueFleetAssociation>,
+}
+
+impl Queue {
+    /// Whether any fleet associated with this queue is in a status that schedules the
+    /// queue's work onto it.
+    ///
+    /// A queue with no such association has no worker that could ever pick up its jobs:
+    /// the three statuses that are not [`QUEUE_FLEET_ASSOCIATION_STATUS_ACTIVE`] all stop
+    /// the fleet scheduling for the queue.
+    pub fn schedules_jobs(&self) -> bool {
+        self.fleet_associations
+            .values()
+            .any(|association| association.status == QUEUE_FLEET_ASSOCIATION_STATUS_ACTIVE)
+    }
+}
+
+/// A persisted queue-fleet association, as `CreateQueueFleetAssociation` stored it under
+/// its queue. The pair of ids is its identity — the model mints no id for it.
+#[derive(Debug, Clone)]
+pub struct QueueFleetAssociation {
+    pub queue_id: String,
+    pub fleet_id: String,
+    pub status: String,
+    pub created_at: SystemTime,
+    pub created_by: String,
+    pub updated_at: Option<SystemTime>,
+    pub updated_by: Option<String>,
 }
 
 /// A persisted job, as `CreateJob` stored it under its queue.
@@ -474,6 +554,11 @@ pub struct Job {
     pub attachments: Option<crate::ops::types::Attachments>,
     pub storage_profile_id: Option<String>,
     pub target_task_run_status: String,
+    /// The job's own run status: what the service has settled its tasks to, as opposed to
+    /// the [`target_task_run_status`](Self::target_task_run_status) the request asked for.
+    /// It starts at [`TASK_RUN_STATUS_PENDING`] and every later value is set by a
+    /// clock-owed move in [`Job::settle`].
+    pub task_run_status: String,
     pub max_failed_tasks_count: i32,
     pub max_retries_per_task: i32,
     pub max_worker_count: Option<i32>,
@@ -488,22 +573,76 @@ pub struct Job {
     /// When the clock-owed `CREATE_IN_PROGRESS -> CREATE_COMPLETE` move comes due;
     /// `None` once it has been materialised. See [`JOB_CREATE_COMPLETE_AFTER`].
     pub create_complete_due_at: Option<Instant>,
+    /// When the clock-owed reconciliation of this job against the fleets its queue
+    /// schedules onto comes due; `None` once it has been materialised. See
+    /// [`JOB_RECONCILE_AFTER`].
+    pub reconcile_due_at: Option<Instant>,
 }
 
 impl Job {
-    /// Materialise the lifecycle transition the clock already made due.
+    /// Materialise the status moves the clock already made due.
     ///
-    /// A read calls this before answering: the move was owed at this instant whether or
+    /// A read calls this before answering: each move was owed at this instant whether or
     /// not anybody called, so applying it on read is reporting, not mutating.
-    pub fn settle_lifecycle(&mut self) {
+    ///
+    /// `queue_schedules_jobs` is [`Queue::schedules_jobs`] for the queue holding this job:
+    /// the reconciliation places the job against the fleets its queue schedules onto, and
+    /// a job no fleet can ever pick up is the one that settles to
+    /// [`TASK_RUN_STATUS_NOT_COMPATIBLE`].
+    pub fn settle(&mut self, queue_schedules_jobs: bool) {
+        let now = Instant::now();
         if let Some(due) = self.create_complete_due_at {
-            if Instant::now() >= due {
+            if now >= due {
                 self.lifecycle_status = JOB_LIFECYCLE_CREATE_COMPLETE.to_string();
                 self.lifecycle_status_message =
                     "The job was created and is ready to be scheduled.".to_string();
+                // Creation has converged on the status the request asked the job to start
+                // in, so that is what the job's tasks now carry.
+                self.task_run_status = self.target_task_run_status.clone();
                 self.create_complete_due_at = None;
             }
         }
+        if let Some(due) = self.reconcile_due_at {
+            if now >= due {
+                if !queue_schedules_jobs && self.awaiting_scheduling() {
+                    self.lifecycle_status = JOB_LIFECYCLE_UPDATE_SUCCEEDED.to_string();
+                    self.lifecycle_status_message =
+                        "The job can't be scheduled because no fleet associated with its \
+                         queue can run it."
+                            .to_string();
+                    self.task_run_status = TASK_RUN_STATUS_NOT_COMPATIBLE.to_string();
+                    // The service, not a caller, moved the job, so the update it made is
+                    // dated here and `updatedBy` stays absent: no principal made it.
+                    self.updated_at = Some(SystemTime::now());
+                }
+                self.reconcile_due_at = None;
+            }
+        }
+    }
+
+    /// Whether the service still has to find a worker for this job's tasks.
+    ///
+    /// Only a job whose tasks are [`TASK_RUN_STATUS_READY`] is waiting to be scheduled: a
+    /// job started suspended is held back until it is requeued
+    /// (`smithy_query(query="doc", shape="CreateJobRequest", member="targetTaskRunStatus")`
+    /// documents it as not running until then), and a job whose tasks have reached an end
+    /// state is not waiting for anything either.
+    fn awaiting_scheduling(&self) -> bool {
+        self.task_run_status == TASK_RUN_STATUS_READY
+    }
+
+    /// The `targetTaskRunStatus` a read of this job reports.
+    ///
+    /// The target is the run status the service is still working the job towards, so it is
+    /// reported only while the lifecycle says that work is in progress — the statuses the
+    /// model spells with an `_IN_PROGRESS` suffix
+    /// (`smithy_query(query="shape", shape="JobLifecycleStatus")`). Once the lifecycle has
+    /// settled, [`task_run_status`](Self::task_run_status) is what the job reports and the
+    /// target is dropped.
+    pub fn reported_target_task_run_status(&self) -> Option<String> {
+        self.lifecycle_status
+            .ends_with("_IN_PROGRESS")
+            .then(|| self.target_task_run_status.clone())
     }
 }
 
@@ -706,18 +845,55 @@ impl ComAmazonawsDeadlineDeadlineState {
         self.farms.get(farm_id)?.limits.get(limit_id)
     }
 
-    /// The job `job_id` names under `farm_id`/`queue_id`, with any clock-owed lifecycle
-    /// transition already materialised.
+    /// The job `job_id` names under `farm_id`/`queue_id`, with any clock-owed status move
+    /// already materialised.
     pub fn settled_job(&mut self, farm_id: &str, queue_id: &str, job_id: &str) -> Option<&Job> {
-        let job = self
-            .farms
-            .get_mut(farm_id)?
-            .queues
-            .get_mut(queue_id)?
-            .jobs
-            .get_mut(job_id)?;
-        job.settle_lifecycle();
+        let queue = self.farms.get_mut(farm_id)?.queues.get_mut(queue_id)?;
+        let schedules_jobs = queue.schedules_jobs();
+        let job = queue.jobs.get_mut(job_id)?;
+        job.settle(schedules_jobs);
         Some(job)
+    }
+
+    /// Materialise every job of `queue_id`'s owed status moves against the queue's fleet
+    /// associations as they stand NOW.
+    ///
+    /// A call that changes those associations runs this first, so each job is reconciled
+    /// against what its queue could schedule onto while the move was owed rather than
+    /// against what the call is about to make true.
+    pub fn settle_jobs(&mut self, farm_id: &str, queue_id: &str) {
+        let Some(queue) = self.queue_mut(farm_id, queue_id) else {
+            return;
+        };
+        let schedules_jobs = queue.schedules_jobs();
+        for job in queue.jobs.values_mut() {
+            job.settle(schedules_jobs);
+        }
+    }
+
+    /// The association between `queue_id` and `fleet_id` UNDER `farm_id`: an association
+    /// of another farm's queue is not found here, because the model reaches an association
+    /// only through its own farm's path.
+    pub fn queue_fleet_association(
+        &self,
+        farm_id: &str,
+        queue_id: &str,
+        fleet_id: &str,
+    ) -> Option<&QueueFleetAssociation> {
+        self.queue(farm_id, queue_id)?
+            .fleet_associations
+            .get(fleet_id)
+    }
+
+    /// The queue of `farm_id` that still has `fleet_id` associated with it, lowest id
+    /// first so the answer does not depend on map order. `None` when no queue does.
+    pub fn queue_associated_with_fleet(&self, farm_id: &str, fleet_id: &str) -> Option<&str> {
+        let farm = self.farms.get(farm_id)?;
+        farm.queues
+            .values()
+            .filter(|queue| queue.fleet_associations.contains_key(fleet_id))
+            .map(|queue| queue.queue_id.as_str())
+            .min()
     }
 }
 
@@ -792,6 +968,30 @@ pub fn fleet_at_worker_capacity(
         // CONFLICT_EXCEPTION, CONCURRENT_MODIFICATION, RESOURCE_ALREADY_EXISTS,
         // RESOURCE_IN_USE, STATUS_CONFLICT. Every worker the fleet holds is in use by it,
         // which is what leaves no room for another.
+        reason: "RESOURCE_IN_USE".to_string(),
+        resource_id: fleet_id.to_string(),
+        resource_type: RESOURCE_TYPE_FLEET.to_string(),
+        context: None,
+    }
+}
+
+/// The 409 this service answers when a fleet a queue is still associated with is deleted.
+///
+/// The association is what the deletion would leave pointing at a fleet that no longer
+/// exists, so the fleet is the resource in conflict and the message names the queue that
+/// holds it; `queue_id` is read from the store, never from the request.
+pub fn fleet_associated_with_queue(
+    fleet_id: &str,
+    queue_id: &str,
+) -> crate::ops::types::ConflictException {
+    crate::ops::types::ConflictException {
+        message: format!(
+            "The fleet {fleet_id} can't be deleted because it is associated with the \
+             queue {queue_id}."
+        ),
+        // From `smithy_query(query="shape", shape="ConflictExceptionReason")`:
+        // CONFLICT_EXCEPTION, CONCURRENT_MODIFICATION, RESOURCE_ALREADY_EXISTS,
+        // RESOURCE_IN_USE, STATUS_CONFLICT. The queue's association is a use of the fleet.
         reason: "RESOURCE_IN_USE".to_string(),
         resource_id: fleet_id.to_string(),
         resource_type: RESOURCE_TYPE_FLEET.to_string(),

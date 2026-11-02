@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQueueFleetAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQueueFleetAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Associates a queue of a farm with one of that farm's fleets in this service's store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQueueFleetAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The association hangs off its queue, keyed by `fleetId`, exactly as the model's path
+//! (`/2023-10-12/farms/{farmId}/queue-fleet-associations/{queueId}/{fleetId}`) reaches it:
+//! a queue holds at most one association per fleet. The operation is `@idempotent` and the
+//! model declares no `ConflictException` for it, so associating a pair that is already
+//! associated answers the same success again and leaves the stored association — its
+//! status, its creation time and its creator — exactly as the first call left it.
+//!
+//! An association is what gives the queue's jobs a fleet that can run them, so the jobs
+//! the queue already holds are settled against the associations that held while their
+//! reconciliation was owed BEFORE this one is stored (`crate::state::settle_jobs`).
+//!
+//! The queue holds at most one association per fleet of its farm, and a fleet the farm
+//! does not hold is refused, so this store grows by at most
+//! `crate::state::MAX_FLEETS_PER_FARM` entries per queue however often the operation is
+//! called.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +151,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQueueFleetAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQueueFleetAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQueueFleetAssociation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateQueueFleetAssociationErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The association joins a queue and a fleet OF ONE FARM, so an unheld farm, queue
+        // or fleet is a 404 naming the level that is missing, and nothing is stored.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(
+                CreateQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+                )
+                .into(),
+            );
+        }
+        if store.queue(&input.farm_id, &input.queue_id).is_none() {
+            return Err(
+                CreateQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+                )
+                .into(),
+            );
+        }
+        if store.fleet(&input.farm_id, &input.fleet_id).is_none() {
+            return Err(
+                CreateQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_FLEET, &input.fleet_id),
+                )
+                .into(),
+            );
+        }
+
+        let created_by = crate::state::caller_principal(ctx);
+        // What each job of this queue was owed while the queue still had the associations
+        // it has now.
+        store.settle_jobs(&input.farm_id, &input.queue_id);
+
+        let Some(queue) = store.queue_mut(&input.farm_id, &input.queue_id) else {
+            return Err(
+                CreateQueueFleetAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, &input.queue_id),
+                )
+                .into(),
+            );
+        };
+        // A retry of the same association is the same association: the stored one stays as
+        // the first call made it, rather than being re-created with a later timestamp.
+        queue
+            .fleet_associations
+            .entry(input.fleet_id.clone())
+            .or_insert_with(|| crate::state::QueueFleetAssociation {
+                queue_id: input.queue_id.clone(),
+                fleet_id: input.fleet_id.clone(),
+                // The association schedules the queue's work onto the fleet from the
+                // moment it exists; only `UpdateQueueFleetAssociation` stops it.
+                status: crate::state::QUEUE_FLEET_ASSOCIATION_STATUS_ACTIVE.to_string(),
+                created_at: ::std::time::SystemTime::now(),
+                created_by,
+                updated_at: None,
+                updated_by: None,
+            });
+
+        Ok(CreateQueueFleetAssociationOutput {})
     }
 }

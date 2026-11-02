@@ -21,6 +21,8 @@ mod delete_fleet;
 mod farm_queue_job;
 #[path = "all/fleet.rs"]
 mod fleet;
+#[path = "all/job_run_status.rs"]
+mod job_run_status;
 #[path = "all/limit.rs"]
 mod limit;
 #[path = "all/state_roundtrip.rs"]
