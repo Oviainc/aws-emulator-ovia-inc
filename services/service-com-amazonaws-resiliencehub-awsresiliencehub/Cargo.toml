@@ -25,6 +25,9 @@ tracing = { workspace = true }
 # edge of this package in Cargo.lock (which does not distinguish a dev dependency),
 # so declaring it here leaves the lock file untouched.
 hex = { workspace = true }
+# Mints the version-4 UUIDs this service's server-generated identifiers (appArn and
+# policyArn ids, resolutionId) are, rather than hand-rolling the version/variant bits.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

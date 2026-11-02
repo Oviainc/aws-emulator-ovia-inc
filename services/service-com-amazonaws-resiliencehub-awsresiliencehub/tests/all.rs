@@ -25,6 +25,8 @@ mod app_version_template;
 mod application_lifecycle;
 #[path = "all/list_app_versions.rs"]
 mod list_app_versions;
+#[path = "all/minted_identifier_shape.rs"]
+mod minted_identifier_shape;
 #[path = "all/publish_app_version.rs"]
 mod publish_app_version;
 #[path = "all/reported_output_members.rs"]

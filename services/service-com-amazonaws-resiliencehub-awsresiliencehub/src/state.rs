@@ -802,29 +802,21 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 }
 
 /// The next server-generated resource id, as the canonical 8-4-4-4-12 form AWS gives
-/// a Resilience Hub application or resiliency policy.
+/// a Resilience Hub application, resiliency policy or resource resolution.
 ///
-/// Unique within this emulator: the low half is a monotonic counter, so two ids
-/// minted in the same nanosecond still differ, and the high half is the minting
-/// instant, so ids do not repeat across a restart. Server-generated, never derived
-/// from the request.
+/// OPAQUE: a fresh version-4 UUID, drawn from the operating system's random source
+/// by the maintained `uuid` crate, so every nibble a client may inspect — the
+/// version nibble and the variant nibble included — is the one a canonically shaped
+/// identifier carries, and no part of the value encodes the minting instant, a
+/// sequence number or anything else a client could read an ordering or a neighbour's
+/// id out of. Two ids minted back to back are therefore unrelated, and ids of
+/// different applications and policies share no derivable structure.
+///
+/// Unique within this emulator: 122 random bits, so the identifiers this service
+/// hands out do not collide, within a run or across a restart. Server-generated,
+/// never derived from the request.
 fn mint_resource_id() -> String {
-    static MINTED: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-
-    let sequence = MINTED.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-    let minted_at = ::std::time::SystemTime::now()
-        .duration_since(::std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (minted_at >> 32) as u32,
-        (minted_at >> 16) & 0xffff,
-        minted_at & 0xffff,
-        (sequence >> 48) & 0xffff,
-        sequence & 0xffff_ffff_ffff,
-    )
+    ::uuid::Uuid::new_v4().hyphenated().to_string()
 }
 
 /// The refusal message for an `additionalInfo` map whose `member` holds a value
