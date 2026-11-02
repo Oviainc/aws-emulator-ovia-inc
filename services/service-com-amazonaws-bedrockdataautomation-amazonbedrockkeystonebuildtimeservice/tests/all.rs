@@ -21,6 +21,8 @@ mod data_automation_project_lifecycle;
 mod data_automation_project_listing;
 #[path = "all/data_automation_project_update.rs"]
 mod data_automation_project_update;
+#[path = "all/project_effective_configuration.rs"]
+mod project_effective_configuration;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/state_roundtrip.rs"]

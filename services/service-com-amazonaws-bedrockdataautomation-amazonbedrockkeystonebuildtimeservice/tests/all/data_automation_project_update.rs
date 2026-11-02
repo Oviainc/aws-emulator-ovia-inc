@@ -10,11 +10,12 @@
 //! The rule under test: `UpdateDataAutomationProject` is an `@idempotent` PUT over an
 //! existing project's configuration (`standardOutputConfiguration` is `@required`), so
 //! the project at the named ARN takes exactly the configuration the request carries —
-//! a configuration member the request omits is CLEARED — while its identity (ARN,
-//! `projectName`, `projectType`, `creationTime`) and, when the request names no stage,
-//! its `projectStage` are untouched; the call moves `lastModifiedTime` and re-starts
-//! the project's build, so the project reports `IN_PROGRESS` until the transition the
-//! clock now owes falls due. An ARN no project holds is the modelled 404.
+//! a configuration member the request omits is CLEARED, and a read then reports the
+//! service's default for it rather than what an earlier request had set — while its
+//! identity (ARN, `projectName`, `projectType`, `creationTime`) and, when the request
+//! names no stage, its `projectStage` are untouched; the call moves `lastModifiedTime`
+//! and re-starts the project's build, so the project reports `IN_PROGRESS` until the
+//! transition the clock now owes falls due. An ARN no project holds is the modelled 404.
 //!
 //! The suites are TABLE-driven: the rows differ along what that rule generalises over
 //! (which configuration members the request carries, the shape of each one, whether
@@ -31,7 +32,7 @@ use service_com_amazonaws_bedrockdataautomation_amazonbedrockkeystonebuildtimese
 use service_com_amazonaws_bedrockdataautomation_amazonbedrockkeystonebuildtimeservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::support::{encode_label, error_code, string_at, timestamp_at};
+use crate::support::{assert_json_contains, encode_label, error_code, string_at, timestamp_at};
 
 /// The region every case signs for.
 const REGION: &str = "us-east-1";
@@ -363,24 +364,45 @@ async fn an_update_replaces_the_project_configuration_and_persists_it() {
             state::PROJECT_IN_PROGRESS
         );
 
-        // ROUND TRIP: the read answers with the configuration the update stored.
+        // ROUND TRIP: the read answers with the configuration the update stored, plus
+        // the service's default wherever the update was silent (which is why these are
+        // containments and not equalities — see `project_effective_configuration`).
+        // A configuration member the update CLEARED therefore reads back as the
+        // service's default for it, never as an absent block.
         let after = read_back(&router, &arn, case).await;
-        assert_eq!(
-            after.get("standardOutputConfiguration"),
-            Some(&spec.standard_output),
-            "case {case:?}: the wrong standardOutputConfiguration read back: {after:?}"
+        assert_json_contains(
+            after
+                .get("standardOutputConfiguration")
+                .unwrap_or_else(|| panic!(
+                    "case {case:?}: no standardOutputConfiguration read back: {after:?}"
+                )),
+            &spec.standard_output,
+            case,
+            "standardOutputConfiguration",
         );
-        assert_eq!(
-            after.get("customOutputConfiguration"),
-            spec.custom_output.as_ref(),
-            "case {case:?}: customOutputConfiguration must be exactly what the update \
-             carried (cleared when it carried none): {after:?}"
+        assert_json_contains(
+            after.get("customOutputConfiguration").unwrap_or_else(|| {
+                panic!("case {case:?}: no customOutputConfiguration read back: {after:?}")
+            }),
+            spec.custom_output.as_ref().unwrap_or(&json!({})),
+            case,
+            "customOutputConfiguration",
         );
-        assert_eq!(
-            after.get("overrideConfiguration"),
-            spec.override_configuration.as_ref(),
-            "case {case:?}: overrideConfiguration must be exactly what the update \
-             carried (cleared when it carried none): {after:?}"
+        if spec.custom_output.is_none() {
+            assert_eq!(
+                after.get("customOutputConfiguration"),
+                Some(&json!({})),
+                "case {case:?}: an update that carried no customOutputConfiguration \
+                 clears the binding, which reads back as the empty one: {after:?}"
+            );
+        }
+        assert_json_contains(
+            after.get("overrideConfiguration").unwrap_or_else(|| {
+                panic!("case {case:?}: no overrideConfiguration read back: {after:?}")
+            }),
+            spec.override_configuration.as_ref().unwrap_or(&json!({})),
+            case,
+            "overrideConfiguration",
         );
         assert_eq!(
             after.get("projectDescription").and_then(Value::as_str),

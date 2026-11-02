@@ -66,3 +66,45 @@ pub fn error_code(payload: &Value) -> String {
         .unwrap_or("<no __type>")
         .to_string()
 }
+
+/// Assert that every member and element of `expected` appears in `actual` with an
+/// equal value, naming the case and the JSON path of the first difference.
+///
+/// This is the relation a project read has to the configuration its create or update
+/// carried: the read reports what the request specified AND the service's defaults
+/// wherever the request was silent, so it is a SUPERSET of the request's own
+/// configuration rather than equal to it. A list is compared element for element,
+/// including its length — a read neither drops nor invents an element.
+pub fn assert_json_contains(actual: &Value, expected: &Value, case: &str, path: &str) {
+    match expected {
+        Value::Object(members) => {
+            let found = actual.as_object().unwrap_or_else(|| {
+                panic!("case {case:?}: {path} must be a JSON object, got {actual:?}")
+            });
+            for (name, value) in members {
+                let child = found.get(name).unwrap_or_else(|| {
+                    panic!("case {case:?}: {path}.{name} is absent from {actual:?}")
+                });
+                assert_json_contains(child, value, case, &format!("{path}.{name}"));
+            }
+        }
+        Value::Array(elements) => {
+            let found = actual.as_array().unwrap_or_else(|| {
+                panic!("case {case:?}: {path} must be a JSON array, got {actual:?}")
+            });
+            assert_eq!(
+                found.len(),
+                elements.len(),
+                "case {case:?}: {path} must carry {} element(s), got {found:?}",
+                elements.len()
+            );
+            for (index, value) in elements.iter().enumerate() {
+                assert_json_contains(&found[index], value, case, &format!("{path}[{index}]"));
+            }
+        }
+        leaf => assert_eq!(
+            actual, leaf,
+            "case {case:?}: {path}: expected {leaf:?}, got {actual:?}"
+        ),
+    }
+}

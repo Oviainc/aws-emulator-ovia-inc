@@ -27,7 +27,7 @@ use service_com_amazonaws_bedrockdataautomation_amazonbedrockkeystonebuildtimese
 use service_com_amazonaws_bedrockdataautomation_amazonbedrockkeystonebuildtimeservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::support::{encode_label, error_code, string_at, timestamp_at};
+use crate::support::{assert_json_contains, encode_label, error_code, string_at, timestamp_at};
 
 /// A SigV4 `Authorization` header for this service's signing name (`bedrock`, per
 /// `OPERATIONS.md`). `can_handle` resolves the route key from it, and the handlers read
@@ -422,11 +422,30 @@ async fn a_well_formed_create_answers_the_modeled_201_and_persists_the_project()
             spec.description.as_deref(),
             "case {case:?}: the wrong projectDescription read back: {fetched:?}"
         );
-        assert_eq!(
-            fetched.get("standardOutputConfiguration"),
-            Some(&spec.standard_output),
-            "case {case:?}: the wrong standardOutputConfiguration read back: {fetched:?}"
+        // The read reports the EFFECTIVE configuration: every value the create
+        // carried, plus the service's default wherever the create was silent (which is
+        // why this is a containment and not an equality — see
+        // `project_effective_configuration` for the rule and the exact defaults).
+        let read_standard_output = fetched
+            .get("standardOutputConfiguration")
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: no standardOutputConfiguration read back: {fetched:?}")
+            });
+        assert_json_contains(
+            read_standard_output,
+            &spec.standard_output,
+            case,
+            "standardOutputConfiguration",
         );
+        // Every modality is reported whether or not the create named it: an absent one
+        // would leave a client unable to tell "off" from "defaulted on".
+        for modality in ["document", "image", "video", "audio"] {
+            assert!(
+                read_standard_output.get(modality).is_some(),
+                "case {case:?}: standardOutputConfiguration.{modality} must be \
+                 reported, got {read_standard_output:?}"
+            );
+        }
         let created_at = timestamp_at(&fetched, "creationTime", case);
         assert_eq!(
             timestamp_at(&fetched, "lastModifiedTime", case),

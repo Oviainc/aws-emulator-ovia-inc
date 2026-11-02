@@ -169,13 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The status this reports is the one the project HAD when the delete took
-        // it: the modeled enum carries no deleting state, so there is nothing else
-        // a delete could truthfully answer.
-        let status = record.status_at(::std::time::SystemTime::now()).to_string();
+        // The status a delete reports is the TEARDOWN's, not the project's: the call
+        // accepts the teardown and the teardown proceeds after it returns, so what
+        // holds at the instant of the response is the in-flight status (see
+        // `PROJECT_DELETION_ACCEPTED`). The project's own build status is settled
+        // history by now and is not what this member carries.
         Ok(DeleteDataAutomationProjectOutput {
             project_arn: record.project_arn,
-            status: Some(status),
+            status: Some(crate::state::PROJECT_DELETION_ACCEPTED.to_string()),
         })
     }
 }

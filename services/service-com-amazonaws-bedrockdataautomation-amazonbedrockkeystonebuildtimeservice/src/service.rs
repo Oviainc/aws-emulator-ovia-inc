@@ -35,6 +35,10 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is the one this service DOES take: it serves the
+//! model's own `restJson1` codec with every timestamp in the ISO-8601 `date-time` form
+//! this model's single timestamp shape declares (see [`date_time_timestamps`]).
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -62,6 +66,8 @@ const MODEL_JSON: &str = include_str!(
 static WITHHELD_MEMBERS: LazyLock<service_common::sensitive_members::WithheldMembers> =
     LazyLock::new(|| service_common::sensitive_members::WithheldMembers::from_model(MODEL_JSON));
 
+pub mod date_time_timestamps;
+
 /// The `com-amazonaws-bedrockdataautomation-amazonbedrockkeystonebuildtimeservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -69,6 +75,9 @@ static WITHHELD_MEMBERS: LazyLock<service_common::sensitive_members::WithheldMem
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it.
+    protocol: date_time_timestamps::DateTimeRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -78,6 +87,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: date_time_timestamps::DateTimeRestJson::new(),
         }
     }
 }
@@ -175,5 +185,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own restJson1 codec, with the ONE difference the generic
+        // renderer cannot express: a timestamp is written in the ISO-8601 date-time
+        // form this model's only timestamp shape declares, rather than in the
+        // protocol's default epoch-seconds form (see `date_time_timestamps`).
+        // Borrowed from the field built in `new`, never constructed per request.
+        Some(&self.protocol)
     }
 }

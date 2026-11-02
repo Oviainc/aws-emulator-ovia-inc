@@ -25,6 +25,11 @@ use crate::ops::types::{
     DataAutomationProjectSummary, OverrideConfiguration, StandardOutputConfiguration, Tag,
 };
 
+/// How a project's STORED configuration becomes the EFFECTIVE configuration a read
+/// reports: the service's defaults materialised wherever the create or the update was
+/// silent. Used by [`DataAutomationProjectRecord::to_project`].
+pub mod project_configuration;
+
 /// The `blueprintStage` a blueprint takes when `CreateBlueprint` names none.
 ///
 /// `CreateBlueprintRequest$blueprintStage` is OPTIONAL and targets the enum
@@ -314,6 +319,19 @@ pub const PROJECT_COMPLETED: &str = "COMPLETED";
 /// record and compared against the clock.
 pub const PROJECT_CREATION_SPAN: Duration = Duration::from_millis(500);
 
+/// The status `DeleteDataAutomationProject` reports for the teardown it has just
+/// accepted.
+///
+/// `DeleteDataAutomationProjectResponse$status` is modelled as a
+/// `DataAutomationProjectStatus` (`smithy_query(shape="DataAutomationProjectStatus")`
+/// -> `["COMPLETED", "IN_PROGRESS", "FAILED"]`), which is the one place the delete
+/// answers about the teardown rather than about the project: the call ACCEPTS the
+/// teardown and the teardown proceeds after it returns, so the status that holds at
+/// the instant of the response is the in-flight one. A delete can therefore never
+/// answer `COMPLETED` — there is no span, however short, in which the work it started
+/// has already finished when it answers.
+pub const PROJECT_DELETION_ACCEPTED: &str = PROJECT_IN_PROGRESS;
+
 /// How many DataAutomationProjects the store holds before
 /// `CreateDataAutomationProject` refuses with the modelled
 /// `ServiceQuotaExceededException` (HTTP 402). Same reasoning as
@@ -364,7 +382,14 @@ impl DataAutomationProjectRecord {
     }
 
     /// Project the record onto the modeled `DataAutomationProject` shape, with the
-    /// status the clock has made due at `now`.
+    /// status the clock has made due at `now` and the project's EFFECTIVE
+    /// configuration: every configuration block present, each member taking the value
+    /// the create or the update specified and the service's default wherever that
+    /// specification was silent (see [`project_configuration`]). A reader asks the
+    /// project what it will be processed under, not which members a request happened
+    /// to spell out — and the defaults are materialised HERE rather than folded into
+    /// the record, so the stored configuration stays the caller's own and this
+    /// projection writes nothing.
     ///
     /// INFALLIBLE: every member of the projection is a member of the record, so no
     /// request can make this fail and no handler needs an unwrap for it.
@@ -377,12 +402,24 @@ impl DataAutomationProjectRecord {
             project_stage: Some(self.project_stage.clone()),
             project_type: Some(self.project_type.clone()),
             project_description: self.project_description.clone(),
-            standard_output_configuration: self.standard_output_configuration.clone(),
-            custom_output_configuration: self.custom_output_configuration.clone(),
-            override_configuration: self.override_configuration.clone(),
-            data_automation_library_configuration: self
-                .data_automation_library_configuration
-                .clone(),
+            standard_output_configuration: Some(
+                project_configuration::effective_standard_output_configuration(
+                    self.standard_output_configuration.as_ref(),
+                ),
+            ),
+            custom_output_configuration: Some(
+                project_configuration::effective_custom_output_configuration(
+                    self.custom_output_configuration.as_ref(),
+                ),
+            ),
+            override_configuration: Some(project_configuration::effective_override_configuration(
+                self.override_configuration.as_ref(),
+            )),
+            data_automation_library_configuration: Some(
+                project_configuration::effective_data_automation_library_configuration(
+                    self.data_automation_library_configuration.as_ref(),
+                ),
+            ),
             status: self.status_at(now).to_string(),
             kms_key_id: self.kms_key_id.clone(),
             kms_encryption_context: self.kms_encryption_context.clone(),
