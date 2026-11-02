@@ -40,6 +40,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     APPLICATION_STATUS_CREATING, TAG_QUOTA,
 };
 
+use super::application_updates::read_list;
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX, SETTLE_WAIT};
 use super::resource_tags::{add_tags, list_tags, reported_tags};
 
@@ -319,13 +320,22 @@ async fn a_created_application_round_trips_through_get() {
             "case {case}: expected 200 from GetApplication, got {} with {:?}",
             read.status, read.body
         );
-        for member in ["id", "name", "arn", "dataSources", "appConfigs", "kmsKeyArn"] {
+        for member in ["id", "name", "arn", "dataSources", "kmsKeyArn"] {
             assert_eq!(
                 read.body[member], created.body[member],
                 "case {case}: the read reports the {member} the create persisted, got {:?}",
                 read.body
             );
         }
+        // The read reports the whole stored record, so the configuration settings come
+        // back as the list the application holds — `[]` where it holds none.
+        assert_eq!(
+            read.body["appConfigs"],
+            read_list(row.request.get("appConfigs")),
+            "case {case}: the read reports the configuration settings the create persisted, got \
+             {:?}",
+            read.body
+        );
         assert_eq!(
             read.body["createdAt"], created.body["createdAt"],
             "case {case}: the creation instant does not move between reads, got {:?}",
@@ -494,7 +504,7 @@ async fn a_name_the_account_already_uses_is_refused_and_creates_nothing() {
         );
         assert_eq!(
             read.body["appConfigs"],
-            Value::Null,
+            json!([]),
             "case {name}: the refused create changed nothing about it, got {:?}",
             read.body
         );

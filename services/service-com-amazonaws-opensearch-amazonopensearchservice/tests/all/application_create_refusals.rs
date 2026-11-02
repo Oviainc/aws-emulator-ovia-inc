@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::APP_CONFIG_TYPE_VALUES;
 
 use super::application_listing::listed_ids;
-use super::application_updates::app_configs;
+use super::application_updates::{app_configs, read_list};
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
 
 /// A `kmsKeyArn` of the form `KmsKeyArn`'s own pattern admits
@@ -252,26 +252,16 @@ async fn a_value_at_a_published_bound_is_admitted_and_mints_one_application() {
             "case {case:?}: expected 200 from GetApplication, got {} with {:?}",
             read.status, read.body
         );
-        // An application holding no configuration setting reports the member not at all
-        // rather than as an empty list, so a row that named none — or named the empty
-        // list at the 0-entry lower bound — must come back WITHOUT the member, never as
-        // `[]` and never with a setting no request asked for.
-        match body.get("appConfigs").and_then(Value::as_array) {
-            Some(entries) if !entries.is_empty() => assert_eq!(
-                read.body["appConfigs"],
-                body["appConfigs"],
-                "case {case:?}: the read reports the {} configuration settings the create \
-                 named, got {:?}",
-                entries.len(),
-                read.body["appConfigs"]
-            ),
-            _ => assert!(
-                read.body["appConfigs"].is_null(),
-                "case {case:?}: an application holding no configuration setting reports the \
-                 member not at all, got {:?}",
-                read.body["appConfigs"]
-            ),
-        }
+        // `appConfigs` is `@length(min: 0, max: 200)`, so the read reports the settings
+        // the application holds — the EMPTY list at the 0-entry lower bound and for a row
+        // that named none — and never a setting no request asked for.
+        assert_eq!(
+            read.body["appConfigs"],
+            read_list(body.get("appConfigs")),
+            "case {case:?}: the read reports the configuration settings the create named, \
+             got {:?}",
+            read.body["appConfigs"]
+        );
         assert_eq!(
             read.body["name"], body["name"],
             "case {case:?}: the read reports the name the create named, got {:?}",

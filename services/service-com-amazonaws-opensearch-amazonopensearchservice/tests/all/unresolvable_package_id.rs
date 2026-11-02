@@ -9,11 +9,14 @@
 //! [`super::domain_lifecycle`] and the package helpers from
 //! [`super::package_associations`]; this suite adds no second copy of either.
 //!
-//! The rule under test, which holds for every operation that resolves a `PackageID`
-//! rather than for the ones a report cited: an id the account holds no package under
-//! is a bad input VALUE, so the call is refused with `ValidationException` at the HTTP
-//! 400 the model declares it at, carrying the service's fixed sentence for that
-//! condition and no part of the request — and nothing is written.
+//! The rule under test, which holds for every operation that CHANGES what a
+//! `PackageID` resolves to rather than for the ones a report cited: an id the account
+//! holds no package under is a bad input VALUE, so the call is refused with
+//! `ValidationException` at the HTTP 400 the model declares it at, carrying the
+//! service's fixed sentence for that condition and no part of the request — and nothing
+//! is written. The listing of the DOMAINS an id is associated with is the other side of
+//! that boundary: it reports a set, so it is served with that set empty (see
+//! [`super::absent_scope_listings`]).
 //!
 //! So the assertions span a SET of inputs: every operation of the family crossed with
 //! the ways an id resolves to nothing (never minted, in either form the `PackageID`
@@ -37,7 +40,7 @@ const DOMAIN: &str = "unresolvable-pkg";
 
 /// Which operation of the package family a row drives. Every operation whose input
 /// carries a `PackageID` — the batch and single forms of associating and dissociating,
-/// the delete, the two updates, and the two by-id reads — plus the prerequisite list,
+/// the delete, the two updates, and the by-id reads — plus the prerequisite list,
 /// which resolves ids of its own inside an otherwise serviceable request.
 #[derive(Debug, Clone, Copy)]
 enum Op {
@@ -53,9 +56,13 @@ enum Op {
     ListDomainsForPackage,
 }
 
-/// Every operation under test, so a row is asserted over the whole family rather than
-/// over the operations a report happened to name.
-const OPS: [Op; 10] = [
+/// Every operation the refusal rule covers, so a row is asserted over the whole family
+/// rather than over the operations a report happened to name.
+/// `Op::ListDomainsForPackage` is NOT one of them: it reports the set of domains an id
+/// is associated with, and an unresolvable id names an empty set rather than a refusal,
+/// which [`every_operation_that_resolves_a_package_id_refuses_one_that_names_no_package`]
+/// asserts beside each refusal.
+const OPS: [Op; 9] = [
     Op::AssociatePackages,
     Op::AssociatePackagesPrerequisite,
     Op::AssociatePackage,
@@ -65,7 +72,6 @@ const OPS: [Op; 10] = [
     Op::UpdatePackage,
     Op::UpdatePackageScope,
     Op::GetPackageVersionHistory,
-    Op::ListDomainsForPackage,
 ];
 
 /// Drive `op` for `package_id`. `live` is a package the account DOES hold, which the
@@ -289,6 +295,22 @@ async fn every_operation_that_resolves_a_package_id_refuses_one_that_names_no_pa
                 answer.body
             );
         }
+
+        // The other side of the boundary: the listing of the domains this id is
+        // associated with reports that empty set rather than refusing the id.
+        let listed = drive(&emulator, Op::ListDomainsForPackage, package_id, &live).await;
+        let case = format!("ListDomainsForPackage({package_id}) / {row}");
+        assert_eq!(
+            listed.status, 200,
+            "case {case}: expected the listing to be served, got {} with {:?}",
+            listed.status, listed.body
+        );
+        assert_eq!(
+            listed.body["DomainPackageDetailsList"].as_array(),
+            Some(&Vec::<Value>::new()),
+            "case {case}: expected an empty DomainPackageDetailsList, got {:?}",
+            listed.body
+        );
     }
 
     // A refused call writes nothing: no association was made on the domain, and the

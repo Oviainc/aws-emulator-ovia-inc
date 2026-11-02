@@ -9733,6 +9733,28 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         }
     }
 
+    /// The insights a LISTING reports for the entity a request names.
+    ///
+    /// Resolves the entity exactly as [`Self::insights_of_entity`] does — the same ONE
+    /// decision — except that a `DomainName` this account holds no domain under selects
+    /// no insight rather than refusing: a listing reports the set an entity holds, and
+    /// an entity holding none reports the EMPTY set however it came to be empty. The
+    /// entity itself is still a requirement, so one whose type is outside
+    /// `InsightEntityType`, one that names no value where its type needs one, and one
+    /// naming another account are refused as the malformed requests they are.
+    ///
+    /// Reads ONLY.
+    pub fn insights_listed_for_entity(
+        &self,
+        entity: &InsightEntity,
+    ) -> Result<Vec<&InsightRecord>, ValidationException> {
+        match self.insights_of_entity(entity) {
+            Ok(held) => Ok(held),
+            Err(InsightEntityRefusal::NotFound(_)) => Ok(Vec::new()),
+            Err(InsightEntityRefusal::Validation(payload)) => Err(payload),
+        }
+    }
+
     /// The one insight the entity a request names holds under `insight_id`, or
     /// `None` where that entity holds none under it.
     ///

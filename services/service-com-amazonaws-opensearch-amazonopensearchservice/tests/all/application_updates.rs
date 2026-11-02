@@ -59,7 +59,10 @@ const IDENTITY_CENTER_MEMBERS: [&str; 4] = [
 ];
 
 /// `CreateApplication`: `POST /2021-01-01/opensearch/application`.
-async fn create_application(emulator: &Emulator, body: Value) -> Answer {
+///
+/// Reached by a sibling suite as `super::application_updates::create_application`, so
+/// the crate grows no second copy of this route.
+pub(crate) async fn create_application(emulator: &Emulator, body: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -69,8 +72,9 @@ async fn create_application(emulator: &Emulator, body: Value) -> Answer {
         .await
 }
 
-/// `UpdateApplication`: `PUT /2021-01-01/opensearch/application/{id}`.
-async fn update_application(emulator: &Emulator, id: &str, body: Value) -> Answer {
+/// `UpdateApplication`: `PUT /2021-01-01/opensearch/application/{id}`. Reached by a
+/// sibling suite on the same rule as [`create_application`].
+pub(crate) async fn update_application(emulator: &Emulator, id: &str, body: Value) -> Answer {
     emulator
         .call(
             "PUT",
@@ -80,8 +84,9 @@ async fn update_application(emulator: &Emulator, id: &str, body: Value) -> Answe
         .await
 }
 
-/// `GetApplication`: `GET /2021-01-01/opensearch/application/{id}`.
-async fn get_application(emulator: &Emulator, id: &str) -> Answer {
+/// `GetApplication`: `GET /2021-01-01/opensearch/application/{id}`. Reached by a
+/// sibling suite on the same rule as [`create_application`].
+pub(crate) async fn get_application(emulator: &Emulator, id: &str) -> Answer {
     emulator
         .call(
             "GET",
@@ -107,6 +112,20 @@ fn reported_list(carried: Option<&Value>) -> Value {
 /// create's where it did not.
 fn expected_list(create: &Value, update: &Value, member: &str) -> Value {
     reported_list(update.get(member).or_else(|| create.get(member)))
+}
+
+/// What a READ of the whole stored record reports for a list member whose target lets
+/// it hold zero entries (`AppConfigs` is `@length(min: 0, max: 200)`,
+/// `smithy_query(query="shape",shape="AppConfigs")`): the list the application holds,
+/// and the EMPTY list where it holds none.
+///
+/// Reached by a sibling suite as `super::application_updates::read_list`, so the crate
+/// holds ONE statement of what such a member reads back as.
+pub(crate) fn read_list(carried: Option<&Value>) -> Value {
+    match carried {
+        Some(Value::Array(entries)) => Value::Array(entries.clone()),
+        _ => Value::Array(Vec::new()),
+    }
 }
 
 /// The Identity Center settings a response reports once `update` has been applied to an
@@ -361,7 +380,6 @@ async fn an_update_applies_the_members_it_carries() {
             "name",
             "arn",
             "dataSources",
-            "appConfigs",
             "iamIdentityCenterOptions",
             "createdAt",
             "lastUpdatedAt",
@@ -372,6 +390,15 @@ async fn an_update_applies_the_members_it_carries() {
                 read.body
             );
         }
+        // The read reports the whole stored record, so the configuration settings come
+        // back as the list the application holds — `[]` where it holds none.
+        assert_eq!(
+            read.body["appConfigs"],
+            read_list(row.update.get("appConfigs").or_else(|| create.get("appConfigs"))),
+            "case {case}: the read reports the configuration settings the update persisted, got \
+             {:?}",
+            read.body
+        );
 
         // An update changes the application's settings, not where it is in its
         // lifecycle: the status is still the one of a just-created application.
@@ -435,15 +462,20 @@ async fn successive_updates_accumulate_on_the_one_stored_record() {
         }
 
         let read = get_application(&emulator, &id).await;
-        for member in ["dataSources", "appConfigs"] {
-            assert_eq!(
-                read.body[member],
-                reported_list(expected.get(member)),
-                "case {case}: the application still holds the {member} an earlier update \
-                 left, got {:?}",
-                read.body
-            );
-        }
+        assert_eq!(
+            read.body["dataSources"],
+            reported_list(expected.get("dataSources")),
+            "case {case}: the application still holds the dataSources an earlier update \
+             left, got {:?}",
+            read.body
+        );
+        assert_eq!(
+            read.body["appConfigs"],
+            read_list(expected.get("appConfigs")),
+            "case {case}: the application still holds the appConfigs an earlier update \
+             left, got {:?}",
+            read.body
+        );
         for member in IDENTITY_CENTER_MEMBERS {
             assert_eq!(
                 read.body["iamIdentityCenterOptions"][member],

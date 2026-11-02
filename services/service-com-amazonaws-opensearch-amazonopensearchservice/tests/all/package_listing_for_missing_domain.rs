@@ -40,7 +40,10 @@ use super::package_listing_page_bounds::{
 /// `smithy_query(query="operation",operation="ListPackagesForDomain")`) that this
 /// account holds no domain under: the shortest the length allows, the longest, one
 /// spanning the digits and hyphens the pattern allows, and one mixing them.
-const MISSING_NAMES: [(&str, &str); 4] = [
+///
+/// Reached by a sibling suite as `super::package_listing_for_missing_domain::MISSING_NAMES`,
+/// so the crate holds ONE table of these names.
+pub(crate) const MISSING_NAMES: [(&str, &str); 4] = [
     ("the shortest name the length allows", "abc"),
     (
         "the longest name the length allows",
@@ -55,8 +58,9 @@ const MISSING_NAMES: [(&str, &str); 4] = [
 const DELETED_NAME: &str = "missing-gone-domain";
 
 /// Every name the tables carry: the syntactically valid ones nothing created, plus the
-/// one this call creates and deletes.
-async fn missing_names(emulator: &Emulator) -> Vec<(String, String)> {
+/// one this call creates and deletes. Reached by a sibling suite on the same rule as
+/// [`MISSING_NAMES`].
+pub(crate) async fn missing_names(emulator: &Emulator) -> Vec<(String, String)> {
     let mut names: Vec<(String, String)> = MISSING_NAMES
         .iter()
         .map(|(case, name)| ((*case).to_owned(), (*name).to_owned()))

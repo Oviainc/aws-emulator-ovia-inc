@@ -12,6 +12,10 @@
 //! passed ([`crate::state::PROVISIONING`]) — a move that was due at this instant even
 //! if nobody had called.
 //!
+//! The whole stored record is reported, so `appConfigs` — a list the model lets hold
+//! zero entries — is answered as the empty list for an application holding no
+//! configuration setting rather than left out.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -199,7 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: Some(application.status.clone()),
             iam_identity_center_options: application.iam_identity_center_options.clone(),
             data_sources: application.reported_data_sources(),
-            app_configs: application.reported_app_configs(),
+            // `appConfigs` targets a list whose modelled length starts at ZERO
+            // (`smithy_query(query="shape",shape="AppConfigs")` reports
+            // `@length(min: 0, max: 200)`), so the empty list is a value the member
+            // takes: a read of the whole stored record answers with the settings the
+            // application holds — `[]` where it holds none — rather than leaving the
+            // member out and making every reader of it null-check one the model fills.
+            app_configs: Some(application.app_configs.clone()),
             created_at: Some(datetime(application.created_at)),
             last_updated_at: Some(datetime(application.last_updated_at)),
             kms_key_arn: application.kms_key_arn.clone(),

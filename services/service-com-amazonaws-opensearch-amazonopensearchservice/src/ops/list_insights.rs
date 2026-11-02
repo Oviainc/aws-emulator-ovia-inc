@@ -8,6 +8,11 @@
 //! page handed out. It only REPORTS: an insight is raised by the service observing a
 //! domain, never by a read of the set.
 //!
+//! A report over that set, so an empty set is an empty page: an entity holding no
+//! insight, a query whose filters match none, and a name this account holds no domain
+//! under all answer 200 with an empty `Insights`, leaving the refusal of such a name to
+//! the calls that address ONE insight of an entity.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -90,7 +95,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{epoch_millis, invalid_next_token, InsightEntityRefusal, InsightRecord};
+use crate::state::{epoch_millis, invalid_next_token, InsightRecord};
 
 /// The largest page this operation answers with, and the page size a request that
 /// names none gets: `MaxResults` is `@range(min: 1, max: 500)` — "valid values are 1
@@ -253,19 +258,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // The listing belongs to the entity the request names, and resolving that
-        // entity is the store's one decision ([`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::insights_of_entity`]),
-        // so a domain this account does not hold has no listing rather than an empty
-        // one.
+        // entity is the store's one decision ([`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::insights_listed_for_entity`]),
+        // so an entity holding no insight — including a name this account holds no
+        // domain under — reports the empty set rather than refusing the read, which is
+        // left to the calls addressing ONE insight of that entity.
         let held = store
-            .insights_of_entity(&input.entity)
-            .map_err(|refusal| match refusal {
-                InsightEntityRefusal::NotFound(payload) => {
-                    ListInsightsErrorModeled::ResourceNotFoundException(payload)
-                }
-                InsightEntityRefusal::Validation(payload) => {
-                    ListInsightsErrorModeled::ValidationException(payload)
-                }
-            })?;
+            .insights_listed_for_entity(&input.entity)
+            .map_err(ListInsightsErrorModeled::ValidationException)?;
 
         let mut insights: Vec<&InsightRecord> = held
             .into_iter()

@@ -24,8 +24,8 @@
 //!   while the same package named once is served and reports exactly one association;
 //! * a listing of a domain's packages is a report over that domain's set, so a name
 //!   nothing created and a domain that exists with nothing linked both report the
-//!   empty set, while the sibling listing of ONE package's domains refuses an id
-//!   nothing minted as the bad input value it is;
+//!   empty set, and the sibling listing of ONE package's domains reports the same empty
+//!   set for an id nothing minted;
 //! * paging walks the whole set exactly once, with every page but the last as large as
 //!   the request asked for.
 
@@ -438,7 +438,7 @@ async fn a_batch_that_names_one_package_twice_is_refused_as_a_whole() {
 }
 
 #[tokio::test]
-async fn a_listing_of_a_domain_nothing_created_is_the_empty_set_and_a_bad_package_id_is_refused() {
+async fn a_listing_of_a_resource_nothing_created_is_the_empty_set() {
     let emulator = Emulator::new();
     let ids = available_packages(&emulator).await;
 
@@ -455,14 +455,18 @@ async fn a_listing_of_a_domain_nothing_created_is_the_empty_set_and_a_bad_packag
             "case ListPackagesForDomain({name:?}): expected the empty set, got {reported:?}"
         );
     }
+    // An id the store holds no package under is associated with nothing either: the
+    // listing reports that empty set rather than refusing the id.
     let answer = list_for_package(&emulator, UNKNOWN_PACKAGE_ID, None, None).await;
+    let reported = listed(
+        &answer,
+        "ListDomainsForPackage(an id nothing minted)",
+    );
     assert_eq!(
-        (answer.status, error_code(&answer).as_str()),
-        (400, "ValidationException"),
-        "case ListDomainsForPackage(an id nothing minted): expected the id to be refused as \
-         a bad input value, got {} with {:?}",
-        answer.status,
-        answer.body
+        reported,
+        Vec::<Value>::new(),
+        "case ListDomainsForPackage(an id nothing minted): expected the empty set, got \
+         {reported:?}"
     );
 
     // A resource that EXISTS with nothing linked reports the empty set rather than a

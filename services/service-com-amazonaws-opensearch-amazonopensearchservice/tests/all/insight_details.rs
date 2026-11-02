@@ -138,7 +138,10 @@ fn field_names() -> Vec<String> {
 /// `@length(36, 36)` with pattern
 /// `^\p{XDigit}{8}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{12}$`, so an
 /// id is a hyphenated UUID whose last field is what tells it apart.
-fn guid(suffix: &str) -> String {
+///
+/// Reached by a sibling suite as `super::insight_details::guid`, so the crate holds ONE
+/// builder of a well-formed insight id.
+pub(crate) fn guid(suffix: &str) -> String {
     format!("4d2e7a91-6b3c-4f5d-9e8a-{suffix}")
 }
 

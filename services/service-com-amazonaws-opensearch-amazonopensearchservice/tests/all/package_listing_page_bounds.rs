@@ -89,7 +89,11 @@ pub(crate) async fn associate_many(
 
 /// `ListDomainsForPackage`: `GET /2021-01-01/packages/{PackageID}/domains`, carrying
 /// `query` verbatim.
-async fn list_for_package(emulator: &Emulator, package_id: &str, query: &str) -> Answer {
+pub(crate) async fn list_for_package(
+    emulator: &Emulator,
+    package_id: &str,
+    query: &str,
+) -> Answer {
     emulator
         .call(
             "GET",

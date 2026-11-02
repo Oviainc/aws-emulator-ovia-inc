@@ -22,8 +22,9 @@
 //! * a request that names no principal, or both kinds at once, is refused and the
 //!   stored set stands — as is a service principal outside the modelled enum;
 //! * the set belongs to the domain the request names: a grant on one domain is
-//!   invisible on another, a name the registry does not resolve is refused by both
-//!   operations, and deleting a domain releases its authorizations with it;
+//!   invisible on another, a name the registry does not resolve is refused by the GRANT
+//!   and reported as the empty set by the listing, and deleting a domain releases its
+//!   authorizations with it;
 //! * one answer reports the whole set exactly once in the order the listing reports it
 //!   and carries no `NextToken` member at all, while a token that names no principal of
 //!   the set is refused;
@@ -458,28 +459,33 @@ async fn the_authorization_set_belongs_to_the_domain_the_request_names() {
         other.body
     );
 
-    // A name the registry does not resolve has no set to grant into or to report.
-    for (label, answer) in [
-        (
-            "authorize",
-            authorize(&emulator, "search-absent", grant.body.clone()).await,
-        ),
-        ("list", list(&emulator, "search-absent", None).await),
-    ] {
-        let case = format!("{label}(search-absent)");
-        assert_eq!(
-            answer.status, 409,
-            "case {case}: expected 409 for a domain the registry does not hold, got {} \
-             with {:?}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            error_code(&answer),
-            "ResourceNotFoundException",
-            "case {case}: expected ResourceNotFoundException, got {:?}",
-            answer.body
-        );
-    }
+    // A name the registry does not resolve has no set to grant INTO — the grant needs
+    // the domain — while the listing of such a name reports that empty set.
+    let refused = authorize(&emulator, "search-absent", grant.body.clone()).await;
+    assert_eq!(
+        refused.status, 409,
+        "case authorize(search-absent): expected 409 for a domain the registry does not hold, \
+         got {} with {:?}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ResourceNotFoundException",
+        "case authorize(search-absent): expected ResourceNotFoundException, got {:?}",
+        refused.body
+    );
+    let absent = list(&emulator, "search-absent", None).await;
+    assert_eq!(
+        absent.status, 200,
+        "case list(search-absent): expected the listing to be served, got {} with {:?}",
+        absent.status, absent.body
+    );
+    assert!(
+        principal_list(&absent, "search-absent").is_empty(),
+        "case list(search-absent): a name no domain is held under reports an empty list, got \
+         {:?}",
+        absent.body
+    );
 
     // An authorization is access TO a domain, so it goes when the domain does.
     let deleted = emulator
@@ -492,10 +498,15 @@ async fn the_authorization_set_belongs_to_the_domain_the_request_names() {
     );
     let after = list(&emulator, "search-one", None).await;
     assert_eq!(
-        error_code(&after),
-        "ResourceNotFoundException",
-        "case ListVpcEndpointAccess(search-one after delete): expected \
-         ResourceNotFoundException, got {:?}",
+        after.status, 200,
+        "case ListVpcEndpointAccess(search-one after delete): expected the listing to be \
+         served, got {} with {:?}",
+        after.status, after.body
+    );
+    assert!(
+        principal_list(&after, "search-one after delete").is_empty(),
+        "case ListVpcEndpointAccess(search-one after delete): the grant went with the domain, \
+         got {:?}",
         after.body
     );
 }

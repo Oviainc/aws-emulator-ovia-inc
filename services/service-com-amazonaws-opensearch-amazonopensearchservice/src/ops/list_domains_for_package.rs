@@ -8,6 +8,11 @@
 //! projection the call that MADE the association answered with, so the two listings
 //! and the associate's own answer cannot disagree.
 //!
+//! A report over that set, so an empty set is an empty page: a package no domain has
+//! and an id this account holds no package under both answer 200 with an empty
+//! `DomainPackageDetailsList`, leaving the refusal of such an id to the calls that
+//! CHANGE a package or a domain's associations.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -83,7 +88,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{invalid_next_token, max_results_out_of_range, package_not_found};
+use crate::state::{invalid_next_token, max_results_out_of_range};
 
 /// The largest page this operation answers with: `MaxResults` is `@range(max: 100)`,
 /// so 100 results is the most any request can ask for. Held as the modelled member's
@@ -195,28 +200,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain.settle_package_associations(now);
         }
 
-        // The associations reported are the ones of ONE package, so an id that names no
-        // package of this account has no set to report: refused as the bad input value it
-        // is rather than as an empty page. A package the account DOES hold that no
-        // domain has reports the empty set, which is what tells a caller the package is
-        // associated with nothing.
-        let package = store.packages.get(&input.package_id).ok_or_else(|| {
-            ListDomainsForPackageErrorModeled::ValidationException(package_not_found())
-        })?;
-
+        // This report answers over the SET of links ONE package has, and an empty set is
+        // an empty page however it came to be empty: a package the account holds that no
+        // domain has, and an id this account holds no package under, both report nothing
+        // linked. Refusing such an id belongs to the calls that CHANGE the package or a
+        // domain's associations, which cannot be served without the package; a listing
+        // can, so a caller walking a set of ids is told each id's links rather than
+        // stopped at the first id that is gone. The id's own shape is still a
+        // requirement, enforced by `PackageID`'s modelled pattern before this handler
+        // runs.
+        //
+        // Each association is reported through the package it links to, which is where
+        // the package's own name and type live — the ONE stored package record, so a
+        // package operation and this listing cannot report the same package differently
+        // — so the row carries that record and an id resolving to none selects no row at
+        // all.
+        //
         // Order-stable, because the store is keyed by domain name and a domain holds at
         // most ONE association per package: the same request reports the same order
         // twice, which is what lets a token name a place in the set.
-        let associated: Vec<(&String, &crate::state::PackageAssociation)> = store
-            .domains
-            .iter()
-            .filter_map(|(name, domain)| {
-                domain
-                    .package_associations
-                    .get(&input.package_id)
-                    .map(|association| (name, association))
+        type Row<'a> = (
+            &'a String,
+            &'a crate::state::PackageAssociation,
+            &'a crate::state::Package,
+        );
+        let associated: Vec<Row<'_>> = store
+            .packages
+            .get(&input.package_id)
+            .map(|package| {
+                store
+                    .domains
+                    .iter()
+                    .filter_map(|(name, domain)| {
+                        domain
+                            .package_associations
+                            .get(&input.package_id)
+                            .map(|association| (name, association, package))
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         // A token names the domain the next page starts at, so paging resumes from a
         // place in the set rather than from an offset an associate or a dissociate
@@ -226,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => associated
                 .iter()
-                .position(|(name, _)| *name == token)
+                .position(|(name, _, _)| *name == token)
                 .ok_or_else(|| {
                     ListDomainsForPackageErrorModeled::ValidationException(invalid_next_token())
                 })?,
@@ -244,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page: Vec<DomainPackageDetails> = associated[start..end]
             .iter()
-            .map(|(name, association)| association.to_details(name, package))
+            .map(|(name, association, package)| association.to_details(name, package))
             .collect();
 
         Ok(ListDomainsForPackageOutput {
@@ -252,7 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "When nextToken is returned, there are more results available": the token
             // is the domain the next page starts at, and there is none once this page
             // ended the set.
-            next_token: associated.get(end).map(|(name, _)| (*name).clone()),
+            next_token: associated.get(end).map(|(name, _, _)| (*name).clone()),
         })
     }
 }

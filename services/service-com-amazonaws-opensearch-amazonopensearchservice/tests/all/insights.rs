@@ -12,9 +12,10 @@
 //! domain's for an `Account` entity — each as the stored record's values, narrowed to
 //! the insights raised inside the requested time range, ordered by the instant each
 //! was raised in the requested sort order, in pages of at most `MaxResults` resumed by
-//! the token the previous page handed out; an entity this account does not hold has no
-//! listing, and a token naming no insight of the listing is refused rather than
-//! answered with a page.
+//! the token the previous page handed out; an entity holding no insight — including a
+//! name this account holds no domain under — reports the empty set, while an entity
+//! this service cannot resolve at all and a token naming no insight of the listing are
+//! refused rather than answered with a page.
 //!
 //! So the assertions span a SET of inputs rather than one call: a table of insights
 //! covering EVERY value of `InsightType`, `InsightPriorityLevel` and `InsightStatus`
@@ -22,7 +23,7 @@
 //! the call, and two insights raised at the SAME instant; then both sort orders and
 //! the absent one, five page sizes and the unbounded case, the published bounds and
 //! values past them at either end, six time ranges, four shapes of unresolvable token
-//! and five entities this account holds nothing for.
+//! and five entities this service resolves nothing for.
 //!
 //! The insights themselves are written into the store directly (through
 //! [`super::domain_lifecycle::Emulator::store`]): the service RAISES an insight from
@@ -260,7 +261,10 @@ async fn list(emulator: &Emulator, body: Value) -> Answer {
 }
 
 /// The listing of `name`, with whatever extra members `extra` carries merged in.
-async fn list_domain(emulator: &Emulator, name: &str, extra: Value) -> Answer {
+///
+/// Reached by a sibling suite as `super::insights::list_domain`, so the crate drives
+/// this listing through ONE request helper.
+pub(crate) async fn list_domain(emulator: &Emulator, name: &str, extra: Value) -> Answer {
     let mut body = json!({"Entity": domain_entity(name)});
     if let Some(members) = extra.as_object() {
         for (member, value) in members {
@@ -270,8 +274,9 @@ async fn list_domain(emulator: &Emulator, name: &str, extra: Value) -> Answer {
     list(emulator, body).await
 }
 
-/// The `Insights` of an accepted listing.
-fn insights(answer: &Answer, case: &str) -> Vec<Value> {
+/// The `Insights` of an accepted listing. Reached by a sibling suite on the same rule
+/// as [`list_domain`].
+pub(crate) fn insights(answer: &Answer, case: &str) -> Vec<Value> {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected 200, got {} with {:?}",
@@ -688,7 +693,7 @@ async fn a_token_that_names_no_insight_of_the_listing_is_refused() {
 }
 
 #[tokio::test]
-async fn an_entity_this_account_does_not_hold_has_no_listing() {
+async fn an_entity_this_account_does_not_hold_has_an_empty_listing() {
     let emulator = Emulator::new();
     seeded(&emulator, "insight-present").await;
     create_baseline(&emulator, "insight-deleted").await;
@@ -707,19 +712,30 @@ async fn an_entity_this_account_does_not_hold_has_no_listing() {
 
     // Rows differ along the shape of the name: one never created, one at the shortest
     // the model admits, one at its longest, and one the account held until it was
-    // deleted.
+    // deleted. A name no domain is held under holds no insight either, so the listing
+    // reports that empty set rather than refusing the name.
     for name in [
         "never-created",
         "abc",
         "a-domain-name-at-its-upper-b",
         "insight-deleted",
     ] {
+        let case = format!("ListInsights(DomainName {name:?})");
         let answer = list_domain(&emulator, name, json!({})).await;
-        refused(
-            &answer,
-            &format!("ListInsights(DomainName {name:?})"),
-            409,
-            "ResourceNotFoundException",
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected the listing to be served, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert!(
+            insights(&answer, &case).is_empty(),
+            "case {case}: expected an empty Insights, got {:?}",
+            answer.body
+        );
+        assert!(
+            answer.body["NextToken"].is_null(),
+            "case {case}: expected no token past the end of an empty set, got {:?}",
+            answer.body["NextToken"]
         );
     }
 

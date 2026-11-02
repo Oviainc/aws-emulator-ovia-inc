@@ -7,7 +7,11 @@
 //! the same records `AuthorizeVpcEndpointAccess` grants.
 //!
 //! A pure read: the set is reported exactly as it is stored, so the next caller sees
-//! what this one saw. The domain's set is bounded by
+//! what this one saw. A report over that set, so an empty set is an empty answer: a
+//! domain nobody was granted access to and a name this account holds no domain under
+//! both answer 200 with an empty `AuthorizedPrincipalList`, leaving the refusal of such
+//! a name to the calls that CHANGE a domain's authorizations. The domain's set is
+//! bounded by
 //! [`crate::state::VPC_ENDPOINT_ACCESS_QUOTA`], so one answer reports it whole and this
 //! listing hands out no continuation token: its response carries no `NextToken` member,
 //! which is how a complete result set is reported.
@@ -172,19 +176,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read: the authorizations of a domain are reported exactly as they are
         // stored, so this call writes nothing at all.
         let store = state.lock();
-        // The set belongs to the domain, so a name the registry does not resolve has no
-        // set to report: the modelled missing-resource refusal rather than an empty
-        // page.
-        let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
-            ListVpcEndpointAccessErrorModeled::ResourceNotFoundException(
-                crate::state::domain_not_found(&input.domain_name),
-            )
-        })?;
 
+        // This report answers over the SET of principals a domain has granted access
+        // to, and an empty set is an empty answer however it came to be empty: a domain
+        // nobody was granted access to, and a name this account holds no domain under,
+        // both report nothing authorized. Refusing such a name belongs to the calls that
+        // CHANGE a domain's authorizations, which cannot be served without the domain; a
+        // listing can, so a caller walking a set of names is told each name's grants
+        // rather than stopped at the first name that is gone.
+        //
         // Order-stable, because the domain's set is keyed by the principal: the same
         // request reports the same order twice, which is what lets a token name a place
         // in the set.
-        //
+        let authorized: Vec<(&String, &AuthorizedPrincipal)> = store
+            .domains
+            .get(&input.domain_name)
+            .map(|domain| domain.vpc_endpoint_access.iter().collect())
+            .unwrap_or_default();
+
         // A token names the principal the answer starts at, so a listing resumes from a
         // place in the set rather than from an offset a grant or a revoke would have
         // shifted. A token naming no principal of the set — one this service never
@@ -192,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // place, which is a malformed request rather than an empty page. The EMPTY token
         // means the start of the set, exactly as naming no token does.
         let start = crate::state::vpc_endpoint_access_start(
-            domain.vpc_endpoint_access.keys(),
+            authorized.iter().map(|(principal, _)| *principal),
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {
@@ -203,11 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this caller has not been shown and there is no continuation token to report —
         // the response carries no `NextToken` member at all, which is how a complete
         // result set is reported.
-        let listed: Vec<AuthorizedPrincipal> = domain
-            .vpc_endpoint_access
-            .values()
+        let listed: Vec<AuthorizedPrincipal> = authorized
+            .iter()
             .skip(start)
-            .cloned()
+            .map(|(_, principal)| (*principal).clone())
             .collect();
 
         Ok(ListVpcEndpointAccessOutput {

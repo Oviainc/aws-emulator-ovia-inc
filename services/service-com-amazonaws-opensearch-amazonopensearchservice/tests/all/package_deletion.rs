@@ -28,7 +28,8 @@
 //! The stored set is read back over the wire through `DescribePackages`, and the other
 //! read paths of one package (`GetPackageVersionHistory`, `ListDomainsForPackage`)
 //! through their own routes, so a case asserts that no read reports a package the
-//! removal has taken out.
+//! removal has taken out — the by-id read refusing the id and the listing of its
+//! domains reporting the empty set.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
@@ -309,7 +310,9 @@ async fn a_package_no_domain_holds_is_deleted_and_reported_from_the_stored_recor
         );
 
         // Every read path of ONE package answers for a package the account no longer
-        // holds the same way: there is nothing left to report.
+        // holds the same way: there is nothing left to report. The listing of the
+        // DOMAINS the id is associated with reports a SET, so it answers that set empty
+        // rather than refusing the id.
         let history = emulator
             .call(
                 "GET",
@@ -325,7 +328,19 @@ async fn a_package_no_domain_holds_is_deleted_and_reported_from_the_stored_recor
                 None,
             )
             .await;
-        assert_not_found(&domains, row.case);
+        assert_eq!(
+            domains.status, 200,
+            "case {}: expected the listing to be served, got {} with {:?}",
+            row.case, domains.status, domains.body
+        );
+        assert_eq!(
+            domains.body["DomainPackageDetailsList"].as_array(),
+            Some(&Vec::<Value>::new()),
+            "case {}: expected an empty DomainPackageDetailsList once the package is gone, \
+             got {:?}",
+            row.case,
+            domains.body
+        );
         let again = delete(&emulator, &package_id).await;
         assert_not_found(&again, row.case);
     }
