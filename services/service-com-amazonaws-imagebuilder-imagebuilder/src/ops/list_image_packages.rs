@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListImagePackages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListImagePackages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListImagePackages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the package inventory one image build version holds, as one page of
+//! `ImagePackage`.
+//!
+//! The rules it follows, each from the modelled documentation quoted beside it:
+//!
+//! * the operation "lists the packages that are associated with an image build version, as
+//!   determined by Amazon Web Services Systems Manager Inventory at build time" — so it
+//!   reports the inventory the named build version holds, and a build version this Region
+//!   holds none of reports an empty list rather than refusing: an inventory nothing
+//!   recorded is empty, not missing;
+//! * `imageBuildVersionArn` "must be a full build version ARN", which the modelled pattern
+//!   already enforces, and names ONE build — so the lookup is exact;
+//! * `maxResults` bounds the page at 1..25, and a page that does not exhaust the inventory
+//!   answers with a `nextToken` that continues it — a token this operation did not issue
+//!   for this build version's listing is `InvalidPaginationTokenException`.
+//!
+//! A pure read: it answers from the store and writes nothing a later caller sees. The page
+//! token CARRIES the position it continues rather than being filed in the store, so
+//! listing one page cannot change what a later caller observes.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +184,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListImagePackages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListImagePackagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListImagePackages"))
+        // The ARN's pattern, the `maxResults` 1..25 range and the token's length have all
+        // been refused past by the centralized walk before this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListImagePackagesErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // Which listing this page belongs to: the build version whose inventory it walks,
+        // so a token issued for one image is refused for another.
+        let mut cursor = crate::state::PageCursor {
+            operation: crate::state::LIST_IMAGE_PACKAGES_OPERATION.to_string(),
+            region: region.clone(),
+            query: crate::state::image_package_query_fingerprint(&input.image_build_version_arn),
+            after: String::new(),
+        };
+        let after = match input.next_token.as_deref() {
+            None => String::new(),
+            Some(token) => match crate::state::decode_page_token(token, &cursor) {
+                Some(after) => after,
+                None => {
+                    return Err(
+                        ListImagePackagesErrorModeled::InvalidPaginationTokenException(
+                            InvalidPaginationTokenException {
+                                message: Some(crate::state::invalid_pagination_token_message()),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        // A page carries at most `maxResults` entries, and at most the modelled maximum
+        // when the request names none.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_IMAGE_PACKAGES_PER_PAGE)
+            .clamp(1, crate::state::MAX_IMAGE_PACKAGES_PER_PAGE);
+
+        // A pure read: the guard is taken, this page of the stored inventory is copied out
+        // as modelled packages, and nothing is written. The inventory is keyed by package
+        // name, so the listing has one order and a token's position in it is stable. A
+        // build version this Region holds none of contributes no entries at all, which is
+        // the empty page such a read answers with.
+        let store = state.lock();
+        let mut inventory = store
+            .image(&input.image_build_version_arn, &region)
+            .into_iter()
+            .flat_map(|record| record.packages.iter())
+            .filter(|(name, _)| name.as_str() > after.as_str());
+
+        let page: Vec<ImagePackage> = inventory
+            .by_ref()
+            .take(page_size)
+            .map(|(name, version)| ImagePackage {
+                package_name: Some(name.clone()),
+                package_version: Some(version.clone()),
+            })
+            .collect();
+        // A `nextToken` is answered only when a package this page did not carry remains.
+        let remaining = inventory.next().is_some();
+        let next_token = page
+            .last()
+            .filter(|_| remaining)
+            .and_then(|last| last.package_name.clone())
+            .map(|last| {
+                cursor.after = last;
+                crate::state::encode_page_token(&cursor)
+            });
+        drop(store);
+
+        Ok(ListImagePackagesOutput {
+            request_id: Some(crate::state::new_request_id()),
+            image_package_list: Some(page),
+            next_token,
+        })
     }
 }

@@ -19,6 +19,13 @@
 //! alternation grouped) delegates to [`aws_validation_refusal_with`] and passes it: the
 //! rendering is the only thing a service chooses here.
 //!
+//! Not every service answers that envelope at all. One whose model declares no
+//! `ValidationException`, and whose recordings show an error OF ITS OWN for a value one of
+//! its `@pattern`s does not admit, states that one: [`parameter_pattern_refusal`] over the
+//! sentence [`parameter_pattern_mismatch`], naming the parameter and the pattern its value
+//! had to match. There too the service chooses only its error code, which of its patterns it
+//! states that way, and the rendering of the expression — the sentence stays here.
+//!
 //! The rendering rule is framework-level — it belongs in
 //! `vendor/smithy-schema-server/src/constraints.rs`'s `Violation::requirement`, which a fix
 //! may not change from here; once it learns this, delete this module and every
@@ -764,6 +771,63 @@ pub fn aws_validation_refusal_with(
     stated_refusal(refusal, quote_pattern, |_| false)
 }
 
+/// The refusal a service states for a value one of its own `@pattern`s does not admit,
+/// where its recordings show an error OF ITS OWN instead of the envelope above: the
+/// parameter the value sat at, and the pattern that value had to match.
+///
+/// A service reaches for this rather than [`aws_validation_refusal`] when its recordings
+/// show that it does not answer `ValidationException` at all for such a value — a model that
+/// declares no `ValidationException` cannot answer one — and it chooses only what is its
+/// own: `code`, the error it answers (which travels with the message, as everywhere in this
+/// module); `claims`, asked about the pattern a violation carries, which decides which of
+/// its patterns are stated this way; and `quote_pattern`, the rendering of the expression the
+/// message quotes, which the module header above states is the one rendering a service
+/// chooses. The SENTENCE is [`parameter_pattern_mismatch`] and stays here, so two services
+/// cannot word it differently.
+///
+/// `None` unless EVERY violation of the refusal is a pattern the service claims, so a
+/// refusal that is even partly about another constraint keeps the framework's own envelope
+/// rather than being restated as one parameter's.
+pub fn parameter_pattern_refusal(
+    refusal: &Refusal,
+    code: &str,
+    claims: impl Fn(&str) -> bool,
+    quote_pattern: impl Fn(&str) -> String,
+) -> Option<Refused> {
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
+    let claimed: Vec<(&str, String)> = violations
+        .iter()
+        .map(|violation| match &violation.kind {
+            ViolationKind::Pattern(pattern) if claims(pattern) => {
+                Some((violation.path.as_str(), quote_pattern(pattern)))
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // One parameter is named, the first the walk found: the sentence states the parameter
+    // whose value was refused, and a refusal naming several would be a different sentence.
+    let (member, pattern) = claimed.first()?;
+    Some(Refused {
+        code: code.to_owned(),
+        message: parameter_pattern_mismatch(member, pattern),
+    })
+}
+
+/// The sentence [`parameter_pattern_refusal`] states: the parameter whose value was refused,
+/// and the pattern that value had to match.
+///
+/// The value itself is WITHHELD — the requirement is the pattern, not the one value that
+/// missed it — so the sentence is the same whatever a caller submitted.
+#[must_use]
+pub fn parameter_pattern_mismatch(member: &str, pattern: &str) -> String {
+    format!(
+        "The value supplied for parameter '{member}' is not valid. {member} must match \
+         pattern {pattern}"
+    )
+}
+
 /// The ONE body behind every entry point above: the framework's envelope over the
 /// framework's clauses, with the two renderings this module owns applied — the `@pattern`
 /// quoting the caller chose, and the value half dropped from a clause that states none (a
@@ -1073,9 +1137,10 @@ mod tests {
         aws_validation_refusal, aws_validation_refusal_over_elements, aws_validation_refusal_with,
         aws_validation_refusal_withholding, aws_validation_refusal_withholding_with,
         enum_value_not_found, envelope_over, float_value_text, in_float_value_rendering,
-        in_pattern_first_order, map_key_refusal, map_key_refusal_quoting, pattern_mismatch,
-        property_count_refusal, quoting_the_submitted_collection,
-        quoting_the_whole_submitted_value, string_too_long, string_too_short,
+        in_pattern_first_order, map_key_refusal, map_key_refusal_quoting,
+        parameter_pattern_refusal, pattern_mismatch, property_count_refusal,
+        quoting_the_submitted_collection, quoting_the_whole_submitted_value, string_too_long,
+        string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -2409,5 +2474,125 @@ mod tests {
             envelope_over(&[]).is_none(),
             "expected no clause to state nothing"
         );
+    }
+
+    /// RULE: a service that answers an error OF ITS OWN for a value one of its patterns
+    /// does not admit states the parameter and the pattern that value had to match, in its
+    /// own code; a refusal that is even partly about another constraint keeps the
+    /// framework's envelope.
+    ///
+    /// The rows span what that generalises over: which pattern a violation carries (claimed
+    /// or not), which constraint class the violation is, how many violations the refusal
+    /// holds, and whether the rendering restates the expression or passes it through.
+    #[test]
+    fn a_claimed_patterns_refusal_names_the_parameter_and_its_pattern() {
+        /// The rendering one service chooses: the expression with its one bounded field
+        /// restated, which is what a service passes in.
+        fn stated(pattern: &str) -> String {
+            pattern.replace("[^:]+", "[a-z]+")
+        }
+
+        let rows: Vec<(&str, Refusal, Option<&str>)> = vec![
+            (
+                "a claimed pattern, restated",
+                Refusal::Invalid(vec![violation(
+                    "resourceArn",
+                    ViolationKind::Pattern("^arn:aws:thing:[^:]+:x$".to_owned()),
+                    "not-an-arn",
+                )]),
+                Some(
+                    "The value supplied for parameter 'resourceArn' is not valid. resourceArn \
+                     must match pattern ^arn:aws:thing:[a-z]+:x$",
+                ),
+            ),
+            (
+                "a claimed pattern the rendering leaves alone",
+                Refusal::Invalid(vec![violation(
+                    "otherArn",
+                    ViolationKind::Pattern("^arn:aws:thing:x$".to_owned()),
+                    "x",
+                )]),
+                Some(
+                    "The value supplied for parameter 'otherArn' is not valid. otherArn must \
+                     match pattern ^arn:aws:thing:x$",
+                ),
+            ),
+            (
+                "two claimed patterns: the first parameter is named",
+                Refusal::Invalid(vec![
+                    violation(
+                        "firstArn",
+                        ViolationKind::Pattern("^arn:aws:thing:x$".to_owned()),
+                        "x",
+                    ),
+                    violation(
+                        "secondArn",
+                        ViolationKind::Pattern("^arn:aws:thing:y$".to_owned()),
+                        "y",
+                    ),
+                ]),
+                Some(
+                    "The value supplied for parameter 'firstArn' is not valid. firstArn must \
+                     match pattern ^arn:aws:thing:x$",
+                ),
+            ),
+            (
+                "a pattern the service does not claim",
+                Refusal::Invalid(vec![violation(
+                    "version",
+                    ViolationKind::Pattern(r"^[0-9]+$".to_owned()),
+                    "x",
+                )]),
+                None,
+            ),
+            (
+                "a constraint that is not a pattern",
+                Refusal::Invalid(vec![violation("name", ViolationKind::MinLength(3), "ab")]),
+                None,
+            ),
+            (
+                "one claimed pattern beside another constraint",
+                Refusal::Invalid(vec![
+                    violation(
+                        "resourceArn",
+                        ViolationKind::Pattern("^arn:aws:thing:x$".to_owned()),
+                        "x",
+                    ),
+                    violation("name", ViolationKind::MinLength(3), "ab"),
+                ]),
+                None,
+            ),
+            ("no violations at all", Refusal::Invalid(Vec::new()), None),
+            ("an unauthenticated caller", Refusal::Unauthenticated, None),
+        ];
+
+        for (case, refusal, expected) in &rows {
+            let answered = parameter_pattern_refusal(
+                refusal,
+                "InvalidParameterValueException",
+                |pattern| pattern.starts_with("^arn:aws:thing:"),
+                stated,
+            );
+            match expected {
+                Some(message) => {
+                    let stated = answered
+                        .unwrap_or_else(|| panic!("case {case:?}: expected a stated refusal"));
+                    assert_eq!(
+                        stated.code, "InvalidParameterValueException",
+                        "case {case:?}: expected the service's own code, got {:?}",
+                        stated.code
+                    );
+                    assert_eq!(
+                        stated.message, *message,
+                        "case {case:?}: expected {message:?}, got {:?}",
+                        stated.message
+                    );
+                }
+                None => assert!(
+                    answered.is_none(),
+                    "case {case:?}: expected the framework's own wording, got {answered:?}"
+                ),
+            }
+        }
     }
 }

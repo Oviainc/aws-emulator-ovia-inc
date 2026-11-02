@@ -24,8 +24,10 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. This service rewords one case: a value a modelled ARN
+//!   pattern does not admit, answered as the modelled
+//!   `InvalidParameterValueException`. Every other refusal keeps the framework's
+//!   wording. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,10 +42,28 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
+
+/// The error code this service answers a value its model's ARN patterns do not admit
+/// with: the modelled `InvalidParameterValueException` (HTTP 400), whose own documentation
+/// is "The value that you provided for the specified parameter is invalid".
+///
+/// This model declares NO `ValidationException` — its only service-common error is
+/// `ServiceException` (`smithy_query(query="service_info")`) — so the framework's synthetic
+/// one is not an error this service can answer with, and the refusal is stated through the
+/// shared seam for a service that answers an error of its own
+/// (`service_common::validation_message::parameter_pattern_refusal`).
+const INVALID_PARAMETER_VALUE_EXCEPTION: &str = "InvalidParameterValueException";
+
+/// Which of this model's patterns are stated as a refused parameter VALUE: the ones that
+/// require an ARN, which every `*Arn` shape of this model opens with `^arn:`.
+///
+/// A pattern of any other kind is left to the framework's own refusal, so this reword is
+/// about what an ARN member admits rather than about constraints in general.
+fn requires_an_arn(pattern: &str) -> bool {
+    pattern.starts_with("^arn:")
+}
 
 /// The `com-amazonaws-imagebuilder-imagebuilder` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +118,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // A value a modelled ARN pattern does not admit is stated through the shared
+        // refusal seam, which owns the sentence and the envelope; this service chooses only
+        // the error it answers, which of its patterns are stated that way, and how the
+        // expression is quoted ([`crate::state::stated_arn_pattern`]). Every other
+        // violation class keeps the framework's wording.
+        ::service_common::validation_message::parameter_pattern_refusal(
+            refusal,
+            INVALID_PARAMETER_VALUE_EXCEPTION,
+            requires_an_arn,
+            crate::state::stated_arn_pattern,
+        )
     }
 
     fn override_routing_error(

@@ -39,6 +39,13 @@
 //! * an image recipe is keyed by its own ARN, which carries the [`normalized_name`] and
 //!   the semantic version, so one name+version pair is stored at most once.
 //!
+//! Beside those the store holds the **image build versions** a build produced, keyed by
+//! their own build version ARNs, each carrying what its build RECORDED — today the
+//! package inventory `ListImagePackages` reports
+//! ([`ImageBuildVersionRecord`]). A build version nothing has built is absent, and a read
+//! of an absent one reports no packages rather than refusing: the inventory of a build
+//! that never ran is empty, not missing.
+//!
 //! A **resource policy** is held beside the resource it is applied to, keyed by that
 //! resource's own ARN
 //! ([`ComAmazonawsImagebuilderImagebuilderState::resource_policies`]): every policy pair
@@ -88,6 +95,11 @@ pub const COMPONENT_ARN_PREFIX: &str = "component/";
 /// `^arn:aws[^:]*:imagebuilder:[^:]+:(?:[0-9]{12}|aws):image-recipe/[a-z0-9-_]+/(?:[0-9]+|x)\.(?:[0-9]+|x)\.(?:[0-9]+|x)$`.
 pub const IMAGE_RECIPE_ARN_PREFIX: &str = "image-recipe/";
 
+/// The resource portion an image build version ARN carries before its name, from the
+/// modelled `ImageBuildVersionArn` pattern
+/// `^arn:aws[^:]*:imagebuilder:[^:]+:(?:[0-9]{12}|aws(?:-[a-z-]+)?):image/[a-z0-9-_]+/[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$`.
+pub const IMAGE_ARN_PREFIX: &str = "image/";
+
 /// The operations whose `clientToken` receipts share one index, each named as the key
 /// that index files its receipts under — the operation's own name, so two operations
 /// never read each other's.
@@ -103,6 +115,9 @@ pub const CREATE_IMAGE_RECIPE_OPERATION: &str = "CreateImageRecipe";
 /// The listing a page token belongs to, so a token issued by one list operation cannot
 /// be spent on another ([`encode_page_token`]).
 pub const LIST_IMAGE_RECIPES_OPERATION: &str = "ListImageRecipes";
+
+/// See [`LIST_IMAGE_RECIPES_OPERATION`].
+pub const LIST_IMAGE_PACKAGES_OPERATION: &str = "ListImagePackages";
 
 /// How many nodes of a semantic version a caller assigns.
 ///
@@ -157,6 +172,10 @@ pub const IMAGE_RECIPE_FILTER_NAMES: &[&str] = &["name", "parentImage", "platfor
 /// The most items one `ListImageRecipes` page carries when the request names no
 /// `maxResults`: the modelled `maxResults` range's own maximum (1..25).
 pub const MAX_IMAGE_RECIPES_PER_PAGE: usize = 25;
+
+/// The most items one `ListImagePackages` page carries when the request names no
+/// `maxResults`: the modelled `maxResults` range's own maximum (1..25).
+pub const MAX_IMAGE_PACKAGES_PER_PAGE: usize = 25;
 
 /// The most tags one resource carries.
 ///
@@ -246,6 +265,21 @@ pub const MAX_COMPONENTS: usize = 1_000;
 /// The most image recipes this emulator will hold. An emulator resource guard, for the
 /// same reason as [`MAX_COMPONENTS`].
 pub const MAX_IMAGE_RECIPES: usize = 1_000;
+
+/// The most image build versions this emulator will hold. An emulator resource guard, for
+/// the same reason as [`MAX_COMPONENTS`]:
+/// [`ComAmazonawsImagebuilderImagebuilderState::image_store_is_full`] is what a build
+/// checks before it files one.
+pub const MAX_IMAGES: usize = 1_000;
+
+/// The most packages this emulator keeps in ONE build version's inventory.
+///
+/// An emulator resource guard like [`MAX_IMAGES`], and a bound on one RECORD rather than on
+/// the store: the modelled `ImagePackageList` carries no maximum, and the inventory of a
+/// built image runs to a few thousand packages, so this cap sits above that and exists only
+/// so one record cannot grow without bound
+/// ([`ComAmazonawsImagebuilderImagebuilderState::insert_image`]).
+pub const MAX_IMAGE_PACKAGES: usize = 5_000;
 
 /// The policy document a resource-policy read reports for a resource no policy has been
 /// applied to.
@@ -506,6 +540,31 @@ impl ImageRecipeRecord {
     }
 }
 
+/// One stored image build version: what the build that produced it recorded, which is
+/// what every later read reports.
+///
+/// The record exists for the sake of what a build OBSERVED, not only for the image's own
+/// members: `ListImagePackages` reports "the packages that are associated with an image
+/// build version, as determined by Amazon Web Services Systems Manager Inventory at build
+/// time", so that inventory is taken on the instance the build ran on and is held here
+/// beside the build version it was taken for. Nothing else can derive it — no recipe,
+/// component or configuration this store holds says which packages an operating system
+/// ended up with — so a build version whose build recorded no inventory holds none, and a
+/// read of it reports none.
+#[derive(Debug, Clone, Default)]
+pub struct ImageBuildVersionRecord {
+    /// This build version's own ARN, which is also its key in the store.
+    pub arn: String,
+    /// The Region whose endpoint built it, and the only one that can reach it.
+    pub region: String,
+    /// The package inventory recorded for this build version, keyed by package name: one
+    /// version per name, held in name order, so two reads of one page report the same
+    /// entries and a token's position in the listing is stable. Bounded at
+    /// [`MAX_IMAGE_PACKAGES`] where it is filed
+    /// ([`ComAmazonawsImagebuilderImagebuilderState::insert_image`]).
+    pub packages: BTreeMap<String, String>,
+}
+
 /// What a successful create filed about the request it served, so a retry of that
 /// request can be told from a different one carrying the same `clientToken`.
 #[derive(Debug, Clone)]
@@ -554,6 +613,11 @@ pub struct ComAmazonawsImagebuilderImagebuilderState {
     /// normalized name and its version, so one key says which name+version pair is
     /// taken where.
     pub image_recipes: BTreeMap<String, ImageRecipeRecord>,
+    /// Every stored image build version, keyed by its own build version ARN — which
+    /// carries its Region, its normalized name, its version and its build number. The
+    /// image-build path is what files one ([`Self::insert_image`]), together with the
+    /// package inventory the build recorded.
+    pub images: BTreeMap<String, ImageBuildVersionRecord>,
     /// The answer each `clientToken` already got, keyed by (operation, Region, token):
     /// an idempotency token is spent on ONE operation, so the same token may create a
     /// component and a recipe. Bounded on its own, by age, at [`MAX_CREATE_RECEIPTS`] —
@@ -863,6 +927,52 @@ impl ComAmazonawsImagebuilderImagebuilderState {
         self.image_recipes.insert(record.arn.clone(), record);
     }
 
+    /// The image build version `arn` names exactly, but only when it belongs to
+    /// `request_region`.
+    ///
+    /// A regional endpoint serves only its own Region's resources, so a build version of
+    /// another Region answers as if it did not exist. The lookup is EXACT: a build version
+    /// ARN names one build, never the latest build of the version it belongs to.
+    #[must_use]
+    pub fn image(&self, arn: &str, request_region: &str) -> Option<&ImageBuildVersionRecord> {
+        self.images
+            .get(arn)
+            .filter(|record| record.region == request_region)
+    }
+
+    /// Store one image build version, with whatever the build recorded about it.
+    ///
+    /// Answers `false` and stores NOTHING once the store already holds [`MAX_IMAGES`] other
+    /// build versions, so a store driven from the request path cannot grow without bound; a
+    /// build checks [`Self::image_store_is_full`] first and refuses rather than reaching
+    /// here. A build version the store already holds is replaced whatever the count, since
+    /// that stores no additional record.
+    ///
+    /// The inventory ONE record keeps is bounded on its own at [`MAX_IMAGE_PACKAGES`],
+    /// counted in the package-name order the record holds it in, so one build cannot grow
+    /// one record without bound either.
+    pub fn insert_image(&mut self, mut record: ImageBuildVersionRecord) -> bool {
+        if self.image_store_is_full() && !self.images.contains_key(&record.arn) {
+            return false;
+        }
+        if record.packages.len() > MAX_IMAGE_PACKAGES {
+            record.packages = record
+                .packages
+                .into_iter()
+                .take(MAX_IMAGE_PACKAGES)
+                .collect();
+        }
+        self.images.insert(record.arn.clone(), record);
+        true
+    }
+
+    /// Whether the store is already holding as many image build versions as this emulator
+    /// will keep ([`MAX_IMAGES`]).
+    #[must_use]
+    pub fn image_store_is_full(&self) -> bool {
+        self.images.len() >= MAX_IMAGES
+    }
+
     /// Forget the image recipe `arn` names, when it belongs to `request_region`.
     pub fn remove_image_recipe(
         &mut self,
@@ -1049,6 +1159,24 @@ pub fn image_recipe_arn(region: &str, name: &str, version: &str) -> String {
         region,
         &format!(
             "{IMAGE_RECIPE_ARN_PREFIX}{}/{version}",
+            normalized_name(name)
+        ),
+    )
+}
+
+/// The ARN of one build version of the image `name` names at `version` in `region`.
+#[must_use]
+pub fn image_build_version_arn(
+    region: &str,
+    name: &str,
+    version: &str,
+    build_version: u64,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!(
+            "{IMAGE_ARN_PREFIX}{}/{version}/{build_version}",
             normalized_name(name)
         ),
     )
@@ -1571,6 +1699,19 @@ pub fn image_recipe_query_fingerprint(owner: Option<&str>, filters: Option<&[Fil
     )
 }
 
+/// A deterministic rendering of which packages one `ListImagePackages` request asked for,
+/// so a token issued for one image build version is refused for another.
+///
+/// `maxResults` is deliberately NOT part of it, for the reason
+/// [`image_recipe_query_fingerprint`] states.
+#[must_use]
+pub fn image_package_query_fingerprint(image_build_version_arn: &str) -> String {
+    format!(
+        "imageBuildVersionArn={};",
+        text(Some(image_build_version_arn))
+    )
+}
+
 /// The region this request was signed for, from its SigV4 credential scope; the
 /// emulator's default region when it carries none.
 ///
@@ -1967,6 +2108,43 @@ fn group(parts: &[String]) -> String {
 //
 // Each wording lives here once, so two operations state the same failure the same way.
 // ---------------------------------------------------------------------------
+
+/// The ARN partition field as the model spells it: `aws` followed by anything up to the
+/// next colon, which is all a pattern needs in order to bound ONE field.
+const MODELLED_PARTITION_FIELD: &str = "arn:aws[^:]*:";
+
+/// The ARN partition field as a refusal states it: `aws` followed by the hyphenated words a
+/// partition name is made of (`aws-cn`, `aws-us-gov`).
+const STATED_PARTITION_FIELD: &str = "arn:aws(?:-[a-z]+)*:";
+
+/// The ARN Region field of this service as the model spells it: anything up to the next
+/// colon, for the same reason as [`MODELLED_PARTITION_FIELD`].
+const MODELLED_REGION_FIELD: &str = ":imagebuilder:[^:]+:";
+
+/// The ARN Region field as a refusal states it: the form a Region code takes — an area, one
+/// or more hyphenated words, and a number (`us-east-1`, `ap-southeast-3`).
+const STATED_REGION_FIELD: &str = ":imagebuilder:[a-z]{2,}(?:-[a-z]+)+-[0-9]+:";
+
+/// How a refusal of this service quotes the pattern an ARN member's value had to match: the
+/// member's own modelled pattern, with the two fields above spelled the way this service
+/// states them rather than the way a model bounds a field — anchors included, since this
+/// service states the whole-value expression as the model writes it.
+///
+/// The two fields are the ones EVERY `*Arn` shape of this model spells identically
+/// (`^arn:aws[^:]*:imagebuilder:[^:]+:…`), so one rendering serves every ARN member of every
+/// operation. Every other field — the account, the resource kind, the name, the version —
+/// is quoted exactly as the model carries it, which is also what a pattern spelling the two
+/// fields some other way gets, since there is then nothing to restate.
+///
+/// This is the one rendering this service chooses; the sentence and the envelope it is
+/// quoted in belong to the shared refusal seam
+/// (`service_common::validation_message::parameter_pattern_refusal`).
+#[must_use]
+pub fn stated_arn_pattern(pattern: &str) -> String {
+    pattern
+        .replace(MODELLED_PARTITION_FIELD, STATED_PARTITION_FIELD)
+        .replace(MODELLED_REGION_FIELD, STATED_REGION_FIELD)
+}
 
 /// Why a request naming a subnet but no security group is refused.
 ///
