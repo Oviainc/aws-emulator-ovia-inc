@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CmkSecretConfig, CustomSecretConfig, FilterRule, ManifestConfig, Options, S3Config,
+    CmkSecretConfig, CustomSecretConfig, Ec2Config, FilterRule, ManifestConfig, Options, S3Config,
     TagListEntry, TaskReportConfig, TaskSchedule,
 };
 
@@ -117,6 +117,8 @@ pub enum LocationKind {
     AzureBlob,
     /// A self-managed or third-party object storage system.
     ObjectStorage,
+    /// An Amazon EFS file system.
+    Efs,
 }
 
 impl LocationKind {
@@ -126,6 +128,7 @@ impl LocationKind {
             Self::S3 => "s3",
             Self::AzureBlob => "azure-blob",
             Self::ObjectStorage => "object-storage",
+            Self::Efs => "efs",
         }
     }
 
@@ -135,7 +138,8 @@ impl LocationKind {
     /// `LocationUri` is documented as `TYPE://GLOBAL_ID/SUBDIR`, where TYPE is the kind
     /// of location and GLOBAL_ID identifies the resource backing it (a bucket name for
     /// Amazon S3, a container's host and name for Azure Blob Storage, a server and a
-    /// bucket for an object storage system) — so every kind of location assembles its
+    /// bucket for an object storage system, a Region and file system id for Amazon
+    /// EFS) — so every kind of location assembles its
     /// URI the same way and contributes only its own GLOBAL_ID. The subdirectory becomes
     /// one slash-delimited prefix, however many leading or trailing slashes the request
     /// spelled it with.
@@ -156,6 +160,7 @@ impl LocationKind {
             Self::S3 => "an Amazon S3",
             Self::AzureBlob => "an Azure Blob Storage",
             Self::ObjectStorage => "an object storage",
+            Self::Efs => "an Amazon EFS",
         }
     }
 }
@@ -229,6 +234,21 @@ pub struct ObjectStorageLocationConfig {
     pub secret: LocationSecret,
 }
 
+/// The Amazon EFS configuration of a transfer location.
+///
+/// `access_point_arn`, `file_system_access_role_arn` and `in_transit_encryption` are
+/// each optional in the create request and in the describe response, so a location is
+/// stored with exactly what the request named and reports no value the caller never
+/// asked for.
+#[derive(Debug, Clone)]
+pub struct EfsLocationConfig {
+    pub filesystem_arn: String,
+    pub ec2_config: Ec2Config,
+    pub access_point_arn: Option<String>,
+    pub file_system_access_role_arn: Option<String>,
+    pub in_transit_encryption: Option<String>,
+}
+
 /// The per-kind configuration of a transfer location: one variant per
 /// [`LocationKind`], so a location holds the members of its own kind and no others.
 #[derive(Debug, Clone)]
@@ -236,6 +256,7 @@ pub enum LocationConfig {
     S3(S3LocationConfig),
     AzureBlob(AzureBlobLocationConfig),
     ObjectStorage(ObjectStorageLocationConfig),
+    Efs(EfsLocationConfig),
 }
 
 impl LocationConfig {
@@ -245,6 +266,7 @@ impl LocationConfig {
             Self::S3(_) => LocationKind::S3,
             Self::AzureBlob(_) => LocationKind::AzureBlob,
             Self::ObjectStorage(_) => LocationKind::ObjectStorage,
+            Self::Efs(_) => LocationKind::Efs,
         }
     }
 
@@ -268,6 +290,14 @@ impl LocationConfig {
     pub fn as_object_storage(&self) -> Option<&ObjectStorageLocationConfig> {
         match self {
             Self::ObjectStorage(object_storage) => Some(object_storage),
+            _ => None,
+        }
+    }
+
+    /// The Amazon EFS configuration, when that is this location's kind.
+    pub fn as_efs(&self) -> Option<&EfsLocationConfig> {
+        match self {
+            Self::Efs(efs) => Some(efs),
             _ => None,
         }
     }
@@ -595,6 +625,11 @@ impl ComAmazonawsDatasyncFmrsserviceState {
         arn: &str,
     ) -> Result<(&Location, &AzureBlobLocationConfig), String> {
         self.located(arn, LocationKind::AzureBlob, LocationConfig::as_azure_blob)
+    }
+
+    /// The Amazon EFS location stored under `arn`, with its EFS configuration.
+    pub fn efs_location(&self, arn: &str) -> Result<(&Location, &EfsLocationConfig), String> {
+        self.located(arn, LocationKind::Efs, LocationConfig::as_efs)
     }
 
     /// The object storage location stored under `arn`, with its object storage

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLocationEfs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLocationEfs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLocationEfs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `LocationArn` and stores the whole Amazon EFS transfer location in
+//! [`crate::state`], so `DescribeLocationEfs` and `CreateTask` can resolve it again.
+//! Nothing is echoed back: the response carries only the newly minted ARN, and each call
+//! mints its own — two requests carrying the same file system address two independent
+//! locations.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +168,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLocationEfs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLocationEfsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLocationEfs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLocationEfsErrorModeled::InternalException(
+                InternalException {
+                    message: Some(
+                        "the DataSync emulator could not reach its state store".to_string(),
+                    ),
+                    error_code: None,
+                },
+            )
+            .into());
+        };
+
+        if let Some(message) = in_transit_encryption_refusal(&input) {
+            return Err(CreateLocationEfsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                    error_code: None,
+                    datasync_error_code: None,
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let location_uri = crate::state::LocationKind::Efs.location_uri(
+            &efs_global_id(&input.efs_filesystem_arn),
+            input.subdirectory.as_deref(),
+        );
+
+        let location_arn = {
+            let mut store = state.lock();
+            store.advance_clock(now);
+            if let Some(message) = store.at_capacity(crate::state::ResourceStore::Locations) {
+                return Err(CreateLocationEfsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(message),
+                        error_code: None,
+                        datasync_error_code: None,
+                    },
+                )
+                .into());
+            }
+
+            let location_arn = store.mint_location_arn(&region);
+            store.locations.insert(
+                location_arn.clone(),
+                crate::state::Location {
+                    arn: location_arn.clone(),
+                    location_uri,
+                    subdirectory: input.subdirectory,
+                    // An Amazon EFS location reaches its file system through a mount
+                    // target in the subnet `Ec2Config` names, so it has no agents: the
+                    // operation models no `AgentArns` member at all.
+                    agent_arns: Vec::new(),
+                    tags: input.tags.unwrap_or_default(),
+                    creation_time: now,
+                    config: crate::state::LocationConfig::Efs(crate::state::EfsLocationConfig {
+                        filesystem_arn: input.efs_filesystem_arn,
+                        ec2_config: input.ec2_config,
+                        access_point_arn: input.access_point_arn,
+                        file_system_access_role_arn: input.file_system_access_role_arn,
+                        in_transit_encryption: input.in_transit_encryption,
+                    }),
+                },
+            );
+            location_arn
+        };
+
+        Ok(CreateLocationEfsOutput {
+            location_arn: Some(location_arn),
+        })
     }
 }
+
+/// The GLOBAL_ID of an Amazon EFS file system: the Region it lives in and its file
+/// system id, as a `LocationUri` spells them (`efs://<region>.<file-system-id>/`).
+///
+/// Both come out of the modelled `EfsFilesystemArn`
+/// (`arn:<partition>:elasticfilesystem:<region>:<account>:file-system/<file-system-id>`),
+/// so the URI names the file system's own Region whichever Region the request was
+/// signed for.
+fn efs_global_id(filesystem_arn: &str) -> String {
+    let mut fields = filesystem_arn.splitn(6, ':');
+    // Fields 0..3 are `arn`, the partition and the service namespace; field 3 is the
+    // Region, field 4 the account id and field 5 the `file-system/<id>` resource.
+    let region = fields.nth(3).unwrap_or_default();
+    let resource = fields.nth(1).unwrap_or_default();
+    let filesystem_id = resource
+        .split('/')
+        .next_back()
+        .unwrap_or(resource)
+        .trim_matches('/');
+    if region.is_empty() {
+        filesystem_id.to_string()
+    } else {
+        format!("{region}.{filesystem_id}")
+    }
+}
+
+/// The refusal a request earns by asking for a restricted mount without the encryption
+/// that mount requires, if any.
+///
+/// `InTransitEncryption`'s own documentation states the rule: "If you specify an access
+/// point using AccessPointArn or an IAM role using FileSystemAccessRoleArn, you must set
+/// this parameter to TLS1_2." Either member therefore makes `TLS1_2` the only accepted
+/// value, and a request that names one while leaving the parameter out or setting it to
+/// the other modelled value (`NONE`) is a client error.
+fn in_transit_encryption_refusal(input: &CreateLocationEfsInput) -> Option<String> {
+    let restricted = input.access_point_arn.is_some() || input.file_system_access_role_arn.is_some();
+    let tls = input.in_transit_encryption.as_deref() == Some(TLS_IN_TRANSIT_ENCRYPTION);
+    (restricted && !tls).then(|| {
+        "If you specify an access point using AccessPointArn or an IAM role using \
+         FileSystemAccessRoleArn, you must set InTransitEncryption to TLS1_2."
+            .to_string()
+    })
+}
+
+/// The `EfsInTransitEncryption` value that encrypts the mount, one of the two the
+/// modelled enum admits (`NONE | TLS1_2`).
+const TLS_IN_TRANSIT_ENCRYPTION: &str = "TLS1_2";
