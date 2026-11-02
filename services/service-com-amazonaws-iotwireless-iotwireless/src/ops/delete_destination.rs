@@ -157,11 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.destinations.remove(&input.name).is_none() {
             return Err(
                 DeleteDestinationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!("Destination {} not found", input.name)),
-                        resource_id: Some(input.name.clone()),
-                        resource_type: Some("Destination".to_string()),
-                    },
+                    crate::state::destination_not_found(),
                 )
                 .into(),
             );

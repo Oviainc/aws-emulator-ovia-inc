@@ -157,13 +157,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
+        // A name the account does not hold is refused with the service's own fixed
+        // sentence and neither optional member set — see
+        // `crate::state::destination_not_found`, which every destination-addressing
+        // operation refuses through.
         let destination = store.destinations.get(&input.name).ok_or_else(|| {
             GetDestinationError::from(GetDestinationErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Destination {} not found", input.name)),
-                    resource_id: Some(input.name.clone()),
-                    resource_type: Some("Destination".to_string()),
-                },
+                crate::state::destination_not_found(),
             ))
         })?;
 

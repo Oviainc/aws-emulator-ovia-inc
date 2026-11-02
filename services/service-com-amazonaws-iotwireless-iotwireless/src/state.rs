@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANMulticast, SidewalkDevice, Tag,
+    LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANMulticast, ResourceNotFoundException,
+    SidewalkDevice, Tag,
 };
 
 /// The ARN service namespace (`arn:aws:iotwireless:...`) and the SigV4 signing name
@@ -116,6 +117,25 @@ pub struct Destination {
     pub description: Option<String>,
     pub role_arn: String,
     pub tags: Vec<Tag>,
+}
+
+/// The sentence this service's 404 carries when the destination a request addresses is
+/// not one the account holds: fixed text, with no part of it taken from the request or
+/// from the store, so the refusal discloses nothing about which names exist.
+pub const DESTINATION_NOT_FOUND_MESSAGE: &str = "Destination doesn't exist";
+
+/// The `ResourceNotFoundException` body for a destination the account does not hold.
+///
+/// One function, so every operation that addresses a destination by name refuses a
+/// missing one with the SAME body: [`DESTINATION_NOT_FOUND_MESSAGE`] and the two
+/// optional members the model merely permits (`ResourceId`, `ResourceType`) left unset,
+/// which is how this service answers the destination lookup.
+pub fn destination_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(DESTINATION_NOT_FOUND_MESSAGE.to_string()),
+        resource_id: None,
+        resource_type: None,
+    }
 }
 
 /// A device profile: the radio parameters a wireless device of one technology shares.

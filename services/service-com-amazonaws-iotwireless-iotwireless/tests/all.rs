@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/destination_and_wireless_device_lifecycle.rs"]
 mod destination_and_wireless_device_lifecycle;
+#[path = "all/destination_update_and_not_found.rs"]
+mod destination_update_and_not_found;
 #[path = "all/device_profile_lifecycle.rs"]
 mod device_profile_lifecycle;
 #[path = "all/multicast_group_lifecycle.rs"]

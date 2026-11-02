@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDestination`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: replaces the routing target, description and role of a stored
+//! destination, so every later read reports its CURRENT configuration — this is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +141,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDestination"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDestinationError::from(UpdateDestinationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotwireless store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let mut store = state.lock();
+        // `Name` is this operation's `@httpLabel`, so it ADDRESSES the destination to
+        // update; a name the account does not hold is the modelled 404, worded by the one
+        // helper every destination-addressing operation refuses through.
+        let destination = store.destinations.get_mut(&input.name).ok_or_else(|| {
+            UpdateDestinationError::from(UpdateDestinationErrorModeled::ResourceNotFoundException(
+                crate::state::destination_not_found(),
+            ))
+        })?;
+
+        // Every member the request CARRIED replaces the stored one, and a member it
+        // omitted leaves the stored value as it was — so re-pointing only the routing
+        // target keeps the destination's description and role. `ExpressionType` is a
+        // modelled enum, so a value outside it is already refused before this handler
+        // runs and nothing unmodelled reaches the store.
+        if let Some(expression) = input.expression {
+            destination.expression = expression;
+        }
+        if let Some(expression_type) = input.expression_type {
+            destination.expression_type = expression_type;
+        }
+        if let Some(description) = input.description {
+            destination.description = Some(description);
+        }
+        if let Some(role_arn) = input.role_arn {
+            destination.role_arn = role_arn;
+        }
+
+        Ok(UpdateDestinationOutput {})
     }
 }

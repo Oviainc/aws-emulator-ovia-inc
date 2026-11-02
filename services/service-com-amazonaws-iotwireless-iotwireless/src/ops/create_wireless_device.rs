@@ -239,11 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.destinations.contains_key(referenced) {
                 return Err(
                     CreateWirelessDeviceErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(format!("Destination {referenced} not found")),
-                            resource_id: Some(referenced.to_string()),
-                            resource_type: Some("Destination".to_string()),
-                        },
+                        crate::state::destination_not_found(),
                     )
                     .into(),
                 );
