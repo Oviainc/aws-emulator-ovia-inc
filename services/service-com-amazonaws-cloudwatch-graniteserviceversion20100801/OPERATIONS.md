@@ -171,7 +171,7 @@ contents — read that shape in the model above when you need its own members.
 ## GetInsightRuleReport
 
 - **Input:** `RuleName` (string, len 1..128, pattern ^[\x20-\x7E]+$, required), `StartTime` (timestamp, required), `EndTime` (timestamp, required), `Period` (integer, range 1.., required), `MaxContributorCount` (integer), `Metrics` (list<string>), `OrderBy` (string, len 1..32, pattern ^[\x20-\x7E]+$)
-- **Output:** `KeyLabels` (list<string>), `AggregationStatistic` (string), `AggregateValue` (double), `ApproximateUniqueCount` (long), `Contributors` (list<InsightRuleContributor>), `MetricDatapoints` (list<InsightRuleMetricDatapoint>)
+- **Output:** `RuleAttributes` (list<string>), `KeyLabels` (list<string>), `AggregationStatistic` (string), `AggregateValue` (double), `ApproximateUniqueCount` (long), `Contributors` (list<InsightRuleContributor>), `MetricDatapoints` (list<InsightRuleMetricDatapoint>)
 - **Errors:** `InvalidParameterValueException (HTTP 400)`, `MissingRequiredParameterException (HTTP 400)`, `ResourceNotFoundException (HTTP 404)`
 
 ## GetMetricData

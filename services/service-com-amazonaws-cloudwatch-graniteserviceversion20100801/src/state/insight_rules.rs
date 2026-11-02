@@ -620,6 +620,23 @@ pub struct ReportRequest {
 /// `GetInsightRuleReport` reports, computed from the observations the rule collected.
 #[derive(Debug, Clone, Default)]
 pub struct InsightReport {
+    /// The attributes of the rule the report carries a series for
+    /// (`GetInsightRuleReportOutput$RuleAttributes`).
+    ///
+    /// A rule attribute is a property of the RULE, not a statistic of a datapoint: the
+    /// statistics are what `Metrics` asks for ([`INSIGHT_RULE_METRICS`]) and they are reported
+    /// per datapoint. A rule the emulator evaluates is a log rule
+    /// ([`LogRuleDefinition`]), whose properties are the log groups it reads, the format it
+    /// reads them in, the fields it classifies contributors by — reported as
+    /// [`InsightReport::key_labels`] — and the contribution it aggregates; none of them is an
+    /// attribute a report carries its own series for, so a report of one comes to NO rule
+    /// attribute.
+    ///
+    /// That is an EMPTY series, which is not the same thing as a missing one: a report answers
+    /// every series it reports, so a caller can read, length and iterate this one and learn
+    /// that the report has no attribute, rather than finding the member absent and being
+    /// unable to tell "none" from "not answered".
+    pub rule_attributes: Vec<String>,
     /// The strings used as the keys for the rule, which are the fields it classifies
     /// contributors by.
     pub key_labels: Vec<String>,
@@ -706,6 +723,10 @@ pub fn report(rule: &StoredInsightRule, request: &ReportRequest) -> InsightRepor
         definition.aggregate_on.as_str()
     });
     InsightReport {
+        // No rule attribute, since a log rule declares none
+        // ([`InsightReport::rule_attributes`]) — an empty series, which the report still
+        // answers.
+        rule_attributes: Vec::new(),
         key_labels: definition
             .map(|definition| definition.keys.clone())
             .unwrap_or_default(),
@@ -896,11 +917,18 @@ pub const MAX_REPORTED_PERIODS: usize = 100_800;
 /// The windows are ANCHORED at multiples of the period, the same anchoring this service
 /// aggregates metric datapoints into periods with, so the instant a datapoint is reported at is
 /// decided by the observation's own time and not by when the report was asked for.
+///
+/// TOTAL over every instant a request can name: the cast saturates, so an instant outside the
+/// epoch seconds an `i64` holds lands on the bound rather than wrapping, and the anchoring is
+/// taken off saturatingly — the window the smallest representable instant falls in opens at that
+/// bound, since no window opens further back than it. A caller's `StartTime` reaches here
+/// unchanged ([`reported_period_count`]), so an arithmetic that was not total would be an
+/// overflow a single request could ask for.
 #[must_use]
 pub fn period_start(at_secs: f64, period: i64) -> i64 {
     #[allow(clippy::cast_possible_truncation)]
     let secs = at_secs.floor() as i64;
-    secs - secs.rem_euclid(period.max(1))
+    secs.saturating_sub(secs.rem_euclid(period.max(1)))
 }
 
 impl State {
