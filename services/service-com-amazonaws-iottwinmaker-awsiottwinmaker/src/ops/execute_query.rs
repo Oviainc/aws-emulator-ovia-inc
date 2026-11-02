@@ -35,7 +35,11 @@
 //!     matches without the caller having modelled the hierarchy as a property;
 //!   * a property of ANY of the entity's components, at any path, whose value carries a
 //!     `relationshipValue` naming a target entity of the same workspace, labelled with
-//!     the property's name.
+//!     the property's name. A component's properties are the ones it stores itself AND
+//!     the ones the component type it instantiates gives it, and a property's value is
+//!     the one a read of it reports ([`component_property_values`]), so a relationship a
+//!     component only inherits — and one the time-series data plane wrote last — is as
+//!     much an edge as one the entity's own create set.
 //!
 //!   The label is what `-[:isLocationOf]->` matches on, and a relationship whose other
 //!   end is not an entity of this workspace (a target outside it, or the root sentinel a
@@ -251,7 +255,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // also what makes the walk a consistent read of one instant — and the statement
         // and the token below are judged OUTSIDE the lock, so resolving the scope first
         // does not widen what the lock is held for.
-        let entities: Vec<crate::state::Entity> = {
+        //
+        // The WHOLE workspace is snapshotted, not its entities alone: naming a
+        // `componentTypeId` is what gives a component that type's properties, so the
+        // properties a component has and the value each of them reads as are resolved
+        // against the workspace's component types the way every other property reader of
+        // this service resolves them.
+        let workspace: crate::state::Workspace = {
             let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
                 ExecuteQueryErrorModeled::InternalServerException(InternalServerException {
                     message: Some("the iottwinmaker store is unavailable".to_string()),
@@ -267,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
                 .into());
             };
-            workspace.entities.values().cloned().collect()
+            workspace.clone()
         };
 
         // Parsed and planned once the scope holds, and still before the walk: a
@@ -313,7 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the top of its budget cannot starve the worker that serves health checks and
         // every other request, and a cancellation or a timeout has somewhere to land.
         let walked = ::tokio::task::spawn_blocking(move || {
-            let graph = Graph::build(&entities);
+            let graph = Graph::build(&workspace);
             let bindings = Matcher::new(&graph, &query, &plan).run()?;
             let rows: Vec<Row> = bindings
                 .iter()
@@ -1411,27 +1421,37 @@ impl Plan {
 /// knowledge graph holds whether or not any component property models one.
 const HIERARCHY_RELATIONSHIP_NAME: &str = "isChildOf";
 
-/// One relationship of the graph: either the stored parent of an entity, or a stored
-/// property value pointing at another entity of the same workspace.
+/// One relationship of the graph: either the stored parent of an entity, or a property
+/// of one of its components whose value points at another entity of the same workspace.
 #[derive(Debug)]
 struct GraphEdge<'a> {
     source: usize,
     target: usize,
     /// The relationship's own name, which is the label `-[:name]->` matches: the name of
     /// the property holding it, or [`HIERARCHY_RELATIONSHIP_NAME`] for the hierarchy.
-    relationship_name: &'a str,
+    ///
+    /// OWNED, because a property a component only INHERITS from the component type it
+    /// instantiates is named by that type rather than by anything the entity stores.
+    relationship_name: String,
     /// The component holding the relationship, and `None` for the hierarchy, which is
     /// held between the entities themselves rather than on a component of either. A
     /// composite component is named by its own name, the last segment of its path, the
     /// way `GetEntity` keys it.
     component_name: Option<&'a str>,
-    target_component_name: Option<&'a str>,
+    /// The component at the far end the relationship names, owned for the same reason
+    /// the name is: it comes out of the value a read of the property RESOLVED, which a
+    /// default declared on the component type contributes to.
+    target_component_name: Option<String>,
 }
 
-/// The nodes and edges of one workspace, derived fresh per call from a snapshot of the
-/// stored entities — so a query never reads a cached projection of state.
+/// The nodes and edges of one workspace, derived fresh per call from a snapshot of it —
+/// so a query never reads a cached projection of state.
 #[derive(Debug)]
 struct Graph<'a> {
+    /// The snapshotted workspace the nodes and edges below are derived from, kept so a
+    /// projection of a component's properties resolves them against the component types
+    /// the components instantiate ([`component_property_values`]).
+    workspace: &'a crate::state::Workspace,
     /// The workspace's entities in `entityId` order (the order the snapshot's map gave
     /// them in), so a row set (and therefore a page boundary) is the same for the same
     /// state.
@@ -1446,10 +1466,10 @@ struct Graph<'a> {
 }
 
 impl<'a> Graph<'a> {
-    /// Build the graph from a SNAPSHOT of the workspace's entities, taken under the
-    /// store's lock and read here with the lock already released.
-    fn build(snapshot: &'a [crate::state::Entity]) -> Self {
-        let entities: Vec<&crate::state::Entity> = snapshot.iter().collect();
+    /// Build the graph from a SNAPSHOT of the workspace, taken under the store's lock and
+    /// read here with the lock already released.
+    fn build(snapshot: &'a crate::state::Workspace) -> Self {
+        let entities: Vec<&crate::state::Entity> = snapshot.entities.values().collect();
         let index_of: BTreeMap<&str, usize> = entities
             .iter()
             .enumerate()
@@ -1485,7 +1505,7 @@ impl<'a> Graph<'a> {
                 edges.push(GraphEdge {
                     source,
                     target: parent,
-                    relationship_name: HIERARCHY_RELATIONSHIP_NAME,
+                    relationship_name: HIERARCHY_RELATIONSHIP_NAME.to_string(),
                     component_name: None,
                     target_component_name: None,
                 });
@@ -1493,9 +1513,12 @@ impl<'a> Graph<'a> {
                 incoming[parent].push(index);
             }
             for component in entity.components_at_every_path() {
-                for (property_name, property) in component.properties() {
-                    let Some(relationship) = property
-                        .value
+                // Every property the component HAS, each with the value a read of it
+                // reports — so a relationship a component only inherits from its
+                // component type, and one the time-series data plane wrote last, is an
+                // edge here exactly as it is a relationship to every other reader.
+                for (property_name, value) in component_property_values(snapshot, &component) {
+                    let Some(relationship) = value
                         .as_ref()
                         .and_then(|value| value.relationship_value.as_ref())
                     else {
@@ -1514,9 +1537,9 @@ impl<'a> Graph<'a> {
                     edges.push(GraphEdge {
                         source,
                         target,
-                        relationship_name: property_name.as_str(),
+                        relationship_name: property_name,
                         component_name: Some(component.component_name()),
-                        target_component_name: relationship.target_component_name.as_deref(),
+                        target_component_name: relationship.target_component_name.clone(),
                     });
                     outgoing[source].push(index);
                     incoming[target].push(index);
@@ -1524,6 +1547,7 @@ impl<'a> Graph<'a> {
             }
         }
         Self {
+            workspace: snapshot,
             entities,
             labels,
             edges,
@@ -1544,7 +1568,7 @@ impl<'a> Graph<'a> {
             Bound::Node(index) => NODE_MEMBERS
                 .iter()
                 .filter_map(|name| {
-                    node_member(self.entities[index], name)
+                    node_member(self.workspace, self.entities[index], name)
                         .map(|value| ((*name).to_string(), value))
                 })
                 .collect(),
@@ -1563,18 +1587,18 @@ impl<'a> Graph<'a> {
     /// — PartiQL's MISSING, which is what makes a comparison against it UNKNOWN.
     fn member(&self, bound: Bound, field: &str) -> Option<Document> {
         match bound {
-            Bound::Node(index) => node_member(self.entities[index], field),
+            Bound::Node(index) => node_member(self.workspace, self.entities[index], field),
             Bound::Edge(index) => self.edge_member(&self.edges[index], field),
         }
     }
 
     fn edge_member(&self, edge: &GraphEdge<'_>, field: &str) -> Option<Document> {
         match field {
-            "relationshipName" => Some(text(edge.relationship_name)),
+            "relationshipName" => Some(text(&edge.relationship_name)),
             "sourceEntityId" => Some(text(&self.entities[edge.source].entity_id)),
             "sourceComponentName" => edge.component_name.map(text),
             "targetEntityId" => Some(text(&self.entities[edge.target].entity_id)),
-            "targetComponentName" => edge.target_component_name.map(text),
+            "targetComponentName" => edge.target_component_name.as_deref().map(text),
             _ => None,
         }
     }
@@ -1605,7 +1629,11 @@ const EDGE_MEMBERS: [&str; 5] = [
     "targetEntityId",
 ];
 
-fn node_member(entity: &crate::state::Entity, field: &str) -> Option<Document> {
+fn node_member(
+    workspace: &crate::state::Workspace,
+    entity: &crate::state::Entity,
+    field: &str,
+) -> Option<Document> {
     match field {
         "arn" => Some(text(&entity.arn)),
         "entityId" => Some(text(&entity.entity_id)),
@@ -1615,18 +1643,21 @@ fn node_member(entity: &crate::state::Entity, field: &str) -> Option<Document> {
         "description" => Some(text(&entity.description)),
         "creationDate" => Some(epoch_seconds(entity.creation_date_time)),
         "lastUpdateDate" => Some(epoch_seconds(entity.update_date_time)),
-        "components" => Some(components_document(entity)),
+        "components" => Some(components_document(workspace, entity)),
         _ => None,
     }
 }
 
-/// The entity's stored components, each with the properties stored on it: every
-/// component the entity holds, at every path it holds one at, so a composite component is
-/// reported as the component of the entity it is. A composite component carries the
-/// `componentPath` it is addressed by, the member this service reports one by
-/// (`ComponentSummary::componentPath`), which a top-level component — addressed by name
-/// alone — does not have.
-fn components_document(entity: &crate::state::Entity) -> Document {
+/// The entity's stored components, each with every property it HAS and the value that
+/// property reads as ([`component_property_values`]): every component the entity holds,
+/// at every path it holds one at, so a composite component is reported as the component
+/// of the entity it is. A composite component carries the `componentPath` it is addressed
+/// by, the member this service reports one by (`ComponentSummary::componentPath`), which
+/// a top-level component — addressed by name alone — does not have.
+fn components_document(
+    workspace: &crate::state::Workspace,
+    entity: &crate::state::Entity,
+) -> Document {
     Document::Array(
         entity
             .components_at_every_path()
@@ -1647,19 +1678,14 @@ fn components_document(entity: &crate::state::Entity) -> Document {
                 members.insert(
                     "properties".to_string(),
                     Document::Array(
-                        component
-                            .properties()
-                            .iter()
-                            .map(|(property_name, property)| {
+                        component_property_values(workspace, &component)
+                            .into_iter()
+                            .map(|(property_name, value)| {
                                 let mut property_members = HashMap::from([(
                                     "propertyName".to_string(),
-                                    text(property_name),
+                                    text(&property_name),
                                 )]);
-                                // The most recent value written to the
-                                // property through either plane, so a time
-                                // series property is queried on the value its
-                                // series last carries rather than on nothing.
-                                if let Some(value) = property.latest_written_value() {
+                                if let Some(value) = value {
                                     property_members
                                         .insert("propertyValue".to_string(), data_value(&value, 0));
                                 }
@@ -1672,6 +1698,53 @@ fn components_document(entity: &crate::state::Entity) -> Document {
             })
             .collect(),
     )
+}
+
+/// Every property one component of an entity HAS, in property-name order, each with the
+/// value a read of it reports — `None` for a property that reads as no value at all.
+///
+/// The two projections every property reader of this crate shares, composed: the
+/// component's EFFECTIVE property set
+/// ([`crate::state::Workspace::component_property_names`]), which is what naming a
+/// `componentTypeId` gives the component on top of the records the entity stores itself,
+/// and the value each of those properties reads as
+/// ([`crate::state::latest_property_value`]) — the latest value written to it through
+/// either plane, else the `defaultValue` its effective definition declares
+/// ([`crate::state::Workspace::effective_property_definition`], which is what makes a
+/// default declared only on the component TYPE apply to a component that restates
+/// nothing).
+///
+/// Both of this operation's property projections go through here — the `properties` array
+/// of a `NODE` row and the relationships [`Graph::build`] derives its edges from — so one
+/// property of one component says the same thing in a query as it does through
+/// `GetEntity`, `ListProperties` and `GetPropertyValue`.
+///
+/// The cost is bounded by the component's own properties plus the definitions on its
+/// inheritance chain, which
+/// [`crate::state::Workspace::component_type_chain`] walks at most once per component type
+/// reached.
+fn component_property_values(
+    workspace: &crate::state::Workspace,
+    component: &crate::state::ComponentAtPath<'_>,
+) -> Vec<(String, Option<DataValue>)> {
+    let component_type_id = component.component_type_id();
+    let properties = component.properties();
+    workspace
+        .component_property_names(component_type_id, properties)
+        .into_iter()
+        .map(|property_name| {
+            let definition = workspace.effective_property_definition(
+                component_type_id,
+                properties,
+                &property_name,
+            );
+            let value = crate::state::latest_property_value(
+                properties.get(&property_name),
+                definition.as_ref(),
+            );
+            (property_name, value)
+        })
+        .collect()
 }
 
 /// How deeply a stored `DataValue`'s list and map nesting is projected before the

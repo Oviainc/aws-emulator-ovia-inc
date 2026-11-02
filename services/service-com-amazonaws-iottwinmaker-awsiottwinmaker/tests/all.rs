@@ -113,6 +113,9 @@ mod execute_query_composite_components;
 #[path = "all/execute_query_hierarchy.rs"]
 mod execute_query_hierarchy;
 
+#[path = "all/execute_query_inherited_properties.rs"]
+mod execute_query_inherited_properties;
+
 #[path = "all/filtered_page_token_scope.rs"]
 mod filtered_page_token_scope;
 
