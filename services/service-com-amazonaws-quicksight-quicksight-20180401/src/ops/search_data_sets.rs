@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchDataSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchDataSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchDataSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +150,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchDataSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchDataSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A report on stored state: nothing here writes to the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SearchDataSetsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+
+        // `Filters` is modelled `len 1..1`, so the one filter is already guaranteed by
+        // the time this handler runs; an empty list could only arrive if that
+        // constraint went away, and it names nothing to search on.
+        let Some(filter) = input.filters.first() else {
+            return Err(SearchDataSetsErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some("Filters must contain exactly one filter.".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // `Operator` and `Name` are modelled enums, so the request walk has already
+        // refused a value outside either catalog; what it cannot know is which
+        // combinations of the two the service accepts.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchDataSets"))
+        // The model states that the substring comparison applies to the data set's
+        // name only: every other attribute holds a principal ARN, which is compared
+        // whole.
+        if filter.operator == OPERATOR_STRING_LIKE && filter.name != ATTRIBUTE_DATASET_NAME {
+            return Err(SearchDataSetsErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "The {OPERATOR_STRING_LIKE} operator only supports the Name value \
+                         {ATTRIBUTE_DATASET_NAME}."
+                    )),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // A token this service did not issue names no position, so it is refused
+        // rather than read as "from the beginning".
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(after) => Some(after),
+                None => {
+                    return Err(SearchDataSetsErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some("The NextToken value isn't valid.".to_string()),
+                            request_id: Some(request_id),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        let store = state.lock();
+        // The search runs over the account's data sets in the same id order the list
+        // operation pages through, so a `NextToken` names a position in one stable
+        // order whichever filter produced the page.
+        let matched: Vec<&crate::state::DataSetRecord> = store
+            .data_sets_in(&input.aws_account_id)
+            .into_iter()
+            .filter(|record| matches_filter(record, filter))
+            .collect();
+        let (page, next_token) = crate::state::page_of(
+            &matched,
+            |record| record.data_set_id.as_str(),
+            resume_after.as_deref(),
+            input.max_results,
+        );
+        let summaries = page
+            .into_iter()
+            .map(crate::state::DataSetRecord::to_summary)
+            .collect();
+
+        Ok(SearchDataSetsOutput {
+            data_set_summaries: Some(summaries),
+            next_token,
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
+}
+
+/// The `FilterOperator` member that compares by substring.
+const OPERATOR_STRING_LIKE: &str = "StringLike";
+
+/// The `DataSetFilterAttribute` member that compares against the data set's display
+/// name; every other member compares against a principal ARN in the data set's
+/// permissions.
+const ATTRIBUTE_DATASET_NAME: &str = "DATASET_NAME";
+
+/// The `DataSetFilterAttribute` members that match a principal holding owner access.
+const OWNER_ATTRIBUTES: &[&str] = &["QUICKSIGHT_OWNER", "DIRECT_QUICKSIGHT_OWNER"];
+
+/// The `DataSetFilterAttribute` members that match a principal holding owner OR
+/// viewer access.
+const VIEWER_OR_OWNER_ATTRIBUTES: &[&str] = &[
+    "QUICKSIGHT_VIEWER_OR_OWNER",
+    "DIRECT_QUICKSIGHT_VIEWER_OR_OWNER",
+];
+
+/// The `DataSetFilterAttribute` member that matches a principal that is the data
+/// set's only owner.
+const ATTRIBUTE_SOLE_OWNER: &str = "DIRECT_QUICKSIGHT_SOLE_OWNER";
+
+/// The actions that change a data set, its permissions or its existence: the ones
+/// this service's `UpdateDataSet`, `UpdateDataSetPermissions` and `DeleteDataSet`
+/// operations document as acting on the permissions resource
+/// `arn:aws:quicksight:<region>:<account>:dataset/<data-set-id>`. A grant carrying
+/// any of them is owner access; a grant of only reading actions is viewer access.
+const DATA_SET_OWNER_ACTIONS: &[&str] = &[
+    "quicksight:UpdateDataSet",
+    "quicksight:UpdateDataSetPermissions",
+    "quicksight:DeleteDataSet",
+];
+
+/// Whether `record` satisfies `filter`.
+///
+/// `Name` picks what is compared and `Operator` picks how: the display name by
+/// substring (`StringLike`) or in full (`StringEquals`), and a principal ARN in the
+/// data set's permissions in full, at the access level the attribute names.
+fn matches_filter(record: &crate::state::DataSetRecord, filter: &DataSetSearchFilter) -> bool {
+    if filter.name == ATTRIBUTE_DATASET_NAME {
+        return if filter.operator == OPERATOR_STRING_LIKE {
+            record.name.contains(filter.value.as_str())
+        } else {
+            record.name == filter.value
+        };
+    }
+
+    // Every remaining attribute is about who may reach the data set, and its value is
+    // the principal's ARN. A principal with no grant on this data set matches none of
+    // them, including the attributes that also count permissions a principal
+    // inherits: a data set's access here comes only from the grants stored on it.
+    let holds_owner_access = |permission: &ResourcePermission| {
+        permission
+            .actions
+            .iter()
+            .any(|action| DATA_SET_OWNER_ACTIONS.contains(&action.as_str()))
+    };
+    let grants_to_principal = || {
+        record
+            .permissions
+            .iter()
+            .filter(|permission| permission.principal == filter.value)
+    };
+
+    if OWNER_ATTRIBUTES.contains(&filter.name.as_str()) {
+        return grants_to_principal().any(holds_owner_access);
+    }
+    if VIEWER_OR_OWNER_ATTRIBUTES.contains(&filter.name.as_str()) {
+        return grants_to_principal().next().is_some();
+    }
+    if filter.name == ATTRIBUTE_SOLE_OWNER {
+        return grants_to_principal().any(holds_owner_access)
+            && !record.permissions.iter().any(|permission| {
+                permission.principal != filter.value && holds_owner_access(permission)
+            });
+    }
+
+    // Unreachable for a modelled request: `Name` is an enum, so every member it can
+    // carry is one of the attributes above, and the request walk refuses the rest.
+    debug_assert!(
+        !DATA_SET_FILTER_ATTRIBUTE_VALUES.contains(&filter.name.as_str()),
+        "a DataSetFilterAttribute member is unhandled: {}",
+        filter.name
+    );
+    false
 }
