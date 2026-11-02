@@ -100,12 +100,12 @@ enum Expect {
 }
 
 /// The requirement a role the service may not act as fails, worded as this service words it
-/// for every member that carries such a role (`state::assume_role_refusal`), with the
-/// principal the policy has to admit substituted in.
+/// for every member that carries such a role (`state::assumable_role_requirement`), with
+/// the principal the policy has to admit substituted in.
 fn role_requirement() -> String {
     format!(
-        "names a role {PRINCIPAL} cannot assume: check the trust policy grants it \
-         sts:AssumeRole"
+        "must be assumable by MediaPackage. Please ensure that its trust policy includes \
+         {PRINCIPAL}"
     )
 }
 

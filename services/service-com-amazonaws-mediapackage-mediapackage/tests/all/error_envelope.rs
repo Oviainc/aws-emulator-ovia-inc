@@ -8,11 +8,14 @@
 //!
 //! 1. ENVELOPE. Every client-visible refusal answers with a modelled error — its own
 //!    status, its name in `__type` AND in the `x-amzn-errortype` header — and a body
-//!    carrying BOTH members: `message`, and an `errors` object keyed by the thing that
-//!    was wrong. The sentence states the same key and reason, so a client reading either
-//!    half reads the same failure. An entry's VALUE says which step refused the request:
-//!    the request validator reports the one requirement a member failed, as a bare
-//!    string; everything decided against state reports a list of reasons for its key.
+//!    whose `message` states the failure. A refusal the service reports AGAINST A KEY
+//!    carries an `errors` object keyed by the thing that was wrong as well, and the
+//!    sentence states the same key and reason, so a client reading either half reads the
+//!    same failure. An entry's VALUE says which step refused the request: the request
+//!    validator reports the one requirement a member failed, as a bare string;
+//!    everything decided against state reports a list of reasons for its key. A refusal
+//!    the service words as ONE sentence of its own reports no key, so its body carries
+//!    `message` alone.
 //! 2. WHICH ERROR. A request ADDRESSING a resource by id that this service does not hold
 //!    is `NotFoundException` (404), keyed by the RESOURCE TYPE. A request whose MEMBER
 //!    names a resource that cannot be resolved is `UnprocessableEntityException` (422),
@@ -24,12 +27,15 @@
 //! 4. INPUT. A value this service will not accept — a page size outside the bound it
 //!    enforces, a pagination token it did not issue, a member a declared constraint
 //!    refuses, a required member that is absent — is `UnprocessableEntityException`
-//!    (422) keyed by the member, never the framework's generic 400 `ValidationException`
+//!    (422), never the framework's generic 400 `ValidationException`
 //!    (a status and a code this service's model does not declare at all).
 //!
-//! What is NOT asserted is the recorded sentence: the status and the error code are the
-//! contract, and the message follows a rule — `<key> <reason>`, built from the request —
-//! so it is the rule that is pinned, on every row.
+//! What is NOT asserted is the recorded sentence of a KEYED refusal: the status and the
+//! error code are the contract, and that message follows a rule — `<key> <reason>`, built
+//! from the request — so it is the rule that is pinned, on every row. A refusal the
+//! service words as its own fixed sentence has no such rule to derive it from, so the
+//! sentence itself is the requirement and the row states it
+//! (`tests/all/refusal_wording.rs` covers those).
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -133,11 +139,13 @@ fn error_code(body: &Value) -> String {
 
 /// Which step of the service refused the request, and so how its `errors` entry reports
 /// the reason: the request VALIDATOR reports the one requirement a member failed as a
-/// bare string; anything decided against STATE reports a list of reasons for its key.
+/// bare string; anything decided against STATE reports a list of reasons for its key; and
+/// a class the service words as ONE sentence of its own reports no entry at all.
 #[derive(Clone, Copy)]
 enum Reported {
     Requirement,
     Reasons,
+    Sentence,
 }
 
 /// One refusal to exercise: the request, and the envelope it must answer with.
@@ -152,10 +160,12 @@ struct Refusal {
     /// The modelled error shape name.
     code: &'static str,
     /// The `errors` key this refusal is about: a resource type or a request member.
+    /// Ignored by a [`Reported::Sentence`] row, which reports no key.
     key: &'static str,
     /// How that key reports its reason.
     reported: Reported,
-    /// The reason, which is the same text whichever way it is reported.
+    /// The reason, which is the same text whichever way it is reported — or, for a
+    /// [`Reported::Sentence`] row, the whole sentence the refusal states.
     reason: String,
 }
 
@@ -181,10 +191,12 @@ async fn assert_envelope(router: &MultiServiceRouter, row: &Refusal) {
         row.code
     );
     // The structured half: an object keyed by the thing that was wrong, reporting that
-    // key's reasons the way the refusing step reports them.
+    // key's reasons the way the refusing step reports them — and nothing at all when the
+    // refusal is the service's own sentence, which is about no key.
     let expected_errors = match row.reported {
         Reported::Requirement => json!({ row.key: row.reason.clone() }),
         Reported::Reasons => json!({ row.key: [row.reason.clone()] }),
+        Reported::Sentence => Value::Null,
     };
     let errors = body.get("errors").unwrap_or(&Value::Null).clone();
     assert_eq!(
@@ -192,7 +204,10 @@ async fn assert_envelope(router: &MultiServiceRouter, row: &Refusal) {
         "case {case:?}: expected errors {expected_errors}, got {body:?}"
     );
     // The sentence: the same key and reason, so the two halves cannot disagree.
-    let expected_message = format!("{} {}", row.key, row.reason);
+    let expected_message = match row.reported {
+        Reported::Sentence => row.reason.clone(),
+        _ => format!("{} {}", row.key, row.reason),
+    };
     assert_eq!(
         body.get("message").and_then(Value::as_str),
         Some(expected_message.as_str()),
@@ -643,16 +658,17 @@ async fn a_page_size_outside_the_enforced_bound_is_a_keyed_422() {
 }
 
 /// RULE 4, the rest of the input surface: a token this service did not issue, and a
-/// required member the request leaves out, are the same keyed 422 — never a generic 400
-/// `ValidationException`, which this service's model does not declare.
+/// required member the request leaves out, are the same modelled 422 — never a generic
+/// 400 `ValidationException`, which this service's model does not declare.
 #[tokio::test]
-async fn an_input_the_service_will_not_accept_is_a_keyed_422() {
+async fn an_input_the_service_will_not_accept_is_a_modelled_422() {
     let router = emulator();
     seed_channel(&router, "live-channel").await;
 
     let mut rows: Vec<Refusal> = Vec::new();
     // Tokens differing in how they are wrong: not hex, odd-length hex, non-hex letters,
-    // and percent noise.
+    // and percent noise. The service words this class as one sentence of its own, so the
+    // row states that sentence rather than a per-member reason.
     for token in ["not-a-token", "abc", "zz", "%%%"] {
         for path in ["/channels", "/origin_endpoints"] {
             rows.push(Refusal {
@@ -662,9 +678,9 @@ async fn an_input_the_service_will_not_accept_is_a_keyed_422() {
                 body: None,
                 status: 422,
                 code: "UnprocessableEntityException",
-                key: "nextToken",
-                reported: Reported::Requirement,
-                reason: "is not a pagination token this service issued".to_string(),
+                key: "",
+                reported: Reported::Sentence,
+                reason: "Invalid NextToken".to_string(),
             });
         }
     }

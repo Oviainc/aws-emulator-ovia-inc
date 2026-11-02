@@ -181,22 +181,28 @@ impl SerializableStruct for ValidationException {
 // MediaPackage's own error envelope: `message` AND `errors`
 // =============================================================================
 //
-// Every MediaPackage error body carries TWO members: the `message` sentence the
-// model declares, and an `errors` object keyed by the thing that was wrong — a
-// resource type for a resource that is missing or in the way, a request member for a
-// value the service will not accept — whose value reports the reasons for that key (see
-// [`Reasons`] for the two shapes a recorded body uses). The model declares only
-// `Message` on each error shape, so the generated
+// A MediaPackage error body carries the `message` sentence the model declares, and —
+// for a failure the service reports AGAINST A KEY — an `errors` object keyed by the
+// thing that was wrong: a resource type for a resource that is missing or in the way, a
+// request member for a value the service will not accept, whose value reports the
+// reasons for that key (see [`Reasons`] for the two shapes a recorded body uses). The
+// model declares only `Message` on each error shape, so the generated
 // error structs (`NotFoundException`, `UnprocessableEntityException`, …) cannot carry
 // the second member: they are generated from the model and a field that is not a
 // modelled member does not exist on them.
 //
 // [`ServiceError`] is that envelope, and it travels on the error channel as
 // [`Scaffolded::Service`]. It carries the MODELLED error's wire code and HTTP status
-// (so a client branches exactly as the model says) and renders the two body members
+// (so a client branches exactly as the model says) and renders the body members
 // from the per-key reasons it was built with — including the `message`, which is
 // built FROM those reasons rather than written twice, so the sentence and the
 // structured map can never disagree.
+//
+// Some refusals this service answers are worded as ONE sentence of the service's own,
+// stating no key and no per-key reason at all ([`ServiceError::unprocessable_sentence`]).
+// Those carry that sentence as `message` and no `errors` member, because there is no key
+// the failure is reported against: inventing one would put prose in the body the service
+// does not state.
 //
 // The wording of each reason — what a missing resource, a duplicate id or a refused
 // member says — lives in `crate::state`, beside the rest of this service's
@@ -219,7 +225,8 @@ static SERVICE_ERROR_MESSAGE: Schema = Schema::new_member(
 
 /// The `errors` member of this service's error envelope: an object keyed by the resource
 /// type or request member the failure is about, whose value reports that key's reasons —
-/// a bare requirement string or a list, as [`Reasons`] describes.
+/// a bare requirement string or a list, as [`Reasons`] describes. Absent from the body of
+/// a refusal the service words as one sentence of its own, which reports no key.
 ///
 /// One member schema serves the map, its keys and its list values: the JSON codec reads
 /// a member schema for the BODY KEY it emits and for nothing else (list elements and map
@@ -312,9 +319,14 @@ pub struct ServiceError {
     code: &'static str,
     /// That shape's modelled `httpError` status.
     status: u16,
+    /// The ONE sentence this error class states, for a refusal the service words itself
+    /// rather than reporting against a key. `None` for every keyed failure, whose
+    /// sentence is built from [`Self::errors`].
+    sentence: Option<String>,
     /// The reasons, by the resource type or request member each is about. A `BTreeMap`,
     /// so the body's key order is the keys' own order rather than an insertion or hash
-    /// order: one failure renders the same bytes every time.
+    /// order: one failure renders the same bytes every time. Empty exactly when
+    /// [`Self::sentence`] is set.
     errors: std::collections::BTreeMap<String, Reasons>,
 }
 
@@ -326,6 +338,7 @@ impl ServiceError {
         Self {
             code,
             status,
+            sentence: None,
             errors,
         }
     }
@@ -363,6 +376,21 @@ impl ServiceError {
         )
     }
 
+    /// `UnprocessableEntityException` (422) stating `sentence` — the whole wording this
+    /// service answers one class of refusal with, reported against no key.
+    ///
+    /// For a refusal the service words as its own fixed sentence rather than as a
+    /// requirement some member failed: the sentence is the error class's text, so it is
+    /// stated verbatim and the body carries no `errors` entry to go with it.
+    pub fn unprocessable_sentence(sentence: impl Into<String>) -> Self {
+        Self {
+            code: UNPROCESSABLE_ENTITY_CODE,
+            status: UNPROCESSABLE_ENTITY_STATUS,
+            sentence: Some(sentence.into()),
+            errors: std::collections::BTreeMap::new(),
+        }
+    }
+
     /// `TooManyRequestsException` (429): "The client has exceeded their resource or
     /// throttling limits".
     pub fn too_many_requests(key: &str, reason: impl Into<String>) -> Self {
@@ -374,9 +402,13 @@ impl ServiceError {
         )
     }
 
-    /// The sentence this error states: each reason after the key it is about, so the
-    /// `message` and the `errors` map say the same thing in the same words.
+    /// The sentence this error states: the error class's own wording when it has one,
+    /// otherwise each reason after the key it is about, so the `message` and the `errors`
+    /// map say the same thing in the same words.
     pub fn message(&self) -> String {
+        if let Some(sentence) = &self.sentence {
+            return sentence.clone();
+        }
         self.errors
             .iter()
             .flat_map(|(key, reasons)| {
@@ -416,6 +448,11 @@ impl std::error::Error for ServiceError {}
 impl SerializableStruct for ServiceError {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         s.write_string(&SERVICE_ERROR_MESSAGE, self.message().as_str())?;
+        // A refusal worded as one sentence reports no key, so the body carries `message`
+        // alone rather than an empty object.
+        if self.errors.is_empty() {
+            return Ok(());
+        }
         s.write_map(&SERVICE_ERROR_ERRORS, &|entries| {
             for (key, reasons) in &self.errors {
                 entries.write_string(&SERVICE_ERROR_ERRORS, key.as_str())?;

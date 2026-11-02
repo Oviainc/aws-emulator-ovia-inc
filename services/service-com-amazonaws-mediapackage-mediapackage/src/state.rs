@@ -180,7 +180,7 @@ pub const MAX_STRING_CHARS: usize = 1024;
 // ---------------------------------------------------------------------------
 // How MediaPackage states a refusal
 //
-// Every MediaPackage error body carries `message` AND an `errors` object keyed by the
+// A MediaPackage error body carries `message` AND an `errors` object keyed by the
 // thing that was wrong — a RESOURCE TYPE when the request addressed a resource that is
 // missing or in the way, a REQUEST MEMBER when a value is one the service will not
 // accept — reporting that key's reasons (`crate::scaffolded::Reasons` describes the two
@@ -188,8 +188,15 @@ pub const MAX_STRING_CHARS: usize = 1024;
 // (`<key> <reason>`), so it is derived from the request rather than written twice; see
 // [`crate::scaffolded::ServiceError`], which owns the envelope.
 //
-// Every constructor below returns one of those envelopes, so this is the one home of
-// this service's refusal text: a handler names the rule, never the sentence.
+// A few classes the service words as ONE sentence of its own, against no key at all
+// ([`invalid_page_token`]): the service's sentence is the message, and the body carries no
+// `errors` entry, because the service reports none.
+//
+// Either way the wording is the SERVICE's, not this emulator's: a message a client reads
+// is the text the real service states for that error class — its fixed part verbatim, and
+// its variable parts (the member path, a bound, an id) taken from the request and the
+// store. Every constructor below returns one of those envelopes, so this is the one home
+// of this service's refusal text: a handler names the rule, never the sentence.
 // ---------------------------------------------------------------------------
 
 /// How a MediaPackage error names a Channel in `errors` — the resource type, lowerCamel,
@@ -361,12 +368,20 @@ pub fn resource_limit_reached(kind: &str, max: usize) -> ServiceError {
     )
 }
 
+/// The whole sentence MediaPackage answers a `nextToken` it did not issue with.
+///
+/// FIXED text for the error class: the service states this one sentence for every refused
+/// token, naming neither the offending value nor any other part of the request
+/// (recorded 2026-10-29, `ListOriginEndpoints`). So it is written here once, verbatim,
+/// rather than paraphrased per listing.
+pub const INVALID_PAGE_TOKEN_MESSAGE: &str = "Invalid NextToken";
+
 /// `UnprocessableEntityException` (422) for a `nextToken` this service did not issue.
+///
+/// Worded as the service's own sentence ([`INVALID_PAGE_TOKEN_MESSAGE`]) rather than as a
+/// requirement reported against `nextToken`, which is how MediaPackage answers it.
 pub fn invalid_page_token() -> ServiceError {
-    member_invalid(
-        "nextToken",
-        "is not a pagination token this service issued",
-    )
+    ServiceError::unprocessable_sentence(INVALID_PAGE_TOKEN_MESSAGE)
 }
 
 /// `UnprocessableEntityException` (422) for two request members the service treats as
@@ -2991,6 +3006,20 @@ pub fn iam_state<Eng: Send + Sync + 'static>(
 /// by (`S3Destination$RoleArn` is `@jsonName("roleArn")` inside `s3Destination`).
 pub const HARVEST_ROLE_MEMBER: &str = "s3Destination.roleArn";
 
+/// The requirement a member naming a role MediaPackage may not act as has failed, as the
+/// service words it.
+///
+/// FIXED text for the error class, with the principal the trust policy has to admit
+/// ([`SERVICE_PRINCIPAL`]) in it; the member the refusal is keyed by supplies the rest of
+/// the sentence, so every member carrying such a role states the same requirement
+/// (recorded 2026-10-29, `CreateHarvestJob`).
+pub fn assumable_role_requirement() -> String {
+    format!(
+        "must be assumable by MediaPackage. Please ensure that its trust policy includes \
+         {SERVICE_PRINCIPAL}"
+    )
+}
+
 /// `None` when this emulator has no reason to think MediaPackage could not act as the role
 /// `role_arn` that `member` names; otherwise the refusal that answers the request.
 ///
@@ -3014,13 +3043,7 @@ pub fn assume_role_refusal(member: &str, role_arn: &str, iam: &IamState) -> Opti
     match admits {
         // A document this emulator cannot read as a policy is no evidence either way.
         None | Some(true) => None,
-        Some(false) => Some(member_invalid(
-            member,
-            format!(
-                "names a role {SERVICE_PRINCIPAL} cannot assume: check the trust \
-                 policy grants it sts:AssumeRole"
-            ),
-        )),
+        Some(false) => Some(member_invalid(member, assumable_role_requirement())),
     }
 }
 

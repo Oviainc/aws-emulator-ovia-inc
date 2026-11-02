@@ -49,10 +49,10 @@ const LISTINGS: &[Listing] = &[
     },
 ];
 
-/// The reason a refused `nextToken` states, and the member it is keyed by
-/// (`crate::state::invalid_page_token`).
-const TOKEN_MEMBER: &str = "nextToken";
-const TOKEN_REASON: &str = "is not a pagination token this service issued";
+/// The whole sentence a refused `nextToken` is answered with
+/// (`crate::state::INVALID_PAGE_TOKEN_MESSAGE`): the service's own wording for the class,
+/// stating no member and no part of the request.
+const TOKEN_MESSAGE: &str = "Invalid NextToken";
 
 /// The ids this suite seeds each collection with: four per collection, so every listing
 /// has several pages at the small page sizes below, and the ids differ in their first
@@ -216,7 +216,7 @@ fn with_first_character_changed(token: &str) -> String {
 }
 
 /// Assert that `path` with `token` is refused as a `nextToken` this service did not
-/// issue: the modelled 422, keyed by the member, with no items served.
+/// issue: the modelled 422, stating the service's sentence, with no items served.
 async fn assert_refused(
     router: &MultiServiceRouter,
     region: &str,
@@ -237,14 +237,15 @@ async fn assert_refused(
         "case {case:?} ({uri:?}): expected UnprocessableEntityException, got {body:?}"
     );
     assert_eq!(
-        body.get("errors"),
-        Some(&json!({ TOKEN_MEMBER: TOKEN_REASON })),
-        "case {case:?} ({uri:?}): expected the refusal keyed by {TOKEN_MEMBER}, got {body:?}"
+        body.get("message").and_then(Value::as_str),
+        Some(TOKEN_MESSAGE),
+        "case {case:?} ({uri:?}): expected the service's sentence, got {body:?}"
     );
     assert_eq!(
-        body.get("message").and_then(Value::as_str),
-        Some(format!("{TOKEN_MEMBER} {TOKEN_REASON}").as_str()),
-        "case {case:?} ({uri:?}): expected the keyed sentence, got {body:?}"
+        body.get("errors"),
+        None,
+        "case {case:?} ({uri:?}): the sentence is the whole refusal, so no errors entry, \
+         got {body:?}"
     );
     assert_eq!(
         body.get(items),

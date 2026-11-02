@@ -65,6 +65,8 @@ mod page_token_authenticity;
 mod playback_path_is_one_rule;
 #[path = "all/refusal_order.rs"]
 mod refusal_order;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/reserved_and_malformed_tags.rs"]
