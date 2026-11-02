@@ -24,8 +24,10 @@
 //! The work splits in two so that no delivery is made while the store is locked:
 //! [`owed`] decides which alerts a write leaves owed (under the lock, from the state it
 //! wrote) and [`deliver`] publishes them (after the lock is released). An alert is owed
-//! only on a topic of the account whose budget it names ([`publishable`]), so a budget's
-//! figures cannot be deposited on another account's topic. The number of
+//! only on a topic of the account whose budget it names ([`publishable`]) — which is the
+//! same decision the write that establishes such a subscriber is held to, so a budget's
+//! figures cannot be deposited on another account's topic and no address that write
+//! accepted is skipped here. The number of
 //! alerts one call can owe is bounded by what a budget can hold — one `SNS` subscriber
 //! per notification ([`super::MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION`]) and at most
 //! [`super::MAX_NOTIFICATIONS_PER_BUDGET`] notifications — so a request cannot grow the
@@ -89,7 +91,7 @@ pub struct BudgetAlert {
 /// Empty for a notification that is not in alarm: nothing has passed its threshold, so
 /// no subscriber of it is owed anything. Empty, too, for a notification in alarm whose
 /// subscribers are all addresses no alert of THIS budget can be published to
-/// ([`publishable`]) — an email mailbox, or a topic of another account.
+/// ([`publishable`]) — an email mailbox, the one address form nothing is delivered to.
 pub fn owed(
     source: &AlertSource,
     notification: &Notification,
@@ -113,21 +115,15 @@ pub fn owed(
 /// Whether an alert for a budget of the account `source` names can be published to the
 /// topic `address` names.
 ///
-/// Two things have to hold, and both are read off the address through the ONE reading of
-/// an `SNS` subscriber's address ([`super::sns_topic`], over the shared ARN parse
-/// `service_common::arn`) rather than by splitting it here:
-///
-/// * it names an SNS topic, which — SNS being a regional service — is a topic in a Region
-///   and so an address this emulator can route a publish to at all. It is the SAME
-///   reading the write that established the subscriber was held to
-///   ([`super::subscriber_address_violation`]), so a stored `SNS` subscriber cannot fail
-///   it: an address no alert could be published to is refused before it is stored.
-/// * that topic belongs to the SAME account as the budget alerting on it. An alert carries
-///   the budget's own figures ([`message`]), and a budget's notifications deliver to the
-///   topics of the account that owns the budget, so an address naming any other account
-///   names no topic this alert goes to — it is dropped here rather than published.
+/// Decided by the ONE decision that says which topic a notification of an account is
+/// published to ([`super::publishable_topic`], over the shared ARN parse
+/// `service_common::arn`) — the SAME decision the write that established the subscriber
+/// was held to ([`super::subscriber_address_violation`]). A stored `SNS` subscriber
+/// therefore cannot fail it: an address no alert of this budget could be published to —
+/// one naming no topic, or a topic of another account — is refused before it is stored,
+/// so nothing is dropped here that a read reports.
 fn publishable(source: &AlertSource, address: &str) -> bool {
-    super::sns_topic(address).is_some_and(|topic| topic.account == source.account_id)
+    super::publishable_topic(&source.account_id, address).is_ok()
 }
 
 /// The alert published for `notification` of the budget `source` names: the budget it

@@ -79,7 +79,7 @@ fn email_subscriber(n: usize) -> Value {
 fn sns_subscriber() -> Value {
     json!({
         "SubscriptionType": "SNS",
-        "Address": "arn:aws:sns:us-east-1:111122223333:budget-alerts"
+        "Address": format!("arn:aws:sns:us-east-1:{}:budget-alerts", caller_account())
     })
 }
 
@@ -782,7 +782,7 @@ async fn a_notification_holds_at_most_the_documented_subscribers_of_each_type() 
     let mut two_sns = vec![sns_subscriber()];
     two_sns.push(json!({
         "SubscriptionType": "SNS",
-        "Address": "arn:aws:sns:us-east-1:111122223333:other-alerts"
+        "Address": format!("arn:aws:sns:us-east-1:{}:other-alerts", caller_account())
     }));
 
     // (case, subscribers, the error code expected, or None for "accepted")

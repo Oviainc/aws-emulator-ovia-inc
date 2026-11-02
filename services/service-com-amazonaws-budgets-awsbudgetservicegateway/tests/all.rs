@@ -121,5 +121,7 @@ mod subscriber_notification_reads;
 mod subscriber_set_identity;
 #[path = "all/subscriber_sns_topic_region.rs"]
 mod subscriber_sns_topic_region;
+#[path = "all/subscriber_topic_account.rs"]
+mod subscriber_topic_account;
 #[path = "all/subscriber_update.rs"]
 mod subscriber_update;

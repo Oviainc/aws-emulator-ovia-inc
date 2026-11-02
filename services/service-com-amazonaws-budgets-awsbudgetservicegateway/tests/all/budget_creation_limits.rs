@@ -73,7 +73,7 @@ fn sns_subscribers(count: usize) -> Vec<Value> {
         .map(|i| {
             json!({
                 "SubscriptionType": "SNS",
-                "Address": format!("arn:aws:sns:us-east-1:111122223333:alerts-{i}")
+                "Address": format!("arn:aws:sns:us-east-1:{}:alerts-{i}", caller_account())
             })
         })
         .collect()

@@ -11,9 +11,10 @@
 //! per-type subscriber limits are answered with `CreationLimitExceededException`.
 //!
 //! The subscriber's address is held to the form its own `SubscriptionType` names — an
-//! email address or an SNS topic ARN, and no line breaks either way
-//! ([`crate::state::subscriber_address_violation`]) — so one that could never receive the
-//! notification's alert is refused with `InvalidParameterException` rather than stored.
+//! email address or the ARN of an SNS topic of the budget's own account, and no line
+//! breaks either way ([`crate::state::subscriber_address_violation`]) — so one that could
+//! never receive the notification's alert is refused with `InvalidParameterException`
+//! rather than stored.
 //!
 //! ## Shape of an operation
 //!
@@ -191,17 +192,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Either an Amazon SNS topic or an email address" (`Subscriber`), and "the value
         // of `Address` can't contain line breaks" (`Subscriber$Address`) — the form of the
-        // address this call would attach, which no constraint trait can express. Checked
-        // before the budget is looked up, so a request that is malformed in itself is
-        // refused the same way whichever notification it names.
-        crate::state::subscriber_address_violation(::std::slice::from_ref(&input.subscriber))
-            .map_err(|message| {
-                CreateSubscriberErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
-                    },
-                )
-            })?;
+        // address this call would attach, which no constraint trait can express. An `SNS`
+        // address is held to the account it is established under as well: "the address
+        // that Amazon Web Services sends budget notifications to" is a topic of the
+        // account that owns the budget. Checked before the budget is looked up, so a
+        // request that is malformed in itself is refused the same way whichever
+        // notification it names.
+        crate::state::subscriber_address_violation(
+            &input.account_id,
+            ::std::slice::from_ref(&input.subscriber),
+        )
+        .map_err(|message| {
+            CreateSubscriberErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        })?;
 
         let now = ::std::time::SystemTime::now();
         // Every write this call makes is made under the store's lock, and the lock is

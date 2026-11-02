@@ -72,7 +72,10 @@ fn subscriber_set(scope: usize, notification: usize) -> Value {
     if (scope + notification).is_multiple_of(2) {
         list.push(json!({
             "SubscriptionType": "SNS",
-            "Address": format!("arn:aws:sns:us-east-1:111122223333:budget-s{scope}-n{notification}")
+            "Address": format!(
+                "arn:aws:sns:us-east-1:{}:budget-s{scope}-n{notification}",
+                caller_account()
+            )
         }));
     }
     list.extend((0..emails).map(|index| {

@@ -499,9 +499,10 @@ fn rows() -> Vec<Row> {
                 "ComparisonOperator": "LESS_THAN",
                 "Threshold": 80
             }),
-            subscribers: json!([sns_subscriber(
-                "arn:aws-cn:sns:cn-north-1:123456789012:budget-alerts"
-            )]),
+            subscribers: json!([sns_subscriber(&format!(
+                "arn:aws-cn:sns:cn-north-1:{}:budget-alerts",
+                account_id()
+            ))]),
             then_subscribe: None,
             expected: Vec::new(),
         },

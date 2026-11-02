@@ -44,7 +44,10 @@ use super::budget_lifecycle::{caller_account, call, is_error, router_with_engine
 fn extra_sns_subscriber(n: usize) -> Value {
     json!({
         "SubscriptionType": "SNS",
-        "Address": format!("arn:aws:sns:us-east-1:111122223333:budget-action-alerts-{n}")
+        "Address": format!(
+            "arn:aws:sns:us-east-1:{}:budget-action-alerts-{n}",
+            caller_account()
+        )
     })
 }
 

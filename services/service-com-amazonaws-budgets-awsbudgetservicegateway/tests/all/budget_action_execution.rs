@@ -139,7 +139,7 @@ pub(crate) fn email_subscriber(n: usize) -> Value {
 pub(crate) fn sns_subscriber() -> Value {
     json!({
         "SubscriptionType": "SNS",
-        "Address": "arn:aws:sns:us-east-1:111122223333:budget-action-alerts"
+        "Address": format!("arn:aws:sns:us-east-1:{}:budget-action-alerts", caller_account())
     })
 }
 

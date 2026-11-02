@@ -91,7 +91,7 @@ fn well_formed_of(subscription_type: &str, label: &str) -> Value {
         "EMAIL" => subscriber("EMAIL", &format!("{label}@example.com")),
         "SNS" => subscriber(
             "SNS",
-            &format!("arn:aws:sns:us-east-1:111122223333:{label}"),
+            &format!("arn:aws:sns:us-east-1:{}:{label}", caller_account()),
         ),
         other => panic!("no well-formed address form is known for subscription type {other:?}"),
     }

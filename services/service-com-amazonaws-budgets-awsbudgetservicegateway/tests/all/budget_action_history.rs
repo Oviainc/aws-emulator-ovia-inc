@@ -135,7 +135,10 @@ fn subscribers(count: usize) -> Value {
             if index < MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION {
                 json!({
                     "SubscriptionType": "SNS",
-                    "Address": format!("arn:aws:sns:us-east-1:123456789012:budget-topic-{index}")
+                    "Address": format!(
+                        "arn:aws:sns:us-east-1:{}:budget-topic-{index}",
+                        caller_account()
+                    )
                 })
             } else {
                 json!({

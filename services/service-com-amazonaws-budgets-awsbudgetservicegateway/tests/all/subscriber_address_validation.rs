@@ -18,7 +18,8 @@
 //! WHICH way the address fails (no `@`, no domain, a single-label domain, an all-numeric
 //! top-level domain, internal whitespace, the other type's form, another vendor's ARN, an
 //! ARN naming something beneath a topic, an ARN whose Region field names no Region SNS can
-//! be addressed in, and a line feed or a carriage return under either type), the
+//! be addressed in, an ARN naming a topic of another account, and a line feed or a
+//! carriage return under either type), the
 //! well-formed rows along the forms each type admits (mailbox shapes and subdomains,
 //! partitions, Regions up to the published bound, a topic name with a suffix), and both
 //! are driven through EVERY write that establishes a subscriber: `CreateBudget`'s
@@ -40,7 +41,7 @@ use super::budget_action_execution::{
     definition_for, describe_action, seed_action, seed_budget, simple_create_body,
 };
 use super::budget_action_subscriber_limits::stored_action_count;
-use super::budget_lifecycle::{caller_account, call, is_error, router_with_engine, same};
+use super::budget_lifecycle::{account, caller_account, call, is_error, router_with_engine, same};
 use super::client_error_envelopes::message;
 
 /// The error every write that establishes a subscriber answers a malformed address with:
@@ -165,11 +166,33 @@ pub(crate) fn malformed_rows() -> Vec<Malformed> {
             case,
             subscriber: subscriber(subscription_type, address),
         })
+        // An `SNS` address also has to name a topic of the account the subscriber is
+        // established under — "the address that Amazon Web Services sends budget
+        // notifications to" is a topic of the account that owns the budget — so a
+        // well-formed topic ARN of any other account is an address no notification of
+        // this account's budgets is sent to. Built from the account helper rather than
+        // written out, so the row cannot accidentally name the account this emulator
+        // answers for. `tests/all/subscriber_topic_account.rs` spans that rule.
+        .chain(::std::iter::once(Malformed {
+            case: "SNS naming a topic of an account other than the caller's",
+            subscriber: subscriber(
+                "SNS",
+                &format!(
+                    "arn:aws:sns:us-east-1:{}:budget-alerts",
+                    account(111_122_223_333)
+                ),
+            ),
+        }))
         .collect()
 }
 
-/// The well-formed table: the address forms each subscription type admits.
+/// The well-formed table: the address forms each subscription type admits. Every `SNS`
+/// row names a topic of the caller's own account, the only account whose topics a
+/// notification of its budgets is published to
+/// (`tests/all/subscriber_topic_account.rs`), so the rows differ along the address FORM
+/// alone.
 pub(crate) fn well_formed_rows() -> Vec<(&'static str, Value)> {
+    let owner = caller_account();
     vec![
         (
             "an email address",
@@ -189,22 +212,28 @@ pub(crate) fn well_formed_rows() -> Vec<(&'static str, Value)> {
         ),
         (
             "an SNS topic ARN",
-            subscriber("SNS", "arn:aws:sns:us-east-1:111122223333:budget-alerts"),
+            subscriber("SNS", &format!("arn:aws:sns:us-east-1:{owner}:budget-alerts")),
         ),
         (
             "an SNS topic ARN in another partition and Region",
-            subscriber("SNS", "arn:aws-cn:sns:cn-north-1:111122223333:budget-alerts"),
+            subscriber(
+                "SNS",
+                &format!("arn:aws-cn:sns:cn-north-1:{owner}:budget-alerts"),
+            ),
         ),
         (
             "an SNS topic ARN whose Region field is exactly at the published bound",
             subscriber(
                 "SNS",
-                "arn:aws:sns:us-east-1-us-east-1x:111122223333:budget-alerts",
+                &format!("arn:aws:sns:us-east-1-us-east-1x:{owner}:budget-alerts"),
             ),
         ),
         (
             "an SNS topic ARN whose topic name carries a suffix",
-            subscriber("SNS", "arn:aws:sns:us-east-1:111122223333:budget-alerts.fifo"),
+            subscriber(
+                "SNS",
+                &format!("arn:aws:sns:us-east-1:{owner}:budget-alerts.fifo"),
+            ),
         ),
     ]
 }

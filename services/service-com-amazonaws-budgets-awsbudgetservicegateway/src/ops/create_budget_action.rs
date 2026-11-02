@@ -258,13 +258,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of `Address` can't contain line breaks" (`Subscriber$Address`) — the form of
         // every address this write establishes, the same rule a notification's
         // subscribers are held to, since both sets are the one modelled `Subscribers`
-        // shape. Checked before the budget is looked up, so nothing is persisted by a
-        // refused create.
-        crate::state::subscriber_address_violation(&input.subscribers).map_err(|message| {
-            CreateBudgetActionErrorModeled::InvalidParameterException(InvalidParameterException {
-                message: Some(message),
-            })
-        })?;
+        // shape: an `SNS` address therefore names a topic of the account that owns the
+        // budget, the account "that Amazon Web Services sends budget notifications" for.
+        // Checked before the budget is looked up, so nothing is persisted by a refused
+        // create.
+        crate::state::subscriber_address_violation(&input.account_id, &input.subscribers)
+            .map_err(|message| {
+                CreateBudgetActionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+            })?;
 
         // "A notification can have one SNS subscriber and up to 10 email subscribers,
         // for a total of 11 subscribers" — the PER-TYPE halves of the subscriber set

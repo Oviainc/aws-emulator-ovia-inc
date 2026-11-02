@@ -194,20 +194,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The subscriber this call would ESTABLISH is held to the same address rule as
         // the one a create establishes — "either an Amazon SNS topic or an email address"
-        // (`Subscriber`), with no line breaks (`Subscriber$Address`) — so an update
-        // cannot leave a notification holding an address a create would have been
-        // refused. `OldSubscriber` is not checked: it only NAMES the subscriber to
-        // replace, and whatever it names is already stored or absent. Checked before the
-        // budget is looked up, so a request that is malformed in itself is refused the
-        // same way whichever notification it names.
-        crate::state::subscriber_address_violation(::std::slice::from_ref(&input.new_subscriber))
-            .map_err(|message| {
-                UpdateSubscriberErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
-                    },
-                )
-            })?;
+        // (`Subscriber`), with no line breaks (`Subscriber$Address`), and, for an `SNS`
+        // address, a topic of the account that owns the budget ("the address that Amazon
+        // Web Services sends budget notifications to") — so an update cannot leave a
+        // notification holding an address a create would have been refused.
+        // `OldSubscriber` is not checked: it only NAMES the subscriber to replace, and
+        // whatever it names is already stored or absent. Checked before the budget is
+        // looked up, so a request that is malformed in itself is refused the same way
+        // whichever notification it names.
+        crate::state::subscriber_address_violation(
+            &input.account_id,
+            ::std::slice::from_ref(&input.new_subscriber),
+        )
+        .map_err(|message| {
+            UpdateSubscriberErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        })?;
 
         let now = ::std::time::SystemTime::now();
         // Every write this call makes is made under the store's lock, and the lock is

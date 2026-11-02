@@ -240,14 +240,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Every address in a replacement set is held to the form its own
             // `SubscriptionType` names, exactly as the set a create establishes is: "either
             // an Amazon SNS topic or an email address" (`Subscriber`), with no line breaks
-            // (`Subscriber$Address`).
-            crate::state::subscriber_address_violation(subscribers).map_err(|message| {
-                UpdateBudgetActionErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
-                    },
-                )
-            })?;
+            // (`Subscriber$Address`), and, for an `SNS` address, a topic of the account
+            // that owns the budget.
+            crate::state::subscriber_address_violation(&input.account_id, subscribers).map_err(
+                |message| {
+                    UpdateBudgetActionErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(message),
+                        },
+                    )
+                },
+            )?;
             crate::state::subscriber_limit_violation(subscribers).map_err(|message| {
                 UpdateBudgetActionErrorModeled::InvalidParameterException(
                     InvalidParameterException {

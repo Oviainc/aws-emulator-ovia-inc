@@ -73,7 +73,7 @@ fn email(notification: usize, index: usize) -> Value {
 fn sns(notification: usize) -> Value {
     json!({
         "SubscriptionType": "SNS",
-        "Address": format!("arn:aws:sns:us-east-1:111122223333:n{notification}")
+        "Address": format!("arn:aws:sns:us-east-1:{}:n{notification}", caller_account())
     })
 }
 
@@ -150,7 +150,10 @@ fn replacement(notification: usize, index: usize, held: &[Value]) -> Value {
         "EMAIL"
     };
     let address = if subscription_type == "SNS" {
-        format!("arn:aws:sns:us-east-1:111122223333:new-n{notification}p{index}")
+        format!(
+            "arn:aws:sns:us-east-1:{}:new-n{notification}p{index}",
+            caller_account()
+        )
     } else {
         format!("new-n{notification}p{index}@example.com")
     };
@@ -703,7 +706,7 @@ async fn an_update_cannot_take_a_notification_outside_the_per_type_subscriber_sp
             at_sns_bound[MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION].clone(),
             json!({
                 "SubscriptionType": "SNS",
-                "Address": "arn:aws:sns:us-east-1:111122223333:second"
+                "Address": format!("arn:aws:sns:us-east-1:{}:second", caller_account())
             }),
         ),
         (
@@ -747,7 +750,7 @@ async fn an_update_cannot_take_a_notification_outside_the_per_type_subscriber_sp
             sns(0),
             json!({
                 "SubscriptionType": "SNS",
-                "Address": "arn:aws:sns:us-east-1:111122223333:moved"
+                "Address": format!("arn:aws:sns:us-east-1:{}:moved", caller_account())
             }),
         ),
         (

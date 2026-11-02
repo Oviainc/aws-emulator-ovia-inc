@@ -67,7 +67,7 @@ fn email(notification: usize, index: usize) -> Value {
 fn sns(notification: usize) -> Value {
     json!({
         "SubscriptionType": "SNS",
-        "Address": format!("arn:aws:sns:us-east-1:111122223333:n{notification}")
+        "Address": format!("arn:aws:sns:us-east-1:{}:n{notification}", caller_account())
     })
 }
 

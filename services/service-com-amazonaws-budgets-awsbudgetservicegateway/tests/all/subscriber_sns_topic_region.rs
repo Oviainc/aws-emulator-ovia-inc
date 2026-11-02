@@ -170,7 +170,7 @@ fn the_address_gate_and_the_alert_path_agree_on_which_addresses_name_a_topic() {
             subscription_type: "SNS".to_string(),
             address: address.clone(),
         }];
-        let accepted = subscriber_address_violation(&subscribers).is_ok();
+        let accepted = subscriber_address_violation(&caller_account(), &subscribers).is_ok();
         assert_eq!(
             accepted, row.names_a_topic,
             "case {:?}: expected the address gate to accept {address}: {}, got {accepted}",

@@ -1331,6 +1331,22 @@ const SNS_ADDRESS_REFUSAL: &str =
 const SUBSCRIBER_FORM_REFUSAL: &str =
     "The Address of a subscriber must be either an Amazon SNS topic or an email address.";
 
+/// The sentence refusing an `SNS` subscriber whose address names a topic of ANOTHER
+/// account, stating the rule as `Subscriber$Address` words it ("the address that Amazon
+/// Web Services sends budget notifications to") about the account a notification of this
+/// budget is sent in: the account that owns the budget, which is the account whose topics
+/// its alerts are published to ([`publishable_topic`]).
+///
+/// It names the account the REQUEST itself supplied, never the refused address nor the
+/// account that address named: `Subscriber$Address` is `@sensitive`, so a refusal that
+/// echoed either field of it would put a caller's topic into every error body and log.
+fn sns_topic_account_refusal(account_id: &str) -> String {
+    format!(
+        "The Address of an SNS subscriber must be the ARN of an Amazon SNS topic in account \
+         {account_id}."
+    )
+}
+
 /// The ADDRESS rule every subscriber a write ESTABLISHES is held to.
 ///
 /// A `Subscriber` "consists of a subscription type and either an Amazon SNS topic or an
@@ -1356,12 +1372,19 @@ const SUBSCRIBER_FORM_REFUSAL: &str =
 ///
 /// Neither form is decided here: an email address is read through the ONE shared reading
 /// of a caller-supplied address (`service_common::email_address`) and a topic through the
-/// ONE shared parse of a caller-supplied ARN ([`sns_topic`]), so this service cannot
-/// disagree with another about what either is.
+/// ONE decision that says which topic a notification of this account is published to
+/// ([`publishable_topic`], over the ONE shared parse of a caller-supplied ARN
+/// [`sns_topic`]), so this service cannot disagree with another about what either is, nor
+/// with itself about which addresses an alert reaches.
+///
+/// `account_id` is the account the request names, which is the account the subscriber is
+/// established under: an `SNS` address therefore has to name a topic of THAT account, the
+/// only account whose topics a notification of its budgets is published to.
 ///
 /// Takes any iterator of subscribers, so an operation that establishes ONE subscriber and
 /// one that establishes a whole set are held to the same rule.
 pub fn subscriber_address_violation<'a>(
+    account_id: &str,
     subscribers: impl IntoIterator<Item = &'a Subscriber>,
 ) -> Result<(), String> {
     for subscriber in subscribers {
@@ -1371,33 +1394,65 @@ pub fn subscriber_address_violation<'a>(
         let violation = match subscriber.subscription_type.as_str() {
             SUBSCRIPTION_TYPE_EMAIL => {
                 (!::service_common::email_address::is_email_address(&subscriber.address))
-                    .then_some(EMAIL_ADDRESS_REFUSAL)
+                    .then(|| EMAIL_ADDRESS_REFUSAL.to_string())
             }
-            SUBSCRIPTION_TYPE_SNS => {
-                sns_topic(&subscriber.address).is_none().then_some(SNS_ADDRESS_REFUSAL)
-            }
+            // The SAME decision the alert published to such a subscriber is made by, so an
+            // address this write accepts is one an alert of this account's budgets is
+            // published to.
+            SUBSCRIPTION_TYPE_SNS => publishable_topic(account_id, &subscriber.address).err(),
             // No request reaches this arm today: `SubscriptionType` is a modelled enum of
             // exactly these two, so a value outside them is refused at request validation.
             // It is a refusal rather than an acceptance because a type this service knows
             // no address form for can only mean the catalog grew, and an address nothing
             // checked is what this rule exists to keep out of the store.
-            _ => Some(SUBSCRIBER_FORM_REFUSAL),
+            _ => Some(SUBSCRIBER_FORM_REFUSAL.to_string()),
         };
         if let Some(message) = violation {
-            return Err(message.to_string());
+            return Err(message);
         }
     }
     Ok(())
 }
 
+/// The TOPIC a budget notification of `account_id` is published to when `address` names
+/// one — `Err` carrying the sentence that refuses the address when it names none.
+///
+/// The ONE decision for BOTH halves of what an `SNS` subscriber is for: the write that
+/// establishes one ([`subscriber_address_violation`]) and the alert published to one
+/// ([`alerts`]) each read an address through here, so an address a write accepts is an
+/// address an alert can be published to and no stored subscriber is quietly skipped by
+/// the delivery path.
+///
+/// Two things have to hold, and the address is read for both through the ONE parse of an
+/// `SNS` subscriber's address ([`sns_topic`]) rather than split again here:
+///
+/// * it names an SNS topic at all, which — SNS being a regional service — is a topic in a
+///   Region, and so an address a publish can be addressed to.
+/// * that topic belongs to `account_id`, the account the budget is owned by. An alert
+///   carries that budget's own figures (`alerts::message`), and a budget's notifications
+///   are delivered to the topics of the account that owns it, so an address naming any
+///   other account names no topic a notification of this budget is sent to — however
+///   well-formed the ARN is. The same shape as the other caller-supplied ARN this service
+///   holds, whose account field is likewise checked before the value is stored
+///   ([`validate_execution_role_account`]).
+pub(crate) fn publishable_topic<'a>(
+    account_id: &str,
+    address: &'a str,
+) -> Result<::service_common::arn::Arn<'a>, String> {
+    let topic = sns_topic(address).ok_or_else(|| SNS_ADDRESS_REFUSAL.to_string())?;
+    if topic.account != account_id {
+        return Err(sns_topic_account_refusal(account_id));
+    }
+    Ok(topic)
+}
+
 /// The Amazon SNS TOPIC `address` names, as the fields of its ARN — `None` when it names
 /// no topic, which is what an `SNS` subscriber's address has to be.
 ///
-/// The ONE reading of an `SNS` subscriber's address, for BOTH halves of what such a
-/// subscriber is for: the write that establishes one ([`subscriber_address_violation`])
-/// and the alert published to one ([`alerts`]) each read an address through here, so an
-/// address a write accepts is an address an alert can be published to, and the gate's
-/// guarantee holds instead of the delivery path quietly skipping a stored subscriber.
+/// The ONE reading of an `SNS` subscriber's address, which both halves of what such a
+/// subscriber is for reach through [`publishable_topic`]: the write that establishes one
+/// and the alert published to one read an address the same way, so this service cannot
+/// hold one address to two different grammars.
 ///
 /// Read through the ONE shared parse of a caller-supplied ARN (`service_common::arn`)
 /// rather than split here: the value has to be a well-formed resource ARN in SNS's own

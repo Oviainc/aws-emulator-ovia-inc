@@ -260,7 +260,7 @@ fn malformed_update_patches() -> Vec<(&'static str, Value)> {
         .map(|n| {
             subscriber(
                 "SNS",
-                &format!("arn:aws:sns:us-east-1:111122223333:budget-alerts-{n}"),
+                &format!("arn:aws:sns:us-east-1:{}:budget-alerts-{n}", caller_account()),
             )
         })
         .collect();

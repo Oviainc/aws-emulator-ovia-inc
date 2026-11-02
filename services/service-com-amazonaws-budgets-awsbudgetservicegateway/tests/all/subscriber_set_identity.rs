@@ -46,7 +46,7 @@ fn email(tag: &str) -> Value {
 fn sns(tag: &str) -> Value {
     json!({
         "SubscriptionType": "SNS",
-        "Address": format!("arn:aws:sns:us-east-1:111122223333:{tag}")
+        "Address": format!("arn:aws:sns:us-east-1:{}:{tag}", caller_account())
     })
 }
 

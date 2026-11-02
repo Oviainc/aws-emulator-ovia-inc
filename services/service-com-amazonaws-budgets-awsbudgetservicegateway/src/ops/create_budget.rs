@@ -222,8 +222,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of `Address` can't contain line breaks" (`Subscriber$Address`) — the form of
         // every address attached with the notifications this call creates, checked over
         // all of them at once because the budget this request would create is created
-        // whole or not at all.
+        // whole or not at all. An `SNS` address is held to the account it is established
+        // under as well: "the address that Amazon Web Services sends budget notifications
+        // to" is a topic of the account that owns the budget, which is the one decision the
+        // alert published to such a subscriber is made by.
         crate::state::subscriber_address_violation(
+            &input.account_id,
             input
                 .notifications_with_subscribers
                 .iter()

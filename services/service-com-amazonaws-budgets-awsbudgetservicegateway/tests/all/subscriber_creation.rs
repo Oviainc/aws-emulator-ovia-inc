@@ -235,7 +235,7 @@ fn persistence_rows() -> Vec<Row> {
         .map(|subscription_type| match *subscription_type {
             "SNS" => json!({
                 "SubscriptionType": "SNS",
-                "Address": "arn:aws:sns:us-east-1:111122223333:each-type"
+                "Address": format!("arn:aws:sns:us-east-1:{}:each-type", caller_account())
             }),
             other => json!({"SubscriptionType": other, "Address": "each-type@example.com"}),
         })
@@ -249,7 +249,7 @@ fn persistence_rows() -> Vec<Row> {
             case: "one SNS topic subscriber",
             added: vec![json!({
                 "SubscriptionType": "SNS",
-                "Address": "arn:aws:sns:us-east-1:111122223333:budget-alerts"
+                "Address": format!("arn:aws:sns:us-east-1:{}:budget-alerts", caller_account())
             })],
         },
         Row {
@@ -394,7 +394,7 @@ async fn a_subscriber_is_identified_by_its_type_and_its_address() {
             "a subscriber of the other subscription type",
             json!({
                 "SubscriptionType": "SNS",
-                "Address": "arn:aws:sns:us-east-1:111122223333:identity"
+                "Address": format!("arn:aws:sns:us-east-1:{}:identity", caller_account())
             }),
             false,
         ),
@@ -402,7 +402,7 @@ async fn a_subscriber_is_identified_by_its_type_and_its_address() {
             "that SNS subscriber a second time",
             json!({
                 "SubscriptionType": "SNS",
-                "Address": "arn:aws:sns:us-east-1:111122223333:identity"
+                "Address": format!("arn:aws:sns:us-east-1:{}:identity", caller_account())
             }),
             true,
         ),
@@ -638,7 +638,7 @@ async fn growing_a_notification_one_subscriber_at_a_time_honours_the_per_type_li
     let sns = |n: usize| {
         json!({
             "SubscriptionType": "SNS",
-            "Address": format!("arn:aws:sns:us-east-1:111122223333:t{n}")
+            "Address": format!("arn:aws:sns:us-east-1:{}:t{n}", caller_account())
         })
     };
     let mut expected = vec![pair(&seed_subscriber())];
