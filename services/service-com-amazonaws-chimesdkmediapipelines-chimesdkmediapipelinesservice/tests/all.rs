@@ -17,6 +17,8 @@ mod kinesis_video_stream_pool_lifecycle;
 mod media_capture_pipeline_lifecycle;
 #[path = "all/media_insights_pipeline_configuration_lifecycle.rs"]
 mod media_insights_pipeline_configuration_lifecycle;
+#[path = "all/media_insights_pipeline_configuration_listing.rs"]
+mod media_insights_pipeline_configuration_listing;
 #[path = "all/media_insights_pipeline_status.rs"]
 mod media_insights_pipeline_status;
 #[path = "all/resource_tagging.rs"]

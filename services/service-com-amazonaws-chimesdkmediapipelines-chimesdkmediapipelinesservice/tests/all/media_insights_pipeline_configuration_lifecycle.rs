@@ -61,15 +61,17 @@ const NOT_FOUND_EXCEPTION: &str = "NotFoundException";
 /// The `ErrorCode` value the modelled `BadRequestException` carries in its body `Code`
 /// member, from the same `ErrorCode` enum, and the wire error-shape name beside it.
 const ERROR_CODE_BAD_REQUEST: &str = "BadRequest";
-const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+pub(crate) const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 
-/// One request/response round trip through the router.
-struct Emulator {
+/// One request/response round trip through the router. `pub(crate)` because the sibling
+/// suite `media_insights_pipeline_configuration_listing` drives the same wire surface and
+/// must not build a second copy of it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
@@ -78,7 +80,12 @@ impl Emulator {
 
     /// Dispatch one request and return what the rows assert on (`Value::Null` for an
     /// empty body, which is what a 204 carries).
-    async fn call(&self, method: &str, path_and_query: &str, body: Option<Value>) -> Response {
+    pub(crate) async fn call(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: Option<Value>,
+    ) -> Response {
         let payload = body.map_or_else(Vec::new, |b| {
             serde_json::to_vec(&b).expect("a JSON value serializes")
         });
@@ -128,7 +135,7 @@ impl Emulator {
         }
     }
 
-    async fn create(&self, input: Value) -> Response {
+    pub(crate) async fn create(&self, input: Value) -> Response {
         self.call(
             "POST",
             "/media-insights-pipeline-configurations",
@@ -137,7 +144,7 @@ impl Emulator {
         .await
     }
 
-    async fn get(&self, identifier: &str) -> Response {
+    pub(crate) async fn get(&self, identifier: &str) -> Response {
         self.call(
             "GET",
             &format!(
@@ -149,7 +156,7 @@ impl Emulator {
         .await
     }
 
-    async fn delete(&self, identifier: &str) -> Response {
+    pub(crate) async fn delete(&self, identifier: &str) -> Response {
         self.call(
             "DELETE",
             &format!(
@@ -169,17 +176,17 @@ fn encode_label(label: &str) -> String {
 }
 
 #[derive(Debug)]
-struct Response {
-    status: u16,
+pub(crate) struct Response {
+    pub(crate) status: u16,
     error_type: Option<String>,
     content_type: Option<String>,
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Response {
     /// The wire error shape name, read from `x-amzn-errortype` (which restJson1
     /// resolves the shape from) and falling back to the body's `__type`.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.error_type
             .clone()
             .or_else(|| {
@@ -225,7 +232,7 @@ fn iso8601_seconds(case: &str, value: &str) -> f64 {
 
 /// A `ResourceAccessRoleArn` satisfying the modelled `Arn` shape (len 1..1024,
 /// pattern `^arn[\/\:\-\_\.a-zA-Z0-9]+$`).
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/media-insights-access";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/media-insights-access";
 
 /// A 64-character configuration name: the longest the modelled
 /// `MediaInsightsPipelineConfigurationNameString` allows (len 2..64, pattern

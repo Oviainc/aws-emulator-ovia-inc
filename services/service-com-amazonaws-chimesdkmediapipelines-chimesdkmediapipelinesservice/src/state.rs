@@ -36,7 +36,8 @@ use crate::ops::types::{
     KinesisVideoStreamSourceRuntimeConfiguration, KinesisVideoStreamSourceTaskConfiguration,
     MediaCapturePipeline, MediaCapturePipelineSummary, MediaInsightsPipeline,
     MediaInsightsPipelineConfiguration, MediaInsightsPipelineConfigurationElement,
-    MediaPipelineSummary, NotFoundException, RealTimeAlertConfiguration,
+    MediaInsightsPipelineConfigurationSummary, MediaPipelineSummary, NotFoundException,
+    RealTimeAlertConfiguration,
     ResourceLimitExceededException, S3RecordingSinkRuntimeConfiguration, ServiceFailureException,
     SpeakerSearchTask, SseAwsKeyManagementParams,
 };
@@ -641,6 +642,16 @@ impl InsightsConfiguration {
             media_insights_pipeline_configuration_id: Some(self.id.clone()),
             created_timestamp: Some(self.created_timestamp),
             updated_timestamp: Some(self.updated_timestamp),
+        }
+    }
+
+    /// This configuration as `ListMediaInsightsPipelineConfigurations` summarises it:
+    /// the three members that identify it, rendered from the stored record.
+    pub fn as_summary(&self) -> MediaInsightsPipelineConfigurationSummary {
+        MediaInsightsPipelineConfigurationSummary {
+            media_insights_pipeline_configuration_name: Some(self.name.clone()),
+            media_insights_pipeline_configuration_id: Some(self.id.clone()),
+            media_insights_pipeline_configuration_arn: Some(self.arn.clone()),
         }
     }
 }
@@ -1337,6 +1348,22 @@ impl ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
         self.insights_configurations
             .iter()
             .find(|configuration| configuration.is_named_by(identifier))
+    }
+
+    /// One page of the media insights pipeline configurations, in creation order, as
+    /// [`page_by_sequence`] pages every listing of this service.
+    pub fn page_insights_configurations(
+        &self,
+        next_token: Option<&str>,
+        max_results: Option<i32>,
+    ) -> Result<(Vec<&InsightsConfiguration>, Option<String>), InvalidPageToken> {
+        page_by_sequence(
+            self.insights_configurations
+                .iter()
+                .map(|configuration| (configuration.seq, configuration)),
+            next_token,
+            max_results,
+        )
     }
 
     /// The configuration a previous create minted under `token`, for the idempotent
