@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -217,18 +207,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResources"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListResourcesErrorModeled::ServiceInternalErrorException(
+                ServiceInternalErrorException {
+                    message: Some(crate::state::STORE_NOT_MOUNTED.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "The resource model to use to select the resources to return": a partial
+        // model, so the listing reports the resources whose own model carries every
+        // property it names with the same value. Judged on the REQUEST alone, before
+        // anything it names is resolved.
+        let selector = match input.resource_model.as_deref() {
+            Some(model) => Some(
+                crate::state::parse_properties("ResourceModel", model).map_err(invalid_request)?,
+            ),
+            None => None,
+        };
+
+        let mut store = state.lock();
+        // What the clock already owes the store, so one listing cannot report a resource
+        // another read says no longer exists.
+        store.materialise_due(::std::time::SystemTime::now());
+
+        // A continuation token carries the position it names, so only the authenticator
+        // inside it tells one this store minted from one a caller wrote — and a token
+        // minted for another type's listing resumes nothing here either.
+        let key = store.page_token_key();
+        let resume_after = match crate::state::requested_page_token(input.next_token.as_deref()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(&key, &input.type_name, token).ok_or_else(
+                    || invalid_request("NextToken is not a continuation token of this listing"),
+                )?,
+            ),
+            None => None,
+        };
+
+        // `MaxResults` is "the maximum number of results to be returned with a single
+        // call", bounded by the model at 100; a read that names none answers that same
+        // maximum, so the page is bounded either way.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+
+        // One more than the page is read, so the presence of a further resource — and
+        // the position to resume at — is known without scanning the rest of the type.
+        let mut page: Vec<&crate::state::StoredResource> = store
+            .resources_of_type(&input.type_name)
+            .filter(|stored| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|from| stored.identifier.as_str() > from)
+            })
+            .filter(|stored| {
+                selector.as_ref().is_none_or(|selector| {
+                    crate::state::properties_match_selector(&stored.properties, selector)
+                })
+            })
+            .take(page_size + 1)
+            .collect();
+        let next_token = if page.len() > page_size {
+            page.truncate(page_size);
+            page.last().map(|stored| {
+                crate::state::encode_page_token(
+                    &key,
+                    &crate::state::page_cursor(&input.type_name, &stored.identifier),
+                )
+            })
+        } else {
+            // The last page carries no token, which is what tells a client to stop.
+            None
+        };
+
+        Ok(ListResourcesOutput {
+            type_name: Some(input.type_name.clone()),
+            resource_descriptions: Some(
+                page.into_iter()
+                    .map(crate::state::resource_description)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The modelled refusal this operation states a fault in the REQUEST with: "the resource
+/// handler has returned that invalid input from the user has generated a generic
+/// exception".
+fn invalid_request(detail: impl AsRef<str>) -> ListResourcesError {
+    ListResourcesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(crate::state::invalid_request_message(detail.as_ref())),
+    })
+    .into()
 }

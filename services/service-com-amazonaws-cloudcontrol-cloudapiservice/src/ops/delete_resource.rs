@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -231,18 +221,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteResourceErrorModeled::ServiceInternalErrorException(
+                ServiceInternalErrorException {
+                    message: Some(crate::state::STORE_NOT_MOUNTED.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialise_due(now);
+
+        // @idempotencyToken: the same rule the other two mutating operations apply — a
+        // token that already carried THIS request replays it, and a token reused for a
+        // different one is refused.
+        let fingerprint = crate::state::request_fingerprint(&[
+            Some(Self::NAME),
+            Some(&input.type_name),
+            input.type_version_id.as_deref(),
+            input.role_arn.as_deref(),
+            Some(&input.identifier),
+        ]);
+        match store.judge_client_token(input.client_token.as_deref(), &fingerprint) {
+            crate::state::ClientTokenVerdict::Replay(request_token) => {
+                if let Some(record) = store.request(&request_token) {
+                    let progress_event = crate::state::progress_event(record);
+                    crate::state::audit(
+                        ctx.parts(),
+                        Self::NAME,
+                        &crate::state::resource_label(&input.type_name, &input.identifier),
+                        &request_token,
+                        crate::state::OUTCOME_REPLAYED,
+                    );
+                    return Ok(DeleteResourceOutput {
+                        progress_event: Some(progress_event),
+                    });
+                }
+            }
+            crate::state::ClientTokenVerdict::Conflict => {
+                return Err(DeleteResourceErrorModeled::ClientTokenConflictException(
+                    ClientTokenConflictException {
+                        message: Some(crate::state::CLIENT_TOKEN_CONFLICT_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            crate::state::ClientTokenVerdict::Fresh => {}
+        }
+
+        // A resource is acted on by one operation at a time, so a delete that arrives
+        // while another operation is still running against this identifier is refused
+        // rather than racing it.
+        if store.operation_in_flight(&input.type_name, &input.identifier) {
+            return Err(DeleteResourceErrorModeled::ConcurrentOperationException(
+                ConcurrentOperationException {
+                    message: Some(crate::state::CONCURRENT_OPERATION_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        if store.resource(&input.type_name, &input.identifier).is_none() {
+            return Err(DeleteResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.type_name,
+                        &input.identifier,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(request_token) = store.allocate_request_token() else {
+            return Err(DeleteResourceErrorModeled::ServiceInternalErrorException(
+                ServiceInternalErrorException {
+                    message: Some("could not allocate a free request token".to_string()),
+                },
+            )
+            .into());
+        };
+        // The request is answered while the delete is still running: the resource stays
+        // readable until the work this record owes falls due, which is when it is
+        // removed from the store.
+        let record = crate::state::RequestRecord::accepted(
+            request_token.clone(),
+            input.type_name.clone(),
+            Some(input.identifier.clone()),
+            crate::state::OPERATION_DELETE,
+            now,
+            crate::state::ResourceEffect::Delete,
+        );
+        let progress_event = crate::state::progress_event(&record);
+        if store.record_request(record).is_err() {
+            return Err(DeleteResourceErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::THROTTLING_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        store.remember_client_token(
+            input.client_token.as_deref(),
+            fingerprint,
+            &request_token,
+            now,
+        );
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &crate::state::resource_label(&input.type_name, &input.identifier),
+            &request_token,
+            crate::state::OUTCOME_ACCEPTED,
+        );
+
+        Ok(DeleteResourceOutput {
+            progress_event: Some(progress_event),
+        })
     }
 }

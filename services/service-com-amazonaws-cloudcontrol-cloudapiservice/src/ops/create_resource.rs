@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -231,18 +221,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateResourceErrorModeled::ServiceInternalErrorException(
+                ServiceInternalErrorException {
+                    message: Some(crate::state::STORE_NOT_MOUNTED.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // What the REQUEST ITSELF carries is judged before anything it names is
+        // resolved, so no verdict about a resource can mask a fault in the input: the
+        // desired state has to be a JSON object of properties, and the property that
+        // carries the type's primary identifier has to hold something that can be one.
+        let properties = crate::state::parse_properties("DesiredState", &input.desired_state)
+            .map_err(invalid_request)?;
+        let (identifier, identifier_property, properties) =
+            match crate::state::derive_identifier(&properties, &input.type_name) {
+                crate::state::DerivedIdentifier::Carried {
+                    property,
+                    identifier,
+                } => (identifier, property, properties),
+                crate::state::DerivedIdentifier::Assigned {
+                    property,
+                    identifier,
+                } => {
+                    // The type's primary identifier is one this service allocates for
+                    // this resource, so it is recorded in the resource model the reads
+                    // report: the identifier a caller is handed is always findable as a
+                    // property of the resource it names.
+                    let mut properties = properties;
+                    if let Some(model) = properties.as_object_mut() {
+                        model.insert(
+                            property.clone(),
+                            ::serde_json::Value::String(identifier.clone()),
+                        );
+                    }
+                    (identifier, property, properties)
+                }
+                crate::state::DerivedIdentifier::Unusable { property } => {
+                    return Err(invalid_request(format!(
+                        "{property} must be a non-empty scalar of at most {} characters to \
+                         identify the resource",
+                        crate::state::MAX_IDENTIFIER_CHARACTERS
+                    )));
+                }
+            };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialise_due(now);
+
+        // @idempotencyToken: a retry carrying a client token that already started a
+        // resource request replays THAT request rather than starting a second one, and a
+        // token reused for a different request is refused. "The same request" is judged
+        // on every member of this create the caller owns, absence included.
+        let fingerprint = crate::state::request_fingerprint(&[
+            Some(Self::NAME),
+            Some(&input.type_name),
+            input.type_version_id.as_deref(),
+            input.role_arn.as_deref(),
+            Some(&input.desired_state),
+        ]);
+        match store.judge_client_token(input.client_token.as_deref(), &fingerprint) {
+            crate::state::ClientTokenVerdict::Replay(request_token) => {
+                if let Some(record) = store.request(&request_token) {
+                    let progress_event = crate::state::progress_event(record);
+                    let resource = crate::state::resource_label(
+                        &record.type_name,
+                        record.identifier.as_deref().unwrap_or_default(),
+                    );
+                    crate::state::audit(
+                        ctx.parts(),
+                        Self::NAME,
+                        &resource,
+                        &request_token,
+                        crate::state::OUTCOME_REPLAYED,
+                    );
+                    return Ok(CreateResourceOutput {
+                        progress_event: Some(progress_event),
+                    });
+                }
+            }
+            crate::state::ClientTokenVerdict::Conflict => {
+                return Err(CreateResourceErrorModeled::ClientTokenConflictException(
+                    ClientTokenConflictException {
+                        message: Some(crate::state::CLIENT_TOKEN_CONFLICT_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            crate::state::ClientTokenVerdict::Fresh => {}
+        }
+
+        // A resource is acted on by one operation at a time: while a request against
+        // this identifier is still running there is nothing to say whether the resource
+        // will exist, so a second one is refused rather than racing it.
+        if store.operation_in_flight(&input.type_name, &identifier) {
+            return Err(CreateResourceErrorModeled::ConcurrentOperationException(
+                ConcurrentOperationException {
+                    message: Some(crate::state::CONCURRENT_OPERATION_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        if store.resource(&input.type_name, &identifier).is_some() {
+            return Err(CreateResourceErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(crate::state::already_exists_message(
+                        &input.type_name,
+                        &identifier,
+                    )),
+                },
+            )
+            .into());
+        }
+        // Checked BEFORE anything is stored, so an accepted call is the only thing that
+        // can grow the store.
+        if store.resource_count() >= crate::state::MAX_RESOURCES {
+            return Err(CreateResourceErrorModeled::ServiceLimitExceededException(
+                ServiceLimitExceededException {
+                    message: Some(crate::state::resource_limit_message(&input.type_name)),
+                },
+            )
+            .into());
+        }
+
+        let Some(request_token) = store.allocate_request_token() else {
+            return Err(CreateResourceErrorModeled::ServiceInternalErrorException(
+                ServiceInternalErrorException {
+                    message: Some("could not allocate a free request token".to_string()),
+                },
+            )
+            .into());
+        };
+        // The request is answered while the create is still running: the resource is
+        // provisioned when the work this record owes falls due, and whichever call
+        // arrives then applies it.
+        let record = crate::state::RequestRecord::accepted(
+            request_token.clone(),
+            input.type_name.clone(),
+            Some(identifier.clone()),
+            crate::state::OPERATION_CREATE,
+            now,
+            crate::state::ResourceEffect::Create {
+                properties,
+                identifier_property,
+                type_version_id: input.type_version_id.clone(),
+            },
+        );
+        let progress_event = crate::state::progress_event(&record);
+        if store.record_request(record).is_err() {
+            return Err(CreateResourceErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::THROTTLING_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        store.remember_client_token(
+            input.client_token.as_deref(),
+            fingerprint,
+            &request_token,
+            now,
+        );
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &crate::state::resource_label(&input.type_name, &identifier),
+            &request_token,
+            crate::state::OUTCOME_ACCEPTED,
+        );
+
+        Ok(CreateResourceOutput {
+            progress_event: Some(progress_event),
+        })
     }
+}
+
+/// The modelled refusal this operation states a fault in the REQUEST with: "the resource
+/// handler has returned that invalid input from the user has generated a generic
+/// exception".
+fn invalid_request(detail: impl AsRef<str>) -> CreateResourceError {
+    CreateResourceErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(crate::state::invalid_request_message(detail.as_ref())),
+    })
+    .into()
 }

@@ -1,0 +1,374 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The ONE wire harness this crate's suites drive the emulator through.
+//!
+//! Every suite calls the service the way a client does — `POST /` with
+//! `X-Amz-Target: CloudApiService.<Operation>` on `awsJson1_0`, signed for the
+//! `cloudcontrolapi` signing name, through the same `MultiServiceRouter::dispatch` the
+//! socket front door uses — so the mounting rules live here once rather than in each
+//! suite.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use serde_json::{json, Map, Value};
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The sigv4 signing name the model gives this service.
+pub(crate) const SIGNING_NAME: &str = "cloudcontrolapi";
+
+/// The `X-Amz-Target` prefix a client writes: the local name of this service's Smithy
+/// service shape.
+pub(crate) const TARGET_PREFIX: &str = "CloudApiService";
+
+/// The region the harness signs for.
+pub(crate) const SIGNING_REGION: &str = "us-east-1";
+
+/// How long a wait for a resource operation request to complete runs before the case
+/// fails.
+///
+/// An accepted request is answered in a non-terminal status, so the clock owes it the
+/// rest of the progression; this is well past that span, because a case waits for the
+/// STATUS it is after and never for a fixed span.
+pub(crate) const SETTLED_BUDGET: Duration = Duration::from_secs(30);
+
+/// How often that wait re-reads.
+pub(crate) const SETTLED_INTERVAL: Duration = Duration::from_millis(20);
+
+/// "`IN_PROGRESS`: The resource operation is currently in progress."
+pub(crate) const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// "`SUCCESS`: The resource operation has successfully completed."
+pub(crate) const STATUS_SUCCESS: &str = "SUCCESS";
+
+/// One emulator: a router with this service mounted over one shared engine.
+pub(crate) struct Emulator {
+    router: MultiServiceRouter,
+}
+
+impl Emulator {
+    /// One emulator, mounted the way the assembled router mounts this service.
+    pub(crate) fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        // Pinned off so the suites do not depend on the process-wide default; the
+        // Authorization header below is still what carries the credential scope.
+        router.set_request_authentication(false);
+        router.register_service(
+            service_com_amazonaws_cloudcontrol_cloudapiservice::EmulatedService::new(engine),
+        );
+        Self { router }
+    }
+
+    /// One operation of this service, as a `(status, body)` pair.
+    pub(crate) async fn cc(&self, operation: &str, body: Value) -> (u16, Value) {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{SIGNING_REGION}/{SIGNING_NAME}/\
+             aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=00"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("{SIGNING_NAME}.localhost"))
+            .header("content-type", "application/x-amz-json-1.0")
+            .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
+            .header("authorization", authorization)
+            .body(Bytes::from(
+                serde_json::to_vec(&body).expect("the request body serializes"),
+            ))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let decoded = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, decoded)
+    }
+
+    /// One operation of this service, required to succeed.
+    pub(crate) async fn cc_ok(&self, operation: &str, body: Value) -> Value {
+        let (status, decoded) = self.cc(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
+        );
+        decoded
+    }
+
+    /// One `CreateResource` request body, handed back rather than posted — which is what
+    /// sending the SAME request twice, as judging a repeated `ClientToken` takes, needs.
+    pub(crate) fn create_request(
+        type_name: &str,
+        desired_state: &Value,
+        client_token: Option<&str>,
+    ) -> Value {
+        let mut request = Map::new();
+        request.insert("TypeName".to_string(), json!(type_name));
+        // `DesiredState` is a JSON blob carried as a string member.
+        request.insert("DesiredState".to_string(), json!(desired_state.to_string()));
+        if let Some(token) = client_token {
+            request.insert("ClientToken".to_string(), json!(token));
+        }
+        Value::Object(request)
+    }
+
+    /// `CreateResource`, as a `(status, body)` pair.
+    pub(crate) async fn create(
+        &self,
+        type_name: &str,
+        desired_state: &Value,
+        client_token: Option<&str>,
+    ) -> (u16, Value) {
+        self.cc(
+            "CreateResource",
+            Self::create_request(type_name, desired_state, client_token),
+        )
+        .await
+    }
+
+    /// `CreateResource`, required to succeed, answering the `ProgressEvent` it reports.
+    pub(crate) async fn create_ok(
+        &self,
+        type_name: &str,
+        desired_state: &Value,
+        client_token: Option<&str>,
+    ) -> Value {
+        let created = self
+            .cc_ok(
+                "CreateResource",
+                Self::create_request(type_name, desired_state, client_token),
+            )
+            .await;
+        progress(&created)
+    }
+
+    /// The `ProgressEvent` `GetResourceRequestStatus` reports for `request_token`, as a
+    /// `(status, body)` pair.
+    pub(crate) async fn status(&self, request_token: &str) -> (u16, Value) {
+        self.cc(
+            "GetResourceRequestStatus",
+            json!({ "RequestToken": request_token }),
+        )
+        .await
+    }
+
+    /// Wait until the request `request_token` names has completed, answering the
+    /// `ProgressEvent` it reports then.
+    pub(crate) async fn settled(&self, request_token: &str) -> Value {
+        let started = Instant::now();
+        loop {
+            let (status, body) = self.status(request_token).await;
+            assert_eq!(
+                status, 200,
+                "request {request_token:?}: expected HTTP 200 from \
+                 GetResourceRequestStatus, got {status} with body {body:?}"
+            );
+            let event = progress(&body);
+            if text(&event, "OperationStatus") == STATUS_SUCCESS {
+                return event;
+            }
+            assert!(
+                started.elapsed() < SETTLED_BUDGET,
+                "request {request_token:?}: expected the operation to complete within \
+                 {SETTLED_BUDGET:?}, it is still {:?}",
+                text(&event, "OperationStatus")
+            );
+            tokio::time::sleep(SETTLED_INTERVAL).await;
+        }
+    }
+
+    /// Create one resource and wait until it is provisioned, answering its primary
+    /// identifier — the server-resolved one, never a value the case chose.
+    pub(crate) async fn provision(&self, type_name: &str, desired_state: &Value) -> String {
+        let accepted = self.create_ok(type_name, desired_state, None).await;
+        let settled = self.settled(&text(&accepted, "RequestToken")).await;
+        text(&settled, "Identifier")
+    }
+
+    /// `GetResource`, as a `(status, body)` pair.
+    pub(crate) async fn get(&self, type_name: &str, identifier: &str) -> (u16, Value) {
+        self.cc(
+            "GetResource",
+            json!({ "TypeName": type_name, "Identifier": identifier }),
+        )
+        .await
+    }
+
+    /// The resource model `GetResource` reports for one resource, parsed back from the
+    /// JSON string the `Properties` member carries.
+    pub(crate) async fn properties(&self, type_name: &str, identifier: &str) -> Value {
+        let fetched = self.cc_ok(
+            "GetResource",
+            json!({ "TypeName": type_name, "Identifier": identifier }),
+        )
+        .await;
+        properties_of(&fetched["ResourceDescription"])
+    }
+
+    /// `UpdateResource`, as a `(status, body)` pair.
+    pub(crate) async fn update(
+        &self,
+        type_name: &str,
+        identifier: &str,
+        patch_document: &Value,
+        client_token: Option<&str>,
+    ) -> (u16, Value) {
+        let mut request = Map::new();
+        request.insert("TypeName".to_string(), json!(type_name));
+        request.insert("Identifier".to_string(), json!(identifier));
+        // `PatchDocument` is a JSON Patch document carried as a string member.
+        request.insert(
+            "PatchDocument".to_string(),
+            json!(patch_document.to_string()),
+        );
+        if let Some(token) = client_token {
+            request.insert("ClientToken".to_string(), json!(token));
+        }
+        self.cc("UpdateResource", Value::Object(request)).await
+    }
+
+    /// Apply one patch and wait until the resource carries it.
+    pub(crate) async fn update_and_settle(
+        &self,
+        type_name: &str,
+        identifier: &str,
+        patch_document: &Value,
+    ) -> Value {
+        let (status, body) = self.update(type_name, identifier, patch_document, None).await;
+        assert_eq!(
+            status, 200,
+            "UpdateResource {identifier:?}: expected HTTP 200, got {status} with body {body:?}"
+        );
+        let accepted = progress(&body);
+        self.settled(&text(&accepted, "RequestToken")).await
+    }
+
+    /// `DeleteResource`, as a `(status, body)` pair.
+    pub(crate) async fn delete(&self, type_name: &str, identifier: &str) -> (u16, Value) {
+        self.delete_with_token(type_name, identifier, None).await
+    }
+
+    /// `DeleteResource` carrying `client_token`, as a `(status, body)` pair.
+    pub(crate) async fn delete_with_token(
+        &self,
+        type_name: &str,
+        identifier: &str,
+        client_token: Option<&str>,
+    ) -> (u16, Value) {
+        let mut request = Map::new();
+        request.insert("TypeName".to_string(), json!(type_name));
+        request.insert("Identifier".to_string(), json!(identifier));
+        if let Some(token) = client_token {
+            request.insert("ClientToken".to_string(), json!(token));
+        }
+        self.cc("DeleteResource", Value::Object(request)).await
+    }
+
+    /// Delete one resource and wait until it is gone.
+    pub(crate) async fn delete_and_settle(&self, type_name: &str, identifier: &str) -> Value {
+        let (status, body) = self.delete(type_name, identifier).await;
+        assert_eq!(
+            status, 200,
+            "DeleteResource {identifier:?}: expected HTTP 200, got {status} with body {body:?}"
+        );
+        let accepted = progress(&body);
+        self.settled(&text(&accepted, "RequestToken")).await
+    }
+
+    /// `ListResources` for one window, as the service reports it.
+    pub(crate) async fn list(
+        &self,
+        type_name: &str,
+        max_results: Option<i64>,
+        next_token: Option<&str>,
+    ) -> Value {
+        self.cc_ok(
+            "ListResources",
+            Self::list_request(type_name, max_results, next_token, None),
+        )
+        .await
+    }
+
+    /// One `ListResources` request body.
+    pub(crate) fn list_request(
+        type_name: &str,
+        max_results: Option<i64>,
+        next_token: Option<&str>,
+        resource_model: Option<&Value>,
+    ) -> Value {
+        let mut request = Map::new();
+        request.insert("TypeName".to_string(), json!(type_name));
+        if let Some(max_results) = max_results {
+            request.insert("MaxResults".to_string(), json!(max_results));
+        }
+        if let Some(token) = next_token {
+            request.insert("NextToken".to_string(), json!(token));
+        }
+        if let Some(model) = resource_model {
+            request.insert("ResourceModel".to_string(), json!(model.to_string()));
+        }
+        Value::Object(request)
+    }
+
+    /// Every identifier `ListResources` reports for `type_name`, walking the pages at
+    /// `max_results` per page, in the order the pages reported them.
+    pub(crate) async fn walk(&self, type_name: &str, max_results: Option<i64>) -> Vec<String> {
+        let mut identifiers = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let listed = self.list(type_name, max_results, token.as_deref()).await;
+            identifiers.extend(descriptions(&listed).iter().map(|d| text(d, "Identifier")));
+            match listed["NextToken"].as_str() {
+                Some(next) => token = Some(next.to_string()),
+                None => return identifiers,
+            }
+            assert!(
+                identifiers.len() <= 1_000,
+                "listing {type_name:?}: the pages never ran out, got {identifiers:?}"
+            );
+        }
+    }
+}
+
+/// The `ProgressEvent` member of a mutating operation's response.
+pub(crate) fn progress(body: &Value) -> Value {
+    body["ProgressEvent"].clone()
+}
+
+/// The `ResourceDescriptions` of a listing.
+pub(crate) fn descriptions(listed: &Value) -> Vec<Value> {
+    listed["ResourceDescriptions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The resource model one `ResourceDescription` carries, parsed back from the JSON
+/// string its `Properties` member holds.
+pub(crate) fn properties_of(description: &Value) -> Value {
+    let rendered = text(description, "Properties");
+    serde_json::from_str(&rendered).unwrap_or(Value::Null)
+}
+
+/// A string member, or `""` when absent — so a missing member fails an assertion rather
+/// than panicking the harness.
+pub(crate) fn text(value: &Value, member: &str) -> String {
+    value[member].as_str().unwrap_or_default().to_string()
+}
+
+/// The wire error code of an error body.
+pub(crate) fn code(body: &Value) -> String {
+    text(body, "__type")
+}
+
+/// The `message` an error body carries, under either casing the envelope may use.
+pub(crate) fn message(body: &Value) -> String {
+    body["message"]
+        .as_str()
+        .or_else(|| body["Message"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}

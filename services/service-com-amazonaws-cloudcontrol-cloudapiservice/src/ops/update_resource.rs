@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -222,6 +212,83 @@ impl<Eng> UpdateResource<Eng> {
     }
 }
 
+/// What this service's own store says about an `UpdateResource` request.
+enum StoreVerdict {
+    /// The request's `ClientToken` already started this request, so it is replayed: the
+    /// event that request reports, and the token that names it.
+    ///
+    /// Boxed: a `ProgressEvent` is far wider than the other variant, and this enum is a
+    /// verdict passed once per request rather than a value held in bulk.
+    Replay(Box<ProgressEvent>, String),
+    /// Nothing the store holds refuses the request: this is the resource model the patch
+    /// applies to, and the property that model carries the primary identifier in.
+    Update(::serde_json::Value, String),
+}
+
+/// Judge an update against everything this service's OWN store answers: the idempotent
+/// replay, whether another operation is running against the resource, and whether the
+/// resource exists at all.
+///
+/// Called under the lock BOTH before the patch is applied and again at the instant the
+/// request is recorded, so a verdict is never acted on from a store that has since moved:
+/// the check and the insert happen under one lock, and the patch — the one piece of work
+/// a request can make expensive — happens between them with no lock held.
+fn judge_against_store(
+    store: &crate::state::ComAmazonawsCloudcontrolCloudapiserviceState,
+    input: &UpdateResourceInput,
+    fingerprint: &str,
+) -> Result<StoreVerdict, UpdateResourceError> {
+    // @idempotencyToken: the same rule the other two mutating operations apply — a token
+    // that already carried THIS request replays it, and a token reused for a different
+    // one is refused.
+    match store.judge_client_token(input.client_token.as_deref(), fingerprint) {
+        crate::state::ClientTokenVerdict::Replay(request_token) => {
+            if let Some(record) = store.request(&request_token) {
+                return Ok(StoreVerdict::Replay(
+                    Box::new(crate::state::progress_event(record)),
+                    request_token,
+                ));
+            }
+        }
+        crate::state::ClientTokenVerdict::Conflict => {
+            return Err(UpdateResourceErrorModeled::ClientTokenConflictException(
+                ClientTokenConflictException {
+                    message: Some(crate::state::CLIENT_TOKEN_CONFLICT_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        crate::state::ClientTokenVerdict::Fresh => {}
+    }
+
+    // A resource is acted on by one operation at a time: a patch applied to a model
+    // another running operation is about to replace would be lost, so the second
+    // operation is refused rather than racing it.
+    if store.operation_in_flight(&input.type_name, &input.identifier) {
+        return Err(UpdateResourceErrorModeled::ConcurrentOperationException(
+            ConcurrentOperationException {
+                message: Some(crate::state::CONCURRENT_OPERATION_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+    let Some(stored) = store.resource(&input.type_name, &input.identifier) else {
+        return Err(UpdateResourceErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: Some(crate::state::resource_not_found_message(
+                    &input.type_name,
+                    &input.identifier,
+                )),
+            },
+        )
+        .into());
+    };
+    Ok(StoreVerdict::Update(
+        stored.properties.clone(),
+        stored.identifier_property.clone(),
+    ))
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for UpdateResource<Eng>
 {
@@ -239,18 +306,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateResourceErrorModeled::ServiceInternalErrorException(
+                ServiceInternalErrorException {
+                    message: Some(crate::state::STORE_NOT_MOUNTED.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // What the REQUEST ITSELF carries is judged before anything it names is
+        // resolved: `PatchDocument` is "a JavaScript Object Notation (JSON) document
+        // that describes a list of patch operations", so it is read by the RFC 6902
+        // implementation and a document that is not one is a fault in the input
+        // whatever the identifier names.
+        let patch: ::json_patch::Patch = ::serde_json::from_str(&input.patch_document)
+            .map_err(|_| invalid_request("PatchDocument is not a valid JSON Patch document"))?;
+        let fingerprint = crate::state::request_fingerprint(&[
+            Some(Self::NAME),
+            Some(&input.type_name),
+            input.type_version_id.as_deref(),
+            input.role_arn.as_deref(),
+            Some(&input.identifier),
+            Some(&input.patch_document),
+        ]);
+        let resource = crate::state::resource_label(&input.type_name, &input.identifier);
+
+        // Everything this service's own store answers is judged first, under a lock that
+        // is DROPPED before the patch below — so no caller waits on the store while
+        // another caller's patch is computed.
+        let (base, identifier_property) = {
+            let mut store = state.lock();
+            store.materialise_due(::std::time::SystemTime::now());
+            match judge_against_store(&store, &input, &fingerprint)? {
+                StoreVerdict::Replay(progress_event, request_token) => {
+                    drop(store);
+                    crate::state::audit(
+                        ctx.parts(),
+                        Self::NAME,
+                        &resource,
+                        &request_token,
+                        crate::state::OUTCOME_REPLAYED,
+                    );
+                    return Ok(UpdateResourceOutput {
+                        progress_event: Some(*progress_event),
+                    });
+                }
+                StoreVerdict::Update(properties, identifier_property) => {
+                    (properties, identifier_property)
+                }
+            }
+        };
+
+        // "You specify your resource property updates as a list of patch operations
+        // contained in a JSON patch document": the patch is applied to a COPY of the
+        // model the store holds, with the one rule that bounds the work it can drive
+        // (`crate::state::apply_patch`), and what it produces is what the store holds
+        // next. Nothing is stored unless the whole patch succeeded.
+        let mut patched = base.clone();
+        crate::state::apply_patch(&mut patched, &patch)
+            .map_err(|refusal| invalid_request(refusal.detail()))?;
+        // A resource's primary identifier is what every operation addresses it by, so it
+        // is create-only for every resource type: a patch that would change or drop it
+        // is the modelled create-only refusal rather than a resource that answers to a
+        // different identifier than the one it is stored under.
+        if patched
+            .get(&identifier_property)
+            .and_then(crate::state::identifier_text)
+            .as_deref()
+            != Some(input.identifier.as_str())
+        {
+            return Err(UpdateResourceErrorModeled::NotUpdatableException(
+                NotUpdatableException {
+                    message: Some(crate::state::not_updatable_message(&identifier_property)),
+                },
+            )
+            .into());
+        }
+
+        // The request is recorded under a fresh lock and judged against the store once
+        // more under THAT lock, so what lands is judged against the store as it is THEN.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialise_due(now);
+        match judge_against_store(&store, &input, &fingerprint)? {
+            StoreVerdict::Replay(progress_event, request_token) => {
+                drop(store);
+                crate::state::audit(
+                    ctx.parts(),
+                    Self::NAME,
+                    &resource,
+                    &request_token,
+                    crate::state::OUTCOME_REPLAYED,
+                );
+                return Ok(UpdateResourceOutput {
+                    progress_event: Some(*progress_event),
+                });
+            }
+            StoreVerdict::Update(properties, _) if properties != base => {
+                // The model the patch was computed against is no longer the model the
+                // store holds, so applying it would discard whatever changed it: the
+                // resource is not in a state this request can be acted on from.
+                return Err(UpdateResourceErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        message: Some(crate::state::RESOURCE_CONFLICT_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+            StoreVerdict::Update(..) => {}
+        }
+
+        let Some(request_token) = store.allocate_request_token() else {
+            return Err(UpdateResourceErrorModeled::ServiceInternalErrorException(
+                ServiceInternalErrorException {
+                    message: Some("could not allocate a free request token".to_string()),
+                },
+            )
+            .into());
+        };
+        let record = crate::state::RequestRecord::accepted(
+            request_token.clone(),
+            input.type_name.clone(),
+            Some(input.identifier.clone()),
+            crate::state::OPERATION_UPDATE,
+            now,
+            crate::state::ResourceEffect::Update {
+                properties: patched,
+            },
+        );
+        let progress_event = crate::state::progress_event(&record);
+        if store.record_request(record).is_err() {
+            return Err(UpdateResourceErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::THROTTLING_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        store.remember_client_token(
+            input.client_token.as_deref(),
+            fingerprint,
+            &request_token,
+            now,
+        );
+        drop(store);
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &resource,
+            &request_token,
+            crate::state::OUTCOME_ACCEPTED,
+        );
+
+        Ok(UpdateResourceOutput {
+            progress_event: Some(progress_event),
+        })
     }
+}
+
+/// The modelled refusal this operation states a fault in the REQUEST with: "the resource
+/// handler has returned that invalid input from the user has generated a generic
+/// exception".
+fn invalid_request(detail: impl AsRef<str>) -> UpdateResourceError {
+    UpdateResourceErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(crate::state::invalid_request_message(detail.as_ref())),
+    })
+    .into()
 }

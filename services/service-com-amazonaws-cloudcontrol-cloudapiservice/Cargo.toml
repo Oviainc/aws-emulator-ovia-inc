@@ -7,6 +7,9 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# The shared, authenticated continuation-token primitive every paginated read of
+# this emulator mints its `NextToken` with.
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -21,13 +24,22 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `PatchDocument` is an RFC 6902 JSON Patch document: apply it with a real
+# implementation of that RFC rather than walking the operations by hand.
+# `default-features = false` drops the `diff` feature, which this service never asks for.
+json-patch = { version = "4.2", default-features = false }
+# Opaque pagination tokens are hex-encoded, so a token this store did not mint is
+# detectable rather than silently decoded.
+hex = { workspace = true }
+# A `ClientToken`'s record holds a digest of the request it carried, so a reuse with
+# different parameters is told from a retry without keeping the request bodies.
+sha2 = { workspace = true }
+# `RequestToken`s and server-assigned primary identifiers are UUIDs: mint them with a
+# real UUID implementation rather than assembling the text by hand.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
