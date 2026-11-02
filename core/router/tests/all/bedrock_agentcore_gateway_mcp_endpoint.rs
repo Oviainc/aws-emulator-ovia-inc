@@ -108,17 +108,30 @@ async fn call(
     (status, body_json(response.body()))
 }
 
+/// The `(host, path)` a published gateway URL addresses. The URL carries BOTH: the
+/// gateway's own endpoint host and the transport path its protocol is served on, so a
+/// client holding it drives exactly that path and appends nothing.
+fn split_url(url: &str) -> (String, String) {
+    let rest = url
+        .strip_prefix("https://")
+        .expect("the published gateway URL is an https URL");
+    match rest.find('/') {
+        Some(path_start) => (
+            rest[..path_start].to_string(),
+            rest[path_start..].to_string(),
+        ),
+        None => (rest.to_string(), "/".to_string()),
+    }
+}
+
 /// One JSON-RPC call to a published gateway endpoint, driven the way an MCP client holding
-/// that URL does: the URL's own host, its `/mcp` path, and a SigV4 credential for the
+/// that URL does: the URL's own host and path, and a SigV4 credential for the
 /// `bedrock-agentcore` signing name the gateway's `AWS_IAM` authorizer admits.
 async fn mcp(router: &MultiServiceRouter, url: &str, message: &Value) -> (u16, Value) {
-    let host = url
-        .strip_prefix("https://")
-        .expect("the published gateway URL is an https URL")
-        .to_string();
+    let (host, path) = split_url(url);
     let request = http::Request::builder()
         .method("POST")
-        .uri("/mcp")
+        .uri(path)
         .header("host", host)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
@@ -245,10 +258,7 @@ fn parts(method: &str, host: &str, uri: &str) -> http::request::Parts {
 async fn exactly_one_service_claims_the_published_gateway_endpoint() {
     let router = router();
     let (_, url) = create_gateway(&router, "claimgateway").await;
-    let host = url
-        .strip_prefix("https://")
-        .expect("the published gateway URL is an https URL")
-        .to_string();
+    let (host, _) = split_url(&url);
     let (control, data, lambda) = services();
 
     // (case, method, host, uri, claimed by the control plane)

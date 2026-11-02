@@ -4,7 +4,8 @@
 //! `CreateGateway` hands back in `gatewayUrl`, and what answers on it.
 //!
 //! RULE: a URL this service advertises is a URL it SERVES. A JSON-RPC 2.0 `POST` to the
-//! `/mcp` sub-path of the host a `READY` gateway published answers the MCP exchange
+//! URL a `READY` gateway published — its own host and the `/mcp` transport path that URL
+//! carries, driven exactly as published — answers the MCP exchange
 //! computed from that gateway's own persisted record: `initialize` naming the gateway,
 //! `tools/list` aggregating the tools its `READY` targets DECLARE under
 //! `<targetName>___<toolName>`, and `tools/call` translated into an invocation of the
@@ -90,8 +91,9 @@ async fn control(
     (status, body_json(response.body()))
 }
 
-/// The `(host, path)` an `https://` URL addresses.
-fn split_url(case: &str, url: &str) -> (String, String) {
+/// The `(host, path)` an `https://` URL addresses. Shared with the suites that drive a
+/// URL this service published.
+pub(crate) fn split_url(case: &str, url: &str) -> (String, String) {
     let rest = url
         .strip_prefix("https://")
         .unwrap_or_else(|| panic!("case {case:?}: expected an https URL, got {url:?}"));
@@ -411,8 +413,9 @@ async fn the_published_gateway_url_serves_tools_list_from_its_targets() {
         );
         assert_eq!(
             url,
-            format!("https://{gateway_id}.gateway.bedrock-agentcore.{region}.amazonaws.com"),
-            "case {case:?}: expected the gateway's own endpoint host, got {url}"
+            format!("https://{gateway_id}.gateway.bedrock-agentcore.{region}.amazonaws.com/mcp"),
+            "case {case:?}: expected the gateway's own endpoint — its host and the MCP \
+             transport path — got {url}"
         );
 
         // A gateway takes a target only once the clock-owed transition out of `CREATING`
@@ -434,7 +437,9 @@ async fn the_published_gateway_url_serves_tools_list_from_its_targets() {
         }
         settle_now(&engine);
 
-        let endpoint = format!("{url}/mcp");
+        // The published URL is driven EXACTLY as it was published: its transport path is
+        // part of the value, so a client holding it appends nothing.
+        let endpoint = url.clone();
         let (status, answer) = jsonrpc(
             &router,
             &case,
@@ -503,7 +508,7 @@ async fn only_ready_targets_contribute_tools() {
     let case = "a target still CREATING";
     let (gateway_id, _) = create_gateway(&router, case, region, "mixedtargets", "AWS_IAM").await;
     let url = published_url(&router, case, region, &gateway_id).await;
-    let endpoint = format!("{url}/mcp");
+    let endpoint = url.clone();
 
     // With no target at all: an empty list.
     settle_now(&engine);
@@ -638,7 +643,7 @@ async fn a_target_that_declares_no_tools_contributes_none() {
     let (status, answer) = jsonrpc(
         &router,
         case,
-        &format!("{url}/mcp"),
+        &url,
         region,
         &call(1, "tools/list", json!({})),
     )
@@ -661,7 +666,7 @@ async fn a_tool_call_reports_the_invocation_and_never_invents_a_result() {
     let case = "tools/call with no Lambda to reach";
     let (gateway_id, _) = create_gateway(&router, case, region, "callgateway", "AWS_IAM").await;
     let url = published_url(&router, case, region, &gateway_id).await;
-    let endpoint = format!("{url}/mcp");
+    let endpoint = url.clone();
     let tools = json!([{
         "name": "put_object",
         "description": "write an object",
@@ -750,7 +755,7 @@ async fn the_endpoint_serves_the_json_rpc_exchange() {
     let case = "the JSON-RPC exchange";
     let (gateway_id, _) = create_gateway(&router, case, region, "rpcgateway", "AWS_IAM").await;
     let url = published_url(&router, case, region, &gateway_id).await;
-    let endpoint = format!("{url}/mcp");
+    let endpoint = url.clone();
     settle_now(&engine);
 
     let (status, answer) = jsonrpc(
@@ -896,7 +901,7 @@ async fn the_inbound_authorizer_decides_whether_the_endpoint_answers() {
         )
         .await;
         let url = published_url(&router, &case, region, &gateway_id).await;
-        let endpoint = format!("{url}/mcp");
+        let endpoint = url.clone();
         settle_now(&engine);
         let message = call(1, "tools/list", json!({})).to_string();
 
@@ -981,8 +986,8 @@ async fn nothing_is_served_without_a_ready_gateway_behind_the_address() {
         ("a path the gateway publishes nothing at", format!("https://{host}/tools"), "POST", 404),
         ("the bare host the URL publishes", format!("https://{host}/"), "POST", 404),
         ("a deeper path under the MCP endpoint", format!("https://{host}/mcp/messages"), "POST", 404),
-        ("the MCP endpoint reached with GET", format!("{url}/mcp"), "GET", 405),
-        ("the MCP endpoint reached with DELETE", format!("{url}/mcp"), "DELETE", 405),
+        ("the MCP endpoint reached with GET", url.clone(), "GET", 405),
+        ("the MCP endpoint reached with DELETE", url.clone(), "DELETE", 405),
     ];
     for (row, address, method, expected) in rows {
         let (status, answer) = mcp(
@@ -1011,14 +1016,14 @@ async fn nothing_is_served_without_a_ready_gateway_behind_the_address() {
         &router,
         "a gateway still CREATING",
         "POST",
-        &format!("{url}/mcp"),
+        &url,
         Some(region),
         Some(&message),
     )
     .await;
     assert_eq!(
         status, 404,
-        "case \"a gateway still CREATING\": {url}/mcp serves nothing yet, got {status} ({answer})"
+        "case \"a gateway still CREATING\": {url} serves nothing yet, got {status} ({answer})"
     );
 
     // ...and once the clock-owed transition falls due, the very same URL serves.
@@ -1027,14 +1032,14 @@ async fn nothing_is_served_without_a_ready_gateway_behind_the_address() {
         &router,
         "a gateway that reached READY",
         "POST",
-        &format!("{url}/mcp"),
+        &url,
         Some(region),
         Some(&message),
     )
     .await;
     assert_eq!(
         status, 200,
-        "case \"a gateway that reached READY\": {url}/mcp must serve, got {status} ({answer})"
+        "case \"a gateway that reached READY\": {url} must serve, got {status} ({answer})"
     );
 
     // A deleted gateway serves nothing: the removal the clock owes is materialised on the
@@ -1051,14 +1056,14 @@ async fn nothing_is_served_without_a_ready_gateway_behind_the_address() {
         &router,
         "a deleted gateway",
         "POST",
-        &format!("{url}/mcp"),
+        &url,
         Some(region),
         Some(&message),
     )
     .await;
     assert_eq!(
         status, 404,
-        "case \"a deleted gateway\": {url}/mcp must serve nothing, got {status} ({answer})"
+        "case \"a deleted gateway\": {url} must serve nothing, got {status} ({answer})"
     );
 }
 

@@ -3417,7 +3417,8 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         gateway_id: &str,
     ) -> Option<&GatewayRecord> {
         let record = self.gateways.get(gateway_id)?;
-        (record.gateway_url == gateway_url(region, gateway_id)).then_some(record)
+        let published = gateway_url(region, gateway_id, record.protocol_type.as_deref());
+        (record.gateway_url == published).then_some(record)
     }
 
     /// Remove every gateway whose deletion the clock has already made due, with
@@ -4251,18 +4252,40 @@ pub fn configuration_bundle_arn(region: &str, bundle_id: &str) -> String {
 }
 
 /// The gateway's endpoint, in the form AWS returns for a Bedrock AgentCore
-/// gateway: `https://{gatewayId}.gateway.bedrock-agentcore.{region}.amazonaws.com`.
+/// gateway: its host, plus the transport path the gateway's own protocol is
+/// served on —
+/// `https://{gatewayId}.gateway.bedrock-agentcore.{region}.amazonaws.com/mcp`
+/// for an MCP gateway.
 ///
-/// HOST ONLY, with no path: the recorded `CreateGateway`/`GetGateway` responses
-/// report exactly this origin, and the protocol's own path (`/mcp` for MCP) is
-/// the client's to append — a URL that already carried it sent an MCP client to
-/// `/mcp/mcp`.
+/// The PATH IS PART OF THE VALUE: what this publishes is the address a client
+/// opens a session against, not an origin a suffix is still owed on, so the URL
+/// a gateway publishes is exactly the URL this emulator serves that gateway's
+/// protocol on ([`gateway_transport_path`]).
 ///
-/// Derived from the gateway id and the request's Region, so a caller that reads
-/// one gateway twice sees one URL. `GatewayUrl` is only constrained in length
-/// (1..1024), which this form satisfies for every id the pattern admits.
-pub fn gateway_url(region: &str, gateway_id: &str) -> String {
-    format!("https://{}", gateway_endpoint_host(region, gateway_id))
+/// Derived from the gateway id, the request's Region and the gateway's
+/// `protocolType`, so a caller that reads one gateway twice sees one URL.
+/// `GatewayUrl` is only constrained in length (1..1024), which this form
+/// satisfies for every id the pattern admits.
+pub fn gateway_url(region: &str, gateway_id: &str, protocol_type: Option<&str>) -> String {
+    format!(
+        "https://{}{}",
+        gateway_endpoint_host(region, gateway_id),
+        gateway_transport_path(protocol_type).unwrap_or_default()
+    )
+}
+
+/// The transport path a gateway speaking `protocol_type` serves that protocol
+/// on, under the host [`gateway_endpoint_host`] publishes — or `None` for a
+/// protocol this service serves no transport for.
+///
+/// `GatewayProtocolType` carries the single value `MCP`, which `protocolType`
+/// also carries as its modelled default (`smithy_query shape=GatewayProtocolType`),
+/// so a gateway that named no protocol is served the MCP transport path too.
+pub fn gateway_transport_path(protocol_type: Option<&str>) -> Option<&'static str> {
+    match protocol_type.unwrap_or(PROTOCOL_TYPE_MCP) {
+        PROTOCOL_TYPE_MCP => Some(GATEWAY_MCP_PATH),
+        _ => None,
+    }
 }
 
 /// The label a gateway endpoint host carries between the gateway's own id and
@@ -4305,10 +4328,11 @@ pub fn gateway_endpoint_identity(host: &str) -> Option<(&str, &str)> {
 }
 
 /// The fixed sub-path a gateway's MCP JSON-RPC surface is reached at, under the
-/// bare host [`gateway_url`] publishes.
+/// endpoint host [`gateway_endpoint_host`] publishes — the transport path the
+/// gateway's own [`gateway_url`] carries for an MCP gateway.
 ///
 /// Recorded behaviour only: the MCP wire surface is not in this service's model,
-/// and the blessed recording drives `<gatewayUrl>/mcp`.
+/// and the blessed recording's `gatewayUrl` ends in `/mcp`.
 pub const GATEWAY_MCP_PATH: &str = "/mcp";
 
 /// The separator a gateway qualifies an aggregated tool name with:

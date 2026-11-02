@@ -15,11 +15,13 @@
 //!    It is checked end to end over HTTP on every implemented operation that reports a
 //!    timestamp (so the rows differ along operation, shape, member, and whether the member
 //!    is `@required`), and directly on the member schemas the codec reads the form off.
-//! 2. A gateway's `gatewayUrl` is the HOST AWS assigns the gateway and carries no path
-//!    component: `https://{gatewayId}.gateway.bedrock-agentcore.{region}.amazonaws.com`, as
-//!    the recorded `CreateGateway`/`GetGateway` responses report it. The protocol's own path
-//!    is the client's to append, so a URL that already carried one sent an MCP client to
-//!    `/mcp/mcp`.
+//! 2. A gateway's `gatewayUrl` is the endpoint AWS assigns the gateway: the host it was
+//!    given, FOLLOWED by the transport path its `protocolType` is served on
+//!    (`https://{gatewayId}.gateway.bedrock-agentcore.{region}.amazonaws.com/mcp` for MCP,
+//!    the model's only protocol and its default), as the recorded
+//!    `CreateGateway`/`UpdateGateway`/`GetGateway` responses report it. The whole rule, and
+//!    the endpoint being the URL this emulator SERVES, is pinned in
+//!    `gateway_endpoint_url.rs`; this row keeps the wire form beside the other wire rules.
 //! 3. A gateway's `workloadIdentityDetails` carries a server-generated ARN: its text is
 //!    minted by the service rather than derived from the request, so what is under test is
 //!    the ARN's form and its invariants — stable across reads, one per gateway.
@@ -492,14 +494,14 @@ fn every_reported_timestamp_member_schema_carries_the_date_time_format() {
     }
 }
 
-/// A gateway's `gatewayUrl` is the host it was assigned, with no path component, and the
-/// read reports the same URL the create did.
+/// A gateway's `gatewayUrl` is the host it was assigned plus the transport path of the
+/// protocol it speaks, and the read reports the same URL the create did.
 ///
 /// The rows differ along what the rule generalises over: the name's shape (which the
 /// gateway id is derived from) and the Region the request is signed for (which the host
 /// carries).
 #[tokio::test]
-async fn a_gateway_url_is_the_assigned_host_with_no_path() {
+async fn a_gateway_url_is_the_assigned_host_and_transport_path() {
     let router = router();
 
     // (case, name, region)
@@ -524,18 +526,13 @@ async fn a_gateway_url_is_the_assigned_host_with_no_path() {
             .as_str()
             .expect("the create reports the minted gatewayId")
             .to_string();
-        let expected = format!("https://{id}.gateway.bedrock-agentcore.{region}.amazonaws.com");
+        let expected =
+            format!("https://{id}.gateway.bedrock-agentcore.{region}.amazonaws.com/mcp");
         let url = at(&created, "/gatewayUrl");
         assert_eq!(
             url,
             json!(expected),
-            "case {case:?}: expected the assigned gateway host {expected:?}, got {url}"
-        );
-        let text = url.as_str().unwrap_or_default();
-        assert!(
-            !text.trim_start_matches("https://").contains('/'),
-            "case {case:?}: a gatewayUrl carries no path — the protocol's own path is the \
-             client's to append — got {text:?}"
+            "case {case:?}: expected the assigned gateway endpoint {expected:?}, got {url}"
         );
 
         let fetched = ok(&router, "GET", &format!("/gateways/{id}/"), region, None).await;

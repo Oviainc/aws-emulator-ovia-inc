@@ -312,9 +312,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let gateway_id = store.mint_gateway_id(&input.name, now);
+        // `protocolType` carries the model's `MCP` default, so a gateway created
+        // without one still reports the protocol it speaks — and is published on
+        // that protocol's own transport path.
+        let protocol_type = input
+            .protocol_type
+            .unwrap_or_else(|| DEFAULT_PROTOCOL_TYPE.to_string());
         let record = crate::state::GatewayRecord {
             gateway_arn: crate::state::gateway_arn(&region, &gateway_id),
-            gateway_url: crate::state::gateway_url(&region, &gateway_id),
+            gateway_url: crate::state::gateway_url(&region, &gateway_id, Some(&protocol_type)),
             name: input.name,
             created_at: now,
             updated_at: now,
@@ -325,13 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             settles_at: now + crate::state::GATEWAY_SETTLE_DELAY,
             description: input.description,
             role_arn: input.role_arn,
-            // `protocolType` carries the model's `MCP` default, so a gateway created
-            // without one still reports the protocol it speaks.
-            protocol_type: Some(
-                input
-                    .protocol_type
-                    .unwrap_or_else(|| DEFAULT_PROTOCOL_TYPE.to_string()),
-            ),
+            protocol_type: Some(protocol_type),
             protocol_configuration: input.protocol_configuration,
             authorizer_type: input.authorizer_type,
             authorizer_configuration: input.authorizer_configuration,

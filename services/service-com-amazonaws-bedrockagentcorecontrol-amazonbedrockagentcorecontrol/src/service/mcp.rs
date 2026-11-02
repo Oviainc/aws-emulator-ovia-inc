@@ -8,8 +8,10 @@
 //! Every operation in this service's model is control plane: it creates, reads, updates
 //! and deletes gateways and the targets configured on them. What an MCP client then does
 //! with the URL `CreateGateway` / `GetGateway` hand back is the Model Context Protocol
-//! itself — a JSON-RPC 2.0 `POST` to the fixed `/mcp` sub-path of that host
-//! ([`crate::state::GATEWAY_MCP_PATH`]), carrying `initialize`, `tools/list` and
+//! itself — a JSON-RPC 2.0 `POST` to that URL, whose path is the fixed `/mcp` transport
+//! path of the gateway's host ([`crate::state::GATEWAY_MCP_PATH`], which
+//! [`crate::state::gateway_url`] publishes as part of the endpoint), carrying
+//! `initialize`, `tools/list` and
 //! `tools/call`. None of those is a modelled operation and none carries an `X-Amz-Target`:
 //! they are addressed by host, path and method, so nothing in the generated routing table
 //! can name them and they are reached through the seams
@@ -278,9 +280,8 @@ impl<Eng: Send + Sync + 'static> GatewayMcpSurface<Eng> {
 /// Whether a request's path names the gateway's MCP endpoint — the one resource a
 /// gateway endpoint host publishes.
 ///
-/// A trailing slash is the same resource: an MCP client appends the sub-path to the bare
-/// host `gatewayUrl` publishes, and a client that kept the host's own trailing slash
-/// sends `/mcp/`.
+/// A trailing slash is the same resource: the `gatewayUrl` a client holds already ends in
+/// this sub-path, and a client that appended its own separator sends `/mcp/`.
 fn addresses_mcp_path(req: &RtRequest) -> bool {
     let path = ::service_common::request_path(req.uri());
     path.strip_suffix('/').unwrap_or(path) == state::GATEWAY_MCP_PATH

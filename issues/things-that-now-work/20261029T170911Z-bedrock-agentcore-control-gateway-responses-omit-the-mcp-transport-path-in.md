@@ -61,3 +61,31 @@ Cause 4 — bedrock-agentcore-control-gateway-lifecycle-basic#setup#1, CreateGat
 2. Cause 1: fixture acc-gateway-rate-limit-batch-and-update, step setup#2 — CreateGateway with protocolType MCP; compare $.gatewayUrl with the recorded endpoint.
 3. Cause 2/3: fixture acc-gateway-update-and-target-errors, steps task#5 (UpdateGateway) and task#6 (GetGateway) on that gateway; compare $.gatewayUrl.
 4. Cause 4: fixture bedrock-agentcore-control-gateway-lifecycle-basic, step setup#1 — CreateGateway; check whether $.workloadIdentityDetails is present in the 202 body.
+
+## Resolution
+
+Causes 1, 2 and 3 are fixed: `gatewayUrl` is now composed as the gateway's endpoint host
+plus the transport path of the protocol in its `protocolType` (`/mcp` for MCP, the model's
+only value and its default), at the single composition point every gateway response is
+rendered from, so create, update and read report one value and the URL the service
+advertises is the URL it serves. Fixtures `acc-gateway-rate-limit-batch-and-update` and
+`bedrock-agentcore-control-gateway-get-returns-metadata` replay clean, and
+`acc-gateway-update-and-target-errors` gets past its gateway steps (task#5/#6) to an
+unrelated `UpdateGatewayTarget` divergence at task#7.
+
+Cause 4 is DECLINED on the recorded responses. Removing `workloadIdentityDetails` from the
+create envelope was implemented and then reverted, because replay showed the recorded
+`CreateGateway` responses of `acc-gateway-rate-limit-batch-and-update#setup#2` and
+`acc-gateway-update-and-target-errors#setup#2` DO carry the block — omitting it diverges
+those units, including the step this issue is bound to. The member's only content is a
+per-run, server-minted workload-identity ARN that already has its modelled form and is
+stable across reads and unique per gateway.
+
+Conflicting fixture, kept on the record: `bedrock-agentcore-control-gateway-lifecycle-basic`
+recorded the OPPOSITE of the other three units on exactly these two members — a path-less
+`gatewayUrl` and no `workloadIdentityDetails` (see
+`20261023T004131Z-bedrock-agentcore-control-gateway-responses-serialize-timestamps-as-epoch-numbers-and.md`,
+filed from that same fixture). One response cannot satisfy both recordings, so the
+implementation follows this issue's bound unit and the majority of units, which is also the
+endpoint form AWS publishes for an MCP gateway; that fixture still diverges at
+`$.gatewayUrl` and `$.workloadIdentityDetails.workloadIdentityArn`.
