@@ -15,6 +15,8 @@
 mod account_behavior_graph_singleton;
 #[path = "all/behavior_graph_lifecycle.rs"]
 mod behavior_graph_lifecycle;
+#[path = "all/client_error_bodies.rs"]
+mod client_error_bodies;
 #[path = "all/datasource_package_ingest.rs"]
 mod datasource_package_ingest;
 #[path = "all/datasource_package_reporting.rs"]

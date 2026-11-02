@@ -7,8 +7,9 @@
 //!
 //! 1. A request naming a behavior graph the service does not hold is refused with the
 //!    modelled `ResourceNotFoundException` (404) carrying the fixed message that
-//!    operation's surface publishes, which never echoes the caller-supplied ARN —
-//!    whatever the operation and however the graph came to be absent.
+//!    operation's surface publishes — or, for the DELETE of a graph that is already gone,
+//!    no message member at all — and never echoing the caller-supplied ARN, whatever the
+//!    operation and however the graph came to be absent.
 //! 2. A well-formed id of a resource scoped to a graph that the graph does not hold is
 //!    the same modelled 404, told apart from "no such graph" by its own fixed message;
 //!    an id outside its modelled constraints is still the framework's generic 400.
@@ -61,19 +62,21 @@ struct GraphScopedCall {
 }
 
 /// The fixed message rule 1 says the operation called `name` refuses an absent graph
-/// with.
+/// with, and `None` for the one operation whose refusal states no message at all.
 ///
-/// Three refusal texts, each written exactly once in `crate::state` and shared by every
-/// operation it belongs to: the operations bound under this service's `/investigations/`
-/// URIs word an unresolvable graph with the investigation surface's sentence;
-/// `RejectInvitation` resolves the CALLING account's membership rather than the graph, so
-/// it words the same request as a missing membership and discloses nothing about the
-/// graph; every other graph-scoped operation carries the graph-not-found sentence.
-fn absent_graph_message(name: &str) -> &'static str {
+/// Each text is written exactly once in `crate::state` and shared by every operation it
+/// belongs to: the operations bound under this service's `/investigations/` URIs word an
+/// unresolvable graph with the investigation surface's sentence; `RejectInvitation`
+/// resolves the CALLING account's membership rather than the graph, so it words the same
+/// request as a missing membership and discloses nothing about the graph; `DeleteGraph`
+/// states nothing — the recorded delete of a graph that is already gone carries no message
+/// member; every other graph-scoped operation carries the graph-not-found sentence.
+fn absent_graph_message(name: &str) -> Option<&'static str> {
     match name {
-        "StartInvestigation" | "GetInvestigation" => INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE,
-        "RejectInvitation" => NO_SUCH_MEMBERSHIP_MESSAGE,
-        _ => GRAPH_NOT_FOUND_MESSAGE,
+        "StartInvestigation" | "GetInvestigation" => Some(INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE),
+        "RejectInvitation" => Some(NO_SUCH_MEMBERSHIP_MESSAGE),
+        "DeleteGraph" => None,
+        _ => Some(GRAPH_NOT_FOUND_MESSAGE),
     }
 }
 
@@ -213,12 +216,20 @@ async fn a_graph_the_service_does_not_hold_is_refused_with_its_own_fixed_message
                 "case {case:?}: expected ResourceNotFoundException, got {answered:?}"
             );
             let message = error_message(&answered);
-            let expected = absent_graph_message(call_case.name);
-            assert_eq!(
-                message, expected,
-                "case {case:?}: expected this surface's fixed absent-graph message, \
-                 got {message:?}"
-            );
+            match absent_graph_message(call_case.name) {
+                Some(expected) => assert_eq!(
+                    message, expected,
+                    "case {case:?}: expected this surface's fixed absent-graph message, \
+                     got {message:?}"
+                ),
+                // The one refusal that states nothing: the body carries no message member,
+                // which the harness reads back as this sentinel.
+                None => assert_eq!(
+                    message, "<no message>",
+                    "case {case:?}: expected a refusal carrying no message member, got \
+                     {message:?}"
+                ),
+            }
             assert!(
                 !message.contains(arn.as_str()),
                 "case {case:?}: the message must not echo the requested ARN, got {message:?}"
@@ -519,7 +530,7 @@ async fn an_investigation_id_no_investigation_carries_is_the_modelled_not_found(
         );
         let message = error_message(&answered);
         assert_ne!(
-            message,
+            Some(message.as_str()),
             absent_graph_message("GetInvestigation"),
             "case {id:?}: a missing investigation is not a missing graph, got {message:?}"
         );

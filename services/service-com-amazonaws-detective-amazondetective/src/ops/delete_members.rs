@@ -5,7 +5,8 @@
 //! IMPLEMENTED: each account the request names is looked up in the stored graph's member
 //! records and REMOVED from it, so `ListMembers` and `GetMembers` stop reporting it; an
 //! account the graph holds no membership for is reported in `UnprocessedAccounts` with
-//! the reason instead, so one call can both remove and refuse.
+//! the reason instead, so one call can both remove and refuse. Both report lists are
+//! served whatever the outcome — each empty when the call produced no entry for it.
 //!
 //! The caller's own permissions are not evaluated here: this emulator runs no IAM policy
 //! evaluation and serves exactly one account, which is every graph's administrator
@@ -167,11 +168,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // `GraphArn`'s pattern, `AccountIds`' 1..50 length and each entry's 12-digit
-        // `AccountId` pattern are modelled constraints, so the centralized walk has
-        // already refused anything outside them with a 400 before this body runs: the
-        // reasons an account lands in `UnprocessedAccounts` below are the ones the model
-        // cannot express.
+        // `GraphArn`'s pattern and `AccountIds`' 1..50 length and 12-character entries
+        // are modelled constraints the centralized walk has already refused anything
+        // outside of: the reasons an account lands in `UnprocessedAccounts` below are the
+        // ones the model cannot express. The one constraint class the walk does NOT see is
+        // each entry's `@pattern`, for the reason `super::types::delete_members_types`
+        // states — this service names this input shape in that refusal — so it is checked
+        // here, where the input shape is known.
+        if input
+            .account_ids
+            .iter()
+            .any(|account_id| !crate::state::matches_account_id_pattern(account_id))
+        {
+            return Err(DeleteMembersErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::list_members_pattern_message(
+                        Self::INPUT_SCHEMA,
+                        &DeleteMembersInput::M_ACCOUNT_IDS,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteMembersErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the behavior graph store is unavailable".to_string()),
@@ -225,11 +244,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(DeleteMembersOutput {
-            // The modelled `AccountIds` output list carries 1..50 entries, so a call that
-            // removed nothing at all reports no list rather than an empty one outside
-            // that bound. `UnprocessedAccounts` has no such bound, so it is always
-            // present — empty when every named account was removed.
-            account_ids: (!removed.is_empty()).then_some(removed),
+            // Both modelled output lists are always serialised, empty when the call
+            // produced no entry for them: a caller reads `AccountIds` to learn which
+            // removals succeeded, so "nothing was removed" has to be an empty list it
+            // can iterate rather than an absent member it has to guard. The 1..50 length
+            // the model declares on the list is a constraint on a REQUEST — the
+            // validating walk runs on operation inputs only — so it does not make an
+            // empty report unserialisable.
+            account_ids: Some(removed),
             unprocessed_accounts: Some(unprocessed_accounts),
         })
     }

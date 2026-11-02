@@ -49,6 +49,23 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `AccountId` (length 12..12, pattern `^[0-9]+$`).
 pub const ACCOUNT_ID_LEN: usize = 12;
 
+/// The modelled `@pattern` of `AccountId`
+/// (`smithy_query(query="shape",shape="AccountIdList")`): digits only, at least one.
+pub const ACCOUNT_ID_PATTERN: &str = "^[0-9]+$";
+
+/// The modelled `@pattern` of `GraphArn`
+/// (`smithy_query(query="shape",shape="GraphArn")`), written once so every member schema
+/// that captures it for the boundary walk refuses against the one expression.
+pub const GRAPH_ARN_PATTERN: &str =
+    r"^arn:aws[-\w]{0,10}?:detective:[-\w]{2,20}?:\d{12}?:graph:[abcdef\d]{32}?$";
+
+/// The fewest account ids one member batch may name, from the modelled `AccountIdList`
+/// (length 1..50), which `GetMembers` and `DeleteMembers` both bind their `AccountIds` to.
+pub const MIN_ACCOUNT_IDS: usize = 1;
+
+/// The most account ids one member batch may name, from the same bound.
+pub const MAX_ACCOUNT_IDS: usize = 50;
+
 /// The most graphs this emulator will hold.
 ///
 /// Emulator resource guard, NOT an AWS quota. The account-level rule `CreateGraph`
@@ -873,6 +890,18 @@ pub fn graph_not_found() -> ResourceNotFoundException {
     }
 }
 
+/// The refusal the DELETE of a behavior graph this service does not hold answers with:
+/// the same modelled 404, with no message member at all.
+///
+/// Recorded behaviour: the operations that read, administer or scope work to a graph
+/// state [`GRAPH_NOT_FOUND_MESSAGE`] when they cannot resolve one, but the recorded
+/// delete of a graph that is already gone carries no explanatory text — the member is
+/// optional in the model, and there is nothing this service publishes for that
+/// condition, so none is invented. See [`crate::ops::delete_graph`].
+pub fn graph_not_found_unstated() -> ResourceNotFoundException {
+    ResourceNotFoundException { message: None }
+}
+
 /// The refusal the investigation operations answer a behavior graph this service does
 /// not hold with: the same modelled 404, carrying that surface's own
 /// [`INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE`].
@@ -918,6 +947,33 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
 /// hands back cannot drift apart.
 pub fn account_member_pattern_message(member: &str) -> String {
     format!("Account.{member} did not match the pattern.")
+}
+
+/// How this service states the ELEMENTS of a list member of an operation's input failing
+/// that element shape's modelled `@pattern`: one clause naming the shape that declares
+/// the list and the list member itself, then the constraint class — with neither the
+/// offending value nor the position it was sent in.
+///
+/// The same rule [`account_member_pattern_message`] states one step out: a `@pattern`
+/// failure is reported against the shape that DECLARES the constrained member, in the
+/// API-level spelling the model uses, and interpolates nothing from the request. Where the
+/// constrained value is a list ELEMENT rather than a member of a structure, the clause
+/// names the declaring shape and the list member and says it is that member's own members
+/// that failed. Recorded behaviour: a 12-character non-numeric `AccountId` in a member
+/// batch is refused with exactly this sentence, which is why the message is the rule
+/// rather than a report of the input.
+///
+/// Both variable parts are read off the model-derived schemas rather than written out:
+/// `input` is the operation's input schema and `member` the list member's.
+pub fn list_members_pattern_message(
+    input: &::aws_smithy_schema::Schema,
+    member: &::aws_smithy_schema::Schema,
+) -> String {
+    format!(
+        "{}.{} members did not match the pattern.",
+        input.shape_id().shape_name(),
+        member.member_name().unwrap_or_default(),
+    )
 }
 
 /// How `UpdateDatasourcePackages` states requested packages outside the
@@ -1084,7 +1140,14 @@ pub fn is_graph_arn(arn: &str) -> bool {
 
 /// Whether `account_id` is shaped like the modelled `AccountId` (12 digits).
 pub fn is_account_id(account_id: &str) -> bool {
-    account_id.len() == ACCOUNT_ID_LEN && account_id.bytes().all(|b| b.is_ascii_digit())
+    account_id.len() == ACCOUNT_ID_LEN && matches_account_id_pattern(account_id)
+}
+
+/// Whether `value` satisfies the modelled `AccountId` `@pattern`
+/// ([`ACCOUNT_ID_PATTERN`], digits only and at least one), independent of its `@length`:
+/// the two are separate constraints and this service states their refusals differently.
+pub fn matches_account_id_pattern(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// The page size to serve, whatever the request asked for.

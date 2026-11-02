@@ -8,7 +8,8 @@
 //! from the list of accounts in the behavior graph. ... An administrator account cannot
 //! use DeleteMembers to remove their own account from the behavior graph"): a
 //! member-removal batch DROPS the stored membership of every account it names that the
-//! graph holds one for and reports those accounts in `AccountIds`, and reports every
+//! graph holds one for and reports those accounts in `AccountIds` — which is always
+//! served, empty when the batch removed nothing — and reports every
 //! other account it names in `UnprocessedAccounts` with the reason it could not be
 //! processed — so the membership readers stop reporting the removed accounts, every
 //! membership the batch did not name is untouched, and repeating the call changes nothing
@@ -155,23 +156,23 @@ fn unprocessed_reasons(case: &str, body: &Value) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The `AccountIds` of one `DeleteMembers` answer, or `None` when the answer carried no
-/// such list at all.
-fn removed_account_ids(case: &str, body: &Value) -> Option<BTreeSet<String>> {
-    body.get("AccountIds").map(|value| {
-        value
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: AccountIds is not a list: {body:?}"))
-            .iter()
-            .map(|id| {
-                id.as_str()
-                    .unwrap_or_else(|| {
-                        panic!("case {case:?}: AccountIds carried a non-string: {body:?}")
-                    })
-                    .to_string()
-            })
-            .collect()
-    })
+/// The `AccountIds` of one `DeleteMembers` answer. The member is always served — empty
+/// when the call removed nothing — so an answer carrying no such list at all is a
+/// failure, not an empty set.
+fn removed_account_ids(case: &str, body: &Value) -> BTreeSet<String> {
+    body.get("AccountIds")
+        .unwrap_or_else(|| panic!("case {case:?}: the answer carried no AccountIds: {body:?}"))
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: AccountIds is not a list: {body:?}"))
+        .iter()
+        .map(|id| {
+            id.as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: AccountIds carried a non-string: {body:?}")
+                })
+                .to_string()
+        })
+        .collect()
 }
 
 /// One row of the removal table: the accounts one `DeleteMembers` call names, the
@@ -315,23 +316,14 @@ async fn a_removal_batch_drops_the_memberships_it_names_and_reports_the_rest_unp
             "case {name:?}: DeleteMembers expected 200, got {status} {answered:?}"
         );
 
-        // The accounts removed are exactly the ones the graph held a membership for.
-        let reported_removed = removed_account_ids(name, &answered);
-        if case.expect_removed.is_empty() {
-            // The modelled output `AccountIds` carries 1..50 entries, so a call that
-            // removed nothing reports no list rather than one outside that bound.
-            assert_eq!(
-                reported_removed, None,
-                "case {name:?}: expected no AccountIds when nothing was removed, got {answered:?}"
-            );
-        } else {
-            assert_eq!(
-                reported_removed.as_ref(),
-                Some(&case.expect_removed),
-                "case {name:?}: expected {:?} removed, got {answered:?}",
-                case.expect_removed
-            );
-        }
+        // The accounts removed are exactly the ones the graph held a membership for —
+        // reported in `AccountIds`, which is served whether or not it is empty.
+        assert_eq!(
+            removed_account_ids(name, &answered),
+            case.expect_removed,
+            "case {name:?}: expected {:?} removed, got {answered:?}",
+            case.expect_removed
+        );
         // Every other account it named is reported with the reason it was not processed.
         assert_eq!(
             unprocessed_reasons(name, &answered),

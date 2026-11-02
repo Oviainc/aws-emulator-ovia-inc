@@ -148,9 +148,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // `GraphArn`'s pattern, `AccountIds`' 1..50 length and each entry's 12-digit
-        // `AccountId` pattern are modelled constraints, so the centralized walk has
-        // already refused anything outside them with a 400 before this body runs.
+        // `GraphArn`'s pattern and `AccountIds`' 1..50 length and 12-character entries
+        // are modelled constraints the centralized walk has already refused anything
+        // outside of. The one class it does NOT see is each entry's `@pattern`: this
+        // service states that refusal with a sentence naming this input shape, which the
+        // refusal seam cannot know, so the member's element `@pattern` is left off the
+        // input schema (see `super::types::get_members_types`) and checked here — the one
+        // place that does know which input shape it is.
+        if input
+            .account_ids
+            .iter()
+            .any(|account_id| !crate::state::matches_account_id_pattern(account_id))
+        {
+            return Err(GetMembersErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::list_members_pattern_message(
+                        Self::INPUT_SCHEMA,
+                        &GetMembersInput::M_ACCOUNT_IDS,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetMembersErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the behavior graph store is unavailable".to_string()),

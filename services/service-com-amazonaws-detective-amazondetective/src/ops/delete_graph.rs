@@ -3,7 +3,11 @@
 //! @op DeleteGraph
 //!
 //! IMPLEMENTED: removes the stored graph with its member records and its tags, so
-//! every later call that names the ARN answers `ResourceNotFoundException`.
+//! every later call that names the ARN answers `ResourceNotFoundException`. A delete that
+//! resolves no graph is refused with that same modelled 404 carrying no message, which is
+//! what the recorded delete of an already-deleted graph answers
+//! (`crate::state::graph_not_found_unstated`) — the operations that READ a graph are the
+//! ones that state the fixed graph-not-found sentence.
 //!
 //! ## Shape of an operation
 //!
@@ -175,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // dropping the record drops all three together.
         if state.lock().remove_graph(&input.graph_arn).is_none() {
             return Err(DeleteGraphErrorModeled::ResourceNotFoundException(
-                crate::state::graph_not_found(),
+                crate::state::graph_not_found_unstated(),
             )
             .into());
         }

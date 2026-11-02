@@ -79,6 +79,14 @@ const WHOLE_VALUE_PATTERN_SUFFIX: &str = ".*";
 ///   set by LISTING them, which is the only place the service names which packages it
 ///   did not recognise.
 ///
+/// A third sentence of the same family never reaches this seam at all: the `@pattern`
+/// failure of the ELEMENTS of a list member is stated with a clause naming the operation's
+/// INPUT SHAPE (`crate::state::list_members_pattern_message`), and a [`Refusal`] carries
+/// the violations without the shape they were found in — two operations of this service
+/// declare an `AccountIds` list, so the input shape cannot be recovered from the member
+/// path. Those two operations therefore own that one class themselves; see
+/// `crate::ops::get_members`.
+///
 /// Everything else keeps the framework's generic `N validation error(s) detected: …`
 /// envelope, which is what AWS answers for the rest of this service's members
 /// (`GetInvestigation$InvestigationId`, say) — except that a `@pattern` clause inside it

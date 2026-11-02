@@ -36,9 +36,7 @@ static START_INVESTIGATION_M_GRAPH_ARN_TRAITS: ::std::sync::LazyLock<
 > = ::std::sync::LazyLock::new(|| {
     let mut m = ::aws_smithy_schema::TraitMap::new();
     m.insert(::std::boxed::Box::new(
-        ::aws_smithy_schema_server::constraints::PatternTrait::new(
-            r"^arn:aws[-\w]{0,10}?:detective:[-\w]{2,20}?:\d{12}?:graph:[abcdef\d]{32}?$",
-        ),
+        ::aws_smithy_schema_server::constraints::PatternTrait::new(crate::state::GRAPH_ARN_PATTERN),
     ));
     m
 });

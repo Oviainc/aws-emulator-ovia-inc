@@ -30,9 +30,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_detective_amazondetective::state::{
-    INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE, INVESTIGATION_ID_LEN, INVITATION_NOT_ACCEPTED_MESSAGE,
-    MANDATORY_DATASOURCE_PACKAGE, MAX_PAGE_SIZE, MAX_RESULTS_MUST_BE_NULL_MESSAGE,
-    NO_SUCH_MEMBERSHIP_MESSAGE,
+    ACCOUNT_ID_PATTERN, INVESTIGATION_GRAPH_NOT_FOUND_MESSAGE, INVESTIGATION_ID_LEN,
+    INVITATION_NOT_ACCEPTED_MESSAGE, MANDATORY_DATASOURCE_PACKAGE, MAX_PAGE_SIZE,
+    MAX_RESULTS_MUST_BE_NULL_MESSAGE, NO_SUCH_MEMBERSHIP_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -57,10 +57,6 @@ const GET_INVESTIGATION_URI: &str = "/investigations/getInvestigation";
 /// `smithy_query(query="shape",shape="EntityArn")`: anchored at the start and NOT
 /// terminated, which is what rule 5 completes.
 const ENTITY_ARN_PATTERN: &str = "^arn:";
-
-/// `AccountId`'s modelled pattern, `smithy_query(query="shape",shape="AccountId")`:
-/// already a whole-value expression, so rule 5 reports it unchanged.
-const ACCOUNT_ID_PATTERN: &str = "^[0-9]+$";
 
 /// `GraphArn`'s modelled pattern, `smithy_query(query="shape",shape="GraphArn")`:
 /// likewise already terminated.
@@ -578,14 +574,9 @@ async fn a_pattern_refusal_reports_the_whole_value_form_of_the_pattern() {
         path: "accountId",
         reported: ACCOUNT_ID_PATTERN.to_string(),
     });
-    cases.push(PatternCase {
-        name: "GetMembers.AccountIds.member",
-        uri: GET_MEMBERS_URI,
-        body: json!({ "GraphArn": graph_arn, "AccountIds": ["abcdefghijkl"] }),
-        value: "abcdefghijkl".to_string(),
-        path: "accountIds.1.member",
-        reported: ACCOUNT_ID_PATTERN.to_string(),
-    });
+    // The ELEMENTS of a list member are deliberately absent from this table: that one
+    // class is not stated in this envelope at all, but with the service's own clause
+    // naming the input shape, which `client_error_bodies` asserts.
     let not_hex = format!("arn:aws:detective:{REGION}:{ACCOUNT}:graph:{}", "z".repeat(32));
     cases.push(PatternCase {
         name: "GetMembers.GraphArn",
