@@ -199,10 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ConflictException` (HTTP 409) names.
         if bucket.namespaces.contains_key(&namespace_name) {
             return Err(CreateNamespaceErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "A namespace with the name {namespace_name} already exists in the table \
-                     bucket."
-                )),
+                message: Some(crate::state::NAMESPACE_ALREADY_EXISTS_MESSAGE.to_string()),
             })
             .into());
         }

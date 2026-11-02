@@ -188,13 +188,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modeled length (3..63) and character set (`^[0-9a-z-]*$`) are
         // refused at the boundary. What the pattern cannot express is that a
         // name begins and ends with a letter or a digit, so a hyphen only ever
-        // sits between them.
+        // sits between them. Either way the name is one this service will not
+        // accept, so it is stated with the one sentence this service states
+        // that with — the same one the boundary refusal carries.
         if !crate::state::name_begins_and_ends_alphanumeric(&input.name) {
-            return Err(bad_request(format!(
-                "The table bucket name {} is not valid. A table bucket name must begin and end \
-                 with a letter or number.",
-                input.name
-            )));
+            return Err(bad_request(
+                crate::state::INVALID_TABLE_BUCKET_NAME_MESSAGE.to_string(),
+            ));
         }
 
         // `encryptionConfiguration` and `storageClassConfiguration` are stored

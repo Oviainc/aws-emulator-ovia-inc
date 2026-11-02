@@ -558,6 +558,55 @@ pub fn metadata_location(warehouse_location: &str, metadata_id: &str) -> String 
     format!("{warehouse_location}/metadata/00000-{metadata_id}.metadata.json")
 }
 
+/// How this service states a table bucket name it will not accept.
+///
+/// FIXED text: it names the CLASS of the failure and takes nothing from the
+/// request, so the same sentence answers every unacceptable name — one outside
+/// the modelled length or character set, and one that opens or closes with a
+/// hyphen. The member it is stated for is the one the model constrains with
+/// `TableBucketName` (`@length(3, 63)`, `@pattern(^[0-9a-z-]*$)`).
+pub const INVALID_TABLE_BUCKET_NAME_MESSAGE: &str =
+    "The specified bucket name isn't valid. Specify a different bucket name, and then try again.";
+
+/// How this service states a table name it will not accept — the members the
+/// model constrains with `TableName` (`@length(1, 255)`,
+/// `@pattern(^[0-9a-z_]*$)`). FIXED text, as [`INVALID_TABLE_BUCKET_NAME_MESSAGE`].
+pub const INVALID_TABLE_NAME_MESSAGE: &str = "The specified table name is not valid.";
+
+/// How this service states a namespace name it will not accept — the members
+/// the model constrains with `NamespaceName` (`@length(1, 255)`,
+/// `@pattern(^[0-9a-z_]*$)`), which are the elements of a namespace and the
+/// label the namespace and table operations address one by. FIXED text, as
+/// [`INVALID_TABLE_BUCKET_NAME_MESSAGE`].
+pub const INVALID_NAMESPACE_NAME_MESSAGE: &str =
+    "The specified namespace name isn’t valid. Specify a different namespace name, and then try \
+     again.";
+
+/// How this service states a namespace naming more than one part: the model
+/// bounds `CreateNamespaceRequest.namespace` (a `NamespaceList`) at
+/// `@length(min: 1, max: 1)`, so a namespace is one name and nesting is not a
+/// thing this service has.
+pub const MULTIPART_NAMESPACE_MESSAGE: &str = "Multipart namespaces are not supported.";
+
+/// How this service states a namespace name that is already taken in the table
+/// bucket the create addresses: the conflict with a previous write the model's
+/// `ConflictException` (HTTP 409) names. FIXED text — it states that the name is
+/// taken, not which name was asked for.
+pub const NAMESPACE_ALREADY_EXISTS_MESSAGE: &str =
+    "A namespace with an identical name already exists in the bucket.";
+
+/// How this service states a value that cannot be a table bucket ARN at all —
+/// the members the model constrains with `TableBucketARN`. FIXED text, as
+/// [`INVALID_TABLE_BUCKET_NAME_MESSAGE`].
+pub const INVALID_TABLE_BUCKET_ARN_MESSAGE: &str = "The specified table bucket ARN is not valid.";
+
+/// How this service states a value that cannot be a taggable resource's ARN at
+/// all — the `resourceArn` member of the tagging operations, which the model
+/// constrains with `ResourceArn`. FIXED text, as
+/// [`INVALID_TABLE_BUCKET_NAME_MESSAGE`], and it names the member the way the
+/// service does.
+pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "The specified resourceArn is not valid.";
+
 /// Whether `name` satisfies the table-bucket naming rule the model's
 /// `@pattern` cannot express: a name begins and ends with a letter or a digit,
 /// so a hyphen may only appear between them.

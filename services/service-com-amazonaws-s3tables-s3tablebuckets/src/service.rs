@@ -40,10 +40,121 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::{Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The one client-input error this service models: `BadRequestException`,
+/// `errorKind` client, `httpError` 400, one `message` member
+/// (`smithy_query(query="shape", shape="BadRequestException")`). It is a
+/// service-common error, so EVERY operation declares it, and the model declares
+/// no `ValidationException` anywhere — which is why a boundary refusal is
+/// answered under this code rather than under the framework's generic one.
+const BAD_REQUEST_CODE: &str = "BadRequestException";
+
+/// `TableBucketName`'s character set and length
+/// (`smithy_query(query="shape", shape="TableBucketName")`).
+const TABLE_BUCKET_NAME_PATTERN: &str = "^[0-9a-z-]*$";
+const TABLE_BUCKET_NAME_MIN: i64 = 3;
+const TABLE_BUCKET_NAME_MAX: i64 = 63;
+
+/// `TableName`'s character set and length
+/// (`smithy_query(query="shape", shape="TableName")`). The two name shapes of
+/// this model differ in BOTH, which is what tells a refused `name` member
+/// apart: `CreateTableBucket` names a table bucket with it and the table
+/// operations name a table.
+const TABLE_NAME_PATTERN: &str = "^[0-9a-z_]*$";
+const TABLE_NAME_MIN: i64 = 1;
+const TABLE_NAME_MAX: i64 = 255;
+
+/// The one part a namespace has: `CreateNamespaceRequest.namespace` is a
+/// `NamespaceList` with `@length(min: 1, max: 1)`
+/// (`smithy_query(query="operation", operation="CreateNamespace")`). No other
+/// member of this model named `namespace` is bounded at one — the namespace
+/// NAME shape is bounded at 255 — so a list longer than this is the only
+/// refusal that reaches the multipart clause below.
+const NAMESPACE_PARTS_MAX: i64 = 1;
+
+/// The input member a violation path names: its FIRST segment, so a value
+/// refused inside a collection (`namespace.1.member`) is named by the input
+/// member that carried it rather than by the collection step.
+fn violated_member(path: &str) -> &str {
+    path.split('.').next().unwrap_or(path)
+}
+
+/// The fixed sentence this service states `violation` with, or `None` when the
+/// member it refused is not one of the classes this service words itself.
+///
+/// The class is read off the MEMBER and the CONSTRAINT the value failed — the
+/// two facts a violation carries — never off the operation or the rejected
+/// value, so one arm covers every operation that takes the member.
+fn fixed_sentence(violation: &Violation) -> Option<&'static str> {
+    let member = violated_member(&violation.path);
+    match (member, &violation.kind) {
+        // `TableBucketARN` declares a pattern and no length, so its only
+        // value-rejecting constraint is the pattern.
+        ("tableBucketARN", ViolationKind::Pattern(_)) => {
+            Some(crate::state::INVALID_TABLE_BUCKET_ARN_MESSAGE)
+        }
+        // `ResourceArn` declares both, and either way the value cannot be a
+        // resource ARN at all.
+        (
+            "resourceArn",
+            ViolationKind::Pattern(_) | ViolationKind::MinLength(_) | ViolationKind::MaxLength(_),
+        ) => Some(crate::state::INVALID_RESOURCE_ARN_MESSAGE),
+        // The namespace LIST's own bound: more parts than a namespace has.
+        ("namespace", ViolationKind::MaxLength(NAMESPACE_PARTS_MAX)) => {
+            Some(crate::state::MULTIPART_NAMESPACE_MESSAGE)
+        }
+        // A namespace NAME — the list's element, and the label the namespace and
+        // table operations address one by — outside its character set or length.
+        (
+            "namespace" | "newNamespaceName",
+            ViolationKind::Pattern(_) | ViolationKind::MinLength(_) | ViolationKind::MaxLength(_),
+        ) => Some(crate::state::INVALID_NAMESPACE_NAME_MESSAGE),
+        ("name", ViolationKind::Pattern(pattern)) if pattern == TABLE_BUCKET_NAME_PATTERN => {
+            Some(crate::state::INVALID_TABLE_BUCKET_NAME_MESSAGE)
+        }
+        (
+            "name",
+            ViolationKind::MinLength(TABLE_BUCKET_NAME_MIN)
+            | ViolationKind::MaxLength(TABLE_BUCKET_NAME_MAX),
+        ) => Some(crate::state::INVALID_TABLE_BUCKET_NAME_MESSAGE),
+        ("name" | "newName", ViolationKind::Pattern(pattern)) if pattern == TABLE_NAME_PATTERN => {
+            Some(crate::state::INVALID_TABLE_NAME_MESSAGE)
+        }
+        (
+            "name" | "newName",
+            ViolationKind::MinLength(TABLE_NAME_MIN) | ViolationKind::MaxLength(TABLE_NAME_MAX),
+        ) => Some(crate::state::INVALID_TABLE_NAME_MESSAGE),
+        _ => None,
+    }
+}
+
+/// How this service answers a request the boundary refused for breaking a
+/// modelled constraint: always its own `BadRequestException`, worded with the
+/// fixed sentence for the member class when it states one.
+///
+/// A member class this service has no sentence of its own for keeps the
+/// framework's clause, which names the member and the requirement it broke —
+/// only the error code changes there, and it changes because the code the
+/// framework would otherwise name is a shape this service's model does not
+/// declare.
+///
+/// `None` when there is nothing to state, which leaves the framework's wording.
+fn constraint_refusal(violations: &[Violation]) -> Option<Refused> {
+    let message = violations
+        .iter()
+        .find_map(fixed_sentence)
+        .map(str::to_string)
+        .or_else(|| aws_smithy_schema_server::envelope(violations))?;
+    Some(Refused {
+        code: BAD_REQUEST_CODE.to_string(),
+        message,
+    })
+}
 
 /// The `com-amazonaws-s3tables-s3tablebuckets` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +209,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. A value this service's model rules out is its own
+        // `BadRequestException` — the only client-input error it declares — and,
+        // for a name, a namespace or an ARN, the fixed sentence it states that
+        // class with. BOTH the code and the message are replaced together, which
+        // is what [`constraint_refusal`] builds.
+        //
+        // An authentication refusal, and any refusal kind added later, keeps the
+        // framework's wording.
+        match refusal {
+            Refusal::Invalid(violations) => constraint_refusal(violations),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
