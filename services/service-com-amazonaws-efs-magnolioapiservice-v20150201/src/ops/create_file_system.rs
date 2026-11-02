@@ -319,9 +319,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let provisioned = throughput_mode == efs::THROUGHPUT_MODE_PROVISIONED;
         match (provisioned, input.provisioned_throughput_in_mibps) {
             (true, None) => {
-                return Err(bad_request(
-                    "ProvisionedThroughputInMibps is required when ThroughputMode is provisioned",
-                ))
+                // The same rule as `UpdateFileSystem`'s, announced with the same fixed
+                // sentence (held in `crate::state`).
+                return Err(bad_request(efs::PROVISIONED_THROUGHPUT_REQUIRED_MESSAGE))
             }
             (false, Some(_)) => {
                 return Err(bad_request(format!(

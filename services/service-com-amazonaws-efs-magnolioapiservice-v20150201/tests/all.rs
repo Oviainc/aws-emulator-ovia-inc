@@ -31,6 +31,8 @@ mod harness;
 mod lifecycle_configuration;
 #[path = "all/mutation_results.rs"]
 mod mutation_results;
+#[path = "all/provisioned_throughput_required.rs"]
+mod provisioned_throughput_required;
 #[path = "all/replication_configuration.rs"]
 mod replication_configuration;
 #[path = "all/resource_tags.rs"]

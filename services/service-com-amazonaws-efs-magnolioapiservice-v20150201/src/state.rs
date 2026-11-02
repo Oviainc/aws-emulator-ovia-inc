@@ -1240,6 +1240,20 @@ pub fn file_system_already_exists_message(
     )
 }
 
+/// The `BadRequest` sentence every throughput request that resolves to the
+/// `provisioned` mode ([`THROUGHPUT_MODE_PROVISIONED`]) and carries no
+/// `ProvisionedThroughputInMibps` — neither on the request nor already on the record —
+/// is refused with. EFS states the rule in prose ("Required if ThroughputMode is set to
+/// provisioned") and the sentence that announces it is FIXED text: it interpolates
+/// nothing from the request or from state (no file-system id, no member name, no limit),
+/// and is terminated with a period.
+///
+/// Held here once rather than per handler, so `CreateFileSystem` and `UpdateFileSystem`
+/// — the two entry points that resolve a throughput mode — announce the one rule with
+/// the one sentence.
+pub const PROVISIONED_THROUGHPUT_REQUIRED_MESSAGE: &str =
+    "Provisioned throughput must be set for file systems that use provisioned throughput mode.";
+
 /// Why a caller-supplied tag list cannot be stored, as the `BadRequest` sentence to
 /// refuse with — `None` when the list is storable. Two rules, one per resource this
 /// service tags: the list holds at most [`MAX_TAGS_PER_RESOURCE`] tags, and "each key

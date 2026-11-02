@@ -276,9 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // using ThroughputMode set to provisioned" and for no other mode.
         let mibps = if mode == efs::THROUGHPUT_MODE_PROVISIONED {
             let Some(mibps) = input.provisioned_throughput_in_mibps.or(current_mibps) else {
-                return Err(bad_request(
-                    "ProvisionedThroughputInMibps is required when ThroughputMode is provisioned",
-                ));
+                // The sentence EFS announces this rule with is fixed text, held once in
+                // `crate::state` for every entry point that resolves a throughput mode.
+                return Err(bad_request(efs::PROVISIONED_THROUGHPUT_REQUIRED_MESSAGE));
             };
             Some(mibps)
         } else {
