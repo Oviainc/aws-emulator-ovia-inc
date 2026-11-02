@@ -23,9 +23,9 @@
 //! * a page size that names no page and a `Marker` that is no resume point this service
 //!   handed out are refused with the error the operation models (`InvalidArgument` 400),
 //!   and change nothing;
-//! * "An origin access control with the specified parameters already exists" — a create
-//!   repeating every parameter of a stored control is refused (409) and leaves it
-//!   untouched, while one that differs in ANY member describes a different control;
+//! * "An origin access control with the same name already exists" — a create under the
+//!   `Name` of a stored control is refused (409) and leaves it untouched, whichever other
+//!   member it differs in, while one under a free name describes a different control;
 //! * an id no control holds is `NoSuchOriginAccessControl` (404);
 //! * `OriginAccessControlConfig$Name`: "You can specify up to 64 characters", so a longer
 //!   name is refused before anything is stored;
@@ -760,7 +760,7 @@ async fn a_page_size_or_marker_that_names_no_page_is_refused() {
 }
 
 #[tokio::test]
-async fn a_create_repeating_every_parameter_names_the_control_that_holds_them() {
+async fn a_create_under_a_taken_name_names_the_control_that_holds_it() {
     let router = emulator();
     let row = Control {
         case: "the control the account already holds".to_string(),
@@ -796,14 +796,9 @@ async fn a_create_repeating_every_parameter_names_the_control_that_holds_them() 
         repeated.raw
     );
 
-    // A request differing in ANY member describes a DIFFERENT control, whichever member
-    // it is — including the optional one.
-    let variants = [
-        Control {
-            case: "a different name".to_string(),
-            name: "oac-already-exists-renamed".to_string(),
-            ..row.clone()
-        },
+    // A request under the taken NAME names the control that holds it, whichever other
+    // member differs — including the optional one.
+    let under_the_taken_name = [
         Control {
             case: "a different description".to_string(),
             description: Some("another description".to_string()),
@@ -830,13 +825,44 @@ async fn a_create_repeating_every_parameter_names_the_control_that_holds_them() 
             ..row.clone()
         },
     ];
+    for variant in &under_the_taken_name {
+        let answer = create_control(&router, &variant.xml()).await;
+        assert_eq!(
+            answer.status, 409,
+            "case {}: expected HTTP 409 under the taken name, got {} with {}",
+            variant.case, answer.status, answer.raw
+        );
+        assert_eq!(
+            answer.error_code(),
+            "OriginAccessControlAlreadyExists",
+            "case {}: expected OriginAccessControlAlreadyExists, got {}",
+            variant.case,
+            answer.raw
+        );
+    }
+
+    // A request under a FREE name describes a different control and creates one, even when
+    // every other parameter repeats a stored control's.
     let mut ids: BTreeSet<String> = BTreeSet::new();
     ids.insert(id.clone());
-    for variant in &variants {
+    for variant in &[
+        Control {
+            case: "the same parameters under a free name".to_string(),
+            name: "oac-already-exists-renamed".to_string(),
+            ..row.clone()
+        },
+        Control {
+            case: "other parameters under another free name".to_string(),
+            name: "oac-already-exists-other".to_string(),
+            description: None,
+            signing_protocol: "sigv4a".to_string(),
+            ..row.clone()
+        },
+    ] {
         let answer = create_control(&router, &variant.xml()).await;
         assert_eq!(
             answer.status, 201,
-            "case {}: a configuration differing in one member is a new control, got {} \
+            "case {}: a configuration under a free name is a new control, got {} \
              with {}",
             variant.case, answer.status, answer.raw
         );
@@ -853,7 +879,7 @@ async fn a_create_repeating_every_parameter_names_the_control_that_holds_them() 
     }
 
     // The control the conflict named is untouched, and the listing holds one record per
-    // distinct configuration.
+    // distinct name.
     let read = get_control(&router, &id).await;
     assert_eq!(
         read.status, 200,

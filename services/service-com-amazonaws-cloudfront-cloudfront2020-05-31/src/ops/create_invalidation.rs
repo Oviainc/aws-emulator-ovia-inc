@@ -7,6 +7,11 @@
 //! record it stored. A repeated `CallerReference` for the same batch is the same
 //! request again, so it reports the invalidation it already created.
 //!
+//! A batch naming a value that is no invalidation path — one not starting at the
+//! distribution's root, or carrying a character the documentation requires URL-encoded — and
+//! one naming no path at all, are refused with `InvalidArgument` before anything is stored
+//! ([`crate::state::is_invalidation_path`] states the rule).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,6 +191,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if path_count > crate::state::MAX_INVALIDATION_PATHS {
             return Err(CreateInvalidationErrorModeled::BatchTooLarge(
                 crate::state::batch_too_large(),
+            )
+            .into());
+        }
+
+        // "The path is relative to the distribution and must begin with a slash", and the
+        // characters a URI path cannot carry unescaped have to be URL-encoded: a value
+        // breaking either names no object of this distribution to invalidate, and a batch
+        // naming none describes no invalidation. Refused before anything is stored, with the
+        // sentence the service states for the batch.
+        if crate::state::batch_names_invalid_path(&input.invalidation_batch) {
+            return Err(CreateInvalidationErrorModeled::InvalidArgument(
+                crate::state::invalid_invalidation_paths(),
             )
             .into());
         }

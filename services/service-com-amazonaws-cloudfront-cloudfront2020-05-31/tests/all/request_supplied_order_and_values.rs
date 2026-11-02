@@ -369,7 +369,6 @@ async fn a_configuration_reports_the_values_submitted() {
             None,
             Some(content_type(false, true)),
         ),
-        Config::new("neither section", "ref-values-neither", None, None, None),
     ];
 
     for row in &rows {

@@ -30,6 +30,11 @@
 //!   `InconsistentQuantities` (HTTP 400), the same rule every CloudFront list wrapper obeys
 //!   and the one the create path walks
 //!   ([`crate::state::origin_request_policy_quantity_mismatch`]);
+//! * a configuration naming more headers, cookies or query strings than CloudFront's
+//!   published per-policy quota allows ([`crate::state::MAX_HEADERS_IN_POLICY`]) —
+//!   `TooManyHeadersInOriginRequestPolicy`, `TooManyCookiesInOriginRequestPolicy` or
+//!   `TooManyQueryStringsInOriginRequestPolicy` (HTTP 400), the SAME bounds the create path
+//!   applies, since the lists are stored whole;
 //! * a `Name` ANOTHER policy already holds — `OriginRequestPolicyConfig$Name` is "A unique
 //!   name to identify the origin request policy", so renaming a policy onto a name that is
 //!   taken is `OriginRequestPolicyAlreadyExists` (HTTP 409); the name this policy already
@@ -39,12 +44,7 @@
 //! [`crate::ops::create_origin_request_policy`] refuses a payload with, so an update stores
 //! nothing the create would have refused and refuses nothing it accepts. `InvalidArgument`
 //! is unreachable for that reason: an `OriginRequestPolicyConfig` carries no member this
-//! service validates beyond those, and the three per-list quota refusals
-//! (`TooManyCookiesInOriginRequestPolicy`, `TooManyHeadersInOriginRequestPolicy`,
-//! `TooManyQueryStringsInOriginRequestPolicy`) are unreachable for the reason the create
-//! path states: their maximum is an account quota CloudFront can raise and neither the model
-//! nor the shape documentation states a number for it, so a bound invented for them would
-//! refuse configurations the service accepts. `AccessDenied` is unreachable here, as it is
+//! service validates beyond those. `AccessDenied` is unreachable here, as it is
 //! from every other operation in this service: the emulator authorizes no caller.
 //!
 //! ## Shape of an operation
@@ -284,6 +284,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // Each list is bounded by CloudFront's published per-policy quota on every payload
+        // that states a policy, so an update cannot store a list the create would have
+        // refused.
+        if let Some(list) = crate::state::origin_request_policy_list_over_quota(&config) {
+            return Err(match list {
+                crate::state::PolicyList::Headers => {
+                    UpdateOriginRequestPolicyErrorModeled::TooManyHeadersInOriginRequestPolicy(
+                        TooManyHeadersInOriginRequestPolicy {
+                            message: Some(
+                                crate::state::TOO_MANY_HEADERS_IN_ORIGIN_REQUEST_POLICY_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PolicyList::Cookies => {
+                    UpdateOriginRequestPolicyErrorModeled::TooManyCookiesInOriginRequestPolicy(
+                        TooManyCookiesInOriginRequestPolicy {
+                            message: Some(
+                                crate::state::TOO_MANY_COOKIES_IN_ORIGIN_REQUEST_POLICY_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PolicyList::QueryStrings => {
+                    UpdateOriginRequestPolicyErrorModeled::TooManyQueryStringsInOriginRequestPolicy(
+                        TooManyQueryStringsInOriginRequestPolicy {
+                            message: Some(
+                                crate::state::TOO_MANY_QUERY_STRINGS_IN_ORIGIN_REQUEST_POLICY_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                }
+            }
+            .into());
         }
 
         // "A unique name to identify the origin request policy": a name identifies ONE

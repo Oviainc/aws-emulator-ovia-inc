@@ -16,19 +16,15 @@
 //!   characters — `InvalidArgument`
 //!   ([`crate::state::cache_policy_config_invalid`] states each rule, and why only the
 //!   members the request supplies take part in the ordering);
+//! * a configuration naming more headers, cookies or query strings in the cache key than
+//!   CloudFront's published per-policy quota allows ([`crate::state::MAX_HEADERS_IN_POLICY`])
+//!   — `TooManyHeadersInCachePolicy`, `TooManyCookiesInCachePolicy` or
+//!   `TooManyQueryStringsInCachePolicy`, each naming the list it refused;
 //! * a `Name` another policy already holds — `CachePolicyConfig$Name` is "A unique name to
 //!   identify the cache policy", so the second create under a name is
 //!   `CachePolicyAlreadyExists` rather than a second policy;
 //! * more policies than this emulator holds ([`crate::state::MAX_CACHE_POLICIES`]) —
 //!   `TooManyCachePolicies`.
-//!
-//! The model declares three more refusals whose maximum is an account quota CloudFront can
-//! raise and neither the model nor the shape documentation states a number for
-//! (`TooManyCookiesInCachePolicy`, `TooManyHeadersInCachePolicy`,
-//! `TooManyQueryStringsInCachePolicy`). Nothing here refuses on them, for the same reason
-//! `CreateOriginRequestPolicy` does not refuse on its own per-list quotas: a bound invented
-//! for them would refuse configurations the service accepts, which is a worse answer than
-//! accepting them.
 //!
 //! `AccessDenied` is deliberately unreachable from this handler, so a reader does not take
 //! it for an omission: this emulator authorizes no caller. The request boundary verifies
@@ -238,6 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Each of the three cache key lists a policy names is bounded by CloudFront's
+        // published per-policy quota, and the policy carries the list whole for its whole
+        // life, so a list past its quota is refused with the error the model names for THAT
+        // list before anything is minted.
+        if let Some(list) = crate::state::cache_policy_list_over_quota(&config) {
+            return Err(cache_policy_list_refusal(list).into());
+        }
+
         // "A unique name to identify the cache policy": a name identifies ONE policy, so a
         // name another policy already holds cannot name a second one — the policy that
         // holds it is left exactly as it was.
@@ -288,5 +292,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // this policy is checked against.
             e_tag: Some(etag),
         })
+    }
+}
+
+/// The refusal a cache key list past its published quota carries: the error this operation
+/// models for THAT list, under the sentence the service states for it.
+fn cache_policy_list_refusal(list: crate::state::PolicyList) -> CreateCachePolicyErrorModeled {
+    match list {
+        crate::state::PolicyList::Headers => {
+            CreateCachePolicyErrorModeled::TooManyHeadersInCachePolicy(TooManyHeadersInCachePolicy {
+                message: Some(
+                    crate::state::TOO_MANY_HEADERS_IN_CACHE_POLICY_MESSAGE.to_string(),
+                ),
+            })
+        }
+        crate::state::PolicyList::Cookies => {
+            CreateCachePolicyErrorModeled::TooManyCookiesInCachePolicy(TooManyCookiesInCachePolicy {
+                message: Some(
+                    crate::state::TOO_MANY_COOKIES_IN_CACHE_POLICY_MESSAGE.to_string(),
+                ),
+            })
+        }
+        crate::state::PolicyList::QueryStrings => {
+            CreateCachePolicyErrorModeled::TooManyQueryStringsInCachePolicy(
+                TooManyQueryStringsInCachePolicy {
+                    message: Some(
+                        crate::state::TOO_MANY_QUERY_STRINGS_IN_CACHE_POLICY_MESSAGE.to_string(),
+                    ),
+                },
+            )
+        }
     }
 }

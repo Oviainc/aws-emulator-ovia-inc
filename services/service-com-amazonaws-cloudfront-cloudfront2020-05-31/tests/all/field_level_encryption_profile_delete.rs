@@ -169,8 +169,7 @@ fn query_arg_config(case: &str, reference: &str, profile: &str) -> Config {
 }
 
 /// A configuration whose only mapping is one content type naming `profile` — the mapping kind
-/// whose `ProfileId` is OPTIONAL, so `profile` being `None` is a configuration that names no
-/// profile at all.
+/// whose `ProfileId` is OPTIONAL.
 fn content_type_config(case: &str, reference: &str, profile: Option<&str>) -> Config {
     Config::new(
         case,
@@ -540,17 +539,27 @@ async fn a_profile_a_configuration_names_cannot_be_deleted() {
             );
         }
 
-        // A configuration whose only mapping names NO profile at all references nothing, so it
-        // leaves the spare profile deletable while it stands.
-        let (nameless_id, nameless_etag) = store_config(
-            &router,
-            &content_type_config(
-                "a configuration whose content type mapping names no profile",
-                "fle-profile-in-use-nameless",
-                None,
-            ),
-        )
-        .await;
+        // A configuration whose content type mapping names NO profile references nothing
+        // through that mapping, so it leaves the spare profile deletable while it stands.
+        // Its query argument mapping names the subject the gate above already holds, since a
+        // configuration naming no profile in either section is not one the service stores.
+        let nameless = Config::new(
+            "a configuration whose content type mapping names no profile",
+            "fle-profile-in-use-nameless",
+            None,
+            Some(Section::new(
+                false,
+                Some(vec![QueryArgMapping::new("fle-profile", &profile_id)]),
+            )),
+            Some(Section::new(
+                false,
+                Some(vec![ContentTypeMapping::new(
+                    "application/x-www-form-urlencoded",
+                    None,
+                )]),
+            )),
+        );
+        let (nameless_id, nameless_etag) = store_config(&router, &nameless).await;
         let spare_deleted = delete_profile(&router, &spare_id, Some(&spare_etag)).await;
         assert_eq!(
             spare_deleted.status, 204,

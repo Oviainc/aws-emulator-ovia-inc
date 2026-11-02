@@ -356,17 +356,17 @@ impl Row {
 /// each forwarding flag; a content type mapping with and without a `ProfileId`; and the
 /// comment forms (absent, ASCII, XML metacharacters, non-ASCII and the documented
 /// 128-character bound, which `FieldLevelEncryptionConfig$Comment` states as "The comment
-/// cannot be longer than 128 characters").
+/// cannot be longer than 128 characters"). Every row names a profile in one of its sections,
+/// since a configuration naming none in either is refused rather than stored.
 fn table(profile: &str) -> Vec<Row> {
     let on_the_bound = "c".repeat(MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT);
     let mut rows = vec![
-        Row::new(profile, "neither mapping section", None, None, None),
         Row::new(
             profile,
-            "a query argument section holding no mapping",
+            "a query argument section holding no mapping, beside a content type mapping",
             Some(""),
             Some(Section::new(true, &[], true)),
-            None,
+            Some(Section::new(false, &["text/html"], true)),
         ),
         Row::new(
             profile,
@@ -388,9 +388,9 @@ fn table(profile: &str) -> Vec<Row> {
         ),
         Row::new(
             profile,
-            "a content type mapping that names no profile",
+            "a content type mapping that names no profile, beside a query argument mapping",
             Some("フィールドレベル暗号化 — 設定"),
-            None,
+            Some(Section::new(true, &["fle-profile"], true)),
             Some(Section::new(false, &["text/plain"], false)),
         ),
         Row::new(

@@ -11,6 +11,12 @@
 //! A mutating operation — "Create a field-level encryption profile" — and the only path by
 //! which a profile enters this service's store.
 //!
+//! A profile is unique by its `Name` as well as by its `CallerReference`: a create under a
+//! name another profile of this account already holds is
+//! `FieldLevelEncryptionProfileAlreadyExists` (HTTP 409) rather than a second profile, and so
+//! is one under a reference another profile holds. The NAME is checked first, so a repeat of
+//! a whole request — which carries the stored profile's name — is refused on the name.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -201,29 +207,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "Profile name for the field-level encryption profile": a name identifies ONE
+        // profile of this account, so a name another profile already holds cannot name a
+        // second one — the profile that holds it is left exactly as it was. Checked FIRST of
+        // the two values a profile is unique by, so a create repeating a stored profile's
+        // name is refused on the name whatever caller reference it carries.
+        if store
+            .field_level_encryption_profile_named(&config.name)
+            .is_some()
+        {
+            return Err(
+                CreateFieldLevelEncryptionProfileErrorModeled::FieldLevelEncryptionProfileAlreadyExists(
+                    FieldLevelEncryptionProfileAlreadyExists {
+                        message: Some(
+                            crate::state::FIELD_LEVEL_ENCRYPTION_PROFILE_NAME_ALREADY_EXISTS_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // A caller reference identifies ONE profile for its whole life: it is "a unique
-        // number that ensures that the request can't be replayed", so a repeat under a
-        // reference the store already holds is either the SAME request again or a second
-        // profile under a taken reference. What separates the two is the content of the
-        // configuration — the rule this service's distribution, origin access identity and
-        // public key creates follow for their own references: a repeat whose configuration is
-        // the one that reference already names is answered with that profile, its version and
-        // its location (creating nothing), and a repeat that changes the configuration is
-        // refused.
+        // number that ensures that the request can't be replayed", so a create under a
+        // reference the store already holds is refused rather than storing a second profile
+        // under it. The sentence names the profile that holds the reference, which is the one
+        // piece of detail the caller cannot work out for itself. A repeat of the whole
+        // request reaches the NAME refusal above instead, since a profile's name travels with
+        // its reference.
         if let Some(existing) =
             store.field_level_encryption_profile_by_caller_reference(&config.caller_reference)
         {
-            if crate::state::same_field_level_encryption_profile_config(&existing.config, &config) {
-                // The same request again: the record the first create left behind, at its
-                // current version. Nothing is minted and nothing is stored.
-                return Ok(CreateFieldLevelEncryptionProfileOutput {
-                    field_level_encryption_profile: Some(existing.to_profile()),
-                    location: Some(crate::state::location_uri(
-                        &crate::state::field_level_encryption_profile_path(&existing.id),
-                    )),
-                    e_tag: Some(existing.etag.clone()),
-                });
-            }
             let message =
                 crate::state::field_level_encryption_profile_already_exists_message(&existing.id);
             return Err(
@@ -241,10 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the patterns": the profile encrypts WITH that key, so an id no stored public key
         // carries names no key to encrypt with and no profile can be built from it.
         //
-        // Checked AFTER the caller reference above, because the replay that reference answers
-        // creates nothing: it reports the profile the first create already stored, whose keys
-        // were resolved then, so a repeat of that request stays idempotent even if one of the
-        // keys it named has since been deleted.
+        // Checked AFTER the two uniqueness values above, because a create refused on one of
+        // them stores nothing: the profiles a stored record names were resolved when it was
+        // stored.
         let names_unknown_key = config
             .encryption_entities
             .items

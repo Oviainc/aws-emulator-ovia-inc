@@ -29,9 +29,13 @@
 //! * a `Comment` past the documented 128 characters — `InvalidArgument` (HTTP 400), the SAME
 //!   check the create path applies
 //!   ([`crate::state::MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT`]);
-//! * a `QueryArgProfile` stating no profile at all — `QueryArgProfileEmpty` (HTTP 400), the
-//!   SAME check the create path applies: a mapping pairs a query argument with the profile the
-//!   matching fields are encrypted under;
+//! * a payload that states no `QueryArgProfileConfig` at all — `IllegalUpdate` (HTTP 400):
+//!   an update replaces the configuration whole, and the service requires that section on
+//!   every update of one
+//!   ([`crate::state::illegal_update_query_arg_profile_config_required`]);
+//! * a configuration leaving CloudFront no profile to encrypt a request's fields under —
+//!   `QueryArgProfileEmpty` (HTTP 400), the SAME check the create path applies
+//!   ([`crate::state::query_arg_profile_missing`]);
 //! * a mapping list past this service's bound —
 //!   `TooManyFieldLevelEncryptionQueryArgProfiles` /
 //!   `TooManyFieldLevelEncryptionContentTypeProfiles` (HTTP 400), the SAME bounds the create
@@ -283,6 +287,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An update replaces the configuration WHOLE, and CloudFront requires the query
+        // argument-profile section on every update of one — a payload that leaves it out
+        // would drop the mapping the stored configuration encrypts by, which is not a
+        // modification the service allows. Checked before the section is read below, so a
+        // dropped section is this refusal rather than an empty one.
+        if config.query_arg_profile_config.is_none() {
+            return Err(UpdateFieldLevelEncryptionConfigErrorModeled::IllegalUpdate(
+                crate::state::illegal_update_query_arg_profile_config_required(),
+            )
+            .into());
+        }
+
         let query_arg_profiles: &[QueryArgProfile] = config
             .query_arg_profile_config
             .as_ref()
@@ -296,13 +312,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|profiles| profiles.items.as_deref())
             .unwrap_or_default();
 
-        // A query argument-profile mapping pairs a query argument with the profile the matching
-        // fields are encrypted under, so one that states no profile maps its argument to
-        // nothing — the same refusal the create path makes.
-        if query_arg_profiles
-            .iter()
-            .any(|profile| profile.profile_id.trim().is_empty())
-        {
+        // A configuration encrypts a request's fields under the profile its query argument
+        // maps to, or under the one a content type mapping names — so one whose mappings name
+        // no profile at all encrypts nothing: the same refusal the create path makes, on an
+        // update's payload.
+        if crate::state::query_arg_profile_missing(&config) {
             return Err(UpdateFieldLevelEncryptionConfigErrorModeled::QueryArgProfileEmpty(
                 crate::state::query_arg_profile_empty(),
             )

@@ -38,7 +38,8 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::continuous_deployment_policies::{create_policy, get_policy, policy_table, Policy};
+use crate::continuous_deployment_policies::{create_policy, get_policy, policy_table, staged,
+    Policy};
 use crate::distribution_lifecycle::{
     call, config, create_distribution, emulator, update_distribution, Answer, API_VERSION,
 };
@@ -126,7 +127,7 @@ async fn assert_still_stored(
 async fn an_accepted_delete_removes_the_policy() {
     let router = emulator();
 
-    for (index, policy) in policy_table().iter().enumerate() {
+    for (index, policy) in staged(&router, "delete", policy_table()).await.iter().enumerate() {
         let case = policy.case;
         let form = ["{token}", "\"{token}\"", "W/\"{token}\""][index % 3];
         let (id, etag) = seed(&router, policy).await;
@@ -185,7 +186,7 @@ async fn an_accepted_delete_removes_the_policy() {
 #[tokio::test]
 async fn an_if_match_the_policy_cannot_satisfy_is_refused() {
     let router = emulator();
-    let table = policy_table();
+    let table = staged(&router, "deleteifm", policy_table()).await;
     let subject = &table[0];
     let other = &table[1];
 
@@ -277,7 +278,7 @@ async fn an_if_match_the_policy_cannot_satisfy_is_refused() {
 #[tokio::test]
 async fn a_policy_a_distribution_names_cannot_be_deleted() {
     let router = emulator();
-    let table = policy_table();
+    let table = staged(&router, "deleteinuse", policy_table()).await;
 
     for (index, policy) in table.iter().enumerate().take(3) {
         let case = policy.case;
@@ -376,7 +377,7 @@ async fn a_policy_a_distribution_names_cannot_be_deleted() {
 #[tokio::test]
 async fn an_id_no_policy_holds_is_refused() {
     let router = emulator();
-    let table = policy_table();
+    let table = staged(&router, "deleteabsent", policy_table()).await;
     let present = &table[0];
     let (id, etag) = seed(&router, present).await;
 

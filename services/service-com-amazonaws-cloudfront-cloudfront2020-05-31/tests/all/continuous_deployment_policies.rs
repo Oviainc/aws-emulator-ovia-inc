@@ -48,7 +48,8 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
-    call, emulator, is_minted_uuid, is_version_token, Answer, Node, API_VERSION, HOST,
+    call, config as distribution_config, create_distribution, emulator, is_minted_uuid,
+    is_version_token, Answer, Node, API_VERSION, HOST,
 };
 
 // ---------------------------------------------------------------------------
@@ -295,6 +296,12 @@ impl Policy {
 /// each of the two the `Type` enum admits (`ContinuousDeploymentPolicyType` is
 /// `SingleHeader | SingleWeight`, from `smithy_query`), a weight at each published bound
 /// of "between 0 and 0.15", and session stickiness at the bounds of "300–3600 seconds".
+///
+/// The domain names here are PLACEHOLDERS: a policy names its staging distribution by the
+/// domain name CloudFront assigned it, so a row that is to be STORED goes through
+/// [`staged`] first, which replaces them with the domain names of distributions this
+/// service really holds. A row that a refusal is asserted on keeps them, since a request
+/// refused before the names are resolved never reaches that lookup.
 pub(crate) fn policy_table() -> Vec<Policy> {
     vec![
         Policy {
@@ -343,6 +350,69 @@ pub(crate) fn policy_table() -> Vec<Policy> {
             },
         },
     ]
+}
+
+// ---------------------------------------------------------------------------
+// The staging distributions a policy points at
+// ---------------------------------------------------------------------------
+
+/// Create one distribution and report the domain name CloudFront ASSIGNED it.
+///
+/// `StagingDistributionDnsNames` is "the CloudFront domain name of the staging
+/// distribution", so a policy this service stores names a distribution it really holds:
+/// every domain name a stored policy carries below comes from a create like this one rather
+/// than from a literal written here.
+pub(crate) async fn staging_domain(router: &MultiServiceRouter, reference: &str) -> String {
+    let created =
+        create_distribution(router, &distribution_config("staging", reference).xml()).await;
+    assert_eq!(
+        created.status, 201,
+        "case the staging distribution {reference}: expected HTTP 201 from CreateDistribution, \
+         got {} with {}",
+        created.status, created.raw
+    );
+    let domain = created
+        .root()
+        .text_at("DomainName")
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !domain.is_empty(),
+        "case the staging distribution {reference}: expected an assigned domain name, got {}",
+        created.raw
+    );
+    domain
+}
+
+/// `count` staging distributions, in creation order, stamped with `prefix` so two callers
+/// cannot ask for the same caller reference.
+pub(crate) async fn staging_domains(
+    router: &MultiServiceRouter,
+    prefix: &str,
+    count: usize,
+) -> Vec<String> {
+    let mut domains = Vec::with_capacity(count);
+    for index in 0..count {
+        domains.push(staging_domain(router, &format!("ref-{prefix}-{index}")).await);
+    }
+    domains
+}
+
+/// Every row with its placeholder staging distribution domain names replaced by the domain
+/// names of distributions this call creates — one distribution per name, so no two rows
+/// claim the same staging distribution.
+pub(crate) async fn staged(
+    router: &MultiServiceRouter,
+    prefix: &str,
+    rows: Vec<Policy>,
+) -> Vec<Policy> {
+    let mut staged = Vec::with_capacity(rows.len());
+    for (index, mut row) in rows.into_iter().enumerate() {
+        let count = row.dns_names.len();
+        row.dns_names = staging_domains(router, &format!("{prefix}-{index}"), count).await;
+        staged.push(row);
+    }
+    staged
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +473,7 @@ async fn create_persists_the_policy_the_read_then_reports() {
     let mut ids = BTreeSet::new();
     let mut etags = BTreeSet::new();
 
-    for policy in policy_table() {
+    for policy in staged(&router, "persisted", policy_table()).await {
         let case = policy.case;
         let created = create_policy(&router, &policy.xml()).await;
         assert_eq!(
@@ -488,7 +558,7 @@ async fn create_persists_the_policy_the_read_then_reports() {
 #[tokio::test]
 async fn a_read_refuses_an_id_no_policy_holds() {
     let router = emulator();
-    let table = policy_table();
+    let table = staged(&router, "readrefusal", policy_table()).await;
     create_all(&router, &table[..1]).await;
 
     for (case, id) in [
@@ -559,7 +629,7 @@ async fn an_empty_account_lists_no_policies() {
 #[tokio::test]
 async fn a_list_reports_the_stored_policies_in_id_order() {
     let router = emulator();
-    let table = policy_table();
+    let table = staged(&router, "listed", policy_table()).await;
     let created = create_all(&router, &table).await;
     let expected: Vec<String> = {
         let mut ids: Vec<String> = created.iter().map(|(_, id)| id.clone()).collect();
@@ -647,11 +717,12 @@ async fn a_list_reports_the_stored_policies_in_id_order() {
 async fn walking_the_pages_enumerates_every_policy_once() {
     let router = emulator();
     // More policies than the smallest page sizes below, each with its own staging
-    // distribution domain name.
+    // distribution.
+    let domains = staging_domains(&router, "page", 7).await;
     let policies: Vec<Policy> = (0..7)
         .map(|index| Policy {
             case: "pagination",
-            dns_names: vec![format!("d{index}00000abcdef8.cloudfront.net")],
+            dns_names: vec![domains[index].clone()],
             enabled: index % 2 == 0,
             traffic: match index % 3 {
                 0 => Traffic::None,
@@ -750,7 +821,7 @@ async fn walking_the_pages_enumerates_every_policy_once() {
 #[tokio::test]
 async fn unusable_list_arguments_are_refused() {
     let router = emulator();
-    let table = policy_table();
+    let table = staged(&router, "listargs", policy_table()).await;
     create_all(&router, &table[..2]).await;
 
     // Rows: a page size that is no page, one that is no integer, and markers of every
@@ -812,7 +883,9 @@ async fn configurations_outside_the_documented_constraints_are_refused() {
 
     // Each row: what it is, the document, the status and the wire code. The quantity row
     // states a `Quantity` that disagrees with its `Items`; the rest sit one step outside
-    // a published bound, or name a `Type` whose configuration is missing.
+    // a published bound, or name a `Type` whose configuration is missing. Every one of them
+    // is refused on the member it breaks, before the staging distribution domain names are
+    // resolved, so their domain names stay placeholders.
     let base = Policy {
         case: "refusals",
         dns_names: vec!["d777777abcdef8.cloudfront.net".to_string()],
@@ -988,12 +1061,16 @@ async fn configurations_outside_the_documented_constraints_are_refused() {
     }
 
     // The same configurations AT the published bounds are accepted, so each refusal above
-    // is about the bound rather than about the member.
+    // is about the bound rather than about the member. Each one names staging distributions
+    // this service really holds, which is what a stored policy's domain names are.
+    let bound_domains = staging_domains(&router, "bounds", 2).await;
+    let at_the_bound_domains =
+        staging_domains(&router, "atbound", MAX_STAGING_DISTRIBUTION_DNS_NAMES).await;
     for (case, policy) in [
         (
             "the lower weight bound",
             Policy {
-                dns_names: vec!["d999999abcdef8.cloudfront.net".to_string()],
+                dns_names: vec![bound_domains[0].clone()],
                 traffic: Traffic::SingleWeight {
                     weight: 0.0,
                     stickiness: Some((MIN_SESSION_STICKINESS_TTL, MAX_SESSION_STICKINESS_TTL)),
@@ -1004,7 +1081,7 @@ async fn configurations_outside_the_documented_constraints_are_refused() {
         (
             "the upper weight bound",
             Policy {
-                dns_names: vec!["daaaaaaabcdef8.cloudfront.net".to_string()],
+                dns_names: vec![bound_domains[1].clone()],
                 traffic: Traffic::SingleWeight {
                     weight: MAX_TRAFFIC_WEIGHT,
                     stickiness: Some((MAX_SESSION_STICKINESS_TTL, MAX_SESSION_STICKINESS_TTL)),
@@ -1015,9 +1092,7 @@ async fn configurations_outside_the_documented_constraints_are_refused() {
         (
             "exactly as many staging domain names as the server's bound allows",
             Policy {
-                dns_names: (0..MAX_STAGING_DISTRIBUTION_DNS_NAMES)
-                    .map(|index| format!("dbound{index:02}bcdef8.cloudfront.net"))
-                    .collect(),
+                dns_names: at_the_bound_domains.clone(),
                 traffic: Traffic::None,
                 ..base.clone()
             },
@@ -1039,12 +1114,11 @@ async fn configurations_outside_the_documented_constraints_are_refused() {
 #[tokio::test]
 async fn a_staging_distribution_takes_part_in_at_most_one_policy() {
     let router = emulator();
+    // Three staging distributions: the two the stored policy holds, and one no policy does.
+    let domains = staging_domains(&router, "inuse", 3).await;
     let first = Policy {
         case: "the policy that holds the staging distribution",
-        dns_names: vec![
-            "dbbbbbbbbcdef8.cloudfront.net".to_string(),
-            "dcccccccbcdef8.cloudfront.net".to_string(),
-        ],
+        dns_names: vec![domains[0].clone(), domains[1].clone()],
         enabled: true,
         traffic: Traffic::SingleWeight {
             weight: 0.1,
@@ -1084,10 +1158,7 @@ async fn a_staging_distribution_takes_part_in_at_most_one_policy() {
         (
             "one of the staging domains, beside a new one",
             Policy {
-                dns_names: vec![
-                    "dcccccccbcdef8.cloudfront.net".to_string(),
-                    "ddddddddbcdef8.cloudfront.net".to_string(),
-                ],
+                dns_names: vec![domains[1].clone(), domains[2].clone()],
                 ..first.clone()
             },
             "StagingDistributionInUse",
@@ -1134,7 +1205,7 @@ async fn a_staging_distribution_takes_part_in_at_most_one_policy() {
     // A policy over a staging distribution no policy holds still lands.
     let other = Policy {
         case: "another staging distribution",
-        dns_names: vec!["deeeeeeebcdef8.cloudfront.net".to_string()],
+        dns_names: vec![staging_domain(&router, "ref-inuse-free").await],
         enabled: true,
         traffic: Traffic::SingleWeight {
             weight: 0.1,
@@ -1157,10 +1228,11 @@ async fn an_account_holds_at_most_the_bound_many_policies() {
     let router = emulator();
 
     // One policy per slot the bound allows, each over its own staging distribution.
-    for index in 0..MAX_CONTINUOUS_DEPLOYMENT_POLICIES {
+    let domains = staging_domains(&router, "fill", MAX_CONTINUOUS_DEPLOYMENT_POLICIES).await;
+    for (index, domain) in domains.iter().enumerate() {
         let policy = Policy {
             case: "filling the account",
-            dns_names: vec![format!("dfill{index:03}bcdef8.cloudfront.net")],
+            dns_names: vec![domain.clone()],
             enabled: index % 2 == 0,
             traffic: Traffic::None,
         };
@@ -1186,7 +1258,7 @@ async fn an_account_holds_at_most_the_bound_many_policies() {
     // it.
     let over = Policy {
         case: "one policy past the bound",
-        dns_names: vec!["dover000bcdef8.cloudfront.net".to_string()],
+        dns_names: vec![staging_domain(&router, "ref-fill-over").await],
         enabled: true,
         traffic: Traffic::None,
     };

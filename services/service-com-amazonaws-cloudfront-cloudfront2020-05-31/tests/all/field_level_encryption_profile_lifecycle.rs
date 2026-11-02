@@ -49,6 +49,13 @@ use crate::public_key_lifecycle::{create_key, pem};
 // disagree about how a submitted value is written.
 use crate::response_headers_policy_lifecycle::escape;
 
+/// The sentence `FieldLevelEncryptionProfileAlreadyExists` carries when the NAME a create
+/// submits is one another profile of the account already holds — spelled out here rather than
+/// taken from the crate, so a reworded refusal fails this suite.
+const NAME_ALREADY_EXISTS_MESSAGE: &str =
+    "The name that you are using to create a field level encryption profile is associated with \
+     another field level encryption profile in your account.";
+
 // ---------------------------------------------------------------------------
 // Calling the profile surface
 // ---------------------------------------------------------------------------
@@ -728,11 +735,11 @@ async fn an_entity_naming_no_stored_public_key_is_refused() {
     }
 }
 
-/// A caller reference identifies ONE profile for its whole life: the same request again
-/// reports the profile the first create stored (minting nothing: the same id and the same
-/// version), and a request that changes the configuration under a reference already taken is
-/// refused (`FieldLevelEncryptionProfileAlreadyExists`, 409), leaving the stored profile
-/// exactly as it was.
+/// A profile is unique by the two values a create submits for it: the same request again is
+/// refused on its NAME (`FieldLevelEncryptionProfileAlreadyExists`, 409 — the stored profile
+/// already holds it), a request that renames the profile under a reference already taken is
+/// refused on the REFERENCE under the same code, and both leave the stored profile exactly as
+/// it was.
 #[tokio::test]
 async fn a_caller_reference_names_at_most_one_profile() {
     let router = emulator();
@@ -748,30 +755,31 @@ async fn a_caller_reference_names_at_most_one_profile() {
         let id = first.root().text_at("Id").unwrap_or_default().to_string();
         let etag = first.header("etag").to_string();
 
-        // The same request again: the record the first create left behind, at its version.
+        // The same request again carries the name the stored profile holds, which is the
+        // first of the two values a create is refused on.
         let repeat = create_profile(&router, &row.xml()).await;
         assert_eq!(
-            repeat.status, 201,
-            "case {:?}: expected the replayed create to be answered, got {} with {}",
+            repeat.status, 409,
+            "case {:?}: expected HTTP 409 for the replayed create, got {} with {}",
             row.case, repeat.status, repeat.raw
         );
         assert_eq!(
-            repeat.root().text_at("Id"),
-            Some(id.as_str()),
-            "case {:?}: expected the replay to report the stored id {id:?}, got {:?}",
+            repeat.error_code(),
+            "FieldLevelEncryptionProfileAlreadyExists",
+            "case {:?}: expected FieldLevelEncryptionProfileAlreadyExists, got {}",
             row.case,
-            repeat.root().text_at("Id")
+            repeat.raw
         );
         assert_eq!(
-            repeat.header("etag"),
-            etag,
-            "case {:?}: expected the replay at the stored version {etag:?}, got {:?}",
+            repeat.root().find_text("Message").unwrap_or_default(),
+            NAME_ALREADY_EXISTS_MESSAGE,
+            "case {:?}: expected the sentence naming the taken name, got {}",
             row.case,
-            repeat.header("etag")
+            repeat.raw
         );
 
-        // A DIFFERENT configuration under the same reference is a second profile under a
-        // reference already taken, which is refused.
+        // A request that renames the profile under the same reference is a second profile
+        // under a reference already taken, which is refused on the reference.
         let mut changed = row.clone();
         changed.name = format!("{}-renamed", row.name);
         changed.comment = Some("a different configuration under a taken reference".to_string());
@@ -804,6 +812,13 @@ async fn a_caller_reference_names_at_most_one_profile() {
             "case {:?}: expected the stored profile to be readable after the refusal, got {} \
              with {}",
             row.case, read.status, read.raw
+        );
+        assert_eq!(
+            read.header("etag"),
+            etag,
+            "case {:?}: expected the refusals to leave the stored version {etag:?}, got {:?}",
+            row.case,
+            read.header("etag")
         );
         row.assert_matches(
             read.root()

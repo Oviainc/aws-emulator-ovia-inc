@@ -50,7 +50,7 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 };
 
 use crate::anycast_ip_list_lifecycle::{create_anycast_ip_list, get_anycast_ip_list, Create};
-use crate::continuous_deployment_policies::{create_policy, policy_table};
+use crate::continuous_deployment_policies::{create_policy, policy_table, staged};
 use crate::distribution_lifecycle::{call, config, emulator, Answer, API_VERSION};
 use crate::distribution_tenant_lifecycle::multi_tenant_distribution;
 use crate::key_group_lifecycle::{create_group, get_group, mint_public_keys, Group};
@@ -668,7 +668,8 @@ async fn a_conditional_mutation_decides_the_if_match_before_the_resource() {
 
     // A continuous deployment policy and a distribution, each at the version its create
     // handed back — the "another resource's current version" row, and the served contrast.
-    let policy = &policy_table()[0];
+    let table = staged(&router, "ifmfirst", policy_table()).await;
+    let policy = &table[0];
     let created = create_policy(&router, &policy.xml()).await;
     assert_eq!(
         created.status, 201,

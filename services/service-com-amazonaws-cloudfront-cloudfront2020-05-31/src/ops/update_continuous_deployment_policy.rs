@@ -26,6 +26,11 @@
 //!   `InconsistentQuantities` (HTTP 400), the same rule every CloudFront list wrapper
 //!   obeys and the one the create path walks
 //!   ([`crate::state::policy_config_quantity_mismatch`]);
+//! * a `StagingDistributionDnsNames` that carries no domain name at all, or whose entry no
+//!   distribution of this account is served on — `InvalidArgument` (HTTP 400), the SAME
+//!   checks the create path applies
+//!   ([`crate::state::names_no_staging_distribution_domain`],
+//!   [`crate::state::names_foreign_staging_distribution_domain`]);
 //! * a member outside what the documentation allows for it (the traffic configuration the
 //!   stated `Type` selects, the weight's range, the session stickiness TTLs, how many
 //!   staging distribution domain names one policy may name) — `InvalidArgument` (HTTP
@@ -260,6 +265,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     InconsistentQuantities {
                         message: Some(message),
                     },
+                )
+                .into(),
+            );
+        }
+
+        // `StagingDistributionDnsNames` names the staging distribution the policy moves
+        // traffic to, so a payload carrying no name at all describes no policy — on an
+        // update exactly as on a create.
+        if crate::state::names_no_staging_distribution_domain(&config) {
+            return Err(
+                UpdateContinuousDeploymentPolicyErrorModeled::InvalidArgument(
+                    crate::state::empty_staging_distribution_dns_names(),
+                )
+                .into(),
+            );
+        }
+
+        // "The CloudFront domain name of the staging distribution": each name is resolved
+        // against the stored distributions, and one that names none of them names no staging
+        // distribution to move traffic to — on an update's payload exactly as on a create's.
+        if crate::state::names_foreign_staging_distribution_domain(&store, &config) {
+            return Err(
+                UpdateContinuousDeploymentPolicyErrorModeled::InvalidArgument(
+                    crate::state::foreign_staging_distribution_domain(),
                 )
                 .into(),
             );

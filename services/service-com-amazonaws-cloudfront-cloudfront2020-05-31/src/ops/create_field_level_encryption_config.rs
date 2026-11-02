@@ -11,6 +11,11 @@
 //! A mutating operation and the only path by which a field-level encryption configuration
 //! enters this service's store.
 //!
+//! A configuration that leaves CloudFront no profile to encrypt a request's fields under —
+//! no query argument-profile mapping naming one, and no content type-profile mapping naming
+//! one either — is refused with `QueryArgProfileEmpty` before anything is minted
+//! ([`crate::state::query_arg_profile_missing`] states the rule).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -218,15 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|profiles| profiles.items.as_deref())
             .unwrap_or_default();
 
-        // `QueryArgProfile$ProfileId` is "ID of profile to use for field-level encryption
-        // query argument-profile mapping": a mapping pairs a query argument with the profile
-        // the matching fields are encrypted under, so one that states no profile maps its
-        // argument to nothing — "No profile specified for the field-level encryption query
-        // argument."
-        if query_arg_profiles
-            .iter()
-            .any(|profile| profile.profile_id.trim().is_empty())
-        {
+        // A configuration encrypts a request's fields under the profile its query argument
+        // maps to, or under the one a content type mapping names for its content type — so
+        // one whose query argument mappings name no profile, and whose content type mappings
+        // name none either, encrypts nothing at all. Refused before anything is minted.
+        if crate::state::query_arg_profile_missing(&config) {
             return Err(CreateFieldLevelEncryptionConfigErrorModeled::QueryArgProfileEmpty(
                 crate::state::query_arg_profile_empty(),
             )

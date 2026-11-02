@@ -26,6 +26,11 @@
 //!   that names a negative TTL, or one whose `Comment` is past the documented 128
 //!   characters — `InvalidArgument` (HTTP 400), the SAME check the create path applies
 //!   ([`crate::state::cache_policy_config_invalid`]);
+//! * a configuration naming more headers, cookies or query strings in the cache key than
+//!   CloudFront's published per-policy quota allows
+//!   ([`crate::state::MAX_HEADERS_IN_POLICY`]) — `TooManyHeadersInCachePolicy`,
+//!   `TooManyCookiesInCachePolicy` or `TooManyQueryStringsInCachePolicy` (HTTP 400), the
+//!   SAME bounds the create path applies, since the lists are stored whole;
 //! * a `Name` ANOTHER policy already holds — `CachePolicyConfig$Name` is "A unique name to
 //!   identify the cache policy", so renaming a policy onto a name that is taken is
 //!   `CachePolicyAlreadyExists` (HTTP 409); the name this policy already holds is its own,
@@ -34,11 +39,7 @@
 //! `IllegalUpdate` ("The update contains modifications that are not allowed") is not
 //! reachable here: a `CachePolicyConfig` carries no member documented as fixed for the
 //! policy's life — unlike a distribution's `CallerReference` — so there is no modification
-//! to refuse on. The three per-list quota refusals (`TooManyCookiesInCachePolicy`,
-//! `TooManyHeadersInCachePolicy`, `TooManyQueryStringsInCachePolicy`) are unreachable for
-//! the reason the create path states: their maximum is an account quota CloudFront can
-//! raise and neither the model nor the shape documentation states a number for it, so a
-//! bound invented for them would refuse configurations the service accepts. `AccessDenied`
+//! to refuse on. `AccessDenied`
 //! is unreachable here, as it is from every other operation in this service: the emulator
 //! authorizes no caller.
 //!
@@ -282,6 +283,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(message),
                 },
             )
+            .into());
+        }
+
+        // Each cache key list is bounded by CloudFront's published per-policy quota on every
+        // payload that states a policy, so an update cannot store a list the create would
+        // have refused.
+        if let Some(list) = crate::state::cache_policy_list_over_quota(&config) {
+            return Err(match list {
+                crate::state::PolicyList::Headers => {
+                    UpdateCachePolicyErrorModeled::TooManyHeadersInCachePolicy(
+                        TooManyHeadersInCachePolicy {
+                            message: Some(
+                                crate::state::TOO_MANY_HEADERS_IN_CACHE_POLICY_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PolicyList::Cookies => {
+                    UpdateCachePolicyErrorModeled::TooManyCookiesInCachePolicy(
+                        TooManyCookiesInCachePolicy {
+                            message: Some(
+                                crate::state::TOO_MANY_COOKIES_IN_CACHE_POLICY_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PolicyList::QueryStrings => {
+                    UpdateCachePolicyErrorModeled::TooManyQueryStringsInCachePolicy(
+                        TooManyQueryStringsInCachePolicy {
+                            message: Some(
+                                crate::state::TOO_MANY_QUERY_STRINGS_IN_CACHE_POLICY_MESSAGE
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                }
+            }
             .into());
         }
 

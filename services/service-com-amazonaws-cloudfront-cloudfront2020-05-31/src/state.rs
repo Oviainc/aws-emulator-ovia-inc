@@ -68,7 +68,8 @@ use crate::ops::types::{
     CachePolicy, CachePolicyAlreadyExists, CachePolicyConfig,
     CachedMethods, CloudFrontOriginAccessIdentity, CloudFrontOriginAccessIdentityConfig,
     CloudFrontOriginAccessIdentitySummary,
-    CNAMEAlreadyExists, ConnectionGroup, ConnectionGroupSummary, ContinuousDeploymentPolicy,
+    CNAMEAlreadyExists, ConnectionGroup, ConnectionGroupSummary, ContentTypeProfile,
+    ContinuousDeploymentPolicy,
     ContinuousDeploymentPolicyConfig,
     ContinuousDeploymentSingleHeaderConfig, ContinuousDeploymentSingleWeightConfig,
     CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
@@ -91,7 +92,7 @@ use crate::ops::types::{
     NoSuchResponseHeadersPolicy, Origin, OriginAccessControl, OriginAccessControlConfig,
     OriginAccessControlSummary, OriginRequestPolicy, OriginRequestPolicyAlreadyExists,
     OriginRequestPolicyConfig, OriginSslProtocols, Parameter, ParameterDefinition, Paths,
-    PublicKey, PublicKeyConfig, PublicKeySummary, ResponseHeadersPolicy,
+    PublicKey, PublicKeyConfig, PublicKeySummary, QueryArgProfile, ResponseHeadersPolicy,
     ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig, Restrictions,
     SessionStickinessConfig, Signer, StreamingDistribution, StreamingDistributionConfig,
     StreamingDistributionSummary, StreamingLoggingConfig, StringSchemaConfig, Tag, Tags,
@@ -673,6 +674,27 @@ pub const MAX_ORIGIN_REQUEST_POLICIES: usize = 1_000;
 /// can be raised and the model states no number, so this bound is the emulator's rather
 /// than a claim about the service.
 pub const MAX_CACHE_POLICIES: usize = 1_000;
+
+/// The most headers ONE cache policy or origin request policy may name.
+///
+/// CloudFront's published quota is 10 headers per cache policy and 10 headers per origin
+/// request policy (the Amazon CloudFront Developer Guide's "Quotas", the cache key and
+/// origin request settings), and both policy kinds model a refusal naming exactly that
+/// scope — `TooManyHeadersInCachePolicy` and `TooManyHeadersInOriginRequestPolicy`. The
+/// list is stored WHOLE inside the policy record and is walked for every request the policy
+/// is attached to, so the bound is refused on every payload that states a policy rather
+/// than only on the create.
+pub const MAX_HEADERS_IN_POLICY: usize = 10;
+
+/// The most cookies ONE cache policy or origin request policy may name: the same published
+/// quota [`MAX_HEADERS_IN_POLICY`] states for headers, under
+/// `TooManyCookiesInCachePolicy` / `TooManyCookiesInOriginRequestPolicy`.
+pub const MAX_COOKIES_IN_POLICY: usize = 10;
+
+/// The most query strings ONE cache policy or origin request policy may name: the same
+/// published quota [`MAX_HEADERS_IN_POLICY`] states for headers, under
+/// `TooManyQueryStringsInCachePolicy` / `TooManyQueryStringsInOriginRequestPolicy`.
+pub const MAX_QUERY_STRINGS_IN_POLICY: usize = 10;
 
 /// The prefix a public key id carries.
 ///
@@ -4214,11 +4236,11 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// whole life, so it addresses at most one record. This is how a resource that names a
     /// distribution by its DOMAIN name rather than by its id — a continuous deployment
     /// policy's `StagingDistributionDnsNames` — resolves to the distribution it routes
-    /// traffic to.
+    /// traffic to. DNS names are case-insensitive, so the comparison is ([`same_domain`]).
     pub fn distribution_by_domain_name(&self, domain_name: &str) -> Option<&StoredDistribution> {
         self.distributions
             .values()
-            .find(|distribution| distribution.domain_name == domain_name)
+            .find(|distribution| same_domain(&distribution.domain_name, domain_name))
     }
 
     /// The continuous deployment policy `id` names, or `None` when the store holds none.
@@ -4668,25 +4690,23 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.origin_access_controls.get(id)
     }
 
-    /// The origin access control whose STORED configuration asks for exactly what
-    /// `config` asks for, or `None` when no control does.
+    /// The origin access control whose STORED configuration carries `name`, or `None` when
+    /// no control does.
     ///
-    /// `CreateOriginAccessControl` models `OriginAccessControlAlreadyExists` as "An origin
-    /// access control with the specified parameters already exists", so what makes a
-    /// create a conflict is the whole set of parameters rather than any single member: a
-    /// request that changes any of them describes a DIFFERENT control and creates one.
+    /// `OriginAccessControlConfig$Name` is "A name to identify the origin access control",
+    /// and the service refuses a create under a name an existing control holds with "An
+    /// origin access control with the same name already exists" — so at most one control
+    /// answers, and a repeated name is a conflict rather than a second control, whatever
+    /// the rest of the parameters say.
     ///
     /// A scan over the controls rather than a second index beside them: the stored
-    /// records are the single source of truth for which configurations exist, so a scan
+    /// records are the single source of truth for which names are taken, so a scan
     /// cannot drift out of step with them, and the collection is bounded by
     /// [`MAX_ORIGIN_ACCESS_CONTROLS`].
-    pub fn origin_access_control_with_config(
-        &self,
-        config: &OriginAccessControlConfig,
-    ) -> Option<&StoredOriginAccessControl> {
+    pub fn origin_access_control_named(&self, name: &str) -> Option<&StoredOriginAccessControl> {
         self.origin_access_controls
             .values()
-            .find(|control| same_origin_access_control_config(&control.config, config))
+            .find(|control| control.config.name == name)
     }
 
     /// The distribution that attaches the origin access control `id` to one of its
@@ -4862,6 +4882,21 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|key| key.config.caller_reference == caller_reference)
     }
 
+    /// The public key whose STORED configuration carries `name`, or `None`.
+    ///
+    /// `PublicKeyConfig$Name` is "A name to help identify the public key", and the create
+    /// models `PublicKeyAlreadyExists` for a name another key of the account already holds
+    /// — so at most one key answers, and this is what makes a repeated name a conflict
+    /// rather than a second key. The SAME scan
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::key_group_named`] makes for the
+    /// neighbouring resource: the stored records are the single source of truth for which
+    /// names are taken, and the collection is bounded by [`MAX_PUBLIC_KEYS`].
+    pub fn public_key_named(&self, name: &str) -> Option<&StoredPublicKey> {
+        self.public_keys
+            .values()
+            .find(|key| key.config.name == name)
+    }
+
     /// The key group whose STORED configuration lists the public key `public_key_id` names,
     /// or `None` when no stored group does.
     ///
@@ -4933,6 +4968,25 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         id: &str,
     ) -> Option<&StoredFieldLevelEncryptionProfile> {
         self.field_level_encryption_profiles.get(id)
+    }
+
+    /// The field-level encryption profile whose STORED configuration carries `name`, or
+    /// `None`.
+    ///
+    /// `FieldLevelEncryptionProfileConfig$Name` is "Profile name for the field-level
+    /// encryption profile", and the create models
+    /// `FieldLevelEncryptionProfileAlreadyExists` for a name another profile of the account
+    /// already holds — so at most one profile answers, and this is what makes a repeated
+    /// name a conflict rather than a second profile. The SAME scan
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::public_key_named`] makes, bounded by
+    /// [`MAX_FIELD_LEVEL_ENCRYPTION_PROFILES`].
+    pub fn field_level_encryption_profile_named(
+        &self,
+        name: &str,
+    ) -> Option<&StoredFieldLevelEncryptionProfile> {
+        self.field_level_encryption_profiles
+            .values()
+            .find(|stored| stored.config.name == name)
     }
 
     /// The field-level encryption profile created under `caller_reference`, or `None` when
@@ -5821,7 +5875,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// is drawn from here too rather than from a second rendering of the mint.
     pub fn allocate_domain_name(&mut self) -> String {
         let label = self.mint(ID_BODY_LEN).to_lowercase();
-        format!("d{label}.cloudfront.net")
+        format!("d{label}{CLOUDFRONT_DOMAIN_SUFFIX}")
     }
 
     /// Allocate an invalidation id no invalidation of the named distribution tenant holds.
@@ -8054,18 +8108,6 @@ pub fn same_origin_access_identity_config(
     format!("{left:?}") == format!("{right:?}")
 }
 
-/// Whether two public key configurations ask for the same thing, which is what decides
-/// whether a repeated `CallerReference` is the same create again or a second public key
-/// under a reference that is already taken.
-///
-/// The same comparison [`same_origin_access_identity_config`] makes, for the same reasons:
-/// every member a caller can submit takes part — down to the members a request left out —
-/// and comparing the DESERIALIZED configurations is what makes it insensitive to the
-/// request document's whitespace and member order.
-pub fn same_public_key_config(left: &PublicKeyConfig, right: &PublicKeyConfig) -> bool {
-    format!("{left:?}") == format!("{right:?}")
-}
-
 /// The member of a public key's configuration an update would CHANGE, out of the members
 /// that are fixed for the key's life, or `None` when it changes none of them.
 ///
@@ -8115,46 +8157,17 @@ pub fn cannot_change_immutable_public_key_fields()
     }
 }
 
-/// Whether two field-level encryption profile configurations ask for the same thing, which
-/// is what decides whether a repeated `CallerReference` is the same create again or a second
-/// profile under a reference that is already taken.
-///
-/// The same comparison [`same_public_key_config`] makes, for the same reasons: every member
-/// a caller can submit takes part — down to the members a request left out — and comparing
-/// the DESERIALIZED configurations is what makes it insensitive to the request document's
-/// whitespace and member order.
-pub fn same_field_level_encryption_profile_config(
-    left: &FieldLevelEncryptionProfileConfig,
-    right: &FieldLevelEncryptionProfileConfig,
-) -> bool {
-    format!("{left:?}") == format!("{right:?}")
-}
-
 /// Whether two field-level encryption configurations ask for the same thing, which is what
 /// decides whether a repeated `CallerReference` is the same create again or a second
 /// configuration under a reference that is already taken.
 ///
-/// The same comparison [`same_field_level_encryption_profile_config`] makes, for the same
+/// The same comparison [`same_origin_access_identity_config`] makes, for the same
 /// reasons: every member a caller can submit takes part — down to the members a request left
 /// out — and comparing the DESERIALIZED configurations is what makes it insensitive to the
 /// request document's whitespace and member order.
 pub fn same_field_level_encryption_config(
     left: &FieldLevelEncryptionConfig,
     right: &FieldLevelEncryptionConfig,
-) -> bool {
-    format!("{left:?}") == format!("{right:?}")
-}
-
-/// Whether two origin access control configurations ask for the same thing, which is what
-/// decides whether a create describes a control the account already holds or a new one.
-///
-/// The same comparison [`same_config`] makes, for the same reasons: every member a caller
-/// can submit takes part — down to the members a request left out — and comparing the
-/// DESERIALIZED configurations is what makes it insensitive to the request document's
-/// whitespace and member order.
-pub fn same_origin_access_control_config(
-    left: &OriginAccessControlConfig,
-    right: &OriginAccessControlConfig,
 ) -> bool {
     format!("{left:?}") == format!("{right:?}")
 }
@@ -9128,6 +9141,154 @@ pub fn cache_policy_quantity_mismatch(config: &CachePolicyConfig) -> Option<Stri
         .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
 }
 
+/// Which of the three caller-chosen lists a cache policy or an origin request policy
+/// carries names more entries than its published quota allows.
+///
+/// One value per list rather than per error shape: each policy kind models its OWN
+/// `TooMany…` error for the same three lists, so a handler maps the answer onto the error
+/// its own operation declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyList {
+    /// `HeadersConfig.Headers`, bounded by [`MAX_HEADERS_IN_POLICY`].
+    Headers,
+    /// `CookiesConfig.Cookies`, bounded by [`MAX_COOKIES_IN_POLICY`].
+    Cookies,
+    /// `QueryStringsConfig.QueryStrings`, bounded by [`MAX_QUERY_STRINGS_IN_POLICY`].
+    QueryStrings,
+}
+
+impl PolicyList {
+    /// How many entries this list may name.
+    pub const fn quota(self) -> usize {
+        match self {
+            PolicyList::Headers => MAX_HEADERS_IN_POLICY,
+            PolicyList::Cookies => MAX_COOKIES_IN_POLICY,
+            PolicyList::QueryStrings => MAX_QUERY_STRINGS_IN_POLICY,
+        }
+    }
+}
+
+/// The first list in `counts` that names more entries than its quota allows, as
+/// `(the list, the count it stated)`, or `None` when every list is within its quota.
+///
+/// An absent list names nothing, so it is within every quota. The count a wrapper STATES
+/// and the number of entries it carries both take part, for the reason
+/// [`policy_config_invalid_argument`] takes both: by the time a handler reaches here the
+/// wrapper walk has already refused a `Quantity` that disagrees with its `Items`, so the
+/// two spellings cannot differ — this simply does not depend on that order.
+fn list_over_quota(counts: [(PolicyList, Option<(i32, usize)>); 3]) -> Option<PolicyList> {
+    counts.into_iter().find_map(|(list, stated)| {
+        let (quantity, carried) = stated?;
+        let count = i64::from(quantity).max(i64::try_from(carried).unwrap_or(0));
+        (count > i64::try_from(list.quota()).unwrap_or(i64::MAX)).then_some(list)
+    })
+}
+
+/// The cache key list a cache policy configuration names more entries in than CloudFront's
+/// published quota allows, or `None` when every list is within it.
+///
+/// A configuration that names no cache key parameters reaches no list at all.
+pub fn cache_policy_list_over_quota(config: &CachePolicyConfig) -> Option<PolicyList> {
+    let parameters = config
+        .parameters_in_cache_key_and_forwarded_to_origin
+        .as_ref()?;
+    list_over_quota([
+        (
+            PolicyList::Headers,
+            parameters
+                .headers_config
+                .headers
+                .as_ref()
+                .map(|list| (list.quantity, items_len(&list.items))),
+        ),
+        (
+            PolicyList::Cookies,
+            parameters
+                .cookies_config
+                .cookies
+                .as_ref()
+                .map(|list| (list.quantity, items_len(&list.items))),
+        ),
+        (
+            PolicyList::QueryStrings,
+            parameters
+                .query_strings_config
+                .query_strings
+                .as_ref()
+                .map(|list| (list.quantity, items_len(&list.items))),
+        ),
+    ])
+}
+
+/// The same walk over an origin request policy configuration's three lists, which carry the
+/// SAME published quotas ([`MAX_HEADERS_IN_POLICY`]) and are reached directly on the
+/// configuration rather than under a cache key parameters member.
+pub fn origin_request_policy_list_over_quota(
+    config: &OriginRequestPolicyConfig,
+) -> Option<PolicyList> {
+    list_over_quota([
+        (
+            PolicyList::Headers,
+            config
+                .headers_config
+                .headers
+                .as_ref()
+                .map(|list| (list.quantity, items_len(&list.items))),
+        ),
+        (
+            PolicyList::Cookies,
+            config
+                .cookies_config
+                .cookies
+                .as_ref()
+                .map(|list| (list.quantity, items_len(&list.items))),
+        ),
+        (
+            PolicyList::QueryStrings,
+            config
+                .query_strings_config
+                .query_strings
+                .as_ref()
+                .map(|list| (list.quantity, items_len(&list.items))),
+        ),
+    ])
+}
+
+/// The sentence `TooManyHeadersInCachePolicy` carries, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with — and fixed whole: the
+/// condition is that the request named more headers than the policy may hold, and neither
+/// the count submitted nor the quota is part of it.
+pub const TOO_MANY_HEADERS_IN_CACHE_POLICY_MESSAGE: &str =
+    "Your request contains more headers in the Cache Policy than are allowed.";
+
+/// The sentence `TooManyCookiesInCachePolicy` carries, as
+/// [`TOO_MANY_HEADERS_IN_CACHE_POLICY_MESSAGE`] states the same condition about the
+/// policy's other cache key list.
+pub const TOO_MANY_COOKIES_IN_CACHE_POLICY_MESSAGE: &str =
+    "Your request contains more cookies in the Cache Policy than are allowed.";
+
+/// The sentence `TooManyQueryStringsInCachePolicy` carries, worded as
+/// [`TOO_MANY_HEADERS_IN_CACHE_POLICY_MESSAGE`] is.
+pub const TOO_MANY_QUERY_STRINGS_IN_CACHE_POLICY_MESSAGE: &str =
+    "Your request contains more query strings in the Cache Policy than are allowed.";
+
+/// The sentence `TooManyHeadersInOriginRequestPolicy` carries, on the wire: the same
+/// condition [`TOO_MANY_HEADERS_IN_CACHE_POLICY_MESSAGE`] states, named for the other policy
+/// kind — which CloudFront words without the article.
+pub const TOO_MANY_HEADERS_IN_ORIGIN_REQUEST_POLICY_MESSAGE: &str =
+    "Your request contains more headers in Origin Request Policy than are allowed.";
+
+/// The sentence `TooManyCookiesInOriginRequestPolicy` carries, worded as
+/// [`TOO_MANY_HEADERS_IN_ORIGIN_REQUEST_POLICY_MESSAGE`] is.
+pub const TOO_MANY_COOKIES_IN_ORIGIN_REQUEST_POLICY_MESSAGE: &str =
+    "Your request contains more cookies in Origin Request Policy than are allowed.";
+
+/// The sentence `TooManyQueryStringsInOriginRequestPolicy` carries, worded as
+/// [`TOO_MANY_HEADERS_IN_ORIGIN_REQUEST_POLICY_MESSAGE`] is.
+pub const TOO_MANY_QUERY_STRINGS_IN_ORIGIN_REQUEST_POLICY_MESSAGE: &str =
+    "Your request contains more query strings in Origin Request Policy than are allowed.";
+
 /// The modelled `InconsistentQuantities` message for the first list wrapper in a
 /// field-level encryption profile configuration whose `Quantity` disagrees with the length
 /// of its `Items`, or `None` when every wrapper agrees.
@@ -9296,6 +9457,72 @@ pub fn batch_path_count(batch: &InvalidationBatch) -> usize {
     items_len(&batch.paths.items)
 }
 
+/// Whether `path` names objects of a distribution the way an invalidation path does.
+///
+/// "The path is relative to the distribution and must begin with a slash (/)", and "if the
+/// path includes non-ASCII characters or unsafe characters … specify the characters as
+/// URL-encoded", so a path carrying unescaped one of the characters RFC 1738 calls unsafe in
+/// a URL ([`UNSAFE_PATH_CHARACTERS`]), or a `%` that starts no escape, is not a path either
+/// (the Amazon CloudFront Developer Guide, "Invalidating files"). A value breaking either
+/// names no object of the distribution, so there is nothing for it to invalidate.
+///
+/// The `*` wildcard is NOT placed by this rule: CloudFront takes an invalidation path
+/// verbatim, so a `*` anywhere in it is part of the pattern it matches with.
+pub fn is_invalidation_path(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    let mut characters = path.chars();
+    while let Some(character) = characters.next() {
+        if UNSAFE_PATH_CHARACTERS.contains(&character) {
+            return false;
+        }
+        // An escape is a `%` and two hexadecimal digits, so a `%` carrying anything else
+        // escapes nothing.
+        if character == '%'
+            && !characters
+                .next()
+                .zip(characters.next())
+                .is_some_and(|(high, low)| high.is_ascii_hexdigit() && low.is_ascii_hexdigit())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// The characters an invalidation path cannot carry unescaped: the ones RFC 1738 calls
+/// unsafe in a URL, which CloudFront's own documentation requires URL-ENCODED. The `%` it
+/// also lists is admitted by [`is_invalidation_path`] only as the start of an escape.
+const UNSAFE_PATH_CHARACTERS: &[char] =
+    &[' ', '"', '<', '>', '#', '{', '}', '|', '\\', '^', '[', ']', '`'];
+
+/// Whether an invalidation batch names no object to invalidate: one carrying a value that is
+/// no invalidation path ([`is_invalidation_path`]), or none at all — a batch IS the set of
+/// objects the invalidation removes from the caches, so an empty one describes no
+/// invalidation.
+pub fn batch_names_invalid_path(batch: &InvalidationBatch) -> bool {
+    let paths = batch.paths.items.as_deref().unwrap_or_default();
+    paths.is_empty() || paths.iter().any(|path| !is_invalidation_path(path))
+}
+
+/// The sentence CloudFront refuses a batch naming a path it cannot invalidate with, on the
+/// wire.
+///
+/// FIXED text: what the refusal states is the RULE the paths broke, and the condition is a
+/// property of the batch rather than of any one path in it, so no path from the request
+/// belongs in it.
+pub const INVALID_INVALIDATION_PATHS_MESSAGE: &str =
+    "Your request contains one or more invalid invalidation paths.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a batch naming a path that is no
+/// invalidation path.
+pub fn invalid_invalidation_paths() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_INVALIDATION_PATHS_MESSAGE.to_string()),
+    }
+}
+
 /// `TrafficConfig$Type` selecting a share of traffic, from
 /// [`crate::ops::types::CONTINUOUS_DEPLOYMENT_POLICY_TYPE_VALUES`] — the values the model
 /// says the member accepts.
@@ -9432,6 +9659,78 @@ pub fn policy_config_invalid_argument(
         crate::ops::types::CONTINUOUS_DEPLOYMENT_POLICY_TYPE_VALUES.join(", ")
     ))
 }
+
+/// Whether a continuous deployment policy configuration names a staging distribution
+/// domain name that is no distribution of this account's.
+///
+/// `StagingDistributionDnsNames` carries "the CloudFront domain name of the staging
+/// distribution. For example: `d111111abcdef8.cloudfront.net`" — the DEFAULT domain name
+/// CloudFront ASSIGNED one of this account's distributions
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::allocate_domain_name`] mints it), and
+/// the policy moves traffic to THAT distribution. So a name no distribution of this account
+/// is served on names no staging distribution the policy could move traffic to, whether it
+/// is a domain of another zone, an alternate domain name a distribution also answers to, or
+/// a name in the assigned shape that was never assigned here. Resolved against the STORED
+/// distributions rather than a second index beside them, so it cannot drift out of step with
+/// what a read of those distributions reports, and the collection is bounded by
+/// [`MAX_DISTRIBUTIONS`]. DNS names are case-insensitive, so the comparison is
+/// ([`same_domain`]).
+pub fn names_foreign_staging_distribution_domain(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    config: &ContinuousDeploymentPolicyConfig,
+) -> bool {
+    staging_distribution_dns_names(config)
+        .iter()
+        .any(|name| store.distribution_by_domain_name(name).is_none())
+}
+
+/// Whether a continuous deployment policy configuration states no staging distribution
+/// domain name at all.
+///
+/// `StagingDistributionDnsNames` is the REQUIRED member naming the staging distribution the
+/// policy moves traffic to, so a wrapper carrying no name names no distribution and there is
+/// no policy to build from it.
+pub fn names_no_staging_distribution_domain(
+    config: &ContinuousDeploymentPolicyConfig,
+) -> bool {
+    staging_distribution_dns_names(config).is_empty()
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) for a `StagingDistributionDnsNames` that
+/// carries no domain name.
+///
+/// FIXED service text ([`EMPTY_STAGING_DISTRIBUTION_DNS_NAMES_MESSAGE`]): the refusal states
+/// which member was left empty, and nothing from the request.
+pub fn empty_staging_distribution_dns_names() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(EMPTY_STAGING_DISTRIBUTION_DNS_NAMES_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence CloudFront refuses a `StagingDistributionDnsNames` carrying no domain name
+/// with, on the wire.
+pub const EMPTY_STAGING_DISTRIBUTION_DNS_NAMES_MESSAGE: &str =
+    "The parameter StagingDistributionDnsNames is null or empty.";
+
+/// The zone the domain names CloudFront assigns a distribution live under, with the
+/// separating dot: `d111111abcdef8.cloudfront.net` is one label under it.
+pub const CLOUDFRONT_DOMAIN_SUFFIX: &str = ".cloudfront.net";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a `StagingDistributionDnsNames` naming a
+/// domain CloudFront did not assign a distribution.
+///
+/// FIXED service text ([`FOREIGN_STAGING_DISTRIBUTION_DOMAIN_MESSAGE`]): what the refusal
+/// states is the RULE the member broke, so no domain from the request belongs in it.
+pub fn foreign_staging_distribution_domain() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(FOREIGN_STAGING_DISTRIBUTION_DOMAIN_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence CloudFront refuses a staging distribution domain name of its own zone with,
+/// on the wire: it names the member that carried the value, and nothing else.
+pub const FOREIGN_STAGING_DISTRIBUTION_DOMAIN_MESSAGE: &str =
+    "The parameter StagingDistributionDnsNames is not a default CloudFront domain name.";
 
 /// `NoSuchContinuousDeploymentPolicy`'s message for an id no stored policy answers to, on
 /// the wire.
@@ -10143,24 +10442,31 @@ pub fn invalid_anycast_ip_count(ip_count: i32) -> crate::ops::types::InvalidArgu
     }
 }
 
-/// The modelled `EntityLimitExceeded` (HTTP 400) for a create there are no Anycast static
-/// IP addresses left to allocate for.
+/// The modelled `EntityLimitExceeded` (HTTP 400) for a create this account's Anycast static
+/// IP entitlement cannot be served from — in this emulator, one there are no addresses left
+/// to allocate for ([`ANYCAST_IP_POOL`]).
 ///
-/// CloudFront words a quota refusal as the condition the request would cause — its
-/// `TooManyDistributions` is "Processing your request would cause you to exceed the maximum
-/// number of distributions allowed" — so this states the same thing about what the create
-/// could not be served: the static IP ADDRESSES it asked to have allocated, which is the
-/// condition the caller actually hit. WHY the allocation runs out here is
-/// [`ANYCAST_IP_POOL`]'s doc, which a client never reads.
+/// The sentence is the WIRE text CloudFront answers this code with on this operation
+/// ([`ANYCAST_IP_LIST_LIMIT_EXCEEDED_MESSAGE`]): the entitlement is a Service Quotas quota,
+/// so what the refusal states is how to have it raised rather than any value from the
+/// request.
 pub fn anycast_ip_pool_exhausted() -> crate::ops::types::EntityLimitExceeded {
     crate::ops::types::EntityLimitExceeded {
-        message: Some(
-            "Processing your request would cause you to exceed the maximum number of \
-             Anycast static IP addresses allowed"
-                .to_string(),
-        ),
+        message: Some(ANYCAST_IP_LIST_LIMIT_EXCEEDED_MESSAGE.to_string()),
     }
 }
+
+/// The sentence CloudFront refuses a `CreateAnycastIpList` the account's entitlement cannot
+/// serve with, on the wire: the Service Quotas page of the quota that bounds it
+/// (`L-6A19EDFD`), beside the instruction to ask AWS Support for an increase.
+///
+/// CloudFront is a global service whose quotas are held in `us-east-1`, so that is the
+/// console the page lives on for every account; the quota code is the one that bounds this
+/// resource. Nothing from the request belongs in the text.
+pub const ANYCAST_IP_LIST_LIMIT_EXCEEDED_MESSAGE: &str =
+    "To request a limit increase for your Anycast static IP list, contact AWS Support: \
+     https://us-east-1.console.aws.amazon.com/servicequotas/home/services/cloudfront/quotas/\
+     L-6A19EDFD";
 
 /// The sentence CloudFront answers a distribution tenant name that is already taken with,
 /// on the wire: the WIRE text for `EntityAlreadyExists` on THIS resource kind, worded as
@@ -10620,16 +10926,15 @@ pub const INVALID_LAMBDA_FUNCTION_ASSOCIATION_PREFIX: &str =
 /// holds it is any part of it.
 ///
 /// This constant is the SENTENCE the refusal carries, not the predicate that raises it:
-/// what makes a submitted configuration a conflict is `origin_access_control_with_config`'s
-/// own rule, which this does not decide. The recorded service words the sentence around the
-/// control's name, so a predicate that admitted a second control under a name already taken
-/// would never serve it — a question about the predicate, answered where the predicate
-/// lives.
+/// what makes a submitted configuration a conflict is
+/// [`ComAmazonawsCloudfrontCloudfront20200531State::origin_access_control_named`]'s own
+/// rule, which this does not decide. The recorded service words the sentence around the
+/// control's NAME, which is the value that predicate compares.
 pub const ORIGIN_ACCESS_CONTROL_ALREADY_EXISTS_MESSAGE: &str =
     "An origin access control with the same name already exists.";
 
 /// The modelled `OriginAccessControlAlreadyExists` (HTTP 409) for a create or an update
-/// whose configuration a stored control already holds.
+/// naming a control the account already holds.
 ///
 /// Takes no identifier: the sentence is fixed service text
 /// ([`ORIGIN_ACCESS_CONTROL_ALREADY_EXISTS_MESSAGE`]), so both entry points into the
@@ -11056,6 +11361,18 @@ pub fn field_level_encryption_profile_already_exists_message(existing_id: &str) 
     )
 }
 
+/// The sentence `FieldLevelEncryptionProfileAlreadyExists` carries when it is the profile
+/// NAME that is already taken, on the wire.
+///
+/// A profile is unique by its name as well as by its caller reference, and the two
+/// conditions share the error code — so the sentence is what tells a caller which of its
+/// values it has to change, as [`PUBLIC_KEY_NAME_ALREADY_EXISTS_MESSAGE`] does for the
+/// neighbouring resource. Fixed whole: the caller already holds the name, and the
+/// identifier of the profile that holds it is no part of the text.
+pub const FIELD_LEVEL_ENCRYPTION_PROFILE_NAME_ALREADY_EXISTS_MESSAGE: &str =
+    "The name that you are using to create a field level encryption profile is associated \
+     with another field level encryption profile in your account.";
+
 /// The modelled `TooManyFieldLevelEncryptionProfiles` (HTTP 400) for a create that would
 /// take the store past [`MAX_FIELD_LEVEL_ENCRYPTION_PROFILES`].
 ///
@@ -11192,21 +11509,86 @@ pub fn too_many_field_level_encryption_content_type_profiles(
 pub const TOO_MANY_FIELD_LEVEL_ENCRYPTION_CONTENT_TYPE_PROFILES_MESSAGE: &str =
     "The maximum number of content type profiles for field-level encryption have been created.";
 
-/// The modelled `QueryArgProfileEmpty` (HTTP 400) for a query argument-profile mapping that
-/// names no profile to encrypt the matching fields with.
+/// The modelled `QueryArgProfileEmpty` (HTTP 400) for a field-level encryption
+/// configuration that maps no query argument to a profile it could encrypt with.
 ///
-/// The sentence is the one the model states on the shape itself — "No profile specified for
-/// the field-level encryption query argument." — a property of the mapping rather than of
-/// any one value in it, so nothing from the request belongs in the text.
+/// The sentence is fixed service text ([`QUERY_ARG_PROFILE_EMPTY_MESSAGE`]), stating the
+/// RULE the configuration broke, so nothing from the request belongs in it.
 pub fn query_arg_profile_empty() -> crate::ops::types::QueryArgProfileEmpty {
     crate::ops::types::QueryArgProfileEmpty {
         message: Some(QUERY_ARG_PROFILE_EMPTY_MESSAGE.to_string()),
     }
 }
 
-/// `QueryArgProfileEmpty`'s message, as the model documents the shape.
+/// `QueryArgProfileEmpty`'s message, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with — which differs from
+/// the sentence the MODEL's documentation of the shape uses for the same code ("No profile
+/// specified for the field-level encryption query argument."): that one documents the
+/// condition, this one states the rule and is what is served. Do not "correct" this
+/// constant to the documentation sentence.
 pub const QUERY_ARG_PROFILE_EMPTY_MESSAGE: &str =
-    "No profile specified for the field-level encryption query argument.";
+    "The query arg profile in field level encryption config cannot be empty when content \
+     type profile is empty or when no default profile id is given in any content type \
+     profile.";
+
+/// Whether a field-level encryption configuration leaves CloudFront no profile to encrypt a
+/// request's fields under.
+///
+/// A configuration encrypts matching fields under the profile a `QueryArgProfile` maps the
+/// request's query argument to, and falls back to the profile a `ContentTypeProfile` names
+/// for the request's content type; `ContentTypeProfile$ProfileId` is optional, so a content
+/// type mapping may name none. So the query argument mappings have to name a profile unless
+/// some content type mapping does: a configuration where neither does encrypts nothing, and
+/// so does one whose query argument mapping states an empty profile id — the same condition
+/// seen from the mapping's side, and the one `QueryArgProfileEmpty` refuses.
+pub fn query_arg_profile_missing(config: &FieldLevelEncryptionConfig) -> bool {
+    let query_arg_profiles: &[QueryArgProfile] = config
+        .query_arg_profile_config
+        .as_ref()
+        .and_then(|query_arg| query_arg.query_arg_profiles.as_ref())
+        .and_then(|profiles| profiles.items.as_deref())
+        .unwrap_or_default();
+    if query_arg_profiles
+        .iter()
+        .any(|profile| profile.profile_id.trim().is_empty())
+    {
+        return true;
+    }
+    if !query_arg_profiles.is_empty() {
+        return false;
+    }
+    let content_type_profiles: &[ContentTypeProfile] = config
+        .content_type_profile_config
+        .as_ref()
+        .and_then(|content_type| content_type.content_type_profiles.as_ref())
+        .and_then(|profiles| profiles.items.as_deref())
+        .unwrap_or_default();
+    !content_type_profiles.iter().any(|profile| {
+        profile
+            .profile_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+    })
+}
+
+/// The modelled `IllegalUpdate` (HTTP 400) for an update to a field-level encryption
+/// configuration that leaves out the `QueryArgProfileConfig` the service requires on every
+/// update of one.
+///
+/// FIXED service text ([`QUERY_ARG_PROFILE_CONFIG_REQUIRED_MESSAGE`]), naming the member
+/// that has to be there and nothing from the request.
+pub fn illegal_update_query_arg_profile_config_required() -> crate::ops::types::IllegalUpdate {
+    crate::ops::types::IllegalUpdate {
+        message: Some(QUERY_ARG_PROFILE_CONFIG_REQUIRED_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence CloudFront refuses an update of a field-level encryption configuration that
+/// states no `QueryArgProfileConfig` with: an update replaces the configuration WHOLE, so
+/// the member cannot be dropped by a payload that omits it.
+pub const QUERY_ARG_PROFILE_CONFIG_REQUIRED_MESSAGE: &str =
+    "QueryArgProfileConfig is required for updates";
 
 /// The modelled `InvalidArgument` (HTTP 400) for a `ListPublicKeys` `Marker` that is no
 /// resume point this service handed out.
@@ -11314,6 +11696,17 @@ pub fn too_many_public_keys() -> crate::ops::types::TooManyPublicKeys {
 pub const PUBLIC_KEY_ALREADY_EXISTS_MESSAGE: &str =
     "The caller reference that you are using to create a CloudFront public key is associated \
      with another public key in your account.";
+
+/// The sentence `PublicKeyAlreadyExists` carries when it is the NAME that is already taken,
+/// on the wire.
+///
+/// The same sentence [`PUBLIC_KEY_ALREADY_EXISTS_MESSAGE`] states for the other value a key
+/// is unique by, worded around the name instead: the two conditions share the error code, so
+/// the sentence is what tells a caller which of its values it has to change. Fixed whole,
+/// for the reason that one is.
+pub const PUBLIC_KEY_NAME_ALREADY_EXISTS_MESSAGE: &str =
+    "The name that you are using to create a CloudFront public key is associated with \
+     another public key in your account.";
 
 /// The longest comment a key group carries.
 ///

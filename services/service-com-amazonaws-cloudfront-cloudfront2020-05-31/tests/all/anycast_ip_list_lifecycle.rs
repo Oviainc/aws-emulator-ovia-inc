@@ -887,4 +887,17 @@ async fn the_address_pool_bounds_what_can_be_allocated() {
         beyond.case,
         answer.raw
     );
+    // The sentence CloudFront answers this code with on this operation: the Service Quotas
+    // page of the quota that bounds the account's Anycast static IP lists, beside the
+    // instruction to ask AWS Support for an increase. A LITERAL here rather than the crate's
+    // constant, so a reworded refusal fails this suite.
+    assert_eq!(
+        answer.root().find_text("Message").unwrap_or_default(),
+        "To request a limit increase for your Anycast static IP list, contact AWS Support: \
+         https://us-east-1.console.aws.amazon.com/servicequotas/home/services/cloudfront/\
+         quotas/L-6A19EDFD",
+        "case {}: expected the service's sentence for this quota, got {}",
+        beyond.case,
+        answer.raw
+    );
 }

@@ -52,6 +52,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// crate's constant, so the WORDING is what these rows are held to.
 const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
 
+/// The sentence `PublicKeyAlreadyExists` carries when the NAME a create submits is one
+/// another key of the account already holds, spelled out here for the same reason.
+const NAME_ALREADY_EXISTS_MESSAGE: &str =
+    "The name that you are using to create a CloudFront public key is associated with another \
+     public key in your account.";
+
 use crate::distribution_lifecycle::{
     call, emulator, is_distribution_id, Answer, Node, API_VERSION, HOST,
 };
@@ -786,28 +792,28 @@ async fn a_caller_reference_identifies_one_public_key() {
         .to_string();
     let etag = created.header("etag").to_string();
 
-    // "A string included in the request to help make sure that the request can't be
-    // replayed": the SAME configuration under the same reference reports the key the first
-    // create stored, at its current version, and creates nothing.
+    // A key is unique by the two values a create submits for it, and the NAME is the first
+    // of them: the SAME configuration under the same reference carries the name the stored
+    // key holds, so it is refused on that name rather than answered with the stored key.
     let replayed = create_key(&router, &row.xml()).await;
     assert_eq!(
-        replayed.status, 201,
-        "case {}: expected the replayed create to report the stored key, got {} with {}",
+        replayed.status, 409,
+        "case {}: expected HTTP 409 for the replayed create, got {} with {}",
         row.case, replayed.status, replayed.raw
     );
     assert_eq!(
-        replayed.root().text_at("Id"),
-        Some(id.as_str()),
-        "case {}: expected the replayed create to name {id}, got {}",
+        replayed.error_code(),
+        "PublicKeyAlreadyExists",
+        "case {}: expected PublicKeyAlreadyExists, got {}",
         row.case,
         replayed.raw
     );
     assert_eq!(
-        replayed.header("etag"),
-        etag,
-        "case {}: expected the replayed create to report the stored version, got {:?}",
+        replayed.root().find_text("Message").unwrap_or_default(),
+        NAME_ALREADY_EXISTS_MESSAGE,
+        "case {}: expected the sentence naming the taken name, got {}",
         row.case,
-        replayed.header("etag")
+        replayed.raw
     );
 
     // A DIFFERENT configuration under a reference already taken is refused, whichever
@@ -850,10 +856,12 @@ async fn a_caller_reference_identifies_one_public_key() {
         );
     }
 
-    // The same configuration under a FRESH reference is a second key, with its own id.
+    // The same key MATERIAL under a fresh reference and a fresh name is a second key, with
+    // its own id: a key is unique by each of those two values, and both are free here.
     let second = Key {
-        case: "the same key under another reference".to_string(),
+        case: "the same material under another reference and name".to_string(),
         caller_reference: "public-key-second-reference".to_string(),
+        name: "public-key-second-name".to_string(),
         ..row.clone()
     };
     let answer = create_key(&router, &second.xml()).await;
@@ -880,6 +888,13 @@ async fn a_caller_reference_identifies_one_public_key() {
         read.status, 200,
         "case {}: the refusals must leave the stored key readable, got {} with {}",
         row.case, read.status, read.raw
+    );
+    assert_eq!(
+        read.header("etag"),
+        etag,
+        "case {}: expected the refusals to leave the stored version {etag:?}, got {:?}",
+        row.case,
+        read.header("etag")
     );
     let config = read
         .root()
@@ -1040,10 +1055,10 @@ async fn a_create_past_the_account_bound_is_refused() {
             comment: Some("one too many".to_string()),
         },
         Key {
-            case: "a key past the bound reusing a stored key's name".to_string(),
-            caller_reference: "public-key-bound-past-renamed".to_string(),
-            name: "public-key-bound-0".to_string(),
-            encoded_key: pem(2, 'T'),
+            case: "a key past the bound carrying a stored key's material".to_string(),
+            caller_reference: "public-key-bound-past-material".to_string(),
+            name: "public-key-bound-past-material".to_string(),
+            encoded_key: pem(1, 'Q'),
             comment: Some(String::new()),
         },
     ];
@@ -1089,8 +1104,7 @@ async fn a_create_past_the_account_bound_is_refused() {
             .filter(|(_, name)| name == &row.name)
             .map(|(id, _)| id.as_str())
             .collect();
-        // One stored key already carries the third row's name, and no refusal may add a
-        // second one under it.
+        // No refusal may add a key under a name no stored key carries.
         let expected = usize::from(filled.iter().any(|(_, name)| name == &row.name));
         assert_eq!(
             names.len(),

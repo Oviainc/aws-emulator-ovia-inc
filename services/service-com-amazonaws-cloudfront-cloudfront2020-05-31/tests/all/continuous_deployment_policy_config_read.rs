@@ -22,7 +22,8 @@
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::MAX_STAGING_DISTRIBUTION_DNS_NAMES;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::continuous_deployment_policies::{create_policy, get_policy, policy_table, Policy, Traffic};
+use crate::continuous_deployment_policies::{create_policy, get_policy, policy_table, staged,
+    Policy, Traffic};
 use crate::distribution_lifecycle::{call, emulator, is_version_token, Answer, API_VERSION};
 use crate::response_headers_policy_lifecycle::text;
 
@@ -76,7 +77,7 @@ fn config_read_table() -> Vec<Policy> {
 async fn the_config_read_reports_the_stored_configuration_and_its_version() {
     let router = emulator();
 
-    for policy in config_read_table() {
+    for policy in staged(&router, "cfgread", config_read_table()).await {
         let case = policy.case;
         let created = create_policy(&router, &policy.xml()).await;
         assert_eq!(
@@ -162,7 +163,9 @@ async fn the_config_read_reports_the_stored_configuration_and_its_version() {
 #[tokio::test]
 async fn the_config_read_refuses_an_id_no_policy_holds() {
     let router = emulator();
-    let present = policy_table().swap_remove(0);
+    let present = staged(&router, "cfgreadabsent", policy_table())
+        .await
+        .swap_remove(0);
     let case = present.case;
     let created = create_policy(&router, &present.xml()).await;
     assert_eq!(

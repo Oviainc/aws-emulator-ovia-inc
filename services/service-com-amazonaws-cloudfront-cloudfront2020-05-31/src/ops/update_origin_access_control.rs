@@ -240,15 +240,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "An origin access control with the specified parameters already exists": the
-        // conflict is over the whole set of parameters, so an update asking for exactly
-        // what ANOTHER stored control asks for is refused leaving both untouched. The
-        // control being updated already holds its own parameters, which is why the
-        // holder's id is compared: re-submitting them is not a conflict with itself. The
-        // refusal itself carries the service's fixed sentence for this code, which names
-        // neither control.
+        // "An origin access control with the same name already exists": a name identifies
+        // ONE control of this account, so a name ANOTHER stored control holds cannot be
+        // moved onto this one — both are left untouched. The control being updated already
+        // holds its own name, which is why the holder's id is compared: keeping it is not a
+        // conflict with itself. The refusal itself carries the service's fixed sentence for
+        // this code, which names neither control.
         if store
-            .origin_access_control_with_config(&config)
+            .origin_access_control_named(&config.name)
             .is_some_and(|holder| holder.id != input.id)
         {
             return Err(

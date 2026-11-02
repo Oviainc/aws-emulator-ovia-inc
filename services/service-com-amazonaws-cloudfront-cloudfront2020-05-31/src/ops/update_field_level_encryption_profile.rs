@@ -31,13 +31,13 @@
 //!   ([`crate::state::MAX_FIELD_LEVEL_ENCRYPTION_PROFILE_COMMENT`]);
 //! * an `EncryptionEntity$PublicKeyId` no stored public key carries — `NoSuchPublicKey`
 //!   (HTTP 404), the SAME check the create path applies: the profile encrypts WITH that key;
+//! * a `Name` ANOTHER profile already holds — `FieldLevelEncryptionProfileAlreadyExists`
+//!   (HTTP 409): a name identifies one profile of the account, so it cannot be moved onto
+//!   this one, while the name this profile already holds is its own;
 //! * a `CallerReference` that is not the one this profile was created under — `IllegalUpdate`
 //!   (HTTP 400), "The update contains modifications that are not allowed"
 //!   ([`crate::state::illegal_update_caller_reference`]).
 //!
-//! `FieldLevelEncryptionProfileAlreadyExists` is unreachable here: a caller reference names
-//! one profile for its whole life, so a request carrying another profile's reference is the
-//! modification refused above rather than a second profile under a reference already taken.
 //! `FieldLevelEncryptionProfileSizeExceeded`, `TooManyFieldLevelEncryptionEncryptionEntities`
 //! and `TooManyFieldLevelEncryptionFieldPatterns` are unreachable for the same reason they are
 //! from the create path: this service applies no bound to a profile's byte size or to its
@@ -301,6 +301,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateFieldLevelEncryptionProfileErrorModeled::NoSuchPublicKey(
                     crate::state::no_such_public_key(),
+                )
+                .into(),
+            );
+        }
+
+        // "Profile name for the field-level encryption profile": a name identifies ONE
+        // profile of this account, so a name another profile holds cannot be moved onto this
+        // one. The profile being updated already holds its own name, which is why the
+        // holder's id is compared.
+        if store
+            .field_level_encryption_profile_named(&config.name)
+            .is_some_and(|holder| holder.id != input.id)
+        {
+            return Err(
+                UpdateFieldLevelEncryptionProfileErrorModeled::FieldLevelEncryptionProfileAlreadyExists(
+                    FieldLevelEncryptionProfileAlreadyExists {
+                        message: Some(
+                            crate::state::FIELD_LEVEL_ENCRYPTION_PROFILE_NAME_ALREADY_EXISTS_MESSAGE
+                                .to_string(),
+                        ),
+                    },
                 )
                 .into(),
             );

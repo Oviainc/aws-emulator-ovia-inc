@@ -11,19 +11,15 @@
 //! * a list wrapper whose `Quantity` disagrees with the length of its `Items` —
 //!   `InconsistentQuantities`, the same rule every CloudFront list wrapper obeys
 //!   ([`crate::state::origin_request_policy_quantity_mismatch`]);
+//! * a configuration naming more headers, cookies or query strings than CloudFront's
+//!   published per-policy quota allows ([`crate::state::MAX_HEADERS_IN_POLICY`]) —
+//!   `TooManyHeadersInOriginRequestPolicy`, `TooManyCookiesInOriginRequestPolicy` or
+//!   `TooManyQueryStringsInOriginRequestPolicy`, each naming the list it refused;
 //! * a `Name` another policy already holds — `OriginRequestPolicyConfig$Name` is "A unique
 //!   name to identify the origin request policy", so the second create under a name is
 //!   `OriginRequestPolicyAlreadyExists` rather than a second policy;
 //! * more policies than this emulator holds
 //!   ([`crate::state::MAX_ORIGIN_REQUEST_POLICIES`]) — `TooManyOriginRequestPolicies`.
-//!
-//! The model declares three more refusals whose maximum is an account quota CloudFront can
-//! raise and neither the model nor the shape documentation states a number for
-//! (`TooManyCookiesInOriginRequestPolicy`, `TooManyHeadersInOriginRequestPolicy`,
-//! `TooManyQueryStringsInOriginRequestPolicy`). Nothing here refuses on them, for the same
-//! reason `CreateResponseHeadersPolicy` does not refuse on its own per-list quotas: a bound
-//! invented for them would refuse configurations the service accepts, which is a worse
-//! answer than accepting them.
 //!
 //! Two further modelled errors are deliberately unreachable from this handler, so a reader
 //! does not take them for omissions:
@@ -228,6 +224,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Each of the three lists a policy names is bounded by CloudFront's published
+        // per-policy quota, and the policy carries the list whole for its whole life, so a
+        // list past its quota is refused with the error the model names for THAT list
+        // before anything is minted.
+        if let Some(list) = crate::state::origin_request_policy_list_over_quota(&config) {
+            return Err(origin_request_policy_list_refusal(list).into());
+        }
+
         // "A unique name to identify the origin request policy": a name identifies ONE
         // policy, so a name another policy already holds cannot name a second one — the
         // policy that holds it is left exactly as it was.
@@ -282,5 +286,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // against this policy is checked against.
             e_tag: Some(etag),
         })
+    }
+}
+
+/// The refusal a list past its published quota carries: the error this operation models for
+/// THAT list, under the sentence the service states for it.
+fn origin_request_policy_list_refusal(
+    list: crate::state::PolicyList,
+) -> CreateOriginRequestPolicyErrorModeled {
+    match list {
+        crate::state::PolicyList::Headers => {
+            CreateOriginRequestPolicyErrorModeled::TooManyHeadersInOriginRequestPolicy(
+                TooManyHeadersInOriginRequestPolicy {
+                    message: Some(
+                        crate::state::TOO_MANY_HEADERS_IN_ORIGIN_REQUEST_POLICY_MESSAGE.to_string(),
+                    ),
+                },
+            )
+        }
+        crate::state::PolicyList::Cookies => {
+            CreateOriginRequestPolicyErrorModeled::TooManyCookiesInOriginRequestPolicy(
+                TooManyCookiesInOriginRequestPolicy {
+                    message: Some(
+                        crate::state::TOO_MANY_COOKIES_IN_ORIGIN_REQUEST_POLICY_MESSAGE.to_string(),
+                    ),
+                },
+            )
+        }
+        crate::state::PolicyList::QueryStrings => {
+            CreateOriginRequestPolicyErrorModeled::TooManyQueryStringsInOriginRequestPolicy(
+                TooManyQueryStringsInOriginRequestPolicy {
+                    message: Some(
+                        crate::state::TOO_MANY_QUERY_STRINGS_IN_ORIGIN_REQUEST_POLICY_MESSAGE
+                            .to_string(),
+                    ),
+                },
+            )
+        }
     }
 }

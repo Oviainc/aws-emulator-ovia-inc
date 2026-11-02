@@ -56,8 +56,8 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::continuous_deployment_policies::{create_policy, get_policy, policy_table, Policy,
-    Traffic};
+use crate::continuous_deployment_policies::{create_policy, get_policy, policy_table,
+    staging_domains, Policy, Traffic};
 use crate::distribution_lifecycle::{
     call, emulator, inconsistent_quantities_message, is_version_token, Answer, API_VERSION,
 };
@@ -70,7 +70,10 @@ use crate::distribution_lifecycle::{
 /// `ContinuousDeploymentPolicyConfig` document `body` and the `If-Match` header `if_match`
 /// (left off entirely when `None`) — the route, the payload member and the header the model
 /// binds this operation to.
-async fn update_policy(
+///
+/// `pub(crate)` so a sibling suite that updates a policy goes over this one wire path rather
+/// than growing a copy of it.
+pub(crate) async fn update_policy(
     router: &MultiServiceRouter,
     id: &str,
     body: &str,
@@ -99,14 +102,16 @@ async fn delete_policy(router: &MultiServiceRouter, id: &str, if_match: &str) ->
     .await
 }
 
-/// The same row with its staging distribution domain names replaced by `suffix`-stamped
-/// ones, so two rows of the table can be stored side by side without either claiming a
-/// domain name the other holds.
-fn renamed(policy: &Policy, suffix: &str) -> Policy {
+/// The same row over staging distributions this call CREATES, stamped with `suffix`, so two
+/// rows of the table can be stored side by side without either claiming a staging
+/// distribution the other holds.
+///
+/// A policy's `StagingDistributionDnsNames` names the staging DISTRIBUTION by the domain
+/// name CloudFront assigned it, so a row that is to be stored names distributions this
+/// service really holds rather than domain names written here.
+async fn renamed(router: &MultiServiceRouter, policy: &Policy, suffix: &str) -> Policy {
     let mut row = policy.clone();
-    row.dns_names = (0..policy.dns_names.len())
-        .map(|index| format!("d{suffix}{index}abcdef8.cloudfront.net"))
-        .collect();
+    row.dns_names = staging_domains(router, suffix, policy.dns_names.len()).await;
     row
 }
 
@@ -182,8 +187,8 @@ async fn an_accepted_update_replaces_the_stored_configuration() {
 
     for (index, policy) in table.iter().enumerate() {
         let case = policy.case;
-        let before = renamed(policy, &format!("u{index}a"));
-        let after = renamed(&table[(index + 1) % table.len()], &format!("u{index}b"));
+        let before = renamed(&router, policy, &format!("u{index}a")).await;
+        let after = renamed(&router, &table[(index + 1) % table.len()], &format!("u{index}b")).await;
         let (id, created_etag) = seed(&router, &before).await;
         assert_stored(&router, &id, &before, &created_etag, "after the create").await;
 
@@ -266,9 +271,9 @@ async fn an_accepted_update_replaces_the_stored_configuration() {
 async fn an_if_match_that_is_not_the_current_version_is_refused() {
     let router = emulator();
     let table = policy_table();
-    let subject = renamed(&table[2], "ifm-a");
-    let other = renamed(&table[3], "ifm-b");
-    let target = renamed(&table[0], "ifm-c");
+    let subject = renamed(&router, &table[2], "ifm-a").await;
+    let other = renamed(&router, &table[3], "ifm-b").await;
+    let target = renamed(&router, &table[0], "ifm-c").await;
 
     let (_, other_etag) = seed(&router, &other).await;
     let (id, first_etag) = seed(&router, &subject).await;
@@ -387,8 +392,8 @@ async fn an_if_match_that_is_not_the_current_version_is_refused() {
 async fn an_id_no_policy_holds_is_refused() {
     let router = emulator();
     let table = policy_table();
-    let present = renamed(&table[1], "missing-a");
-    let deleted = renamed(&table[4], "missing-b");
+    let present = renamed(&router, &table[1], "missing-a").await;
+    let deleted = renamed(&router, &table[4], "missing-b").await;
 
     let (id, etag) = seed(&router, &present).await;
     let (gone_id, gone_etag) = seed(&router, &deleted).await;
@@ -455,7 +460,7 @@ async fn an_id_no_policy_holds_is_refused() {
 async fn a_configuration_the_create_would_refuse_is_refused() {
     let router = emulator();
     let table = policy_table();
-    let stored = renamed(&table[2], "bad-a");
+    let stored = renamed(&router, &table[2], "bad-a").await;
     let (id, etag) = seed(&router, &stored).await;
 
     // The `Quantity` of the one list wrapper this configuration carries, stated as one more
@@ -519,7 +524,7 @@ async fn a_configuration_the_create_would_refuse_is_refused() {
     // than or equal to MaximumTTL", `ContinuousDeploymentSingleHeaderConfig$Header` "must
     // contain the prefix aws-cf-cd-", and at most
     // `MAX_STAGING_DISTRIBUTION_DNS_NAMES` staging distribution domain names.
-    let mut too_many = renamed(&table[0], "bad-many");
+    let mut too_many = table[0].clone();
     too_many.dns_names = (0..=MAX_STAGING_DISTRIBUTION_DNS_NAMES)
         .map(|index| format!("dbadmany{index}abcdef8.cloudfront.net"))
         .collect();
@@ -659,8 +664,9 @@ async fn an_update_claiming_another_policys_staging_distribution_is_refused() {
 
     for (index, policy) in table.iter().enumerate().take(3) {
         let case = policy.case;
-        let subject = renamed(policy, &format!("inuse{index}a"));
-        let holder = renamed(&table[(index + 1) % table.len()], &format!("inuse{index}b"));
+        let subject = renamed(&router, policy, &format!("inuse{index}a")).await;
+        let holder = renamed(&router, &table[(index + 1) % table.len()], &format!("inuse{index}b"))
+            .await;
 
         let (holder_id, _) = seed(&router, &holder).await;
         let (id, etag) = seed(&router, &subject).await;
@@ -695,7 +701,7 @@ async fn an_update_claiming_another_policys_staging_distribution_is_refused() {
 
         // Keeping its OWN domain names is no conflict: the policy may change everything else
         // the configuration states while routing traffic to the same staging distribution.
-        let mut kept = renamed(&table[(index + 2) % table.len()], &format!("inuse{index}a"));
+        let mut kept = table[(index + 2) % table.len()].clone();
         kept.dns_names = subject.dns_names.clone();
         let accepted = update_policy(&router, &id, &kept.xml(), Some(&etag)).await;
         assert_eq!(

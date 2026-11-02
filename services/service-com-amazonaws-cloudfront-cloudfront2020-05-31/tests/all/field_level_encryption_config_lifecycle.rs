@@ -68,7 +68,9 @@ const URL_ENCODED: &str = "URLEncoded";
 const NO_SUCH_CONFIG_MESSAGE: &str = "The specified field level encryption config does not exist.";
 const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
 const QUERY_ARG_PROFILE_EMPTY: &str =
-    "No profile specified for the field-level encryption query argument.";
+    "The query arg profile in field level encryption config cannot be empty when content \
+     type profile is empty or when no default profile id is given in any content type \
+     profile.";
 
 // ---------------------------------------------------------------------------
 // Calling the configuration surface
@@ -478,36 +480,41 @@ pub(crate) fn is_config_id(value: &str) -> bool {
 /// The configurations every case below is run over, each mapping pointing at the stored
 /// profile `profile`.
 ///
-/// The rows span what the rules generalise over: a configuration with neither mapping section,
-/// with one, and with both; a section whose wrapper is left out, one stating an empty list,
-/// one mapping and several; both settings of each forwarding flag; a content type mapping
-/// with and without a `ProfileId`; and the comment forms (absent, empty, plain ASCII, XML
-/// metacharacters, and the published 128-character bound).
+/// The rows span what the rules generalise over: one mapping section and both; a section
+/// whose wrapper is left out, one stating an empty list, one mapping and several; both
+/// settings of each forwarding flag; a content type mapping with and without a `ProfileId`;
+/// and the comment forms (absent, empty, plain ASCII, XML metacharacters, and the published
+/// 128-character bound). Every row names a profile in one of its two sections, since a
+/// configuration naming none in either is refused (`QueryArgProfileEmpty`, 400) — asserted
+/// in [`crate::request_validation_limits`].
 pub(crate) fn table(profile: &str) -> Vec<Config> {
     // "The comment cannot be longer than 128 characters": the bound itself is admissible, so
     // one row sits exactly on it.
     let on_the_bound = "c".repeat(MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT);
     vec![
         Config::new(
-            "neither mapping section",
-            "fle-config-bare",
-            None,
-            None,
-            None,
-        ),
-        Config::new(
-            "a query argument section with no wrapper at all",
+            "a query argument section with no wrapper at all, beside a content type mapping \
+             naming the profile",
             "fle-config-no-wrapper",
             Some(""),
             Some(Section::new(true, None)),
-            None,
+            Some(Section::new(
+                false,
+                Some(vec![ContentTypeMapping::new("text/html", Some(profile))]),
+            )),
         ),
         Config::new(
-            "both sections, each stating an empty list",
+            "an empty query argument list beside a content type mapping naming the profile",
             "fle-config-empty-lists",
             Some("the configuration for an emulator test"),
             Some(Section::new(false, Some(Vec::new()))),
-            Some(Section::new(false, Some(Vec::new()))),
+            Some(Section::new(
+                false,
+                Some(vec![ContentTypeMapping::new(
+                    "application/json",
+                    Some(profile),
+                )]),
+            )),
         ),
         Config::new(
             "one query argument mapping",
@@ -533,10 +540,13 @@ pub(crate) fn table(profile: &str) -> Vec<Config> {
             )),
         ),
         Config::new(
-            "a content type mapping that names no profile",
+            "a content type mapping that names no profile, beside a query argument mapping",
             "fle-config-content-type-no-profile",
             Some("no profile on the mapping"),
-            None,
+            Some(Section::new(
+                false,
+                Some(vec![QueryArgMapping::new("fle-profile", profile)]),
+            )),
             Some(Section::new(
                 true,
                 Some(vec![ContentTypeMapping::new("text/plain", None)]),

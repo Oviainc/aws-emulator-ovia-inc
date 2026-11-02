@@ -6,6 +6,13 @@
 //! freshly minted id and version token, so a later read or listing answers from that
 //! record rather than from the request that created it.
 //!
+//! A `StagingDistributionDnsNames` that carries no domain name at all, and one whose entry
+//! no distribution of this account is served on, are each refused with `InvalidArgument`
+//! before anything is minted
+//! ([`crate::state::names_no_staging_distribution_domain`],
+//! [`crate::state::names_foreign_staging_distribution_domain`]): the policy moves traffic to
+//! a staging DISTRIBUTION of this account, which neither names.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -179,6 +186,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // `StagingDistributionDnsNames` is the member naming the staging distribution the
+        // policy moves traffic to, so a wrapper carrying no name at all describes no policy.
+        if crate::state::names_no_staging_distribution_domain(&config) {
+            return Err(CreateContinuousDeploymentPolicyErrorModeled::InvalidArgument(
+                crate::state::empty_staging_distribution_dns_names(),
+            )
+            .into());
+        }
+
         // A member outside what the documentation allows for it (the traffic
         // configuration the stated `Type` selects, the weight's range, the session
         // stickiness TTLs) is "An argument is invalid", named member by member.
@@ -194,6 +210,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
+
+        // "The CloudFront domain name of the staging distribution": the policy moves traffic
+        // to a distribution of this account, named by the domain name CloudFront assigned
+        // it — so each name is resolved against the stored distributions, and one that names
+        // none of them names no staging distribution to move traffic to. Refused before
+        // anything is minted, naming the member that carried it.
+        if crate::state::names_foreign_staging_distribution_domain(&store, &config) {
+            return Err(CreateContinuousDeploymentPolicyErrorModeled::InvalidArgument(
+                crate::state::foreign_staging_distribution_domain(),
+            )
+            .into());
+        }
 
         // "A continuous deployment policy with this configuration already exists": a
         // create repeating a configuration the store already holds names that policy

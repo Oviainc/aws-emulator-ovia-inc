@@ -142,9 +142,8 @@ const KINDS: &[(Kind, &str, &str)] = &[
 /// The kinds whose UPDATE takes the same name member, so the uniqueness rule has a second
 /// entry point: the update that moves onto this resource a name a sibling already holds.
 ///
-/// `UpdateOriginAccessControl` reaches the same rule, but its conflict is decided over the
-/// whole parameter set rather than the name, so it is asserted where that comparison is
-/// already driven — `crate::origin_access_control_update`'s
+/// `UpdateOriginAccessControl` reaches the same rule, which is asserted where that update's
+/// own suite drives it — `crate::origin_access_control_update`'s
 /// `parameters_another_control_holds_cannot_be_moved_onto_this_one` — rather than here.
 const UPDATED_KINDS: &[Kind] = &[Kind::KeyGroup, Kind::CachePolicy, Kind::OriginRequestPolicy];
 
@@ -377,15 +376,8 @@ async fn update_to_name(
 /// The configuration a repeat under a taken name carries: a DIFFERENT row of the kind's own
 /// table, so a create that replaced the stored resource rather than refusing the name would
 /// be visible in the read-back.
-///
-/// The one exception is the origin access control, whose conflict this service decides over
-/// the WHOLE parameter set rather than the name alone, so there the repeat re-submits the
-/// parameters the first create stored.
-fn repeat_variant(kind: Kind, variant: usize) -> usize {
-    match kind {
-        Kind::OriginAccessControl => variant,
-        _ => variant + 1,
-    }
+fn repeat_variant(_kind: Kind, variant: usize) -> usize {
+    variant + 1
 }
 
 /// One resource this suite created: the identifier and the version token its create

@@ -72,7 +72,10 @@ const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption prof
 
 /// `PUT /2020-05-31/field-level-encryption/{Id}/config` with the `FieldLevelEncryptionConfig`
 /// document `body` and the `If-Match` header `if_match` (left off entirely when `None`).
-async fn update_config(
+///
+/// `pub(crate)` so a sibling suite that updates a configuration goes over this one wire path
+/// rather than growing a copy of it.
+pub(crate) async fn update_config(
     router: &MultiServiceRouter,
     id: &str,
     body: &str,
@@ -184,9 +187,11 @@ async fn assert_stored(
 ///
 /// Every member an update may move, moved: the comment in each of its forms (replaced, emptied,
 /// left out, exactly on the published bound, multi-byte beside XML metacharacters) and the
-/// mapping sections taken from both to neither and back, over each forwarding flag, each
-/// wrapper form (absent, empty, one mapping, several) and a content type mapping with and
-/// without a `ProfileId`.
+/// mapping sections over each forwarding flag, each wrapper form (absent, empty, one mapping,
+/// several) and a content type mapping with and without a `ProfileId`. Every target states a
+/// `QueryArgProfileConfig` and names a profile in one of its sections, since an update that
+/// drops the section or names no profile at all is refused — asserted in
+/// [`crate::request_validation_limits`].
 fn targets(row: &Config, profile: &str) -> Vec<Config> {
     let on_the_bound = "c".repeat(MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT);
     #[allow(clippy::type_complexity)]
@@ -194,9 +199,7 @@ fn targets(row: &Config, profile: &str) -> Vec<Config> {
         Option<Section<QueryArgMapping>>,
         Option<Section<ContentTypeMapping>>,
     )> = vec![
-        // Neither section at all: an update may take a configuration back to carrying none.
-        (None, None),
-        // One query argument mapping, forwarding an unknown profile.
+        // One query argument mapping and no content type section at all.
         (
             Some(Section::new(
                 true,
@@ -204,10 +207,14 @@ fn targets(row: &Config, profile: &str) -> Vec<Config> {
             )),
             None,
         ),
-        // Both sections, each stating an empty list, with both flags off.
+        // An empty query argument list beside a content type mapping that names the
+        // profile: the fallback the content type mapping supplies is what makes it usable.
         (
             Some(Section::new(false, Some(Vec::new()))),
-            Some(Section::new(false, Some(Vec::new()))),
+            Some(Section::new(
+                false,
+                Some(vec![ContentTypeMapping::new("text/html", Some(profile))]),
+            )),
         ),
         // Several mappings in both sections, one content type mapping naming no profile.
         (
@@ -227,7 +234,25 @@ fn targets(row: &Config, profile: &str) -> Vec<Config> {
             )),
         ),
         // A content type section whose wrapper is left out entirely.
-        (None, Some(Section::new(true, None))),
+        (
+            Some(Section::new(
+                true,
+                Some(vec![QueryArgMapping::new("kept-arg", profile)]),
+            )),
+            Some(Section::new(true, None)),
+        ),
+        // A query argument section whose wrapper is left out entirely, beside the content
+        // type mapping that names the profile.
+        (
+            Some(Section::new(false, None)),
+            Some(Section::new(
+                true,
+                Some(vec![ContentTypeMapping::new(
+                    "application/json",
+                    Some(profile),
+                )]),
+            )),
+        ),
     ];
     let comments: Vec<Option<String>> = vec![
         Some("updated once".to_string()),
@@ -481,6 +506,17 @@ async fn an_update_that_moves_the_caller_reference_is_refused() {
     for row in table(&profile) {
         let (id, etag, instant) = seed(&router, &row).await;
 
+        // Every update states the `QueryArgProfileConfig` the service requires on one, so a
+        // row that carries no such section submits it with its wrapper left out — the
+        // refusals below are about the caller reference and nothing else.
+        let payload = Config {
+            query_arg: row
+                .query_arg
+                .clone()
+                .or_else(|| Some(Section::new(false, None))),
+            ..row.clone()
+        };
+
         // One row per form the change takes: another value, an empty one, a longer one, the
         // same value in another case, and a reference no configuration holds.
         let references: [(&str, String); 5] = [
@@ -508,7 +544,7 @@ async fn an_update_that_moves_the_caller_reference_is_refused() {
             let moved = Config {
                 case: case.clone(),
                 caller_reference: reference.clone(),
-                ..row.clone()
+                ..payload.clone()
             };
             let answer = update_config(&router, &id, &moved.xml(), Some(&etag)).await;
             assert_eq!(
@@ -535,7 +571,7 @@ async fn an_update_that_moves_the_caller_reference_is_refused() {
         let legal = Config {
             case: format!("{} / the stored reference", row.case),
             comment: Some("the legal update after the refusals".to_string()),
-            ..row.clone()
+            ..payload.clone()
         };
         let accepted = update_config(&router, &id, &legal.xml(), Some(&etag)).await;
         assert_eq!(
@@ -879,7 +915,9 @@ async fn an_update_whose_mapping_list_passes_its_bound_is_refused() {
             } else {
                 Config {
                     case: format!("{list} {case} ({count} mappings)"),
-                    query_arg: None,
+                    // The section is required on every update, so it is stated with its
+                    // wrapper left out while the content type mappings name the profile.
+                    query_arg: Some(Section::new(true, None)),
                     content_type: Some(Section::new(
                         true,
                         Some(

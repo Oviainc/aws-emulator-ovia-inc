@@ -171,14 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "An origin access control with the specified parameters already exists": the
-        // conflict is over the whole set of parameters, so a request asking for exactly
-        // what a stored control already asks for names THAT control rather than a second
-        // one, and is refused leaving it untouched. A request that differs in any member
-        // describes a different control and creates one. The refusal carries the service's
-        // fixed sentence for this code, so it names neither the submitted parameters nor
-        // the control that holds them.
-        if store.origin_access_control_with_config(&config).is_some() {
+        // "An origin access control with the same name already exists": a name identifies
+        // ONE control of this account, so a request under a name a stored control holds
+        // names THAT control rather than a second one, and is refused leaving it untouched.
+        // The refusal carries the service's fixed sentence for this code, so it names
+        // neither the submitted parameters nor the control that holds the name.
+        if store.origin_access_control_named(&config.name).is_some() {
             return Err(
                 CreateOriginAccessControlErrorModeled::OriginAccessControlAlreadyExists(
                     crate::state::origin_access_control_already_exists(),

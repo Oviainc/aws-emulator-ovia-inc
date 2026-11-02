@@ -10,6 +10,12 @@
 //! A mutating operation — "Uploads a public key to CloudFront" — and the only path by
 //! which a public key enters this service's store.
 //!
+//! A key is unique by its `Name` as well as by its `CallerReference`: a create under a name
+//! another key of this account already holds is `PublicKeyAlreadyExists` (HTTP 409) rather
+//! than a second key, and so is one under a reference another key holds — the sentence names
+//! the value that was taken. The NAME is checked first, so a repeat of a whole request, which
+//! carries the stored key's name, is refused on the name.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -167,29 +173,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "A name to help identify the public key": a name identifies ONE key of this
+        // account, so a name another key already holds cannot name a second one — the key
+        // that holds it is left exactly as it was. Checked FIRST of the two values a key is
+        // unique by, so a create repeating a stored key's name is refused on the name
+        // whatever caller reference it carries.
+        if store.public_key_named(&config.name).is_some() {
+            return Err(CreatePublicKeyErrorModeled::PublicKeyAlreadyExists(
+                PublicKeyAlreadyExists {
+                    message: Some(
+                        crate::state::PUBLIC_KEY_NAME_ALREADY_EXISTS_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         // A caller reference identifies ONE public key for its whole life: it is "a string
         // included in the request to help make sure that the request can't be replayed", so
-        // a repeat under a reference the store already holds is either the SAME request
-        // again or a second key under a taken reference. What separates the two is the
-        // content of the configuration — the rule this service's distribution and origin
-        // access identity creates follow for their own references: a repeat whose
-        // configuration is the one that reference already names is answered with that key,
-        // its version and its location (creating nothing), and a repeat that changes the
-        // configuration is refused.
-        if let Some(existing) = store.public_key_by_caller_reference(&config.caller_reference) {
-            if crate::state::same_public_key_config(&existing.config, &config) {
-                // The same request again: the record the first create left behind, at its
-                // current version. Nothing is minted and nothing is stored.
-                return Ok(CreatePublicKeyOutput {
-                    public_key: Some(existing.to_public_key()),
-                    location: Some(crate::state::location_uri(&crate::state::public_key_path(
-                        &existing.id,
-                    ))),
-                    e_tag: Some(existing.etag.clone()),
-                });
-            }
-            // The conflict is over the caller reference the REQUEST carried, so the
-            // sentence is fixed service text and names no stored identifier.
+        // a create under a reference the store already holds is refused rather than storing
+        // a second key under it. The conflict is over the reference the REQUEST carried, so
+        // the sentence is fixed service text and names no stored identifier. A repeat of a
+        // whole request reaches the NAME refusal above instead, since a key's name travels
+        // with its reference.
+        if store
+            .public_key_by_caller_reference(&config.caller_reference)
+            .is_some()
+        {
             return Err(CreatePublicKeyErrorModeled::PublicKeyAlreadyExists(
                 PublicKeyAlreadyExists {
                     message: Some(crate::state::PUBLIC_KEY_ALREADY_EXISTS_MESSAGE.to_string()),

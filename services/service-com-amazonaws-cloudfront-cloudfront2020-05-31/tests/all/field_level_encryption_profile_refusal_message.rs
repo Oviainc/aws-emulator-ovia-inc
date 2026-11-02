@@ -196,10 +196,12 @@ fn assert_refusal(answer: &Answer, case: &str, status: u16, code: &str, message:
 // ---------------------------------------------------------------------------
 
 /// Every path that reports a field-level encryption profile id as naming nothing answers
-/// `NoSuchFieldLevelEncryptionProfile` with the ONE wire sentence for that code: the two
-/// readers, the update and the delete of the profile itself, where the id travels in the path,
-/// and the create and the update of a configuration, where it travels in the document as a
-/// mapping's `ProfileId`.
+/// `NoSuchFieldLevelEncryptionProfile`, and the MESSAGE is the wire sentence for what it
+/// found: an `Id` outside the shape a profile id takes is refused as an identifier the
+/// service cannot read, a well-formed id no profile answers to is the absent-profile
+/// sentence, and a profile id borne by a DOCUMENT — a mapping's `ProfileId` on a
+/// configuration create or update — is the absent-profile sentence whatever its shape, since
+/// it addresses no operation.
 #[tokio::test]
 async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
     let router = emulator();

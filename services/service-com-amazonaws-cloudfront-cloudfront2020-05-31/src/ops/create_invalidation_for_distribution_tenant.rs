@@ -222,6 +222,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // "The path is relative to the distribution and must begin with a slash", and the
+        // characters a URI path cannot carry unescaped have to be URL-encoded: the SAME rule
+        // the distribution's own invalidation path applies, since a tenant's batch names
+        // objects the same way.
+        if crate::state::batch_names_invalid_path(&input.invalidation_batch) {
+            return Err(
+                CreateInvalidationForDistributionTenantErrorModeled::InvalidArgument(
+                    crate::state::invalid_invalidation_paths(),
+                )
+                .into(),
+            );
+        }
+
         // "If you make a second invalidation request with the same value for
         // CallerReference, and if the rest of the request is the same, CloudFront doesn't
         // create a new invalidation request. Instead, CloudFront returns information about
