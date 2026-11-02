@@ -263,6 +263,8 @@ mod triggers;
 mod unfiltered_metadata;
 #[path = "all/unfiltered_table_metadata.rs"]
 mod unfiltered_table_metadata;
+#[path = "all/update_partition.rs"]
+mod update_partition;
 #[path = "all/usage_profiles.rs"]
 mod usage_profiles;
 #[path = "all/wire.rs"]

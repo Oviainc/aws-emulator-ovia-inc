@@ -31,21 +31,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::error_messages::assert_refusal;
 use crate::partitions::{
-    batch_create, get_partition, instant, partition_errors, seed_table, values_of, without_instants,
+    batch_create, generation, instant, partition_errors, seed_table, stored, values_of,
+    without_instants, SETTABLE_MEMBERS,
 };
 use crate::wire::{assert_echoed, emulator, ok, ACCOUNT_ID, ERROR_DETAIL_TAG};
-
-/// The members of a stored partition a `PartitionInput` can set, so a suite can assert
-/// the ones an update OMITTED are gone rather than left over from the create.
-///
-/// Source: the members of `com.amazonaws.glue#PartitionInput` other than `Values`, which
-/// is the partition's address (`smithy_query shape=PartitionInput`).
-const SETTABLE_MEMBERS: [&str; 4] = [
-    "StorageDescriptor",
-    "Parameters",
-    "LastAccessTime",
-    "LastAnalyzedTime",
-];
 
 /// Submit one `BatchUpdatePartition` that must answer 200, and return its body.
 async fn batch_update(
@@ -79,22 +68,6 @@ fn update_errors(body: &Value) -> &[Value] {
 /// address an update may write to.
 fn entry(input: &Value) -> Value {
     json!({ "PartitionValueList": values_of(input), "PartitionInput": input })
-}
-
-/// `Parameters` naming which write stored a definition, so a read says which one it is
-/// serving.
-fn generation(which: &str) -> Value {
-    json!({ "generation": which })
-}
-
-/// Read one partition that must be there, and return it.
-async fn stored(router: &MultiServiceRouter, database: &str, table: &str, values: &[&str]) -> Value {
-    let (status, body) = get_partition(router, database, table, values).await;
-    assert_eq!(
-        status, 200,
-        "the partition {values:?} must be readable, got {status} with {body}"
-    );
-    body["Partition"].clone()
 }
 
 // ---------------------------------------------------------------------------

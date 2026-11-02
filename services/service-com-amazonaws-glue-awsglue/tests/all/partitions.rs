@@ -137,6 +137,39 @@ pub(crate) fn instant(value: &Value, member: &str) -> Option<f64> {
     value.get(member).and_then(Value::as_f64)
 }
 
+/// The members of a stored partition a `PartitionInput` can set, so a suite can assert
+/// the ones a write OMITTED are gone rather than left over from an earlier write.
+///
+/// Source: the members of `com.amazonaws.glue#PartitionInput` other than `Values`, which
+/// is the partition's address (`smithy_query shape=PartitionInput`).
+pub(crate) const SETTABLE_MEMBERS: [&str; 4] = [
+    "StorageDescriptor",
+    "Parameters",
+    "LastAccessTime",
+    "LastAnalyzedTime",
+];
+
+/// Read one partition that must be there, and return it.
+pub(crate) async fn stored(
+    router: &MultiServiceRouter,
+    database: &str,
+    table: &str,
+    values: &[&str],
+) -> Value {
+    let (status, body) = get_partition(router, database, table, values).await;
+    assert_eq!(
+        status, 200,
+        "the partition {values:?} must be readable, got {status} with {body}"
+    );
+    body["Partition"].clone()
+}
+
+/// `Parameters` naming which write stored a definition, so a read says which one it is
+/// serving.
+pub(crate) fn generation(which: &str) -> Value {
+    json!({ "generation": which })
+}
+
 // ---------------------------------------------------------------------------
 // Batch create -> read round trip
 // ---------------------------------------------------------------------------

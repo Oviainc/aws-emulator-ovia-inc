@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePartition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePartition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePartition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Writes ONE submitted `PartitionInput` over the whole client-settable definition of the
+//! partition the request addresses by its `PartitionValueList`, so a later `GetPartition`
+//! of those values serves exactly the members this request sent and nothing it omitted,
+//! while the partition keeps the address and the server-set `CreationTime` its create
+//! wrote. "The Values property can't be changed. If you want to change the partition key
+//! values for a partition, delete and recreate the partition"
+//! (`UpdatePartitionRequest$PartitionInput`), so an update never moves a partition to
+//! another address.
+//!
+//! The update decision is the SAME one each entry of `BatchUpdatePartition` makes
+//! ([`crate::state::TableEntry::update_partition`]); only the reporting differs. A batch
+//! reports a refusal as a per-entry `ErrorDetail`, while this single-partition update
+//! raises the modelled exception that error code names: an input carrying no values, or
+//! values other than the ones the request addresses, is `InvalidInputException`, and a
+//! value list the table holds no partition for is `EntityNotFoundException` — as is a
+//! database or table the catalog does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +162,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePartition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePartitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePartition"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePartitionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
+        // An update STORES a definition, so it is a catalog write: the key it is encrypted
+        // under is the one the catalog's setting names NOW and not the one the partition's
+        // create used, because "the specified encryption is applied to every catalog write
+        // thereafter" (`PutDataCatalogEncryptionSettings`). The data key is produced before
+        // the store's guard is taken, so a key KMS refuses refuses the write and leaves the
+        // stored partition exactly where it is (`crate::state::catalog_encryption`).
+        let write_key = crate::state::catalog_encryption::write_key(&state.lock(), &catalog_id);
+        let encryption =
+            match crate::state::catalog_encryption::seal(ctx, &region, write_key.as_deref()).await {
+                Ok(encryption) => encryption,
+                Err(message) => {
+                    return Err(UpdatePartitionErrorModeled::GlueEncryptionException(
+                        GlueEncryptionException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            };
+
+        let mut store = state.lock();
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(UpdatePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let database_name = database.name.clone();
+        let Some(table) = database
+            .tables
+            .get_mut(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(UpdatePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let table_name = table.name.clone();
+        match table.update_partition(
+            &input.partition_value_list,
+            &input.partition_input,
+            encryption,
+        ) {
+            Ok(_) => {
+                ::tracing::info!(
+                    operation = "UpdatePartition",
+                    catalog_id = %catalog_id,
+                    database = %database_name,
+                    table = %table_name,
+                    values = ?input.partition_value_list,
+                    "updated a Data Catalog partition"
+                );
+                // "Updates a partition": the write is the whole answer, and
+                // `UpdatePartitionResponse` carries no member at all, so nothing of the
+                // stored definition is handed back.
+                Ok(UpdatePartitionOutput {})
+            }
+            // The refusal already carries the error code it is reported under and its
+            // wording; this update raises the modelled exception that code names, so the
+            // single update and each entry of the batch refuse the same entries for the
+            // same reasons.
+            Err(refusal) => {
+                let message = Some(refusal.message());
+                Err(match refusal {
+                    crate::state::PartitionUpdateRefusal::ValuesRequired
+                    | crate::state::PartitionUpdateRefusal::ValuesCannotBeChanged => {
+                        UpdatePartitionErrorModeled::InvalidInputException(InvalidInputException {
+                            message,
+                            from_federation_source: None,
+                        })
+                    }
+                    crate::state::PartitionUpdateRefusal::NotFound => {
+                        UpdatePartitionErrorModeled::EntityNotFoundException(
+                            EntityNotFoundException {
+                                message,
+                                from_federation_source: None,
+                            },
+                        )
+                    }
+                }
+                .into())
+            }
+        }
     }
 }
