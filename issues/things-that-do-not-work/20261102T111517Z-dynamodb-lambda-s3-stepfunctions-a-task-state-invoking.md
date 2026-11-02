@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: dynamodb__lambda__s3__sfn.tenant-setup-rerun-execution-name-rejected-and-put-item-replaces-record dynamodb__lambda__s3__sfn.tenant-workflow-input-without-tenant-id-fails-at-first-task
-Issue-Key: dynamodb__lambda__s3__sfn.tenant-setup-rerun-execution-name-rejected-and-put-item-replaces-record|_await_workflow_role#1|AssertionError|assert not assumed and time.monotonic() < deadline, (
-Issue-Key: dynamodb__lambda__s3__sfn.tenant-workflow-input-without-tenant-id-fails-at-first-task|_await_workflow_role#1|AssertionError|assert not assumed and time.monotonic() < deadline, (
+Issue-Trace-Ids: dynamodb__lambda__s3__stepfunctions.tenant-setup-rerun-execution-name-rejected-and-put-item-replaces-record dynamodb__lambda__s3__stepfunctions.tenant-workflow-input-without-tenant-id-fails-at-first-task
+Issue-Key: dynamodb__lambda__s3__stepfunctions.tenant-setup-rerun-execution-name-rejected-and-put-item-replaces-record|_await_workflow_role#1|AssertionError|assert not assumed and time.monotonic() < deadline, (
+Issue-Key: dynamodb__lambda__s3__stepfunctions.tenant-workflow-input-without-tenant-id-fails-at-first-task|_await_workflow_role#1|AssertionError|assert not assumed and time.monotonic() < deadline, (
 Issue-Commit: fbef683f21970efb4631f2658975dd3b2c5af139
 
 # dynamodb__lambda__s3__stepfunctions: a Task state invoking Lambda ends FAILED with error States.Runtime and an emulator-authored cause, so no tenant-provisioning workflow can run (1 cause)

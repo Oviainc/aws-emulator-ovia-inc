@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: dynamodb__lambda__sfn.sfn-saga-compensate-on-failure
-Issue-Key: dynamodb__lambda__sfn.sfn-saga-compensate-on-failure|run#10|Timeout|execution = sfn.start_execution(stateMachineArn=sm["arn"], input=json.dumps({}))
+Issue-Trace-Ids: dynamodb__lambda__stepfunctions.sfn-saga-compensate-on-failure
+Issue-Key: dynamodb__lambda__stepfunctions.sfn-saga-compensate-on-failure|run#10|Timeout|execution = sfn.start_execution(stateMachineArn=sm["arn"], input=json.dumps({}))
 Issue-Commit: fbef683f21970efb4631f2658975dd3b2c5af139
 
 # dynamodb__lambda__stepfunctions: a saga whose Lambda task fails never reaches its Catch/compensation branch — every attempt ends FAILED States.Runtime, so the check spins to the harness cap (1 cause)
