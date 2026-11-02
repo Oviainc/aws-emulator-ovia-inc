@@ -10,11 +10,11 @@
 //! The rule under test: a `CallerReference` "uniquely identifies a request to create a
 //! resource" and names that resource for its whole life, so no update moves one onto
 //! another value — whichever resource is being updated. The refusal is `IllegalUpdate`
-//! (HTTP 400) carrying the service's ONE fixed sentence for this modification, which states
-//! the rule and embeds NOTHING from the request or from the stored record; a client or a
-//! fixture matching on that sentence sees the same string whatever the two references are.
-//! A refused update writes nothing, so the stored reference is still the one the create
-//! minted the resource under.
+//! (HTTP 400) carrying the FIXED sentence the surface being updated states this
+//! modification with — one sentence per surface, each stating the rule and embedding NOTHING
+//! from the request or from the stored record; a client or a fixture matching on that
+//! sentence sees the same string whatever the two references are. A refused update writes
+//! nothing, so the stored reference is still the one the create minted the resource under.
 //!
 //! The rows span both operations of this service that refuse the modification
 //! (`UpdateCloudFrontOriginAccessIdentity` and `UpdateDistribution`) and the forms a
@@ -27,7 +27,9 @@
 //! The wire harness, the distribution configuration builder and the identity request
 //! helpers are the lifecycle suites', reused rather than copied.
 
-use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::ILLEGAL_UPDATE_CALLER_REFERENCE_MESSAGE;
+use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
+    ILLEGAL_UPDATE_CALLER_REFERENCE_MESSAGE, ILLEGAL_UPDATE_DISTRIBUTION_CALLER_REFERENCE_MESSAGE,
+};
 
 use crate::distribution_lifecycle::{
     config, create_distribution, emulator, get_distribution, update_distribution, Answer, Config,
@@ -55,9 +57,10 @@ fn mutations() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Assert `answer` is the one refusal this rule states, and that neither reference leaked
-/// into its message.
-fn assert_refusal(answer: &Answer, case: &str, submitted: &str) {
+/// Assert `answer` is the one refusal this rule states, in the sentence `expected` — the
+/// wording the surface under test refuses the modification with — and that neither reference
+/// leaked into its message.
+fn assert_refusal(answer: &Answer, case: &str, submitted: &str, expected: &str) {
     assert_eq!(
         answer.status, 400,
         "case {case}: expected HTTP 400 from the update, got {} with {}",
@@ -71,8 +74,9 @@ fn assert_refusal(answer: &Answer, case: &str, submitted: &str) {
     );
     let message = answer.root().find_text("Message").unwrap_or_default();
     assert_eq!(
-        message, ILLEGAL_UPDATE_CALLER_REFERENCE_MESSAGE,
-        "case {case}: expected the service's fixed caller-reference sentence, got {message:?}"
+        message, expected,
+        "case {case}: expected the surface's fixed caller-reference sentence {expected:?}, got \
+         {message:?}"
     );
     assert!(
         !message.contains(STORED) && !message.contains(submitted),
@@ -111,7 +115,12 @@ async fn an_identity_update_refuses_a_changed_caller_reference_with_one_sentence
             comment: "within the documented bound".to_string(),
         };
         let answer = update_identity(&router, &id, &moved.xml(), Some(&etag)).await;
-        assert_refusal(&answer, case, &submitted);
+        assert_refusal(
+            &answer,
+            case,
+            &submitted,
+            ILLEGAL_UPDATE_CALLER_REFERENCE_MESSAGE,
+        );
 
         // Nothing was written: the stored configuration still carries the reference the
         // create minted the identity under, at the version the refused update matched on.
@@ -136,8 +145,9 @@ async fn an_identity_update_refuses_a_changed_caller_reference_with_one_sentence
     }
 }
 
-/// `UpdateDistribution` refuses the SAME modification with the SAME sentence: one rule, one
-/// refusal, across the resources whose creates mint a caller reference.
+/// `UpdateDistribution` refuses the SAME modification under the SAME code: one rule across
+/// the resources whose creates mint a caller reference, in the sentence the DISTRIBUTION
+/// surface words it with.
 #[tokio::test]
 async fn a_distribution_update_refuses_a_changed_caller_reference_with_one_sentence() {
     let router = emulator();
@@ -162,7 +172,12 @@ async fn a_distribution_update_refuses_a_changed_caller_reference_with_one_sente
             ..stored.clone()
         };
         let answer = update_distribution(&router, &id, &moved.xml(), Some(&etag)).await;
-        assert_refusal(&answer, case, &submitted);
+        assert_refusal(
+            &answer,
+            case,
+            &submitted,
+            ILLEGAL_UPDATE_DISTRIBUTION_CALLER_REFERENCE_MESSAGE,
+        );
 
         // Nothing was written: the stored configuration still carries the reference the
         // create minted the distribution under.

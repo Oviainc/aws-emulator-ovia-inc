@@ -150,10 +150,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(SystemTime::now());
 
         // The SHAPE of the identifier is a property of the request alone, so it is decided
-        // before the store is consulted. This operation's model serves no `InvalidArgument`,
-        // so the argument defect is reported under its own not-found code and the message is
-        // what tells it from a tenant that is simply absent — and it names the member that
-        // carried the identifier, which here is `DistributionTenantId`.
+        // before the store is consulted. THIS operation reads it against the shape a tenant
+        // id this service mints takes, rather than against the identifier form its siblings
+        // read ([`crate::state::is_namespaced_resource_id`]): its own recorded contract
+        // answers the identifier-format sentence for a tenant identifier at another width,
+        // which the siblings answer as a tenant that is absent, so the ordering here follows
+        // this operation's recording rather than theirs. Its model serves no
+        // `InvalidArgument`, so the argument defect is reported under its own not-found code
+        // and the message is what tells it from a tenant that is simply absent — and it names
+        // the member that carried the identifier, which here is `DistributionTenantId`.
         if !crate::state::is_distribution_tenant_id(&input.distribution_tenant_id) {
             return Err(
                 GetInvalidationForDistributionTenantErrorModeled::EntityNotFound(

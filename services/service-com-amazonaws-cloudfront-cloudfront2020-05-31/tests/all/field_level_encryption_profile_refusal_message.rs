@@ -22,6 +22,12 @@
 //!   is refused for — a query argument-profile mapping, a content type-profile mapping, or one
 //!   of each at once.
 //!
+//! One condition under that code is not the absent profile: a READ addressed by an `Id` that
+//! is a minted id of ANOTHER resource kind of this service reports the identifier it cannot
+//! read, since a profile id's namespace is disjoint from theirs. The last case below spans
+//! those namespaces against the absent-profile rows, so the two conditions the one code
+//! covers stay told apart by their sentences.
+//!
 //! Every message is also asserted NOT to be the documentation prose of its error shape
 //! (`smithy_query(query="doc",shape="NoSuchFieldLevelEncryptionProfile")` and
 //! `…shape="FieldLevelEncryptionProfileInUse"`), so the substitution this suite pins cannot
@@ -45,6 +51,7 @@ use crate::field_level_encryption_profile_lifecycle::{
 /// The sentences CloudFront sends on the wire for these refusals, spelled out here rather than
 /// taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
+const ID_FORMAT_INVALID_MESSAGE: &str = "Id format is invalid";
 const PROFILE_IN_USE_MESSAGE: &str =
     "The field level encryption profile is currently associated with a field level encryption \
      config. Please disassociate the profile before deleting.";
@@ -309,6 +316,97 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
 
     // None of those refusals disturbed the profile the account really holds, so each message
     // above answered a missing id rather than a broken store.
+    let fetched = get_profile(&router, &known).await;
+    assert_eq!(
+        fetched.status, 200,
+        "case the stored profile: expected it to survive every refusal, got {} with {}",
+        fetched.status, fetched.raw
+    );
+}
+
+/// A READ of a profile answers its one not-found code for every `Id` it cannot resolve, and
+/// the MESSAGE says which condition it was: an `Id` that is a minted id of ANOTHER resource
+/// kind of this service — the sibling field-level encryption CONFIG, a public key, a
+/// distribution, a UUID-keyed policy — could never have been a profile id, so it is reported
+/// as the identifier CloudFront cannot read, while any other unresolved `Id` is the profile
+/// that is absent.
+///
+/// The rows span the namespaces of this service that a profile id's namespace is disjoint
+/// from, taking two of them from ids this emulator really minted, against the absent-profile
+/// rows that carry a profile id never minted, the stored id in another case, a bare word and
+/// the profile's own caller reference.
+#[tokio::test]
+async fn a_profile_read_tells_an_identifier_of_another_kind_from_an_absent_profile() {
+    let router = emulator();
+    let key = upload_key(&router, 0).await;
+    let (known, _) = store_profile_with_token(&router, "fle-profile-kinds-known", &key).await;
+    let (config_id, _) = store_config(
+        &router,
+        &simple(
+            "a configuration whose id is of the sibling resource kind",
+            "fle-profile-kinds-config",
+            &known,
+        ),
+    )
+    .await;
+
+    // `(case, the Id submitted, the sentence the read answers)`
+    let rows: [(&str, String, &str); 8] = [
+        (
+            "the sibling configuration's own id",
+            config_id.clone(),
+            ID_FORMAT_INVALID_MESSAGE,
+        ),
+        (
+            "a public key id this service minted",
+            key.clone(),
+            ID_FORMAT_INVALID_MESSAGE,
+        ),
+        (
+            "a distribution id's namespace",
+            "E1234567890ABC".to_string(),
+            ID_FORMAT_INVALID_MESSAGE,
+        ),
+        (
+            "a UUID, the namespace the policy kinds are keyed by",
+            "00000000-0000-0000-0000-000000000000".to_string(),
+            ID_FORMAT_INVALID_MESSAGE,
+        ),
+        (
+            "a profile id never minted",
+            "P0000000000000".to_string(),
+            NO_SUCH_PROFILE_MESSAGE,
+        ),
+        (
+            "the stored id in lower case",
+            known.to_lowercase(),
+            NO_SUCH_PROFILE_MESSAGE,
+        ),
+        (
+            "a bare word",
+            "not-a-profile-id".to_string(),
+            NO_SUCH_PROFILE_MESSAGE,
+        ),
+        (
+            "the profile's caller reference rather than its id",
+            "fle-profile-kinds-known".to_string(),
+            NO_SUCH_PROFILE_MESSAGE,
+        ),
+    ];
+
+    for (case, id, message) in &rows {
+        let answer = get_profile(&router, id).await;
+        assert_refusal(
+            &answer,
+            &format!("GetFieldLevelEncryptionProfile with {case}"),
+            404,
+            "NoSuchFieldLevelEncryptionProfile",
+            message,
+        );
+    }
+
+    // The profile the account really holds is still readable, so every row above answered an
+    // identifier rather than a broken store.
     let fetched = get_profile(&router, &known).await;
     assert_eq!(
         fetched.status, 200,

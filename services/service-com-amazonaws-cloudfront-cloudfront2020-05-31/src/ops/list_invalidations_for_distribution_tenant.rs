@@ -176,10 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports the status its invalidation has at this instant.
         store.settle(SystemTime::now());
 
-        // The SHAPE of the id is a property of the request alone, so it is decided before
-        // the store is consulted: a value that was never a distribution tenant id is an
-        // argument this operation cannot read, not a tenant that is absent.
-        if !crate::state::is_distribution_tenant_id(&input.id) {
+        // What the REQUEST alone decides about the id is whether it could be an identifier
+        // CloudFront issued at all: `Id` carries no pattern in the model, so neither the
+        // namespace label nor the width or alphabet of the body is a constraint to refuse a
+        // value on. A value of that form is resolved against the store below, so one that
+        // was never issued is a tenant that is ABSENT rather than an argument this operation
+        // cannot read.
+        if !crate::state::is_namespaced_resource_id(&input.id) {
             return Err(
                 ListInvalidationsForDistributionTenantErrorModeled::InvalidArgument(
                     crate::state::invalid_id_format("Id"),

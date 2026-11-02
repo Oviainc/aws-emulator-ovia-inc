@@ -436,9 +436,14 @@ pub const KVS_PROVISIONING_DELAY: Duration = Duration::from_millis(500);
 /// performs, so nothing here ever reports it.
 pub const ANYCAST_IP_LIST_STATUS_DEPLOYING: &str = "Deploying";
 
-/// What an `AnycastIpList$Id` starts with: the shape CloudFront writes one in, as the
-/// ids in this crate's `ListConnectionGroups` cases show (`ipl-08d1a1b2c3d4e5f67`). The
-/// model puts no pattern on the member, so this is the one place the shape is stated.
+/// What an `AnycastIpList$Id` this service MINTS starts with, as the ids in this crate's
+/// `ListConnectionGroups` cases are written (`ipl-08d1a1b2c3d4e5f67`).
+///
+/// `AnycastIpList$Id` carries no pattern in the model, so this is the form this service
+/// writes an id in rather than a constraint it may read an id against: an identifier a
+/// caller submits is read with [`is_namespaced_resource_id`], which is why a list id under
+/// another namespace label is answered as a list that is ABSENT rather than as an identifier
+/// that cannot be read.
 pub const ANYCAST_IP_LIST_ID_PREFIX: &str = "ipl-";
 
 /// How many lowercase hex digits follow [`ANYCAST_IP_LIST_ID_PREFIX`] in an
@@ -7644,7 +7649,7 @@ pub fn is_connection_group_id(value: &str) -> bool {
         .is_some_and(is_token_body)
 }
 
-/// Whether `value` has the shape of a distribution tenant id this service mints
+/// Whether `value` has the shape of a distribution tenant id this service MINTS
 /// ([`DISTRIBUTION_TENANT_ID_PREFIX`] followed by [`ID_BODY_LEN`] characters of the id
 /// alphabet).
 ///
@@ -7652,40 +7657,71 @@ pub fn is_connection_group_id(value: &str) -> bool {
 /// which is a tenant id this service handed out, and the model constrains it no further
 /// than `string` — so this is what tells a resume point the service issued from a value a
 /// client made up.
+///
+/// NOT what an operation that ADDRESSES a tenant reads its path identifier with: the width
+/// and the alphabet here are this mint's, not CloudFront's, so refusing an identifier on
+/// them would answer an argument failure for a tenant that is merely absent. That decision
+/// is [`is_namespaced_resource_id`]'s.
 pub fn is_distribution_tenant_id(value: &str) -> bool {
     value
         .strip_prefix(DISTRIBUTION_TENANT_ID_PREFIX)
         .is_some_and(is_token_body)
 }
 
-/// Whether `value` has the shape of an Anycast static IP list id this service mints
-/// ([`ComAmazonawsCloudfrontCloudfront20200531State::allocate_anycast_ip_list_id`]): the
-/// [`ANYCAST_IP_LIST_ID_PREFIX`] namespace, followed by a body.
+/// The longest a namespace label may be in an identifier [`is_namespaced_resource_id`]
+/// admits.
 ///
-/// The PREFIX is the whole of the shape. `AnycastIpList$Id` carries no pattern in the model,
-/// so nothing documents the body's width or its alphabet: the ids this emulator mints are
-/// [`ANYCAST_IP_LIST_ID_HEX_LEN`] lowercase hex digits because that is what one observed id
-/// is, which is no claim that CloudFront never writes another width or another alphabet —
-/// and recorded behaviour has an `ipl-` id of another form answered as a list that is ABSENT
-/// rather than as an identifier that cannot be read. What the prefix DOES decide is the
-/// namespace: a value carrying none of it was never an id of this resource kind, which is a
-/// property of the value alone and therefore decidable without consulting the store.
-pub fn is_anycast_ip_list_id(value: &str) -> bool {
-    value
-        .strip_prefix(ANYCAST_IP_LIST_ID_PREFIX)
-        .is_some_and(|body| !body.is_empty())
+/// The labels CloudFront writes these ids under are short: two letters for a distribution
+/// tenant ([`DISTRIBUTION_TENANT_ID_PREFIX`]) or a connection group
+/// ([`CONNECTION_GROUP_ID_PREFIX`]), three for an Anycast static IP list
+/// ([`ANYCAST_IP_LIST_ID_PREFIX`]) — so this is the longest label any id of this service's
+/// resources carries, and a longer word followed by a separator is not a namespace at all.
+const MAX_ID_NAMESPACE_LABEL_LEN: usize = 3;
+
+/// Whether `value` could be an opaque identifier CloudFront issued for a namespaced
+/// resource: a lowercase namespace label of at most [`MAX_ID_NAMESPACE_LABEL_LEN`] letters,
+/// a separator (`_` or `-`), and a non-empty body of identifier characters (ASCII
+/// alphanumerics and those same separators).
+///
+/// This is ALL a request alone decides about such an identifier, and it is what the
+/// operations that address one by a path member (`GetAnycastIpList$Id`,
+/// `DeleteDistributionTenant$Id`, …) read it with. Those members are plain `string` in the
+/// model — no `@pattern`, no `@length` — so neither the label, nor the width of the body,
+/// nor its alphabet is a constraint this service may refuse a value on: the ids it MINTS are
+/// one form of a namespace, never the only form CloudFront writes one in. Whether an
+/// identifier of this form was ever ISSUED, and to which resource, is a property of the
+/// STORE — so a value of this form that nothing answers to is a resource that is ABSENT (the
+/// operation's not-found code, status and fixed sentence), while a value of no such form is
+/// the identifier that cannot be read at all ([`invalid_id_format`]).
+pub fn is_namespaced_resource_id(value: &str) -> bool {
+    let Some(separator) = value.find(['_', '-']) else {
+        return false;
+    };
+    let (label, rest) = value.split_at(separator);
+    let body = &rest[1..];
+    !label.is_empty()
+        && label.len() <= MAX_ID_NAMESPACE_LABEL_LEN
+        && label.bytes().all(|b| b.is_ascii_lowercase())
+        && !body.is_empty()
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Whether `value` has the shape of a key group id this service mints
-/// ([`ComAmazonawsCloudfrontCloudfront20200531State::allocate_key_group_id`] draws a UUID),
-/// for the reason [`is_anycast_ip_list_id`] exists.
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::allocate_key_group_id`] draws a UUID).
+///
+/// A key group id is a UUID, whose form is fully specified — five hex groups of fixed width
+/// — so unlike a namespaced id ([`is_namespaced_resource_id`]) the BODY is what says the
+/// value could be one at all, and this predicate is what a read of a key group reads its
+/// `Id` with.
 pub fn is_key_group_id(value: &str) -> bool {
     is_minted_uuid(value)
 }
 
 /// Whether `value` has the shape of a continuous deployment policy id this service mints
 /// ([`ComAmazonawsCloudfrontCloudfront20200531State::allocate_continuous_deployment_policy_id`]
-/// draws a UUID), for the reason [`is_anycast_ip_list_id`] exists.
+/// draws a UUID), for the reason [`is_key_group_id`] exists.
 pub fn is_continuous_deployment_policy_id(value: &str) -> bool {
     is_minted_uuid(value)
 }
@@ -9018,28 +9054,25 @@ pub fn response_headers_policy_quantity_mismatch(
 /// request where the two disagree. An `OriginRequestPolicyConfig` reaches exactly three of
 /// them — the optional `Headers`, `Cookies` and `QueryStrings` lists its three behaviour
 /// configurations carry.
+///
+/// The sentence names the WRAPPER MEMBER whose `Quantity` disagreed — `Headers`, `Cookies`,
+/// `QueryStrings` — rather than the path to it, as every other wrapper this service reports
+/// is named (`Origins`, `Aliases`, `Paths`, `ContentTypeProfiles`): recorded behaviour for
+/// this operation's refusal.
 pub fn origin_request_policy_quantity_mismatch(
     config: &OriginRequestPolicyConfig,
 ) -> Option<String> {
     let mut counts: Vec<(&'static str, i32, usize)> = Vec::new();
 
     if let Some(headers) = &config.headers_config.headers {
-        counts.push((
-            "HeadersConfig.Headers",
-            headers.quantity,
-            items_len(&headers.items),
-        ));
+        counts.push(("Headers", headers.quantity, items_len(&headers.items)));
     }
     if let Some(cookies) = &config.cookies_config.cookies {
-        counts.push((
-            "CookiesConfig.Cookies",
-            cookies.quantity,
-            items_len(&cookies.items),
-        ));
+        counts.push(("Cookies", cookies.quantity, items_len(&cookies.items)));
     }
     if let Some(query_strings) = &config.query_strings_config.query_strings {
         counts.push((
-            "QueryStringsConfig.QueryStrings",
+            "QueryStrings",
             query_strings.quantity,
             items_len(&query_strings.items),
         ));
@@ -10398,6 +10431,27 @@ pub fn illegal_update_caller_reference() -> crate::ops::types::IllegalUpdate {
 pub const ILLEGAL_UPDATE_CALLER_REFERENCE_MESSAGE: &str =
     "You cannot update the value of CallerReference.";
 
+/// The modelled `IllegalUpdate` (HTTP 400) for an update that would move a DISTRIBUTION's
+/// `CallerReference` onto another value.
+///
+/// The same RULE [`illegal_update_caller_reference`] states — a caller reference names its
+/// resource for the resource's whole life, so no update moves one — reported in the sentence
+/// the DISTRIBUTION surface words it with
+/// ([`ILLEGAL_UPDATE_DISTRIBUTION_CALLER_REFERENCE_MESSAGE`]). The wording of a refusal is
+/// the service's own per surface, as [`DISTRIBUTION_TENANT_NOT_DISABLED_MESSAGE`] and the
+/// other wire sentences here are; the sentence takes nothing from the request or the stored
+/// record, so every refusal of it reads the same.
+pub fn illegal_update_distribution_caller_reference() -> crate::ops::types::IllegalUpdate {
+    crate::ops::types::IllegalUpdate {
+        message: Some(ILLEGAL_UPDATE_DISTRIBUTION_CALLER_REFERENCE_MESSAGE.to_string()),
+    }
+}
+
+/// `IllegalUpdate`'s message for an update that would change a DISTRIBUTION's
+/// `CallerReference`, on the wire.
+pub const ILLEGAL_UPDATE_DISTRIBUTION_CALLER_REFERENCE_MESSAGE: &str =
+    "The caller reference cannot be modified.";
+
 /// The modelled `MonitoringSubscriptionAlreadyExists` (HTTP 409) for a distribution that
 /// already carries a monitoring subscription.
 ///
@@ -10923,6 +10977,47 @@ pub fn no_such_field_level_encryption_profile() -> crate::ops::types::NoSuchFiel
 pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
     "The specified field level encryption profile does not exist.";
 
+/// The modelled `NoSuchFieldLevelEncryptionProfile` (HTTP 404) a READ of a profile answers
+/// an `Id` it cannot resolve.
+///
+/// `GetFieldLevelEncryptionProfile` models this one not-found code, so one code and one
+/// status cover two conditions and the MESSAGE is what tells them apart — the same split
+/// [`unresolved_key_group_id`] makes for a key group. An `Id` that is a minted id of ANOTHER
+/// resource kind of this service ([`is_minted_entity_id_of_another_kind`]) was never a
+/// profile id: the namespaces are told apart by the letter or the form they are minted
+/// under, which is a property of the value alone, so CloudFront reports it as the identifier
+/// it cannot read ([`id_format_invalid_message`]). Every other `Id` the store holds no
+/// profile for is the absent-profile sentence
+/// ([`NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE`]) — a name, a caller reference or a
+/// profile id that was simply never minted is a profile that is not there. Both are fixed
+/// text.
+pub fn unresolved_field_level_encryption_profile_id(
+    id: &str,
+) -> crate::ops::types::NoSuchFieldLevelEncryptionProfile {
+    if is_minted_entity_id_of_another_kind(id) {
+        crate::ops::types::NoSuchFieldLevelEncryptionProfile {
+            message: Some(id_format_invalid_message("Id")),
+        }
+    } else {
+        no_such_field_level_encryption_profile()
+    }
+}
+
+/// Whether `value` is a minted id of a resource kind OTHER than a field-level encryption
+/// profile: an id of the sibling field-level encryption CONFIG, a public key, a distribution,
+/// or one of the UUID-keyed policy kinds.
+///
+/// Each of those namespaces is disjoint from a profile id's
+/// ([`is_field_level_encryption_profile_id`]), so a value in one of them could never have
+/// been a profile id — which is what separates an identifier of the WRONG RESOURCE KIND from
+/// a profile id, a name or a caller reference the store simply holds nothing for.
+fn is_minted_entity_id_of_another_kind(value: &str) -> bool {
+    is_field_level_encryption_config_id(value)
+        || is_public_key_id(value)
+        || is_distribution_id(value)
+        || is_minted_uuid(value)
+}
+
 /// The modelled `FieldLevelEncryptionProfileInUse` (HTTP 409) for a delete of a profile a
 /// stored field-level encryption configuration still names.
 ///
@@ -11419,27 +11514,29 @@ mod tests {
         );
     }
 
-    /// Each resource kind's id predicate admits exactly what this service MINTS for it and
-    /// nothing else: an id of another kind, the right prefix at the wrong length and the
-    /// right characters in the wrong case are all outside the shape.
+    /// Each MINT's predicate admits exactly what this service mints for that kind — the
+    /// resume points a listing issues are its own ids — while the form an operation
+    /// ADDRESSES a resource with ([`is_namespaced_resource_id`]) admits every namespace an
+    /// opaque id is written under, whatever label, width and alphabet it takes, and nothing
+    /// that carries no namespace at all.
     #[test]
     fn an_id_predicate_admits_only_the_shape_its_mint_renders() {
         let mut state = ComAmazonawsCloudfrontCloudfront20200531State::default();
         for _ in 0..100 {
             let list = state.allocate_anycast_ip_list_id();
             assert!(
-                is_anycast_ip_list_id(&list),
-                "case allocate_anycast_ip_list_id: expected {list:?} to be a list id"
+                is_namespaced_resource_id(&list),
+                "case allocate_anycast_ip_list_id: expected {list:?} to be an addressable id"
             );
             assert!(
-                !is_anycast_ip_list_id(&list.to_uppercase()),
-                "case upper-cased: expected {list:?} upper-cased not to be a list id, since the \
-                 prefix names the namespace"
+                !is_namespaced_resource_id(&list.to_uppercase()),
+                "case upper-cased: expected {list:?} upper-cased not to be an addressable id, \
+                 since a namespace label is lowercase"
             );
             assert!(
-                is_anycast_ip_list_id(&list[..list.len() - 1]),
-                "case one digit short: expected {list:?} truncated to still be a list id, since \
-                 the width is one observed id's rather than the rule"
+                is_namespaced_resource_id(&list[..list.len() - 1]),
+                "case one digit short: expected {list:?} truncated to still be an addressable id, \
+                 since the width is one observed id's rather than the rule"
             );
 
             let tenant = state.allocate_distribution_tenant_id();
@@ -11449,7 +11546,13 @@ mod tests {
             );
             assert!(
                 !is_distribution_tenant_id(&tenant.to_lowercase()),
-                "case lower-cased: expected {tenant:?} lower-cased not to be a tenant id"
+                "case lower-cased: expected {tenant:?} lower-cased not to be a minted tenant id"
+            );
+            assert!(
+                is_namespaced_resource_id(&tenant)
+                    && is_namespaced_resource_id(&tenant.to_lowercase()),
+                "case addressing {tenant:?}: expected both cases of the body to be addressable, \
+                 since the body's alphabet is this mint's rather than the rule"
             );
 
             let group = state.allocate_key_group_id();
@@ -11474,8 +11577,8 @@ mod tests {
         // is read as an id at all.
         for value in ["EDFDVBD6EXAMPLE", "nope", "-", ""] {
             assert!(
-                !is_anycast_ip_list_id(value),
-                "case {value:?}: expected it not to be an Anycast static IP list id"
+                !is_namespaced_resource_id(value),
+                "case {value:?}: expected it not to be an addressable namespaced id"
             );
             assert!(
                 !is_distribution_tenant_id(value),
@@ -11484,6 +11587,42 @@ mod tests {
             assert!(
                 !is_key_group_id(value),
                 "case {value:?}: expected it not to be a key group id"
+            );
+        }
+
+        // The addressable form spans the namespaces CloudFront writes an opaque id under:
+        // another label, another body width, another body alphabet and another separator are
+        // each an id the store decides on.
+        for value in [
+            "dt_3JO1OQa51Jb3BZh7XQh6pbvF3Wa",
+            "aip_1A2B3C4D5E6F7G8H9J0K1L",
+            "ipl-notaminted-id",
+            "cg_ZZZZZZZZZZZZZ",
+            "zz_0",
+        ] {
+            assert!(
+                is_namespaced_resource_id(value),
+                "case {value:?}: expected a namespaced id to be addressable"
+            );
+        }
+
+        // And it refuses what carries no namespace: no separator at all, an empty or
+        // over-long label, an upper-case label, a body that is empty or outside the
+        // identifier alphabet.
+        let grossly_malformed = "A".repeat(512);
+        for value in [
+            grossly_malformed.as_str(),
+            "iplist0123456789",
+            "-ipl-0",
+            "present-list",
+            "IPL-0123456789abcdef0",
+            "dt_",
+            "dt_token with a space",
+            "f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e",
+        ] {
+            assert!(
+                !is_namespaced_resource_id(value),
+                "case {value:?}: expected a value of no namespace not to be addressable"
             );
         }
     }

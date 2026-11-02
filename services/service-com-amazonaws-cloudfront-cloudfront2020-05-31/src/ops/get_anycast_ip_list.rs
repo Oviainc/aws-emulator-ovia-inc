@@ -151,10 +151,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        // The SHAPE of the id is a property of the request alone, so it is decided before
-        // the store is consulted: a value that was never an Anycast static IP list id is an
-        // argument this operation cannot read, not a list that is absent.
-        if !crate::state::is_anycast_ip_list_id(&input.id) {
+        // What the REQUEST alone decides about the id is whether it could be an identifier
+        // CloudFront issued at all: `Id` carries no pattern in the model, so neither the
+        // namespace label nor the width or alphabet of the body is a constraint to refuse a
+        // value on — the `ipl-` + hex form this service MINTS is one namespace an Anycast
+        // static IP list id is written under, not the only one. A value of that form is
+        // resolved against the store below, so one that was never issued is a list that is
+        // ABSENT rather than an argument this operation cannot read.
+        if !crate::state::is_namespaced_resource_id(&input.id) {
             return Err(GetAnycastIpListErrorModeled::InvalidArgument(
                 crate::state::invalid_id_format("Id"),
             )

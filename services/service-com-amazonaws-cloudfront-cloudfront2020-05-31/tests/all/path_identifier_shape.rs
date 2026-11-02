@@ -4,17 +4,19 @@
 //! HTTP.
 //!
 //! Two rules, both about ordering, and both per OPERATION rather than per resource kind —
-//! each operation's own recorded behaviour decides whether it reads the identifier's shape
+//! each operation's own recorded behaviour decides whether it reads the identifier's form
 //! before resolving it, exactly as the response-headers-policy family already shows (its
 //! config read answers the shape sentence while its listing answers the absent-policy one):
 //!
-//! * an identifier bound to the path is checked for the SHAPE its resource type's ids take
-//!   before it is resolved: a value that was never an id of that kind is reported as the
-//!   unreadable argument it is — `InvalidArgument` (400) where the operation's model serves
-//!   one, otherwise under the operation's own unresolvable-identifier code, with the message
-//!   naming the MEMBER the identifier arrived in — and never as a resource that is absent. A
-//!   well-formed id the store holds nothing for is the absent-resource answer, which is the
-//!   contrast that makes the rule about shape rather than about absence;
+//! * an identifier bound to the path is checked for the FORM an identifier of its resource
+//!   can take before it is resolved: a value that could be no such identifier at all is
+//!   reported as the unreadable argument it is — `InvalidArgument` (400) where the
+//!   operation's model serves one, otherwise under the operation's own
+//!   unresolvable-identifier code, with the message naming the MEMBER the identifier arrived
+//!   in — and never as a resource that is absent. A value that COULD be one and that the
+//!   store holds nothing for is the absent-resource answer, whatever namespace label, body
+//!   width or body alphabet it takes, which is the contrast that makes the rule about the
+//!   identifier's form rather than about absence;
 //! * a mutation that runs under an `If-Match` evaluates the header before it reports on the
 //!   resource: what the header has to be is the current version of a resource the id can
 //!   ADDRESS, so a header that is absent or is no version token at all, and any header at
@@ -26,12 +28,16 @@
 //! different shapes (an Anycast static IP list's `ipl-` + lowercase hex, a distribution
 //! tenant's `dt_` + the minted token alphabet, a key group's UUID), every operation the
 //! recorded behaviour puts under each rule, both member names those identifiers arrive in
-//! (`Id` and `DistributionTenantId`), and six forms an identifier can take outside its own
-//! shape — another namespace's id, that namespace mis-spelled or at the wrong length, the
+//! (`Id` and `DistributionTenantId`), and six forms an identifier can take that is no
+//! identifier at all — another namespace's id, a namespace label with no separator, the
 //! right characters in the wrong case, the resource's NAME, a bare word and a lone
-//! separator. Each kind also carries well-formed ids the store holds nothing for, and each
-//! operation is exercised against the resource that really exists, so the precheck is shown
-//! not to refuse the calls it must serve.
+//! separator. Each kind also carries identifiers the store holds nothing for — including, for
+//! the Anycast static IP list, other labels, other body widths and other body alphabets than
+//! the one this service mints — and each operation is exercised against the resource that
+//! really exists, so the precheck is shown not to refuse the calls it must serve. How wide
+//! each OPERATION reads a tenant identifier is its own recorded contract, so the identifiers
+//! that only the siblings of `GetInvalidationForDistributionTenant` resolve live in
+//! [`crate::absent_identifier_namespaces`] rather than in the tables here.
 //!
 //! Every assertion travels the router, so each case exercises routing, the restXml reader,
 //! the handler, the persisted state and serialization. The request harness and the create
@@ -234,10 +240,11 @@ async fn call_op(router: &MultiServiceRouter, op: Op, id: &str, version: &str) -
     }
 }
 
-/// The identifiers of each kind that are OUTSIDE the shape its ids take: `(case, value)`.
+/// The identifiers of each kind that could be NO identifier of their resource at all:
+/// `(case, value)`.
 ///
-/// One row per form a wrong identifier takes — another namespace's id, the right prefix at
-/// the wrong length, the right characters in the wrong case, the resource's own NAME, a bare
+/// One row per form such a value takes — another namespace's id, the namespace label with no
+/// separator at all, the right characters in the wrong case, the resource's own NAME, a bare
 /// word, and a lone separator — so the rule is asserted over the class rather than over the
 /// recorded token.
 fn malformed(kind: Kind, name: &str, minted: &str) -> Vec<(String, String)> {
@@ -247,17 +254,21 @@ fn malformed(kind: Kind, name: &str, minted: &str) -> Vec<(String, String)> {
         // A key group id, which is a UUID.
         Kind::DistributionTenant => "f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c3e".to_string(),
     };
-    let short = match kind {
-        // The prefix MIS-SPELLED: the prefix names the namespace, and the body's width and
-        // alphabet are no part of an Anycast list id's shape (see `well_formed_but_absent`),
-        // so what makes this one unreadable is the namespace.
-        Kind::AnycastIpList => "ipl_0123456789abcdef0".to_string(),
-        Kind::DistributionTenant => "dt_SHORTTOKEN".to_string(),
+    let unseparated = match kind {
+        // The namespace label with its SEPARATOR dropped: a namespaced id is a label, a
+        // separator and a body, and the body's width and alphabet are no part of it (see
+        // `well_formed_but_absent`), so what makes this one unreadable is that it carries no
+        // namespace.
+        Kind::AnycastIpList => "ipl0123456789abcdef0".to_string(),
+        Kind::DistributionTenant => "dtNEVERMINTED12".to_string(),
         Kind::KeyGroup => "f9a6a0b4-8d39-4a1e-9f67-1b0f7f5d2c".to_string(),
     };
     vec![
         ("another resource kind's id".to_string(), foreign),
-        ("the namespace mis-spelled or at the wrong length".to_string(), short),
+        (
+            "the namespace label with no separator, or a UUID at the wrong length".to_string(),
+            unseparated,
+        ),
         ("the minted id in the wrong case".to_string(), flip_case(minted)),
         ("the resource's name".to_string(), name.to_string()),
         ("a bare word".to_string(), "nope".to_string()),
@@ -265,8 +276,12 @@ fn malformed(kind: Kind, name: &str, minted: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// The identifiers of each kind that ARE in the shape its ids take but name no stored
-/// resource: `(case, value)`.
+/// The identifiers of each kind that COULD be one of its resource's identifiers but name no
+/// stored resource: `(case, value)`.
+///
+/// For the namespaced kinds the rows vary the parts nothing in the model constrains — the
+/// namespace label, the body's width and the body's alphabet — because none of them can
+/// refuse an identifier: only the store knows which ids were issued.
 fn well_formed_but_absent(kind: Kind) -> Vec<(String, String)> {
     match kind {
         Kind::AnycastIpList => vec![
@@ -281,6 +296,14 @@ fn well_formed_but_absent(kind: Kind) -> Vec<(String, String)> {
             (
                 "an id never minted outside the minted alphabet".to_string(),
                 "ipl-notaminted-id".to_string(),
+            ),
+            (
+                "an id under another namespace label".to_string(),
+                "aip_1A2B3C4D5E6F7G8H9J0K1L".to_string(),
+            ),
+            (
+                "the same label under the other separator".to_string(),
+                "ipl_0123456789abcdef0".to_string(),
             ),
         ],
         Kind::DistributionTenant => vec![

@@ -487,12 +487,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A distribution's caller reference identifies it for its whole life, so an
-        // update that renames it is not a modification CloudFront allows. The same one
-        // fixed sentence every caller-reference refusal of this service carries, naming no
-        // value from the request or from the stored record.
+        // update that renames it is not a modification CloudFront allows. The fixed
+        // sentence the DISTRIBUTION surface states that rule in, naming no value from the
+        // request or from the stored record.
         if input.distribution_config.caller_reference != current_caller_reference {
             return Err(UpdateDistributionErrorModeled::IllegalUpdate(
-                crate::state::illegal_update_caller_reference(),
+                crate::state::illegal_update_distribution_caller_reference(),
             )
             .into());
         }

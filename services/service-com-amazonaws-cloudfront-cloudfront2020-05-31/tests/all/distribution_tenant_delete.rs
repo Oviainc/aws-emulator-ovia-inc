@@ -415,10 +415,11 @@ async fn a_disabled_tenant_is_deleted_at_its_current_version() {
     }
 }
 
-/// An id in the shape a distribution tenant id takes but holding no tenant is
-/// `EntityNotFound` (HTTP 404); an id outside that shape was never a tenant id at all, which
-/// is `InvalidArgument` (HTTP 400) naming the member that carried it — decided before the
-/// store is consulted. The tenant that does exist is untouched either way.
+/// An id that COULD be a distribution tenant identifier but holds no tenant is
+/// `EntityNotFound` (HTTP 404) — whatever namespace label and body the value carries, since
+/// `Id` carries no pattern in the model; a value that could be no identifier at all is
+/// `InvalidArgument` (HTTP 400) naming the member that carried it — decided before the store
+/// is consulted. The tenant that does exist is untouched either way.
 #[tokio::test]
 async fn an_id_no_tenant_holds_is_refused() {
     let router = emulator();
@@ -449,7 +450,7 @@ async fn an_id_no_tenant_holds_is_refused() {
     let mut flipped: Vec<char> = id.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
-    let rows: [(&str, String, u16, &str, &str); 4] = [
+    let rows: [(&str, String, u16, &str, &str); 6] = [
         (
             "an id never minted",
             "dt_NEVERMINTED12".to_string(),
@@ -464,9 +465,28 @@ async fn an_id_no_tenant_holds_is_refused() {
             "EntityNotFound",
             TENANT_NOT_FOUND_MESSAGE,
         ),
+        // The body's width and alphabet are this emulator's mint, not a constraint the model
+        // states, so an id of another width is a tenant that is absent rather than an
+        // argument that cannot be read.
+        (
+            "an id never minted at another width and alphabet",
+            "dt_3JO1OQa51Jb3BZh7XQh6pbvF3Wa".to_string(),
+            404,
+            "EntityNotFound",
+            TENANT_NOT_FOUND_MESSAGE,
+        ),
+        // A hyphenated value whose first token is short enough to be a namespace label is in
+        // that same position: it could have been issued, so only the store decides it.
+        (
+            "another namespace label over a hyphenated body",
+            "not-a-tenant".to_string(),
+            404,
+            "EntityNotFound",
+            TENANT_NOT_FOUND_MESSAGE,
+        ),
         // `Id` is "the ID of the distribution tenant to delete", so neither the name nor the
-        // ARN the reads also accept resolves one here — and neither is in the shape a tenant
-        // id takes, so each is reported as the unreadable argument it is.
+        // ARN the reads also accept resolves one here — and neither could be an id at all,
+        // carrying no namespace, so each is reported as the unreadable argument it is.
         (
             "the tenant's name",
             present.name.clone(),
@@ -475,8 +495,8 @@ async fn an_id_no_tenant_holds_is_refused() {
             &id_format_invalid,
         ),
         (
-            "a value of no id's shape",
-            "not-a-tenant".to_string(),
+            "a value carrying no namespace",
+            "notatenant".to_string(),
             400,
             "InvalidArgument",
             &id_format_invalid,

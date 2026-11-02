@@ -51,7 +51,9 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::distribution_lifecycle::{call, emulator, is_version_token, Answer, API_VERSION};
+use crate::distribution_lifecycle::{
+    call, emulator, inconsistent_quantities_message, is_version_token, Answer, API_VERSION,
+};
 use crate::origin_request_policy_lifecycle::{
     assert_config, create_policy, get_policy, policy_table, strings, Policy,
 };
@@ -155,14 +157,32 @@ async fn assert_stored(
 /// wrapper is spelled verbatim as `wrapper` — how a `Quantity` that disagrees with its
 /// `Items` is put on the wire at all, which the typed table above cannot express.
 fn raw_config(name: &str, wrapper: &str) -> String {
+    raw_config_with(name, "whitelist", wrapper, "none", "", "none", "")
+}
+
+/// The `OriginRequestPolicyConfig` document for a policy named `name` whose three behaviour
+/// configurations carry the behaviours and the verbatim list wrappers stated — so a
+/// `Quantity` that disagrees with its `Items` can be put on the wire under ANY of the three
+/// wrappers an origin request policy reaches, not only the first.
+fn raw_config_with(
+    name: &str,
+    header_behavior: &str,
+    headers: &str,
+    cookie_behavior: &str,
+    cookies: &str,
+    query_string_behavior: &str,
+    query_strings: &str,
+) -> String {
     format!(
         "<OriginRequestPolicyConfig \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <Name>{name}</Name>\
-         <HeadersConfig><HeaderBehavior>whitelist</HeaderBehavior>{wrapper}</HeadersConfig>\
-         <CookiesConfig><CookieBehavior>none</CookieBehavior></CookiesConfig>\
-         <QueryStringsConfig><QueryStringBehavior>none</QueryStringBehavior>\
-         </QueryStringsConfig>\
+         <HeadersConfig><HeaderBehavior>{header_behavior}</HeaderBehavior>{headers}\
+         </HeadersConfig>\
+         <CookiesConfig><CookieBehavior>{cookie_behavior}</CookieBehavior>{cookies}\
+         </CookiesConfig>\
+         <QueryStringsConfig><QueryStringBehavior>{query_string_behavior}\
+         </QueryStringBehavior>{query_strings}</QueryStringsConfig>\
          </OriginRequestPolicyConfig>"
     )
 }
@@ -672,8 +692,13 @@ async fn a_refused_update_writes_nothing() {
     };
     let (_, _) = seed(&router, &occupant).await;
 
-    // (case, the submitted document, expected status, expected wire code)
-    let rows: Vec<(&'static str, String, u16, &'static str)> = vec![
+    // (case, the submitted document, expected status, expected wire code, expected message)
+    //
+    // The `InconsistentQuantities` rows span all three wrappers an origin request policy
+    // reaches and both directions the `Quantity` can disagree in, and each asserts the
+    // SENTENCE: it names the wrapper member whose quantity disagreed and the two counts
+    // taken from the request.
+    let rows: Vec<(&'static str, String, u16, &'static str, Option<String>)> = vec![
         (
             "a Headers wrapper whose Quantity is overstated",
             raw_config(
@@ -683,6 +708,7 @@ async fn a_refused_update_writes_nothing() {
             ),
             400,
             "InconsistentQuantities",
+            Some(inconsistent_quantities_message("Headers", 2, 1)),
         ),
         (
             "a Headers wrapper whose Quantity is understated",
@@ -693,6 +719,38 @@ async fn a_refused_update_writes_nothing() {
             ),
             400,
             "InconsistentQuantities",
+            Some(inconsistent_quantities_message("Headers", 1, 2)),
+        ),
+        (
+            "a Cookies wrapper whose Quantity is overstated",
+            raw_config_with(
+                "refusal-subject",
+                "none",
+                "",
+                "whitelist",
+                "<Cookies><Quantity>3</Quantity><Items><Name>session</Name></Items></Cookies>",
+                "none",
+                "",
+            ),
+            400,
+            "InconsistentQuantities",
+            Some(inconsistent_quantities_message("Cookies", 3, 1)),
+        ),
+        (
+            "a QueryStrings wrapper whose Quantity is overstated",
+            raw_config_with(
+                "refusal-subject",
+                "none",
+                "",
+                "none",
+                "",
+                "whitelist",
+                "<QueryStrings><Quantity>2</Quantity><Items><Name>page</Name></Items>\
+                 </QueryStrings>",
+            ),
+            400,
+            "InconsistentQuantities",
+            Some(inconsistent_quantities_message("QueryStrings", 2, 1)),
         ),
         (
             "a Name another policy already holds",
@@ -703,10 +761,11 @@ async fn a_refused_update_writes_nothing() {
             .xml(),
             409,
             "OriginRequestPolicyAlreadyExists",
+            None,
         ),
     ];
 
-    for (case, body, status, code) in rows {
+    for (case, body, status, code, message) in rows {
         let answer = update_policy(&router, &id, &body, Some(&etag)).await;
         assert_eq!(
             answer.status, status,
@@ -719,6 +778,14 @@ async fn a_refused_update_writes_nothing() {
             "case {case}: expected {code}, got {}",
             answer.raw
         );
+        if let Some(expected) = &message {
+            let actual = answer.root().find_text("Message").unwrap_or_default();
+            assert_eq!(
+                actual, *expected,
+                "case {case}: expected {expected:?}, got {actual:?} in {}",
+                answer.raw
+            );
+        }
         // Nothing was written: the configuration and the version token are untouched, so
         // the token the refused update carried is still the current one.
         assert_stored(&router, &id, &subject, &etag, &format!("after {case}")).await;
