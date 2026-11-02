@@ -20,6 +20,9 @@ use crate::onboarding_loop::{
     b2bi_router, call, call_signed_for, error_code, given_transformer, is_generated_id, text,
     ACCOUNT, SIGNING_REGION,
 };
+// The shape id this service's wire discriminates a `Tag` object by, stated once for the
+// whole test target in the suite that owns that rule.
+use crate::tag_type_discriminator::TAG_WIRE_SHAPE_ID;
 
 /// Every configuration member `CreateTransformerResponse` can echo, so a row can assert
 /// that what it did NOT send comes back absent.
@@ -270,7 +273,9 @@ async fn a_created_transformer_round_trips_every_persisted_member() {
         // Tags live on the stored record, so this service's tag reader reports exactly
         // the list the create supplied for the transformer's own ARN — an empty list when
         // it supplied none. Member names are `ResourceARN` / `Tags` per
-        // `smithy_query(query="operation",operation="ListTagsForResource")`.
+        // `smithy_query(query="operation",operation="ListTagsForResource")`, and each
+        // reported entry carries the `__type` discriminator this service's wire puts on a
+        // `Tag` object beside its modelled members (see `tag_type_discriminator.rs`).
         let (status, listed) = call_signed_for(
             &router,
             region,
@@ -283,13 +288,26 @@ async fn a_created_transformer_round_trips_every_persisted_member() {
             "case {case:?}: a transformer's ARN must resolve for the tag reader, got \
              {status} {listed}"
         );
-        assert_eq!(
-            listed["Tags"],
+        let expected_tags: Value = Value::Array(
             request
                 .get("tags")
+                .and_then(Value::as_array)
                 .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new())),
-            "case {case:?}: expected the tags the create supplied, got {:?}",
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| {
+                    json!({
+                        "__type": TAG_WIRE_SHAPE_ID,
+                        "Key": tag["Key"],
+                        "Value": tag["Value"],
+                    })
+                })
+                .collect(),
+        );
+        assert_eq!(
+            listed["Tags"], expected_tags,
+            "case {case:?}: expected the tags the create supplied, discriminated: \
+             {expected_tags}, got {:?}",
             listed["Tags"]
         );
     }

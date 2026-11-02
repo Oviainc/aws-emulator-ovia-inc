@@ -28,7 +28,7 @@ use crate::tag_resource::{
 use crate::tagging::{given_tagged_resource, message, tag_list, Kind};
 
 /// Detach `keys` from `arn`, signed for [`SIGNING_REGION`].
-async fn untag_resource(
+pub(crate) async fn untag_resource(
     router: &MultiServiceRouter,
     arn: &str,
     keys: &[&str],

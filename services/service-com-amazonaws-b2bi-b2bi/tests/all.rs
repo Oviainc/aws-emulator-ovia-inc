@@ -33,6 +33,8 @@ mod starter_mapping_template;
 mod state_roundtrip;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/tag_type_discriminator.rs"]
+mod tag_type_discriminator;
 #[path = "all/tagging.rs"]
 mod tagging;
 #[path = "all/tagging_and_test_harness.rs"]
