@@ -2,26 +2,33 @@
 
 //! What this service's `ResourceNotFoundException` SAYS.
 //!
-//! The text is CONSTANT: it does not vary with what was looked up, so a client matching
-//! on it does not depend on what it asked for and the lookup key never reaches an error
-//! the service keeps opaque. The rows below span the not-found paths the service has — a
-//! read, a delete, a dataset create, a conversion event, a send — and, for each, several
-//! ids that name no resource, including the ARN form and ids of different lengths: each
-//! path answers its own constant every time.
+//! Each not-found PATH states its own constant: the text does not vary with what was
+//! looked up, so a client matching on it does not depend on what it asked for and the
+//! lookup key never reaches an error the service keeps opaque, while two paths that word
+//! the same miss differently stay distinguishable. The rows below span the not-found paths
+//! the service has — a read, a delete, a dataset create, a conversion event, a send — and,
+//! for each, several ids that name no resource, including the ARN form and ids of different
+//! lengths: each path answers its own constant every time.
 
 use aws_smithy_types::base64;
 use serde_json::json;
 
 use crate::harness::{call, emulator, link, query_escape, ACCOUNT_ID};
 
-/// The message the service answers an account-or-phone-number not-found with
+/// The message the account READ answers an id that names no linked account with
 /// (`RESOURCE_NOT_FOUND_MESSAGE` in `src/state.rs`).
 const NOT_FOUND: &str = "Requested resource not found.";
 
-/// The message the Conversions API answers its own not-found with
-/// (`DATASET_NOT_FOUND_MESSAGE` in `src/state.rs`): a constant too, and the one that path
-/// was recorded stating.
+/// The message the Conversions API paths answer their own not-found with
+/// (`DATASET_NOT_FOUND_MESSAGE` in `src/state.rs`): a constant too, and the one those
+/// paths — the dataset create and the conversion event — were recorded stating.
 const DATASET_NOT_FOUND: &str = "Id not found for account.";
+
+/// The message the DISASSOCIATION answers an id that names no linked account with
+/// (`DISASSOCIATION_NOT_FOUND_MESSAGE` in `src/state.rs`): a constant too, and the one
+/// that path was recorded stating — different text from the read's and the dataset's,
+/// which is how a caller tells which lookup failed.
+const DISASSOCIATION_NOT_FOUND: &str = "Resource requested for disassociation does not exist.";
 
 /// The message the PHONE-NUMBER lookups answer an unregistered number with
 /// (`ORIGINATION_PHONE_NUMBER_NOT_FOUND_MESSAGE` in `src/state.rs`): a constant too, and
@@ -73,14 +80,14 @@ async fn every_not_found_states_the_services_constant_message() {
                 "DELETE",
                 format!("/v1/whatsapp/waba/disassociate?id={}", query_escape(id)),
                 None,
-                NOT_FOUND,
+                DISASSOCIATION_NOT_FOUND,
             ),
             (
                 "CreateWhatsAppDataset",
                 "POST",
                 "/v1/whatsapp/waba/dataset".to_string(),
                 Some(json!({ "id": id })),
-                NOT_FOUND,
+                DATASET_NOT_FOUND,
             ),
             (
                 "SendWhatsAppConversionEvent",

@@ -22,7 +22,9 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, emulator, link, query_escape, start_signup, Answer, ACCOUNT_ID};
+use crate::harness::{
+    call, console_call, emulator, link, query_escape, start_signup, Answer, ACCOUNT_ID,
+};
 
 /// The text the service refuses a cross-account pass-role with
 /// (`CROSS_ACCOUNT_PASS_ROLE_MESSAGE` in `src/state.rs`): wholly fixed, so nothing of the
@@ -90,7 +92,7 @@ async fn finalize_with_destinations(
     token: &str,
     destinations: Value,
 ) -> Answer {
-    call(
+    console_call(
         router,
         "POST",
         "/v1/whatsapp/signup",

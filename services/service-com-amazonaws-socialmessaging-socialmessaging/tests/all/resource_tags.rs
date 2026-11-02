@@ -21,7 +21,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, emulator, query_escape, start_signup, ACCOUNT_ID};
+use crate::harness::{call, console_call, emulator, query_escape, start_signup, ACCOUNT_ID};
 
 /// One tag, as the wire carries it.
 fn tag(key: &str, value: &str) -> Value {
@@ -66,7 +66,7 @@ async fn link_tagged(
             json!({ "id": meta_id, "twoFactorPin": "123456", "tags": tags })
         })
         .collect();
-    let finalize = call(
+    let finalize = console_call(
         router,
         "POST",
         "/v1/whatsapp/signup",

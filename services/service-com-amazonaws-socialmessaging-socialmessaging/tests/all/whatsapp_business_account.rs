@@ -14,11 +14,13 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The request path, the emulator and the signup moves every suite in this crate shares.
 use crate::harness::{
-    call, emulator, link, query_escape, setup_body, start_signup, Answer, ACCOUNT_ID,
+    call, console_call, emulator, link, query_escape, setup_body, start_signup, Answer, ACCOUNT_ID,
 };
 
+// Every sign-up call goes through the console flow this operation is served through; the
+// refusal of one that does not is `console_signup_admission`'s own suite.
 async fn associate(router: &MultiServiceRouter, body: Value) -> Answer {
-    call(router, "POST", "/v1/whatsapp/signup", Some(body)).await
+    console_call(router, "POST", "/v1/whatsapp/signup", Some(body)).await
 }
 
 async fn get_account(router: &MultiServiceRouter, id: &str) -> Answer {

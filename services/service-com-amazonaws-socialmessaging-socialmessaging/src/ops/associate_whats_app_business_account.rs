@@ -3,6 +3,10 @@
 //! @op AssociateWhatsAppBusinessAccount
 //! Links a WhatsApp Business Account (WABA) to this account.
 //!
+//! Served through the console's sign-up flow ALONE: a request that did not arrive through
+//! it carries no console CSRF header, and is refused with the recorded 403 access-denied
+//! envelope before anything is read or written — see [`crate::state::require_console_request`].
+//!
 //! A `signupCallback` records a signup that is still in progress and hands back the
 //! `associateInProgressToken` that finalizes it. A `setupFinalization` finalizes
 //! exactly such a signup — a token no callback issued, or one already finalized or
@@ -167,6 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{self as st, LinkedAccount, PendingSignup, PhoneNumberRecord};
         use std::time::SystemTime;
+
+        // The door this operation is behind: it "is only used through the Amazon Web
+        // Services console during sign-up" (the modelled doc above), so a request that
+        // did not arrive through that flow is not admitted at all. The decision needs the
+        // REQUEST alone, so it is made FIRST — ahead of every lookup and every write, so a
+        // refused call records no signup, mints no token and leaves the store untouched.
+        st::require_console_request(ctx)?;
 
         // A `waba` block may hand this service the role it writes events through. Whether
         // the caller may hand that role over is decided from the REQUEST alone, so it is

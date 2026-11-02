@@ -56,6 +56,9 @@
 //! * `linkedAccounts` (LinkedWhatsAppBusinessAccountSummaryList) — A list of WhatsApp
 //!   Business Accounts linked to your Amazon Web Services account.
 //! * `nextToken` (NextToken, len 1..600) — The next token for pagination.
+//! * `setupEnabled` (Boolean) — Whether WhatsApp setup is enabled for your Amazon Web
+//!   Services account. Added to this service's model copy from the recorded responses;
+//!   see the note in `super::types::list_linked_whats_app_business_accounts_types`.
 //!
 //! ## Errors
 //!
@@ -189,6 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         Ok(ListLinkedWhatsAppBusinessAccountsOutput {
+            // An account-level fact, reported beside the page whatever the page holds:
+            // read from the store rather than computed from the listing, so an account
+            // with no linked WhatsApp Business Account still reports it.
+            setup_enabled: Some(store.setup_enabled),
             linked_accounts: Some(linked_accounts),
             next_token,
         })

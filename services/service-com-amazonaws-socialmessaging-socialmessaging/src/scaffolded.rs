@@ -177,6 +177,91 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The wire error code the console's access-denied refusal carries.
+///
+/// The console-facing front end this refusal comes from names the shape with the Coral
+/// locator appended, and that whole string is what the response carries — in
+/// `x-amzn-errortype`, which is where a restJson1 client resolves the error shape from,
+/// and in the body's `__type`. The shape it names is the access-denied one; the suffix is
+/// fixed text, not a value of the request or of the account.
+pub const CONSOLE_ACCESS_DENIED_ERROR_TYPE: &str =
+    "AccessDeniedException:http://internal.amazon.com/coral/com.amazon.coral.service/";
+
+/// The `Message` member of the console's access-denied error shape.
+///
+/// Spelled `Message`, not `message`: the console-facing front end frames this refusal
+/// itself rather than through the service's modeled `AccessDeniedException` (whose member
+/// is the model's lowercase `message`), and the capitalised member is the key the recorded
+/// response carries the text under — so a client reading the message would find none at
+/// all under a lowercase name. `@jsonName` is set to the same spelling so the JSON
+/// protocols write it even where the member name alone would not be consulted.
+static CONSOLE_ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ConsoleAccessDenied$Message",
+        "smithy.framework",
+        "Message",
+    ),
+    ShapeType::String,
+    "Message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("Message");
+
+/// Schema for the console's access-denied error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the shape
+/// is not in any service's model, so it must not collide with a modeled one. This service's
+/// model DOES declare an `AccessDeniedException`, and an operation that refuses a caller
+/// through the model's own rules uses that one; this shape exists only because the
+/// console-only door is shut by a front end that frames its refusal differently — a
+/// capitalised `Message` and the Coral-located error code in
+/// [`CONSOLE_ACCESS_DENIED_ERROR_TYPE`] — and the emulator answers what the service puts
+/// on the wire.
+pub static CONSOLE_ACCESS_DENIED_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#ConsoleAccessDenied",
+        "smithy.framework",
+        "ConsoleAccessDenied",
+    ),
+    ShapeType::Structure,
+    &[&CONSOLE_ACCESS_DENIED_MESSAGE],
+);
+
+/// The payload of a console-only refusal: why the request was not admitted.
+#[derive(Debug, Clone)]
+pub struct ConsoleAccessDenied {
+    pub message: String,
+}
+
+impl ConsoleAccessDenied {
+    /// A refusal carrying `message`.
+    ///
+    /// The text states the admission precondition the request did not meet, and nothing
+    /// about the resources the request named — none is looked up before this refusal is
+    /// answered, so the caller learns nothing from it about what the account holds.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ConsoleAccessDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{CONSOLE_ACCESS_DENIED_ERROR_TYPE}: {}", self.message)
+    }
+}
+
+impl std::error::Error for ConsoleAccessDenied {}
+
+impl SerializableStruct for ConsoleAccessDenied {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&CONSOLE_ACCESS_DENIED_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,6 +281,16 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The request did not arrive through the console flow a console-only operation is
+    /// served through. Renders as HTTP 403 with the Coral-located access-denied error
+    /// code and a capitalised `Message` member.
+    ///
+    /// It is the one refusal answered BEFORE the request is looked at any further, so a
+    /// caller that is not admitted neither learns what the account holds nor leaves a
+    /// trace in it. See [`crate::state::require_console_request`] for the precondition
+    /// and [`CONSOLE_ACCESS_DENIED_SCHEMA`] for why it is not the model's own
+    /// `AccessDeniedException`.
+    ConsoleAccessDenied(ConsoleAccessDenied),
 }
 
 impl<E> Scaffolded<E> {
@@ -223,12 +318,20 @@ impl<E> Scaffolded<E> {
     }
 }
 
+/// Lets a handler's admission gate lift its refusal into the error channel with `?`.
+impl<E> From<ConsoleAccessDenied> for Scaffolded<E> {
+    fn from(denied: ConsoleAccessDenied) -> Self {
+        Self::ConsoleAccessDenied(denied)
+    }
+}
+
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::ConsoleAccessDenied(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +344,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::ConsoleAccessDenied(e) => e.source(),
         }
     }
 }
@@ -255,6 +359,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::ConsoleAccessDenied(e) => e,
         }
     }
 
@@ -263,6 +368,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::ConsoleAccessDenied(_) => &CONSOLE_ACCESS_DENIED_SCHEMA,
         }
     }
 
@@ -275,6 +381,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            Self::ConsoleAccessDenied(_) => CONSOLE_ACCESS_DENIED_ERROR_TYPE,
         }
     }
 
@@ -287,6 +394,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            // The access-denied status the model's own `AccessDeniedException` carries,
+            // and the one this refusal was recorded with.
+            Self::ConsoleAccessDenied(_) => 403,
         }
     }
 
@@ -299,6 +409,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            Self::ConsoleAccessDenied(_) => None,
         }
     }
 }

@@ -154,7 +154,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DisassociateWhatsAppBusinessAccountErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                        // This path's own not-found wording: the same lookup miss is
+                        // worded per operation, so a caller can tell which lookup failed.
+                        message: Some(
+                            crate::state::DISASSOCIATION_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -168,7 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DisassociateWhatsAppBusinessAccountErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                        message: Some(
+                            crate::state::DISASSOCIATION_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

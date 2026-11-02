@@ -126,11 +126,65 @@ pub const ORIGINATION_PHONE_NUMBER_NOT_FOUND_MESSAGE: &str =
 
 /// The message the Conversions API's `ResourceNotFoundException` carries.
 ///
-/// A constant too, and the one `SendWhatsAppConversionEvent` was recorded answering: that
-/// path states its own text rather than the one the account reads state
+/// A constant too, and the one the Conversions API paths were recorded answering for a
+/// `id` that names no linked account: the dataset create and the conversion event both
+/// state it. Those paths state their own text rather than the one the account reads state
 /// ([`RESOURCE_NOT_FOUND_MESSAGE`]), so the rule — a not-found message is a constant, not
 /// a formatted one — holds with each path stating the constant it was recorded with.
 pub const DATASET_NOT_FOUND_MESSAGE: &str = "Id not found for account.";
+
+/// The message the DISASSOCIATION path's `ResourceNotFoundException` carries.
+///
+/// A constant too, and the one that path was recorded answering for an `id` that names no
+/// linked account: it says the resource asked to be disassociated does not exist and
+/// nothing of the id itself, so it does not vary with the request. Its text is NOT the one
+/// the account reads state ([`RESOURCE_NOT_FOUND_MESSAGE`]) — the same lookup miss is
+/// worded per operation — which is the distinction a caller reads to tell which lookup
+/// failed.
+pub const DISASSOCIATION_NOT_FOUND_MESSAGE: &str =
+    "Resource requested for disassociation does not exist.";
+
+/// The header the console's WhatsApp sign-up flow presents on the sign-up callback it
+/// posts.
+///
+/// The sign-up operation is reached through that flow alone — its model doc says it "is
+/// only used through the Amazon Web Services console during sign-up" — and a console
+/// request carries the flow's own CSRF token in this header. A request made with anything
+/// else does not carry it, which is the difference [`require_console_request`] decides on.
+pub const CONSOLE_CSRF_HEADER: &str = "x-csrf-token";
+
+/// The message a console-only operation refuses a request made outside the console with.
+///
+/// Constant, like every other error text this service states: the refusal is decided from
+/// the absence of [`CONSOLE_CSRF_HEADER`] alone, so nothing of the request — no id, no
+/// name, no value — reaches it.
+pub const CSRF_HEADER_MISSING_MESSAGE: &str = "CSRF header does not exist";
+
+/// Admit only the requests that arrive through the console flow a console-only operation
+/// is served through.
+///
+/// A request carrying no [`CONSOLE_CSRF_HEADER`] — or carrying it empty, which is the same
+/// absence as far as the flow is concerned — did not come through that flow, and is
+/// refused with the 403 access-denied envelope that refusal is answered in
+/// ([`crate::scaffolded::ConsoleAccessDenied`]). The decision is made from the REQUEST
+/// alone, so an operation asks here BEFORE it reads or writes anything: a refused call
+/// leaves the store exactly as it found it, records no signup and mints no token.
+pub fn require_console_request(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) -> Result<(), crate::scaffolded::ConsoleAccessDenied> {
+    let through_the_console = ctx
+        .parts()
+        .headers
+        .get(CONSOLE_CSRF_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|token| !token.trim().is_empty());
+    if through_the_console {
+        return Ok(());
+    }
+    Err(crate::scaffolded::ConsoleAccessDenied::new(
+        CSRF_HEADER_MISSING_MESSAGE,
+    ))
+}
 
 /// The message this service refuses a request that hands it a role of ANOTHER account
 /// with.
@@ -281,8 +335,19 @@ pub struct ConversionEvent {
     pub sent_at: SystemTime,
 }
 
+/// Whether a fresh store reports WhatsApp setup as enabled for the account.
+///
+/// `setupEnabled` is an account-level fact `ListLinkedWhatsAppBusinessAccounts` reports
+/// beside the listing, and the recorded listing reports it `true` for an account with no
+/// linked WhatsApp Business Account at all, so it is not derived from what the account
+/// holds. No operation this service models enables or disables WhatsApp setup — it is
+/// settled for the account before any of them is called — so the store starts from this
+/// value and [`ComAmazonawsSocialmessagingSocialmessagingState::setup_enabled`] is what
+/// the listing reads.
+pub const SETUP_ENABLED_DEFAULT: bool = true;
+
 /// Per-service state for com-amazonaws-socialmessaging-socialmessaging. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsSocialmessagingSocialmessagingState {
     /// Linked accounts by [`LinkedAccount::id`].
     pub linked_accounts: HashMap<String, LinkedAccount>,
@@ -304,8 +369,31 @@ pub struct ComAmazonawsSocialmessagingSocialmessagingState {
     /// ARN -> resource id, so an ARN-form `id` input resolves to the same record
     /// as the short form.
     pub arn_index: HashMap<String, String>,
+    /// Whether WhatsApp setup is enabled for this account, as the listing reports it
+    /// beside `linkedAccounts`. Starts at [`SETUP_ENABLED_DEFAULT`].
+    pub setup_enabled: bool,
     /// Monotonic counter behind every minted id, so each one is unique.
     pub id_seq: u64,
+}
+
+/// A fresh store holds no resources and reports WhatsApp setup as
+/// [`SETUP_ENABLED_DEFAULT`], which is the one field whose empty value is not its
+/// type's default — hence the hand-written impl rather than a derive.
+impl Default for ComAmazonawsSocialmessagingSocialmessagingState {
+    fn default() -> Self {
+        Self {
+            linked_accounts: HashMap::new(),
+            phone_numbers: HashMap::new(),
+            pending_signups: HashMap::new(),
+            sent_messages: VecDeque::new(),
+            retained_message_bytes: 0,
+            conversion_events: VecDeque::new(),
+            retained_conversion_event_bytes: 0,
+            arn_index: HashMap::new(),
+            setup_enabled: SETUP_ENABLED_DEFAULT,
+            id_seq: 0,
+        }
+    }
 }
 
 impl ComAmazonawsSocialmessagingSocialmessagingState {
