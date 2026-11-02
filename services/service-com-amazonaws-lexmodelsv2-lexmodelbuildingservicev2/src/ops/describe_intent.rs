@@ -228,9 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sample_utterances: Some(intent.sample_utterances.clone()),
             dialog_code_hook: intent.dialog_code_hook.clone(),
             fulfillment_code_hook: intent.fulfillment_code_hook.clone(),
-            // Slot priorities are ordered over the slots of an intent, and no operation
-            // in this slice stores a slot, so a stored intent has none to prioritise.
-            slot_priorities: None,
+            // Slot priorities are ordered over the slots of an intent, so a describe
+            // reports the order the intent holds and nothing for an intent nobody has
+            // ordered.
+            slot_priorities: intent.wire_slot_priorities(),
             intent_confirmation_setting: intent.intent_confirmation_setting.clone(),
             intent_closing_setting: intent.intent_closing_setting.clone(),
             input_contexts: Some(intent.input_contexts.clone()),

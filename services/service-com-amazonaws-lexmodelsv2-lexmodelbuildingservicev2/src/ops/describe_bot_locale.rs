@@ -3,8 +3,10 @@
 //! @op DescribeBotLocale
 //!
 //! Reports one stored bot locale out of [`crate::state`], applying the status
-//! transition the clock has already made due before answering. It writes nothing else:
-//! a describe never changes what a later caller sees.
+//! transition the clock has already made due before answering — which is also what
+//! publishes the outcome of a build in flight, so a failed build's `failureReasons` are
+//! readable here. It writes nothing else: a describe never changes what a later caller
+//! sees.
 //!
 //! ## Shape of an operation
 //!
@@ -233,9 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             intents_count: Some(i32::try_from(intents_count).unwrap_or(i32::MAX)),
             slot_types_count: Some(i32::try_from(slot_types_count).unwrap_or(i32::MAX)),
             bot_locale_status: Some(locale.bot_locale_status.clone()),
-            // Only a locale in `Failed` carries failure reasons and the recommended
-            // actions that resolve them, and nothing in this slice puts a locale there.
-            failure_reasons: None,
+            // "If the status is Failed, the reasons for the failure are listed in the
+            // failureReasons field": the reasons the locale's last settled build recorded
+            // are reported here, and a locale whose build succeeded has none.
+            failure_reasons: locale.wire_failure_reasons(),
+            // Recommended actions resolve an error in `failureReasons`; the service
+            // recommends none for the build failures this slice records.
             recommended_actions: None,
             creation_date_time: Some(crate::state::to_date_time(locale.creation_date_time)),
             last_updated_date_time: Some(crate::state::to_date_time(

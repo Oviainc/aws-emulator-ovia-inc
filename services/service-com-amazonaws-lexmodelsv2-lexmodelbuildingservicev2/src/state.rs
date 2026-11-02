@@ -14,10 +14,15 @@
 //! out of `slot_types`: a custom slot type is defined inside one locale of one bot
 //! version, so every record carries that triple and every read is scoped by it.
 //!
-//! The intent slice (`CreateIntent`, `DescribeIntent`) is served out of `intents` the
-//! same way, and is what `DescribeBotLocale` counts: a locale is created with the
-//! fallback intent Amazon Lex adds to it, so a locale nothing else was added to holds
-//! one intent.
+//! The intent slice (`CreateIntent`, `DescribeIntent`, `UpdateIntent`) is served out of
+//! `intents` the same way, and is what `DescribeBotLocale` counts: a locale is created
+//! with the fallback intent Amazon Lex adds to it, so a locale nothing else was added to
+//! holds one intent. What those intents carry is also what decides whether
+//! `BuildBotLocale` can build the locale at all.
+//!
+//! The slot slice (`CreateSlot`, `DescribeSlot`, `ListSlots`) is served out of `slots`:
+//! a slot is defined inside one intent of one locale of one bot version, so every record
+//! carries those four identifiers and every read is scoped by them.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -26,10 +31,11 @@ use crate::ops::types::{
     AudioFillerSettings, BotMember, BotSummary, CompositeSlotTypeSetting, DataPrivacy,
     DialogCodeHookSettings, ErrorLogSettings, ExternalSourceSetting, FulfillmentCodeHookSettings,
     GenerativeAISettings, InitialResponseSetting, InputContext, IntentClosingSetting,
-    IntentConfirmationSetting, KendraConfiguration, OutputContext, QInConnectIntentConfiguration,
-    QnAIntentConfiguration, SampleUtterance, SlotTypeSummary, SlotTypeValue,
+    IntentConfirmationSetting, KendraConfiguration, MultipleValuesSetting, ObfuscationSetting,
+    OutputContext, QInConnectIntentConfiguration, QnAIntentConfiguration, SampleUtterance,
+    SlotPriority, SlotSummary, SlotTypeSummary, SlotTypeValue, SlotValueElicitationSetting,
     SlotValueSelectionSetting, SpeakerDiarizationSettings, SpeechRecognitionSettings,
-    UnifiedSpeechSettings, VoiceSettings,
+    SubSlotSetting, UnifiedSpeechSettings, VoiceSettings,
 };
 
 /// `BotStatus` members this crate names. The full modelled set is
@@ -53,8 +59,14 @@ pub const BOT_LOCALE_STATUS_NOT_BUILT: &str = "NotBuilt";
 /// Lex is building the bot for testing and use", which is where a submitted build starts.
 pub const BOT_LOCALE_STATUS_BUILDING: &str = "Building";
 /// See [`BOT_LOCALE_STATUS_CREATING`]. AWS documents this as the status once "the bot is
-/// ready for use and can be tested using any utterance", which is where a build settles.
+/// ready for use and can be tested using any utterance", which is where a build that
+/// succeeds settles.
 pub const BOT_LOCALE_STATUS_BUILT: &str = "Built";
+/// See [`BOT_LOCALE_STATUS_CREATING`]. The modelled terminal status of a build that did
+/// not succeed: `DescribeBotLocale` documents it as the status whose "reasons for the
+/// failure are listed in the failureReasons field", which is where a build the locale's
+/// own content cannot satisfy settles.
+pub const BOT_LOCALE_STATUS_FAILED: &str = "Failed";
 
 /// Every language and locale Amazon Lex V2 accepts, each with the locale name the API
 /// reports for it.
@@ -228,6 +240,39 @@ pub const BOTS_PER_ACCOUNT_QUOTA: usize = 100;
 /// that map past it.
 pub const SLOT_TYPES_PER_LOCALE_QUOTA: usize = 1_000;
 
+/// The locale id in which a slot may return multiple values: the `multipleValuesSetting`
+/// member of `CreateSlot` documents the restriction — "Multi-value slots are only
+/// available in the en-US locale. If you set this value to true in any other locale,
+/// Amazon Lex throws a ValidationException" — and this is how [`SUPPORTED_LOCALES`] names
+/// that locale.
+pub const MULTIPLE_VALUES_LOCALE_ID: &str = "en_US";
+
+/// How many slots one intent may hold: the AWS Lex V2 model-building quota on the slots
+/// of an intent, which is adjustable on request, at the default this emulator enforces.
+///
+/// `CreateSlot` answers the modelled `ServiceQuotaExceededException` ("You have reached a
+/// quota for your bot", HTTP 402) once the intent holds this many, which is what bounds
+/// the stored slots: at most the intents the store may hold times this many records, so a
+/// caller cannot grow that map past it.
+pub const SLOTS_PER_INTENT_QUOTA: usize = 100;
+
+/// Every member of the modelled `SlotSortAttribute` enum
+/// (`smithy_query(query="shape",shape="SlotSortAttribute")`).
+pub const SLOT_SORT_ATTRIBUTES: [&str; 2] = ["SlotName", "LastUpdatedDateTime"];
+
+/// Every member of the modelled `SlotFilterName` enum
+/// (`smithy_query(query="shape",shape="SlotFilterName")`), which names only the slot's
+/// own name.
+pub const SLOT_FILTER_NAMES: [&str; 1] = ["SlotName"];
+
+/// Every member of the modelled `SlotFilterOperator` enum
+/// (`smithy_query(query="shape",shape="SlotFilterOperator")`).
+pub const SLOT_FILTER_OPERATORS: [&str; 2] = ["CO", "EQ"];
+
+/// How Amazon Lex V2 names a slot in a message about a name that is already in use.
+/// See [`name_already_exists`].
+pub const SLOT_RESOURCE_LABEL: &str = "Slot";
+
 /// How Amazon Lex V2 names a bot in a message about a name that is already in use.
 /// See [`name_already_exists`].
 pub const BOT_RESOURCE_LABEL: &str = "Bot";
@@ -332,19 +377,21 @@ impl Bot {
     }
 }
 
-/// Move `status` on to the transition the clock has already made due, if any.
+/// Move `status` on to the transition the clock has already made due, if any, and answer
+/// whether it moved.
 ///
 /// Shared by every record that carries a scheduled status, so one rule decides when a
 /// pending transition is owed.
-fn settle_status(status: &mut String, pending: &mut Option<(String, Instant)>) {
+fn settle_status(status: &mut String, pending: &mut Option<(String, Instant)>) -> bool {
     let now = Instant::now();
     if let Some((next, due)) = pending.take() {
         if now >= due {
             *status = next;
-        } else {
-            *pending = Some((next, due));
+            return true;
         }
+        *pending = Some((next, due));
     }
+    false
 }
 
 /// The `resolutionStrategy` a slot type resolves values under when a create names no
@@ -366,6 +413,32 @@ pub const DEFAULT_RESOLUTION_STRATEGY: &str = "OriginalValue";
 /// service answers a resource it cannot find with exactly this text.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Failed to retrieve resource since it does not exist";
 
+/// What this control plane says when a request names a PARENT resource it does not hold:
+/// the bot, bot version, locale, intent or slot type the resource being created, built or
+/// updated has to hang off.
+///
+/// The modelled `PreconditionFailedException` documents the condition — "Your request
+/// couldn't be completed because one or more request fields aren't valid" — and the
+/// service states it with this one sentence, which, like
+/// [`RESOURCE_NOT_FOUND_MESSAGE`], has no variable part: it names neither the kind of
+/// parent nor the identifier that failed to resolve, so every such refusal of this
+/// service carries exactly this text.
+pub const PARENT_RESOURCE_NOT_FOUND_MESSAGE: &str =
+    "Failed to retrieve parent resource since it does not exist";
+
+/// The prefix the modelled `BuiltInOrCustomSlotTypeId` shape gives a reference to a slot
+/// type Amazon Lex supplies rather than one defined in the bot: its pattern
+/// `^((AMAZON\.)[a-zA-Z_]+?|[0-9a-zA-Z]+)$` admits exactly these two forms, so a
+/// reference carrying this prefix is a built-in and any other is the id of a custom slot
+/// type the locale has to hold.
+pub const BUILT_IN_SLOT_TYPE_PREFIX: &str = "AMAZON.";
+
+/// Is this `slotTypeId` a reference to a built-in slot type Amazon Lex supplies?
+/// See [`BUILT_IN_SLOT_TYPE_PREFIX`].
+pub fn is_built_in_slot_type(slot_type_id: &str) -> bool {
+    slot_type_id.starts_with(BUILT_IN_SLOT_TYPE_PREFIX)
+}
+
 /// The voice-activity-detection sensitivity a bot locale runs at when a create names
 /// none: the member of the modelled `SpeechDetectionSensitivity` enum
 /// (`smithy_query(query="shape",shape="SpeechDetectionSensitivity")`) its own
@@ -378,6 +451,19 @@ pub const DEFAULT_SPEECH_DETECTION_SENSITIVITY: &str = "Default";
 /// `parentSlotTypeSignature` member documents the restriction: "The built-in slot type
 /// used as a parent of this slot type. [...] Only AMAZON.AlphaNumeric is supported."
 pub const SUPPORTED_PARENT_SLOT_TYPE_SIGNATURE: &str = "AMAZON.AlphaNumeric";
+
+/// The one reason Amazon Lex gives for refusing to build a locale that holds nothing it
+/// could build: a locale is buildable only once it has a custom intent carrying at least
+/// one valid sample utterance, and the sentence names the locale the build was asked for.
+///
+/// The locale id is the only variable part; the rest is fixed text for this failure.
+pub fn no_utterances_failure_reason(locale_id: &str) -> String {
+    format!(
+        "The locale '{locale_id}' doesn't have any utterances. A locale must have at least \
+         one custom intent with a valid utterance. Add a custom intent and try your request \
+         again."
+    )
+}
 
 /// A bot locale, as `CreateBotLocale` stored it and `DescribeBotLocale` reads it back.
 #[derive(Debug, Clone)]
@@ -401,6 +487,14 @@ pub struct BotLocale {
     /// When the locale was last submitted for building; `None` until a build is asked
     /// for.
     pub last_build_submitted_date_time: Option<SystemTime>,
+    /// Why the build this locale has already settled on did not succeed; empty for a
+    /// locale whose last build succeeded and for one never built. Only a locale in
+    /// [`BOT_LOCALE_STATUS_FAILED`] carries any.
+    pub failure_reasons: Vec<String>,
+    /// The reasons that become [`BotLocale::failure_reasons`] once the status the clock
+    /// owes falls due — the outcome of the build in flight, which is not a caller's to
+    /// read before the build settles.
+    pub pending_failure_reasons: Vec<String>,
     /// The status the clock owes this locale, and the instant it falls due. Set it
     /// through [`BotLocale::schedule_status`] rather than by hand.
     pub pending_status: Option<(String, Instant)>,
@@ -408,9 +502,12 @@ pub struct BotLocale {
 
 impl BotLocale {
     /// Apply the status transition the clock has already made due, if any — the same
-    /// contract as [`Bot::settle`].
+    /// contract as [`Bot::settle`]. A settled build also publishes its outcome: the
+    /// reasons it failed for become readable with the status that carries them.
     pub fn settle(&mut self) {
-        settle_status(&mut self.bot_locale_status, &mut self.pending_status);
+        if settle_status(&mut self.bot_locale_status, &mut self.pending_status) {
+            self.failure_reasons = std::mem::take(&mut self.pending_failure_reasons);
+        }
     }
 
     /// Schedule `status` to become this locale's status once `after` has elapsed.
@@ -418,13 +515,31 @@ impl BotLocale {
         self.pending_status = Some((status.to_string(), Instant::now() + after));
     }
 
-    /// Record a build submitted at `now`: the locale is building from that instant, the
-    /// build timestamp is the one a read reports, and the `Built` the clock then owes is
-    /// due [`BUILD_SETTLES_AFTER`] later.
-    pub fn submit_build(&mut self, now: SystemTime) {
+    /// Record a build submitted at `now` whose outcome is `failure_reasons`: the locale
+    /// is building from that instant, the build timestamp is the one a read reports, and
+    /// the terminal status the clock then owes is due [`BUILD_SETTLES_AFTER`] later —
+    /// [`BOT_LOCALE_STATUS_BUILT`] when the locale was buildable and
+    /// [`BOT_LOCALE_STATUS_FAILED`], carrying those reasons, when it was not.
+    ///
+    /// The reasons a PREVIOUS build settled on go with it: they described that build, so
+    /// a locale building again reports none until this one settles.
+    pub fn submit_build(&mut self, now: SystemTime, failure_reasons: Vec<String>) {
         self.last_build_submitted_date_time = Some(now);
         self.bot_locale_status = BOT_LOCALE_STATUS_BUILDING.to_string();
-        self.schedule_status(BOT_LOCALE_STATUS_BUILT, BUILD_SETTLES_AFTER);
+        self.failure_reasons = Vec::new();
+        let terminal = if failure_reasons.is_empty() {
+            BOT_LOCALE_STATUS_BUILT
+        } else {
+            BOT_LOCALE_STATUS_FAILED
+        };
+        self.pending_failure_reasons = failure_reasons;
+        self.schedule_status(terminal, BUILD_SETTLES_AFTER);
+    }
+
+    /// The stored failure reasons as the wire shape renders them: absent rather than an
+    /// empty list, since a locale that did not fail a build has none to report.
+    pub fn wire_failure_reasons(&self) -> Option<Vec<String>> {
+        (!self.failure_reasons.is_empty()).then(|| self.failure_reasons.clone())
     }
 }
 
@@ -435,8 +550,8 @@ impl BotLocale {
 /// each empty until the intent is given some, so the three are held as the lists they are
 /// rather than as "set or not": what a read reports is the list the record holds.
 ///
-/// `slotPriorities` is not held: it is ordered by `CreateSlot` / `UpdateIntent`, neither
-/// of which this slice implements, so a stored intent has no slot to prioritise.
+/// `slotPriorities` is held the same way: it is ordered over the slots of the intent by
+/// `UpdateIntent`, and is empty for an intent nobody has ordered.
 #[derive(Debug, Clone)]
 pub struct Intent {
     pub intent_id: String,
@@ -448,6 +563,7 @@ pub struct Intent {
     pub description: Option<String>,
     pub parent_intent_signature: Option<String>,
     pub sample_utterances: Vec<SampleUtterance>,
+    pub slot_priorities: Vec<SlotPriority>,
     pub dialog_code_hook: Option<DialogCodeHookSettings>,
     pub fulfillment_code_hook: Option<FulfillmentCodeHookSettings>,
     pub intent_confirmation_setting: Option<IntentConfirmationSetting>,
@@ -468,6 +584,27 @@ impl Intent {
     /// carries.
     pub fn is_in_locale(&self, bot_id: &str, bot_version: &str, locale_id: &str) -> bool {
         self.bot_id == bot_id && self.bot_version == bot_version && self.locale_id == locale_id
+    }
+
+    /// Is this a CUSTOM intent — one the bot defines itself — rather than one built on a
+    /// built-in intent Amazon Lex supplies, which an intent names through
+    /// `parentIntentSignature`?
+    pub fn is_custom(&self) -> bool {
+        self.parent_intent_signature.is_none()
+    }
+
+    /// Does this intent carry at least one VALID sample utterance? An utterance with no
+    /// text in it is not one Amazon Lex can recognise, so it does not count.
+    pub fn has_valid_utterance(&self) -> bool {
+        self.sample_utterances
+            .iter()
+            .any(|sample| !sample.utterance.trim().is_empty())
+    }
+
+    /// The stored `slotPriorities`, as the wire shape renders them: absent rather than an
+    /// empty list when nothing has ordered the intent's slots.
+    pub fn wire_slot_priorities(&self) -> Option<Vec<SlotPriority>> {
+        (!self.slot_priorities.is_empty()).then(|| self.slot_priorities.clone())
     }
 }
 
@@ -556,6 +693,63 @@ impl SlotType {
     }
 }
 
+/// A slot of one intent, as `CreateSlot` stored it and `DescribeSlot` / `ListSlots` read
+/// it back.
+#[derive(Debug, Clone)]
+pub struct Slot {
+    pub slot_id: String,
+    pub slot_name: String,
+    pub bot_id: String,
+    pub bot_version: String,
+    pub locale_id: String,
+    pub intent_id: String,
+    pub description: Option<String>,
+    /// The slot type the slot elicits values for: the id of a custom slot type of the
+    /// same locale, or a reference to a built-in one ([`BUILT_IN_SLOT_TYPE_PREFIX`]).
+    /// `None` for a slot the create named none for.
+    pub slot_type_id: Option<String>,
+    pub value_elicitation_setting: SlotValueElicitationSetting,
+    pub obfuscation_setting: Option<ObfuscationSetting>,
+    pub multiple_values_setting: Option<MultipleValuesSetting>,
+    pub sub_slot_setting: Option<SubSlotSetting>,
+    pub creation_date_time: SystemTime,
+    pub last_updated_date_time: SystemTime,
+}
+
+impl Slot {
+    /// Is this slot one that intent of that locale holds? A slot is defined inside one
+    /// intent of one locale of one bot version, so every read is scoped by the same four
+    /// identifiers the operation's URI carries.
+    pub fn is_in_intent(
+        &self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+        intent_id: &str,
+    ) -> bool {
+        self.bot_id == bot_id
+            && self.bot_version == bot_version
+            && self.locale_id == locale_id
+            && self.intent_id == intent_id
+    }
+
+    /// This slot as a `ListSlots` summary entry.
+    pub fn summary(&self) -> SlotSummary {
+        SlotSummary {
+            slot_id: Some(self.slot_id.clone()),
+            slot_name: Some(self.slot_name.clone()),
+            description: self.description.clone(),
+            slot_constraint: Some(self.value_elicitation_setting.slot_constraint.clone()),
+            slot_type_id: self.slot_type_id.clone(),
+            value_elicitation_prompt_specification: self
+                .value_elicitation_setting
+                .prompt_specification
+                .clone(),
+            last_updated_date_time: Some(to_date_time(self.last_updated_date_time)),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
@@ -581,6 +775,12 @@ pub struct ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
     /// locale ids a bot version can carry ([`SUPPORTED_LOCALES`]) times
     /// [`INTENTS_PER_LOCALE_QUOTA`]: a caller cannot grow it past that.
     pub intents: HashMap<String, Intent>,
+    /// Every slot this emulator holds, keyed by the `slotId` it minted. The record
+    /// carries the bot, bot version, locale and intent it was created in, which is what
+    /// scopes every read of it. A slot belongs to one intent, so this map is bounded by
+    /// the intents the store may hold times [`SLOTS_PER_INTENT_QUOTA`]: a caller cannot
+    /// grow it past that.
+    pub slots: HashMap<String, Slot>,
     /// The monotonic source the minted ids are derived from.
     id_seq: u64,
 }
@@ -622,6 +822,19 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
             self.id_seq += 1;
             let candidate = render_id(self.id_seq);
             if !self.intents.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint an unused `slotId`, from the same counter and in the same `[0-9a-zA-Z]{10}`
+    /// space [`Self::mint_bot_id`] draws from, and checked against the stored slots
+    /// before it is handed out.
+    pub fn mint_slot_id(&mut self) -> String {
+        loop {
+            self.id_seq += 1;
+            let candidate = render_id(self.id_seq);
+            if !self.slots.contains_key(&candidate) {
                 return candidate;
             }
         }
@@ -731,6 +944,20 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
             .filter(|intent| intent.is_in_locale(bot_id, bot_version, locale_id))
     }
 
+    /// The stored intent the id names, mutably, but only when it is defined in the locale
+    /// the request scopes it to — what an update replaces.
+    pub fn intent_mut(
+        &mut self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+        intent_id: &str,
+    ) -> Option<&mut Intent> {
+        self.intents
+            .get_mut(intent_id)
+            .filter(|intent| intent.is_in_locale(bot_id, bot_version, locale_id))
+    }
+
     /// Store the intent Amazon Lex adds to a locale as it creates it
     /// ([`FALLBACK_INTENT_NAME`]), and answer the id it was minted under.
     pub fn add_fallback_intent(
@@ -751,6 +978,7 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
             description: None,
             parent_intent_signature: Some(FALLBACK_INTENT_SIGNATURE.to_string()),
             sample_utterances: Vec::new(),
+            slot_priorities: Vec::new(),
             dialog_code_hook: None,
             fulfillment_code_hook: None,
             intent_confirmation_setting: None,
@@ -830,6 +1058,97 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         self.slot_types
             .retain(|_, slot_type| slot_type.bot_id != bot_id);
         before - self.slot_types.len()
+    }
+
+    /// Every slot one intent of one locale of one bot version holds.
+    pub fn slots_in_intent<'a>(
+        &'a self,
+        bot_id: &'a str,
+        bot_version: &'a str,
+        locale_id: &'a str,
+        intent_id: &'a str,
+    ) -> impl Iterator<Item = &'a Slot> + 'a {
+        self.slots
+            .values()
+            .filter(move |slot| slot.is_in_intent(bot_id, bot_version, locale_id, intent_id))
+    }
+
+    /// Is `name` already the name of a slot of that intent? A slot is defined inside one
+    /// intent, and the modelled `slotName` member requires the name to be unique where
+    /// the slot lives, so `CreateSlot` refuses a second slot under a name the intent
+    /// already carries.
+    pub fn slot_name_taken(
+        &self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+        intent_id: &str,
+        name: &str,
+    ) -> bool {
+        self.slots_in_intent(bot_id, bot_version, locale_id, intent_id)
+            .any(|slot| slot.slot_name == name)
+    }
+
+    /// The stored slot the id names, but only when it is held by the intent the read
+    /// scopes it to; `None` otherwise, which is what a read reports as not found.
+    pub fn slot(
+        &self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+        intent_id: &str,
+        slot_id: &str,
+    ) -> Option<&Slot> {
+        self.slots
+            .get(slot_id)
+            .filter(|slot| slot.is_in_intent(bot_id, bot_version, locale_id, intent_id))
+    }
+
+    /// Drop every slot of `bot_id`, whatever version, locale or intent holds it, and
+    /// answer how many went: a slot cannot outlive the bot it is defined in.
+    pub fn remove_slots_of_bot(&mut self, bot_id: &str) -> usize {
+        let before = self.slots.len();
+        self.slots.retain(|_, slot| slot.bot_id != bot_id);
+        before - self.slots.len()
+    }
+
+    /// Does `slot_type_id` resolve to a slot type a slot of that locale may elicit values
+    /// for? A reference to a built-in slot type Amazon Lex supplies resolves on its own
+    /// form ([`is_built_in_slot_type`]); any other id has to name a custom slot type
+    /// stored in the very locale the slot is being defined in.
+    pub fn slot_type_resolves(
+        &self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+        slot_type_id: &str,
+    ) -> bool {
+        is_built_in_slot_type(slot_type_id)
+            || self
+                .slot_type(bot_id, bot_version, locale_id, slot_type_id)
+                .is_some()
+    }
+
+    /// Why a build of that locale cannot succeed, as the `failureReasons` the failed
+    /// locale reports; empty for a locale the service can build.
+    ///
+    /// A locale is buildable once it holds a custom intent with at least one valid sample
+    /// utterance: with nothing to recognise, Amazon Lex has no bot to build, and it says
+    /// so with [`no_utterances_failure_reason`].
+    pub fn build_failure_reasons(
+        &self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+    ) -> Vec<String> {
+        let buildable = self
+            .intents_in_locale(bot_id, bot_version, locale_id)
+            .any(|intent| intent.is_custom() && intent.has_valid_utterance());
+        if buildable {
+            Vec::new()
+        } else {
+            vec![no_utterances_failure_reason(locale_id)]
+        }
     }
 }
 

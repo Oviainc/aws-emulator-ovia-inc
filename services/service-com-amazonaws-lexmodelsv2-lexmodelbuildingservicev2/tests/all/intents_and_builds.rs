@@ -62,22 +62,28 @@ fn expected_list(request: &Value, name: &str) -> Value {
 
 /// `CreateIntent`'s URI:
 /// `PUT /bots/{botId}/botversions/{botVersion}/botlocales/{localeId}/intents`.
-fn intents_uri(bot_id: &str, bot_version: &str, locale_id: &str) -> String {
+pub(crate) fn intents_uri(bot_id: &str, bot_version: &str, locale_id: &str) -> String {
     format!("/bots/{bot_id}/botversions/{bot_version}/botlocales/{locale_id}/intents")
 }
 
-/// `DescribeIntent`'s URI, which adds the `intentId` to [`intents_uri`].
-fn intent_uri(bot_id: &str, bot_version: &str, locale_id: &str, intent_id: &str) -> String {
+/// `DescribeIntent`'s URI, which adds the `intentId` to [`intents_uri`]. `UpdateIntent`
+/// is the same URI under `PUT`.
+pub(crate) fn intent_uri(
+    bot_id: &str,
+    bot_version: &str,
+    locale_id: &str,
+    intent_id: &str,
+) -> String {
     format!("{}/{intent_id}", intents_uri(bot_id, bot_version, locale_id))
 }
 
 /// `BuildBotLocale`'s URI, which is `DescribeBotLocale`'s under `POST`.
-fn build_uri(bot_id: &str, bot_version: &str, locale_id: &str) -> String {
+pub(crate) fn build_uri(bot_id: &str, bot_version: &str, locale_id: &str) -> String {
     locale_uri(bot_id, bot_version, locale_id)
 }
 
 /// A `CreateIntent` request body carrying the required `intentName` plus `extra`.
-fn intent_body(name: &str, extra: Value) -> Value {
+pub(crate) fn intent_body(name: &str, extra: Value) -> Value {
     let mut body = json!({ "intentName": name });
     let object = body.as_object_mut().expect("the body is a JSON object");
     for (key, value) in extra.as_object().expect("extras are a JSON object") {
@@ -104,7 +110,7 @@ async fn host_locale(router: &MultiServiceRouter, bot_name: &str, locale_id: &st
 }
 
 /// Create an intent, assert it was accepted, and return its minted id.
-async fn create_intent(
+pub(crate) async fn create_intent(
     router: &MultiServiceRouter,
     bot_id: &str,
     locale_id: &str,
@@ -568,6 +574,19 @@ async fn an_intent_is_created_once_per_locale_and_only_on_a_locale_that_exists()
 async fn a_submitted_build_is_recorded_and_settles_from_building_to_built() {
     let router = emulator();
     let bot_id = host_locale(&router, "BuildingBot", "en_US").await;
+    // This suite's subject is the transition a submitted build makes, so the locale is
+    // given the one thing a build needs to succeed: a custom intent with an utterance.
+    // The buildability rule itself is asserted in the `locale_build_outcome` suite.
+    create_intent(
+        &router,
+        &bot_id,
+        "en_US",
+        &intent_body(
+            "OrderPizza",
+            json!({ "sampleUtterances": [{ "utterance": "I want to order a pizza" }] }),
+        ),
+    )
+    .await;
 
     // Nothing has been submitted for a freshly created locale.
     let (_, described) = call(&router, "GET", &locale_uri(&bot_id, "DRAFT", "en_US"), None).await;

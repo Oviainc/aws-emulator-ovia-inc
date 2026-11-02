@@ -229,10 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.bots.contains_key(&input.bot_id) {
             return Err(CreateSlotTypeErrorModeled::PreconditionFailedException(
                 PreconditionFailedException {
-                    message: Some(format!(
-                        "Bot {} does not exist; check the botId and try again",
-                        input.bot_id
-                    )),
+                    // The sentence this service states when a parent the request names
+                    // does not resolve, whatever the parent and whatever identified it.
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -243,10 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.bot_locale_exists(&input.bot_id, &input.bot_version, &input.locale_id) {
             return Err(CreateSlotTypeErrorModeled::PreconditionFailedException(
                 PreconditionFailedException {
-                    message: Some(format!(
-                        "Locale {} does not exist for bot {} version {}; create the locale before adding slot types to it",
-                        input.locale_id, input.bot_id, input.bot_version
-                    )),
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

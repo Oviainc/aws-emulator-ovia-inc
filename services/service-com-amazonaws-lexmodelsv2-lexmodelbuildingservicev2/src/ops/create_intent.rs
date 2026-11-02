@@ -280,10 +280,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.bot_locale_exists(&input.bot_id, &input.bot_version, &input.locale_id) {
             return Err(CreateIntentErrorModeled::PreconditionFailedException(
                 PreconditionFailedException {
-                    message: Some(format!(
-                        "Locale {} does not exist for bot {} version {}; create the locale before adding intents to it",
-                        input.locale_id, input.bot_id, input.bot_version
-                    )),
+                    // The sentence this service states when a parent the request names
+                    // does not resolve, whatever the parent and whatever identified it.
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -345,6 +344,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             parent_intent_signature: input.parent_intent_signature,
             sample_utterances: input.sample_utterances.unwrap_or_default(),
+            // Slot priorities are ordered over the slots of an intent, and a create adds
+            // an intent with no slot in it: the modelled `CreateSlotRequest` carries no
+            // `slotPriorities` member for it to order.
+            slot_priorities: Vec::new(),
             dialog_code_hook: input.dialog_code_hook,
             fulfillment_code_hook: input.fulfillment_code_hook,
             intent_confirmation_setting: input.intent_confirmation_setting,

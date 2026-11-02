@@ -4,9 +4,14 @@
 //!
 //! Records a build of one locale of one bot version on the stored locale in
 //! [`crate::state`]: the locale is `Building` from the submission, which is the instant
-//! `lastBuildSubmittedDateTime` reports, and the `Built` transition the clock owes is due
+//! `lastBuildSubmittedDateTime` reports, and the terminal status the clock owes is due
 //! [`crate::state::BUILD_SETTLES_AFTER`] later and is materialised by the next read, so a
 //! caller reading straight back still observes `Building`.
+//!
+//! WHICH terminal status is owed is decided here, from what the locale holds: a locale the
+//! service can build settles `Built`, and one it cannot settles `Failed` carrying the
+//! reasons `DescribeBotLocale` reports (see
+//! [`crate::state::ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State::build_failure_reasons`]).
 //!
 //! ## Shape of an operation
 //!
@@ -176,6 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // What the locale holds decides the outcome of the build, so it is evaluated
+        // against the stored intents BEFORE the submission is recorded: a locale with no
+        // custom intent carrying a valid utterance has nothing to build.
+        let failure_reasons =
+            store.build_failure_reasons(&input.bot_id, &input.bot_version, &input.locale_id);
+
         // A build is submitted for a locale that is there; nothing is built for a triple
         // the store holds no locale under.
         let Some(locale) =
@@ -183,10 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(BuildBotLocaleErrorModeled::PreconditionFailedException(
                 PreconditionFailedException {
-                    message: Some(format!(
-                        "Locale {} does not exist for bot {} version {}; create the locale before building it",
-                        input.locale_id, input.bot_id, input.bot_version
-                    )),
+                    // The sentence this service states when a parent the request names
+                    // does not resolve, whatever the parent and whatever identified it.
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -194,11 +204,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The build is recorded on the stored locale, so the status and the build
         // timestamp this call reports are the ones `DescribeBotLocale` reports: building
-        // from now, and `Built` once the span the clock owes has elapsed. A locale the
-        // service is still settling takes the submission too — AWS documents no state a
-        // build is refused from, and the one conflict this error class documents is a
-        // DELETE of a resource that is still being created.
-        locale.submit_build(::std::time::SystemTime::now());
+        // from now, and the terminal status the build earned once the span the clock owes
+        // has elapsed. A locale the service is still settling takes the submission too —
+        // AWS documents no state a build is refused from, and the one conflict this error
+        // class documents is a DELETE of a resource that is still being created.
+        locale.submit_build(::std::time::SystemTime::now(), failure_reasons);
         Ok(BuildBotLocaleOutput {
             bot_id: Some(locale.bot_id.clone()),
             bot_version: Some(locale.bot_version.clone()),

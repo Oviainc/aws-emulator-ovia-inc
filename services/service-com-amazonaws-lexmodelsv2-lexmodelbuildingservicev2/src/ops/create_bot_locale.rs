@@ -297,6 +297,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_date_time: now,
             last_updated_date_time: now,
             last_build_submitted_date_time: None,
+            failure_reasons: Vec::new(),
+            pending_failure_reasons: Vec::new(),
             pending_status: None,
         };
         // "If the bot was saved but not built, the status is NotBuilt": nothing has been

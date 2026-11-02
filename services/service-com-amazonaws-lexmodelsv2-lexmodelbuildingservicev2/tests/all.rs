@@ -17,6 +17,8 @@ mod bot_lifecycle;
 mod bot_locale;
 #[path = "all/intents_and_builds.rs"]
 mod intents_and_builds;
+#[path = "all/locale_build_outcome.rs"]
+mod locale_build_outcome;
 #[path = "all/name_already_exists.rs"]
 mod name_already_exists;
 #[path = "all/refusal_wording.rs"]
@@ -29,5 +31,7 @@ mod service_claim;
 mod slot_type;
 #[path = "all/slot_type_listing.rs"]
 mod slot_type_listing;
+#[path = "all/slots.rs"]
+mod slots;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

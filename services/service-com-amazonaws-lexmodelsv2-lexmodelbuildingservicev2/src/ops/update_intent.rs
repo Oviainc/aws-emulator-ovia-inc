@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIntent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIntent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIntent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the stored definition of one intent in [`crate::state`] with the one the
+//! request carries — every member of the request is "the new" value of that member, so a
+//! member the request leaves out is cleared rather than kept — and reports the record
+//! back off the store, so `DescribeIntent` reads the same intent. What the updated intent
+//! carries is also what `BuildBotLocale` evaluates for buildability. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -229,18 +227,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIntent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIntentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIntent"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateIntentErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // An intent is updated where it is defined: the id has to name an intent of the
+        // locale of the bot version the URI carries. This operation models no not-found
+        // error, so a parent that does not resolve is the modelled precondition failure.
+        if store
+            .intent(
+                &input.bot_id,
+                &input.bot_version,
+                &input.locale_id,
+                &input.intent_id,
+            )
+            .is_none()
+        {
+            return Err(UpdateIntentErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    // The sentence this service states when a parent the request names
+                    // does not resolve, whatever the parent and whatever identified it.
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The new name has to stay unique in the locale that contains the intent, so a
+        // rename onto the name of ANOTHER intent of the same locale is refused and the
+        // stored intent is left as it was. The intent's own name is not a clash.
+        let name_clash = store
+            .intents_in_locale(&input.bot_id, &input.bot_version, &input.locale_id)
+            .any(|intent| {
+                intent.intent_name == input.intent_name && intent.intent_id != input.intent_id
+            });
+        if name_clash {
+            return Err(UpdateIntentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::name_already_exists(
+                        crate::state::INTENT_RESOURCE_LABEL,
+                        &input.intent_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(intent) = store.intent_mut(
+            &input.bot_id,
+            &input.bot_version,
+            &input.locale_id,
+            &input.intent_id,
+        ) else {
+            return Err(UpdateIntentErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every member of the request is the NEW value of that member, so the stored
+        // record is replaced rather than patched: what the request left out the updated
+        // intent no longer carries. The identity of the intent — its id, the triple it
+        // lives in and when it was created — is not the request's to change.
+        intent.intent_name = input.intent_name;
+        intent.intent_display_name = input.intent_display_name;
+        intent.description = input.description;
+        intent.parent_intent_signature = input.parent_intent_signature;
+        intent.sample_utterances = input.sample_utterances.unwrap_or_default();
+        intent.slot_priorities = input.slot_priorities.unwrap_or_default();
+        intent.dialog_code_hook = input.dialog_code_hook;
+        intent.fulfillment_code_hook = input.fulfillment_code_hook;
+        intent.intent_confirmation_setting = input.intent_confirmation_setting;
+        intent.intent_closing_setting = input.intent_closing_setting;
+        intent.input_contexts = input.input_contexts.unwrap_or_default();
+        intent.output_contexts = input.output_contexts.unwrap_or_default();
+        intent.kendra_configuration = input.kendra_configuration;
+        intent.initial_response_setting = input.initial_response_setting;
+        intent.qn_a_intent_configuration = input.qn_a_intent_configuration;
+        intent.q_in_connect_intent_configuration = input.q_in_connect_intent_configuration;
+        intent.last_updated_date_time = ::std::time::SystemTime::now();
+
+        // The response is read back off the record that was just stored, so what this
+        // call reports is what a later read reports.
+        Ok(UpdateIntentOutput {
+            intent_id: Some(intent.intent_id.clone()),
+            intent_name: Some(intent.intent_name.clone()),
+            intent_display_name: intent.intent_display_name.clone(),
+            description: intent.description.clone(),
+            parent_intent_signature: intent.parent_intent_signature.clone(),
+            // An intent HAS a list of sample utterances, of input contexts and of output
+            // contexts, each reported whether or not the update named one.
+            sample_utterances: Some(intent.sample_utterances.clone()),
+            dialog_code_hook: intent.dialog_code_hook.clone(),
+            fulfillment_code_hook: intent.fulfillment_code_hook.clone(),
+            slot_priorities: intent.wire_slot_priorities(),
+            intent_confirmation_setting: intent.intent_confirmation_setting.clone(),
+            intent_closing_setting: intent.intent_closing_setting.clone(),
+            input_contexts: Some(intent.input_contexts.clone()),
+            output_contexts: Some(intent.output_contexts.clone()),
+            kendra_configuration: intent.kendra_configuration.clone(),
+            bot_id: Some(intent.bot_id.clone()),
+            bot_version: Some(intent.bot_version.clone()),
+            locale_id: Some(intent.locale_id.clone()),
+            creation_date_time: Some(crate::state::to_date_time(intent.creation_date_time)),
+            last_updated_date_time: Some(crate::state::to_date_time(
+                intent.last_updated_date_time,
+            )),
+            initial_response_setting: intent.initial_response_setting.clone(),
+            qn_a_intent_configuration: intent.qn_a_intent_configuration.clone(),
+            q_in_connect_intent_configuration: intent
+                .q_in_connect_intent_configuration
+                .clone(),
+        })
     }
 }

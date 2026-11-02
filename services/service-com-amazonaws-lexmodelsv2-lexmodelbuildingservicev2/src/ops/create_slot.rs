@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSlot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSlot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSlot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one slot of one intent in [`crate::state`] and reports it back off the record
+//! it stored, so `DescribeSlot` and `ListSlots` observe the same slot. A reference the
+//! locale cannot resolve — the intent the slot hangs off, or the slot type it elicits
+//! values for — is refused BEFORE anything is written, so a refused call leaves the
+//! intent holding exactly what it held. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -209,18 +207,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSlot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSlotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSlot"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSlotErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // A slot is defined inside one intent of one locale of one bot version, so that
+        // intent is the parent this call hangs the slot off: without it there is nothing
+        // to add a slot to, and the bot, its version and the locale are settled by the
+        // same lookup.
+        if store
+            .intent(
+                &input.bot_id,
+                &input.bot_version,
+                &input.locale_id,
+                &input.intent_id,
+            )
+            .is_none()
+        {
+            return Err(CreateSlotErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    // The sentence this service states when a parent the request names
+                    // does not resolve, whatever the parent and whatever identified it.
+                    message: Some(crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The slot type determines the values that can be entered into the slot": a
+        // reference naming no slot type of this locale and no built-in one resolves to
+        // nothing, so there is no slot to create. The modelled constraints on the
+        // reference are already satisfied here — what is checked is whether it RESOLVES.
+        if let Some(slot_type_id) = input.slot_type_id.as_deref() {
+            if !store.slot_type_resolves(
+                &input.bot_id,
+                &input.bot_version,
+                &input.locale_id,
+                slot_type_id,
+            ) {
+                return Err(CreateSlotErrorModeled::PreconditionFailedException(
+                    PreconditionFailedException {
+                        message: Some(
+                            crate::state::PARENT_RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "Multi-value slots are only available in the en-US locale. If you set this
+        // value to true in any other locale, Amazon Lex throws a ValidationException."
+        if input
+            .multiple_values_setting
+            .as_ref()
+            .is_some_and(|setting| setting.allow_multiple_values)
+            && input.locale_id != crate::state::MULTIPLE_VALUES_LOCALE_ID
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "multipleValuesSetting.allowMultipleValues is only available in the {} locale",
+                crate::state::MULTIPLE_VALUES_LOCALE_ID
+            )));
+        }
+
+        // The per-intent slot quota bounds the store: past it the service answers its
+        // modelled quota error rather than growing forever.
+        if store
+            .slots_in_intent(
+                &input.bot_id,
+                &input.bot_version,
+                &input.locale_id,
+                &input.intent_id,
+            )
+            .count()
+            >= crate::state::SLOTS_PER_INTENT_QUOTA
+        {
+            return Err(CreateSlotErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "You have reached the quota of {} slots for intent {}; delete a slot or request a quota increase",
+                        crate::state::SLOTS_PER_INTENT_QUOTA,
+                        input.intent_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Slot names must be unique" where the slot is defined, so a create under a name
+        // the intent already carries is refused rather than stored beside it — the
+        // modelled `ValidationException`, worded by the one template this service states
+        // for a name that is already in use.
+        if store.slot_name_taken(
+            &input.bot_id,
+            &input.bot_version,
+            &input.locale_id,
+            &input.intent_id,
+            &input.slot_name,
+        ) {
+            return Err(CreateSlotErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::name_already_exists(
+                        crate::state::SLOT_RESOURCE_LABEL,
+                        &input.slot_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let slot_id = store.mint_slot_id();
+        let slot = crate::state::Slot {
+            slot_id: slot_id.clone(),
+            slot_name: input.slot_name,
+            bot_id: input.bot_id,
+            bot_version: input.bot_version,
+            locale_id: input.locale_id,
+            intent_id: input.intent_id,
+            description: input.description,
+            slot_type_id: input.slot_type_id,
+            value_elicitation_setting: input.value_elicitation_setting,
+            obfuscation_setting: input.obfuscation_setting,
+            multiple_values_setting: input.multiple_values_setting,
+            sub_slot_setting: input.sub_slot_setting,
+            creation_date_time: now,
+            last_updated_date_time: now,
+        };
+
+        // The response is read back off the record that was just stored, so a `slotId`
+        // this operation hands out always has a backing slot.
+        let stored = store.slots.entry(slot_id).or_insert(slot);
+        Ok(CreateSlotOutput {
+            slot_id: Some(stored.slot_id.clone()),
+            slot_name: Some(stored.slot_name.clone()),
+            description: stored.description.clone(),
+            slot_type_id: stored.slot_type_id.clone(),
+            value_elicitation_setting: Some(stored.value_elicitation_setting.clone()),
+            obfuscation_setting: stored.obfuscation_setting.clone(),
+            bot_id: Some(stored.bot_id.clone()),
+            bot_version: Some(stored.bot_version.clone()),
+            locale_id: Some(stored.locale_id.clone()),
+            intent_id: Some(stored.intent_id.clone()),
+            creation_date_time: Some(crate::state::to_date_time(stored.creation_date_time)),
+            multiple_values_setting: stored.multiple_values_setting.clone(),
+            sub_slot_setting: stored.sub_slot_setting.clone(),
+        })
     }
 }
