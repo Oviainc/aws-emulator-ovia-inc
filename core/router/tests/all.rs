@@ -20,6 +20,11 @@
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `g…` span (beside the other glue suites) are both regions concurrently landing
+// suites add their line to.
+#[path = "all/glue_studio_notebook_catalog_through_the_router.rs"]
+mod glue_studio_notebook_catalog_through_the_router;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `e…` span (where every elbv2 suite lands) are both regions concurrently landing
 // suites add their line to.
 #[path = "all/elbv2_dualstack_and_security_group_classes.rs"]
