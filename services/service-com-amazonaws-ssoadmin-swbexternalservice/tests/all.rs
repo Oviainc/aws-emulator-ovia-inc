@@ -131,6 +131,8 @@ mod instance_region_status;
 mod instance_regions;
 #[path = "all/instance_single_instant_read.rs"]
 mod instance_single_instant_read;
+#[path = "all/instance_state_view.rs"]
+mod instance_state_view;
 #[path = "all/instance_update.rs"]
 mod instance_update;
 #[path = "all/instance_write_stamp_instant.rs"]

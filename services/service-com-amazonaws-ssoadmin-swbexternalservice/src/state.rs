@@ -30,7 +30,7 @@ use crate::ops::types::{
     AccountAssignmentOperationStatusMetadata, Application, ApplicationAssignment,
     ApplicationProvider, AttachedManagedPolicy, AuthenticationMethod,
     CustomerManagedPolicyReference, DisplayData, EncryptionConfigurationDetails, Grant,
-    InstanceAccessControlAttributeConfiguration, InstanceMetadata,
+    InstanceAccessControlAttributeConfiguration, InstanceMetadata, InstanceState,
     PermissionSet, PermissionSetProvisioningStatus, PermissionSetProvisioningStatusMetadata,
     PermissionsBoundary, PortalOptions,
     RegionMetadata, ResourceServerConfig, ResourceServerScopeDetails, ScopeDetails, Tag,
@@ -1759,12 +1759,14 @@ impl Instance {
             .find(|region| region.region_name == region_name)
     }
 
-    /// This instance as the modeled `InstanceMetadata` shape.
+    /// This instance as the `InstanceMetadata` shape, `State` included.
     ///
     /// `StatusReason` is left absent: the model documents it as additional context for
     /// an instance in a non-ACTIVE state, and there is none to give — a
     /// `CREATE_IN_PROGRESS` instance is on its way to ACTIVE, which the status already
     /// says.
+    ///
+    /// `State` is the instance's status again, as a structure: see [`Instance::state`].
     pub fn to_metadata(&self) -> InstanceMetadata {
         InstanceMetadata {
             instance_arn: Some(self.instance_arn.clone()),
@@ -1777,6 +1779,21 @@ impl Instance {
             status_reason: None,
             primary_region: Some(self.primary_region.clone()),
             regions: Some(self.regions.iter().map(Region::to_shape).collect()),
+            state: Some(self.state()),
+        }
+    }
+
+    /// This instance's `State` view: the structure served beside its `Status`, whose
+    /// `Name` is that same status value.
+    ///
+    /// Read from the one field the instance's status lives in, so the two views of the
+    /// lifecycle cannot disagree — whatever the status is at the instant of the read
+    /// (`CREATE_IN_PROGRESS` while the creation is in flight, `ACTIVE` once the
+    /// activation has fallen due, `DELETE_IN_PROGRESS` while a deletion is), `State.Name`
+    /// is it.
+    pub fn state(&self) -> InstanceState {
+        InstanceState {
+            name: Some(self.status.clone()),
         }
     }
 }
