@@ -6,6 +6,10 @@
 //! names, leaving every other key in place. Removing a key the resource does not carry
 //! changes nothing and is not an error, so the call is idempotent; a request that names
 //! no key at all removes nothing, since `TagKeys` is what says which tags to remove.
+//! A key with no characters, though, names no tag the set could ever hold, so it is a
+//! problem in the request and is refused with the modelled `BadRequestException` — the
+//! one answer `TagResource` gives such a key, out of the state module's single tag-key
+//! rule, so the two doors onto a record's tag map cannot disagree about which keys exist.
 //!
 //! The tags live ON the record they belong to, so a call that would remove one is a
 //! MODIFICATION of the resource the `Arn` names: one naming a built-in resource — the
@@ -82,8 +86,10 @@ use super::types::*;
 
 // Which modelled error a refused tag WRITE is, and the sentence it states, live once for
 // every door onto a record's tag set (`crate::state::TagWriteRefusal`); the impl at the
-// foot of this module states only how THIS operation's errors are built.
-use crate::state::TagWriteRefusalError;
+// foot of this module states only how THIS operation's errors are built. The same holds
+// for a tag set the record cannot carry (`crate::state::TagRefusal`), whose key half this
+// door applies to the keys it was handed.
+use crate::state::{TagRefusalError, TagWriteRefusalError};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -191,6 +197,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The keys this call names are the keys of the record's one tag map, so which
+        // values are keys at all is the tag-set rule the store owns, not this door's:
+        // `crate::state::check_tag_keys` holds them to the same test `TagResource` holds
+        // the keys of its pairs to, so a key that names no tag earns the one sentence that
+        // refusal states whichever door was asked. Applied before the store is reached, so
+        // a refused call removes nothing.
+        let requested_keys = input.tag_keys.unwrap_or_default();
+        if let Err(refusal) = crate::state::check_tag_keys(&requested_keys) {
+            return Err(UntagResourceErrorModeled::of_tag_refusal(refusal).into());
+        }
+
         let mut state = state.lock();
         // No `settle` here: the only state this path reads or writes is the record's tag
         // set, which the job lifecycle's clock never owes anything — settling is that
@@ -205,12 +222,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(UntagResourceErrorModeled::of_tag_write_refusal(refusal, "arn").into());
             }
         };
-        for key in input.tag_keys.unwrap_or_default() {
+        for key in requested_keys {
             // A key the resource never carried is simply not there afterwards either.
             tags.remove(&key);
         }
 
         Ok(UntagResourceOutput {})
+    }
+}
+
+/// How this operation's modelled errors state a tag-set refusal. Which refusal is which
+/// error, and the sentence each states, belong to [`crate::state::TagRefusal`] and its
+/// [`TagRefusalError::of_tag_refusal`], so the keys this door names take the same answer
+/// as the keys of the pairs `TagResource` carries.
+impl TagRefusalError for UntagResourceErrorModeled {
+    fn bad_request(message: String) -> Self {
+        Self::BadRequestException(BadRequestException {
+            message: Some(message),
+        })
+    }
+
+    fn quota_exceeded(message: String) -> Self {
+        Self::ServiceQuotaExceededException(ServiceQuotaExceededException {
+            message: Some(message),
+        })
     }
 }
 

@@ -1630,7 +1630,8 @@ impl TagRefusal {
 /// What a [`TagRefusal`] needs of ONE operation's modelled error enum: how that operation
 /// states the two errors the refusals map onto.
 ///
-/// Every door onto a record's tag set — the four `Create*` paths and `TagResource` — has
+/// Every door onto a record's tag set — the four `Create*` paths, `TagResource` and the
+/// `UntagResource` door that names keys — has
 /// its own generated error enum, which is the only part of answering a refusal that
 /// differs between them. So each door states just those two constructors and the
 /// CLASSIFICATION itself lives once, in [`Self::of_tag_refusal`], exactly as the ordering
@@ -1725,12 +1726,52 @@ pub fn tags_past_cap_message() -> String {
 /// tag count is bounded by [`MAX_TAGS_PER_RESOURCE`]. `tags` here is the set the record
 /// would carry AFTER the call, so a merge is tested on its result and a create on the set
 /// it would persist.
+///
+/// The door that REMOVES tags names keys rather than pairs, so it takes the key half of
+/// this rule through [`check_tag_keys`] over [`names_no_tag`] — the very predicate the key
+/// test here is written in, so neither door can hold a different idea of which keys are
+/// keys.
 pub fn check_tags(tags: &BTreeMap<String, String>) -> Result<(), TagRefusal> {
-    if tags.keys().any(|key| key.is_empty()) {
+    if tags.keys().any(|key| names_no_tag(key)) {
         return Err(TagRefusal::EmptyKey);
     }
     if tags.len() > MAX_TAGS_PER_RESOURCE {
         return Err(TagRefusal::PastCap);
+    }
+    Ok(())
+}
+
+/// Whether a tag KEY the caller sent names no tag at all.
+///
+/// The key IS a tag's identity inside a record's tag set, so what makes a key a key is the
+/// same question whichever member it arrived in: a key of zero length addresses no entry of
+/// that set, neither one a write could create nor one a read or a removal could reach. A
+/// key that carries any character — whitespace included, which is a character the set can
+/// be keyed by and a later call can name again — is a key, exactly as a resource name that
+/// carries characters is stored byte for byte. ONE predicate, so the doors that write a
+/// record's tags cannot disagree about which keys exist.
+///
+/// This is deliberately NOT [`carries_no_characters`], the test a member that NAMES A
+/// RESOURCE takes: that one trims, because a resource whose name is whitespace is a
+/// resource nothing could address, while a tag key of whitespace is an ordinary entry of
+/// one record's map that a later call names again the same way.
+pub fn names_no_tag(key: &str) -> bool {
+    key.is_empty()
+}
+
+/// Whether the tag KEYS a call names can address tags on a record — or the refusal the
+/// request earns, from the same rule [`check_tags`] applies to the keys of a tag SET.
+///
+/// `UntagResource` names keys rather than pairs, and a key is a key under one rule for
+/// every door onto a record's tag map ([`names_no_tag`]): a key naming no tag is a problem
+/// in the request ([`TagRefusal::EmptyKey`]), so the door that removes tags refuses exactly
+/// the key the door that writes them refuses, with the same sentence. Naming more keys than
+/// a record holds tags is NOT a refusal here: removing keys cannot carry a record past
+/// [`MAX_TAGS_PER_RESOURCE`], and a key the record does not carry is simply absent
+/// afterwards too.
+pub fn check_tag_keys(keys: &[String]) -> Result<(), TagRefusal> {
+    if keys.iter().any(|key| names_no_tag(key)) {
+        return Err(TagRefusal::EmptyKey);
     }
     Ok(())
 }

@@ -147,3 +147,5 @@ mod state_roundtrip;
 mod system_job_templates;
 #[path = "all/system_presets.rs"]
 mod system_presets;
+#[path = "all/tag_key_identity.rs"]
+mod tag_key_identity;

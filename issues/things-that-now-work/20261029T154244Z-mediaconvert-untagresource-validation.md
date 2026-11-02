@@ -78,3 +78,30 @@ Test coverage: `tests/all/resource_tagging.rs:1093-1107` pins the `TagResource` 
 2. Send the key that cannot be created: `POST /2017-08-29/tags` with `{"arn": "arn:aws:mediaconvert:<region>:<account>:queues/q", "tags": {"": "v"}}` → 400 `BadRequestException`, "Tags must not contain an empty tag key." (the rule in `check_tags`).
 3. Send the same key to the other door onto that map: `PUT /2017-08-29/tags/arn%3Aaws%3Amediaconvert%3A<region>%3A<account>%3Aqueues%2Fq` with `{"tagKeys": [""]}`.
 4. Observe HTTP 200 with an empty body instead of the 400 `BadRequestException` the crate's one blank-member rule (and the sibling write door on the same tag map) answers.
+
+## Resolution
+
+A tag key is the identity of an entry in a record's tag map, so which values ARE keys is one
+question for both doors onto that map, whichever member the key arrived in (`Tags` pairs or a
+`TagKeys` list, both over the model's bare `__string`): a key of zero length addresses no entry
+— none a write can create, none a read or a removal can reach — so it is refused as a problem in
+the request with the modelled `BadRequestException` (400) stating the crate's one
+`empty_tag_key_message()` sentence, before the store is touched, while a key carrying ANY
+character (whitespace included) is a key and is stored and addressed verbatim.
+
+That predicate is now named once as `crate::state::names_no_tag`; `check_tags` (the pairs door)
+is written in terms of it, and the new `crate::state::check_tag_keys` applies it to a key LIST —
+no cap test there, because removing keys cannot carry a record past `MAX_TAGS_PER_RESOURCE`.
+`src/ops/untag_resource.rs` calls it after the `Arn` form test and BEFORE `tags_for_write`,
+exactly where `tag_resource.rs` calls `check_tags`, and answers through the shared
+classification `TagRefusalError::of_tag_refusal`, so the status, the error shape and the
+sentence are the state module's single wording rather than a second copy. A refused removal
+therefore removes nothing, including the keys named beside the bad one.
+
+Pinned by the new suite `tests/all/tag_key_identity.rs`: a table of key values spanning the
+class (no characters at all, one space, three spaces, a tab, a word, a padded word,
+punctuation, characters beyond ASCII, one character, 128 characters) driven through BOTH doors
+with a read-back through `ListTagsForResource`; a table over where the bad value sits in the key
+list and what travels beside it, with the exact remaining set asserted; and a case showing the
+refusal is answered before the ARN is resolved, with the lookup refusal still served for a real
+key.
