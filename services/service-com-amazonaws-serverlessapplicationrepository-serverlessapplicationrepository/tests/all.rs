@@ -35,6 +35,8 @@ mod error_bodies;
 mod presigned_locators;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/version_publish_surface.rs"]
+mod version_publish_surface;
 #[path = "all/version_templates.rs"]
 mod version_templates;
 #[path = "all/wire_probe.rs"]

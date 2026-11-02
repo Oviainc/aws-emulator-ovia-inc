@@ -133,8 +133,10 @@ pub struct Application {
     /// The region this application was published in — the one its ARN names, and the one
     /// its name is unique within.
     pub region: String,
-    /// Every version of this application, ordered by semantic version so a paged walk
-    /// is stable.
+    /// Every version of this application, keyed by its semantic version so a lookup by
+    /// the `SemanticVersion` label is exact and the map's own order is stable. The order
+    /// a version COLLECTION is reported in is semantic-version precedence, which the
+    /// text of a version does not give — see [`Application::versions_by_precedence`].
     pub versions: BTreeMap<String, AppVersion>,
     /// The semantic version with the highest precedence of those stored, which
     /// `GetApplication` reports when the caller names none.
@@ -159,6 +161,24 @@ impl Application {
     /// — which is as absent as an application that was never created.
     pub fn version_named(&self, semantic_version: &str) -> Option<&AppVersion> {
         self.versions.get(semantic_version)
+    }
+
+    /// This application's semantic versions in ASCENDING semantic-version precedence,
+    /// which is the order a version collection is reported in.
+    ///
+    /// Precedence is semver 2.0.0 §11 ([`precedence_key`]) — the same ordering that
+    /// decides which stored version is [`Application::latest`], so one application cannot
+    /// report a walk whose last entry is not the version it calls its latest. The text of
+    /// a semantic version does not give that order: `1.10.0` sorts below `1.9.0` as text
+    /// and above it as a version, and a prerelease sorts above the release it precedes as
+    /// text and below it as a version.
+    ///
+    /// The key is computed once per version rather than once per comparison, so the walk
+    /// costs one parse of each stored version.
+    pub fn versions_by_precedence(&self) -> Vec<String> {
+        let mut semantic_versions: Vec<String> = self.versions.keys().cloned().collect();
+        semantic_versions.sort_by_cached_key(|semantic_version| precedence_key(semantic_version));
+        semantic_versions
     }
 
     /// Store `version` and keep [`Application::latest_version`] pointing at the stored

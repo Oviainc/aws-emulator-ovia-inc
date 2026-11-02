@@ -3,7 +3,10 @@
 //! @op ListApplicationVersions
 //! Walks the versions one application holds in [`crate::state`], one page at a time:
 //! `maxItems` sizes the page and `nextToken` resumes it, so consecutive pages visit
-//! every stored version exactly once and the final page carries no token.
+//! every stored version exactly once and the final page carries no token. The walk is
+//! ordered by semantic-version precedence
+//! ([`crate::state::Application::versions_by_precedence`]), the same ordering that picks
+//! the application's latest version.
 //!
 //! A pure read: it answers from the store and writes nothing.
 //!
@@ -146,8 +149,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The collection is walked in ascending semantic-version precedence, the order a
+        // version list is reported in, which `crate::state` derives from the stored
+        // versions themselves — so the walk's last entry is the version the application
+        // reports as its latest, and `1.10.0` follows `1.9.0` rather than preceding it as
+        // its text would.
         let page = crate::state::page_of(
-            application.versions.keys().cloned(),
+            application.versions_by_precedence().into_iter(),
             input.max_items,
             input.next_token.as_deref(),
         )
