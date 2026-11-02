@@ -154,24 +154,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let state = state.lock();
-        let Some(service) = state
+        // One lookup of the (service, instance) pair, not two: this read reports
+        // whether that one instance is registered, and a request naming a service that
+        // is not stored has no instance to report either. The recorded refusal for a
+        // `ServiceId` nothing resolves to is an instance miss, so the enclosing
+        // service's absence is not surfaced as its own error on this operation.
+        let Some(instance) = state
             .resolve_service_id(&input.service_id)
             .and_then(|id| state.services.get(&id))
+            .and_then(|service| service.instances.get(&input.instance_id))
         else {
-            return Err(GetInstanceErrorModeled::ServiceNotFound(ServiceNotFound {
-                message: Some(format!(
-                    "No service exists with the specified ID {}.",
-                    input.service_id
-                )),
-            })
-            .into());
-        };
-        let Some(instance) = service.instances.get(&input.instance_id) else {
             return Err(GetInstanceErrorModeled::InstanceNotFound(InstanceNotFound {
-                message: Some(format!(
-                    "No instance exists with the specified ID {} in service {}.",
-                    input.instance_id, service.id
-                )),
+                // The instance the request named, and nothing else: the recorded
+                // refusal echoes the requested `InstanceId` with no sentence around it
+                // and does not name the service it was looked for in.
+                message: Some(input.instance_id.clone()),
             })
             .into());
         };

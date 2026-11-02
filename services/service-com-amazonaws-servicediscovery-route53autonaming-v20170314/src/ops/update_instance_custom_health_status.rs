@@ -167,7 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateInstanceCustomHealthStatusErrorModeled::InvalidInput(
                 InvalidInput {
@@ -205,9 +204,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the custom-health registry this call addresses holds nothing for it.
         let service_not_found = || {
             UpdateInstanceCustomHealthStatusErrorModeled::ServiceNotFound(ServiceNotFound {
+                // The message is this operation's own template: the fixed lower-case
+                // "no service " and the single-quoted ARN of the service the request
+                // named, built from the request whichever form it used.
                 message: Some(format!(
-                    "No service exists with the specified ID {}.",
-                    input.service_id
+                    "no service '{}'",
+                    crate::state::service_reference_arn(
+                        &crate::state::request_region(ctx),
+                        &input.service_id,
+                    )
                 )),
             })
         };
@@ -263,10 +268,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateInstanceCustomHealthStatusErrorModeled::InstanceNotFound(
                     InstanceNotFound {
-                        message: Some(format!(
-                            "No instance exists with the specified ID {} in service {service_id}.",
-                            input.instance_id
-                        )),
+                        // The instance the request named, and nothing else.
+                        message: Some(input.instance_id.clone()),
                     },
                 )
                 .into(),

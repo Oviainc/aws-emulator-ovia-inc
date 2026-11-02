@@ -418,21 +418,24 @@ async fn requests_naming_something_unstored_answer_their_modelled_errors() {
 
     for (case, body, expected_status, expected_code) in [
         (
+            // This read reports whether instances have a status, so a service it
+            // cannot resolve has none to report: the refusal is an instance miss, not
+            // a service miss.
             "a service id nothing was created under",
             json!({ "ServiceId": "srv-nosuchservice" }),
-            404,
-            "ServiceNotFound",
+            400,
+            "InstanceNotFound",
         ),
         (
             "an instance that is not registered with the service",
             json!({ "ServiceId": service_id, "Instances": ["i-9"] }),
-            404,
+            400,
             "InstanceNotFound",
         ),
         (
             "one known and one unknown instance",
             json!({ "ServiceId": service_id, "Instances": ["i-1", "i-9"] }),
-            404,
+            400,
             "InstanceNotFound",
         ),
         (

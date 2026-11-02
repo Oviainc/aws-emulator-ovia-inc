@@ -166,7 +166,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListInstancesErrorModeled::InvalidInput(InvalidInput {
                 message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
@@ -185,9 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|id| state.services.get(&id))
         else {
             return Err(ListInstancesErrorModeled::ServiceNotFound(ServiceNotFound {
-                message: Some(format!(
-                    "No service exists with the specified ID {}.",
-                    input.service_id
+                // The message is the service the request named, as its ARN and nothing
+                // else: the recorded refusal carries that one value, with no sentence
+                // around it, whichever form the request used to name the service.
+                message: Some(crate::state::service_reference_arn(
+                    &crate::state::request_region(ctx),
+                    &input.service_id,
                 )),
             })
             .into());

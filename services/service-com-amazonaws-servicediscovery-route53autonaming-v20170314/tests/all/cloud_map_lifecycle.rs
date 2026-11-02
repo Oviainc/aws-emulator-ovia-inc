@@ -361,7 +361,7 @@ async fn every_refusal_of_a_bad_value_carries_this_service_s_own_code() {
 }
 
 /// A `Name` already owned by a create that has COMPLETED is a duplicate request, not a
-/// bad value: it is refused with 409 `DuplicateRequest` naming that operation. Deleting
+/// bad value: it is refused with `DuplicateRequest` naming that operation. Deleting
 /// the namespace frees the name and the identical call then succeeds.
 #[tokio::test]
 async fn a_name_already_owned_by_a_completed_create_is_a_duplicate_request() {
@@ -399,8 +399,8 @@ async fn a_name_already_owned_by_a_completed_create_is_a_duplicate_request() {
         let (code, _) = error_of(&answer);
         assert_eq!(
             (status, code.as_str()),
-            (409, "DuplicateRequest"),
-            "case {operation} on the taken name {name:?}: expected 409 DuplicateRequest, got \
+            (400, "DuplicateRequest"),
+            "case {operation} on the taken name {name:?}: expected 400 DuplicateRequest, got \
              {answer}"
         );
         assert_eq!(
@@ -549,8 +549,8 @@ async fn a_not_found_or_conflict_body_echoes_no_request_value() {
         let (code, _) = error_of(&answer);
         assert_eq!(
             (status, code.as_str()),
-            (404, "NamespaceNotFound"),
-            "case {operation} with {body}: expected 404 NamespaceNotFound, got {answer}"
+            (400, "NamespaceNotFound"),
+            "case {operation} with {body}: expected 400 NamespaceNotFound, got {answer}"
         );
         assert!(
             answer.get("Message").is_none() && answer.get("message").is_none(),
@@ -580,7 +580,7 @@ async fn a_not_found_or_conflict_body_echoes_no_request_value() {
 }
 
 /// A resource that still contains other resources cannot be deleted: a namespace that
-/// holds a service, and a service that holds an instance, are refused with 409
+/// holds a service, and a service that holds an instance, are refused with
 /// `ResourceInUse`. The delete succeeds once the children are gone.
 #[tokio::test]
 async fn a_resource_that_still_has_children_is_refused_with_resource_in_use() {
@@ -620,7 +620,7 @@ async fn a_resource_that_still_has_children_is_refused_with_resource_in_use() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (409, "ResourceInUse"),
+            (400, "ResourceInUse"),
             "case {case:?}: a namespace holding {services} service(s) is in use"
         );
 
@@ -630,7 +630,7 @@ async fn a_resource_that_still_has_children_is_refused_with_resource_in_use() {
                     failure(&router, "DeleteService", json!({ "Id": service_id })).await;
                 assert_eq!(
                     (status, code.as_str()),
-                    (409, "ResourceInUse"),
+                    (400, "ResourceInUse"),
                     "case {case:?}: a service holding {instances} instance(s) is in use"
                 );
                 for instance in 0..instances {
@@ -646,7 +646,7 @@ async fn a_resource_that_still_has_children_is_refused_with_resource_in_use() {
             let (status, code) = failure(&router, "GetService", json!({ "Id": service_id })).await;
             assert_eq!(
                 (status, code.as_str()),
-                (404, "ServiceNotFound"),
+                (400, "ServiceNotFound"),
                 "case {case:?}: a deleted service is gone from the store"
             );
         }
@@ -674,7 +674,7 @@ async fn a_resource_that_still_has_children_is_refused_with_resource_in_use() {
         let (status, code) = failure(&router, "GetNamespace", json!({ "Id": namespace_id })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "NamespaceNotFound"),
+            (400, "NamespaceNotFound"),
             "case {case:?}: a deleted namespace is gone from the store"
         );
     }
@@ -763,7 +763,7 @@ async fn a_custom_health_status_is_accepted_only_where_a_custom_health_check_is_
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "InstanceNotFound"),
+            (400, "InstanceNotFound"),
             "case {case:?}: a named instance the service never registered is not found"
         );
 
@@ -778,8 +778,8 @@ async fn a_custom_health_status_is_accepted_only_where_a_custom_health_check_is_
                 let (code, _) = error_of(&answer);
                 assert_eq!(
                     (status, code.as_str()),
-                    (404, expected_code),
-                    "case {case:?} with {request}: expected 404 {expected_code}, got {answer}"
+                    (400, expected_code),
+                    "case {case:?} with {request}: expected 400 {expected_code}, got {answer}"
                 );
                 continue;
             }
@@ -829,7 +829,7 @@ async fn a_custom_health_status_is_accepted_only_where_a_custom_health_check_is_
             json!({ "ServiceId": service_id, "InstanceId": "i-never", "Status": "HEALTHY" }),
         )
         .await;
-        let expected = (404, refused_with.unwrap_or("InstanceNotFound"));
+        let expected = (400, refused_with.unwrap_or("InstanceNotFound"));
         assert_eq!(
             (status, code.as_str()),
             expected,
@@ -847,7 +847,7 @@ async fn a_custom_health_status_is_accepted_only_where_a_custom_health_check_is_
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (404, "ServiceNotFound"),
+        (400, "ServiceNotFound"),
         "a service id nothing created answers ServiceNotFound"
     );
 }

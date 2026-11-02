@@ -960,6 +960,25 @@ pub fn service_arn(region: &str, resource: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, resource)
 }
 
+/// The ARN form of a service reference a request named, for an error that answers with
+/// the service the caller asked for rather than with a sentence about it.
+///
+/// Every member that names a service is modelled `Arn` and documented as "the ID or
+/// Amazon Resource Name (ARN)", so a caller may name one either way; this renders the
+/// one ARN form whichever form the request used. Nothing is looked up: the reference
+/// this is built for resolves to no stored service, so the ARN is composed from the
+/// request and the region it was signed for, exactly as a create would have minted it.
+pub fn service_reference_arn(region: &str, reference: &str) -> String {
+    if reference.starts_with(ARN_SCHEME_PREFIX) {
+        return reference.to_string();
+    }
+    service_arn(region, &format!("service/{reference}"))
+}
+
+/// What every ARN starts with, so a reference already in ARN form is recognised rather
+/// than wrapped in a second one.
+const ARN_SCHEME_PREFIX: &str = "arn:";
+
 /// A per-call sort key for one instance id.
 ///
 /// `DiscoverInstances` is documented to return "a randomized list of instances

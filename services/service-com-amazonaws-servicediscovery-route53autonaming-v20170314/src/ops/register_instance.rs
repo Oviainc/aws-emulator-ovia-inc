@@ -152,6 +152,23 @@ impl From<RegisterInstanceErrorModeled> for RegisterInstanceError {
 /// on `RegisterInstanceRequest$Attributes`.
 const INIT_HEALTH_STATUS_ATTRIBUTE: &str = "AWS_INIT_HEALTH_STATUS";
 
+/// The refusal for a service reference that resolves to no stored service.
+///
+/// The message is the service the request named, as its ARN and nothing else: this
+/// operation's `ServiceNotFound` composes no sentence around that one value, and
+/// renders the same ARN whichever form the request used to name the service.
+fn service_not_found(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    service_reference: &str,
+) -> RegisterInstanceErrorModeled {
+    RegisterInstanceErrorModeled::ServiceNotFound(ServiceNotFound {
+        message: Some(crate::state::service_reference_arn(
+            &crate::state::request_region(ctx),
+            service_reference,
+        )),
+    })
+}
+
 /// The `RegisterInstance` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -188,7 +205,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(RegisterInstanceErrorModeled::InvalidInput(InvalidInput {
                 message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
@@ -200,13 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         let Some(service_id) = state.resolve_service_id(&input.service_id) else {
-            return Err(RegisterInstanceErrorModeled::ServiceNotFound(ServiceNotFound {
-                message: Some(format!(
-                    "No service exists with the specified ID {}.",
-                    input.service_id
-                )),
-            })
-            .into());
+            return Err(service_not_found(ctx, &input.service_id).into());
         };
 
         // What the token identifies: this instance in this service.
@@ -297,13 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // can panic a handler, answering the same `ServiceNotFound` the resolution
             // step does.
             let Some(service) = state.services.get_mut(&service_id) else {
-                return Err(RegisterInstanceErrorModeled::ServiceNotFound(ServiceNotFound {
-                    message: Some(format!(
-                        "No service exists with the specified ID {}.",
-                        input.service_id
-                    )),
-                })
-                .into());
+                return Err(service_not_found(ctx, &input.service_id).into());
             };
             // A new instance is refused once the service holds its quota; replacing
             // one that is already there adds nothing, so it is always allowed.

@@ -530,9 +530,9 @@ async fn an_arn_naming_no_stored_resource_is_not_found() {
             let (status, code) = failure(&router, operation, body.clone()).await;
             assert_eq!(
                 (status, code.as_str()),
-                (404, "ResourceNotFoundException"),
+                (400, "ResourceNotFoundException"),
                 "case {case:?} on {operation} with {body}: \
-                 expected 404 ResourceNotFoundException"
+                 expected 400 ResourceNotFoundException"
             );
         }
     }

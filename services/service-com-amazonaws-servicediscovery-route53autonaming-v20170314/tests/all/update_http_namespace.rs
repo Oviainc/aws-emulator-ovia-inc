@@ -300,8 +300,8 @@ async fn a_namespace_is_addressable_by_id_and_by_arn() {
     }
 }
 
-/// A reference no stored namespace answers to is the modelled 404, and nothing is
-/// written for it.
+/// A reference no stored namespace answers to is the modelled `NamespaceNotFound`, and
+/// nothing is written for it.
 #[tokio::test]
 async fn an_unknown_namespace_reference_is_namespace_not_found() {
     let router = emulator();
@@ -326,8 +326,8 @@ async fn an_unknown_namespace_reference_is_namespace_not_found() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "NamespaceNotFound"),
-            "case {case:?}: expected 404 NamespaceNotFound, got {status} {code}"
+            (400, "NamespaceNotFound"),
+            "case {case:?}: expected 400 NamespaceNotFound, got {status} {code}"
         );
     }
 

@@ -108,6 +108,14 @@ impl From<DeleteServiceErrorModeled> for DeleteServiceError {
     }
 }
 
+/// The sentence `ResourceInUse` carries when the service still holds instances.
+///
+/// Documented on this operation: "If the service still contains one or more registered
+/// instances, the request fails." The refusal says exactly that and names neither the
+/// service nor how many instances it holds — the recorded response is this fixed text.
+const SERVICE_CONTAINS_INSTANCES: &str =
+    "Service contains registered instances; delete the instances before deleting the service";
+
 /// The `DeleteService` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,10 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with the account is named by its ARN, so both forms resolve to the one record.
         let Some(service_id) = state.resolve_service_id(&input.id) else {
             return Err(DeleteServiceErrorModeled::ServiceNotFound(ServiceNotFound {
-                message: Some(format!(
-                    "No service exists with the specified ID {}.",
-                    input.id
-                )),
+                // The message is the reference the request named, exactly as it named
+                // it, and nothing else: the recorded refusal echoes the requested `Id`
+                // and composes no sentence around it.
+                message: Some(input.id.clone()),
             })
             .into());
         };
@@ -176,10 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expect("the resolved service id is present");
         if instance_count > 0 {
             return Err(DeleteServiceErrorModeled::ResourceInUse(ResourceInUse {
-                message: Some(format!(
-                    "The service {service_id} can't be deleted because it still contains \
-                     {instance_count} registered instance(s)."
-                )),
+                message: Some(SERVICE_CONTAINS_INSTANCES.to_string()),
             })
             .into());
         }

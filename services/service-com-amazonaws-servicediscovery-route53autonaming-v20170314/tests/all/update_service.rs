@@ -825,8 +825,8 @@ async fn an_http_namespace_service_and_an_unknown_reference_are_refused() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ServiceNotFound"),
-            "case {case:?}: expected 404 ServiceNotFound, got {status} {code}"
+            (400, "ServiceNotFound"),
+            "case {case:?}: expected 400 ServiceNotFound, got {status} {code}"
         );
     }
 }

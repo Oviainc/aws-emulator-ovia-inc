@@ -153,10 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|service_id| state.services.get(&service_id))
         else {
             return Err(GetServiceAttributesErrorModeled::ServiceNotFound(ServiceNotFound {
-                message: Some(format!(
-                    "No service exists with the specified ID {}.",
-                    input.service_id
-                )),
+                // `ServiceNotFound` carries no message on the service-attribute
+                // operations: the recorded refusal reports the class in the error code
+                // and echoes nothing of the request into the body.
+                message: None,
             })
             .into());
         };

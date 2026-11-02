@@ -135,6 +135,12 @@ const DEFAULT_MAX_RESULTS: usize = MAX_MAX_RESULTS;
 /// not honoured as a page boundary by another paginated read.
 const NEXT_TOKEN_SCOPE: &str = "GetInstancesHealthStatus";
 
+/// How a refusal names the scope of a request that listed no `Instances` — the whole
+/// service, as `GetInstancesHealthStatusRequest$Instances` documents ("If you omit
+/// Instances, Cloud Map returns the health status for all the instances that are
+/// associated with the specified service").
+const ALL_INSTANCES: &str = "All instances";
+
 /// The `GetInstancesHealthStatus` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -171,7 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetInstancesHealthStatusErrorModeled::InvalidInput(InvalidInput {
                 message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
@@ -187,22 +192,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
 
-        // The one answer for a service this emulator does not hold, whether the
-        // reference resolves to no id at all or the id it resolves to is no longer
-        // stored: a read never depends on the two agreeing.
-        let service_not_found = || {
-            GetInstancesHealthStatusErrorModeled::ServiceNotFound(ServiceNotFound {
+        // The scope the request asked about, which this operation's refusal reports
+        // back: the instance ids it listed, or the fixed "all instances" wording when it
+        // listed none — "if you omit Instances, Cloud Map returns the health status for
+        // all the instances that are associated with the specified service".
+        let requested_scope = match input.instances.as_deref() {
+            Some(requested) if !requested.is_empty() => requested.join(", "),
+            _ => ALL_INSTANCES.to_string(),
+        };
+
+        // The one answer for a service whose instance statuses this emulator cannot
+        // report, whether the reference resolves to no id at all or the id it resolves
+        // to is no longer stored: there is no instance to report a status for, which is
+        // what an instance miss says. This read does not surface the enclosing service's
+        // absence as its own error. The message is this operation's own template: the
+        // fixed text, the single-quoted ARN of the service the statuses were asked of,
+        // and the scope the request named; the spelling of the fixed part is the
+        // service's own.
+        let instances_not_found = |service_arn: &str| {
+            GetInstancesHealthStatusErrorModeled::InstanceNotFound(InstanceNotFound {
                 message: Some(format!(
-                    "No service exists with the specified ID {}.",
-                    input.service_id
+                    "Instance(s) not found for service '{service_arn}' when trying to \
+                     retreive: {requested_scope}"
                 )),
             })
         };
+        let requested_service_arn = crate::state::service_reference_arn(
+            &crate::state::request_region(ctx),
+            &input.service_id,
+        );
         let Some(service_id) = state.resolve_service_id(&input.service_id) else {
-            return Err(service_not_found().into());
+            return Err(instances_not_found(&requested_service_arn).into());
         };
         let Some(service) = state.services.get_mut(&service_id) else {
-            return Err(service_not_found().into());
+            return Err(instances_not_found(&requested_service_arn).into());
         };
         service.apply_due_health_statuses(now);
         // The rest of this handler only reads, so the record is reborrowed immutably.
@@ -232,16 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(requested) => {
                 for instance_id in requested {
                     if !service.instances.contains_key(instance_id) {
-                        return Err(GetInstancesHealthStatusErrorModeled::InstanceNotFound(
-                            InstanceNotFound {
-                                message: Some(format!(
-                                    "No instance exists with the specified ID {instance_id} in \
-                                     service {}.",
-                                    service.id
-                                )),
-                            },
-                        )
-                        .into());
+                        return Err(instances_not_found(&service.arn).into());
                     }
                 }
                 // A repeated id names one instance, and the response is a map keyed by

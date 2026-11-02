@@ -686,8 +686,8 @@ async fn an_unresolvable_service_answers_service_not_found() {
             let (status, code) = failure(&router, operation, body).await;
             assert_eq!(
                 (status, code.as_str()),
-                (404, "ServiceNotFound"),
-                "case {case:?} on {operation}: expected 404 ServiceNotFound, got {status} {code}"
+                (400, "ServiceNotFound"),
+                "case {case:?} on {operation}: expected 400 ServiceNotFound, got {status} {code}"
             );
         }
     }

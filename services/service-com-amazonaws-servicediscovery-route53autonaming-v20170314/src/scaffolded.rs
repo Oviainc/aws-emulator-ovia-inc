@@ -183,7 +183,8 @@ impl SerializableStruct for ValidationException {
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status this service
+    /// serves that error's class with — see [`served_status`].
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -245,10 +246,33 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
     }
 }
 
+/// The HTTP status this service answers EVERY client-class failure with.
+///
+/// This JSON front end carries the class of a client error in the body's error code
+/// (`__type`), not in the status line: the recorded responses for the not-found and
+/// in-use classes are all HTTP 400, even though the model pins `@httpError` 404 and
+/// 409 on those shapes. A client therefore matches on the code, and a status outside
+/// this one would make it read a normal client error as a transport failure.
+pub const CLIENT_ERROR_STATUS: u16 = 400;
+
+/// The status this service serves a modeled error with: [`CLIENT_ERROR_STATUS`] for
+/// every client-class (4xx) one, the modeled status for anything else.
+///
+/// A server-class error keeps its own status: a 5xx says the request may succeed on a
+/// retry, which is a different claim from a client error and is classified as one by
+/// every SDK.
+pub fn served_status(modeled: u16) -> u16 {
+    if (400..500).contains(&modeled) {
+        CLIENT_ERROR_STATUS
+    } else {
+        modeled
+    }
+}
+
 /// Every `OperationError` method delegates to the modeled error, so wrapping an
-/// implemented operation's error channel changes NOTHING about how that error is
-/// rendered. Only the synthetic variant behaves differently — and it is the one that
-/// must answer 501.
+/// implemented operation's error channel changes NOTHING about the error code or body
+/// it renders. Only the status is this service's to decide ([`served_status`]), and
+/// the synthetic variant answers 501.
 impl<E: OperationError> OperationError for Scaffolded<E> {
     fn as_serializable(&self) -> &dyn SerializableStruct {
         match self {
@@ -278,15 +302,16 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         }
     }
 
-    /// 501 for the scaffold signal.
+    /// 501 for the scaffold signal, and [`CLIENT_ERROR_STATUS`] for every client-class
+    /// modeled error.
     ///
-    /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
+    /// Keep the 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
-            Self::ValidationException(_) => 400,
+            Self::Modeled(e) => served_status(e.http_status()),
+            Self::ValidationException(_) => CLIENT_ERROR_STATUS,
         }
     }
 

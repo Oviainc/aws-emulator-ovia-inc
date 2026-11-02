@@ -426,7 +426,7 @@ async fn bad_requests_answer_their_modelled_errors() {
     let service_id = service(&router, &namespace_id, "list-errors-svc").await;
     register(&router, &service_id, &["i-1".to_string(), "i-2".to_string()]).await;
 
-    // A service reference nothing resolves to: 404 ServiceNotFound.
+    // A service reference nothing resolves to: 400 ServiceNotFound.
     for (case, reference) in [
         ("an id no service carries", "srv-00000000000000000"),
         (
@@ -438,8 +438,8 @@ async fn bad_requests_answer_their_modelled_errors() {
         let (status, code) = failure(&router, "ListInstances", json!({ "ServiceId": reference })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ServiceNotFound"),
-            "case {case:?} ({reference}): expected 404 ServiceNotFound"
+            (400, "ServiceNotFound"),
+            "case {case:?} ({reference}): expected 400 ServiceNotFound"
         );
     }
 

@@ -322,7 +322,7 @@ async fn the_cloud_map_core_loop_reads_back_everything_it_persisted() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (404, "InstanceNotFound"),
+        (400, "InstanceNotFound"),
         "a deregistered instance is gone from the service record"
     );
 
@@ -833,7 +833,7 @@ async fn a_reused_token_naming_another_resource_is_not_a_replay() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ServiceNotFound"),
+            (400, "ServiceNotFound"),
             "namespace {name:?} must have been created by the reused token"
         );
     }
@@ -1261,21 +1261,21 @@ async fn unknown_and_conflicting_resources_answer_their_modelled_errors() {
             "an operation id nothing filed",
             "GetOperation",
             json!({ "OperationId": "nosuchoperation" }),
-            404,
+            400,
             "OperationNotFound",
         ),
         (
             "a namespace id nothing created",
             "GetNamespace",
             json!({ "Id": "ns-nosuchnamespace" }),
-            404,
+            400,
             "NamespaceNotFound",
         ),
         (
             "a service in a namespace that does not exist",
             "CreateService",
             json!({ "Name": "orphan-svc", "NamespaceId": "ns-nosuchnamespace" }),
-            404,
+            400,
             "NamespaceNotFound",
         ),
         (
@@ -1301,7 +1301,7 @@ async fn unknown_and_conflicting_resources_answer_their_modelled_errors() {
             "a namespace name that is already taken",
             "CreateHttpNamespace",
             json!({ "Name": "errors-ns" }),
-            409,
+            400,
             "DuplicateRequest",
         ),
         (
@@ -1315,7 +1315,7 @@ async fn unknown_and_conflicting_resources_answer_their_modelled_errors() {
             "a service id nothing created",
             "GetService",
             json!({ "Id": "srv-nosuchservice" }),
-            404,
+            400,
             "ServiceNotFound",
         ),
         (
@@ -1323,42 +1323,42 @@ async fn unknown_and_conflicting_resources_answer_their_modelled_errors() {
             "RegisterInstance",
             json!({ "ServiceId": "srv-nosuchservice", "InstanceId": "i-9",
                     "Attributes": { "stage": "prod" } }),
-            404,
+            400,
             "ServiceNotFound",
         ),
         (
             "deregistering from a service that does not exist",
             "DeregisterInstance",
             json!({ "ServiceId": "srv-nosuchservice", "InstanceId": "i-1" }),
-            404,
+            400,
             "ServiceNotFound",
         ),
         (
             "deregistering an instance that was never registered",
             "DeregisterInstance",
             json!({ "ServiceId": service_id, "InstanceId": "i-never" }),
-            404,
+            400,
             "InstanceNotFound",
         ),
         (
             "an instance that was never registered",
             "GetInstance",
             json!({ "ServiceId": service_id, "InstanceId": "i-never" }),
-            404,
+            400,
             "InstanceNotFound",
         ),
         (
             "discovery in a namespace that does not exist",
             "DiscoverInstances",
             json!({ "NamespaceName": "nosuch-ns", "ServiceName": "errors-svc" }),
-            404,
+            400,
             "NamespaceNotFound",
         ),
         (
             "discovery of a service that does not exist",
             "DiscoverInstances",
             json!({ "NamespaceName": "errors-ns", "ServiceName": "nosuch-svc" }),
-            404,
+            400,
             "ServiceNotFound",
         ),
     ];

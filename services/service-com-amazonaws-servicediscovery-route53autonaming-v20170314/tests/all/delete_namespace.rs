@@ -132,7 +132,7 @@ async fn a_delete_removes_the_namespace_it_names_and_files_its_operation() {
             let (status, code) = failure(&router, "GetNamespace", json!({ "Id": named })).await;
             assert_eq!(
                 (status, code.as_str()),
-                (404, "NamespaceNotFound"),
+                (400, "NamespaceNotFound"),
                 "case {case:?}: the deleted namespace must not read back by {form}"
             );
         }
@@ -183,7 +183,7 @@ async fn a_namespace_that_still_holds_services_is_refused_and_left_alone() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (409, "ResourceInUse"),
+            (400, "ResourceInUse"),
             "case {service_count} service(s): the delete must be refused"
         );
 
@@ -228,7 +228,7 @@ async fn a_namespace_that_still_holds_services_is_refused_and_left_alone() {
         let (status, code) = failure(&router, "GetNamespace", json!({ "Id": namespace_id })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "NamespaceNotFound"),
+            (400, "NamespaceNotFound"),
             "case {service_count} service(s): the emptied namespace is gone"
         );
     }
@@ -332,8 +332,8 @@ async fn a_delete_in_progress_is_a_duplicate_and_a_settled_one_is_not_found() {
         let (status, code) = failure(&router, "DeleteNamespace", json!({ "Id": named })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "NamespaceNotFound"),
-            "case {case:?}: an unknown namespace is a 404"
+            (400, "NamespaceNotFound"),
+            "case {case:?}: an unknown namespace is refused as not found"
         );
     }
 
@@ -368,7 +368,7 @@ async fn a_delete_in_progress_is_a_duplicate_and_a_settled_one_is_not_found() {
         // duplicate — and it names the operation already running.
         assert_eq!(
             (status, code.as_str()),
-            (409, "DuplicateRequest"),
+            (400, "DuplicateRequest"),
             "a retry inside the operation's span is a duplicate, got {retry}"
         );
         assert_eq!(
@@ -379,8 +379,8 @@ async fn a_delete_in_progress_is_a_duplicate_and_a_settled_one_is_not_found() {
     } else {
         assert_eq!(
             (status, code.as_str()),
-            (404, "NamespaceNotFound"),
-            "past the span the retry is a plain 404, got {retry}"
+            (400, "NamespaceNotFound"),
+            "past the span the retry is a plain not-found, got {retry}"
         );
     }
 
@@ -402,7 +402,7 @@ async fn a_delete_in_progress_is_a_duplicate_and_a_settled_one_is_not_found() {
     let (status, code) = failure(&router, "DeleteNamespace", json!({ "Id": namespace_id })).await;
     assert_eq!(
         (status, code.as_str()),
-        (404, "NamespaceNotFound"),
+        (400, "NamespaceNotFound"),
         "once the delete has settled there is nothing in progress to duplicate"
     );
 }

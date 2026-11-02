@@ -157,9 +157,9 @@ async fn submit(router: &MultiServiceRouter, service: &str, instance_id: &str, s
 }
 
 /// Only a service whose health checking is a custom health check accepts a submitted
-/// status; a Route 53 health check answers `CustomHealthNotFound` (HTTP 404), and a
+/// status; a Route 53 health check answers `CustomHealthNotFound`, and a
 /// service that configures no health checking at all is in no health registry and
-/// answers `ServiceNotFound` (HTTP 404) — whatever status is submitted.
+/// answers `ServiceNotFound` — whatever status is submitted.
 ///
 /// The Route 53 check types come from the model's `HealthCheckType` enum
 /// (`HEALTH_CHECK_TYPE_VALUES` in `src/ops/types/shared_types.rs`) and the statuses from
@@ -219,8 +219,8 @@ async fn a_status_is_client_settable_only_for_a_custom_health_check() {
                 .await;
                 assert_eq!(
                     (http_status, code.as_str()),
-                    (404, expected_code),
-                    "case {case:?} status {status}: expected 404 {expected_code}, \
+                    (400, expected_code),
+                    "case {case:?} status {status}: expected 400 {expected_code}, \
                      got {http_status} {code}"
                 );
                 if expected_code == "CustomHealthNotFound" {
@@ -407,20 +407,20 @@ async fn unknown_resources_and_bad_statuses_answer_their_modelled_errors() {
         (
             "a service id nothing was created with",
             json!({ "ServiceId": "srv-nothinghere0000", "InstanceId": "i-1", "Status": "HEALTHY" }),
-            404,
+            400,
             "ServiceNotFound",
         ),
         (
             "a service ARN nothing was created with",
             json!({ "ServiceId": format!("{service_arn}-other"), "InstanceId": "i-1",
                     "Status": "HEALTHY" }),
-            404,
+            400,
             "ServiceNotFound",
         ),
         (
             "an instance that was never registered",
             json!({ "ServiceId": service_id, "InstanceId": "i-absent", "Status": "HEALTHY" }),
-            404,
+            400,
             "InstanceNotFound",
         ),
         (
@@ -539,8 +539,8 @@ async fn a_route53_health_check_reports_the_status_the_service_computes() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "CustomHealthNotFound"),
-            "case {case:?}: expected 404 CustomHealthNotFound, got {status} {code}"
+            (400, "CustomHealthNotFound"),
+            "case {case:?}: expected 400 CustomHealthNotFound, got {status} {code}"
         );
 
         // The service never sleeps for the span — it stores the due instant and

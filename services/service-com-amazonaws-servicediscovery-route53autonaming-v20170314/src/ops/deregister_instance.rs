@@ -150,7 +150,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeregisterInstanceErrorModeled::InvalidInput(InvalidInput {
                 message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
@@ -163,9 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(service_id) = state.resolve_service_id(&input.service_id) else {
             return Err(DeregisterInstanceErrorModeled::ServiceNotFound(ServiceNotFound {
-                message: Some(format!(
-                    "No service exists with the specified ID {}.",
-                    input.service_id
+                // The service the request named, as its ARN and nothing else — the one
+                // value this service's `ServiceNotFound` carries on the instance
+                // registry's operations.
+                message: Some(crate::state::service_reference_arn(
+                    &crate::state::request_region(ctx),
+                    &input.service_id,
                 )),
             })
             .into());
@@ -179,10 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if service.instances.remove(&input.instance_id).is_none() {
                 return Err(DeregisterInstanceErrorModeled::InstanceNotFound(
                     InstanceNotFound {
-                        message: Some(format!(
-                            "No instance exists with the specified ID {} in service {service_id}.",
-                            input.instance_id
-                        )),
+                        // The instance the request named, and nothing else.
+                        message: Some(input.instance_id.clone()),
                     },
                 )
                 .into());

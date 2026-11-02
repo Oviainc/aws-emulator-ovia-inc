@@ -87,7 +87,7 @@ async fn an_empty_service_is_deleted_by_id_or_by_arn() {
         let (status, code) = failure(&router, "GetService", json!({ "Id": service_id })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ServiceNotFound"),
+            (400, "ServiceNotFound"),
             "case {case:?}: a deleted service is gone from the store"
         );
 
@@ -136,7 +136,7 @@ async fn a_service_holding_instances_is_refused_until_they_are_deregistered() {
         let (status, code) = failure(&router, "DeleteService", json!({ "Id": service_id })).await;
         assert_eq!(
             (status, code.as_str()),
-            (409, "ResourceInUse"),
+            (400, "ResourceInUse"),
             "case {count} instance(s): a service with instances cannot be deleted"
         );
 
@@ -171,7 +171,7 @@ async fn a_service_holding_instances_is_refused_until_they_are_deregistered() {
                 failure(&router, "DeleteService", json!({ "Id": service_id })).await;
             assert_eq!(
                 (status, code.as_str()),
-                (409, "ResourceInUse"),
+                (400, "ResourceInUse"),
                 "case {count} instance(s): still refused with {} instance(s) left",
                 count - index - 1
             );
@@ -188,7 +188,7 @@ async fn a_service_holding_instances_is_refused_until_they_are_deregistered() {
         let (status, code) = failure(&router, "GetService", json!({ "Id": service_id })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ServiceNotFound"),
+            (400, "ServiceNotFound"),
             "case {count} instance(s): an emptied service is deletable"
         );
     }
@@ -231,7 +231,7 @@ async fn a_reference_naming_no_service_answers_service_not_found() {
         let (status, code) = failure(&router, "DeleteService", json!({ "Id": reference })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ServiceNotFound"),
+            (400, "ServiceNotFound"),
             "case {case:?} ({reference:?}): no service exists with that reference"
         );
     }
@@ -253,9 +253,16 @@ async fn mutating_a_deleted_service_is_rejected() {
     .await;
     ok(&router, "DeleteService", json!({ "Id": service_id })).await;
 
-    let rejected: Vec<(&str, Value)> = vec![
-        ("GetService", json!({ "Id": service_id })),
-        ("DeleteService", json!({ "Id": service_id })),
+    // Every call is refused for the resource that is no longer there. `GetInstance`
+    // resolves the (service, instance) pair in one lookup, so the pair it cannot find
+    // is an instance miss rather than a service miss.
+    let rejected: Vec<(&str, Value, &str)> = vec![
+        ("GetService", json!({ "Id": service_id }), "ServiceNotFound"),
+        (
+            "DeleteService",
+            json!({ "Id": service_id }),
+            "ServiceNotFound",
+        ),
         (
             "RegisterInstance",
             json!({
@@ -263,25 +270,29 @@ async fn mutating_a_deleted_service_is_rejected() {
                 "InstanceId": "i-0",
                 "Attributes": { "AWS_INSTANCE_IPV4": "10.0.0.1" },
             }),
+            "ServiceNotFound",
         ),
         (
             "DeregisterInstance",
             json!({ "ServiceId": service_id, "InstanceId": "i-0" }),
+            "ServiceNotFound",
         ),
         (
             "GetInstance",
             json!({ "ServiceId": service_id, "InstanceId": "i-0" }),
+            "InstanceNotFound",
         ),
         (
             "DiscoverInstances",
             json!({ "NamespaceName": "gone-ns", "ServiceName": "gone-svc" }),
+            "ServiceNotFound",
         ),
     ];
-    for (operation, body) in rejected {
+    for (operation, body, expected_code) in rejected {
         let (status, code) = failure(&router, operation, body).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ServiceNotFound"),
+            (400, expected_code),
             "case {operation:?}: a deleted service cannot be read or mutated"
         );
     }

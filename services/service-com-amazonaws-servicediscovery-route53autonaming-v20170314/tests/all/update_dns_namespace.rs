@@ -7,7 +7,7 @@
 //! change shapes — onto the one stored namespace record of ITS namespace type, leaves
 //! every member the change omits as it was, and answers with the `OperationId` of the
 //! `UPDATE_NAMESPACE` operation it files; a reference no namespace answers to is
-//! `NamespaceNotFound` (404) and a namespace of another type `InvalidInput` (400), and
+//! `NamespaceNotFound` and a namespace of another type `InvalidInput`, and
 //! neither writes anything.
 //!
 //! Each assertion spans BOTH DNS namespace kinds, because the two operations are the
@@ -485,8 +485,8 @@ async fn a_namespace_is_addressable_by_id_and_by_arn() {
     }
 }
 
-/// A reference no stored namespace answers to is the modelled 404, and nothing is
-/// written for it.
+/// A reference no stored namespace answers to is the modelled `NamespaceNotFound`, and
+/// nothing is written for it.
 #[tokio::test]
 async fn an_unknown_namespace_reference_is_namespace_not_found() {
     let router = emulator();
@@ -521,8 +521,8 @@ async fn an_unknown_namespace_reference_is_namespace_not_found() {
             .await;
             assert_eq!(
                 (status, code.as_str()),
-                (404, "NamespaceNotFound"),
-                "case {case:?}: expected 404 NamespaceNotFound, got {status} {code}"
+                (400, "NamespaceNotFound"),
+                "case {case:?}: expected 400 NamespaceNotFound, got {status} {code}"
             );
         }
 

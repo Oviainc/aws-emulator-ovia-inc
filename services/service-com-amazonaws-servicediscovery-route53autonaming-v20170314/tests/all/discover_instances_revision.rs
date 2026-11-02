@@ -7,7 +7,7 @@
 //! the service named by `(NamespaceName, ServiceName)` currently holds — a per-service
 //! counter that advances exactly once for each call that changes that service's
 //! instance set and for no other call, and an unresolvable namespace or service name
-//! is refused with that name's modelled 404.
+//! is refused with that name's modelled not-found error.
 //!
 //! The harness (`emulator`, `ok`, `failure`, `namespace`, `service`) is the one
 //! `cloud_map_core` already defines; this suite reuses it rather than rebuilding it.
@@ -296,8 +296,8 @@ async fn each_service_carries_its_own_revision() {
     );
 }
 
-/// A name that resolves to no stored record is refused with that name's modelled 404,
-/// never with a revision for a service the caller did not name.
+/// A name that resolves to no stored record is refused with that name's modelled
+/// not-found error, never with a revision for a service the caller did not name.
 #[tokio::test]
 async fn an_unresolvable_namespace_or_service_name_is_refused() {
     let router = emulator();
@@ -312,13 +312,13 @@ async fn an_unresolvable_namespace_or_service_name_is_refused() {
         (
             "an unknown namespace name",
             json!({ "NamespaceName": "no-such-ns", "ServiceName": "missing-svc" }),
-            404,
+            400,
             "NamespaceNotFound",
         ),
         (
             "an unknown service name in a known namespace",
             json!({ "NamespaceName": "missing-ns", "ServiceName": "no-such-svc" }),
-            404,
+            400,
             "ServiceNotFound",
         ),
         (
@@ -326,20 +326,20 @@ async fn an_unresolvable_namespace_or_service_name_is_refused() {
             // not a name this operation resolves.
             "the namespace id instead of its name",
             json!({ "NamespaceName": namespace_id, "ServiceName": "missing-svc" }),
-            404,
+            400,
             "NamespaceNotFound",
         ),
         (
             "the service id instead of its name",
             json!({ "NamespaceName": "missing-ns", "ServiceName": service_id }),
-            404,
+            400,
             "ServiceNotFound",
         ),
         (
             // A namespace exists under this name, but the service belongs to another.
             "a service name from a different namespace",
             json!({ "NamespaceName": "missing-ns", "ServiceName": "elsewhere-svc" }),
-            404,
+            400,
             "ServiceNotFound",
         ),
     ];

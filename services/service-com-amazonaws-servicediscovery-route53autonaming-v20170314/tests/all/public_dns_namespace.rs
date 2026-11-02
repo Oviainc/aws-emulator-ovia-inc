@@ -239,7 +239,7 @@ async fn a_soa_ttl_outside_the_published_range_is_refused() {
 
 /// The name index holds every namespace type, so a name already taken is refused
 /// whichever create took it — and a name owned by a create that has COMPLETED is the
-/// request conflict `DuplicateRequest` (409) naming that create, not a validation
+/// request conflict `DuplicateRequest` naming that create, not a validation
 /// failure; a replayed `CreatorRequestId` replays the first operation instead of
 /// creating a second namespace.
 #[tokio::test]
@@ -272,7 +272,7 @@ async fn a_taken_name_is_refused_and_a_replayed_token_replays_its_operation() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (409, "DuplicateRequest"),
+            (400, "DuplicateRequest"),
             "case {case:?}: a second namespace named {name:?} must be refused"
         );
     }
@@ -333,7 +333,7 @@ async fn a_token_is_not_replayed_once_its_namespace_is_deleted() {
     let (status, code) = failure(&router, "GetNamespace", json!({ "Id": first_namespace.clone() })).await;
     assert_eq!(
         (status, code.as_str()),
-        (404, "NamespaceNotFound"),
+        (400, "NamespaceNotFound"),
         "the deleted namespace must stop resolving"
     );
 
