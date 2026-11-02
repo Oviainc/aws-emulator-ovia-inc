@@ -83,8 +83,13 @@
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an Amazon Web Services service.
 
+use std::collections::BTreeSet;
+
 #[allow(unused_imports)]
 use super::types::*;
+
+// Brings `Sha256::new`/`update`/`finalize` into scope for the filter-scope digest.
+use ::sha2::Digest;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,36 +159,70 @@ fn invalid_field(member: &str, why: &str) -> GetBillingPreferencesError {
     .into()
 }
 
-/// The opaque `nextToken` for a page of `feature` that ended after `consumed`
-/// entries.
+/// The separator between the fields a `nextToken` carries. The cursor is the
+/// LAST field, so a preference key — whose modeled pattern
+/// (`^[a-zA-Z0-9-\/\*: ]+$`) admits this character — reads back whole.
+const PAGE_TOKEN_SEPARATOR: char = ':';
+
+/// What the scope digests for a request whose filters narrow nothing — a value
+/// no preference key can spell, so "every key" is never the scope of a request
+/// that named keys.
+const SCOPE_EVERY_KEY: &[u8] = b"\0*";
+
+/// Ends each key inside the scope digest. The modeled `PreferenceKey` pattern
+/// admits no NUL, so two different key sets cannot digest the same bytes.
+const SCOPE_KEY_TERMINATOR: &[u8] = b"\0";
+
+/// The opaque `nextToken` for a page of `feature` taken under the filter scope
+/// `scope`, whose last entry was `cursor`.
 ///
-/// The cursor is a COUNT, not a key: a history feature reports one entry per
-/// recorded change, so one key can appear many times and a key alone cannot name
-/// a position. Hex keeps the token inside the modeled `PageToken` pattern
-/// (`^[-a-zA-Z0-9+=/_]+$`) and length, and carries no meaning a client could
-/// construct one from.
-fn encode_page_token(feature: &str, consumed: usize) -> String {
-    hex::encode(format!("{feature}:{consumed}"))
+/// All three fields travel in it, because all three decide which entry the next
+/// page resumes after: the feature and the filters select the sequence, and the
+/// cursor names the entry within it (`state::PreferenceEntry::cursor`) — not a
+/// count of entries already delivered, which a write between two pages would
+/// move.
+///
+/// base64 keeps the token inside the modeled `PageToken` pattern
+/// (`^[-a-zA-Z0-9+=/_]+$`, which admits the whole standard base64 alphabet) and
+/// length (1..4095) for every `PreferenceKey` the model admits — up to 2148
+/// characters, which hex's two-fold expansion would not hold — and it is the
+/// codec `aws_smithy_types` already carries, so no second one is introduced for
+/// it. The token carries no meaning a client could construct one from.
+fn encode_page_token(feature: &str, scope: &str, cursor: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!(
+        "{feature}{PAGE_TOKEN_SEPARATOR}{scope}{PAGE_TOKEN_SEPARATOR}{cursor}"
+    ))
 }
 
-/// How many entries a `nextToken` already delivered, or a `ValidationException`
-/// when the token is not one this service issued for this feature.
-fn decode_page_token(token: &str, feature: &str) -> Result<usize, GetBillingPreferencesError> {
-    let decoded = hex::decode(token)
+/// The entry a `nextToken` resumes strictly after, or a `ValidationException`
+/// when the token is not one this service issued for this very walk: one it did
+/// not mint at all, one minted for another feature, and one minted under
+/// filters that select other entries than this request's do.
+fn decode_page_token(
+    token: &str,
+    feature: &str,
+    scope: &str,
+) -> Result<String, GetBillingPreferencesError> {
+    let decoded = ::aws_smithy_types::base64::decode(token)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|text| {
-            let (stored, consumed) = text.split_once(':')?;
-            Some((stored.to_string(), consumed.parse::<usize>().ok()?))
+            let (stored_feature, rest) = text.split_once(PAGE_TOKEN_SEPARATOR)?;
+            let (stored_scope, cursor) = rest.split_once(PAGE_TOKEN_SEPARATOR)?;
+            Some((
+                stored_feature.to_string(),
+                stored_scope.to_string(),
+                cursor.to_string(),
+            ))
         });
-    let Some((stored_feature, consumed)) = decoded else {
+    let Some((stored_feature, stored_scope, cursor)) = decoded else {
         return Err(GetBillingPreferencesErrorModeled::ValidationException(
             ValidationException {
-                message: "nextToken is not a token this service issued".to_string(),
-                reason: "cannotParse".to_string(),
+                message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
+                reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
                 field_list: Some(vec![ValidationExceptionField {
                     name: "nextToken".to_string(),
-                    message: "The pagination token is not valid.".to_string(),
+                    message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
                 }]),
             },
         )
@@ -195,7 +234,13 @@ fn decode_page_token(token: &str, feature: &str) -> Result<usize, GetBillingPref
             "the pagination token was issued for another feature",
         ));
     }
-    Ok(consumed)
+    if stored_scope != scope {
+        return Err(invalid_field(
+            "nextToken",
+            "the pagination token was issued for another set of filters",
+        ));
+    }
+    Ok(cursor)
 }
 
 /// Refuse a filter name this service does not support, BEFORE any entry is
@@ -221,27 +266,71 @@ fn validate_filters(input: &GetBillingPreferencesInput) -> Result<(), GetBilling
     Ok(())
 }
 
-/// Whether `entry` satisfies every filter the request carries. A filter with no
-/// name, or with no values, selects everything — as `ListBillingViews` treats an
-/// omitted filter in this same service.
-fn matches_filters(
-    entry: &crate::state::PreferenceEntry,
-    input: &GetBillingPreferencesInput,
-) -> bool {
+/// The preference keys the request's `filters` select, or `None` when they
+/// narrow nothing.
+///
+/// Absent `filters`, a filter naming no member and a filter carrying no value
+/// each select everything — as `ListBillingViews` treats an omitted filter in
+/// this same service. Several filters all have to hold, so what they select is
+/// the INTERSECTION of their value sets; the model admits only one filter per
+/// request today, which is that intersection of one.
+///
+/// The one place the request's filters are interpreted, so what a page REPORTS
+/// and what its token is scoped to cannot read them two ways.
+fn filtered_keys(input: &GetBillingPreferencesInput) -> Option<BTreeSet<&str>> {
+    let mut selected: Option<BTreeSet<&str>> = None;
     for filter in input.filters.iter().flatten() {
         if filter.name.as_deref() != Some(FILTER_PREFERENCE_KEY) {
             continue;
         }
-        match filter.value.as_deref() {
-            Some(values) if !values.is_empty() => {
-                if !values.contains(&entry.key) {
-                    return false;
-                }
+        let Some(values) = filter.value.as_deref().filter(|values| !values.is_empty()) else {
+            continue;
+        };
+        let named: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+        selected = Some(match selected {
+            Some(narrowed) => narrowed.intersection(&named).copied().collect(),
+            None => named,
+        });
+    }
+    selected
+}
+
+/// Whether `entry` is one the request's filters select.
+fn matches_filters(
+    entry: &crate::state::PreferenceEntry,
+    selected: Option<&BTreeSet<&str>>,
+) -> bool {
+    selected.is_none_or(|keys| keys.contains(entry.key.as_str()))
+}
+
+/// The scope of the SEQUENCE this request pages through, which travels in every
+/// `nextToken` the walk hands back.
+///
+/// A cursor is a position among the entries the request selects, so a token is
+/// usable only by a request that selects the same ones: the scope covers every
+/// member that narrows the sequence — here the filtered keys, digested in one
+/// canonical order so two requests naming the same keys in different orders
+/// share a scope. `maxResults` is deliberately NOT part of it: a page size is
+/// how much of one walk a caller takes, not which entries the walk is over, so
+/// a caller may change it between pages.
+///
+/// A digest rather than the keys themselves, because `filters` carries up to
+/// ten `PreferenceKey` values of up to 2148 characters — far more than the
+/// modeled `PageToken` length holds — and the scope only ever has to be
+/// COMPARED with the one the next request computes. It is the whole digest, at
+/// one width whatever the request's filters are.
+fn filter_scope(selected: Option<&BTreeSet<&str>>) -> String {
+    let mut digest = ::sha2::Sha256::new();
+    match selected {
+        None => digest.update(SCOPE_EVERY_KEY),
+        Some(keys) => {
+            for key in keys {
+                digest.update(key.as_bytes());
+                digest.update(SCOPE_KEY_TERMINATOR);
             }
-            _ => continue,
         }
     }
-    true
+    hex::encode(digest.finalize())
 }
 
 impl<Eng> GetBillingPreferences<Eng> {
@@ -305,28 +394,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The page resumes at the entry the previous page stopped on.
-        let consumed = match input.next_token.as_deref() {
-            Some(token) => decode_page_token(token, feature)?,
-            None => 0,
-        };
+        // The entries the request selects, and the scope of that selection
+        // every token of this walk is bound to.
+        let selected = filtered_keys(&input);
+        let scope = filter_scope(selected.as_ref());
 
-        let matched: Vec<crate::state::PreferenceEntry> = state
-            .preference_entries(feature)
-            .into_iter()
-            .filter(|entry| matches_filters(entry, &input))
-            .collect();
+        // The page resumes strictly AFTER the entry the previous page ended on,
+        // so a preference written or removed between two pages cannot make the
+        // walk skip or repeat another one — the rule this service's other
+        // paginated reads follow.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token, feature, &scope)?),
+            None => None,
+        };
 
         let limit = input
             .max_results
             .and_then(|max| usize::try_from(max).ok())
             .unwrap_or(DEFAULT_MAX_RESULTS);
-        let page: Vec<crate::state::PreferenceEntry> =
-            matched.iter().skip(consumed).take(limit).cloned().collect();
-        let delivered = consumed + page.len();
-        // "Present when more pages are available; null when there are no more
-        // results." (`nextToken` doc.)
-        let next_token = (delivered < matched.len()).then(|| encode_page_token(feature, delivered));
+
+        let mut page: Vec<crate::state::PreferenceEntry> = Vec::new();
+        let mut more_to_come = false;
+        for entry in state.preference_entries(feature) {
+            // `PreferenceEntry::cursor` ascends with the walk, so one
+            // comparison places an entry on either side of the boundary.
+            if resume_after
+                .as_deref()
+                .is_some_and(|after| entry.cursor.as_str() <= after)
+            {
+                continue;
+            }
+            if !matches_filters(&entry, selected.as_ref()) {
+                continue;
+            }
+            if page.len() == limit {
+                // One further selected entry is what says another page exists:
+                // "Present when more pages are available; null when there are
+                // no more results." (`nextToken` doc.)
+                more_to_come = true;
+                break;
+            }
+            page.push(entry);
+        }
+        let next_token = match (more_to_come, page.last()) {
+            (true, Some(last)) => Some(encode_page_token(feature, &scope, &last.cursor)),
+            _ => None,
+        };
 
         Ok(GetBillingPreferencesOutput {
             billing_preferences: page

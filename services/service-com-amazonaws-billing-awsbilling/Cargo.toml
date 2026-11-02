@@ -15,6 +15,9 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # Hex-encodes the opaque `nextToken` the list operations hand out
 # (ListBillingViews, ListSourceViewsForBillingView).
 hex = { workspace = true }
+# Digests the entry selection a `GetBillingPreferences` page was taken under, so
+# its `nextToken` is bound to it at a fixed width.
+sha2 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

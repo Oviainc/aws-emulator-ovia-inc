@@ -277,6 +277,13 @@ pub const MAX_PREFERENCE_HISTORY: usize = 1024;
 /// One recorded change to a billing preference, as a history feature reports it.
 #[derive(Debug, Clone)]
 pub struct PreferenceChange {
+    /// This change's place in the record, assigned when it was appended and
+    /// never reused — see
+    /// [`ComAmazonawsBillingAwsbillingState::next_preference_change_seq`]. A
+    /// recorded change carries no other unique value (one key can change many
+    /// times, even within one clock tick), so this is what names its position
+    /// to a paginated read.
+    pub seq: u64,
     /// The feature whose preference changed (e.g. `RI_SHARING`), NOT the history
     /// feature that reports the change.
     pub feature: String,
@@ -286,9 +293,27 @@ pub struct PreferenceChange {
     pub at: SystemTime,
 }
 
+/// The cursor value that names a recorded change's position in a history
+/// feature's sequence.
+///
+/// Zero-padded to the widest [`PreferenceChange::seq`] there can be, so the
+/// cursors compare as text in the same order as the changes they name and one
+/// read can hold the cursors of both kinds of feature as strings.
+fn change_cursor(seq: u64) -> String {
+    format!("{seq:020}")
+}
+
 /// One entry `GetBillingPreferences` reports, built from stored state.
 #[derive(Debug, Clone)]
 pub struct PreferenceEntry {
+    /// What names this entry's position in the sequence
+    /// [`ComAmazonawsBillingAwsbillingState::preference_entries`] walks, so a
+    /// page can resume strictly after the entry the previous page ended on: the
+    /// preference key for a feature whose entries are the stored keys (unique,
+    /// and in the walk's own order), and [`change_cursor`] of the recorded
+    /// change for a history feature. Ordered as text, ascending with the walk,
+    /// and never reported on the wire.
+    pub cursor: String,
     /// The feature the request asked for.
     pub feature: String,
     pub key: String,
@@ -527,6 +552,10 @@ pub struct ComAmazonawsBillingAwsbillingState {
     /// features report. Bounded by [`MAX_PREFERENCE_HISTORY`], dropping the
     /// oldest change first.
     pub preference_history: VecDeque<PreferenceChange>,
+    /// Source of the next [`PreferenceChange::seq`]. Only ever advances, so a
+    /// recorded change's position stays its own even after the oldest changes
+    /// are dropped from the front of `preference_history`.
+    pub next_preference_change_seq: u64,
     /// The consolidated billing family: account id -> that account's display
     /// name, which `accountName` reports beside `accountId`.
     pub consolidated_billing_family: BTreeMap<String, String>,
@@ -616,6 +645,7 @@ impl Default for ComAmazonawsBillingAwsbillingState {
             next_view_id: 1,
             billing_preferences: BTreeMap::new(),
             preference_history: VecDeque::new(),
+            next_preference_change_seq: 1,
             consolidated_billing_family,
             billing_family_management_account_id: caller_account_id().to_string(),
             organization_management_account_id: None,
@@ -770,7 +800,10 @@ impl ComAmazonawsBillingAwsbillingState {
         if !changed || history_feature_for(feature).is_none() {
             return;
         }
+        let seq = self.next_preference_change_seq;
+        self.next_preference_change_seq += 1;
         self.preference_history.push_back(PreferenceChange {
+            seq,
             feature: feature.to_string(),
             key: key.to_string(),
             value: value.to_string(),
@@ -788,6 +821,12 @@ impl ComAmazonawsBillingAwsbillingState {
     /// it, oldest first; for every other feature it is the stored keys in key
     /// order. A feature nothing has set reports nothing: the model documents no
     /// key catalog per feature, so the emulator invents no entry for one.
+    ///
+    /// Every entry carries the [`PreferenceEntry::cursor`] that names its place
+    /// in this sequence, and those cursors ASCEND with it — the walk is a
+    /// `BTreeMap` in key order or the record of changes in the order they were
+    /// recorded — so a paginated read resumes after one by comparing cursors
+    /// instead of counting entries it already delivered.
     pub fn preference_entries(&self, feature: &str) -> Vec<PreferenceEntry> {
         if let Some(behind) = feature_behind_history(feature) {
             return self
@@ -795,6 +834,7 @@ impl ComAmazonawsBillingAwsbillingState {
                 .iter()
                 .filter(|change| change.feature == behind)
                 .map(|change| PreferenceEntry {
+                    cursor: change_cursor(change.seq),
                     feature: feature.to_string(),
                     key: change.key.clone(),
                     value: change.value.clone(),
@@ -807,6 +847,7 @@ impl ComAmazonawsBillingAwsbillingState {
             .iter()
             .filter(|((stored, _), _)| stored == feature)
             .map(|((_, key), value)| PreferenceEntry {
+                cursor: key.clone(),
                 feature: feature.to_string(),
                 key: key.clone(),
                 value: value.clone(),

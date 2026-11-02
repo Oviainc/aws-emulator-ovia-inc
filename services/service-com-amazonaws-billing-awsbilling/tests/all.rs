@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/billing_feature_access.rs"]
 mod billing_feature_access;
+#[path = "all/billing_preference_pagination.rs"]
+mod billing_preference_pagination;
 #[path = "all/billing_preferences.rs"]
 mod billing_preferences;
 #[path = "all/billing_view_wire_fidelity.rs"]
