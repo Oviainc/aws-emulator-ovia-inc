@@ -395,7 +395,8 @@ impl Api {
     }
 
     /// One resource under `root` with a method on `verb` and a `MOCK` integration whose
-    /// `200` response template is `template`.
+    /// `200` response template is `template`, answering the id of the resource it
+    /// created so a case can hang its own children under it.
     async fn mock_resource(
         &self,
         edge: &Edge,
@@ -404,7 +405,7 @@ impl Api {
         verb: &str,
         extra: Value,
         template: &str,
-    ) {
+    ) -> String {
         let created = edge
             .api_ok(
                 "POST",
@@ -450,6 +451,7 @@ impl Api {
             201,
         )
         .await;
+        resource
     }
 
     /// Deploy the api into `stage`.
@@ -1930,4 +1932,734 @@ async fn a_counted_rules_custom_request_handling_reaches_the_origin_and_the_samp
             );
         }
     }
+}
+
+/// Every `ResponseContentType` a `CustomResponseBody` can declare, with the media type a
+/// response carrying that body is served under
+/// (`smithy_query(query="shape",shape="ResponseContentType")`: `TEXT_PLAIN`, `TEXT_HTML`,
+/// `APPLICATION_JSON`).
+const RESPONSE_CONTENT_TYPES: [(&str, &str); 3] = [
+    ("TEXT_PLAIN", "text/plain"),
+    ("TEXT_HTML", "text/html"),
+    ("APPLICATION_JSON", "application/json"),
+];
+
+/// The bounds `CustomResponse$ResponseCode` publishes
+/// (`smithy_query(query="shape",shape="ResponseStatusCode")`: `@range(min: 200, max:
+/// 599)`).
+const RESPONSE_CODE_BOUNDS: (u16, u16) = (200, 599);
+
+/// The longest `CustomResponseBody$Content` the member allows
+/// (`smithy_query(query="shape",shape="CustomResponseBody")`: `@length(min: 1, max:
+/// 10240)`).
+const LONGEST_CONTENT: usize = 10_240;
+
+/// The media type the `ResponseContentType` value `declared` names.
+fn media_type(declared: &str) -> &'static str {
+    RESPONSE_CONTENT_TYPES
+        .iter()
+        .find(|(value, _)| *value == declared)
+        .map(|(_, media)| *media)
+        .unwrap_or_else(|| panic!("{declared:?} is not a ResponseContentType this suite declares"))
+}
+
+/// One blocking rule's own custom response, and the stage its web ACL decides.
+struct Refused {
+    case: &'static str,
+    /// The stage this row's web ACL is associated with, and the web ACL's own name.
+    stage: &'static str,
+    /// `CustomResponse$ResponseCode`.
+    status: u16,
+    /// The `CustomResponseBodies` entry the action names, as `(key, ContentType,
+    /// Content)`, or `None` for an action that names no body at all.
+    body: Option<(&'static str, &'static str, String)>,
+    /// `CustomResponse$ResponseHeaders`, in the order they are configured.
+    headers: Vec<(&'static str, &'static str)>,
+}
+
+/// The rule over a TERMINATING action's own `CustomResponse`: a request a blocking rule
+/// matches is answered by WAF at the edge, so the integration never runs and the api's own
+/// gateway response is not what the caller gets — the status is the action's
+/// `ResponseCode`, the body is the web ACL's `CustomResponseBodies` entry the action's
+/// `CustomResponseBodyKey` names, byte for byte, served under the media type that entry's
+/// `ContentType` declares, and every header the action configures is on the response. A
+/// request the rule does not match is served by the origin and carries none of them.
+///
+/// One row per thing the rule generalises over: which `ResponseContentType` the body
+/// declares, what the status code is at each bound `ResponseStatusCode` publishes and
+/// between them, how long the body is at each bound `CustomResponseBody$Content`
+/// publishes, how many headers the action configures (none, one, two), and an action that
+/// names no body at all. Each row gets its own stage and its own web ACL, so the only
+/// thing deciding the row is that web ACL's one blocking rule. A status code past either
+/// published bound is refused by the control plane instead.
+#[tokio::test]
+async fn a_blocking_rules_custom_response_is_served_at_the_edge_from_the_web_acls_bodies() {
+    let edge = Edge::new();
+    let api = Api::build(&edge, "edge-custom-response").await;
+
+    // A body exactly as long as the member allows, so the row proves the bytes come back
+    // whole rather than clipped: the JSON envelope is ten glyphs of the budget.
+    let longest = format!("{{\"pad\":\"{}\"}}", "z".repeat(LONGEST_CONTENT - 10));
+    let rows = vec![
+        Refused {
+            case: "a JSON body and one configured header",
+            stage: "json-body",
+            status: 418,
+            body: Some((
+                "denied",
+                "APPLICATION_JSON",
+                "{\"waf\":\"denied\",\"at\":\"the edge\"}".to_string(),
+            )),
+            headers: vec![("x-waf-probe", "denied")],
+        },
+        Refused {
+            case: "a plain-text body and two configured headers",
+            stage: "plain-body",
+            status: 503,
+            body: Some((
+                "too-busy",
+                "TEXT_PLAIN",
+                "denied at the edge: try later".to_string(),
+            )),
+            headers: vec![("x-waf-probe", "plain"), ("retry-after", "30")],
+        },
+        Refused {
+            case: "an HTML body and no configured header, at the lowest status code the \
+                   member allows",
+            stage: "html-body",
+            status: RESPONSE_CODE_BOUNDS.0,
+            body: Some((
+                "markup",
+                "TEXT_HTML",
+                "<html><body>denied</body></html>".to_string(),
+            )),
+            headers: Vec::new(),
+        },
+        Refused {
+            case: "the shortest body the member allows, at the highest status code it \
+                   allows",
+            stage: "shortest-body",
+            status: RESPONSE_CODE_BOUNDS.1,
+            body: Some(("tiny", "TEXT_PLAIN", "x".to_string())),
+            headers: vec![("x-waf-probe", "tiny")],
+        },
+        Refused {
+            case: "the longest body the member allows",
+            stage: "longest-body",
+            status: 451,
+            body: Some(("long", "APPLICATION_JSON", longest.clone())),
+            headers: vec![("x-waf-probe", "long")],
+        },
+        Refused {
+            case: "a blocking action that names no response body at all",
+            stage: "no-body",
+            status: 429,
+            body: None,
+            headers: vec![("x-waf-probe", "empty")],
+        },
+    ];
+
+    // Every published `ResponseContentType` is exercised by some row: the catalogue is
+    // the member's own value list, so a row per value is what spans it.
+    for (declared, _) in RESPONSE_CONTENT_TYPES {
+        assert!(
+            rows.iter().any(|row| row
+                .body
+                .as_ref()
+                .is_some_and(|(_, content_type, _)| *content_type == declared)),
+            "case the ResponseContentType catalogue: no row declares {declared:?}"
+        );
+    }
+
+    for row in &rows {
+        api.deploy(&edge, row.stage).await;
+    }
+
+    let mut created: Vec<(&Refused, String, String)> = Vec::new();
+    for row in &rows {
+        let mut custom = json!({ "ResponseCode": row.status });
+        let mut extra = json!({});
+        if let Some((key, content_type, content)) = &row.body {
+            custom["CustomResponseBodyKey"] = json!(key);
+            let mut bodies = serde_json::Map::new();
+            bodies.insert(
+                (*key).to_string(),
+                json!({ "ContentType": content_type, "Content": content }),
+            );
+            // `CustomResponseBodies` is "a map of custom response keys and content
+            // bodies … then use them in the rules", so the body lives on the web ACL and
+            // the action only names it.
+            extra["CustomResponseBodies"] = Value::Object(bodies);
+        }
+        if !row.headers.is_empty() {
+            custom["ResponseHeaders"] = Value::Array(
+                row.headers
+                    .iter()
+                    .map(|(name, value)| json!({ "Name": name, "Value": value }))
+                    .collect(),
+            );
+        }
+        let (id, arn, _) = create_web_acl(
+            &edge,
+            row.stage,
+            json!({ "Allow": {} }),
+            json!([rule(
+                "orders",
+                0,
+                byte_match(json!({ "UriPath": {} }), "/orders", "ENDS_WITH"),
+                json!({ "Block": { "CustomResponse": custom } }),
+            )]),
+            extra,
+        )
+        .await;
+        associate(&edge, &arn, &api.id, row.stage).await;
+        created.push((row, id, arn));
+    }
+
+    for (row, _, _) in &created {
+        let blocked = edge.get(&api.id, &format!("/{}/orders", row.stage)).await;
+        assert_eq!(
+            blocked.status, row.status,
+            "case {:?}: the caller gets the status the action's CustomResponse \
+             configures, got {} with {:?}",
+            row.case, blocked.status, blocked.body
+        );
+        let expected_body = row
+            .body
+            .as_ref()
+            .map(|(_, _, content)| content.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            blocked.body, expected_body,
+            "case {:?}: the body is the web ACL's own entry byte for byte, and never the \
+             origin's",
+            row.case
+        );
+        assert_ne!(
+            blocked.body,
+            origin_body("orders"),
+            "case {:?}: the origin is never reached by a blocked request",
+            row.case
+        );
+        if let Some((_, content_type, _)) = &row.body {
+            assert_eq!(
+                blocked.header("content-type"),
+                Some(media_type(content_type)),
+                "case {:?}: the body is served under the media type its ContentType \
+                 declares, got {:?}",
+                row.case,
+                blocked.headers
+            );
+        }
+        for (name, value) in &row.headers {
+            assert_eq!(
+                blocked.header(name),
+                Some(*value),
+                "case {:?}: the response carries the configured header {name}={value:?}, \
+                 got {:?}",
+                row.case,
+                blocked.headers
+            );
+        }
+
+        // A sibling path the rule does not match: served by the origin, carrying none of
+        // the custom response's headers.
+        let served = edge.get(&api.id, &format!("/{}/admin", row.stage)).await;
+        assert_eq!(
+            served.status, 200,
+            "case {:?}: a path the blocking rule does not match is served by the origin, \
+             got {} with {:?}",
+            row.case, served.status, served.body
+        );
+        assert_eq!(
+            served.body,
+            origin_body("admin"),
+            "case {:?}: the unmatched path is answered by the integration, got {:?}",
+            row.case,
+            served.body
+        );
+        for (name, _) in &row.headers {
+            assert_eq!(
+                served.header(name),
+                None,
+                "case {:?}: a request WAF did not refuse carries no {name:?}, got {:?}",
+                row.case,
+                served.headers
+            );
+        }
+    }
+
+    // Serving a custom response changes nothing about the web ACL: its body map reads
+    // back as it was stored, and the stage is still the resource it is associated with.
+    for (row, id, arn) in &created {
+        let stored = edge
+            .waf_ok(
+                "GetWebACL",
+                json!({ "Name": row.stage, "Scope": SCOPE, "Id": id }),
+            )
+            .await;
+        if let Some((key, content_type, content)) = &row.body {
+            let entry = &stored["WebACL"]["CustomResponseBodies"][*key];
+            assert_eq!(
+                entry["ContentType"].as_str(),
+                Some(*content_type),
+                "case {:?}: the stored body's ContentType reads back, got {stored}",
+                row.case
+            );
+            assert_eq!(
+                entry["Content"].as_str(),
+                Some(content.as_str()),
+                "case {:?}: the stored body's Content reads back byte for byte",
+                row.case
+            );
+        }
+        let for_resource = edge
+            .waf_ok(
+                "GetWebACLForResource",
+                json!({ "ResourceArn": stage_arn(&api.id, row.stage) }),
+            )
+            .await;
+        assert_eq!(
+            for_resource["WebACL"]["ARN"].as_str(),
+            Some(arn.as_str()),
+            "case {:?}: the stage still reports the web ACL in front of it, got \
+             {for_resource}",
+            row.case
+        );
+    }
+
+    // A status code past either published bound is not a custom response WAF can serve,
+    // so the web ACL carrying it is refused at creation.
+    for (case, code) in [
+        (
+            "one below the lowest status code the member allows",
+            RESPONSE_CODE_BOUNDS.0 - 1,
+        ),
+        (
+            "one above the highest status code the member allows",
+            RESPONSE_CODE_BOUNDS.1 + 1,
+        ),
+    ] {
+        let (status, parsed) = edge
+            .waf_call(
+                "CreateWebACL",
+                json!({
+                    "Name": format!("out-of-range-{code}"),
+                    "Scope": SCOPE,
+                    "DefaultAction": { "Allow": {} },
+                    "VisibilityConfig": visibility("out-of-range"),
+                    "Rules": [rule(
+                        "orders",
+                        0,
+                        byte_match(json!({ "UriPath": {} }), "/orders", "ENDS_WITH"),
+                        json!({ "Block": { "CustomResponse": { "ResponseCode": code } } }),
+                    )],
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a ResponseCode of {code} is outside the published range, so \
+             the web ACL is refused, got {status} with {parsed}"
+        );
+    }
+}
+
+/// An injected SQL fragment in a query argument, percent-encoded as a client sends it:
+/// what the managed SQLi rule group refuses, when it is the group that evaluates the
+/// request at all.
+const SQLI_ARGUMENT: &str = "q=%27%20OR%201%3D1%20--";
+
+/// The same argument carrying a benign value, which is what tells a request the group
+/// evaluated and found nothing from one the group never evaluated.
+const BENIGN_ARGUMENT: &str = "q=alice";
+
+/// One request a scoped-down managed rule group decides, and what it is answered.
+struct Probe {
+    probe: &'static str,
+    /// The path within the stage, query string included.
+    target: String,
+    headers: Vec<(&'static str, &'static str)>,
+    /// The resource whose `MOCK` integration answers the request, when it reaches the
+    /// origin at all; `None` when the group refuses it at the edge.
+    origin: Option<&'static str>,
+}
+
+/// One managed-rule-group rule's scope-down predicate, and the stage its web ACL decides.
+struct Scoped {
+    case: &'static str,
+    /// The stage this row's web ACL is associated with, and the web ACL's own name.
+    stage: &'static str,
+    /// The `ScopeDownStatement` the group statement carries, or `None` for a group that
+    /// evaluates every request the web ACL sees.
+    scope_down: Option<Value>,
+    probes: Vec<Probe>,
+}
+
+/// A `ManagedRuleGroupStatement` over the SQLi rule set, narrowed by `scope_down` when it
+/// carries one.
+fn managed_sqli_group(scope_down: Option<Value>) -> Value {
+    let mut statement = json!({
+        "VendorName": "AWS",
+        "Name": "AWSManagedRulesSQLiRuleSet",
+    });
+    if let Some(scope_down) = scope_down {
+        statement["ScopeDownStatement"] = scope_down;
+    }
+    json!({ "ManagedRuleGroupStatement": statement })
+}
+
+/// The metric name — and so the rule name — of the web ACL rule that runs the group.
+const GROUP_RULE: &str = "sql-database";
+
+/// A web ACL rule running `statement`: a rule-group rule carries no `Action` of its own,
+/// only whether to override the actions of the rules inside the group.
+fn group_rule(statement: Value) -> Value {
+    json!({
+        "Name": GROUP_RULE,
+        "Priority": 0,
+        "Statement": statement,
+        "OverrideAction": { "None": {} },
+        "VisibilityConfig": visibility(GROUP_RULE),
+    })
+}
+
+/// The rule over a `ManagedRuleGroupStatement$ScopeDownStatement`: it "narrows the scope
+/// of the web requests that are evaluated by the managed rule group", so only a request
+/// matching that nested statement is evaluated by the group's rules at all — a request
+/// outside the predicate reaches the origin even when the group would have refused it,
+/// one inside it is refused, and a benign request inside it is served, which is what
+/// separates a group that ran from a group that never did. The predicate is read from the
+/// web ACL the control plane holds NOW, so removing it widens the group and putting it
+/// back narrows it again.
+///
+/// One row per thing the predicate generalises over: no predicate at all, a URI-path
+/// substring, a header value, a query-string substring, and the negation of a predicate —
+/// each on its own stage of the same api, with the same payload probed inside and outside
+/// the predicate so the only difference is whether the group was asked.
+#[tokio::test]
+async fn a_scope_down_statement_decides_which_requests_the_managed_group_evaluates() {
+    let edge = Edge::new();
+    let api = Api::build(&edge, "edge-scope-down").await;
+    // A resource one segment deeper, so a predicate over the URI path has a path inside
+    // it and a sibling outside it to separate.
+    let nested = api
+        .mock_resource(
+            &edge,
+            &api.root,
+            "api",
+            "GET",
+            json!({}),
+            &origin_body("api"),
+        )
+        .await;
+    api.mock_resource(
+        &edge,
+        &nested,
+        "orders",
+        "GET",
+        json!({}),
+        &origin_body("api/orders"),
+    )
+    .await;
+
+    /// The header a row's predicate inspects.
+    const SCOPE_HEADER: &str = "x-waf-scope";
+
+    let rows = vec![
+        Scoped {
+            case: "no scope-down at all: the group evaluates every request",
+            stage: "everywhere",
+            scope_down: None,
+            probes: vec![
+                Probe {
+                    probe: "the payload on a path one segment deep",
+                    target: format!("/api/orders?{SQLI_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: None,
+                },
+                Probe {
+                    probe: "the identical payload at the top level",
+                    target: format!("/orders?{SQLI_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: None,
+                },
+                Probe {
+                    probe: "a benign argument",
+                    target: format!("/api/orders?{BENIGN_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: Some("api/orders"),
+                },
+            ],
+        },
+        Scoped {
+            case: "scoped down to the uri paths containing a prefix",
+            stage: "contained",
+            scope_down: Some(byte_match(json!({ "UriPath": {} }), "/api/", "CONTAINS")),
+            probes: vec![
+                Probe {
+                    probe: "the payload inside the predicate",
+                    target: format!("/api/orders?{SQLI_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: None,
+                },
+                Probe {
+                    probe: "the identical payload outside the predicate",
+                    target: format!("/orders?{SQLI_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: Some("orders"),
+                },
+                Probe {
+                    probe: "a benign argument inside the predicate",
+                    target: format!("/api/orders?{BENIGN_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: Some("api/orders"),
+                },
+                Probe {
+                    probe: "a benign argument outside the predicate",
+                    target: format!("/orders?{BENIGN_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: Some("orders"),
+                },
+            ],
+        },
+        Scoped {
+            case: "scoped down to the requests carrying a header exactly",
+            stage: "headered",
+            scope_down: Some(byte_match(
+                json!({ "SingleHeader": { "Name": SCOPE_HEADER } }),
+                "inspect",
+                "EXACTLY",
+            )),
+            probes: vec![
+                Probe {
+                    probe: "the payload carrying the inspected header",
+                    target: format!("/orders?{SQLI_ARGUMENT}"),
+                    headers: vec![(SCOPE_HEADER, "inspect")],
+                    origin: None,
+                },
+                Probe {
+                    probe: "the identical payload carrying another value",
+                    target: format!("/orders?{SQLI_ARGUMENT}"),
+                    headers: vec![(SCOPE_HEADER, "skip")],
+                    origin: Some("orders"),
+                },
+                Probe {
+                    probe: "the identical payload carrying no such header",
+                    target: format!("/orders?{SQLI_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: Some("orders"),
+                },
+                Probe {
+                    probe: "a benign argument carrying the inspected header",
+                    target: format!("/orders?{BENIGN_ARGUMENT}"),
+                    headers: vec![(SCOPE_HEADER, "inspect")],
+                    origin: Some("orders"),
+                },
+            ],
+        },
+        Scoped {
+            case: "scoped down to the query strings naming one tenant",
+            stage: "tenanted",
+            scope_down: Some(byte_match(
+                json!({ "QueryString": {} }),
+                "tenant=acme",
+                "CONTAINS",
+            )),
+            probes: vec![
+                Probe {
+                    probe: "the payload inside the predicate",
+                    target: format!("/orders?tenant=acme&{SQLI_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: None,
+                },
+                Probe {
+                    probe: "the identical payload outside the predicate",
+                    target: format!("/orders?tenant=other&{SQLI_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: Some("orders"),
+                },
+            ],
+        },
+        Scoped {
+            case: "scoped down to the NEGATION of a uri-path predicate",
+            stage: "negated",
+            scope_down: Some(json!({
+                "NotStatement": {
+                    "Statement": byte_match(json!({ "UriPath": {} }), "/api/", "CONTAINS")
+                }
+            })),
+            probes: vec![
+                Probe {
+                    probe: "the payload on the path the negated predicate excludes",
+                    target: format!("/api/orders?{SQLI_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: Some("api/orders"),
+                },
+                Probe {
+                    probe: "the identical payload on a path it includes",
+                    target: format!("/orders?{SQLI_ARGUMENT}"),
+                    headers: Vec::new(),
+                    origin: None,
+                },
+            ],
+        },
+    ];
+
+    for row in &rows {
+        api.deploy(&edge, row.stage).await;
+    }
+
+    /// Drive one row's probes against the stage its web ACL decides.
+    async fn probe_all(edge: &Edge, api: &str, case: &str, stage: &str, probes: &[Probe]) {
+        for probe in probes {
+            let answered = edge
+                .invoke(
+                    api,
+                    "GET",
+                    &format!("/{stage}{}", probe.target),
+                    &probe.headers,
+                    &[],
+                )
+                .await;
+            match probe.origin {
+                Some(resource) => {
+                    assert_eq!(
+                        answered.status, 200,
+                        "case {case:?} with {:?}: a request the group did not refuse is \
+                         served by the origin, got {} with {:?}",
+                        probe.probe, answered.status, answered.body
+                    );
+                    assert_eq!(
+                        answered.body,
+                        origin_body(resource),
+                        "case {case:?} with {:?}: the integration answers the request, \
+                         got {:?}",
+                        probe.probe,
+                        answered.body
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        answered.status, 403,
+                        "case {case:?} with {:?}: the group refuses the request, got {} \
+                         with {:?}",
+                        probe.probe, answered.status, answered.body
+                    );
+                    assert_eq!(
+                        answered.message(),
+                        "Forbidden",
+                        "case {case:?} with {:?}: a refusal with no custom response is \
+                         answered through the api's own WAF_FILTERED gateway response, \
+                         got {:?}",
+                        probe.probe,
+                        answered.body
+                    );
+                }
+            }
+        }
+    }
+
+    let mut narrowed: Option<(String, String)> = None;
+    for row in &rows {
+        let (id, arn, lock) = create_web_acl(
+            &edge,
+            row.stage,
+            json!({ "Allow": {} }),
+            json!([group_rule(managed_sqli_group(row.scope_down.clone()))]),
+            json!({}),
+        )
+        .await;
+        associate(&edge, &arn, &api.id, row.stage).await;
+        probe_all(&edge, &api.id, row.case, row.stage, &row.probes).await;
+        if row.stage == "contained" {
+            narrowed = Some((id, lock));
+        }
+    }
+
+    // Removing ONLY the scope-down widens the group to every request the web ACL sees:
+    // the payload that was out of scope is refused now, and a benign request is still
+    // served, so what changed is which requests the group was asked about.
+    let (id, lock) = narrowed.expect("the row whose group is scoped down to a uri path");
+    let stage = "contained";
+    let widened = edge
+        .waf_ok(
+            "UpdateWebACL",
+            json!({
+                "Name": stage,
+                "Scope": SCOPE,
+                "Id": id,
+                "DefaultAction": { "Allow": {} },
+                "VisibilityConfig": visibility(stage),
+                "Rules": [group_rule(managed_sqli_group(None))],
+                "LockToken": lock,
+            }),
+        )
+        .await;
+    let next_lock = widened["NextLockToken"]
+        .as_str()
+        .expect("NextLockToken")
+        .to_string();
+    probe_all(
+        &edge,
+        &api.id,
+        "the scope-down removed by UpdateWebACL",
+        stage,
+        &[
+            Probe {
+                probe: "the payload that was outside the predicate",
+                target: format!("/orders?{SQLI_ARGUMENT}"),
+                headers: Vec::new(),
+                origin: None,
+            },
+            Probe {
+                probe: "a benign argument on the same path",
+                target: format!("/orders?{BENIGN_ARGUMENT}"),
+                headers: Vec::new(),
+                origin: Some("orders"),
+            },
+        ],
+    )
+    .await;
+
+    // And putting it back narrows the group again, so the edge reads the predicate the
+    // control plane holds now rather than the one it held at association time.
+    edge.waf_ok(
+        "UpdateWebACL",
+        json!({
+            "Name": stage,
+            "Scope": SCOPE,
+            "Id": id,
+            "DefaultAction": { "Allow": {} },
+            "VisibilityConfig": visibility(stage),
+            "Rules": [group_rule(managed_sqli_group(Some(byte_match(
+                json!({ "UriPath": {} }),
+                "/api/",
+                "CONTAINS",
+            ))))],
+            "LockToken": next_lock,
+        }),
+    )
+    .await;
+    probe_all(
+        &edge,
+        &api.id,
+        "the scope-down restored by UpdateWebACL",
+        stage,
+        &[
+            Probe {
+                probe: "the payload outside the predicate again",
+                target: format!("/orders?{SQLI_ARGUMENT}"),
+                headers: Vec::new(),
+                origin: Some("orders"),
+            },
+            Probe {
+                probe: "the identical payload inside it",
+                target: format!("/api/orders?{SQLI_ARGUMENT}"),
+                headers: Vec::new(),
+                origin: None,
+            },
+        ],
+    )
+    .await;
 }
