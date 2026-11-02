@@ -10,7 +10,9 @@
 //! that prohibits this action", and a recipe reaches a build version whenever one of its
 //! component references MATCHES it — a wildcard reference answers with whichever build is
 //! newest, so every build it matches is still in use. An ARN nothing is stored under, and
-//! one of another Region, delete nothing.
+//! one of another Region, delete nothing — which is reported MISSING, as the not-found
+//! error this service models for a resource its request references and it does not hold,
+//! so a repeat of a delete that already succeeded is reported the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +87,8 @@
 //! * `ResourceDependencyException` (HTTP 400) — You have attempted to mutate or delete a
 //!   resource with a dependency that prohibits this action. See the error message for more
 //!   details.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   "At least one of the resources referenced by your request does not exist."
 //! * `ServiceException` (HTTP 500) — An internal server error occurred while Image Builder
 //!   processed the request. Retrying the request may succeed.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unable to process your request
@@ -104,7 +108,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `DeleteComponentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#DeleteComponent")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`:
+// `componentBuildVersionArn` is an `@httpQuery` member naming a component that may not
+// exist, this SERVICE models that shape for exactly that case
+// (`com.amazonaws.imagebuilder#ResourceNotFoundException`, HTTP 404, "At least one of
+// the resources referenced by your request does not exist", declared in
+// `types/shared_types.rs`), and this operation's own `errors` list omits it. So an ARN
+// nothing is stored under is reported MISSING rather than dressed up as an invalid
+// request, which is a different claim a client branches on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#DeleteComponent",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum DeleteComponentErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
@@ -112,6 +128,7 @@ pub enum DeleteComponentErrorModeled {
     ForbiddenException(ForbiddenException),
     InvalidRequestException(InvalidRequestException),
     ResourceDependencyException(ResourceDependencyException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -185,9 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .component(&input.component_build_version_arn, &region)
             .is_none()
         {
-            return Err(DeleteComponentErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(crate::state::component_not_found_message(
+            return Err(DeleteComponentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::required_resource_not_found_message(
                         &input.component_build_version_arn,
                     )),
                 },

@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tags) = tags else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::tagged_resource_not_found_message(
+                    message: Some(crate::state::required_resource_not_found_message(
                         &input.resource_arn,
                     )),
                 },

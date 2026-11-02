@@ -8,7 +8,9 @@
 //! The ARN the request names may be a build version ARN or a version ARN whose trailing
 //! nodes are `x` wildcards: "Version ARNs resolve to the latest available matching
 //! component build version" (`componentBuildVersionArn`). An ARN nothing is stored
-//! under, and one of another Region, report nothing.
+//! under, and one of another Region, resolve to nothing — which is reported MISSING, as
+//! the not-found error this service models for a resource its request references and it
+//! does not hold.
 //!
 //! A pure read: it answers from the store and writes nothing a later caller sees.
 //!
@@ -83,6 +85,8 @@
 //!   operation.
 //! * `InvalidRequestException` (HTTP 400) — The request is malformed or otherwise invalid.
 //!   Verify the request and try again.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   "At least one of the resources referenced by your request does not exist."
 //! * `ServiceException` (HTTP 500) — An internal server error occurred while Image Builder
 //!   processed the request. Retrying the request may succeed.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unable to process your request
@@ -102,13 +106,26 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `GetComponentError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#GetComponent")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`:
+// `componentBuildVersionArn` is an `@httpQuery` member naming a component that may not
+// exist, this SERVICE models that shape for exactly that case
+// (`com.amazonaws.imagebuilder#ResourceNotFoundException`, HTTP 404, "At least one of
+// the resources referenced by your request does not exist", declared in
+// `types/shared_types.rs`), and this operation's own `errors` list omits it. So an ARN
+// that resolves to nothing is reported MISSING rather than dressed up as an invalid
+// request, which is a different claim a client branches on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#GetComponent",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum GetComponentErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
     ClientException(ClientException),
     ForbiddenException(ForbiddenException),
     InvalidRequestException(InvalidRequestException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -180,9 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(crate::state::ComponentRecord::view);
 
         let Some(component) = view else {
-            return Err(GetComponentErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    message: Some(crate::state::component_not_found_message(
+            return Err(GetComponentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::required_resource_not_found_message(
                         &input.component_build_version_arn,
                     )),
                 },

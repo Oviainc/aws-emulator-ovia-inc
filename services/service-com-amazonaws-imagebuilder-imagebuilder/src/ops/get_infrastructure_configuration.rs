@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetInfrastructureConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(
-                            crate::state::infrastructure_configuration_not_found_message(
+                            crate::state::required_resource_not_found_message(
                                 &input.infrastructure_configuration_arn,
                             ),
                         ),

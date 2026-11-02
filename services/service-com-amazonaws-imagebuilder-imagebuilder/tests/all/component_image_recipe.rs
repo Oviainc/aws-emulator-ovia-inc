@@ -673,8 +673,8 @@ async fn a_repeated_name_and_version_gets_the_next_build_version() {
         "a version nothing was stored under",
         status,
         &refused,
-        400,
-        "InvalidRequestException",
+        404,
+        "ResourceNotFoundException",
     );
 
     // A regional endpoint reaches only its own Region's components.
@@ -683,8 +683,8 @@ async fn a_repeated_name_and_version_gets_the_next_build_version() {
         "another region's endpoint",
         status,
         &refused,
-        400,
-        "InvalidRequestException",
+        404,
+        "ResourceNotFoundException",
     );
 }
 
@@ -718,8 +718,8 @@ async fn a_replayed_client_token_answers_the_original_response() {
         "a second build version",
         status,
         &refused,
-        400,
-        "InvalidRequestException",
+        404,
+        "ResourceNotFoundException",
     );
 
     // The same token with different creation parameters is the modelled mismatch, for
@@ -867,8 +867,8 @@ async fn a_create_this_service_cannot_serve_is_refused_the_documented_way() {
         "the dry run's ARN",
         status,
         &refused,
-        400,
-        "InvalidRequestException",
+        404,
+        "ResourceNotFoundException",
     );
 
     // The same rules on the recipe create: a wildcard version is for filtering, not for
@@ -902,8 +902,8 @@ async fn a_create_this_service_cannot_serve_is_refused_the_documented_way() {
         "the recipe dry run's ARN",
         status,
         &refused,
-        400,
-        "InvalidRequestException",
+        404,
+        "ResourceNotFoundException",
     );
 }
 
@@ -1077,26 +1077,30 @@ async fn a_recipe_is_refused_when_its_components_do_not_resolve() {
         .cloned()
         .expect("the windows build component");
 
-    let rows: Vec<(&str, Value, &str)> = vec![
+    let rows: Vec<(&str, Value, u16, &str)> = vec![
         (
             "a componentArn naming a component nothing stored",
             json!({"components": [{"componentArn": format!("arn:aws:imagebuilder:{REGION}:{ACCOUNT}:component/no-such-component/1.0.0/1")}]}),
-            "InvalidRequestException",
+            404,
+            "ResourceNotFoundException",
         ),
         (
             "a componentArn naming a version nothing stored",
             json!({"components": [{"componentArn": format!("arn:aws:imagebuilder:{REGION}:{ACCOUNT}:component/prep-linux/9.0.0")}]}),
-            "InvalidRequestException",
+            404,
+            "ResourceNotFoundException",
         ),
         (
             "a componentArn naming a build version nothing stored",
             json!({"components": [{"componentArn": format!("arn:aws:imagebuilder:{REGION}:{ACCOUNT}:component/prep-linux/1.0.0/7")}]}),
-            "InvalidRequestException",
+            404,
+            "ResourceNotFoundException",
         ),
         (
             "a componentArn of another Region",
             json!({"components": [{"componentArn": format!("arn:aws:imagebuilder:eu-west-1:{ACCOUNT}:component/prep-linux/1.0.0/1")}]}),
-            "InvalidRequestException",
+            404,
+            "ResourceNotFoundException",
         ),
         (
             "components of two platforms",
@@ -1104,6 +1108,7 @@ async fn a_recipe_is_refused_when_its_components_do_not_resolve() {
                 {"componentArn": linux_build.clone()},
                 {"componentArn": windows_build},
             ]}),
+            400,
             "InvalidRequestException",
         ),
         (
@@ -1112,10 +1117,11 @@ async fn a_recipe_is_refused_when_its_components_do_not_resolve() {
                 {"componentArn": linux_build.clone()},
                 {"componentArn": format!("arn:aws:imagebuilder:{REGION}:{ACCOUNT}:component/prep-linux/1.x.x")},
             ]}),
+            400,
             "InvalidRequestException",
         ),
     ];
-    for (n, (case, extra, expect_code)) in rows.into_iter().enumerate() {
+    for (n, (case, extra, expect_status, expect_code)) in rows.into_iter().enumerate() {
         let body = recipe_body(
             &format!("refused-recipe-{n}"),
             "1.0.0",
@@ -1123,12 +1129,12 @@ async fn a_recipe_is_refused_when_its_components_do_not_resolve() {
             extra,
         );
         let (status, refused) = create_recipe(&router, &body).await;
-        assert_refused(case, status, &refused, 400, expect_code);
+        assert_refused(case, status, &refused, expect_status, expect_code);
 
         // Nothing was stored for a refused create.
         let (status, missing) =
             get_recipe(&router, &recipe_arn(REGION, &format!("refused-recipe-{n}"), "1.0.0")).await;
-        assert_refused(case, status, &missing, 400, "InvalidRequestException");
+        assert_refused(case, status, &missing, 404, "ResourceNotFoundException");
     }
 
     // "A recipe can contain a maximum of 20 build and test components in any
@@ -1507,24 +1513,36 @@ async fn a_delete_removes_the_record_and_respects_what_depends_on_it() {
         .map(|(_, arn, _)| arn.clone())
         .unwrap_or_default();
     let (status, body) = get_component(&router, &linux_build).await;
-    assert_refused("the deleted component", status, &body, 400, "InvalidRequestException");
+    assert_refused(
+        "the deleted component",
+        status,
+        &body,
+        404,
+        "ResourceNotFoundException",
+    );
     let (status, body) = get_recipe(&router, &first_recipe).await;
-    assert_refused("the deleted recipe", status, &body, 400, "InvalidRequestException");
+    assert_refused(
+        "the deleted recipe",
+        status,
+        &body,
+        404,
+        "ResourceNotFoundException",
+    );
     let (status, body) = delete_component(&router, &linux_build).await;
     assert_refused(
         "a second component delete",
         status,
         &body,
-        400,
-        "InvalidRequestException",
+        404,
+        "ResourceNotFoundException",
     );
     let (status, body) = delete_recipe(&router, &first_recipe).await;
     assert_refused(
         "a second recipe delete",
         status,
         &body,
-        400,
-        "InvalidRequestException",
+        404,
+        "ResourceNotFoundException",
     );
 
     let (status, listed) = list_recipes(&router, &json!({})).await;

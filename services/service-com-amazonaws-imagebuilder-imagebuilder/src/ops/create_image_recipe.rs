@@ -157,6 +157,8 @@
 //!   already exists.
 //! * `ResourceInUseException` (HTTP 400) — The resource that you are trying to operate on is
 //!   currently in use. Review the message details and retry later.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   "At least one of the resources referenced by your request does not exist."
 //! * `ServiceException` (HTTP 500) — An internal server error occurred while Image Builder
 //!   processed the request. Retrying the request may succeed.
 //! * `ServiceQuotaExceededException` (HTTP 402) — You have exceeded the number of permitted
@@ -179,7 +181,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `CreateImageRecipeError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#CreateImageRecipe")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`: every
+// `components[].componentArn` this create carries REFERENCES a component that may not
+// exist, this SERVICE models that shape for exactly that case
+// (`com.amazonaws.imagebuilder#ResourceNotFoundException`, HTTP 404, "At least one of
+// the resources referenced by your request does not exist", declared in
+// `types/shared_types.rs`), and this operation's own `errors` list omits it. So a
+// reference that resolves to nothing is reported MISSING rather than dressed up as an
+// invalid request, which is a different claim a client branches on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#CreateImageRecipe",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateImageRecipeErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
@@ -191,6 +205,7 @@ pub enum CreateImageRecipeErrorModeled {
     InvalidVersionNumberException(InvalidVersionNumberException),
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
     ResourceInUseException(ResourceInUseException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -343,9 +358,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every component the recipe includes has to BE a stored component, resolved the
         // way every other component reference is — so a reference naming nothing, or a
-        // component of another Region, is refused rather than stored. "You can specify
-        // each component only once in a recipe, regardless of version", so a name named
-        // twice is refused too. The platform the recipe reports is the platform those
+        // component of another Region, is reported MISSING rather than stored. "You can
+        // specify each component only once in a recipe, regardless of version", so a name
+        // named twice is refused too. The platform the recipe reports is the platform those
         // components target, so a list spanning two platforms names no platform the recipe
         // could have.
         let mut platform: Option<String> = None;
@@ -354,9 +369,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(component) =
                 store.resolve_component(&configuration.component_arn, &region)
             else {
-                return Err(CreateImageRecipeErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(crate::state::unknown_component_reference_message(
+                return Err(CreateImageRecipeErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::required_resource_not_found_message(
                             &configuration.component_arn,
                         )),
                     },

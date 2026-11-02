@@ -180,7 +180,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetComponentPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::required_resource_not_found_message(
-                        crate::state::COMPONENT_RESOURCE_TYPE,
                         &input.component_arn,
                     )),
                 },

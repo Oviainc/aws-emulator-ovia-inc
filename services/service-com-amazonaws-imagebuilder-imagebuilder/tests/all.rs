@@ -21,6 +21,8 @@ mod component_policy;
 mod image_packages;
 #[path = "all/infrastructure_configuration.rs"]
 mod infrastructure_configuration;
+#[path = "all/resource_not_found.rs"]
+mod resource_not_found;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

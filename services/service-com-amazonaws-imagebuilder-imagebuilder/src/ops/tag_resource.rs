@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.tags_of_resource_mut(&input.resource_arn, &region) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::tagged_resource_not_found_message(
+                    message: Some(crate::state::required_resource_not_found_message(
                         &input.resource_arn,
                     )),
                 },

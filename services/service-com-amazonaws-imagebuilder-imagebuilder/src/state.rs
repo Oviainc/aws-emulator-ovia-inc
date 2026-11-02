@@ -291,10 +291,6 @@ pub const MAX_IMAGE_PACKAGES: usize = 5_000;
 /// reported as this document rather than as empty text.
 pub const UNSET_RESOURCE_POLICY: &str = "{}";
 
-/// The resource-type token a missing-resource report names a component build version by:
-/// the modelled `Component` shape's own name.
-pub const COMPONENT_RESOURCE_TYPE: &str = "Component";
-
 /// The modelled member name a policy document arrives in (`PutComponentPolicy`'s
 /// `policy`), which is the member an invalid-value refusal names.
 pub const POLICY_MEMBER: &str = "policy";
@@ -2173,15 +2169,6 @@ pub fn infrastructure_configuration_exists_message(name: &str) -> String {
     )
 }
 
-/// Why a read naming no stored configuration reports nothing.
-///
-/// Names the RESOURCE TYPE that is absent and the ARN the caller asked about, and
-/// nothing about any configuration that does exist.
-#[must_use]
-pub fn infrastructure_configuration_not_found_message(arn: &str) -> String {
-    format!("The infrastructure configuration {arn} does not exist.")
-}
-
 /// Why a create was not performed because the request asked only for validation.
 ///
 /// From the `dryRun` member's own documentation: "Validates the required permissions
@@ -2274,26 +2261,10 @@ pub fn component_already_exists_message(arn: &str) -> String {
     format!("The component {arn} already exists with identical content.")
 }
 
-/// Why a read naming no stored component reports nothing.
-///
-/// Names the RESOURCE TYPE that is absent and the ARN the caller asked about, and nothing
-/// about any component that does exist.
-#[must_use]
-pub fn component_not_found_message(arn: &str) -> String {
-    format!("The component {arn} does not exist.")
-}
-
 /// Why a delete of a component a stored recipe still includes is refused.
 #[must_use]
 pub fn component_in_use_message(arn: &str, recipe_arn: &str) -> String {
     format!("The component {arn} can't be deleted because the image recipe {recipe_arn} includes it.")
-}
-
-/// Why a create whose component list names something that is not a stored component is
-/// refused.
-#[must_use]
-pub fn unknown_component_reference_message(reference: &str) -> String {
-    format!("The componentArn {reference} does not name a component in this Amazon Web Services Region.")
 }
 
 /// Why a create whose components do not agree on one platform is refused.
@@ -2342,22 +2313,6 @@ pub fn image_recipe_exists_message(name: &str, semantic_version: &str) -> String
     )
 }
 
-/// Why a read naming no stored image recipe reports nothing.
-#[must_use]
-pub fn image_recipe_not_found_message(arn: &str) -> String {
-    format!("The image recipe {arn} does not exist.")
-}
-
-/// Why a tagging call naming no stored resource reports nothing.
-///
-/// Names the ARN the caller asked about and nothing about any resource that does exist.
-/// The ARN a tagging call carries may name any of the resource kinds the modelled
-/// `ImageBuilderArn` admits, so the wording names "the resource" rather than one kind.
-#[must_use]
-pub fn tagged_resource_not_found_message(arn: &str) -> String {
-    format!("The resource {arn} does not exist.")
-}
-
 /// Why a tagging call that would leave a resource holding more tags than one resource may
 /// carry is refused.
 ///
@@ -2392,10 +2347,40 @@ pub fn incomplete_filter_message() -> String {
 /// Why a call naming a resource this Region holds nothing under reports it missing.
 ///
 /// Names the resource TYPE the request needed and the ARN it named, and nothing about any
-/// resource that does exist.
+/// resource that does exist. The type token is the kind the ARN itself names
+/// ([`arn_resource_type`]), so one wording serves every lookup: the resource an operation
+/// acts on, and a resource a create has to resolve a reference to.
 #[must_use]
-pub fn required_resource_not_found_message(resource_type: &str, arn: &str) -> String {
+pub fn required_resource_not_found_message(arn: &str) -> String {
+    let resource_type = arn_resource_type(arn);
     format!("The following required resource '{resource_type}' cannot be found: '{arn}'.")
+}
+
+/// The resource-type token a missing-resource report names the resource `arn` identifies
+/// by: the name this model gives that kind of resource.
+///
+/// An Image Builder ARN carries its kind as the resource TYPE of its resource field, read
+/// through this tree's one ARN parse (`service_common::arn`), in lower kebab case. The
+/// kinds an ARN may name are the alternation of the modelled `ImageBuilderArn` pattern
+/// (`smithy_query(query="shape",shape="ImageBuilderArn")`): `component`, `image`,
+/// `image-recipe`, `container-recipe`, `image-pipeline`, `infrastructure-configuration`,
+/// `distribution-configuration`, `lifecycle-policy` and `workflow`. This model names each
+/// of them by a shape whose name is that same text in upper camel case (`component` is
+/// `Component`, `image-recipe` is `ImageRecipe`), which is the token derived here — so a
+/// kind added to that alternation needs no table kept in step. A value that is not a
+/// resource ARN at all names no kind, and is reported by itself.
+#[must_use]
+pub fn arn_resource_type(arn: &str) -> String {
+    let kind = ::service_common::arn::resource_type(arn).unwrap_or(arn);
+    kind.split('-')
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => first.to_uppercase().chain(characters).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 /// Why a policy document that is not parseable JSON is refused.
