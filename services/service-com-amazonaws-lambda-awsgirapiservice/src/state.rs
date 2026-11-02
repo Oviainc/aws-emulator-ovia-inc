@@ -334,6 +334,23 @@ pub const ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 /// same documentation describes ("During this time, you can't modify the function").
 pub const UPDATE_DELAY: Duration = Duration::from_millis(500);
 
+/// Lambda's sentence for a modification refused because an update of the function it
+/// names is still being applied — the window [`LAST_UPDATE_STATUS_IN_PROGRESS`] covers
+/// ("During this time, you can't modify the function, but you can still invoke it").
+///
+/// It is the message of the `ResourceConflictException` ("another operation is in
+/// progress", HTTP 409) that every operation modifying a function answers while that
+/// window is open, so all of them say it the same way: fixed text, naming the function's
+/// own unqualified ARN as it is stored ([`FunctionRecord::arn`]) rather than anything the
+/// request carried.
+#[must_use]
+pub fn update_in_progress_message(function_arn: &str) -> String {
+    format!(
+        "The operation cannot be performed at this time. An update is in progress for \
+         resource: {function_arn}"
+    )
+}
+
 /// The `SnapStart$ApplyOn` value that asks Lambda to snapshot an initialized execution
 /// environment, from the model's `SnapStartApplyOn` enum (`PublishedVersions | None`).
 pub const SNAP_START_APPLY_ON_PUBLISHED_VERSIONS: &str = "PublishedVersions";

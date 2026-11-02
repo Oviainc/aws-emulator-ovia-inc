@@ -32,11 +32,18 @@
 //! `InvalidParameterValueException` (HTTP 400) without storing anything; and because the
 //! configuration belongs to the version, a qualifier naming an alias reads (and writes)
 //! the configuration of the version that alias invokes.
+//!
+//! Storing a configuration is an update of the function, and Lambda refuses a second
+//! modification while that update is still being applied (`function_update_window_conflict.rs`
+//! pins that refusal), so a suite that writes twice settles the first update in between by
+//! moving its stored due instant into the past — what waiting would do, without waiting.
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+use service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsgirapiserviceState;
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -282,6 +289,20 @@ async fn create_alias(router: &MultiServiceRouter, function: &str, alias: &str, 
         answer.status,
         answer.text()
     );
+}
+
+/// Move every in-flight update's settle instant into the past, so the next call sees an
+/// update the clock has already finished applying rather than one still in flight. This
+/// is what waiting would do, without waiting.
+fn make_update_settled(engine: &Arc<engine::InMemoryEngine>) {
+    let state = engine.state::<ComAmazonawsLambdaAwsgirapiserviceState>();
+    let mut store = state.lock();
+    let past = SystemTime::now() - Duration::from_secs(1);
+    for function in store.functions.values_mut() {
+        if function.last_update_due.is_some() {
+            function.last_update_due = Some(past);
+        }
+    }
 }
 
 /// The unqualified ARN of the function `name`.
@@ -596,6 +617,10 @@ async fn a_version_reports_the_runtime_management_config_it_holds() {
                 put.runtime_version_arn,
                 &expected_function_arn,
             );
+
+            // Storing it updated the function, so the next call in this row waits for
+            // that update the way a client does.
+            make_update_settled(&engine);
         }
 
         let (mode, arn) = case.expected;
@@ -640,6 +665,7 @@ async fn the_runtime_management_config_is_held_per_version() {
         unqualified_put.status,
         unqualified_put.text()
     );
+    make_update_settled(&engine);
 
     // Each version holds its own configuration: `$LATEST` is Manual, version 1 is
     // FunctionUpdate, and a version nobody configured stays at the default.
@@ -723,6 +749,7 @@ async fn a_mode_and_runtime_version_arn_that_cannot_hold_together_are_refused() 
         seed.status,
         seed.text()
     );
+    make_update_settled(&engine);
 
     // One row per way the pair cannot hold together: `Manual` names no runtime version,
     // and each of the other modelled modes names one.
@@ -1044,6 +1071,9 @@ async fn every_way_of_naming_one_version_reads_the_same_configuration() {
             seeded.status,
             seeded.text()
         );
+        // Seeding updated the function, so the next write waits for that update the way
+        // a client does.
+        make_update_settled(&engine);
     }
 
     // Each group names ONE version, so every row in it reads the same stored value and
@@ -1116,6 +1146,9 @@ async fn a_name_and_qualifier_that_name_two_versions_are_refused() {
             seeded.status,
             seeded.text()
         );
+        // Seeding updated the function, so the next write waits for that update the way
+        // a client does.
+        make_update_settled(&engine);
     }
 
     // One row per way the two halves can disagree: the name's qualifier against the
@@ -1228,6 +1261,9 @@ async fn an_alias_reads_the_configuration_of_the_version_it_invokes() {
             seeded.status,
             seeded.text()
         );
+        // Seeding updated the function, so the next write waits for that update the way
+        // a client does.
+        make_update_settled(&engine);
     }
     // Two aliases over the same function, invoking the two different versions.
     create_alias(&router, function, "live", "1").await;
@@ -1284,6 +1320,7 @@ async fn an_alias_reads_the_configuration_of_the_version_it_invokes() {
     // A call addressed by an alias and one addressed by the version that alias invokes
     // reach the SAME configuration: setting it through `live` is what version 1 reports,
     // and `$LATEST` (and therefore `edge`) is untouched.
+    make_update_settled(&engine);
     let through_alias =
         put_runtime_management_config(&router, function, Some("live"), "Auto", None).await;
     assert_reports(

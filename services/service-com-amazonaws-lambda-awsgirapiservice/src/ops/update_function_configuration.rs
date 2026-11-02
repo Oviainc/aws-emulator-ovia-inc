@@ -469,10 +469,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its supporting resources. [...] During this time, you can't modify the
         // function, but you can still invoke it."
         if record.update_in_progress() {
-            return Err(resource_conflict(format!(
-                "The operation cannot be performed at this time. An update is in progress for \
-                 resource: {}",
-                record.arn
+            return Err(resource_conflict(crate::state::update_in_progress_message(
+                &record.arn,
             )));
         }
 

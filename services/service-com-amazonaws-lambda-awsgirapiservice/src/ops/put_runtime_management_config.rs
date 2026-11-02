@@ -13,8 +13,19 @@
 //! otherwise null is returned". So a `Manual` mode naming no runtime version, and any
 //! other mode naming one, each describe no single configuration and are refused with
 //! this operation's own `InvalidParameterValueException` ("One of the parameters in the
-//! request is not valid") before any record is read: the pair is wrong whatever
-//! function it names.
+//! request is not valid") before any record is written.
+//!
+//! The request's members are judged only once the function it names is in a state that
+//! admits a modification at all: this call modifies the function, so while an update of
+//! it is still being applied ("During this time, you can't modify the function, but you
+//! can still invoke it") it is refused `ResourceConflictException` ("another operation
+//! is in progress") whatever it asks for — the same refusal
+//! `UpdateFunctionConfiguration` and `UpdateFunctionCode` answer in that window, worded
+//! once in [`crate::state::update_in_progress_message`]. A configuration this call DOES
+//! store is applied the same way: which runtime version the function runs on is part of
+//! the function's deployed configuration (`FunctionConfiguration$RuntimeVersionConfig`),
+//! so storing one opens that window itself and the next modification meets the same
+//! refusal until the clock settles it.
 //!
 //! Setting the configuration again replaces it — it is one value a version always has,
 //! starting at the documented `Auto` (see [`crate::state::DEFAULT_UPDATE_RUNTIME_ON`]).
@@ -197,6 +208,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // "Specify a version of the function" — the `Qualifier` names the version this
+        // configuration belongs to, and with "no value specified" it is the `$LATEST`
+        // version's configuration that is addressed, which is what resolution defaults
+        // to.
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                PutRuntimeManagementConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                PutRuntimeManagementConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        // "When you update a function, Lambda provisions an instance of the function and
+        // its supporting resources. [...] During this time, you can't modify the
+        // function, but you can still invoke it" — and this call modifies the function,
+        // so while that window is open it is refused whatever it asks for, BEFORE the
+        // request's own members are judged: the state of the resource decides whether any
+        // modification is admissible at all.
+        if record.update_in_progress() {
+            return Err(
+                PutRuntimeManagementConfigErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        r#type: None,
+                        message: Some(crate::state::update_in_progress_message(&record.arn)),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // `UpdateRuntimeOn` is a required enum member, so the boundary validator has
         // already refused everything outside the model's `Auto | Manual |
         // FunctionUpdate` value set and only one of those three reaches here. What is
@@ -228,38 +290,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let region = crate::state::request_region(ctx);
-        let mut store = state.lock();
-        // "Specify a version of the function" — the `Qualifier` names the version this
-        // configuration belongs to, and with "no value specified" it is the `$LATEST`
-        // version's configuration that is addressed, which is what resolution defaults
-        // to.
-        let (record, version) = crate::state::resolve_function(
-            &mut store,
-            &input.function_name,
-            input.qualifier.as_deref(),
-            &region,
-            ::std::time::SystemTime::now(),
-        )
-        .map_err(|failure| match failure {
-            crate::state::ResolveFailure::Malformed(message) => {
-                PutRuntimeManagementConfigErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        r#type: None,
-                        message: Some(message),
-                    },
-                )
-            }
-            crate::state::ResolveFailure::NotFound(message) => {
-                PutRuntimeManagementConfigErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        r#type: None,
-                        message: Some(message),
-                    },
-                )
-            }
-        })?;
-
         record.set_runtime_management_config(
             &version,
             crate::state::RuntimeManagementConfigRecord {
@@ -267,6 +297,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 runtime_version_arn: input.runtime_version_arn.clone(),
             },
         );
+        // Which runtime version the function runs on is part of the function's deployed
+        // configuration — it is what `FunctionConfiguration$RuntimeVersionConfig` reports
+        // — so storing a new one is an update of the function, and Lambda applies it the
+        // way it applies every other configuration change: by provisioning a new instance
+        // of the function, which is the window above. The clock closes it; nothing sleeps
+        // for it.
+        record.begin_update(now);
 
         // Answered by reading the record back, so the response reports what is stored
         // rather than what the request carried.

@@ -147,6 +147,8 @@ mod function_scaling_config_capacity_provider;
 mod function_scaling_config_convergence;
 #[path = "all/function_scaling_config_default.rs"]
 mod function_scaling_config_default;
+#[path = "all/function_update_window_conflict.rs"]
+mod function_update_window_conflict;
 #[path = "all/function_url_config.rs"]
 mod function_url_config;
 #[path = "all/function_url_deletion.rs"]
