@@ -25,7 +25,9 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_ssmsap_ssmsap::state::{FILTER_VALUE_MAX_LENGTH, TRANSITION_SPAN};
+use service_com_amazonaws_ssmsap_ssmsap::state::{
+    no_operation_message, FILTER_VALUE_MAX_LENGTH, TRANSITION_SPAN,
+};
 
 use crate::application_lifecycle::{valid_registration, Emulator, Reply};
 use crate::validation_message_rendering::{message, VALIDATION_EXCEPTION};
@@ -543,8 +545,7 @@ async fn an_operation_record_is_readable_only_in_the_region_that_filed_it() {
                  {VALIDATION_EXCEPTION}, got {reply:?}"
             );
             let stated = message(&reply);
-            let expected =
-                format!("No operation with ID {operation_id} exists in this account and Region");
+            let expected = no_operation_message(operation_id);
             assert_eq!(
                 stated, expected,
                 "case {operation_id:?} read at {other:?}: expected {expected:?}, got \

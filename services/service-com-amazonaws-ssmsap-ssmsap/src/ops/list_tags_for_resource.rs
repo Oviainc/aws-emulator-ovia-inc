@@ -8,7 +8,8 @@
 //! comes from the one place this service keeps tags
 //! ([`crate::state::RegionState::tags_by_arn`]), so it is whatever the calls that write
 //! tags have left there; an ARN naming no resource of this account and Region is
-//! refused with the modelled `ResourceNotFoundException` rather than reported as an
+//! refused with this route's own not-found class
+//! ([`crate::scaffolded::NOT_FOUND_CODE`], HTTP 404) rather than reported as an
 //! empty tag set.
 //!
 //! ## Shape of an operation
@@ -174,16 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the reference is a well-formed ARN. It still has to NAME something: the
         // resources this service holds are the registered SAP application and the
         // resources derived from that registration — its SAP HANA databases and its
-        // components — so an ARN naming none of them is the `ResourceNotFoundException`
-        // this operation models rather than an empty tag set reported for a resource that
-        // does not exist.
+        // components — so an ARN naming none of them is refused rather than answered with
+        // an empty tag set for a resource that does not exist. The error CLASS this route
+        // reports that with is its own ([`crate::scaffolded::NOT_FOUND_CODE`], HTTP 404,
+        // carrying [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`]) rather than the modelled
+        // `ResourceNotFoundException` shape name, as the recorded behaviour of the
+        // `/tags/{resourceArn}` routes shows — the three of them answer it alike.
         if !region_state.holds_resource(&region, &input.resource_arn) {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::resource_not_found_message(
-                    &input.resource_arn,
-                )),
-            )
-            .into());
+            return Err(ListTagsForResourceError::not_found(
+                crate::state::RESOURCE_NOT_FOUND_MESSAGE,
+            ));
         }
 
         // The whole output is the tag set held for that resource, read from the one place

@@ -12,9 +12,8 @@
 //! The rule under test: `ListTagsForResource` reports exactly the tag set persisted for
 //! the resource its ARN names — a registered SAP application or one of the SAP HANA
 //! databases of that registration, in the Region the request was signed for — and
-//! refuses an ARN that names no such resource with the modelled
-//! `ResourceNotFoundException` (HTTP 404) instead of reporting an empty tag set for a
-//! resource that does not exist.
+//! refuses an ARN that names no such resource as not found (HTTP 404) instead of
+//! reporting an empty tag set for a resource that does not exist.
 //!
 //! The table spans what that rule generalises over: tag count (none, one, several), key
 //! form across the modelled `TagKey` character class, value length at both modelled
@@ -25,6 +24,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_ssmsap_ssmsap::state::RESOURCE_NOT_FOUND_MESSAGE;
 
 use crate::application_lifecycle::{settle, tag_pairs, valid_registration, Emulator, Reply};
 use crate::validation_message_rendering::message;
@@ -39,10 +39,11 @@ const OTHER_REGION: &str = "us-west-2";
 /// The account every emulated ARN carries, from the core's single source of truth.
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
-/// The modelled error code and status an absent resource is answered with
-/// (`smithy_query(query="operation", operation="ListTagsForResource")`:
-/// `ResourceNotFoundException` `@httpError 404`).
-const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+/// The error code and status an absent resource is answered with: the class the
+/// ARN-addressed tagging routes really carry, which is NOT the modelled
+/// `ResourceNotFoundException` shape name.
+const TAGGING_NOT_FOUND_CODE: &str =
+    service_com_amazonaws_ssmsap_ssmsap::scaffolded::NOT_FOUND_CODE;
 
 /// The longest `TagValue` the model admits
 /// (`smithy_query(query="shape", shape="TagValue")`: length 1..256).
@@ -320,9 +321,9 @@ async fn a_database_reports_its_own_tag_set_and_not_its_applications() {
     }
 }
 
-/// RULE: an ARN that names no resource of this account and Region is refused with the
-/// modelled `ResourceNotFoundException` (HTTP 404), whose message names the ARN the
-/// request carried — never an empty tag set for a resource that does not exist.
+/// RULE: an ARN that names no resource of this account and Region is refused as not
+/// found (HTTP 404) with the fixed sentence that reports nothing of the ARN — never an
+/// empty tag set for a resource that does not exist.
 #[tokio::test]
 async fn an_arn_naming_no_resource_here_is_refused_as_not_found() {
     let emulator = Emulator::new();
@@ -402,14 +403,14 @@ async fn an_arn_naming_no_resource_here_is_refused_as_not_found() {
         );
         assert_eq!(
             reply.code(),
-            RESOURCE_NOT_FOUND_EXCEPTION,
-            "case {label:?}: expected {RESOURCE_NOT_FOUND_EXCEPTION}, got {:?}",
+            TAGGING_NOT_FOUND_CODE,
+            "case {label:?}: expected {TAGGING_NOT_FOUND_CODE}, got {:?}",
             reply.code()
         );
         let stated = message(&reply);
-        assert!(
-            stated.contains(&arn),
-            "case {label:?}: expected the refusal to name {arn:?}, got {stated:?}"
+        assert_eq!(
+            stated, RESOURCE_NOT_FOUND_MESSAGE,
+            "case {label:?}: expected {RESOURCE_NOT_FOUND_MESSAGE:?}, got {stated:?}"
         );
     }
 }

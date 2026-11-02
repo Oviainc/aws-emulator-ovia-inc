@@ -67,6 +67,8 @@ mod list_element_validation_messages;
 mod list_operation_events;
 #[path = "all/list_operations.rs"]
 mod list_operations;
+#[path = "all/not_found_error_families.rs"]
+mod not_found_error_families;
 #[path = "all/operation_event_resources.rs"]
 mod operation_event_resources;
 #[path = "all/page_token_scope.rs"]

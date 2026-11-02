@@ -4438,10 +4438,12 @@ pub fn no_database_message(reference: &str) -> String {
 ///
 /// The operations that take one (`GetOperation`, `ListOperationEvents`) model no 404, so
 /// an id that resolves to nothing is the `ValidationException` they do model — and both
-/// refuse it in the same words, built from the request's own id, so a client reads one
-/// wording for one condition whichever of them it called.
+/// refuse it in the same words, so a client reads one wording for one condition whichever
+/// of them it called. The template is AWS's, as the `ssm-sap` operation-lookup recording
+/// shows it: fixed text followed by the `OperationId` the request carried verbatim, which
+/// is the only variable part.
 pub fn no_operation_message(operation_id: &str) -> String {
-    format!("No operation with ID {operation_id} exists in this account and Region")
+    format!("Operation Not Found: {operation_id}")
 }
 
 /// Why an `OperationId` that names no configuration check operation of this account and
@@ -4508,15 +4510,16 @@ pub fn application_not_found_message(reference: &str) -> String {
 /// The message a call that names a resource by ARN reports when this account and Region
 /// hold no such resource.
 ///
-/// Built from the request: the ARN the caller sent is the only variable part, so every
-/// call that resolves a resource by its ARN reports the SAME template around it — the
-/// same construction [`application_not_found_message`] uses for an application named by
-/// its id. It goes with the 404 `ResourceNotFoundException` those operations model, which
-/// is the tagging calls: a call whose ARN has to name one KIND of resource states that
-/// instead ([`invalid_database_arn`]).
-pub fn resource_not_found_message(resource_arn: &str) -> String {
-    format!("Resource {resource_arn} doesn't exist.")
-}
+/// ENTIRELY fixed text: the tagging routes state the condition and nothing of the request
+/// that met it — not the ARN, not the kind of resource it named — so a client reads the
+/// same sentence for every ARN that resolves to nothing. It is AWS's own wording for
+/// those routes verbatim, as the `ssm-sap` tagging recording shows it, and it goes with
+/// the wire error code those routes really carry
+/// ([`crate::scaffolded::NOT_FOUND_CODE`], HTTP 404) rather than with the modelled
+/// `ResourceNotFoundException` shape name. A call whose ARN has to name one KIND of
+/// resource states that instead ([`invalid_database_arn`]), and a call that resolves an
+/// application by its id states [`application_not_found_message`].
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
 /// The modelled `ValidationException` (HTTP 400) a resource-permission call is refused
 /// with when its `ResourceArn` does not name a SAP HANA database of this account and
@@ -4572,6 +4575,19 @@ pub fn conflict(message: impl Into<String>) -> ConflictException {
     ConflictException {
         message: Some(message.into()),
     }
+}
+
+/// The message `RegisterApplication` reports when the `ApplicationId` it was given is
+/// already registered in this account and Region.
+///
+/// Built from the request: the `ApplicationId` the caller sent is the only variable part,
+/// quoted, and the fixed text around it is AWS's own for this conflict verbatim, as the
+/// `ssm-sap` registration recording shows it. `RegisterApplication` can raise
+/// `ConflictException` for more than one reason, so the wording is what tells a duplicate
+/// id apart from the others — which is why it has one construction site rather than being
+/// spelled at the handler.
+pub fn duplicate_application_id_message(application_id: &str) -> String {
+    format!("Application id '{application_id}' already exists.")
 }
 
 /// A call that controls ONE registered application: the operations this service files

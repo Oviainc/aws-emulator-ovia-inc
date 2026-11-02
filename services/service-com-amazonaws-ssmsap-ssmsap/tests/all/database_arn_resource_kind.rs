@@ -191,8 +191,8 @@ async fn assert_still_held(emulator: &Emulator, case: &str, arn: &str) {
     assert_policy_grants(&document, arn, action(), &one_source(), case);
 }
 
-/// Assert nothing is held on `arn` any more: the tag read refuses it as the modelled
-/// `ResourceNotFoundException` and the permission read as the modelled
+/// Assert nothing is held on `arn` any more: the tag read refuses it with the not-found
+/// class the tagging routes carry and the permission read as the modelled
 /// `ValidationException` for an ARN that names no database, because the resource it named
 /// has stopped existing.
 async fn assert_gone(emulator: &Emulator, case: &str, arn: &str) {

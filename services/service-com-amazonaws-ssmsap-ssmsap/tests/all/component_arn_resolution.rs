@@ -9,7 +9,7 @@
 //! this service hands a caller is an ARN the ARN-keyed TAGGING calls accept
 //! (`ListTagsForResource`, `TagResource`, `UntagResource`), what is held under it is the
 //! same set every read of that resource reports, and only an ARN naming none of those
-//! resources is refused with the modelled `ResourceNotFoundException` (HTTP 404). The
+//! resources is refused as not found (HTTP 404). The
 //! resource-permission calls are narrower — they are database-scoped — so a component ARN
 //! is no target for them whether or not it resolves, which is the other half of the rule
 //! this suite pins.
@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_ssmsap_ssmsap::state::ConditionalMember;
+use service_com_amazonaws_ssmsap_ssmsap::state::{ConditionalMember, RESOURCE_NOT_FOUND_MESSAGE};
 
 use crate::application_lifecycle::{
     conditional_value, settle, tag_pairs, valid_registration, Emulator, Reply,
@@ -58,11 +58,11 @@ const OTHER_REGION: &str = "us-west-2";
 /// The account every emulated ARN carries, from the core's single source of truth.
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
-/// The modelled error code and status an ARN naming no resource is answered with
-/// (`smithy_query(query="operation", operation="ListTagsForResource")`:
-/// `ResourceNotFoundException` `@httpError 404`, declared for `TagResource` and
-/// `UntagResource` too).
-const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+/// The error code and status an ARN naming no resource is answered with by the
+/// ARN-keyed tagging routes: the class those routes really carry, which is NOT the
+/// modelled `ResourceNotFoundException` shape name.
+const TAGGING_NOT_FOUND_CODE: &str =
+    service_com_amazonaws_ssmsap_ssmsap::scaffolded::NOT_FOUND_CODE;
 
 /// The `ComponentType` of the SAP HANA component of an application's own SAP system: one
 /// of the model's `ComponentType` values (`smithy_query(query="shape",
@@ -207,7 +207,8 @@ async fn tags_held(
     tag_pairs(reply.member("tags"))
 }
 
-/// Assert `reply` is the modelled refusal for an ARN that names nothing, naming that ARN.
+/// Assert `reply` is the not-found refusal the tagging routes carry for an ARN that names
+/// nothing: the fixed sentence, which reports nothing of the ARN.
 fn assert_not_found(case: &str, arn: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 404,
@@ -215,14 +216,14 @@ fn assert_not_found(case: &str, arn: &str, reply: &Reply) {
     );
     assert_eq!(
         reply.code(),
-        RESOURCE_NOT_FOUND_EXCEPTION,
-        "case {case:?}: expected {RESOURCE_NOT_FOUND_EXCEPTION} for {arn:?}, got {:?}",
+        TAGGING_NOT_FOUND_CODE,
+        "case {case:?}: expected {TAGGING_NOT_FOUND_CODE} for {arn:?}, got {:?}",
         reply.code()
     );
     let stated = message(reply);
-    assert!(
-        stated.contains(arn),
-        "case {case:?}: expected the refusal to name {arn:?}, got {stated:?}"
+    assert_eq!(
+        stated, RESOURCE_NOT_FOUND_MESSAGE,
+        "case {case:?}: expected {RESOURCE_NOT_FOUND_MESSAGE:?} for {arn:?}, got {stated:?}"
     );
 }
 
@@ -527,10 +528,10 @@ async fn a_component_arn_is_no_resource_permission_target() {
     }
 }
 
-/// RULE: an ARN naming no resource of this account and Region is refused with the
-/// modelled `ResourceNotFoundException` (HTTP 404) naming that ARN — so a component ARN
-/// whose component no registration describes is refused by every ARN-keyed call, while
-/// one that does resolve is served.
+/// RULE: an ARN naming no resource of this account and Region is refused by the tagging
+/// routes with their own not-found class (HTTP 404) and its fixed sentence — so a
+/// component ARN whose component no registration describes is refused by every ARN-keyed
+/// call, while one that does resolve is served.
 #[tokio::test]
 async fn a_component_arn_naming_nothing_here_is_refused_as_not_found() {
     let emulator = Emulator::new();

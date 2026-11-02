@@ -358,9 +358,9 @@ async fn assert_still_held(emulator: &Emulator, case: &str, arn: &str, source: &
 }
 
 /// Assert `arn` names NOTHING: every call that takes a resource ARN refuses it — the read
-/// and the delete of its tags as the modelled `ResourceNotFoundException` the tagging
-/// calls answer, and the read, the grant and the revocation of its permissions as the
-/// modelled `ValidationException` the database-scoped permission calls answer for an ARN
+/// and the delete of its tags as the not-found class the tagging routes carry, and the
+/// read, the grant and the revocation of its permissions as the modelled
+/// `ValidationException` the database-scoped permission calls answer for an ARN
 /// that names no database.
 async fn assert_gone(emulator: &Emulator, case: &str, arn: &str) {
     let label = format!("{case} / {arn}");

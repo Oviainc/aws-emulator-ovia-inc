@@ -48,7 +48,7 @@ use crate::validation_message_rendering::{message, VALIDATION_EXCEPTION};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::PERMISSION_ACTION_TYPE_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::{
     permission_policy_action, MAX_PERMISSION_SOURCES_PER_RESOURCE, MAX_REGIONS,
-    POLICY_EFFECT_ALLOW, POLICY_VERSION,
+    POLICY_EFFECT_ALLOW, POLICY_VERSION, RESOURCE_NOT_FOUND_MESSAGE,
 };
 
 /// The account every emulated ARN carries, from the core's single source of truth.
@@ -62,11 +62,12 @@ const REGION: &str = "us-east-1";
 /// registered in.
 const OTHER_REGION: &str = "us-west-2";
 
-/// The modelled error code and status the ARN-keyed TAGGING calls answer an ARN naming no
-/// resource with (`smithy_query(query="operation", operation="ListTagsForResource")`:
-/// `ResourceNotFoundException` `@httpError 404`), read through [`assert_not_found`] by
-/// the suites that drive those calls beside the permission calls.
-const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+/// The error code and status the ARN-keyed TAGGING calls answer an ARN naming no
+/// resource with — the class those routes really carry, which is NOT the modelled
+/// `ResourceNotFoundException` shape name — read through [`assert_not_found`] by the
+/// suites that drive those calls beside the permission calls.
+const TAGGING_NOT_FOUND_CODE: &str =
+    service_com_amazonaws_ssmsap_ssmsap::scaffolded::NOT_FOUND_CODE;
 
 /// The input member `PutResourcePermission`'s refusal tags an unresolvable target ARN
 /// with, spelled as the model spells it (`smithy_query(query="operation",
@@ -410,9 +411,9 @@ pub(crate) fn assert_invalid_database_arn(
     );
 }
 
-/// Assert the call was refused as the modelled `ResourceNotFoundException`, naming the
-/// ARN the request carried — what the ARN-keyed TAGGING calls answer for an ARN naming no
-/// resource of this account and Region.
+/// Assert the call was refused as the not-found class the ARN-keyed TAGGING calls carry
+/// for an ARN naming no resource of this account and Region: the fixed sentence, which
+/// reports nothing of the ARN the request carried.
 pub(crate) fn assert_not_found(reply: &Reply, arn: &str, case: &str) {
     assert_eq!(
         reply.status, 404,
@@ -420,13 +421,13 @@ pub(crate) fn assert_not_found(reply: &Reply, arn: &str, case: &str) {
     );
     assert_eq!(
         reply.code(),
-        RESOURCE_NOT_FOUND_EXCEPTION,
-        "case {case:?}: expected {RESOURCE_NOT_FOUND_EXCEPTION}, got {reply:?}"
+        TAGGING_NOT_FOUND_CODE,
+        "case {case:?}: expected {TAGGING_NOT_FOUND_CODE}, got {reply:?}"
     );
     let stated = message(reply);
-    assert!(
-        stated.contains(arn),
-        "case {case:?}: expected the refusal to name {arn:?}, got {stated:?}"
+    assert_eq!(
+        stated, RESOURCE_NOT_FOUND_MESSAGE,
+        "case {case:?}: expected {RESOURCE_NOT_FOUND_MESSAGE:?} for {arn:?}, got {stated:?}"
     );
 }
 

@@ -13,8 +13,8 @@
 //! its ARN names exactly the keys the call names — a key the call does not name keeps
 //! the value it had, and a key the resource does not hold removes nothing, so the
 //! modelled `@idempotent` call leaves the same set however often it is repeated — and an
-//! ARN naming no resource of this account and Region is refused with the modelled
-//! `ResourceNotFoundException` (HTTP 404) with nothing changed.
+//! ARN naming no resource of this account and Region is refused as not found (HTTP 404)
+//! with nothing changed.
 //!
 //! The tables span what that rule generalises over: how many keys the call names (one,
 //! several, every key held), the relation between the keys named and the keys held
@@ -27,6 +27,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Map};
+use service_com_amazonaws_ssmsap_ssmsap::state::RESOURCE_NOT_FOUND_MESSAGE;
 
 use crate::application_lifecycle::{settle, tag_pairs, Emulator, Reply};
 use crate::resource_tags::{
@@ -43,10 +44,11 @@ const REGION: &str = "us-east-1";
 /// registered in.
 const OTHER_REGION: &str = "us-west-2";
 
-/// The modelled error code and status an absent resource is answered with
-/// (`smithy_query(query="operation", operation="UntagResource")`:
-/// `ResourceNotFoundException` `@httpError 404`).
-const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+/// The error code and status an absent resource is answered with: the class the
+/// ARN-addressed tagging routes really carry, which is NOT the modelled
+/// `ResourceNotFoundException` shape name.
+const TAGGING_NOT_FOUND_CODE: &str =
+    service_com_amazonaws_ssmsap_ssmsap::scaffolded::NOT_FOUND_CODE;
 
 /// Percent-encode one query-parameter value.
 ///
@@ -379,9 +381,9 @@ async fn untagging_one_resource_leaves_every_other_resource_alone() {
     }
 }
 
-/// RULE: an ARN that names no resource of this account and Region is refused with the
-/// modelled `ResourceNotFoundException` (HTTP 404), whose message names the ARN the
-/// request carried, and the refused call changes nothing.
+/// RULE: an ARN that names no resource of this account and Region is refused as not
+/// found (HTTP 404) with the fixed sentence that reports nothing of the ARN, and the
+/// refused call changes nothing.
 #[tokio::test]
 async fn an_arn_naming_no_resource_here_is_refused_and_changes_nothing() {
     let emulator = Emulator::new();
@@ -471,14 +473,14 @@ async fn an_arn_naming_no_resource_here_is_refused_and_changes_nothing() {
         );
         assert_eq!(
             reply.code(),
-            RESOURCE_NOT_FOUND_EXCEPTION,
-            "case {label:?}: expected {RESOURCE_NOT_FOUND_EXCEPTION}, got {:?}",
+            TAGGING_NOT_FOUND_CODE,
+            "case {label:?}: expected {TAGGING_NOT_FOUND_CODE}, got {:?}",
             reply.code()
         );
         let stated = message(&reply);
-        assert!(
-            stated.contains(&arn),
-            "case {label:?}: expected the refusal to name {arn:?}, got {stated:?}"
+        assert_eq!(
+            stated, RESOURCE_NOT_FOUND_MESSAGE,
+            "case {label:?}: expected {RESOURCE_NOT_FOUND_MESSAGE:?}, got {stated:?}"
         );
 
         // Nothing changed for the ARN the refused call named, at either endpoint.

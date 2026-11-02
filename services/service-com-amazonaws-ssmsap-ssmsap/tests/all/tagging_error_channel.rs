@@ -7,9 +7,10 @@
 //! serialization all run exactly as they do in the emulator binary.
 //!
 //! The rule under test: a call answers only the error shapes its own operation declares,
-//! plus the service's common errors — so a failure of the EMULATOR that no shape in that
-//! set describes is reported as the cross-service `InternalFailure` (HTTP 500), and never
-//! as a modelled shape the model declares for neither the operation nor the service.
+//! plus the service's common errors and the not-found class the tagging routes
+//! themselves carry — so a failure of the EMULATOR that none of them describes is
+//! reported as the cross-service `InternalFailure` (HTTP 500), and never as a modelled
+//! shape the model declares for neither the operation nor the service.
 //!
 //! The table spans every operation of this service whose modelled error set carries no
 //! server fault — the three the model binds to `/tags/{resourceArn}` (`GET` lists,
@@ -36,11 +37,12 @@ const REGION: &str = "us-east-1";
 /// emulator failure with. HTTP 500.
 const INTERNAL_FAILURE: &str = "InternalFailure";
 
-/// The modelled error code an ARN naming no resource of this account and Region is
-/// answered with (`smithy_query(query="operation",
-/// operation="ListTagsForResource,TagResource,UntagResource")`:
-/// `ResourceNotFoundException` `@httpError 404`).
-const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+/// The error code an ARN naming no resource of this account and Region is answered with:
+/// the class the `/tags/{resourceArn}` routes really carry (HTTP 404), which the model
+/// declares as no shape — the modelled `ResourceNotFoundException` is the shape name, not
+/// the code those routes answer.
+const TAGGING_NOT_FOUND_CODE: &str =
+    service_com_amazonaws_ssmsap_ssmsap::scaffolded::NOT_FOUND_CODE;
 
 /// The modelled error code a request the constraint walk refuses is answered with: the
 /// service's one common error (`smithy_query(query="service_info")`:
@@ -50,11 +52,13 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// The WHOLE set of error codes a tagging call may answer with: the three shapes each of
 /// the three operations declares (`smithy_query(query="operation",
 /// operation="ListTagsForResource,TagResource,UntagResource")`: `ConflictException`,
-/// `ResourceNotFoundException`, `ValidationException`), plus the cross-service
-/// `InternalFailure` for a fault of the emulator itself.
+/// `ResourceNotFoundException`, `ValidationException`), the not-found class those routes
+/// carry instead of the modelled shape name ([`TAGGING_NOT_FOUND_CODE`]), plus the
+/// cross-service `InternalFailure` for a fault of the emulator itself.
 const ANSWERABLE_CODES: &[&str] = &[
     "ConflictException",
-    RESOURCE_NOT_FOUND_EXCEPTION,
+    "ResourceNotFoundException",
+    TAGGING_NOT_FOUND_CODE,
     VALIDATION_EXCEPTION,
     INTERNAL_FAILURE,
 ];
@@ -214,10 +218,10 @@ async fn a_fault_of_the_emulator_is_answered_with_the_cross_service_internal_fai
     }
 }
 
-/// RULE: with its store in reach, each tagging call answers only the shapes its own model
-/// declares — the modelled `ResourceNotFoundException` for an ARN naming no resource
-/// here, the modelled `ValidationException` for a request the constraints refuse, and a
-/// served call with no error at all.
+/// RULE: with its store in reach, each tagging call answers only the classes its route
+/// really carries — its own not-found class for an ARN naming no resource here, the
+/// modelled `ValidationException` for a request the constraints refuse, and a served call
+/// with no error at all.
 #[tokio::test]
 async fn a_served_call_answers_only_the_shapes_its_own_model_declares() {
     let emulator = Emulator::new();
@@ -246,13 +250,13 @@ async fn a_served_call_answers_only_the_shapes_its_own_model_declares() {
             "an application never registered",
             application_arn(REGION, "tags-absent"),
             404,
-            RESOURCE_NOT_FOUND_EXCEPTION,
+            TAGGING_NOT_FOUND_CODE,
         ),
         (
             "a database the registration never named",
             database_arn(REGION, "tags-channel", "NOPE"),
             404,
-            RESOURCE_NOT_FOUND_EXCEPTION,
+            TAGGING_NOT_FOUND_CODE,
         ),
         (
             "a value the modelled pattern refuses",

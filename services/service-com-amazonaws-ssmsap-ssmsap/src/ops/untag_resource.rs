@@ -12,8 +12,9 @@
 //! the resource holds and this call does not name keeps its value, and a key the
 //! resource does not hold removes nothing, which is what makes the modelled
 //! `@idempotent` call leave the same set however often it is repeated. An ARN naming no
-//! resource of this account and Region is refused with the modelled
-//! `ResourceNotFoundException` rather than untagging something that does not exist.
+//! resource of this account and Region is refused with this route's own not-found class
+//! ([`crate::scaffolded::NOT_FOUND_CODE`], HTTP 404) rather than untagging something
+//! that does not exist.
 //!
 //! ## Shape of an operation
 //!
@@ -184,22 +185,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // still has to NAME something: the resources this service holds are the
         // registered SAP application and the resources derived from that registration —
         // its SAP HANA databases and its components — so an ARN naming none of them is
-        // the `ResourceNotFoundException` this operation models
-        // rather than keys deleted from a resource that does not exist. Resolved through
-        // [`crate::state::RegionState::holds_resource`], the one place this service
-        // decides what an ARN names, so the tagging calls cannot disagree about it.
-        // Reading the Region first mints no partition for one that holds nothing
+        // refused rather than keys deleted from a resource that does not exist. The error
+        // CLASS this route reports that with is its own
+        // ([`crate::scaffolded::NOT_FOUND_CODE`], HTTP 404, carrying
+        // [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`]) rather than the modelled
+        // `ResourceNotFoundException` shape name, as the recorded behaviour of the
+        // `/tags/{resourceArn}` routes shows — the three of them answer it alike.
+        // Resolved through [`crate::state::RegionState::holds_resource`], the one place
+        // this service decides what an ARN names, so the tagging calls cannot disagree
+        // about it. Reading the Region first mints no partition for one that holds nothing
         // (`region`, not `region_entry`).
         if !state
             .region(&region)
             .holds_resource(&region, &input.resource_arn)
         {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::resource_not_found_message(
-                    &input.resource_arn,
-                )),
-            )
-            .into());
+            return Err(UntagResourceError::not_found(
+                crate::state::RESOURCE_NOT_FOUND_MESSAGE,
+            ));
         }
 
         // The resource is held HERE, so its Region's partition already exists and this

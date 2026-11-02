@@ -242,9 +242,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .contains_key(&input.application_id)
         {
             return Err(RegisterApplicationErrorModeled::ConflictException(
-                crate::state::conflict(format!(
-                    "An application with ID {} is already registered in this account and Region",
-                    input.application_id
+                crate::state::conflict(crate::state::duplicate_application_id_message(
+                    &input.application_id,
                 )),
             )
             .into());
