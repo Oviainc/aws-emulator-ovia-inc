@@ -95,8 +95,9 @@
 //! Beside those it holds one more record that is NOT caller-created: the SAFETY LEVER
 //! ([`SafetyLeverRecord`]), FIS's account-level control over whether experiments may run,
 //! read by `GetSafetyLever` and moved by `UpdateSafetyLeverState`. No API creates, lists or
-//! deletes a lever — it exists, named by the account's own id ([`safety_lever_id`]) — so
-//! before any update it is the `disengaged` lever every account starts with. It is ONE
+//! deletes a lever — it exists, under the fixed id FIS gives it ([`SAFETY_LEVER_ID`]) — so
+//! before any update it is the `disengaged` lever every account starts with, carrying the
+//! initial reason FIS seeds it with ([`INITIAL_SAFETY_LEVER_REASON`]). It is ONE
 //! record here, as the experiments it governs are one collection: this store holds the
 //! account's records rather than a set of them per Region, and the lever reports its ARN in
 //! the Region of the request that read it, exactly as a catalogued action does
@@ -149,7 +150,7 @@ use crate::ops::types::{
     UpdateExperimentTemplateLogConfigurationInput, UpdateExperimentTemplateReportConfigurationInput,
     UpdateExperimentTemplateStopConditionInput, UpdateExperimentTemplateTargetInput,
     ValidationException, ACCOUNT_TARGETING_VALUES, ACTIONS_MODE_VALUES,
-    EMPTY_TARGET_RESOLUTION_MODE_VALUES,
+    EMPTY_TARGET_RESOLUTION_MODE_VALUES, SAFETY_LEVER_STATUS_INPUT_VALUES,
 };
 
 pub mod action_permissions;
@@ -573,6 +574,19 @@ pub const STOPPED_BY_SAFETY_LEVER: &str = "Stopped by the safety lever";
 /// The resource segment of a safety lever's ARN
 /// (`arn:aws:fis:<region>:<account>:safety-lever/<id>`).
 pub const SAFETY_LEVER_RESOURCE: &str = "safety-lever";
+
+/// The id of the one safety lever an account has.
+///
+/// FIS publishes no operation that creates, lists or deletes a safety lever, so the lever
+/// is not a record a caller mints and its id is not one a caller chose: the account's
+/// lever already exists under this fixed id, which is what makes it reachable without a
+/// create or a list.
+pub const SAFETY_LEVER_ID: &str = "default";
+
+/// The `state.reason` the account's safety lever carries before any update has stored one:
+/// the lever exists already, so its state is one FIS itself seeded rather than an absent
+/// value.
+pub const INITIAL_SAFETY_LEVER_REASON: &str = "Initial default status";
 
 /// The status an experiment this emulator persists can be in.
 ///
@@ -2038,15 +2052,15 @@ impl SafetyLeverStatusKind {
 /// run.
 ///
 /// No API creates or deletes a lever and none lists them, so a lever is not a record a
-/// caller mints: it EXISTS, and a request names it by the account's own id
-/// ([`safety_lever_id`]). A lever nobody has updated is `disengaged` and carries no reason,
-/// which is the state this record defaults to.
+/// caller mints: it EXISTS, under the fixed id FIS names it by ([`SAFETY_LEVER_ID`]). A
+/// lever nobody has updated is `disengaged` under the initial reason FIS seeded it with
+/// ([`INITIAL_SAFETY_LEVER_REASON`]), which is the state this record defaults to.
 #[derive(Debug, Clone)]
 pub struct SafetyLeverRecord {
     pub status: SafetyLeverStatusKind,
     /// The reason the last update gave for the state. `UpdateSafetyLeverState` models it
     /// `@required`, so every state a caller asked for carries one; a lever no call has
-    /// touched carries none.
+    /// touched carries the initial one ([`INITIAL_SAFETY_LEVER_REASON`]).
     pub reason: Option<String>,
     /// When `engaging` falls due to become `engaged`, which is the only transition this
     /// record owes the clock. See [`TRANSITION_DELAY`].
@@ -2057,7 +2071,7 @@ impl Default for SafetyLeverRecord {
     fn default() -> Self {
         Self {
             status: SafetyLeverStatusKind::Disengaged,
-            reason: None,
+            reason: Some(INITIAL_SAFETY_LEVER_REASON.to_string()),
             transition_due: None,
         }
     }
@@ -2105,9 +2119,13 @@ impl SafetyLeverRecord {
 
     /// The `SafetyLever` every safety-lever operation reports for this record, named by
     /// `id` and carrying its ARN in `region`.
+    ///
+    /// The lever belongs to the account this emulator serves, which is the account its ARN
+    /// names, so both come from the one account id.
     pub fn to_safety_lever(&self, id: &str, region: &str) -> SafetyLever {
         SafetyLever {
             id: Some(id.to_string()),
+            account_id: Some(::engine::emulator_account_id().to_string()),
             arn: Some(safety_lever_arn(region, id)),
             state: Some(SafetyLeverState {
                 status: Some(self.status.as_wire().to_string()),
@@ -2117,13 +2135,10 @@ impl SafetyLeverRecord {
     }
 }
 
-/// The id of the safety lever of the account this emulator serves.
-///
-/// FIS gives an account one safety lever per Region and offers no API that creates or
-/// enumerates one, so the id a request names it by is the account's own id — which is
-/// what makes the lever reachable without a list operation.
+/// The id of the safety lever of the account this emulator serves — see
+/// [`SAFETY_LEVER_ID`].
 pub fn safety_lever_id() -> &'static str {
-    ::engine::emulator_account_id()
+    SAFETY_LEVER_ID
 }
 
 /// The ARN of the safety lever `id` names, in `region`.
@@ -2132,12 +2147,35 @@ pub fn safety_lever_arn(region: &str, id: &str) -> String {
 }
 
 /// The `ResourceNotFoundException` payload for an id that names no safety lever of this
-/// account — see [`safety_lever_id`]. Built from the request: the message names the id
-/// that was looked up.
-pub fn safety_lever_not_found(id: &str) -> ResourceNotFoundException {
+/// account — see [`SAFETY_LEVER_ID`].
+///
+/// The sentence is FIXED: FIS states the miss without naming what was looked up, so the
+/// requested id is not echoed back into the message.
+pub fn safety_lever_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Safety lever with ID {id} not found.")),
+        message: Some("Safety lever not found".to_string()),
     }
+}
+
+/// How FIS words a safety-lever state naming a status `SafetyLeverStatusInput` does not
+/// admit: the fixed prefix and the rejected value, taken verbatim from the request.
+///
+/// The ONE place that sentence is written. A value the boundary validator refuses reaches
+/// it through [`crate::service::EmulatedService::override_refusal`]; the handler that
+/// persists the status reaches it from [`safety_lever_status_refusal`], so both report the
+/// same rejection.
+pub fn invalid_safety_lever_status_message(value: &str) -> String {
+    format!("Invalid status: {value}")
+}
+
+/// `None` when `status` is one `SafetyLeverStatusInput` admits; otherwise the
+/// `ValidationException` (400) that refuses the update, worded as
+/// [`invalid_safety_lever_status_message`] states it.
+pub fn safety_lever_status_refusal(status: &str) -> Option<ValidationException> {
+    if SAFETY_LEVER_STATUS_INPUT_VALUES.contains(&status) {
+        return None;
+    }
+    Some(invalid_input(invalid_safety_lever_status_message(status)))
 }
 
 /// The `ConflictException` payload for a `StartExperiment` that arrives while the

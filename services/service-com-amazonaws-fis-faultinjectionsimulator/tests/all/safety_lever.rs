@@ -8,8 +8,9 @@
 //! client takes. The rules under test are the ones FIS states for the lever:
 //!
 //! * an account HAS one safety lever, which no API creates, lists or deletes, so it is
-//!   named by the account's own id and reports `disengaged` with no reason until an update
-//!   stores something, under the lever's ARN in the Region the request is signed for;
+//!   named by the id FIS gives it and reports `disengaged` under its initial reason until
+//!   an update stores something, under the lever's ARN in the Region the request is signed
+//!   for;
 //! * the state a request asks for is PERSISTED: `GetSafetyLever` reports the status and
 //!   the reason the last `UpdateSafetyLeverState` stored, whatever order the two
 //!   admissible states are asked for in and however often;
@@ -37,10 +38,14 @@ use std::sync::Arc;
 /// (`::engine::EMULATOR_ACCOUNT_ID`), spelled out so a changed account fails here.
 const ACCOUNT_ID: &str = "000000000000";
 
-/// The id the account's own safety lever is named by: FIS gives an account one lever per
-/// Region and publishes no API that creates or enumerates one, so the id a request names
-/// it by is the account's own.
-const LEVER_ID: &str = ACCOUNT_ID;
+/// The id the account's own safety lever is named by: FIS gives an account one lever and
+/// publishes no API that creates or enumerates one, so the lever already exists under this
+/// fixed id.
+const LEVER_ID: &str = "default";
+
+/// The `state.reason` the lever carries before any update has stored one: the lever exists
+/// already, so FIS seeded its state.
+const INITIAL_REASON: &str = "Initial default status";
 
 /// The region most cases here sign for.
 const REGION: &str = "us-east-1";
@@ -178,7 +183,12 @@ fn lever(case: &str, answer: &Answer, member: &str, region: &str) -> Value {
     assert_eq!(
         lever["id"].as_str().unwrap_or_default(),
         LEVER_ID,
-        "case {case:?}: expected the lever to name the account id, got {lever:?}"
+        "case {case:?}: expected the lever to name the account's one lever, got {lever:?}"
+    );
+    assert_eq!(
+        lever["accountId"].as_str().unwrap_or_default(),
+        ACCOUNT_ID,
+        "case {case:?}: expected the lever to name the account it belongs to, got {lever:?}"
     );
     assert_eq!(
         lever["arn"].as_str().unwrap_or_default(),
@@ -216,9 +226,10 @@ async fn an_untouched_lever_is_disengaged_and_names_itself() {
             "disengaged",
             "case {case:?}: an untouched lever is disengaged, got {reported:?}"
         );
-        assert!(
-            reported["state"]["reason"].is_null(),
-            "case {case:?}: an untouched lever carries no reason, got {reported:?}"
+        assert_eq!(
+            reported["state"]["reason"].as_str().unwrap_or_default(),
+            INITIAL_REASON,
+            "case {case:?}: an untouched lever carries its initial reason, got {reported:?}"
         );
 
         // Reading it changed nothing a later caller sees.
@@ -235,9 +246,9 @@ async fn an_untouched_lever_is_disengaged_and_names_itself() {
 /// The member names `SafetyLever` declares, and nothing else.
 ///
 /// SOURCE: the model's `com.amazonaws.fis#SafetyLever` structure
-/// (`smithy_query(query="shape",shape="SafetyLever")`), whose members are `id`, `arn` and
-/// `state`.
-const SAFETY_LEVER_MEMBERS: [&str; 3] = ["id", "arn", "state"];
+/// (`smithy_query(query="shape",shape="SafetyLever")`), whose members are `id`,
+/// `accountId`, `arn` and `state`.
+const SAFETY_LEVER_MEMBERS: [&str; 4] = ["id", "accountId", "arn", "state"];
 
 /// The member names `SafetyLeverState` declares.
 ///
@@ -315,10 +326,12 @@ async fn the_reported_lever_carries_only_the_members_the_model_declares() {
                 case,
                 "case {case:?}: expected the stored reason, got {state:?}"
             ),
-            // Nothing has stored one, so the member is absent rather than invented.
-            None => assert!(
-                state["reason"].is_null(),
-                "case {case:?}: expected no reason on an untouched lever, got {state:?}"
+            // Nothing has stored one, so the lever still carries the reason it was
+            // seeded with.
+            None => assert_eq!(
+                state["reason"].as_str().unwrap_or_default(),
+                INITIAL_REASON,
+                "case {case:?}: expected the initial reason on an untouched lever, got {state:?}"
             ),
         }
     }
@@ -569,15 +582,15 @@ async fn the_lever_is_the_accounts_own_whichever_region_reads_it() {
 async fn an_id_that_is_not_this_accounts_names_no_lever() {
     let router = emulator();
 
-    // The rows differ along the SHAPE of the id: another account's, a name, the longest
-    // id `SafetyLeverId` admits (`@length(max: 64)`), one digit too many, and an id that
-    // differs from this account's by one character.
+    // The rows differ along the SHAPE of the id: an account id, the longest id
+    // `SafetyLeverId` admits (`@length(max: 64)`), the lever's id in the wrong case, and
+    // ids that differ from it by one character either way.
     for id in [
-        "123456789012",
-        "default",
+        ACCOUNT_ID,
         &"a".repeat(64),
-        "0000000000000",
-        "000000000001",
+        "DEFAULT",
+        "defaults",
+        "defaul",
     ] {
         let case = format!("unknown-lever-{id}");
         let read = get_lever(&router, id, REGION).await;
@@ -615,8 +628,9 @@ async fn an_id_that_is_not_this_accounts_names_no_lever() {
         "disengaged",
         "case \"unknown-lever-aftermath\": a refused update persists nothing, got {own_lever:?}"
     );
-    assert!(
-        own_lever["state"]["reason"].is_null(),
+    assert_eq!(
+        own_lever["state"]["reason"].as_str().unwrap_or_default(),
+        INITIAL_REASON,
         "case \"unknown-lever-aftermath\": a refused update stores no reason, got {own_lever:?}"
     );
 }
@@ -649,8 +663,9 @@ async fn a_status_outside_the_input_enum_is_refused_and_persists_nothing() {
             "disengaged",
             "case {case:?}: a refused update leaves the lever as it was, got {read_lever:?}"
         );
-        assert!(
-            read_lever["state"]["reason"].is_null(),
+        assert_eq!(
+            read_lever["state"]["reason"].as_str().unwrap_or_default(),
+            INITIAL_REASON,
             "case {case:?}: a refused update stores no reason, got {read_lever:?}"
         );
     }

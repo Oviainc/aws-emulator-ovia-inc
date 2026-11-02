@@ -45,8 +45,8 @@ use crate::experiment_state_reason_and_report::{
     emulator_with_object_storage, given_report_bucket, s3, start_from, template_for, Ending, BUCKET,
 };
 
-/// The id of the account's one safety lever, which is the emulator account's own id.
-pub(crate) const LEVER_ID: &str = "000000000000";
+/// The id of the account's one safety lever, which FIS names by a fixed id.
+pub(crate) const LEVER_ID: &str = "default";
 
 /// How long a row may take to have its report written: the compressed run window plus the
 /// transitions around it and slack for a loaded machine.

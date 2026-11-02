@@ -75,8 +75,8 @@ const LOG_TYPE_EXPERIMENT_STATE_CHANGE: &str = "experiment-state-change";
 /// See [`LOG_TYPE_EXPERIMENT_START`].
 pub(crate) const LOG_TYPE_EXPERIMENT_END: &str = "experiment-end";
 
-/// The account's one safety lever, which is named by the account's own id.
-const LEVER_ID: &str = ACCOUNT_ID;
+/// The account's one safety lever, which FIS names by a fixed id.
+const LEVER_ID: &str = "default";
 
 /// One emulator carrying FIS, CloudWatch Logs and Amazon S3 over ONE shared engine,
 /// exactly as the production router builds them.

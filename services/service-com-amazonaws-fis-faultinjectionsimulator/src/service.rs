@@ -105,25 +105,36 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this service
         // reword it.
         //
-        // FIS states a value longer than its member's `@length` maximum as
-        // "Maximum length exceeded: <member>" — see [`max_length_message`], the one place
-        // that sentence is written. Every other refusal class keeps the framework's
-        // wording, because FIS publishes no rule for how it words those.
+        // Two classes FIS words itself:
+        //
+        // * a value longer than its member's `@length` maximum, stated as
+        //   "Maximum length exceeded: <member>" — see [`max_length_message`];
+        // * a safety-lever state naming a status the input enum does not admit, stated as
+        //   "Invalid status: <value>" — see
+        //   [`crate::state::invalid_safety_lever_status_message`].
+        //
+        // Every other refusal class keeps the framework's wording, because FIS publishes
+        // no rule for how it words those.
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
-        // The FIRST over-long member among the violations, wherever it is reported: a
-        // refusal that carries a length violation behind another class is still a length
-        // refusal to the caller.
-        let violation = violations.iter().find(|violation| {
-            matches!(
-                violation.kind,
-                smithy_server_runtime::ViolationKind::MaxLength(_)
-            )
-        })?;
+        // The FIRST violation among them that FIS words itself, wherever it is reported: a
+        // refusal that carries one behind another class is still that refusal to the
+        // caller. Length comes first, because it is the one rule that holds of every
+        // member rather than of one.
+        let message = violations
+            .iter()
+            .find_map(|violation| {
+                matches!(
+                    violation.kind,
+                    smithy_server_runtime::ViolationKind::MaxLength(_)
+                )
+                .then(|| max_length_message(&violation.path))
+            })
+            .or_else(|| violations.iter().find_map(invalid_safety_lever_status))?;
         Some(Refused {
             code: VALIDATION_EXCEPTION.to_string(),
-            message: max_length_message(&violation.path),
+            message,
         })
     }
 
@@ -154,6 +165,35 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// The dotted path of the member whose status a safety-lever state names
+/// (`UpdateSafetyLeverStateRequest.state.status`, targeting `SafetyLeverStatusInput`).
+///
+/// SOURCE: the model's `com.amazonaws.fis#UpdateSafetyLeverStateRequest`, whose `state`
+/// member targets `UpdateSafetyLeverStateInput` and its `status`.
+const SAFETY_LEVER_STATUS_PATH: &str = "state.status";
+
+/// `Some(message)` when `violation` is a safety-lever state naming a status outside the
+/// values `SafetyLeverStatusInput` admits, worded as FIS words it
+/// ([`crate::state::invalid_safety_lever_status_message`]); `None` for every other
+/// violation.
+///
+/// The boundary validator checks enum membership before a handler runs, so this is where
+/// that refusal is reworded; the handler that persists the status words the same rejection
+/// through the same function.
+fn invalid_safety_lever_status(violation: &smithy_server_runtime::Violation) -> Option<String> {
+    if violation.path != SAFETY_LEVER_STATUS_PATH
+        || !matches!(
+            violation.kind,
+            smithy_server_runtime::ViolationKind::EnumValue(_)
+        )
+    {
+        return None;
+    }
+    Some(crate::state::invalid_safety_lever_status_message(
+        violation.value.as_deref().unwrap_or_default(),
+    ))
 }
 
 /// How this service words the refusal of a value longer than its member's `@length`

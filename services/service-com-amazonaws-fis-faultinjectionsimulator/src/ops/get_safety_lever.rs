@@ -61,9 +61,10 @@
 //! the `disengaged` lever every untouched account has, under the lever's ARN in the Region
 //! the request is signed for. Reporting only — the one thing it writes is the transition
 //! the clock already owed the lever ([`crate::state::SafetyLeverRecord::settle`]), which
-//! was due whether or not anybody read it. An `id` that is not this account's own
-//! ([`crate::state::safety_lever_id`]) names no lever and answers 404: FIS gives an account
-//! exactly one lever and offers no API that creates or enumerates one.
+//! was due whether or not anybody read it. An `id` other than the one FIS names the
+//! account's lever by ([`crate::state::SAFETY_LEVER_ID`]) names no lever and answers 404:
+//! FIS gives an account exactly one lever and offers no API that creates or enumerates
+//! one.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -144,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if input.id != crate::state::safety_lever_id() {
             return Err(GetSafetyLeverErrorModeled::ResourceNotFoundException(
-                crate::state::safety_lever_not_found(&input.id),
+                crate::state::safety_lever_not_found(),
             )
             .into());
         }

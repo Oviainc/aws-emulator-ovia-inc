@@ -73,7 +73,8 @@
 //! ## What this handler does
 //!
 //! FIS gives an account ONE safety lever, which no API creates, lists or deletes, so `id`
-//! resolves against the account's own id and any other id names no lever (404). The state
+//! resolves against the one id FIS names that lever by
+//! ([`crate::state::SAFETY_LEVER_ID`]) and any other id names no lever (404). The state
 //! the request asks for is persisted on that lever and reported back, so `GetSafetyLever`
 //! reports what this call stored:
 //!
@@ -168,15 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // `state.status` is enum-typed, which the boundary validator does not check, and
-        // it is persisted on the lever — so a value `SafetyLeverStatusInput` does not
-        // admit is refused here rather than stored. `engaging` is among the values it
-        // refuses: that is a status the SERVICE reaches, never one a request may ask for.
-        if let Some(refusal) = crate::state::enum_refusal(
-            "state.status",
-            Some(input.state.status.as_str()),
-            SAFETY_LEVER_STATUS_INPUT_VALUES,
-        ) {
+        // `state.status` is enum-typed and is persisted on the lever, so a value
+        // `SafetyLeverStatusInput` does not admit is refused here rather than stored —
+        // worded the way FIS words it, the same sentence the boundary validator's refusal
+        // of the same value is reworded to ([`crate::state::safety_lever_status_refusal`]).
+        // `engaging` is among the values it refuses: that is a status the SERVICE reaches,
+        // never one a request may ask for.
+        if let Some(refusal) = crate::state::safety_lever_status_refusal(input.state.status.as_str())
+        {
             return Err(UpdateSafetyLeverStateErrorModeled::ValidationException(refusal).into());
         }
 
@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // decided before the store is touched so a miss persists nothing.
         if input.id != crate::state::safety_lever_id() {
             return Err(UpdateSafetyLeverStateErrorModeled::ResourceNotFoundException(
-                crate::state::safety_lever_not_found(&input.id),
+                crate::state::safety_lever_not_found(),
             )
             .into());
         }
