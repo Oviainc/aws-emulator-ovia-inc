@@ -39,3 +39,5 @@ mod source_views;
 mod source_views_tags_and_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
