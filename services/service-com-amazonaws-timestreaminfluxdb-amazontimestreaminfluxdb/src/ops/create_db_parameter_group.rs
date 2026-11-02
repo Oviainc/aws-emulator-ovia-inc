@@ -195,7 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A parameter group name is unique per customer and PER REGION (see `name` in
         // the modeled contract above), so a second create under a taken name in the same
-        // region conflicts, while the same name in another region is a new group.
+        // region conflicts, while the same name in another region is a new group. A
+        // service-managed group's name is taken in every region, because that catalog
+        // exists in every region without anyone creating it.
         if let Some(existing_id) = state.db_parameter_group_id_for_name(&region, &input.name) {
             return Err(CreateDbParameterGroupErrorModeled::ConflictException(
                 ConflictException {

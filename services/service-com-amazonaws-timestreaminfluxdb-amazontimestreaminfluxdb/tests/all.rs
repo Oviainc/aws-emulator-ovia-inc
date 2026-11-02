@@ -15,6 +15,8 @@
 mod db_instance_lifecycle;
 #[path = "all/db_parameter_group.rs"]
 mod db_parameter_group;
+#[path = "all/db_parameter_group_catalog.rs"]
+mod db_parameter_group_catalog;
 #[path = "all/db_parameter_group_listing.rs"]
 mod db_parameter_group_listing;
 #[path = "all/parameters_union_roundtrip.rs"]

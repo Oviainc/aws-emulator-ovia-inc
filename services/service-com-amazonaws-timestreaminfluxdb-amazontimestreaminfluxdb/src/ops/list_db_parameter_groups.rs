@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDbParameterGroups
-//! Reports a page of the DB parameter groups this service's state holds, in a stable
-//! order, resuming after the token a previous page handed back.
+//! Reports a page of the DB parameter groups this account and Region has — the
+//! service-managed catalog, which exists without anyone creating it, then the
+//! customer-created ones — in a stable order, resuming after the token a previous page
+//! handed back.
 //!
 //! ## Shape of an operation
 //!
@@ -149,7 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
-        use ::std::ops::Bound;
 
         let _ = ctx;
         let Some(state) = st::service_state(&*self.engine) else {
@@ -171,18 +172,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing, so this handler never writes.
         let state = state.lock();
 
-        // The token is the id the previous page ended on, so a page resumes strictly
-        // after it: every stored group is yielded exactly once even if the group the
-        // token names stopped existing between pages.
-        let lower = match input.next_token.as_deref() {
-            Some(token) => Bound::Excluded(token.to_string()),
-            None => Bound::Unbounded,
-        };
-        let mut remaining = state.db_parameter_groups.range((lower, Bound::Unbounded));
+        // Every group this account and Region has: the service-managed catalog, which
+        // exists without anyone creating it, then the customer-created groups.
+        let groups = state.db_parameter_groups_in_list_order();
+
+        // The token is the id the previous page ended on, resolved to that id's list
+        // position, so a page resumes strictly after it: every group is yielded exactly
+        // once even if the group the token names stopped existing between pages.
+        let resume_after = input.next_token.as_deref().map(st::db_parameter_group_list_key);
+        let mut remaining = groups
+            .into_iter()
+            .filter(|(key, _)| resume_after.as_ref().is_none_or(|after| key > after));
         let items: Vec<DbParameterGroupSummary> = remaining
             .by_ref()
             .take(page_size)
-            .map(|(_, record)| record.to_summary())
+            .map(|(_, summary)| summary)
             .collect();
         // A token comes back only when a further page exists, and it names the last id
         // on THIS page so the next request resumes after it.

@@ -8,13 +8,15 @@
 //! for this crate.
 //!
 //! The assertions are RULES over a table of inputs, not a replay of one recorded call:
-//! the operation reports a page of the DB parameter groups the state holds, each summary
+//! the operation reports a page of the DB parameter groups the account and Region has —
+//! the service-managed catalog and the customer-created groups — each customer summary
 //! projected from the stored record, pages at `maxResults`, hands back a `nextToken` only
 //! while a further page exists, and changes nothing a later caller sees. The rows vary the
 //! number of stored groups, the page size, and the form of each group (name length and
 //! shape, description present / absent / empty, parameters supplied or not).
 
 use serde_json::{json, Value};
+use service_com_amazonaws_timestreaminfluxdb_amazontimestreaminfluxdb as influxdb;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instance_lifecycle::{call, ok, router, ACCOUNT, REGION};
@@ -27,6 +29,19 @@ const SUMMARY_MEMBERS: &[&str] = &["arn", "description", "id", "name"];
 
 /// The `@required` members of `DbParameterGroupSummary`: present on every summary.
 const REQUIRED_SUMMARY_MEMBERS: &[&str] = &["arn", "id", "name"];
+
+/// The ids of the service-managed DB parameter groups every account and Region has
+/// without anyone creating them.
+///
+/// They are reported ahead of the customer-created groups, so every rule this suite
+/// asserts about paging and projection holds over them too. What the catalog CONTAINS is
+/// pinned in `db_parameter_group_catalog`, independently of the implementation.
+fn service_managed_ids() -> Vec<String> {
+    influxdb::state::service_managed_db_parameter_groups()
+        .iter()
+        .map(|group| group.id.clone())
+        .collect()
+}
 
 /// The `id` in a response body.
 fn id_of(case: &str, body: &Value) -> String {
@@ -156,7 +171,9 @@ async fn paging_yields_every_stored_group_exactly_once() {
     for (count, max_results) in cases {
         let case = format!("{count} groups at maxResults {max_results:?}");
         let router = router();
-        let mut expected: Vec<String> = Vec::new();
+        // Every group the account has: the service-managed catalog, plus what this row
+        // creates.
+        let mut expected: Vec<String> = service_managed_ids();
         for index in 0..count {
             let created = ok(
                 &case,
@@ -171,7 +188,7 @@ async fn paging_yields_every_stored_group_exactly_once() {
         }
         expected.sort();
 
-        let seen = drain(&router, &case, max_results, count + 1).await;
+        let seen = drain(&router, &case, max_results, expected.len() + 1).await;
 
         let mut sorted = seen.clone();
         sorted.sort();
@@ -215,8 +232,9 @@ async fn every_summary_is_projected_from_the_stored_record() {
         .unwrap_or_else(|| panic!("expected an `items` list, got {listed}"));
     assert_eq!(
         items.len(),
-        created_by_id.len(),
-        "case \"every stored group\": every created group must be listed, got {listed}"
+        created_by_id.len() + service_managed_ids().len(),
+        "case \"every stored group\": every created group and every service-managed one \
+         must be listed, got {listed}"
     );
 
     for (case, id, created) in &created_by_id {
@@ -303,7 +321,13 @@ async fn listing_changes_nothing_a_later_caller_sees() {
             "case {case:?}: a later list must report the same groups, got {again}"
         );
 
-        let paged = drain(&router, &case, Some(1), stored_cases().len() + 1).await;
+        let paged = drain(
+            &router,
+            &case,
+            Some(1),
+            stored_cases().len() + service_managed_ids().len() + 1,
+        )
+        .await;
         let whole: Vec<String> = first["items"]
             .as_array()
             .expect("an `items` list")

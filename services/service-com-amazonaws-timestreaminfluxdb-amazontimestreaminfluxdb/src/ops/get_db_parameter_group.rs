@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDbParameterGroup
-//! Reports a persisted DB parameter group by its service-generated id. A pure read: it
-//! writes nothing.
+//! Reports a DB parameter group by its id — a persisted customer-created one, or one of
+//! the service-managed groups this account and Region has without anyone creating them. A
+//! pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -165,6 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `identifier` is "The id of the DB parameter group" and carries the
         // `DbParameterGroupId` pattern `^[a-zA-Z0-9]+$`, so the lookup is by id; a name
         // is not an identifier for this operation.
+        //
+        // A service-managed group is one this account and Region has without anyone
+        // creating it, so this reader resolves it too; a catalog entry's `id` is its name.
+        if let Some(group) = st::service_managed_db_parameter_group(&input.identifier) {
+            return Ok(group.to_get_output());
+        }
         let Some(record) = state.db_parameter_groups.get(&input.identifier) else {
             return Err(GetDbParameterGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

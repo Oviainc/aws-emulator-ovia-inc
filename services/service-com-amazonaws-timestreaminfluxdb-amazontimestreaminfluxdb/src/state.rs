@@ -13,8 +13,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DbBackupConfiguration, DbBackupConfigurationOutput, DbInstanceSummary,
-    DbParameterGroupSummary, InfluxDBv2Parameters, LogDeliveryConfiguration,
-    MaintenanceSchedule, Parameters,
+    DbParameterGroupSummary, InfluxDBv2Parameters, InfluxDBv3CoreParameters,
+    InfluxDBv3EnterpriseParameters, LogDeliveryConfiguration, MaintenanceSchedule, Parameters,
 };
 
 /// `Status` values this service's records use, each one a member of
@@ -321,6 +321,190 @@ impl DbParameterGroup {
     }
 }
 
+/// The `db.influx.` prefix every DB instance type carries
+/// (`smithy_query(query="shape", shape="DbInstanceType")`).
+const DB_INSTANCE_TYPE_PREFIX: &str = "db.influx.";
+
+/// The fixed text of the description a per-instance-size service-managed default group
+/// carries. The variable part after it is the group's own name.
+const SERVICE_MANAGED_DEFAULT_DESCRIPTION_PREFIX: &str = "Service-managed parameter group: ";
+
+/// Every DB instance type, in the order the model declares them — ascending size.
+///
+/// The values of the modelled `DbInstanceType` enum
+/// (`smithy_query(query="shape", shape="DbInstanceType")`). The generated
+/// `crate::ops::types::DB_INSTANCE_TYPE_VALUES` holds the same nine values sorted
+/// lexicographically, which is not the order a size-ordered catalog is reported in, so
+/// the declaration order is kept here.
+pub const DB_INSTANCE_TYPES_BY_SIZE: &[&str] = &[
+    "db.influx.medium",
+    "db.influx.large",
+    "db.influx.xlarge",
+    "db.influx.2xlarge",
+    "db.influx.4xlarge",
+    "db.influx.8xlarge",
+    "db.influx.12xlarge",
+    "db.influx.16xlarge",
+    "db.influx.24xlarge",
+];
+
+/// The size token a service-managed default group's name carries for a DB instance type:
+/// the part of the type after the `db.influx.` prefix with its first character upper-cased
+/// (`db.influx.medium` -> `Medium`, `db.influx.2xlarge` -> `2xlarge`).
+fn instance_size_token(db_instance_type: &str) -> String {
+    let size = db_instance_type
+        .strip_prefix(DB_INSTANCE_TYPE_PREFIX)
+        .unwrap_or(db_instance_type);
+    let mut characters = size.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
+/// A v3 engine parameter family a service-managed default group exists for: the v3
+/// members of the modelled `Parameters` union
+/// (`smithy_query(query="shape", shape="Parameters")`).
+#[derive(Debug, Clone, Copy)]
+enum V3Family {
+    Core,
+    Enterprise,
+}
+
+impl V3Family {
+    /// The token this family contributes to a service-managed group's name.
+    fn name_token(self) -> &'static str {
+        match self {
+            V3Family::Core => "Core",
+            V3Family::Enterprise => "Enterprise",
+        }
+    }
+
+    /// The engine parameter family a group of this family configures, with no tunable
+    /// overridden.
+    fn parameters(self) -> Parameters {
+        match self {
+            V3Family::Core => Parameters::InfluxDBv3Core(InfluxDBv3CoreParameters::default()),
+            V3Family::Enterprise => {
+                Parameters::InfluxDBv3Enterprise(InfluxDBv3EnterpriseParameters::default())
+            }
+        }
+    }
+}
+
+/// One entry of the service-managed catalog.
+///
+/// A catalog entry is NOT an account-scoped resource: its `id` IS its `name` and its `arn`
+/// is empty, which is how the service reports a group nobody created. `region` is empty for
+/// the same reason — the catalog is the same in every Region — and `created_at` is the
+/// epoch, a value no parameter-group output shape carries.
+fn service_managed_group(
+    name: &str,
+    description: String,
+    parameters: Parameters,
+) -> DbParameterGroup {
+    DbParameterGroup {
+        id: name.to_string(),
+        name: name.to_string(),
+        arn: String::new(),
+        region: String::new(),
+        description: Some(description),
+        parameters,
+        tags: BTreeMap::new(),
+        created_at: SystemTime::UNIX_EPOCH,
+    }
+}
+
+/// The service-managed (default) DB parameter groups every account and Region has without
+/// anyone creating them, in the order the service reports them.
+///
+/// First the engine groups a create names to start a v3 engine, then one per-instance-size
+/// default for each v3 engine parameter family of the modelled `Parameters` union
+/// (`smithy_query(query="shape", shape="Parameters")`), the sizes in
+/// [`DB_INSTANCE_TYPES_BY_SIZE`] order.
+///
+/// They live here rather than in [`ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState::db_parameter_groups`]
+/// because no operation creates, changes or deletes one and they are identical in every
+/// Region and account: they are the service's own catalog, not this account's records, so
+/// they consume none of the per-account quota and the name index stays about customer
+/// groups only.
+pub fn service_managed_db_parameter_groups() -> &'static [DbParameterGroup] {
+    static CATALOG: ::std::sync::OnceLock<Vec<DbParameterGroup>> = ::std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let mut catalog = vec![
+            service_managed_group(
+                "InfluxDBV3Core",
+                "Service Parameter group to create InfluxDB v3 core engine".to_string(),
+                Parameters::InfluxDBv3Core(InfluxDBv3CoreParameters::default()),
+            ),
+            service_managed_group(
+                "InfluxDBV3Enterprise",
+                "Service Parameter group to create InfluxDB v3 enterprise engine".to_string(),
+                Parameters::InfluxDBv3Enterprise(InfluxDBv3EnterpriseParameters::default()),
+            ),
+            service_managed_group(
+                "InfluxDBV3Enterprise1Node",
+                "Service Parameter group to create InfluxDB v3 enterprise engine with 1 node"
+                    .to_string(),
+                Parameters::InfluxDBv3Enterprise(InfluxDBv3EnterpriseParameters {
+                    // This group's own description is "with 1 node": a single instance
+                    // taking both the ingest and the query role.
+                    ingest_query_instances: 1,
+                    ..InfluxDBv3EnterpriseParameters::default()
+                }),
+            ),
+        ];
+
+        for family in [V3Family::Core, V3Family::Enterprise] {
+            for db_instance_type in DB_INSTANCE_TYPES_BY_SIZE {
+                let name = format!(
+                    "InfluxDBV3{}{}Default",
+                    family.name_token(),
+                    instance_size_token(db_instance_type)
+                );
+                let description = format!("{SERVICE_MANAGED_DEFAULT_DESCRIPTION_PREFIX}{name}");
+                catalog.push(service_managed_group(&name, description, family.parameters()));
+            }
+        }
+        catalog
+    })
+}
+
+/// Where `identifier` sits in the service-managed catalog, if it names one of its groups.
+pub fn service_managed_db_parameter_group_index(identifier: &str) -> Option<usize> {
+    service_managed_db_parameter_groups()
+        .iter()
+        .position(|group| group.id == identifier)
+}
+
+/// The service-managed DB parameter group `identifier` names, if any. A catalog entry's
+/// `id` is its `name`, so either resolves it.
+pub fn service_managed_db_parameter_group(identifier: &str) -> Option<&'static DbParameterGroup> {
+    service_managed_db_parameter_group_index(identifier)
+        .map(|position| &service_managed_db_parameter_groups()[position])
+}
+
+/// Where a DB parameter group sits in the order `ListDbParameterGroups` reports: the
+/// service-managed catalog first, in catalog order, then the customer-created groups by
+/// their minted id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DbParameterGroupListKey {
+    /// A service-managed group, at this position in the catalog.
+    ServiceManaged(usize),
+    /// A customer-created group, by its minted id.
+    Customer(String),
+}
+
+/// The list position an `id` stands for — also what a pagination token resolves to, so a
+/// page resumes strictly after the group the previous page ended on even if that group has
+/// since been deleted or was never stored at all.
+pub fn db_parameter_group_list_key(id: &str) -> DbParameterGroupListKey {
+    match service_managed_db_parameter_group_index(id) {
+        Some(position) => DbParameterGroupListKey::ServiceManaged(position),
+        None => DbParameterGroupListKey::Customer(id.to_string()),
+    }
+}
+
 /// Per-service state for com-amazonaws-timestreaminfluxdb-amazontimestreaminfluxdb. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
@@ -405,9 +589,40 @@ impl ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
     }
 
     /// The id of the DB parameter group holding `name` in `region`, if any.
+    ///
+    /// A service-managed group exists in every Region without anyone creating it, so its
+    /// name is taken in every Region too — the "unique per customer and per region" rule
+    /// covers the service's own catalog as well as this account's records.
     pub fn db_parameter_group_id_for_name(&self, region: &str, name: &str) -> Option<&String> {
+        if let Some(group) = service_managed_db_parameter_group(name) {
+            return Some(&group.id);
+        }
         self.db_parameter_group_names
             .get(&(region.to_string(), name.to_string()))
+    }
+
+    /// Every DB parameter group this account and Region has, each paired with its list
+    /// position, in the stable order `ListDbParameterGroups` reports them: the
+    /// service-managed catalog first, then the customer-created groups by minted id.
+    pub fn db_parameter_groups_in_list_order(
+        &self,
+    ) -> Vec<(DbParameterGroupListKey, DbParameterGroupSummary)> {
+        service_managed_db_parameter_groups()
+            .iter()
+            .enumerate()
+            .map(|(position, group)| {
+                (
+                    DbParameterGroupListKey::ServiceManaged(position),
+                    group.to_summary(),
+                )
+            })
+            .chain(self.db_parameter_groups.iter().map(|(id, record)| {
+                (
+                    DbParameterGroupListKey::Customer(id.clone()),
+                    record.to_summary(),
+                )
+            }))
+            .collect()
     }
 
     /// Claim `name` in `region` for `id`.
