@@ -165,6 +165,8 @@ mod resource_tags;
 mod revoke_token;
 #[path = "all/risk_configuration.rs"]
 mod risk_configuration;
+#[path = "all/self_service_refusal_wire.rs"]
+mod self_service_refusal_wire;
 #[path = "all/self_service_sign_up.rs"]
 mod self_service_sign_up;
 #[path = "all/set_user_mfa_preference.rs"]
