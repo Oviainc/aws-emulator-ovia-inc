@@ -1036,6 +1036,24 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             .find(|quota| quota.service_code == service_code && quota.quota_code == quota_code)
     }
 
+    /// Which fact a `(ServiceCode, QuotaCode)` pair that resolves to no quota failed
+    /// on, worded for the modelled `NoSuchResourceException`.
+    ///
+    /// A lookup fails on the OUTERMOST thing the request named that does not exist: a
+    /// `ServiceCode` the catalog does not publish means there is no service to hold any
+    /// quota, so the refusal states the absent SERVICE
+    /// ([`no_such_service_message`]), and only a service the catalog does publish can
+    /// fail on the code itself, which states the absent QUOTA
+    /// ([`no_such_quota_message`]). Asked here rather than at each caller, so every
+    /// operation that resolves a pair attributes the failure to the same half of it.
+    pub fn unresolved_quota_message(&self, service_code: &str, quota_code: &str) -> String {
+        if self.knows_service(service_code) {
+            no_such_quota_message(service_code, quota_code)
+        } else {
+            no_such_service_message(service_code)
+        }
+    }
+
     /// Every `QuotaCode` the service has a default quota for, in the order the
     /// catalog publishes them.
     pub fn quota_codes(&self, service_code: &str) -> Vec<String> {
@@ -2191,8 +2209,10 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
 /// for, for the modelled `NoSuchResourceException`.
 ///
 /// ONE wording for the fact, wherever a request names a service the catalog does not
-/// hold: the listings that take a `ServiceCode`, and an Automatic Management exclusion
-/// keyed by one.
+/// hold: the listings that take a `ServiceCode`, every lookup that resolves one as half
+/// of a `(ServiceCode, QuotaCode)` pair
+/// ([`ComAmazonawsServicequotasServicequotasv20190624State::unresolved_quota_message`]),
+/// and an Automatic Management exclusion keyed by one.
 pub fn no_such_service_message(service_code: &str) -> String {
     format!("no service quotas are available for ServiceCode '{service_code}'")
 }
@@ -2200,9 +2220,11 @@ pub fn no_such_service_message(service_code: &str) -> String {
 /// How this service states that no quota answers to a `(ServiceCode, QuotaCode)` pair,
 /// for the modelled `NoSuchResourceException`.
 ///
-/// ONE wording for the fact, wherever a request names a pair the catalog does not
-/// hold: the reads and the writes of one quota, and an Automatic Management exclusion
-/// naming one.
+/// ONE wording for the fact, wherever a request names a code a service the catalog DOES
+/// publish holds no quota under: the reads and the writes of one quota, and an Automatic
+/// Management exclusion naming one. A pair whose `ServiceCode` is itself unpublished
+/// fails on the service instead
+/// ([`ComAmazonawsServicequotasServicequotasv20190624State::unresolved_quota_message`]).
 pub fn no_such_quota_message(service_code: &str, quota_code: &str) -> String {
     format!("no quota with ServiceCode '{service_code}' and QuotaCode '{quota_code}' exists")
 }

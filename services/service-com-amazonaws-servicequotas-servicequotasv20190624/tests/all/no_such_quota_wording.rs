@@ -99,7 +99,11 @@ fn pair_requests(service_code: &str, quota_code: &str) -> Vec<(&'static str, &'s
 
 /// The `Message` of the refusal `operation` answers `body` with, after asserting it IS
 /// the modelled `NoSuchResourceException` on this front end's client-fault status.
-async fn no_such_resource_message(
+///
+/// `pub(crate)` so the suite that pins the OTHER half of the same rule — the sentence a
+/// `ServiceCode` the catalog does not publish is stated in — asserts the refusal through
+/// this one reader instead of a copy of it.
+pub(crate) async fn no_such_resource_message(
     client: &Client,
     case: &str,
     operation: &str,
@@ -125,7 +129,7 @@ async fn no_such_resource_message(
 /// first `QuotaCode` it holds — walked over the wire through the harness's own catalog
 /// readers (`quota_workflow::service_inventory` / `default_quotas`), so this suite
 /// carries neither a copy of the catalog nor a second walk of it.
-async fn catalog_services(client: &Client, wanted: usize) -> Vec<(String, String)> {
+pub(crate) async fn catalog_services(client: &Client, wanted: usize) -> Vec<(String, String)> {
     let mut picked: Vec<(String, String)> = Vec::new();
     for service in service_inventory(client).await {
         if picked.len() == wanted {

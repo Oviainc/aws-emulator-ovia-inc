@@ -162,6 +162,33 @@ impl Emulator {
             .to_string();
         (status, code)
     }
+
+    /// One Service Quotas call at the template plane's home Region that must be refused,
+    /// as its status, the error code the envelope carries and the `Message` it states the
+    /// fact in.
+    ///
+    /// `pub(crate)` so a suite that asserts the WORDING of a template-plane refusal
+    /// reaches it through this harness instead of growing a second copy of the two
+    /// services on one engine.
+    pub(crate) async fn refused_at_home(
+        &self,
+        operation: &str,
+        body: Value,
+    ) -> (u16, String, String) {
+        let (status, parsed) = self.quotas(HOME_REGION, operation, body).await;
+        let member = |name: &str, missing: &str| {
+            parsed
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or(missing)
+                .to_string()
+        };
+        (
+            status,
+            member("__type", "<no __type>"),
+            member("Message", "<no Message>"),
+        )
+    }
 }
 
 /// Every template operation, with a request the model accepts: the three association

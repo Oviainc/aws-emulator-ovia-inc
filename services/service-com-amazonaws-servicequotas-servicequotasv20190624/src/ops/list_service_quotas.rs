@@ -141,15 +141,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if codes.is_empty() {
                     // A `QuotaCode` filter naming a pair the catalog does not hold is
                     // the same fact every other read and write of one quota reports, so
-                    // it is stated in the crate's ONE wording for it
-                    // ([`crate::state::no_such_quota_message`]) rather than a second
-                    // sentence of this handler's own.
+                    // which half of the pair failed is decided by the crate's one rule
+                    // for it (the service is known here, since an unknown one was
+                    // refused above) rather than by a second sentence of this handler's
+                    // own.
                     return Err(ListServiceQuotasErrorModeled::NoSuchResourceException(
                         NoSuchResourceException {
-                            message: Some(crate::state::no_such_quota_message(
-                                &input.service_code,
-                                requested,
-                            )),
+                            message: Some(
+                                quotas_state
+                                    .unresolved_quota_message(&input.service_code, requested),
+                            ),
                         },
                     )
                     .into());

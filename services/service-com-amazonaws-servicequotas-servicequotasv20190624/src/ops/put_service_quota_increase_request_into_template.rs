@@ -180,10 +180,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut quotas_state = state.lock();
         let Some(default) = quotas_state.default_quota(&input.service_code, &input.quota_code)
         else {
+            // Which half of the pair the catalog does not hold decides what the refusal
+            // states, through the crate's one rule for it.
             return Err(
                 PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::NoSuchResourceException(
                     NoSuchResourceException {
-                        message: Some(crate::state::no_such_quota_message(
+                        message: Some(quotas_state.unresolved_quota_message(
                             &input.service_code,
                             &input.quota_code,
                         )),

@@ -110,15 +110,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A default quota never changes, so nothing is settled here: this operation
         // only reads the seeded map.
-        let quota = state
-            .lock()
-            .default_quota_view(&region, &input.service_code, &input.quota_code);
+        let quotas_state = state.lock();
+        let quota = quotas_state.default_quota_view(&region, &input.service_code, &input.quota_code);
 
         let Some(quota) = quota else {
+            // Which half of the pair the catalog does not hold decides what the refusal
+            // states, through the crate's one rule for it.
             return Err(
                 GetAWSDefaultServiceQuotaErrorModeled::NoSuchResourceException(
                     NoSuchResourceException {
-                        message: Some(crate::state::no_such_quota_message(
+                        message: Some(quotas_state.unresolved_quota_message(
                             &input.service_code,
                             &input.quota_code,
                         )),
