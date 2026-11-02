@@ -132,16 +132,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let store = state.lock();
 
         // An id no stored profile carries — never created, or already deleted — is a
-        // 404, never a canned success.
+        // 404, never a canned success. The refusal reports the profile by the ARN the id
+        // names in this request's Region, the wording this service words an ARN-keyed
+        // miss with.
         let record = store.profiles.get(&input.profile_id).ok_or_else(|| {
             GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("Profile {} not found", input.profile_id)),
+                message: Some(crate::state::arn_not_found_message(
+                    &crate::state::profile_arn(
+                        &crate::state::request_region(ctx.parts()),
+                        &input.profile_id,
+                    ),
+                )),
             })
         })?;
 

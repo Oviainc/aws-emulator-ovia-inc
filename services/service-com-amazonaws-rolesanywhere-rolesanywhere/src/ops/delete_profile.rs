@@ -132,16 +132,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let mut store = state.lock();
 
         // The response carries the profile that was deleted, so the removed record is
-        // what it is built from — removed first, then projected.
+        // what it is built from — removed first, then projected. An id no stored profile
+        // carries is refused with the same ARN-keyed wording the read path words.
         let record = store.profiles.remove(&input.profile_id).ok_or_else(|| {
             DeleteProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("Profile {} not found", input.profile_id)),
+                message: Some(crate::state::arn_not_found_message(
+                    &crate::state::profile_arn(
+                        &crate::state::request_region(ctx.parts()),
+                        &input.profile_id,
+                    ),
+                )),
             })
         })?;
 

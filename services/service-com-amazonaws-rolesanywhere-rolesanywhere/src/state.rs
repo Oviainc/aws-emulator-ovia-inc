@@ -436,6 +436,17 @@ pub fn crl_arn(region: &str, crl_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("crl/{crl_id}"))
 }
 
+/// The ARN of the profile this id names, in the Region the request was signed for: the
+/// ARN its create minted, so a refusal naming a profile that is not stored words the
+/// SAME ARN the read of a stored one answers with.
+///
+/// `ProfileArn` is `@pattern("^arn:aws(-[^:]+)?:rolesanywhere(:.*){2}(:profile.*)$")`
+/// (`smithy_query(query="shape", shape="ProfileDetail")`, member `profileArn`), which this
+/// satisfies: `arn:aws:rolesanywhere:<region>:<account>:profile/<profileId>`.
+pub fn profile_arn(region: &str, profile_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("profile/{profile_id}"))
+}
+
 /// The trust-anchor id a `TrustAnchorArn` names, or the empty string when the ARN carries
 /// no id.
 ///

@@ -185,11 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let profile_id = store.mint_uuid();
         let record = crate::state::ProfileRecord {
-            profile_arn: ::engine::emulator_arn(
-                crate::state::ARN_NAMESPACE,
-                &region,
-                &format!("profile/{profile_id}"),
-            ),
+            profile_arn: crate::state::profile_arn(&region, &profile_id),
             profile_id: profile_id.clone(),
             name: input.name,
             role_arns: input.role_arns,
