@@ -162,6 +162,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+        // Both identities on a moderator record — the moderator and the caller that
+        // promoted it — carry the `Name` the identity service published in the family's
+        // shared directory; resolved before the store is locked, so the lock order (this
+        // service's store first, the shared directory second) cannot invert.
+        let names = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            DescribeChannelModeratorErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    code: Some("ServiceFailure".to_string()),
+                    message: Some("the identity name directory is unavailable".to_string()),
+                },
+            )
+        })?;
 
         let store = state.lock();
         // One gate: a channel ARN this service cannot resolve, a PRIVATE channel the
@@ -177,8 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .moderator(&input.channel_moderator_arn)
             .ok_or_else(|| not_found(crate::state::NOT_A_MODERATOR_MESSAGE))?;
 
+        let names = names.lock();
         Ok(DescribeChannelModeratorOutput {
-            channel_moderator: Some(moderator.to_channel_moderator(&channel.arn)),
+            channel_moderator: Some(moderator.to_channel_moderator(&channel.arn, &names)),
         })
     }
 }

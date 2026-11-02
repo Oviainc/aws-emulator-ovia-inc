@@ -190,6 +190,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the channel store is unavailable".to_string()),
             })
         })?;
+        // The member's `Name` is the one the identity service published for it, which this
+        // response reports beside its ARN; resolved before the store is locked, so the lock
+        // order (this service's store first, the shared directory second) cannot invert.
+        let names = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            CreateChannelMembershipErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the identity name directory is unavailable".to_string()),
+            })
+        })?;
 
         if !CHANNEL_MEMBERSHIP_TYPE_VALUES.contains(&input.r#type.as_str()) {
             return Err(bad_request(format!(
@@ -267,15 +276,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .push(crate::state::ChannelMembershipRecord {
                     member_arn: input.member_arn.clone(),
                     r#type: input.r#type,
-                    invited_by: crate::state::identity_of(&input.chime_bearer),
+                    invited_by_arn: input.chime_bearer.clone(),
                     created_millis: now,
                     last_updated_millis: now,
                 });
         }
 
+        let names = names.lock();
         Ok(CreateChannelMembershipOutput {
             channel_arn: Some(channel.arn.clone()),
-            member: Some(crate::state::identity_of(&input.member_arn)),
+            member: Some(crate::state::identity_of(&input.member_arn, &names)),
             // Sub-channels are not served, so no sub-channel is echoed back.
             sub_channel_id: None,
         })

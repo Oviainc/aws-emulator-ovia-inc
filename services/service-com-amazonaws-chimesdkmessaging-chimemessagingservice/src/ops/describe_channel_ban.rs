@@ -161,6 +161,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the channel store is unavailable".to_string()),
             })
         })?;
+        // Both identities on a ban — the banned member and the caller that banned it —
+        // carry the `Name` the identity service published in the family's shared directory;
+        // resolved before the store is locked, so the lock order (this service's store
+        // first, the shared directory second) cannot invert.
+        let names = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            DescribeChannelBanErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the identity name directory is unavailable".to_string()),
+            })
+        })?;
 
         let store = state.lock();
         // One gate: a channel ARN this service cannot resolve, a PRIVATE channel the
@@ -176,8 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             not_found(crate::state::NOT_BANNED_MESSAGE)
         })?;
 
+        let names = names.lock();
         Ok(DescribeChannelBanOutput {
-            channel_ban: Some(ban.to_channel_ban(&channel.arn)),
+            channel_ban: Some(ban.to_channel_ban(&channel.arn, &names)),
         })
     }
 }

@@ -208,9 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE)
             })?;
 
-        if !caller_moderates
-            && message.sender.arn.as_deref() != Some(input.chime_bearer.as_str())
-        {
+        if !caller_moderates && message.sender_arn != input.chime_bearer {
             // Only the message's sender or a moderator of the channel redacts it.
             return Err(forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE));
         }

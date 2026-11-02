@@ -157,6 +157,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the AppInstance store is unavailable".to_string()),
             })
         })?;
+        // A rename is visible to the sibling that REPORTS the name, so the family's shared
+        // identity NAME directory is kept in step with the record below; resolved before the
+        // store is locked, so the lock order (this service's store first, the shared
+        // directory second) cannot invert.
+        let name_directory = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            UpdateAppInstanceUserErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime identity name directory is unavailable".to_string()),
+            })
+        })?;
         let mut state = state.lock();
 
         let Some(record) = state.user_mut(&input.app_instance_user_arn) else {
@@ -180,9 +190,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.name = input.name;
         record.metadata = Some(input.metadata);
         record.last_updated_timestamp = ::std::time::SystemTime::now();
+        let arn = record.arn.clone();
+        let name = record.name.clone();
+        name_directory.lock().register(&arn, &name);
 
         Ok(UpdateAppInstanceUserOutput {
-            app_instance_user_arn: Some(record.arn.clone()),
+            app_instance_user_arn: Some(arn),
         })
     }
 }

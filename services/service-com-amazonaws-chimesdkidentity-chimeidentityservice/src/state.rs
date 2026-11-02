@@ -27,7 +27,10 @@
 //! Two things this service reads are NOT in the struct below, because another Chime
 //! service reads or writes them too and the engine keys state by type: the app-instance
 //! ADMIN directory ([`app_instance_admins`]) and the family's ARN-keyed TAG directory
-//! ([`chime_tags`]).
+//! ([`chime_tags`]). A third, the family's identity NAME directory
+//! ([`identity_names`]), is one this service WRITES for a sibling to read: the name an
+//! `AppInstanceUser` or `AppInstanceBot` carries is reported by Chime SDK Messaging on
+//! every channel participant, which cannot see the records below.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::BuildHasher as _;
@@ -535,6 +538,36 @@ pub fn chime_tags<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<::service_common::chime_tags::ChimeTagDirectory>)
+}
+
+/// The SHARED Chime IDENTITY NAME directory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// The name an identity this service owns is registered under is PUBLISHED here, keyed by
+/// that identity's ARN
+/// ([`::service_common::chime_identity_names::ChimeIdentityNameDirectory`]), because the
+/// sibling that has to REPORT it — Chime SDK Messaging, which puts every channel
+/// participant on the wire as an ARN and a name — cannot read this service's own store:
+/// the engine keys state by TYPE. This service's own record stays the authority, so every
+/// operation that registers, renames or deletes an identity keeps the directory in step
+/// with it; an entry that was never written is simply a name no reader reports.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and no
+/// reader holds this one while taking another store, so the order cannot invert.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn identity_names<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<::service_common::chime_identity_names::ChimeIdentityNameDirectory>,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::chime_identity_names::ChimeIdentityNameDirectory,
+            >,
+        )
 }
 
 /// Whether `arn` names a resource THIS service mints, so that this service's store is

@@ -327,7 +327,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_millis: now,
             // Nothing has edited the message, so it carries no edit time yet.
             last_edited_millis: None,
-            sender: crate::state::identity_of(&input.chime_bearer),
+            sender_arn: input.chime_bearer.clone(),
             redacted: false,
             status: "SENT".to_string(),
             message_attributes: input.message_attributes,

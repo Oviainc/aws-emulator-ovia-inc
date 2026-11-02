@@ -57,7 +57,7 @@
 //!   which operation it names — for every service whose published target prefix carries
 //!   dots of its own, which the framework's first-dot readers cannot route;
 //!
-//! Beside them, seven SHARED STORES live here, each held once in the shared engine so
+//! Beside them, eight SHARED STORES live here, each held once in the shared engine so
 //! the services on either side of a hand-off cannot hold two copies of one fact:
 //!
 //! * [`acm_certificate_associations`], the directory of which resources reference an ACM
@@ -86,6 +86,10 @@
 //!   service that SERVED an API call, which is the only one that knows the call
 //!   happened, and read by CloudTrail, which is the service that reports it
 //!   (`LookupEvents`);
+//! * [`chime_identity_names`], the name an Amazon Chime SDK app instance's identity is
+//!   registered under, keyed by its ARN — written by Chime SDK Identity, which owns the
+//!   identity, and read by Chime SDK Messaging, which reports every participant of a
+//!   channel as an ARN and that name and cannot see the store the identity lives in;
 //! * [`ses_identities`], the account's email identity registry — the ONE set of
 //!   identities Amazon SES's two APIs publish, written by whichever surface records or
 //!   deletes an identity and read by both, so an identity created with the modern API
@@ -240,6 +244,11 @@ pub mod caller_principal;
 /// role, which it reserves two of its actions for.
 pub mod chime_app_instance_admins;
 pub mod chime_family;
+/// The IDENTITY NAME directory the Amazon Chime SDK family shares: the name an app
+/// instance's identity is registered under, keyed by its ARN, written by Chime SDK
+/// Identity — which owns the identity — and read by Chime SDK Messaging, which reports
+/// every participant as an ARN and a name.
+pub mod chime_identity_names;
 /// The TAG directory the Amazon Chime SDK family shares: the tags of a Chime resource,
 /// keyed by its ARN, so whichever member serves one of the generic tagging routes reads
 /// and writes the same tags.

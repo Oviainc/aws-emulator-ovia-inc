@@ -12,6 +12,8 @@ engine = { workspace = true }
 # SigV4 signing name, stated once rather than inlined in this service's `can_handle`.
 # `chime_app_instance_admins`: the app-instance ADMIN directory this service READS, which
 # Chime SDK Identity writes, for the two actions the model reserves for an administrator.
+# `chime_identity_names`: the identity NAME directory this service READS, which Chime SDK
+# Identity writes, for the `Name` every participant it reports carries beside its ARN.
 service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

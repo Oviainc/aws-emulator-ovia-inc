@@ -178,6 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the channel store is unavailable".to_string()),
             })
         })?;
+        // Every row's `Sender` carries the `Name` the identity service published for that
+        // identity in the family's shared directory; resolved before the store is locked,
+        // so the lock order (this service's store first, the shared directory second)
+        // cannot invert.
+        let names = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            ListChannelMessagesErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the identity name directory is unavailable".to_string()),
+            })
+        })?;
 
         // "Default is Descending, based on time created" — the model's own `SortOrder`
         // documentation for this operation.
@@ -259,10 +269,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .then(|| page.last().map(|m| crate::state::encode_next_token(&m.message_id)))
             .flatten();
 
+        let names = names.lock();
         Ok(ListChannelMessagesOutput {
             channel_arn: Some(channel.arn.clone()),
             next_token,
-            channel_messages: Some(page.iter().map(|m| m.to_summary()).collect()),
+            channel_messages: Some(page.iter().map(|m| m.to_summary(&names)).collect()),
             // Sub-channels are not served, so no sub-channel is echoed back.
             sub_channel_id: None,
         })

@@ -175,6 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the channel store is unavailable".to_string()),
             })
         })?;
+        // Every row's `Member` carries the `Name` the identity service published for that
+        // identity in the family's shared directory; resolved before the store is locked,
+        // so the lock order (this service's store first, the shared directory second)
+        // cannot invert.
+        let names = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            ListChannelMembershipsErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the identity name directory is unavailable".to_string()),
+            })
+        })?;
 
         if let Some(membership_type) = &input.r#type {
             if !CHANNEL_MEMBERSHIP_TYPE_VALUES.contains(&membership_type.as_str()) {
@@ -249,9 +259,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .flatten();
 
+        let names = names.lock();
         Ok(ListChannelMembershipsOutput {
             channel_arn: Some(channel.arn.clone()),
-            channel_memberships: Some(page.iter().map(|m| m.to_summary()).collect()),
+            channel_memberships: Some(page.iter().map(|m| m.to_summary(&names)).collect()),
             next_token,
         })
     }

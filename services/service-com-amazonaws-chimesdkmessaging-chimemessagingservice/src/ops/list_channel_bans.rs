@@ -164,6 +164,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the channel store is unavailable".to_string()),
             })
         })?;
+        // Every row's `Member` carries the `Name` the identity service published for that
+        // identity in the family's shared directory; resolved before the store is locked,
+        // so the lock order (this service's store first, the shared directory second)
+        // cannot invert.
+        let names = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            ListChannelBansErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the identity name directory is unavailable".to_string()),
+            })
+        })?;
 
         // `MaxResults` is modelled `range 1..50`; an omitted page size takes that
         // maximum, so a caller that asks for no size still gets a bounded page.
@@ -218,10 +228,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .flatten();
 
+        let names = names.lock();
         Ok(ListChannelBansOutput {
             channel_arn: Some(channel.arn.clone()),
             next_token,
-            channel_bans: Some(page.iter().map(|b| b.to_summary()).collect()),
+            channel_bans: Some(page.iter().map(|b| b.to_summary(&names)).collect()),
         })
     }
 }

@@ -167,6 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+        // Resolved before the store is locked, so the lock order (this service's store
+        // first, the shared directory second) cannot invert.
+        let names = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            DescribeChannelMembershipErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    code: Some("ServiceFailure".to_string()),
+                    message: Some("the identity name directory is unavailable".to_string()),
+                },
+            )
+        })?;
 
         // Sub-channels exist only on elastic channels, which this slice does not serve.
         if let Some(sub_channel_id) = &input.sub_channel_id {
@@ -182,6 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let store = state.lock();
+        // Both identities on a membership — the member and the caller that invited it —
+        // carry the `Name` the identity service published in the family's shared directory.
+        let names = names.lock();
         // One gate: a channel ARN this service cannot resolve, a PRIVATE channel the
         // caller is not in and a caller BANNED from it are all the modelled
         // `ForbiddenException`.
@@ -196,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE))?;
 
         Ok(DescribeChannelMembershipOutput {
-            channel_membership: Some(membership.to_channel_membership(&channel.arn)),
+            channel_membership: Some(membership.to_channel_membership(&channel.arn, &names)),
         })
     }
 }

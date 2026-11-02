@@ -176,6 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the Chime tag directory is unavailable".to_string()),
             })
         })?;
+        // The cascade reaches the published names of the identities it deletes too, so the
+        // family's shared identity NAME directory is resolved before the delete.
+        let name_directory = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            DeleteAppInstanceErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime identity name directory is unavailable".to_string()),
+            })
+        })?;
         let mut state = state.lock();
 
         // Deleting an AppInstance deletes everything it owns, so the users and bots it
@@ -201,6 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags.forget(child_arn);
         }
         drop(tags);
+
+        // And the names of the identities the instance took with it: an identity that no
+        // longer exists has no name for any reader to report. Every identity hangs off its
+        // app instance's ARN, so the cascade is stated once in the directory itself.
+        let _dropped_names = name_directory
+            .lock()
+            .forget_identities_of(&input.app_instance_arn);
 
         Ok(DeleteAppInstanceOutput)
     }

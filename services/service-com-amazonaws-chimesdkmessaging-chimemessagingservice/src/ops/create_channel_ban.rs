@@ -175,6 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the channel store is unavailable".to_string()),
             })
         })?;
+        // The member's `Name` is the one the identity service published for it, which this
+        // response reports beside its ARN; resolved before the store is locked, so the lock
+        // order (this service's store first, the shared directory second) cannot invert.
+        let names = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            CreateChannelBanErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the identity name directory is unavailable".to_string()),
+            })
+        })?;
 
         let now = crate::state::now_millis();
         let mut store = state.lock();
@@ -206,16 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             channel.bans.push(crate::state::ChannelBanRecord {
                 member_arn: input.member_arn.clone(),
-                created_by: crate::state::identity_of(&input.chime_bearer),
+                created_by_arn: input.chime_bearer.clone(),
                 created_millis: now,
             });
         }
         // A banned member is out of the channel, as the model documents.
         channel.remove_membership(&input.member_arn);
 
+        let names = names.lock();
         Ok(CreateChannelBanOutput {
             channel_arn: Some(channel.arn.clone()),
-            member: Some(crate::state::identity_of(&input.member_arn)),
+            member: Some(crate::state::identity_of(&input.member_arn, &names)),
         })
     }
 }

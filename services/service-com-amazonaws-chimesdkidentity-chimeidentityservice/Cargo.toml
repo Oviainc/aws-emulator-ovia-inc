@@ -12,6 +12,9 @@ engine = { workspace = true }
 # SigV4 signing name, stated once rather than inlined in this service's `can_handle`.
 # `chime_app_instance_admins`: the app-instance ADMIN directory this service WRITES when
 # it promotes an identity, which Chime SDK Messaging reads the role from.
+# `chime_identity_names`: the identity NAME directory this service WRITES whenever it
+# registers, renames or deletes an identity, which Chime SDK Messaging reads the `Name` of
+# a channel participant from.
 service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

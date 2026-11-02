@@ -308,17 +308,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the model's `Mode` documentation describes "administrators, moderators, and
         // channel members" adding members, and a creator who was neither could not send
         // the first message to the channel it just created.
-        let creator = crate::state::identity_of(&input.chime_bearer);
+        let creator = input.chime_bearer.clone();
         let mut memberships = vec![crate::state::ChannelMembershipRecord {
             member_arn: input.chime_bearer.clone(),
             r#type: "DEFAULT".to_string(),
-            invited_by: creator.clone(),
+            invited_by_arn: creator.clone(),
             created_millis: now,
             last_updated_millis: now,
         }];
         let mut moderators = vec![crate::state::ChannelModeratorRecord {
             moderator_arn: input.chime_bearer.clone(),
-            created_by: creator.clone(),
+            created_by_arn: creator.clone(),
             created_millis: now,
         }];
         // `MemberArns` and `ModeratorArns` are the members and moderators the channel
@@ -339,7 +339,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             memberships.push(crate::state::ChannelMembershipRecord {
                 member_arn,
                 r#type: "DEFAULT".to_string(),
-                invited_by: creator.clone(),
+                invited_by_arn: creator.clone(),
                 created_millis: now,
                 last_updated_millis: now,
             });
@@ -356,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             moderators.push(crate::state::ChannelModeratorRecord {
                 moderator_arn,
-                created_by: creator.clone(),
+                created_by_arn: creator.clone(),
                 created_millis: now,
             });
         }
@@ -371,7 +371,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 mode,
                 privacy,
                 metadata: input.metadata,
-                created_by: creator,
+                created_by_arn: creator,
                 created_millis: now,
                 last_updated_millis: now,
                 // No message has been sent yet, so the channel has no last-message time.

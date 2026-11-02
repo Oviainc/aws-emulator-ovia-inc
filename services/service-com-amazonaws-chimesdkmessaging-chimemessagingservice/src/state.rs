@@ -12,11 +12,18 @@
 //! filter them and `DateTime` carries no total order. [`date_time`] converts one back
 //! for the wire and [`millis_of`] converts an inbound filter bound in.
 //!
-//! Two things this service reads are NOT in the struct below, because another Chime
+//! Three things this service reads are NOT in the struct below, because another Chime
 //! service reads or writes them too and the engine keys state by type: the app-instance
-//! ADMIN directory ([`app_instance_admins`]) and the family's ARN-keyed TAG directory
+//! ADMIN directory ([`app_instance_admins`]), the family's ARN-keyed TAG directory
 //! ([`chime_tags`]), which holds the tags of every channel and channel flow — including
-//! the ones a create was given.
+//! the ones a create was given — and the family's identity NAME directory
+//! ([`identity_names`]), which is where the name of the `AppInstanceUser` or
+//! `AppInstanceBot` an [`Identity`] names is published.
+//!
+//! A participant is therefore stored as its ARN alone: every `Identity` this service puts
+//! on the wire is PROJECTED from that ARN at read time ([`identity_of`]), so a renamed
+//! identity is reported under its current name rather than the one it carried when the
+//! membership, ban, moderator, channel or message was written.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -458,7 +465,10 @@ pub struct ChannelRecord {
     /// `ChannelPrivacy` wire value — see `CHANNEL_PRIVACY_VALUES`.
     pub privacy: String,
     pub metadata: Option<String>,
-    pub created_by: Identity,
+    /// The identity that created the channel, which the model calls `CreatedBy`. Held as
+    /// an ARN, because the `Name` the wire shape carries beside it is the identity's
+    /// current one ([`identity_of`]) rather than a snapshot taken at create time.
+    pub created_by_arn: String,
     pub created_millis: i64,
     pub last_updated_millis: i64,
     /// Set by the last PERSISTENT message sent to the channel; `None` until then.
@@ -486,8 +496,8 @@ pub struct ChannelMembershipRecord {
     pub member_arn: String,
     /// `ChannelMembershipType` wire value — see `CHANNEL_MEMBERSHIP_TYPE_VALUES`.
     pub r#type: String,
-    /// The caller that added this member, which the model calls `InvitedBy`.
-    pub invited_by: Identity,
+    /// The ARN of the caller that added this member, which the model calls `InvitedBy`.
+    pub invited_by_arn: String,
     pub created_millis: i64,
     pub last_updated_millis: i64,
 }
@@ -496,7 +506,8 @@ pub struct ChannelMembershipRecord {
 #[derive(Debug, Clone)]
 pub struct ChannelBanRecord {
     pub member_arn: String,
-    pub created_by: Identity,
+    /// The ARN of the caller that banned the member.
+    pub created_by_arn: String,
     pub created_millis: i64,
 }
 
@@ -505,7 +516,8 @@ pub struct ChannelBanRecord {
 #[derive(Debug, Clone)]
 pub struct ChannelModeratorRecord {
     pub moderator_arn: String,
-    pub created_by: Identity,
+    /// The ARN of the caller that promoted the moderator.
+    pub created_by_arn: String,
     pub created_millis: i64,
 }
 
@@ -524,7 +536,8 @@ pub struct ChannelMessageRecord {
     pub created_millis: i64,
     pub last_updated_millis: i64,
     pub last_edited_millis: Option<i64>,
-    pub sender: Identity,
+    /// The ARN of the identity that sent the message, which the model calls `Sender`.
+    pub sender_arn: String,
     pub redacted: bool,
     /// `ChannelMessageStatus` wire value — see `CHANNEL_MESSAGE_STATUS_VALUES`.
     pub status: String,
@@ -534,14 +547,14 @@ pub struct ChannelMessageRecord {
 
 impl ChannelRecord {
     /// The modelled `Channel` this record describes, as `DescribeChannel` returns it.
-    pub fn to_channel(&self) -> Channel {
+    pub fn to_channel(&self, names: &IdentityNameDirectory) -> Channel {
         Channel {
             name: Some(self.name.clone()),
             channel_arn: Some(self.arn.clone()),
             mode: Some(self.mode.clone()),
             privacy: Some(self.privacy.clone()),
             metadata: self.metadata.clone(),
-            created_by: Some(self.created_by.clone()),
+            created_by: Some(identity_of(&self.created_by_arn, names)),
             created_timestamp: Some(date_time(self.created_millis)),
             last_message_timestamp: self.last_message_millis.map(date_time),
             last_updated_timestamp: Some(date_time(self.last_updated_millis)),
@@ -678,7 +691,11 @@ impl ChannelMessageRecord {
     ///
     /// A REDACTED message carries no `Content` and no `MessageAttributes`: redaction
     /// removes what the message carried while the message itself stays in the channel.
-    pub fn to_channel_message(&self, channel_arn: &str) -> ChannelMessage {
+    pub fn to_channel_message(
+        &self,
+        channel_arn: &str,
+        names: &IdentityNameDirectory,
+    ) -> ChannelMessage {
         ChannelMessage {
             channel_arn: Some(channel_arn.to_string()),
             message_id: Some(self.message_id.clone()),
@@ -688,7 +705,7 @@ impl ChannelMessageRecord {
             created_timestamp: Some(date_time(self.created_millis)),
             last_edited_timestamp: self.last_edited_millis.map(date_time),
             last_updated_timestamp: Some(date_time(self.last_updated_millis)),
-            sender: Some(self.sender.clone()),
+            sender: Some(identity_of(&self.sender_arn, names)),
             redacted: self.redacted,
             persistence: Some(self.persistence.clone()),
             status: Some(self.status_structure()),
@@ -701,7 +718,7 @@ impl ChannelMessageRecord {
     }
 
     /// The modelled `ChannelMessageSummary`, as `ListChannelMessages` returns it.
-    pub fn to_summary(&self) -> ChannelMessageSummary {
+    pub fn to_summary(&self, names: &IdentityNameDirectory) -> ChannelMessageSummary {
         ChannelMessageSummary {
             message_id: Some(self.message_id.clone()),
             content: self.visible_content(),
@@ -710,7 +727,7 @@ impl ChannelMessageRecord {
             created_timestamp: Some(date_time(self.created_millis)),
             last_updated_timestamp: Some(date_time(self.last_updated_millis)),
             last_edited_timestamp: self.last_edited_millis.map(date_time),
-            sender: Some(self.sender.clone()),
+            sender: Some(identity_of(&self.sender_arn, names)),
             redacted: self.redacted,
             status: Some(self.status_structure()),
             message_attributes: self.visible_attributes(),
@@ -771,11 +788,15 @@ impl ChannelMessageRecord {
 
 impl ChannelMembershipRecord {
     /// The modelled `ChannelMembership`, as `DescribeChannelMembership` returns it.
-    pub fn to_channel_membership(&self, channel_arn: &str) -> ChannelMembership {
+    pub fn to_channel_membership(
+        &self,
+        channel_arn: &str,
+        names: &IdentityNameDirectory,
+    ) -> ChannelMembership {
         ChannelMembership {
-            invited_by: Some(self.invited_by.clone()),
+            invited_by: Some(identity_of(&self.invited_by_arn, names)),
             r#type: Some(self.r#type.clone()),
-            member: Some(identity_of(&self.member_arn)),
+            member: Some(identity_of(&self.member_arn, names)),
             channel_arn: Some(channel_arn.to_string()),
             created_timestamp: Some(date_time(self.created_millis)),
             last_updated_timestamp: Some(date_time(self.last_updated_millis)),
@@ -785,47 +806,55 @@ impl ChannelMembershipRecord {
     }
 
     /// The modelled `ChannelMembershipSummary`, as `ListChannelMemberships` returns it.
-    pub fn to_summary(&self) -> ChannelMembershipSummary {
+    pub fn to_summary(&self, names: &IdentityNameDirectory) -> ChannelMembershipSummary {
         ChannelMembershipSummary {
-            member: Some(identity_of(&self.member_arn)),
+            member: Some(identity_of(&self.member_arn, names)),
         }
     }
 }
 
 impl ChannelBanRecord {
     /// The modelled `ChannelBan`, as `DescribeChannelBan` returns it.
-    pub fn to_channel_ban(&self, channel_arn: &str) -> ChannelBan {
+    pub fn to_channel_ban(
+        &self,
+        channel_arn: &str,
+        names: &IdentityNameDirectory,
+    ) -> ChannelBan {
         ChannelBan {
-            member: Some(identity_of(&self.member_arn)),
+            member: Some(identity_of(&self.member_arn, names)),
             channel_arn: Some(channel_arn.to_string()),
             created_timestamp: Some(date_time(self.created_millis)),
-            created_by: Some(self.created_by.clone()),
+            created_by: Some(identity_of(&self.created_by_arn, names)),
         }
     }
 
     /// The modelled `ChannelBanSummary`, as `ListChannelBans` returns it.
-    pub fn to_summary(&self) -> ChannelBanSummary {
+    pub fn to_summary(&self, names: &IdentityNameDirectory) -> ChannelBanSummary {
         ChannelBanSummary {
-            member: Some(identity_of(&self.member_arn)),
+            member: Some(identity_of(&self.member_arn, names)),
         }
     }
 }
 
 impl ChannelModeratorRecord {
     /// The modelled `ChannelModerator`, as `DescribeChannelModerator` returns it.
-    pub fn to_channel_moderator(&self, channel_arn: &str) -> ChannelModerator {
+    pub fn to_channel_moderator(
+        &self,
+        channel_arn: &str,
+        names: &IdentityNameDirectory,
+    ) -> ChannelModerator {
         ChannelModerator {
-            moderator: Some(identity_of(&self.moderator_arn)),
+            moderator: Some(identity_of(&self.moderator_arn, names)),
             channel_arn: Some(channel_arn.to_string()),
             created_timestamp: Some(date_time(self.created_millis)),
-            created_by: Some(self.created_by.clone()),
+            created_by: Some(identity_of(&self.created_by_arn, names)),
         }
     }
 
     /// The modelled `ChannelModeratorSummary`, as `ListChannelModerators` returns it.
-    pub fn to_summary(&self) -> ChannelModeratorSummary {
+    pub fn to_summary(&self, names: &IdentityNameDirectory) -> ChannelModeratorSummary {
         ChannelModeratorSummary {
-            moderator: Some(identity_of(&self.moderator_arn)),
+            moderator: Some(identity_of(&self.moderator_arn, names)),
         }
     }
 }
@@ -906,15 +935,21 @@ pub fn millis_of(value: &DateTime) -> i64 {
         .saturating_add(i64::from(value.subsec_nanos() / 1_000_000))
 }
 
-/// The `Identity` of the caller named by the `x-amz-chime-bearer` ARN.
+/// The identity NAME directory this service reads an [`Identity`]'s `Name` out of.
+pub type IdentityNameDirectory = ::service_common::chime_identity_names::ChimeIdentityNameDirectory;
+
+/// The modelled `Identity` of the `AppInstanceUser` or `AppInstanceBot` `identity_arn`
+/// names: its ARN, and the `Name` it is registered under.
 ///
-/// Only `Arn` is filled: an `AppInstanceUser`'s `Name` is held by the Chime SDK Identity
-/// service, which this emulator cannot read from here, and the member is optional — so
-/// inventing a name would be inventing state.
-pub fn identity_of(bearer_arn: &str) -> Identity {
+/// The name is not this service's own state — an identity is registered, renamed and
+/// deleted through Chime SDK Identity — so it is read from the family's shared directory
+/// ([`identity_names`]) at the moment the response is built. An identity the directory
+/// holds no entry for carries no name, which is what the optional member says: nothing is
+/// invented for it.
+pub fn identity_of(identity_arn: &str, names: &IdentityNameDirectory) -> Identity {
     Identity {
-        arn: Some(bearer_arn.to_string()),
-        name: None,
+        arn: Some(identity_arn.to_string()),
+        name: names.name_of(identity_arn).map(str::to_string),
     }
 }
 
@@ -997,6 +1032,30 @@ pub fn chime_tags<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<::service_common::chime_tags::ChimeTagDirectory>)
+}
+
+/// The SHARED Chime IDENTITY NAME directory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// The name an `AppInstanceUser` or `AppInstanceBot` is registered under is a resource of
+/// the Chime SDK Identity service, which publishes it in ONE ARN-keyed directory
+/// ([`::service_common::chime_identity_names::ChimeIdentityNameDirectory`]); this service
+/// READS it, because every participant it reports — a channel's creator, a message's
+/// sender, a member, a banned member, a moderator, an inviter — is an `Identity` of an ARN
+/// and that name. The engine keys state by TYPE, so a copy of its own inside
+/// [`ComAmazonawsChimesdkmessagingChimemessagingserviceState`] would never see what the
+/// identity service wrote.
+///
+/// LOCK ORDER: a reader takes [`service_state`] first and this directory second, and never
+/// the other way round, so the order cannot invert.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn identity_names<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<IdentityNameDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<IdentityNameDirectory>)
 }
 
 /// The `aws.api#service$arnNamespace` a `LambdaFunctionArn` carries, which is what

@@ -174,6 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the Chime tag directory is unavailable".to_string()),
             })
         })?;
+        // A bot is an identity too, so the name it is created with goes in the family's
+        // shared identity NAME directory beside a user's; resolved before anything is
+        // written so a create cannot half-succeed.
+        let name_directory = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            CreateAppInstanceBotErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime identity name directory is unavailable".to_string()),
+            })
+        })?;
         let mut state = state.lock();
 
         // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
@@ -230,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::AppInstanceBotRecord {
             arn: arn.clone(),
             app_instance_arn: input.app_instance_arn.clone(),
-            name: input.name,
+            name: input.name.clone(),
             metadata: input.metadata,
             configuration: input.configuration,
             created_timestamp: now,
@@ -274,6 +283,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The bot is stored either way; at the structural token ceiling the token is
         // simply not recorded, so the map cannot grow past it.
         let _recorded = state.record_idempotency(Self::NAME, &input.client_request_token, &arn);
+        // `Name` is optional on a bot, and a bot created without one has no name to
+        // publish: the directory holds what was registered, never a placeholder.
+        if let Some(name) = &input.name {
+            name_directory.lock().register(&arn, name);
+        }
         if !tags.is_empty() {
             tag_directory.lock().tag(&arn, tags);
         }

@@ -642,6 +642,10 @@ mod marketplace_signing_name_routing;
 // is the quietest span in the file.
 #[path = "all/chime_app_instance_admin_authorization.rs"]
 mod chime_app_instance_admin_authorization;
+// Declared in this same quiet `n`/`o` gap, beside the other cross-service Chime suite and
+// for the reason the entry above records.
+#[path = "all/chime_identity_name_projection.rs"]
+mod chime_identity_name_projection;
 // Declared HERE, in the sorted list, rather than appended at the end of this file: the
 // tail is where every landing in the same window appends, so it is the contended region,
 // while this span of the sorted list is untouched by those appends.

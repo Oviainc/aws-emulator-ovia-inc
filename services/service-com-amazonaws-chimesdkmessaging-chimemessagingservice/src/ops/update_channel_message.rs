@@ -234,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // Editing is the SENDER's own capability: nobody else rewrites a member's words.
-        if message.sender.arn.as_deref() != Some(input.chime_bearer.as_str()) {
+        if message.sender_arn != input.chime_bearer {
             return Err(forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE));
         }
         // A redacted message has no content left to edit, and restoring content the

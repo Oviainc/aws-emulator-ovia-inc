@@ -172,6 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the channel store is unavailable".to_string()),
             })
         })?;
+        // The moderator's `Name` is the one the identity service published for it, which
+        // this response reports beside its ARN; resolved before the store is locked, so the
+        // lock order (this service's store first, the shared directory second) cannot
+        // invert.
+        let names = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            CreateChannelModeratorErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the identity name directory is unavailable".to_string()),
+            })
+        })?;
 
         let now = crate::state::now_millis();
         let mut store = state.lock();
@@ -207,14 +217,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .moderators
                 .push(crate::state::ChannelModeratorRecord {
                     moderator_arn: input.channel_moderator_arn.clone(),
-                    created_by: crate::state::identity_of(&input.chime_bearer),
+                    created_by_arn: input.chime_bearer.clone(),
                     created_millis: now,
                 });
         }
 
+        let names = names.lock();
         Ok(CreateChannelModeratorOutput {
             channel_arn: Some(channel.arn.clone()),
-            channel_moderator: Some(crate::state::identity_of(&input.channel_moderator_arn)),
+            channel_moderator: Some(crate::state::identity_of(
+                &input.channel_moderator_arn,
+                &names,
+            )),
         })
     }
 }

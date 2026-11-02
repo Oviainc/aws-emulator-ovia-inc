@@ -179,6 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the Chime tag directory is unavailable".to_string()),
             })
         })?;
+        // A deleted identity leaves no published name behind either, so the family's shared
+        // identity NAME directory is resolved before the delete and the entry dropped with
+        // the resource.
+        let name_directory = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            DeleteAppInstanceBotErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime identity name directory is unavailable".to_string()),
+            })
+        })?;
         let mut state = state.lock();
 
         if state.remove_bot(&input.app_instance_bot_arn).is_none() {
@@ -197,6 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         tag_directory.lock().forget(&input.app_instance_bot_arn);
+        name_directory.lock().forget(&input.app_instance_bot_arn);
 
         Ok(DeleteAppInstanceBotOutput)
     }

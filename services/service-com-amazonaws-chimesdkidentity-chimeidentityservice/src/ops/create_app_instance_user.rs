@@ -175,6 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the Chime tag directory is unavailable".to_string()),
             })
         })?;
+        // The name the user is registered under goes in the family's shared identity NAME
+        // directory, which is where the sibling that reports a channel participant reads it
+        // from; resolved before anything is written so a create cannot half-succeed.
+        let name_directory = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            CreateAppInstanceUserErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime identity name directory is unavailable".to_string()),
+            })
+        })?;
         let mut state = state.lock();
 
         // The user ARN is the parent's ARN plus the caller's id, so it is fully
@@ -220,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
             app_instance_arn: input.app_instance_arn.clone(),
             user_id: input.app_instance_user_id.clone(),
-            name: input.name,
+            name: input.name.clone(),
             metadata: input.metadata,
             created_timestamp: now,
             // A user carries a last-updated instant from the moment it is created.
@@ -281,6 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The user is stored either way; at the structural token ceiling the token is
         // simply not recorded, so the map cannot grow past it.
         let _recorded = state.record_idempotency(Self::NAME, &input.client_request_token, &arn);
+        name_directory.lock().register(&arn, &input.name);
         if !tags.is_empty() {
             tag_directory.lock().tag(&arn, tags);
         }

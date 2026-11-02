@@ -161,6 +161,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the channel store is unavailable".to_string()),
             })
         })?;
+        // `Sender` carries the sending identity's `Name` beside its ARN, which the identity
+        // service published in the family's shared directory; resolved before the store is
+        // locked, so the lock order (this service's store first, the shared directory
+        // second) cannot invert.
+        let names = crate::state::identity_names(&*self.engine).ok_or_else(|| {
+            GetChannelMessageErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the identity name directory is unavailable".to_string()),
+            })
+        })?;
 
         // Sub-channels exist only on elastic channels, which this slice does not serve.
         if let Some(sub_channel_id) = &input.sub_channel_id {
@@ -192,8 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE)
         })?;
 
+        let names = names.lock();
         Ok(GetChannelMessageOutput {
-            channel_message: Some(message.to_channel_message(&channel.arn)),
+            channel_message: Some(message.to_channel_message(&channel.arn, &names)),
         })
     }
 }

@@ -21,6 +21,8 @@ mod channel_messaging;
 mod channel_resource_refusals;
 #[path = "all/channel_updates.rs"]
 mod channel_updates;
+#[path = "all/identity_names.rs"]
+mod identity_names;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/service_claim.rs"]
