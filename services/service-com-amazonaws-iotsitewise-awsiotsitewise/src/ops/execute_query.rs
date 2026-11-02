@@ -12,6 +12,18 @@
 //! statements they admit or which rows they read. Changing this operation's own wire
 //! behaviour stays here; changing the engine changes all of them.
 //!
+//! ## What the engine runs
+//!
+//! A query statement is a RELATIONAL expression over the views the IoT SiteWise
+//! query language documents, so the engine computes relations and composes them:
+//! a view read off the store, joined (`ON`, `USING`, `NATURAL`, inner, outer or
+//! cross), filtered, grouped and aggregated, `HAVING`-filtered, projected through
+//! computed expressions, de-duplicated, combined by a set operation, read as a
+//! subquery or a `WITH` definition, ordered and paged. A statement the language
+//! does NOT carry is answered with one of this operation's modelled errors — an
+//! error outside that set is one no generated client carries an exception class
+//! for, so no caller could catch it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -327,42 +339,38 @@ pub(crate) async fn run_statement(
     // Every step of the run is charged against ONE budget: a wall-clock deadline,
     // a row-work step budget and an expression-depth ceiling.
     let budget = Budget::new();
-    let view = view_of(plan(&owned)?)?;
+    // Everything that depends only on the STATEMENT is decided before the store is
+    // read: `plan` refuses a clause this engine does not run and answers which
+    // relations the statement names — its own, its joins' and its subqueries' — so a
+    // statement it cannot plan never takes the shared state lock at all.
+    let views = plan(&owned)?;
     // How long the run takes is MEASURED from here — the instant the store is first
     // read — to the instant the interpretation answers, because that span is the
     // work the engine did and is what a query's reported execution time is.
     let started = ::std::time::Instant::now();
-    // The store is held only while the view's rows are read off it. Filtering,
-    // ordering and projecting the caller's statement then run WITHOUT the shared
-    // state lock, so no query can hold it for the length of its own
+    // The store is held only while the rows of those relations are copied off it.
+    // Joining, filtering, grouping, ordering and projecting then run WITHOUT the
+    // shared state lock, so no query can hold it for the length of its own
     // interpretation.
-    let (columns, rows) = {
+    let catalog = {
         let store = state.lock();
-        materialise(&store, &view.view, &budget)?
+        snapshot(&store, &views, &budget)?
     };
-    // How many BYTES of stored cells the run read, summed before the rows move into
-    // the task below. Counted off the materialised rows themselves, so it is what
-    // this run actually scanned rather than a figure standing in for it; `Cell::chars`
-    // answers a cell's BYTE length (see its own documentation), which is what a
-    // `bytesScanned` figure is reported in.
-    let bytes_scanned = rows
-        .iter()
-        .flat_map(|row| row.iter().map(Cell::chars))
-        .sum::<usize>();
+    // How many BYTES of stored cells the run read, summed off the rows themselves
+    // before they move into the task below, so it is what this run actually scanned
+    // rather than a figure standing in for it; `Cell::chars` answers a cell's BYTE
+    // length (see its own documentation), which is what a `bytesScanned` figure is
+    // reported in.
+    let bytes_scanned = catalog.bytes_held();
     // The interpretation itself is CPU-bound and synchronous, so it runs on a
     // blocking worker under a wall-clock timeout rather than on the async
     // runtime's: a request that spends its whole budget cannot pin a runtime
     // worker, and this call has somewhere to land when it is cancelled or the
-    // server is shutting down. The statement MOVES into the task, and `plan` runs
-    // again there because the borrow it answers cannot cross that move; it is a
-    // total check over an already-admitted statement, so it cannot refuse what
-    // the call above accepted.
+    // server is shutting down. The statement and the rows it reads both MOVE into
+    // the task.
     let result = ::tokio::time::timeout(
         MAX_QUERY_TIME,
-        ::tokio::task::spawn_blocking(move || {
-            let select = plan(&owned)?;
-            run_select(select, &owned, columns, rows, &view, &budget)
-        }),
+        ::tokio::task::spawn_blocking(move || run_query(&owned, &catalog, &budget, 0)),
     )
     .await
     .map_err(|_| {
@@ -380,7 +388,11 @@ pub(crate) async fn run_statement(
     })??;
 
     Ok(QueryRun {
-        columns: result.columns,
+        columns: result
+            .columns
+            .iter()
+            .map(|column| (column.name.clone(), column.scalar_type))
+            .collect(),
         rows: result.rows,
         bytes_scanned: u64::try_from(bytes_scanned).unwrap_or(u64::MAX),
         elapsed: started.elapsed(),
@@ -462,9 +474,16 @@ impl QueryRun {
 #[derive(Debug)]
 pub(crate) enum QueryFailure<'a> {
     /// The statement is not one this service can answer at all: a syntax error, a
-    /// view or column the catalog does not hold, a clause whose value is wrong.
+    /// view or column the catalog does not hold, a clause whose value is wrong, or a
+    /// clause the query language this service answers does not carry.
     Invalid(&'a str),
-    /// Valid SQL a real service would answer that this engine has not written.
+    /// A construct the engine answered in the scaffold's 501 channel rather than
+    /// with one of the operation's modelled errors.
+    ///
+    /// The engine itself produces NONE of these: a statement outside the query
+    /// language is the modelled invalid request, because an error outside an
+    /// operation's modelled set is one no generated client carries a class for. The
+    /// channel can still carry a 501, so the classification stays total.
     Unsupported(&'a str),
     /// The statement outran the engine's budget, so the run did not finish.
     Timeout(&'a str),
@@ -687,7 +706,22 @@ const PREFIX_FORMS: [&str; 3] = ["NOT", "CASE", "WHEN"];
 /// The operators spelled as words rather than punctuation. Counted by
 /// [`parse_nesting`] beside the punctuation ones, so a chain of either shape is
 /// bounded by [`MAX_OPERATORS`].
-const OPERATOR_WORDS: [&str; 6] = ["AND", "OR", "IN", "LIKE", "BETWEEN", "IS"];
+///
+/// The set-operation keywords are counted among them: each chains a tree the parser
+/// builds ITERATIVELY — exactly the shape the nesting measure cannot see — and the
+/// walk of that tree is as deep as the chain is long.
+const OPERATOR_WORDS: [&str; 10] = [
+    "AND",
+    "OR",
+    "IN",
+    "LIKE",
+    "BETWEEN",
+    "IS",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "MINUS",
+];
 
 /// How many items one statement's projection may carry, and how many keys its
 /// `ORDER BY` may name.
@@ -700,6 +734,29 @@ const OPERATOR_WORDS: [&str; 6] = ["AND", "OR", "IN", "LIKE", "BETWEEN", "IS"];
 const MAX_PROJECTION_ITEMS: usize = 64;
 /// See [`MAX_PROJECTION_ITEMS`].
 const MAX_ORDER_BY_KEYS: usize = 8;
+
+/// How many levels of subquery one statement may nest: a `WITH` definition, a
+/// relation in a `FROM` clause, a subquery in a predicate.
+///
+/// Each level is a relation computed in full before the level around it reads it, so
+/// the depth bounds both the recursion of this engine's walk and how many relations
+/// one statement can hold at once. The emulator's own bound.
+const MAX_SUBQUERY_DEPTH: usize = 8;
+
+/// How many relations one statement may JOIN, and how many a `WITH` clause may
+/// define.
+///
+/// A join is a per-row MULTIPLIER — the pairs it considers are the product of its
+/// two sides — so the count carries a ceiling of its own beside the row-work budget
+/// that product is charged against. The emulator's own bounds.
+const MAX_JOINS: usize = 8;
+/// See [`MAX_JOINS`].
+const MAX_CTES: usize = 8;
+
+/// How many keys one `GROUP BY` may name. Each is evaluated once per row and enters
+/// the key the rows are grouped by, so the list is a per-row multiplier the way the
+/// `ORDER BY` is. The emulator's own bound.
+const MAX_GROUP_BY_KEYS: usize = 8;
 
 /// How many COLUMNS a result row may carry, once `*` has been expanded.
 ///
@@ -940,22 +997,134 @@ impl Cell {
     }
 }
 
-/// One column of a view: the name a statement selects it by and the `ScalarType`
-/// the result reports for it.
+/// One column of a VIEW the store materialises: the name a statement selects it by
+/// and the `ScalarType` the result reports for it.
 #[derive(Debug, Clone, Copy)]
-struct Column {
+struct ViewColumn {
     name: &'static str,
     /// A `ScalarType` value. Source: `smithy_query(query="shape",
     /// shape="ScalarType")` — BOOLEAN | INT | DOUBLE | TIMESTAMP | STRING.
     scalar_type: &'static str,
 }
 
-/// A computed result set: the columns the statement projects — each the name the
-/// result reports it under and its `ScalarType` — and its rows.
-#[derive(Debug)]
-struct ResultSet {
-    columns: Vec<(String, &'static str)>,
+/// One column of a RELATION this engine computes over: the name it answers to, the
+/// `ScalarType` of its cells, and the qualifier a statement may write in front of
+/// its name.
+#[derive(Debug, Clone)]
+struct Column {
+    name: String,
+    scalar_type: &'static str,
+    /// The relation name this column belongs to — a view's own name, or the alias a
+    /// `FROM` clause gave it, which is what a qualified identifier names it by. A
+    /// column of a COMPUTED relation (a projection, a set operation) answers to no
+    /// qualifier until a subquery alias gives it one.
+    qualifier: Option<String>,
+}
+
+impl Column {
+    /// Whether this column is one the view declares NUMERIC, which is what decides
+    /// how its cells compare and sort: a `STRING` column holding digits is not
+    /// quietly compared as the number it looks like.
+    fn numeric(&self) -> bool {
+        is_numeric(self.scalar_type)
+    }
+}
+
+/// Whether `scalar_type` is one of the `ScalarType` values that carries a NUMBER.
+fn is_numeric(scalar_type: &str) -> bool {
+    matches!(scalar_type, "INT" | "DOUBLE" | "TIMESTAMP")
+}
+
+/// A relation: the columns every one of its rows carries, and the rows.
+///
+/// Everything this engine runs is a function from relations to a relation — a view
+/// read off the store, a join of two of them, a grouped projection, a set operation,
+/// a subquery — so ONE type carries all of them and the clauses compose, instead of
+/// each clause having to know that the statement reads a single view.
+#[derive(Debug, Clone, Default)]
+struct Relation {
+    columns: Vec<Column>,
     rows: Vec<Vec<Cell>>,
+}
+
+impl Relation {
+    /// This relation read under `qualifier`: the name the `FROM` clause gives it,
+    /// which is what its columns may be qualified by. An alias REPLACES the name the
+    /// relation was read under, as SQL scopes it, so a statement that joins one view
+    /// to itself addresses the two sides by their own aliases.
+    fn qualified(mut self, qualifier: &str) -> Self {
+        for column in &mut self.columns {
+            column.qualifier = Some(qualifier.to_ascii_lowercase());
+        }
+        self
+    }
+
+    /// How many BYTES of cells this relation holds; see [`Cell::chars`].
+    fn bytes(&self) -> usize {
+        self.rows
+            .iter()
+            .flat_map(|row| row.iter().map(Cell::chars))
+            .sum()
+    }
+}
+
+/// The relations a statement can read BY NAME: the views this engine materialised
+/// off the store, and the common table expressions the statement defined.
+///
+/// Cloned per `WITH` level — the clone copies the names and SHARES the relations
+/// themselves — so a name one level defines shadows an outer one for that level
+/// alone.
+#[derive(Debug, Clone, Default)]
+struct Catalog {
+    relations: ::std::collections::BTreeMap<String, ::std::sync::Arc<Relation>>,
+}
+
+impl Catalog {
+    /// How many bytes of stored cells this snapshot of the store holds. What a run
+    /// over it SCANNED: the rows were copied off the store before the run began, so
+    /// this is what it read and not a figure standing in for it.
+    fn bytes_held(&self) -> usize {
+        self.relations
+            .values()
+            .map(|relation| relation.bytes())
+            .sum()
+    }
+
+    /// This catalog with `name` bound to `relation`, shadowing any outer binding.
+    fn with(&self, name: &str, relation: Relation) -> Self {
+        let mut extended = self.clone();
+        extended
+            .relations
+            .insert(name.to_ascii_lowercase(), ::std::sync::Arc::new(relation));
+        extended
+    }
+}
+
+/// What one LEVEL of a statement runs with: the budget every step charges against,
+/// the relations that level reads by name, and the subqueries it has already run.
+///
+/// The memo is what keeps an uncorrelated subquery from being run once per row. A
+/// subquery resolves its columns against its OWN relations only, so one that
+/// resolves at all answers the same rows whichever row of the statement around it is
+/// being evaluated, and its result is read back by the text it was written as. A
+/// level's memo is its own, so a name a nested `WITH` rebinds cannot make one level's
+/// result answer for another's.
+struct Run<'a> {
+    budget: &'a Budget,
+    catalog: &'a Catalog,
+    memo: ::std::cell::RefCell<
+        ::std::collections::BTreeMap<String, ::std::sync::Arc<Relation>>,
+    >,
+}
+
+impl<'a> Run<'a> {
+    fn new(catalog: &'a Catalog, budget: &'a Budget) -> Self {
+        Self {
+            budget,
+            catalog,
+            memo: ::std::cell::RefCell::new(::std::collections::BTreeMap::new()),
+        }
+    }
 }
 
 /// The `asset` view: one row per stored asset.
@@ -965,110 +1134,282 @@ struct ResultSet {
 /// ("Query your asset data"); the Smithy model carries none, since `queryStatement`
 /// is an opaque string. A statement naming a view or a column that is not here is
 /// refused rather than answered from a guess.
-const ASSET_VIEW: &[Column] = &[
-    Column { name: "asset_id", scalar_type: "STRING" },
-    Column { name: "asset_name", scalar_type: "STRING" },
-    Column { name: "asset_description", scalar_type: "STRING" },
-    Column { name: "asset_model_id", scalar_type: "STRING" },
-    Column { name: "asset_external_id", scalar_type: "STRING" },
+const ASSET_VIEW: &[ViewColumn] = &[
+    ViewColumn { name: "asset_id", scalar_type: "STRING" },
+    ViewColumn { name: "asset_name", scalar_type: "STRING" },
+    ViewColumn { name: "asset_description", scalar_type: "STRING" },
+    ViewColumn { name: "asset_model_id", scalar_type: "STRING" },
+    ViewColumn { name: "asset_external_id", scalar_type: "STRING" },
 ];
 
 /// The `asset_property` view: one row per property of every stored asset.
-const ASSET_PROPERTY_VIEW: &[Column] = &[
-    Column { name: "asset_id", scalar_type: "STRING" },
-    Column { name: "property_id", scalar_type: "STRING" },
-    Column { name: "property_name", scalar_type: "STRING" },
-    Column { name: "property_alias", scalar_type: "STRING" },
-    Column { name: "property_external_id", scalar_type: "STRING" },
-    Column { name: "asset_composite_model_id", scalar_type: "STRING" },
-    Column { name: "data_type", scalar_type: "STRING" },
+const ASSET_PROPERTY_VIEW: &[ViewColumn] = &[
+    ViewColumn { name: "asset_id", scalar_type: "STRING" },
+    ViewColumn { name: "property_id", scalar_type: "STRING" },
+    ViewColumn { name: "property_name", scalar_type: "STRING" },
+    ViewColumn { name: "property_alias", scalar_type: "STRING" },
+    ViewColumn { name: "property_external_id", scalar_type: "STRING" },
+    ViewColumn { name: "asset_composite_model_id", scalar_type: "STRING" },
+    ViewColumn { name: "data_type", scalar_type: "STRING" },
 ];
 
 /// The `raw_time_series` view: one row per stored sample, and the shape
 /// `latest_value_time_series` carries too.
-const TIME_SERIES_VIEW: &[Column] = &[
-    Column { name: "asset_id", scalar_type: "STRING" },
-    Column { name: "property_id", scalar_type: "STRING" },
-    Column { name: "property_alias", scalar_type: "STRING" },
-    Column { name: "event_timestamp", scalar_type: "TIMESTAMP" },
-    Column { name: "quality", scalar_type: "STRING" },
-    Column { name: "boolean_value", scalar_type: "BOOLEAN" },
-    Column { name: "int_value", scalar_type: "INT" },
-    Column { name: "double_value", scalar_type: "DOUBLE" },
-    Column { name: "string_value", scalar_type: "STRING" },
+const TIME_SERIES_VIEW: &[ViewColumn] = &[
+    ViewColumn { name: "asset_id", scalar_type: "STRING" },
+    ViewColumn { name: "property_id", scalar_type: "STRING" },
+    ViewColumn { name: "property_alias", scalar_type: "STRING" },
+    ViewColumn { name: "event_timestamp", scalar_type: "TIMESTAMP" },
+    ViewColumn { name: "quality", scalar_type: "STRING" },
+    ViewColumn { name: "boolean_value", scalar_type: "BOOLEAN" },
+    ViewColumn { name: "int_value", scalar_type: "INT" },
+    ViewColumn { name: "double_value", scalar_type: "DOUBLE" },
+    ViewColumn { name: "string_value", scalar_type: "STRING" },
 ];
 
-/// Check the clauses this engine runs and answer the statement's `SELECT`.
+/// The `precomputed_aggregates` view: one row per window of every stored series, at
+/// each of the resolutions IoT SiteWise computes aggregates at.
+///
+/// The aggregates are DERIVED from the samples the store holds, by the one engine
+/// this service reduces a series with (`crate::state::aggregated_values`), so a
+/// window answers here exactly what the aggregate operations answer for it —
+/// including WHICH instant stamps it: `event_timestamp` is the instant the window
+/// ENDS, because that is the instant those operations report a window at, and the
+/// view and they read one engine. `count` is reported as a `DOUBLE` because that is
+/// the type the modelled `Aggregates` member carries.
+const PRECOMPUTED_AGGREGATES_VIEW: &[ViewColumn] = &[
+    ViewColumn { name: "asset_id", scalar_type: "STRING" },
+    ViewColumn { name: "property_id", scalar_type: "STRING" },
+    ViewColumn { name: "property_alias", scalar_type: "STRING" },
+    ViewColumn { name: "event_timestamp", scalar_type: "TIMESTAMP" },
+    ViewColumn { name: "resolution", scalar_type: "STRING" },
+    ViewColumn { name: "average_value", scalar_type: "DOUBLE" },
+    ViewColumn { name: "count_value", scalar_type: "DOUBLE" },
+    ViewColumn { name: "maximum_value", scalar_type: "DOUBLE" },
+    ViewColumn { name: "minimum_value", scalar_type: "DOUBLE" },
+    ViewColumn { name: "standard_deviation_value", scalar_type: "DOUBLE" },
+    ViewColumn { name: "sum_value", scalar_type: "DOUBLE" },
+];
+
+/// Every view this service's query catalog exposes, in the order a refusal names
+/// them. Source: the same query-language reference the column lists above come from.
+const VIEWS: [&str; 5] = [
+    "asset",
+    "asset_property",
+    "raw_time_series",
+    "latest_value_time_series",
+    "precomputed_aggregates",
+];
+
+/// The columns of the view `view` names, or `None` when the catalog holds no such
+/// view.
+fn view_columns(view: &str) -> Option<&'static [ViewColumn]> {
+    match view {
+        "asset" => Some(ASSET_VIEW),
+        "asset_property" => Some(ASSET_PROPERTY_VIEW),
+        "raw_time_series" | "latest_value_time_series" => Some(TIME_SERIES_VIEW),
+        "precomputed_aggregates" => Some(PRECOMPUTED_AGGREGATES_VIEW),
+        _ => None,
+    }
+}
+
+/// The columns of one materialised view, as the relation that reads it under its own
+/// name.
+fn view_relation(view: &str, columns: &'static [ViewColumn], rows: Vec<Vec<Cell>>) -> Relation {
+    Relation {
+        columns: columns
+            .iter()
+            .map(|column| Column {
+                name: column.name.to_string(),
+                scalar_type: column.scalar_type,
+                qualifier: Some(view.to_string()),
+            })
+            .collect(),
+        rows,
+    }
+}
+
+/// The relations a statement reads, copied off the store under ONE lock.
+///
+/// A view is materialised once however many times the statement names it — a
+/// self-join reads the store once and pairs the rows it already holds — and a name
+/// that is not a view is left out, because it is either a `WITH` definition or a view
+/// that does not exist, which is decided where the `FROM` clause resolves it.
+fn snapshot(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    views: &[String],
+    budget: &Budget,
+) -> Result<Catalog, ExecuteQueryError> {
+    let mut catalog = Catalog::default();
+    for view in views {
+        if catalog.relations.contains_key(view) {
+            continue;
+        }
+        if view_columns(view).is_none() {
+            continue;
+        }
+        let relation = materialise(store, view, budget)?;
+        catalog
+            .relations
+            .insert(view.clone(), ::std::sync::Arc::new(relation));
+    }
+    Ok(catalog)
+}
+
+/// Check the clauses this engine runs, and answer the names of the relations the
+/// statement reads.
 ///
 /// Everything that depends only on the STATEMENT is decided here, before the store
 /// is touched, so a statement this engine does not plan never takes the shared
-/// state lock at all.
+/// state lock at all. The names come back so that every view the statement reads —
+/// its own, its joins' and its subqueries' — is copied off the store once, under
+/// one lock.
 ///
 /// Both the query and its select are DESTRUCTURED field by field rather than read
 /// member by member: a clause this engine does not run has to be answered — with
-/// the 501 that says so, or with a modelled refusal — and never dropped, since
-/// dropping a clause the caller wrote answers a different question with 200. The
-/// destructuring is what keeps that true: a field the parser gains later fails the
-/// build here instead of being ignored by accident.
-fn plan(
-    query: &::sqlparser::ast::Query,
-) -> Result<&::sqlparser::ast::Select, ExecuteQueryError> {
-    use ::sqlparser::ast::{GroupByExpr, SetExpr};
+/// the modelled refusal that says the query language does not carry it — and never
+/// dropped, since dropping a clause the caller wrote answers a different question
+/// with 200. The destructuring is what keeps that true: a field the parser gains
+/// later fails the build here instead of being ignored by accident.
+fn plan(query: &::sqlparser::ast::Query) -> Result<Vec<String>, ExecuteQueryError> {
+    let mut relations = Vec::new();
+    plan_query(query, &mut relations, 0)?;
+    Ok(relations)
+}
 
+/// Plan one query LEVEL, collecting into `relations` every name its `FROM` clauses
+/// read. See [`plan`].
+fn plan_query(
+    query: &::sqlparser::ast::Query,
+    relations: &mut Vec<String>,
+    depth: usize,
+) -> Result<(), ExecuteQueryError> {
+    use ::sqlparser::ast::OrderByKind;
+    if depth > MAX_SUBQUERY_DEPTH {
+        return Err(invalid_request(format!(
+            "The query statement nests subqueries more than {MAX_SUBQUERY_DEPTH} \
+             levels deep."
+        )));
+    }
     let ::sqlparser::ast::Query {
         with,
         body,
-        // Read where they are used: `run_select` orders by the one and pages by the
-        // other.
-        order_by: _,
+        order_by,
+        // Read where they are used: `page_of` pages by the one and by the other.
         limit_clause: _,
-        fetch,
+        fetch: _,
         locks,
         for_clause,
         settings,
         format_clause,
         pipe_operators,
     } = query;
-    if with.is_some() {
-        return Err(unsupported("a WITH clause"));
-    }
-    if fetch.is_some() {
-        return Err(unsupported("a FETCH clause"));
-    }
     if !locks.is_empty() {
-        return Err(unsupported("a locking clause"));
+        return Err(not_in_the_language("a locking clause"));
     }
     if for_clause.is_some() {
-        return Err(unsupported("a FOR clause"));
+        return Err(not_in_the_language("a FOR clause"));
     }
     if settings.is_some() {
-        return Err(unsupported("a SETTINGS clause"));
+        return Err(not_in_the_language("a SETTINGS clause"));
     }
     if format_clause.is_some() {
-        return Err(unsupported("a FORMAT clause"));
+        return Err(not_in_the_language("a FORMAT clause"));
     }
     if !pipe_operators.is_empty() {
-        return Err(unsupported("a pipe operator"));
+        return Err(not_in_the_language("a pipe operator"));
     }
+    if let Some(with) = with {
+        // A RECURSIVE definition reads itself, so how much work it asks for is not a
+        // function of the statement's own size — and it is not part of the query
+        // language this service answers.
+        if with.recursive {
+            return Err(not_in_the_language("a recursive WITH clause"));
+        }
+        if with.cte_tables.len() > MAX_CTES {
+            return Err(invalid_request(format!(
+                "A WITH clause defines at most {MAX_CTES} relations, but this one \
+                 defines {}.",
+                with.cte_tables.len()
+            )));
+        }
+        for cte in &with.cte_tables {
+            plan_query(&cte.query, relations, depth + 1)?;
+        }
+    }
+    if let Some(order_by) = order_by {
+        let OrderByKind::Expressions(expressions) = &order_by.kind else {
+            return Err(not_in_the_language("an ORDER BY ALL clause"));
+        };
+        if expressions.len() > MAX_ORDER_BY_KEYS {
+            return Err(invalid_request(format!(
+                "An ORDER BY names at most {MAX_ORDER_BY_KEYS} keys, but this one \
+                 names {}.",
+                expressions.len()
+            )));
+        }
+        for expression in expressions {
+            plan_expr(&expression.expr, relations, depth)?;
+        }
+    }
+    plan_set_expr(body, relations, depth)
+}
 
-    let SetExpr::Select(select) = body.as_ref() else {
-        return Err(unsupported(
-            "a query body that is not a single SELECT (a set operation, VALUES or a subquery)",
-        ));
-    };
+/// Plan a query BODY: one `SELECT`, a set operation over two of them, or a
+/// parenthesised query. See [`plan`].
+fn plan_set_expr(
+    body: &::sqlparser::ast::SetExpr,
+    relations: &mut Vec<String>,
+    depth: usize,
+) -> Result<(), ExecuteQueryError> {
+    use ::sqlparser::ast::{SetExpr, SetQuantifier};
+    match body {
+        SetExpr::Select(select) => plan_select(select, relations, depth),
+        SetExpr::Query(query) => plan_query(query, relations, depth + 1),
+        SetExpr::SetOperation {
+            // Which operators this engine runs is answered where it runs them
+            // ([`set_operation`]), over the relations the two sides compute.
+            op: _,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            match set_quantifier {
+                SetQuantifier::All | SetQuantifier::Distinct | SetQuantifier::None => {}
+                other => {
+                    return Err(not_in_the_language(&format!(
+                        "a set operation qualified {other}"
+                    )))
+                }
+            }
+            plan_set_expr(left, relations, depth)?;
+            plan_set_expr(right, relations, depth)
+        }
+        other => Err(invalid_request(format!(
+            "A query statement must be a SELECT query, not {other}."
+        ))),
+    }
+}
+
+/// Plan one `SELECT`. See [`plan`].
+fn plan_select(
+    select: &::sqlparser::ast::Select,
+    relations: &mut Vec<String>,
+    depth: usize,
+) -> Result<(), ExecuteQueryError> {
+    use ::sqlparser::ast::{Distinct, GroupByExpr, SelectItem};
     let ::sqlparser::ast::Select {
         select_token: _,
         distinct,
-        top,
+        // Read by `page_of`: `TOP n` is how many rows the statement asks for.
+        top: _,
         top_before_distinct: _,
         projection,
         exclude,
         into,
-        // Read by `view_of`.
-        from: _,
+        from,
         prewhere,
-        // Read by `run_select`.
-        selection: _,
+        selection,
         group_by,
         cluster_by,
         distribute_by,
@@ -1081,53 +1422,62 @@ fn plan(
         connect_by,
         lateral_views,
         flavor: _,
-    } = select.as_ref();
-    if distinct.is_some() {
-        return Err(unsupported("SELECT DISTINCT"));
-    }
-    if top.is_some() {
-        return Err(unsupported("SELECT TOP"));
+    } = select;
+    if let Some(Distinct::On(_)) = distinct {
+        return Err(not_in_the_language("a DISTINCT ON clause"));
     }
     if exclude.is_some() {
-        return Err(unsupported("an EXCLUDE clause"));
+        return Err(not_in_the_language("an EXCLUDE clause"));
     }
     if into.is_some() {
-        return Err(unsupported("SELECT INTO"));
+        return Err(not_in_the_language("SELECT INTO"));
     }
     if prewhere.is_some() {
-        return Err(unsupported("a PREWHERE clause"));
+        return Err(not_in_the_language("a PREWHERE clause"));
     }
     if !cluster_by.is_empty() {
-        return Err(unsupported("a CLUSTER BY clause"));
+        return Err(not_in_the_language("a CLUSTER BY clause"));
     }
     if !distribute_by.is_empty() {
-        return Err(unsupported("a DISTRIBUTE BY clause"));
+        return Err(not_in_the_language("a DISTRIBUTE BY clause"));
     }
     if !sort_by.is_empty() {
-        return Err(unsupported("a SORT BY clause"));
-    }
-    if having.is_some() {
-        return Err(unsupported("a HAVING clause"));
+        return Err(not_in_the_language("a SORT BY clause"));
     }
     if !named_window.is_empty() {
-        return Err(unsupported("a WINDOW clause"));
+        return Err(not_in_the_language("a WINDOW clause"));
     }
     if qualify.is_some() {
-        return Err(unsupported("a QUALIFY clause"));
+        return Err(not_in_the_language("a QUALIFY clause"));
     }
     if value_table_mode.is_some() {
-        return Err(unsupported("a value-table SELECT"));
+        return Err(not_in_the_language("a value-table SELECT"));
     }
     if connect_by.is_some() {
-        return Err(unsupported("a CONNECT BY clause"));
+        return Err(not_in_the_language("a CONNECT BY clause"));
     }
     if !lateral_views.is_empty() {
-        return Err(unsupported("a LATERAL VIEW clause"));
+        return Err(not_in_the_language("a LATERAL VIEW clause"));
     }
     match group_by {
-        GroupByExpr::Expressions(expressions, modifiers)
-            if expressions.is_empty() && modifiers.is_empty() => {}
-        _ => return Err(unsupported("a GROUP BY clause")),
+        GroupByExpr::Expressions(expressions, modifiers) => {
+            if !modifiers.is_empty() {
+                return Err(not_in_the_language("a GROUP BY modifier"));
+            }
+            // Each key is evaluated once per row and enters the key the rows are
+            // grouped by, so the list is a per-row multiplier and carries a ceiling.
+            if expressions.len() > MAX_GROUP_BY_KEYS {
+                return Err(invalid_request(format!(
+                    "A GROUP BY names at most {MAX_GROUP_BY_KEYS} keys, but this one \
+                     names {}.",
+                    expressions.len()
+                )));
+            }
+            for expression in expressions {
+                plan_expr(expression, relations, depth)?;
+            }
+        }
+        GroupByExpr::All(_) => return Err(not_in_the_language("a GROUP BY ALL clause")),
     }
     // A SELECT projects at least one column. The generic dialect accepts an empty
     // projection list (`SELECT FROM asset`), which no SQL dialect's grammar admits,
@@ -1143,75 +1493,338 @@ fn plan(
             projection.len()
         )));
     }
-    Ok(select)
+    // The relations this SELECT reads, and the subqueries its clauses carry: a
+    // subquery is planned exactly as the statement around it is, so a clause this
+    // engine does not run is answered before the store is read wherever it was
+    // written.
+    plan_from(from, relations, depth)?;
+    for item in projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                plan_expr(expr, relations, depth)?;
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {}
+        }
+    }
+    if let Some(predicate) = selection {
+        plan_expr(predicate, relations, depth)?;
+    }
+    if let Some(predicate) = having {
+        plan_expr(predicate, relations, depth)?;
+    }
+    Ok(())
 }
 
-/// The one view the statement reads, lower-cased.
-///
-/// Exactly one, with no joins: every view this service exposes is readable on its
-/// own, and a join across two of them is a plan this engine does not run.
-fn view_of(select: &::sqlparser::ast::Select) -> Result<Qualified, ExecuteQueryError> {
+/// Plan a `FROM` clause: the relations it reads and the joins across them. See
+/// [`plan`].
+fn plan_from(
+    from: &[::sqlparser::ast::TableWithJoins],
+    relations: &mut Vec<String>,
+    depth: usize,
+) -> Result<(), ExecuteQueryError> {
+    if from.is_empty() {
+        return Err(invalid_request(
+            "A SELECT must read a view in a FROM clause.".to_string(),
+        ));
+    }
+    // How many relations this clause pairs, whichever syntax it wrote them in: a
+    // comma-separated list is a join as much as the keyword is.
+    let joins = from
+        .iter()
+        .map(|table| table.joins.len())
+        .sum::<usize>()
+        .saturating_add(from.len() - 1);
+    if joins > MAX_JOINS {
+        return Err(invalid_request(format!(
+            "A SELECT joins at most {MAX_JOINS} relations, but this one joins {joins}."
+        )));
+    }
+    for table in from {
+        plan_factor(&table.relation, relations, depth)?;
+        for join in &table.joins {
+            plan_factor(&join.relation, relations, depth)?;
+            // Which join shapes this engine runs is decided here, before the store
+            // is read, and the ON predicate is planned like any other.
+            if let (_, Some(::sqlparser::ast::JoinConstraint::On(predicate))) =
+                join_shape(&join.join_operator)?
+            {
+                plan_expr(predicate, relations, depth)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Plan one relation of a `FROM` clause. See [`plan`].
+fn plan_factor(
+    factor: &::sqlparser::ast::TableFactor,
+    relations: &mut Vec<String>,
+    depth: usize,
+) -> Result<(), ExecuteQueryError> {
     use ::sqlparser::ast::TableFactor;
-    let [table] = select.from.as_slice() else {
-        return Err(unsupported(
-            "a FROM clause that does not name exactly one view",
-        ));
-    };
-    if !table.joins.is_empty() {
-        return Err(unsupported("a JOIN"));
-    }
-    let TableFactor::Table { name, alias, .. } = &table.relation else {
-        return Err(unsupported(
-            "a FROM clause whose relation is not a plain view name",
-        ));
-    };
-    Ok(Qualified {
-        view: name.to_string().to_ascii_lowercase(),
-        alias: alias
-            .as_ref()
-            .map(|alias| alias.name.value.to_ascii_lowercase()),
-    })
-}
-
-/// The view a statement reads and the alias it may qualify its columns with.
-#[derive(Debug)]
-struct Qualified {
-    view: String,
-    alias: Option<String>,
-}
-
-impl Qualified {
-    /// Whether `qualifier` names this view: its own name, or the alias the `FROM`
-    /// clause gave it. A qualifier that names neither belongs to no relation the
-    /// statement reads.
-    fn admits(&self, qualifier: &str) -> bool {
-        let qualifier = qualifier.to_ascii_lowercase();
-        qualifier == self.view || self.alias.as_deref() == Some(qualifier.as_str())
+    match factor {
+        TableFactor::Table { name, args, .. } => {
+            if args.is_some() {
+                return Err(not_in_the_language("a table function"));
+            }
+            relations.push(relation_key(name));
+            Ok(())
+        }
+        TableFactor::Derived {
+            lateral,
+            subquery,
+            alias: _,
+        } => {
+            // A LATERAL subquery is evaluated once per row of the relation beside
+            // it, which is a correlation this engine does not run.
+            if *lateral {
+                return Err(not_in_the_language("a LATERAL subquery"));
+            }
+            plan_query(subquery, relations, depth + 1)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias: _,
+        } => plan_from(
+            ::std::slice::from_ref(table_with_joins.as_ref()),
+            relations,
+            depth,
+        ),
+        other => Err(not_in_the_language(&format!(
+            "the FROM clause relation {other}"
+        ))),
     }
 }
 
-/// Run the statement's `WHERE`, `ORDER BY`, `LIMIT`/`OFFSET` and projection over
-/// `rows`, which were read off the store beforehand.
+/// Plan the subqueries an expression carries, collecting the relations they read.
+///
+/// The walk reaches exactly the expression forms this engine EVALUATES
+/// ([`child_expressions`]), so a subquery it can run is always planned; one written
+/// inside a form the evaluator refuses is answered there. It is driven by an
+/// explicit worklist rather than by recursion: the tree is the caller's, so walking
+/// it costs HEAP and not stack however deeply the statement nests.
+fn plan_expr(
+    expr: &::sqlparser::ast::Expr,
+    relations: &mut Vec<String>,
+    depth: usize,
+) -> Result<(), ExecuteQueryError> {
+    use ::sqlparser::ast::{Expr, FunctionArguments};
+    let mut pending: Vec<&::sqlparser::ast::Expr> = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            Expr::InSubquery { subquery, .. } | Expr::Exists { subquery, .. } => {
+                plan_query(subquery, relations, depth + 1)?;
+            }
+            Expr::Subquery(query) => plan_query(query, relations, depth + 1)?,
+            Expr::Function(function) => {
+                if let FunctionArguments::Subquery(query) = &function.args {
+                    plan_query(query, relations, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        pending.extend(child_expressions(expr));
+    }
+    Ok(())
+}
+
+/// The expressions one expression is BUILT from: the children of every form this
+/// engine evaluates, which is what makes a walk over them total for the statements
+/// it runs.
+///
+/// One enumeration, so the walks that ask "does this carry an aggregate?" and "what
+/// subqueries does this carry?" cannot disagree about what an expression contains.
+fn child_expressions(expr: &::sqlparser::ast::Expr) -> Vec<&::sqlparser::ast::Expr> {
+    use ::sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    match expr {
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Cast { expr: inner, .. } => vec![inner.as_ref()],
+        Expr::BinaryOp { left, right, .. } => vec![left.as_ref(), right.as_ref()],
+        Expr::Like { expr, pattern, .. } => vec![expr.as_ref(), pattern.as_ref()],
+        Expr::Between {
+            expr, low, high, ..
+        } => vec![expr.as_ref(), low.as_ref(), high.as_ref()],
+        Expr::InList { expr, list, .. } => {
+            let mut children = vec![expr.as_ref()];
+            children.extend(list.iter());
+            children
+        }
+        Expr::InSubquery { expr, .. } => vec![expr.as_ref()],
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let mut children: Vec<&Expr> = Vec::new();
+            children.extend(operand.as_deref());
+            children.extend(else_result.as_deref());
+            for when in conditions {
+                children.push(&when.condition);
+                children.push(&when.result);
+            }
+            children
+        }
+        Expr::Function(function) => match &function.args {
+            FunctionArguments::List(list) => list
+                .args
+                .iter()
+                .filter_map(|argument| match argument {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
+                    _ => None,
+                })
+                .collect(),
+            FunctionArguments::None | FunctionArguments::Subquery(_) => Vec::new(),
+        },
+        // A leaf, or a form the evaluator refuses: neither carries an expression this
+        // engine would have to walk.
+        _ => Vec::new(),
+    }
+}
+
+/// The name a `FROM` clause reads a relation under: the whole rendered object name,
+/// undelimited and lower-cased.
+///
+/// The catalog this engine exposes is FLAT — the views it documents, plus the
+/// statement's own `WITH` definitions — so a name carrying a catalog or schema
+/// qualifier names no relation in it, rather than resolving to the view its last
+/// part happens to spell.
+fn relation_key(name: &::sqlparser::ast::ObjectName) -> String {
+    name.to_string().replace('"', "").to_ascii_lowercase()
+}
+
+/// The name a `USING` list, a qualifier or a function call names a column, a
+/// relation or a function by: the last part of the rendered name, undelimited and
+/// lower-cased, since a delimited identifier names the same thing an undelimited
+/// one does.
+fn bare_name(name: &impl ::std::fmt::Display) -> String {
+    name.to_string()
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_ascii_lowercase()
+}
+
+/// Run one query LEVEL and answer the relation it computes.
+///
+/// A level is a whole `Query`: its `WITH` definitions, its body — one `SELECT` or a
+/// set operation over several — and the `ORDER BY` and page that apply to what the
+/// body computed. Every subquery is a level of its own, run through here, so one
+/// implementation answers the statement, its joins' relations, its `WITH`
+/// definitions and its predicates' subqueries.
+fn run_query(
+    query: &::sqlparser::ast::Query,
+    catalog: &Catalog,
+    budget: &Budget,
+    depth: usize,
+) -> Result<Relation, ExecuteQueryError> {
+    use ::sqlparser::ast::SetExpr;
+    if depth > MAX_SUBQUERY_DEPTH {
+        return Err(invalid_request(format!(
+            "The query statement nests subqueries more than {MAX_SUBQUERY_DEPTH} \
+             levels deep."
+        )));
+    }
+    // A `WITH` definition is computed ONCE, here, and bound into the catalog this
+    // level reads: a name it defines shadows a view of that name for this level and
+    // the levels inside it, and a level that names a definition twice reads the
+    // rows it already holds instead of running it again.
+    let mut level = catalog.clone();
+    if let Some(with) = query.with.as_ref() {
+        for cte in &with.cte_tables {
+            let relation = run_query(&cte.query, &level, budget, depth + 1)?;
+            let name = bare_name(&cte.alias.name);
+            level = level.with(&name, aliased(relation, &cte.alias)?);
+        }
+    }
+    let run = Run::new(&level, budget);
+    match query.body.as_ref() {
+        // A single `SELECT` runs its own `ORDER BY` and page, because an `ORDER BY`
+        // key may name a column of the relation it READS and not only one it
+        // projects.
+        SetExpr::Select(select) => {
+            let page = page_of(
+                query.limit_clause.as_ref(),
+                query.fetch.as_ref(),
+                select.top.as_ref(),
+            )?;
+            run_select(select, query.order_by.as_ref(), &page, &run, depth)
+        }
+        body => {
+            let mut relation = run_set_expr(body, &run, depth)?;
+            order_and_page(&mut relation, query, &run)?;
+            Ok(relation)
+        }
+    }
+}
+
+/// Run a query BODY: one `SELECT`, a set operation over two of them, or a
+/// parenthesised query.
+fn run_set_expr(
+    body: &::sqlparser::ast::SetExpr,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Relation, ExecuteQueryError> {
+    use ::sqlparser::ast::SetExpr;
+    run.budget.charge(1)?;
+    match body {
+        // An operand of a set operation carries no `ORDER BY` or `LIMIT` of its own
+        // — the parser hangs those on the query around it — but `TOP` is written
+        // inside the SELECT, so it is read here.
+        SetExpr::Select(select) => {
+            let page = page_of(None, None, select.top.as_ref())?;
+            run_select(select, None, &page, run, depth)
+        }
+        SetExpr::Query(query) => run_query(query, run.catalog, run.budget, depth + 1),
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            let left = run_set_expr(left, run, depth)?;
+            let right = run_set_expr(right, run, depth)?;
+            set_operation(left, right, op, set_quantifier, run.budget)
+        }
+        other => Err(invalid_request(format!(
+            "A query statement must be a SELECT query, not {other}."
+        ))),
+    }
+}
+
+/// Run one `SELECT`: its `FROM`, `WHERE`, `GROUP BY`/`HAVING`, projection,
+/// `DISTINCT`, `ORDER BY` and page, in the order SQL evaluates them.
+///
+/// The order is what lets the clauses compose. The projection is evaluated against
+/// the rows the `WHERE` kept — or against the GROUPS the statement formed, where an
+/// aggregate reads every row of its group and everything else has to be a value the
+/// group agrees on — and an `ORDER BY` key is evaluated in that same context, which
+/// is why a statement may order by a column it does not select, by an expression,
+/// or by the name a projection gave one.
 fn run_select(
     select: &::sqlparser::ast::Select,
-    query: &::sqlparser::ast::Query,
-    columns: &'static [Column],
-    rows: Vec<Vec<Cell>>,
-    from: &Qualified,
-    budget: &Budget,
-) -> Result<ResultSet, ExecuteQueryError> {
-    // WHERE, then ORDER BY, then the projection: the order SQL evaluates them in,
-    // so a statement may order or filter by a column it does not select.
+    order_by: Option<&::sqlparser::ast::OrderBy>,
+    page: &Page,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Relation, ExecuteQueryError> {
+    use ::sqlparser::ast::{Distinct, GroupByExpr};
+    let source = from_relation(&select.from, run, depth)?;
+
+    // WHERE: only a predicate that answers TRUE keeps a row — SQL's UNKNOWN keeps
+    // none, and a statement with no predicate keeps them all.
     let mut kept: Vec<Vec<Cell>> = Vec::new();
-    for row in rows {
+    for row in source.rows {
         // Each row costs a step whether the predicate keeps it or not, so the budget
         // bounds the predicate work and not just the rows answered.
-        budget.charge(1)?;
+        run.budget.charge(1)?;
         let matched = match select.selection.as_ref() {
-            // Only a predicate that answers TRUE keeps a row: SQL's UNKNOWN keeps
-            // none, and a statement with no predicate keeps them all.
             Some(predicate) => {
-                evaluate(predicate, columns, &row, from, budget, 0)? == Some(true)
+                predicate_of(predicate, &source.columns, &Scope::Row(&row), run, 0)? == Some(true)
             }
             None => true,
         };
@@ -1220,15 +1833,1170 @@ fn run_select(
         }
     }
 
-    order_rows(query, columns, from, &mut kept, budget)?;
-    let (offset, limit) = limits(query)?;
-    let kept = kept
-        .into_iter()
-        .skip(offset)
-        .take(limit.unwrap_or(usize::MAX))
-        .collect();
+    // A statement is GROUPED when it says so, when it selects or orders by an
+    // aggregate, or when it carries a `HAVING` clause. The last three form ONE group
+    // of every row the `WHERE` kept, which is what `SELECT COUNT(*)` asks for — and
+    // why it answers a row even when the view holds none.
+    let group_by: &[::sqlparser::ast::Expr] = match &select.group_by {
+        GroupByExpr::Expressions(expressions, _) => expressions,
+        // `GROUP BY ALL` is refused where the statement is planned.
+        GroupByExpr::All(_) => &[],
+    };
+    let ordered_by = order_by_expressions(order_by);
+    let aggregated = !group_by.is_empty()
+        || select.having.is_some()
+        || select
+            .projection
+            .iter()
+            .filter_map(projected_expression)
+            .any(has_aggregate)
+        || ordered_by.iter().copied().any(has_aggregate);
 
-    project(select, columns, from, kept, budget)
+    let keys = group_keys(group_by, &source.columns)?;
+    let projection = projection_plan(select, &source.columns, aggregated, &keys)?;
+    let (sort, extras) = order_plan(order_by, &projection, &source.columns, aggregated, &keys)?;
+
+    let mut out: Vec<Vec<Cell>> = Vec::new();
+    if aggregated {
+        for group in build_groups(&kept, &source.columns, &keys, run)? {
+            let rows: Vec<&Vec<Cell>> = group.iter().filter_map(|at| kept.get(*at)).collect();
+            let scope = Scope::Group(Group {
+                rows: &rows,
+                keys: &keys,
+            });
+            // HAVING filters the GROUPS, after they are formed and before the result
+            // is built from them.
+            if let Some(having) = select.having.as_ref() {
+                if predicate_of(having, &source.columns, &scope, run, 0)? != Some(true) {
+                    continue;
+                }
+            }
+            out.push(output_row(
+                &projection,
+                &extras,
+                &source.columns,
+                &scope,
+                run,
+            )?);
+        }
+    } else {
+        for row in &kept {
+            let scope = Scope::Row(row.as_slice());
+            out.push(output_row(
+                &projection,
+                &extras,
+                &source.columns,
+                &scope,
+                run,
+            )?);
+        }
+    }
+
+    if matches!(select.distinct, Some(Distinct::Distinct)) {
+        distinct_rows(&mut out, &projection, run.budget)?;
+    }
+    sort_rows(&mut out, &sort, run.budget)?;
+    apply_page(&mut out, page);
+    // The keys an `ORDER BY` needed but the statement does not project are carried
+    // beside the projected columns until the sort is done, and no further.
+    for row in &mut out {
+        row.truncate(projection.len());
+    }
+    Ok(Relation {
+        columns: projection
+            .into_iter()
+            .map(|item| item.column)
+            .collect::<Vec<Column>>(),
+        rows: out,
+    })
+}
+
+/// Sort and page a relation a set operation (or a parenthesised query) computed, by
+/// the `ORDER BY` and the limit of the query around it.
+///
+/// Its keys are resolved against the relation's OWN columns, which are both the
+/// rows it holds and the result it answers.
+fn order_and_page(
+    relation: &mut Relation,
+    query: &::sqlparser::ast::Query,
+    run: &Run<'_>,
+) -> Result<(), ExecuteQueryError> {
+    let page = page_of(query.limit_clause.as_ref(), query.fetch.as_ref(), None)?;
+    let columns = relation.columns.clone();
+    let projection: Vec<Projected<'_>> = columns
+        .iter()
+        .enumerate()
+        .map(|(at, column)| Projected {
+            column: column.clone(),
+            source: Origin::At(at),
+        })
+        .collect();
+    let (sort, extras) = order_plan(query.order_by.as_ref(), &projection, &columns, false, &[])?;
+    let width = columns.len();
+    let mut rows = ::std::mem::take(&mut relation.rows);
+    for row in &mut rows {
+        let mut keys = Vec::with_capacity(extras.len());
+        for extra in &extras {
+            keys.push(origin_value(
+                extra,
+                &columns,
+                &Scope::Row(row.as_slice()),
+                run,
+            )?);
+        }
+        row.extend(keys);
+    }
+    sort_rows(&mut rows, &sort, run.budget)?;
+    apply_page(&mut rows, &page);
+    for row in &mut rows {
+        row.truncate(width);
+    }
+    relation.rows = rows;
+    Ok(())
+}
+
+/// The relation a `FROM` clause reads: one view, one subquery, or the join of
+/// several of them.
+fn from_relation(
+    from: &[::sqlparser::ast::TableWithJoins],
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Relation, ExecuteQueryError> {
+    let mut listed = from.iter();
+    let Some(first) = listed.next() else {
+        return Err(invalid_request(
+            "A SELECT must read a view in a FROM clause.".to_string(),
+        ));
+    };
+    let mut relation = joined_relation(first, run, depth)?;
+    // A comma-separated list of relations is their CROSS JOIN: the same pairing the
+    // keyword asks for, so it is run by the same code.
+    for next in listed {
+        let right = joined_relation(next, run, depth)?;
+        relation = pair_rows(relation, right, JoinKind::Cross, None, run, depth)?;
+    }
+    Ok(relation)
+}
+
+/// One relation of a `FROM` clause with the joins written after it.
+fn joined_relation(
+    table: &::sqlparser::ast::TableWithJoins,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Relation, ExecuteQueryError> {
+    let mut relation = factor_relation(&table.relation, run, depth)?;
+    for join in &table.joins {
+        let right = factor_relation(&join.relation, run, depth)?;
+        let (kind, constraint) = join_shape(&join.join_operator)?;
+        relation = pair_rows(relation, right, kind, constraint, run, depth)?;
+    }
+    Ok(relation)
+}
+
+/// One relation a `FROM` clause names: a view (or a `WITH` definition) of the
+/// catalog, a subquery, or a parenthesised join.
+fn factor_relation(
+    factor: &::sqlparser::ast::TableFactor,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Relation, ExecuteQueryError> {
+    use ::sqlparser::ast::TableFactor;
+    run.budget.charge(1)?;
+    match factor {
+        TableFactor::Table { name, alias, .. } => {
+            let view = relation_key(name);
+            let Some(relation) = run.catalog.relations.get(&view) else {
+                return Err(invalid_request(format!(
+                    "The view {view} does not exist. The views this service exposes \
+                     are {}.",
+                    VIEWS.join(", ")
+                )));
+            };
+            // The rows were copied off the store once, under one lock; a statement
+            // that reads one view twice pairs the rows it already holds.
+            run.budget.charge(relation.rows.len())?;
+            let read = relation.as_ref().clone();
+            match alias {
+                Some(alias) => aliased(read, alias),
+                None => Ok(read),
+            }
+        }
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            let relation = run_query(subquery, run.catalog, run.budget, depth + 1)?;
+            // A subquery read as a relation is addressed by its alias, so a
+            // statement that does not give it one can name none of its columns by
+            // relation at all.
+            let Some(alias) = alias else {
+                return Err(invalid_request(
+                    "A subquery in a FROM clause must be given an alias.".to_string(),
+                ));
+            };
+            aliased(relation, alias)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
+            let relation = joined_relation(table_with_joins, run, depth)?;
+            match alias {
+                Some(alias) => aliased(relation, alias),
+                None => Ok(relation),
+            }
+        }
+        other => Err(not_in_the_language(&format!(
+            "the FROM clause relation {other}"
+        ))),
+    }
+}
+
+/// `relation` read under the name an alias gives it: its columns answer to that
+/// name, and carry the names the alias lists when it lists any.
+fn aliased(
+    mut relation: Relation,
+    alias: &::sqlparser::ast::TableAlias,
+) -> Result<Relation, ExecuteQueryError> {
+    if !alias.columns.is_empty() {
+        if alias.columns.len() != relation.columns.len() {
+            return Err(invalid_request(format!(
+                "The alias {} names {} columns, but the relation it names carries {}.",
+                alias.name.value,
+                alias.columns.len(),
+                relation.columns.len()
+            )));
+        }
+        for (column, named) in relation.columns.iter_mut().zip(&alias.columns) {
+            column.name = named.name.value.to_ascii_lowercase();
+        }
+    }
+    Ok(relation.qualified(&alias.name.value))
+}
+
+/// What a join ASKS for: which rows it keeps when a pair does not match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
+/// The shape of one join: what it keeps, and the constraint that decides whether a
+/// pair of rows matches.
+fn join_shape(
+    operator: &::sqlparser::ast::JoinOperator,
+) -> Result<(JoinKind, Option<&::sqlparser::ast::JoinConstraint>), ExecuteQueryError> {
+    use ::sqlparser::ast::JoinOperator;
+    Ok(match operator {
+        JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
+            (JoinKind::Inner, Some(constraint))
+        }
+        JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
+            (JoinKind::Left, Some(constraint))
+        }
+        JoinOperator::Right(constraint) | JoinOperator::RightOuter(constraint) => {
+            (JoinKind::Right, Some(constraint))
+        }
+        JoinOperator::FullOuter(constraint) => (JoinKind::Full, Some(constraint)),
+        JoinOperator::CrossJoin(constraint) => (JoinKind::Cross, Some(constraint)),
+        _ => {
+            return Err(not_in_the_language(
+                "a semi, anti, apply or AS OF join",
+            ))
+        }
+    })
+}
+
+/// Pair the rows of two relations: the join this engine runs.
+///
+/// The pairs a join considers are the PRODUCT of its two sides, so that product is
+/// charged against the work budget before a single pair is built — a join that asks
+/// for more pairs than the budget allows ends in the modelled timeout instead of
+/// being materialised. Each pair is charged again as it is built, so the deadline is
+/// read inside the loops as well.
+///
+/// An outer join keeps the rows of its side that no pair matched, with the columns
+/// of the other side null; the columns a `USING` or `NATURAL` join pairs BY appear
+/// once, as SQL merges them, and carry the value of whichever side has one.
+fn pair_rows(
+    left: Relation,
+    right: Relation,
+    kind: JoinKind,
+    constraint: Option<&::sqlparser::ast::JoinConstraint>,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Relation, ExecuteQueryError> {
+    use ::sqlparser::ast::JoinConstraint;
+    run.budget
+        .charge(left.rows.len().saturating_mul(right.rows.len()))?;
+    let (predicate, pairs) = match constraint {
+        Some(JoinConstraint::On(predicate)) => (Some(predicate), Vec::new()),
+        Some(JoinConstraint::Using(names)) => (None, using_pairs(&left, &right, names)?),
+        Some(JoinConstraint::Natural) => (None, natural_pairs(&left, &right)),
+        Some(JoinConstraint::None) | None => (None, Vec::new()),
+    };
+    let merged: Vec<usize> = pairs.iter().map(|(_, right, _)| *right).collect();
+    let mut columns = left.columns.clone();
+    for (at, column) in right.columns.iter().enumerate() {
+        if !merged.contains(&at) {
+            columns.push(column.clone());
+        }
+    }
+    let left_width = left.columns.len();
+    let right_width = right.columns.len();
+    let combine = |left_row: Option<&Vec<Cell>>, right_row: Option<&Vec<Cell>>| {
+        combine_row(
+            left_row,
+            right_row,
+            left_width,
+            right_width,
+            &pairs,
+            &merged,
+        )
+    };
+
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    let mut matched_right = vec![false; right.rows.len()];
+    for left_row in &left.rows {
+        let mut matched = false;
+        for (at, right_row) in right.rows.iter().enumerate() {
+            run.budget.charge(1)?;
+            let combined = combine(Some(left_row), Some(right_row));
+            let keeps = match predicate {
+                Some(predicate) => {
+                    predicate_of(predicate, &columns, &Scope::Row(&combined), run, depth)?
+                        == Some(true)
+                }
+                // With no predicate, a pair matches when every column the join pairs
+                // by agrees — and a cross join, which pairs by none, keeps them all.
+                None => pairs.iter().all(|(left_at, right_at, numeric)| {
+                    left_row
+                        .get(*left_at)
+                        .zip(right_row.get(*right_at))
+                        .and_then(|(left, right)| left.compare(right, *numeric))
+                        == Some(::std::cmp::Ordering::Equal)
+                }),
+            };
+            if keeps {
+                matched = true;
+                if let Some(seen) = matched_right.get_mut(at) {
+                    *seen = true;
+                }
+                run.budget
+                    .charge_chars(combined.iter().map(Cell::chars).sum())?;
+                rows.push(combined);
+            }
+        }
+        if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
+            rows.push(combine(Some(left_row), None));
+        }
+    }
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        for (at, right_row) in right.rows.iter().enumerate() {
+            if matched_right.get(at).copied().unwrap_or(false) {
+                continue;
+            }
+            rows.push(combine(None, Some(right_row)));
+        }
+    }
+    if rows.len() > MAX_SCANNED_ROWS {
+        return Err(query_timeout(format!(
+            "The query scanned more than {MAX_SCANNED_ROWS} rows without finishing."
+        )));
+    }
+    Ok(Relation { columns, rows })
+}
+
+/// One row of a join: the left row's cells, then the right row's but for the
+/// columns the join merged, with the cells of a side that no pair matched null.
+fn combine_row(
+    left: Option<&Vec<Cell>>,
+    right: Option<&Vec<Cell>>,
+    left_width: usize,
+    right_width: usize,
+    pairs: &[(usize, usize, bool)],
+    merged: &[usize],
+) -> Vec<Cell> {
+    // Every column of the left side, then the right side's but for the columns the
+    // join MERGED, so the width is never more than the two widths together — the
+    // saturating arithmetic says so without depending on the caller's list.
+    let mut row = Vec::with_capacity(
+        left_width
+            .saturating_add(right_width)
+            .saturating_sub(merged.len()),
+    );
+    for at in 0..left_width {
+        let mut cell = left
+            .and_then(|row| row.get(at))
+            .cloned()
+            .unwrap_or(Cell::Null);
+        // A merged column carries whichever side has a value, so an outer join's
+        // unmatched side does not null the column the join was made ON.
+        if cell == Cell::Null {
+            if let Some((_, right_at, _)) = pairs.iter().find(|(left_at, _, _)| *left_at == at) {
+                cell = right
+                    .and_then(|row| row.get(*right_at))
+                    .cloned()
+                    .unwrap_or(Cell::Null);
+            }
+        }
+        row.push(cell);
+    }
+    for at in 0..right_width {
+        if merged.contains(&at) {
+            continue;
+        }
+        row.push(
+            right
+                .and_then(|row| row.get(at))
+                .cloned()
+                .unwrap_or(Cell::Null),
+        );
+    }
+    row
+}
+
+/// The columns a `USING` join pairs by, each as its index on either side and
+/// whether the column compares as a number.
+///
+/// A name the list repeats names ONE column, so it is paired once: a list is a SET
+/// of columns, and a second mention of one would merge a column that was already
+/// merged.
+fn using_pairs(
+    left: &Relation,
+    right: &Relation,
+    names: &[::sqlparser::ast::ObjectName],
+) -> Result<Vec<(usize, usize, bool)>, ExecuteQueryError> {
+    let mut pairs: Vec<(usize, usize, bool)> = Vec::new();
+    for name in names {
+        let named = vec![bare_name(name)];
+        let (Some(at_left), Some(at_right)) = (
+            find_column(&left.columns, &named),
+            find_column(&right.columns, &named),
+        ) else {
+            return Err(missing_column(&named.join(".")));
+        };
+        if pairs
+            .iter()
+            .any(|(held_left, held_right, _)| *held_left == at_left && *held_right == at_right)
+        {
+            continue;
+        }
+        pairs.push((
+            at_left,
+            at_right,
+            left.columns.get(at_left).is_some_and(Column::numeric),
+        ));
+    }
+    Ok(pairs)
+}
+
+/// The columns a `NATURAL` join pairs by: every name both sides carry exactly once.
+fn natural_pairs(left: &Relation, right: &Relation) -> Vec<(usize, usize, bool)> {
+    left.columns
+        .iter()
+        .enumerate()
+        .filter_map(|(at, column)| {
+            let named = vec![column.name.clone()];
+            let at_right = find_column(&right.columns, &named)?;
+            find_column(&left.columns, &named)
+                .filter(|only| *only == at)
+                .map(|_| (at, at_right, column.numeric()))
+        })
+        .collect()
+}
+
+/// Combine two relations: `UNION`, `INTERSECT` and `EXCEPT`, each over the rows as
+/// a SET — the default — or `ALL` of them, which keeps the duplicates.
+fn set_operation(
+    left: Relation,
+    right: Relation,
+    op: &::sqlparser::ast::SetOperator,
+    quantifier: &::sqlparser::ast::SetQuantifier,
+    budget: &Budget,
+) -> Result<Relation, ExecuteQueryError> {
+    use ::sqlparser::ast::{SetOperator, SetQuantifier};
+    if left.columns.len() != right.columns.len() {
+        return Err(invalid_request(format!(
+            "A set operation combines results of the same width, but these carry {} \
+             and {} columns.",
+            left.columns.len(),
+            right.columns.len()
+        )));
+    }
+    budget.charge(left.rows.len().saturating_add(right.rows.len()))?;
+    let all = matches!(quantifier, SetQuantifier::All);
+    // The result takes its column names and types from the LEFT side, as SQL does.
+    let columns: Vec<Column> = left
+        .columns
+        .iter()
+        .map(|column| Column {
+            name: column.name.clone(),
+            scalar_type: column.scalar_type,
+            qualifier: None,
+        })
+        .collect();
+    let numeric: Vec<bool> = columns.iter().map(Column::numeric).collect();
+    let mut rows = match op {
+        SetOperator::Union => {
+            let mut rows = left.rows;
+            rows.extend(right.rows);
+            rows
+        }
+        SetOperator::Intersect | SetOperator::Except | SetOperator::Minus => {
+            // How many of each row the right side holds: `ALL` consumes one per
+            // match, which is what makes the operation a multiset one.
+            let mut held: ::std::collections::BTreeMap<RowKey, usize> =
+                ::std::collections::BTreeMap::new();
+            for row in &right.rows {
+                budget.charge(1)?;
+                *held.entry(row_key(row, &numeric)).or_insert(0) += 1;
+            }
+            let keep_matched = matches!(op, SetOperator::Intersect);
+            let mut rows = Vec::new();
+            for row in left.rows {
+                budget.charge(1)?;
+                let key = row_key(&row, &numeric);
+                let matched = held.get(&key).copied().unwrap_or(0) > 0;
+                if all && matched {
+                    if let Some(count) = held.get_mut(&key) {
+                        *count = count.saturating_sub(1);
+                    }
+                }
+                if matched == keep_matched {
+                    rows.push(row);
+                }
+            }
+            rows
+        }
+    };
+    if !all {
+        let mut seen: ::std::collections::BTreeSet<RowKey> = ::std::collections::BTreeSet::new();
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            budget.charge(1)?;
+            if seen.insert(row_key(&row, &numeric)) {
+                kept.push(row);
+            }
+        }
+        rows = kept;
+    }
+    Ok(Relation { columns, rows })
+}
+
+/// What an expression is evaluated against: one ROW of the relation the statement
+/// reads, or one GROUP of its rows.
+enum Scope<'a> {
+    Row(&'a [Cell]),
+    Group(Group<'a>),
+}
+
+/// One group of rows a statement formed, and the keys it was grouped by.
+struct Group<'a> {
+    rows: &'a [&'a Vec<Cell>],
+    keys: &'a [GroupKey<'a>],
+}
+
+impl<'a> Group<'a> {
+    /// Which key this group was formed by `expr` names — the same column, or the
+    /// same expression written again — and `None` when it names none of them, which
+    /// is what makes the value `expr` asks for not a function of the group.
+    fn key_of(
+        &self,
+        expr: &::sqlparser::ast::Expr,
+        columns: &[Column],
+    ) -> Option<&GroupKey<'a>> {
+        let at = identifier_parts(expr).and_then(|parts| find_column(columns, &parts));
+        let text = normalised(expr);
+        self.keys
+            .iter()
+            .find(|key| (at.is_some() && key.at == at) || key.text == text)
+    }
+
+    /// The first row of the group, which is where a value the whole group agrees on
+    /// is read from.
+    fn first(&self) -> Option<&'a Vec<Cell>> {
+        self.rows.first().copied()
+    }
+}
+
+/// One key a statement groups by: the expression it was written as, the column it
+/// names when it is a bare column, its rendered text — which is how a projection
+/// naming the same expression is recognised as naming this key — and whether it
+/// groups as a number.
+struct GroupKey<'a> {
+    expr: &'a ::sqlparser::ast::Expr,
+    at: Option<usize>,
+    text: String,
+    numeric: bool,
+}
+
+/// The keys a `GROUP BY` names, resolved against the relation the statement reads.
+fn group_keys<'a>(
+    group_by: &'a [::sqlparser::ast::Expr],
+    columns: &[Column],
+) -> Result<Vec<GroupKey<'a>>, ExecuteQueryError> {
+    let mut keys = Vec::with_capacity(group_by.len());
+    for expr in group_by {
+        let at = match identifier_parts(expr) {
+            Some(parts) => Some(column_at(columns, &parts)?),
+            None => None,
+        };
+        let numeric = match at {
+            Some(at) => columns.get(at).is_some_and(Column::numeric),
+            None => is_numeric(type_of(expr, columns)),
+        };
+        keys.push(GroupKey {
+            expr,
+            at,
+            text: normalised(expr),
+            numeric,
+        });
+    }
+    Ok(keys)
+}
+
+/// The text of an expression, case-folded: how two mentions of ONE expression — in
+/// a `GROUP BY` and in the projection — are recognised as the same.
+fn normalised(expr: &::sqlparser::ast::Expr) -> String {
+    expr.to_string().to_ascii_uppercase()
+}
+
+/// Whether source column `at` is one of the keys the statement grouped by.
+fn grouped_column(keys: &[GroupKey<'_>], at: usize) -> bool {
+    keys.iter().any(|key| key.at == Some(at))
+}
+
+/// Group `rows` by the statement's keys, keeping the groups in the order their keys
+/// were first seen and answering each as the positions of its rows.
+///
+/// A statement that aggregates WITHOUT grouping forms one group of every row, so
+/// `SELECT COUNT(*)` answers one row whatever the view holds.
+fn build_groups(
+    rows: &[Vec<Cell>],
+    columns: &[Column],
+    keys: &[GroupKey<'_>],
+    run: &Run<'_>,
+) -> Result<Vec<Vec<usize>>, ExecuteQueryError> {
+    if keys.is_empty() {
+        return Ok(vec![(0..rows.len()).collect()]);
+    }
+    let mut at_key: ::std::collections::BTreeMap<RowKey, usize> =
+        ::std::collections::BTreeMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (at, row) in rows.iter().enumerate() {
+        run.budget.charge(1)?;
+        let mut key = Vec::with_capacity(keys.len());
+        for group_key in keys {
+            let cell = eval(group_key.expr, columns, &Scope::Row(row), run, 0)?;
+            // Keying a cell reads all of it, so its characters are charged like
+            // every other per-row amount in this engine.
+            run.budget.charge_chars(cell.chars())?;
+            key.push(SortKey::identity(&cell, group_key.numeric));
+        }
+        match at_key.entry(RowKey(key)) {
+            ::std::collections::btree_map::Entry::Occupied(held) => {
+                if let Some(group) = groups.get_mut(*held.get()) {
+                    group.push(at);
+                }
+            }
+            ::std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(groups.len());
+                groups.push(vec![at]);
+            }
+        }
+    }
+    Ok(groups)
+}
+
+/// One row of a statement's result, keyed for comparison: a TOTAL order over the
+/// cells, so grouping, `DISTINCT` and a set operation all decide "the same row" the
+/// same way the sort decides an order (see [`SortKey`]).
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RowKey(Vec<SortKey>);
+
+/// The key of one row: each cell keyed as its column compares, on the WHOLE cell
+/// (see [`SortKey::identity`]).
+fn row_key(cells: &[Cell], numeric: &[bool]) -> RowKey {
+    RowKey(
+        cells
+            .iter()
+            .enumerate()
+            .map(|(at, cell)| {
+                SortKey::identity(cell, numeric.get(at).copied().unwrap_or(false))
+            })
+            .collect(),
+    )
+}
+
+/// Where one value of an output row comes from.
+enum Origin<'a> {
+    /// A column of the relation the statement reads.
+    At(usize),
+    /// An expression evaluated against the row or the group.
+    Expr(&'a ::sqlparser::ast::Expr),
+}
+
+/// One item of a statement's projection: the column the result reports, and where
+/// its value comes from.
+struct Projected<'a> {
+    column: Column,
+    source: Origin<'a>,
+}
+
+/// One key of a sort: which column of the OUTPUT row it reads, which way it orders
+/// and whether it orders as a number.
+struct SortSpec {
+    at: usize,
+    descending: bool,
+    numeric: bool,
+}
+
+/// How many rows of a result a statement asks for, and from where.
+///
+/// `OFFSET`/`LIMIT`, `FETCH FIRST n ROWS ONLY` and `TOP n` are three spellings of
+/// one clause, so they are read into one and a statement that writes more than one
+/// of them is refused rather than silently paged by whichever the engine looked at.
+#[derive(Debug, Default)]
+struct Page {
+    offset: usize,
+    limit: Option<usize>,
+}
+
+/// The page a statement's `LIMIT`/`OFFSET`, `FETCH` or `TOP` asks for.
+fn page_of(
+    limit_clause: Option<&::sqlparser::ast::LimitClause>,
+    fetch: Option<&::sqlparser::ast::Fetch>,
+    top: Option<&::sqlparser::ast::Top>,
+) -> Result<Page, ExecuteQueryError> {
+    use ::sqlparser::ast::{LimitClause, TopQuantity};
+    let mut page = Page::default();
+    let mut limits = 0usize;
+    if let Some(clause) = limit_clause {
+        let (limit, offset) = match clause {
+            LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            } => {
+                if !limit_by.is_empty() {
+                    return Err(not_in_the_language("a LIMIT BY clause"));
+                }
+                (limit.as_ref(), offset.as_ref().map(|offset| &offset.value))
+            }
+            LimitClause::OffsetCommaLimit { offset, limit } => (Some(limit), Some(offset)),
+        };
+        page.offset = row_count(offset)?.unwrap_or(0);
+        page.limit = row_count(limit)?;
+        if page.limit.is_some() {
+            limits += 1;
+        }
+    }
+    if let Some(fetch) = fetch {
+        if fetch.with_ties || fetch.percent {
+            return Err(not_in_the_language("a FETCH clause WITH TIES or PERCENT"));
+        }
+        // `FETCH FIRST ROW ONLY`, with no count written, is one row.
+        page.limit = Some(row_count(fetch.quantity.as_ref())?.unwrap_or(1));
+        limits += 1;
+    }
+    if let Some(top) = top {
+        if top.with_ties || top.percent {
+            return Err(not_in_the_language("a TOP clause WITH TIES or PERCENT"));
+        }
+        page.limit = match top.quantity.as_ref() {
+            Some(TopQuantity::Expr(expr)) => row_count(Some(expr))?,
+            Some(TopQuantity::Constant(count)) => {
+                Some(usize::try_from(*count).unwrap_or(usize::MAX))
+            }
+            None => Some(1),
+        };
+        limits += 1;
+    }
+    if limits > 1 {
+        return Err(invalid_request(
+            "A query statement names at most one row limit.".to_string(),
+        ));
+    }
+    Ok(page)
+}
+
+/// Keep only the rows one page asks for; a page past the end keeps none.
+fn apply_page(rows: &mut Vec<Vec<Cell>>, page: &Page) {
+    rows.drain(..page.offset.min(rows.len()));
+    if let Some(limit) = page.limit {
+        rows.truncate(limit);
+    }
+}
+
+/// Keep the first of every set of output rows that agree on their projected
+/// columns: what `SELECT DISTINCT` answers.
+fn distinct_rows(
+    rows: &mut Vec<Vec<Cell>>,
+    projection: &[Projected<'_>],
+    budget: &Budget,
+) -> Result<(), ExecuteQueryError> {
+    let numeric: Vec<bool> = projection
+        .iter()
+        .map(|item| is_numeric(item.column.scalar_type))
+        .collect();
+    let width = projection.len();
+    let mut seen: ::std::collections::BTreeSet<RowKey> = ::std::collections::BTreeSet::new();
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in ::std::mem::take(rows) {
+        budget.charge(1)?;
+        let projected = row.get(..width).unwrap_or(row.as_slice());
+        budget.charge_chars(projected.iter().map(Cell::chars).sum())?;
+        if seen.insert(row_key(projected, &numeric)) {
+            kept.push(row);
+        }
+    }
+    *rows = kept;
+    Ok(())
+}
+
+/// The projection a statement asks for: which column the result reports under which
+/// name and type, and where each value comes from.
+///
+/// `*` stands for every column of the relation the statement reads and
+/// `<relation>.*` for every column of that one. A column the statement neither
+/// grouped by nor aggregated is refused here rather than answered from an arbitrary
+/// row of its group.
+fn projection_plan<'a>(
+    select: &'a ::sqlparser::ast::Select,
+    columns: &[Column],
+    aggregated: bool,
+    keys: &[GroupKey<'_>],
+) -> Result<Vec<Projected<'a>>, ExecuteQueryError> {
+    use ::sqlparser::ast::SelectItem;
+    let mut projection: Vec<Projected<'a>> = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (at, column) in columns.iter().enumerate() {
+                    projection.push(projected_column(at, column, None, aggregated, keys)?);
+                }
+            }
+            SelectItem::QualifiedWildcard(qualifier, _) => {
+                let named = bare_wildcard(qualifier);
+                let mut matched = false;
+                for (at, column) in columns.iter().enumerate() {
+                    if column.qualifier.as_deref() == Some(named.as_str()) {
+                        matched = true;
+                        projection.push(projected_column(at, column, None, aggregated, keys)?);
+                    }
+                }
+                if !matched {
+                    return Err(invalid_request(format!(
+                        "The relation {named} is not one this statement reads."
+                    )));
+                }
+            }
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                let alias = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                    _ => None,
+                };
+                // A bare column is read straight out of the row; anything else is a
+                // value the engine computes, and reports under the text it was
+                // written as unless the statement named it.
+                if let Some(parts) = identifier_parts(expr) {
+                    let at = column_at(columns, &parts)?;
+                    let Some(column) = columns.get(at) else {
+                        return Err(missing_column(&parts.join(".")));
+                    };
+                    projection.push(projected_column(at, column, alias, aggregated, keys)?);
+                } else {
+                    projection.push(Projected {
+                        column: Column {
+                            name: alias.unwrap_or_else(|| expr.to_string()),
+                            scalar_type: type_of(expr, columns),
+                            qualifier: None,
+                        },
+                        source: Origin::Expr(expr),
+                    });
+                }
+            }
+        }
+    }
+    // A wildcard item stands for every column of the relation, so the EXPANDED width
+    // is what decides how many times one cell is copied and carries its own ceiling.
+    if projection.len() > MAX_PROJECTED_COLUMNS {
+        return Err(invalid_request(format!(
+            "A result row carries at most {MAX_PROJECTED_COLUMNS} columns, but this \
+             statement's projection expands to {}.",
+            projection.len()
+        )));
+    }
+    Ok(projection)
+}
+
+/// One projected column of the relation the statement reads, under the alias it
+/// gave it or the column's own name.
+fn projected_column<'a>(
+    at: usize,
+    column: &Column,
+    alias: Option<String>,
+    aggregated: bool,
+    keys: &[GroupKey<'_>],
+) -> Result<Projected<'a>, ExecuteQueryError> {
+    if aggregated && !grouped_column(keys, at) {
+        return Err(must_be_grouped(&column.name));
+    }
+    Ok(Projected {
+        column: Column {
+            name: alias.unwrap_or_else(|| column.name.clone()),
+            scalar_type: column.scalar_type,
+            qualifier: None,
+        },
+        source: Origin::At(at),
+    })
+}
+
+/// The expression one projection item computes, or `None` for a wildcard, which
+/// computes nothing.
+fn projected_expression(
+    item: &::sqlparser::ast::SelectItem,
+) -> Option<&::sqlparser::ast::Expr> {
+    use ::sqlparser::ast::SelectItem;
+    match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => None,
+    }
+}
+
+/// The expressions an `ORDER BY` names.
+fn order_by_expressions(
+    order_by: Option<&::sqlparser::ast::OrderBy>,
+) -> Vec<&::sqlparser::ast::Expr> {
+    use ::sqlparser::ast::OrderByKind;
+    match order_by.map(|order_by| &order_by.kind) {
+        Some(OrderByKind::Expressions(expressions)) => {
+            expressions.iter().map(|expression| &expression.expr).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The relation name a `<relation>.*` wildcard names.
+fn bare_wildcard(qualifier: &impl ::std::fmt::Display) -> String {
+    // The qualifier renders with the `.*` that makes it a wildcard; the relation is
+    // what comes before it.
+    bare_name(
+        &qualifier
+            .to_string()
+            .trim_end_matches('*')
+            .trim_end_matches('.')
+            .to_string(),
+    )
+}
+
+/// Resolve one `ORDER BY` into the columns of the OUTPUT row to sort by, and the
+/// values an output row has to carry for a key it does not project.
+///
+/// A key may name a column of the result by position, by the name a projection gave
+/// it, a column of the relation the statement reads whether it is projected or not,
+/// or any expression over them — so a key that is not already an output column is
+/// evaluated in the same context the projection is and carried beside it until the
+/// sort is done.
+fn order_plan<'a>(
+    order_by: Option<&'a ::sqlparser::ast::OrderBy>,
+    projection: &[Projected<'_>],
+    columns: &[Column],
+    aggregated: bool,
+    keys: &[GroupKey<'_>],
+) -> Result<(Vec<SortSpec>, Vec<Origin<'a>>), ExecuteQueryError> {
+    use ::sqlparser::ast::{Expr, OrderByKind, Value};
+    let mut sort: Vec<SortSpec> = Vec::new();
+    let mut extras: Vec<Origin<'a>> = Vec::new();
+    let Some(order_by) = order_by else {
+        return Ok((sort, extras));
+    };
+    let OrderByKind::Expressions(expressions) = &order_by.kind else {
+        return Err(not_in_the_language("an ORDER BY ALL clause"));
+    };
+    if expressions.len() > MAX_ORDER_BY_KEYS {
+        return Err(invalid_request(format!(
+            "An ORDER BY names at most {MAX_ORDER_BY_KEYS} keys, but this one names {}.",
+            expressions.len()
+        )));
+    }
+    let projected_numeric =
+        |at: usize| projection.get(at).is_some_and(|item| is_numeric(item.column.scalar_type));
+    for expression in expressions {
+        if expression.with_fill.is_some() {
+            return Err(not_in_the_language("an ORDER BY WITH FILL clause"));
+        }
+        let descending = expression.options.asc == Some(false);
+        // A position names a column of the result, as SQL allows.
+        if let Expr::Value(value) = &expression.expr {
+            if let Value::Number(number, _) = &value.value {
+                let at = number
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|at| (1..=projection.len()).contains(at))
+                    .ok_or_else(|| {
+                        invalid_request(format!(
+                            "An ORDER BY position names a column of the result, but \
+                             this one names {number}."
+                        ))
+                    })?;
+                sort.push(SortSpec {
+                    at: at - 1,
+                    descending,
+                    numeric: projected_numeric(at - 1),
+                });
+                continue;
+            }
+        }
+        if let Some(parts) = identifier_parts(&expression.expr) {
+            // The name a projection gave a column comes first: it is the name the
+            // result reports, and the one the caller can see.
+            if let [name] = parts.as_slice() {
+                let name = name.to_ascii_lowercase();
+                if let Some(at) = projection
+                    .iter()
+                    .position(|item| item.column.name.to_ascii_lowercase() == name)
+                {
+                    sort.push(SortSpec {
+                        at,
+                        descending,
+                        numeric: projected_numeric(at),
+                    });
+                    continue;
+                }
+            }
+            // Then a column of the relation the statement reads, selected or not.
+            if let Some(at) = find_column(columns, &parts) {
+                if aggregated && !grouped_column(keys, at) {
+                    return Err(must_be_grouped(&parts.join(".")));
+                }
+                sort.push(SortSpec {
+                    at: projection.len() + extras.len(),
+                    descending,
+                    numeric: columns.get(at).is_some_and(Column::numeric),
+                });
+                extras.push(Origin::At(at));
+                continue;
+            }
+            return Err(missing_column(&parts.join(".")));
+        }
+        sort.push(SortSpec {
+            at: projection.len() + extras.len(),
+            descending,
+            numeric: is_numeric(type_of(&expression.expr, columns)),
+        });
+        extras.push(Origin::Expr(&expression.expr));
+    }
+    Ok((sort, extras))
+}
+
+/// Sort `rows` by `specs`, applied from the LAST key to the first — which a stable
+/// sort turns into ordering by the first key with the later ones breaking its ties.
+///
+/// One pass over the rows per key, each charged against the budget, so the sort
+/// cannot be made to cost more than the budget allows. The comparisons themselves
+/// are charged BEFORE the sort runs, in characters: a comparator cannot read the
+/// deadline, so the only place the `n log n` key-character work can be bounded is
+/// here, and [`MAX_SORT_KEY_CHARS`] is what bounds one comparison.
+fn sort_rows(
+    rows: &mut Vec<Vec<Cell>>,
+    specs: &[SortSpec],
+    budget: &Budget,
+) -> Result<(), ExecuteQueryError> {
+    for spec in specs.iter().rev() {
+        budget.charge(rows.len())?;
+        let key_chars: usize = rows
+            .iter()
+            .map(|row| {
+                row.get(spec.at)
+                    .map_or(1, |cell| cell.chars().min(MAX_SORT_KEY_CHARS))
+            })
+            .sum();
+        let comparisons = usize::BITS as usize - rows.len().leading_zeros() as usize;
+        budget.charge_chars(key_chars.saturating_mul(comparisons.saturating_add(1)))?;
+        // The key is computed ONCE per row and is a TOTAL order (see [`SortKey`]):
+        // the comparison a `WHERE` clause makes is SQL's, where two values can be
+        // incomparable, and a sort cannot be driven by that — a comparator that is
+        // not a total order is what makes a sort's own behaviour undefined.
+        let mut keyed: Vec<(SortKey, Vec<Cell>)> = ::std::mem::take(rows)
+            .into_iter()
+            .map(|row| {
+                (
+                    SortKey::of(row.get(spec.at).unwrap_or(&Cell::Null), spec.numeric),
+                    row,
+                )
+            })
+            .collect();
+        keyed.sort_by(|(left, _), (right, _)| {
+            let order = left.cmp(right);
+            if spec.descending {
+                order.reverse()
+            } else {
+                order
+            }
+        });
+        *rows = keyed.into_iter().map(|(_, row)| row).collect();
+    }
+    Ok(())
+}
+
+/// One row of a statement's result: the value of every projected column, then the
+/// keys the `ORDER BY` needs and the projection does not carry.
+fn output_row(
+    projection: &[Projected<'_>],
+    extras: &[Origin<'_>],
+    columns: &[Column],
+    scope: &Scope<'_>,
+    run: &Run<'_>,
+) -> Result<Vec<Cell>, ExecuteQueryError> {
+    let mut row = Vec::with_capacity(projection.len() + extras.len());
+    for item in projection {
+        row.push(origin_value(&item.source, columns, scope, run)?);
+    }
+    for extra in extras {
+        row.push(origin_value(extra, columns, scope, run)?);
+    }
+    // Rebuilding a row costs one unit of work per cell it carries, plus the
+    // CHARACTERS those cells hold: copying a cell and rendering it to the wire's
+    // `scalarValue` both cost its length and not one unit.
+    run.budget.charge(row.len())?;
+    run.budget.charge_chars(row.iter().map(Cell::chars).sum())?;
+    Ok(row)
+}
+
+/// The value one output cell takes.
+fn origin_value(
+    origin: &Origin<'_>,
+    columns: &[Column],
+    scope: &Scope<'_>,
+    run: &Run<'_>,
+) -> Result<Cell, ExecuteQueryError> {
+    match origin {
+        Origin::At(at) => cell_at(*at, scope, run),
+        Origin::Expr(expr) => eval(expr, columns, scope, run, 0),
+    }
+}
+
+/// The value source column `at` holds in `scope`: the row's own cell, or — in a
+/// GROUP — the cell of its first row, which every row of the group agrees on
+/// because the column is one the statement grouped by (checked where the projection
+/// and the sort are planned).
+fn cell_at(at: usize, scope: &Scope<'_>, run: &Run<'_>) -> Result<Cell, ExecuteQueryError> {
+    let row = match scope {
+        Scope::Row(row) => Some(*row),
+        Scope::Group(group) => group.first().map(Vec::as_slice),
+    };
+    // Reading a column COPIES its cell, which costs the cell's length — charged
+    // before the copy is made.
+    let cell = row
+        .and_then(|row| row.get(at))
+        .cloned()
+        .unwrap_or(Cell::Null);
+    run.budget.charge_chars(cell.chars())?;
+    Ok(cell)
 }
 
 /// Every row of one view, as the cells of its columns.
@@ -1240,13 +3008,13 @@ fn materialise(
     store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
     view: &str,
     budget: &Budget,
-) -> Result<(&'static [Column], Vec<Vec<Cell>>), ExecuteQueryError> {
+) -> Result<Relation, ExecuteQueryError> {
     let text = |value: Option<&str>| match value {
         Some(value) => Cell::Str(value.to_string()),
         None => Cell::Null,
     };
     let mut rows: Vec<Vec<Cell>> = Vec::new();
-    let columns: &'static [Column] = match view {
+    let columns: &'static [ViewColumn] = match view {
         "asset" => {
             for asset in store.assets.values() {
                 let row = vec![
@@ -1284,42 +3052,21 @@ fn materialise(
         }
         "raw_time_series" | "latest_value_time_series" => {
             let latest_only = view == "latest_value_time_series";
-            for asset in store.assets.values() {
-                for property in asset.time_series_properties() {
-                    let series = store
-                        .property_values
-                        .get(&asset.id)
-                        .and_then(|properties| properties.get(&property.id));
-                    let samples: Vec<&AssetPropertyValue> = match (series, latest_only) {
-                        (Some(series), true) => series.last().into_iter().collect(),
-                        (Some(series), false) => series.iter().collect(),
-                        (None, _) => Vec::new(),
-                    };
-                    for sample in samples {
-                        let row = time_series_row(
-                            Cell::Str(asset.id.clone()),
-                            Cell::Str(property.id.clone()),
-                            text(property.alias.as_deref()),
-                            sample,
-                        );
-                        charge_row(budget, &row)?;
-                        rows.push(row);
-                    }
-                }
-            }
-            // A DISASSOCIATED series has no asset property to hang off, and its
-            // samples are data this service holds just as much as a property's are.
-            for series in store.disassociated_time_series.values() {
+            // Every stream the store holds, a property's and a disassociated one
+            // alike: a disassociated series has no asset property to hang off, and
+            // its samples are data this service holds just as much as a property's.
+            for (series, asset_id, property_id, alias) in series_keys(store) {
+                let held = store.series(&series);
                 let samples: Vec<&AssetPropertyValue> = if latest_only {
-                    series.values.last().into_iter().collect()
+                    held.last().into_iter().collect()
                 } else {
-                    series.values.iter().collect()
+                    held.iter().collect()
                 };
                 for sample in samples {
                     let row = time_series_row(
-                        Cell::Null,
-                        Cell::Null,
-                        Cell::Str(series.alias.clone()),
+                        asset_id.clone(),
+                        property_id.clone(),
+                        alias.clone(),
                         sample,
                     );
                     charge_row(budget, &row)?;
@@ -1328,18 +3075,56 @@ fn materialise(
             }
             TIME_SERIES_VIEW
         }
-        // A view the IoT SiteWise query catalog DOES document but this engine does
-        // not compute is not a statement about the caller's query: the view exists,
-        // so saying it does not would be false. It is answered with the 501 this
-        // emulator reserves for a construct it has not written, like every other
-        // clause it does not run.
+        // The aggregates of every stored series, at each resolution IoT SiteWise
+        // computes them for. DERIVED, never stored: the samples are bucketed and
+        // reduced by the one engine this service aggregates a series with, so a
+        // window answers here exactly what the aggregate operations answer for it.
         "precomputed_aggregates" => {
-            return Err(unsupported("the precomputed_aggregates view"))
+            // Every `AggregateType` the model declares, so one row carries all of
+            // the view's aggregate columns.
+            let aggregates: Vec<String> =
+                AGGREGATE_TYPE_VALUES.iter().map(|name| (*name).to_string()).collect();
+            for (series, asset_id, property_id, alias) in series_keys(store) {
+                for (resolution, _) in crate::state::RESOLUTIONS {
+                    // The whole of time: a window is reported because the store
+                    // holds samples in it, not because a request named a range.
+                    let Some(query) = crate::state::AggregateQuery::new(
+                        resolution,
+                        i128::MIN,
+                        i128::MAX,
+                        crate::state::DEFAULT_QUALITY,
+                        &aggregates,
+                        false,
+                    ) else {
+                        continue;
+                    };
+                    for window in crate::state::aggregated_values(store, &series, &query) {
+                        let number = |value: Option<f64>| value.map_or(Cell::Null, Cell::Double);
+                        let row = vec![
+                            asset_id.clone(),
+                            property_id.clone(),
+                            alias.clone(),
+                            Cell::Timestamp(crate::state::date_time_nanos(&window.timestamp)),
+                            Cell::Str(resolution.to_string()),
+                            number(window.value.average),
+                            number(window.value.count),
+                            number(window.value.maximum),
+                            number(window.value.minimum),
+                            number(window.value.standard_deviation),
+                            number(window.value.sum),
+                        ];
+                        charge_row(budget, &row)?;
+                        rows.push(row);
+                    }
+                }
+            }
+            PRECOMPUTED_AGGREGATES_VIEW
         }
         _ => {
             return Err(invalid_request(format!(
                 "The view {view} does not exist. The views this service exposes are \
-                 asset, asset_property, raw_time_series and latest_value_time_series."
+                 {}.",
+                VIEWS.join(", ")
             )))
         }
     };
@@ -1348,7 +3133,41 @@ fn materialise(
             "The query scanned more than {MAX_SCANNED_ROWS} rows without finishing."
         )));
     }
-    Ok((columns, rows))
+    Ok(view_relation(view, columns, rows))
+}
+
+/// Every data stream the store holds, each with the cells the time-series views
+/// report it by: the asset property that owns it, or the alias alone for a stream no
+/// asset property owns.
+///
+/// One enumeration, so the views over a series — its samples and its aggregates —
+/// cannot disagree about which streams exist.
+fn series_keys(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+) -> Vec<(crate::state::SeriesKey, Cell, Cell, Cell)> {
+    let mut streams = Vec::new();
+    for asset in store.assets.values() {
+        for property in asset.time_series_properties() {
+            streams.push((
+                crate::state::SeriesKey::Property(asset.id.clone(), property.id.clone()),
+                Cell::Str(asset.id.clone()),
+                Cell::Str(property.id.clone()),
+                property
+                    .alias
+                    .as_ref()
+                    .map_or(Cell::Null, |alias| Cell::Str(alias.clone())),
+            ));
+        }
+    }
+    for series in store.disassociated_time_series.values() {
+        streams.push((
+            crate::state::SeriesKey::Disassociated(series.alias.clone()),
+            Cell::Null,
+            Cell::Null,
+            Cell::Str(series.alias.clone()),
+        ));
+    }
+    streams
 }
 
 /// Charge one materialised row against the budget: one row of work, PLUS the
@@ -1396,24 +3215,73 @@ fn time_series_row(
 }
 
 /// Which column of `columns` an identifier names, by its own name or by
-/// `<view>.<column>` / `<alias>.<column>`.
+/// `<relation>.<column>`.
 ///
-/// A qualifier that names neither the view the statement reads nor the alias it
-/// gave it belongs to no relation of this statement, so it names no column —
-/// rather than silently resolving against the only view there is.
-fn column_at(columns: &[Column], parts: &[String], from: &Qualified) -> Option<usize> {
+/// A name more than one relation of the statement carries is AMBIGUOUS and names
+/// none of them, rather than silently resolving to the first — and a qualifier that
+/// names no relation the statement reads names no column at all.
+fn column_at(columns: &[Column], parts: &[String]) -> Result<usize, ExecuteQueryError> {
+    match matching_columns(columns, parts).as_slice() {
+        [at] => Ok(*at),
+        [] => Err(missing_column(&parts.join("."))),
+        _ => Err(invalid_request(format!(
+            "The column {} is ambiguous: more than one relation this statement reads \
+             carries it.",
+            parts.join(".")
+        ))),
+    }
+}
+
+/// Which column of `columns` an identifier names, when it names exactly one. See
+/// [`column_at`], which is this with the refusals an unresolved name earns.
+fn find_column(columns: &[Column], parts: &[String]) -> Option<usize> {
+    match matching_columns(columns, parts).as_slice() {
+        [at] => Some(*at),
+        _ => None,
+    }
+}
+
+/// Every column of `columns` the identifier `parts` could name.
+///
+/// An identifier is matched case-INSENSITIVELY, as SQL compares an undelimited one:
+/// a column a projection named `AssetId` is the one a later statement reads as
+/// `assetid`.
+fn matching_columns(columns: &[Column], parts: &[String]) -> Vec<usize> {
     let (qualifier, name) = match parts {
         [name] => (None, name),
         [.., qualifier, name] => (Some(qualifier), name),
-        [] => return None,
+        [] => return Vec::new(),
     };
-    if let Some(qualifier) = qualifier {
-        if !from.admits(qualifier) {
-            return None;
-        }
-    }
-    let name = name.to_ascii_lowercase();
-    columns.iter().position(|column| column.name == name)
+    columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| {
+            column.name.eq_ignore_ascii_case(name)
+                && qualifier.is_none_or(|qualifier| {
+                    column
+                        .qualifier
+                        .as_deref()
+                        .is_some_and(|held| held.eq_ignore_ascii_case(qualifier))
+                })
+        })
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// HTTP 400 `InvalidRequestException`: the statement named a column no relation it
+/// reads carries.
+fn missing_column(name: &str) -> ExecuteQueryError {
+    invalid_request(format!("The column {name} does not exist."))
+}
+
+/// HTTP 400 `InvalidRequestException`: a grouped statement asked for a value that
+/// is neither one of the keys it grouped by nor inside an aggregate, so the value is
+/// not a function of the group.
+fn must_be_grouped(name: &str) -> ExecuteQueryError {
+    invalid_request(format!(
+        "The expression {name} must appear in the GROUP BY clause or be used in an \
+         aggregate function."
+    ))
 }
 
 /// The identifier `expr` names, as its dot-separated parts, or `None` when the
@@ -1429,49 +3297,706 @@ fn identifier_parts(expr: &::sqlparser::ast::Expr) -> Option<Vec<String>> {
     }
 }
 
-/// The value `expr` stands for in `row`: a column of the row, or a literal.
-fn value_of(
+/// The value `expr` stands for in `scope`.
+///
+/// A column of the row — or of a key the statement grouped by — a literal, an
+/// arithmetic or string expression over them, an aggregate over the group, a `CASE`,
+/// a function call, or the one value a scalar subquery answers. A boolean-valued
+/// form is answered by [`predicate_of`], which carries the three-valued logic a
+/// `WHERE` clause needs, and its UNKNOWN is the null cell here.
+fn eval(
     expr: &::sqlparser::ast::Expr,
     columns: &[Column],
-    row: &[Cell],
-    from: &Qualified,
-    budget: &Budget,
+    scope: &Scope<'_>,
+    run: &Run<'_>,
     depth: usize,
 ) -> Result<Cell, ExecuteQueryError> {
-    use ::sqlparser::ast::{Expr, Value};
-    budget.depth(depth)?;
-    // One step per recursion, as in `evaluate`: the walk charges as it walks.
-    budget.charge(1)?;
+    use ::sqlparser::ast::Expr;
+    run.budget.depth(depth)?;
+    // One step per recursion, as in `predicate_of`: the walk charges as it walks.
+    run.budget.charge(1)?;
+    if is_boolean_form(expr) {
+        return Ok(
+            match predicate_of(expr, columns, scope, run, depth)? {
+                Some(known) => Cell::Bool(known),
+                None => Cell::Null,
+            },
+        );
+    }
+    // In a GROUP, an aggregate is the one form that reads every row, and anything
+    // else has to be a value the whole group agrees on: one of the keys it was
+    // grouped by.
+    if let Scope::Group(group) = scope {
+        if let Some(value) = aggregate_value(expr, columns, group, run, depth)? {
+            return Ok(value);
+        }
+        if let Some(key) = group.key_of(expr, columns) {
+            let Some(row) = group.first() else {
+                return Ok(Cell::Null);
+            };
+            return eval(key.expr, columns, &Scope::Row(row), run, depth + 1);
+        }
+    }
     if let Some(parts) = identifier_parts(expr) {
-        let at = column_at(columns, &parts, from).ok_or_else(|| {
-            invalid_request(format!("The column {} does not exist.", parts.join(".")))
-        })?;
-        // Reading a column COPIES its cell, which costs the cell's length — charged
-        // before the copy is made.
-        budget.charge_chars(row[at].chars())?;
-        return Ok(row[at].clone());
+        let at = column_at(columns, &parts)?;
+        if matches!(scope, Scope::Group(_)) {
+            return Err(must_be_grouped(&parts.join(".")));
+        }
+        return cell_at(at, scope, run);
     }
     match expr {
-        Expr::Nested(inner) => value_of(inner, columns, row, from, budget, depth + 1),
-        Expr::Value(value) => match &value.value {
-            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
-                budget.charge_chars(text.len())?;
-                Ok(Cell::Str(text.clone()))
-            }
-            Value::Number(number, _) => number
-                .parse::<i64>()
-                .map(Cell::Int)
-                .or_else(|_| number.parse::<f64>().map(Cell::Double))
-                .map_err(|_| invalid_request(format!("The literal {number} is not a number."))),
-            Value::Boolean(value) => Ok(Cell::Bool(*value)),
-            Value::Null => Ok(Cell::Null),
-            other => Err(unsupported(&format!("the literal {other}"))),
-        },
-        other => Err(unsupported(&format!("the expression {other}"))),
+        Expr::Nested(inner) => eval(inner, columns, scope, run, depth + 1),
+        Expr::Value(value) => literal(&value.value, run),
+        Expr::UnaryOp { op, expr: inner } => {
+            let value = eval(inner, columns, scope, run, depth + 1)?;
+            unary(op, &value)
+        }
+        Expr::BinaryOp { left, op, right } => {
+            arithmetic(left, op, right, columns, scope, run, depth)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => case_value(
+            operand.as_deref(),
+            conditions,
+            else_result.as_deref(),
+            columns,
+            scope,
+            run,
+            depth,
+        ),
+        Expr::Function(function) => scalar_function(function, columns, scope, run, depth),
+        Expr::Subquery(query) => scalar_subquery(query, run, depth),
+        other => Err(invalid_request(format!(
+            "The expression {other} is not one the query language this service \
+             answers carries."
+        ))),
     }
 }
 
-/// Whether `row` satisfies a `WHERE` predicate.
+/// The value a literal stands for.
+fn literal(
+    value: &::sqlparser::ast::Value,
+    run: &Run<'_>,
+) -> Result<Cell, ExecuteQueryError> {
+    use ::sqlparser::ast::Value;
+    match value {
+        Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+            run.budget.charge_chars(text.len())?;
+            Ok(Cell::Str(text.clone()))
+        }
+        Value::Number(number, _) => number
+            .parse::<i64>()
+            .map(Cell::Int)
+            .or_else(|_| number.parse::<f64>().map(Cell::Double))
+            .map_err(|_| invalid_request(format!("The literal {number} is not a number."))),
+        Value::Boolean(value) => Ok(Cell::Bool(*value)),
+        Value::Null => Ok(Cell::Null),
+        other => Err(invalid_request(format!(
+            "The literal {other} is not one the query language this service answers \
+             carries."
+        ))),
+    }
+}
+
+/// The value a prefix operator answers. A null propagates, as SQL propagates it,
+/// and a whole number too large to negate answers one — the operator has no value to
+/// report rather than a wrapped one.
+fn unary(
+    op: &::sqlparser::ast::UnaryOperator,
+    value: &Cell,
+) -> Result<Cell, ExecuteQueryError> {
+    use ::sqlparser::ast::UnaryOperator;
+    match op {
+        UnaryOperator::Plus => Ok(value.clone()),
+        UnaryOperator::Minus => Ok(match (value, value.as_number()) {
+            (_, None) => Cell::Null,
+            (Cell::Int(whole), _) => whole.checked_neg().map_or(Cell::Null, Cell::Int),
+            (_, Some(number)) => Cell::Double(-number),
+        }),
+        other => Err(invalid_request(format!(
+            "The operator {other} is not one the query language this service answers \
+             carries."
+        ))),
+    }
+}
+
+/// The value an arithmetic or string operator answers over two expressions.
+///
+/// A null operand answers null, as SQL propagates it, and two whole numbers answer
+/// a whole number for every operator but division — which answers the quotient and
+/// not the whole part of it.
+fn arithmetic(
+    left: &::sqlparser::ast::Expr,
+    op: &::sqlparser::ast::BinaryOperator,
+    right: &::sqlparser::ast::Expr,
+    columns: &[Column],
+    scope: &Scope<'_>,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Cell, ExecuteQueryError> {
+    use ::sqlparser::ast::BinaryOperator;
+    let left = eval(left, columns, scope, run, depth + 1)?;
+    let right = eval(right, columns, scope, run, depth + 1)?;
+    if matches!(op, BinaryOperator::StringConcat) {
+        return Ok(match (left.as_text(), right.as_text()) {
+            (Some(left), Some(right)) => {
+                run.budget
+                    .charge_chars(left.len().saturating_add(right.len()))?;
+                Cell::Str(format!("{left}{right}"))
+            }
+            _ => Cell::Null,
+        });
+    }
+    let (Some(first), Some(second)) = (left.as_number(), right.as_number()) else {
+        return Ok(Cell::Null);
+    };
+    let whole = matches!((&left, &right), (Cell::Int(_), Cell::Int(_)));
+    let value = match op {
+        BinaryOperator::Plus => first + second,
+        BinaryOperator::Minus => first - second,
+        BinaryOperator::Multiply => first * second,
+        BinaryOperator::Divide | BinaryOperator::Modulo => {
+            if second == 0.0 {
+                return Err(invalid_request("Division by zero.".to_string()));
+            }
+            if matches!(op, BinaryOperator::Divide) {
+                first / second
+            } else {
+                first % second
+            }
+        }
+        other => {
+            return Err(invalid_request(format!(
+                "The operator {other} is not one the query language this service \
+                 answers carries."
+            )))
+        }
+    };
+    Ok(if whole && !matches!(op, BinaryOperator::Divide) {
+        Cell::Int(value as i64)
+    } else {
+        Cell::Double(value)
+    })
+}
+
+/// The value a `CASE` expression answers: the result of the first branch that
+/// matches, the `ELSE` result when none does, and null when there is no `ELSE`.
+fn case_value(
+    operand: Option<&::sqlparser::ast::Expr>,
+    conditions: &[::sqlparser::ast::CaseWhen],
+    else_result: Option<&::sqlparser::ast::Expr>,
+    columns: &[Column],
+    scope: &Scope<'_>,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Cell, ExecuteQueryError> {
+    for when in conditions {
+        run.budget.charge(1)?;
+        let matched = match operand {
+            // `CASE <operand> WHEN <value>`: the branch matches the value the
+            // operand equals, compared as the column it names compares.
+            Some(operand) => {
+                let numeric = numeric_comparison(&[operand, &when.condition], columns);
+                let left = eval(operand, columns, scope, run, depth + 1)?;
+                let right = eval(&when.condition, columns, scope, run, depth + 1)?;
+                left.compare(&right, numeric) == Some(::std::cmp::Ordering::Equal)
+            }
+            // `CASE WHEN <predicate>`: the branch matches when its predicate is
+            // true, which UNKNOWN is not.
+            None => {
+                predicate_of(&when.condition, columns, scope, run, depth + 1)? == Some(true)
+            }
+        };
+        if matched {
+            return eval(&when.result, columns, scope, run, depth + 1);
+        }
+    }
+    match else_result {
+        Some(result) => eval(result, columns, scope, run, depth + 1),
+        None => Ok(Cell::Null),
+    }
+}
+
+/// The aggregate functions this engine computes, each over the rows of one group.
+///
+/// The catalog is the query language's, not the model's: `queryStatement` is an
+/// opaque string, so the functions a statement may call come from the IoT SiteWise
+/// query-language reference ("Query your asset data") and not from the Smithy
+/// model. A function neither this list nor [`SCALAR_FUNCTIONS`] names is refused
+/// rather than answered from a guess.
+const AGGREGATE_FUNCTIONS: [&str; 8] = [
+    "AVG",
+    "COUNT",
+    "MAX",
+    "MIN",
+    "STDDEV",
+    "STDDEV_POP",
+    "STDDEV_SAMP",
+    "SUM",
+];
+
+/// The functions this engine computes over ONE row's values. Same source as
+/// [`AGGREGATE_FUNCTIONS`].
+const SCALAR_FUNCTIONS: [&str; 5] = ["ABS", "COALESCE", "LENGTH", "LOWER", "UPPER"];
+
+/// Whether `expr` carries an aggregate call anywhere inside it, which is what makes
+/// a statement that wrote no `GROUP BY` a grouped one.
+///
+/// Driven by an explicit worklist over [`child_expressions`] rather than by
+/// recursion, so walking a caller's tree costs HEAP and not stack however deeply the
+/// statement nests.
+fn has_aggregate(expr: &::sqlparser::ast::Expr) -> bool {
+    let mut pending: Vec<&::sqlparser::ast::Expr> = vec![expr];
+    while let Some(expr) = pending.pop() {
+        if is_aggregate_call(expr) {
+            return true;
+        }
+        pending.extend(child_expressions(expr));
+    }
+    false
+}
+
+/// Whether `expr` is a call of one of [`AGGREGATE_FUNCTIONS`].
+fn is_aggregate_call(expr: &::sqlparser::ast::Expr) -> bool {
+    matches!(
+        expr,
+        ::sqlparser::ast::Expr::Function(function)
+            if AGGREGATE_FUNCTIONS
+                .contains(&bare_name(&function.name).to_ascii_uppercase().as_str())
+    )
+}
+
+/// The value an aggregate call answers over `group`, or `None` when `expr` is not
+/// an aggregate call at all.
+///
+/// Every row of the group costs a step, so an aggregate is charged for the rows it
+/// reduces however many groups the statement formed.
+fn aggregate_value(
+    expr: &::sqlparser::ast::Expr,
+    columns: &[Column],
+    group: &Group<'_>,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Option<Cell>, ExecuteQueryError> {
+    use ::sqlparser::ast::{
+        DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    };
+    let Expr::Function(function) = expr else {
+        return Ok(None);
+    };
+    let name = bare_name(&function.name).to_ascii_uppercase();
+    if !AGGREGATE_FUNCTIONS.contains(&name.as_str()) {
+        return Ok(None);
+    }
+    let FunctionArguments::List(list) = &function.args else {
+        return Err(invalid_request(format!(
+            "The aggregate function {name} is called over exactly one expression."
+        )));
+    };
+    if !list.clauses.is_empty()
+        || function.filter.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return Err(not_in_the_language(&format!(
+            "a windowed, filtered or ordered {name} call"
+        )));
+    }
+    // `COUNT(*)` counts the ROWS of the group; every other call reduces the values
+    // of one expression over them.
+    let argument = match list.args.as_slice() {
+        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] => None,
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] => Some(argument),
+        _ => {
+            return Err(invalid_request(format!(
+                "The aggregate function {name} is called over exactly one expression."
+            )))
+        }
+    };
+    let numeric = argument
+        .is_none_or(|argument| is_numeric(type_of(argument, columns)));
+    let mut values: Vec<Cell> = Vec::new();
+    match argument {
+        Some(argument) => {
+            for row in group.rows {
+                run.budget.charge(1)?;
+                let value = eval(argument, columns, &Scope::Row(row), run, depth + 1)?;
+                // A null is not a value an aggregate reduces, which is why
+                // `COUNT(column)` counts fewer rows than `COUNT(*)` where the column
+                // is absent.
+                if value != Cell::Null {
+                    values.push(value);
+                }
+            }
+        }
+        None => run.budget.charge(group.rows.len())?,
+    }
+    if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
+        let mut seen: ::std::collections::BTreeSet<RowKey> =
+            ::std::collections::BTreeSet::new();
+        values.retain(|value| seen.insert(row_key(::std::slice::from_ref(value), &[numeric])));
+    }
+    let numbers: Vec<f64> = values.iter().filter_map(Cell::as_number).collect();
+    let mean = (!numbers.is_empty())
+        .then(|| numbers.iter().sum::<f64>() / numbers.len() as f64);
+    Ok(Some(match name.as_str() {
+        "COUNT" => Cell::Int(
+            i64::try_from(argument.map_or(group.rows.len(), |_| values.len()))
+                .unwrap_or(i64::MAX),
+        ),
+        "MIN" => extreme(&values, numeric, ::std::cmp::Ordering::Less),
+        "MAX" => extreme(&values, numeric, ::std::cmp::Ordering::Greater),
+        "SUM" => whole_or_double(numbers.iter().sum(), &values),
+        "AVG" => mean.map_or(Cell::Null, Cell::Double),
+        // The POPULATION deviation treats the group's rows as all of the data there
+        // is; the SAMPLE one — which is what a bare `STDDEV` names — treats them as
+        // a sample of a wider set, so it needs two rows and divides by one fewer.
+        other => {
+            let population = other == "STDDEV_POP";
+            let divisor = if population {
+                numbers.len()
+            } else {
+                numbers.len().saturating_sub(1)
+            };
+            match (mean, divisor) {
+                (Some(mean), divisor) if divisor > 0 => Cell::Double(
+                    (numbers
+                        .iter()
+                        .map(|value| (value - mean) * (value - mean))
+                        .sum::<f64>()
+                        / divisor as f64)
+                        .sqrt(),
+                ),
+                _ => Cell::Null,
+            }
+        }
+    }))
+}
+
+/// The least or greatest of `values`, as the column they come from compares, and
+/// null when there are none.
+fn extreme(values: &[Cell], numeric: bool, want: ::std::cmp::Ordering) -> Cell {
+    values
+        .iter()
+        .fold(None::<&Cell>, |held, value| match held {
+            Some(held) if value.compare(held, numeric) != Some(want) => Some(held),
+            _ => Some(value),
+        })
+        .cloned()
+        .unwrap_or(Cell::Null)
+}
+
+/// `total` as the type the values summed carry: a sum of whole numbers is a whole
+/// number, and a sum of nothing is null.
+fn whole_or_double(total: f64, values: &[Cell]) -> Cell {
+    if values.is_empty() {
+        return Cell::Null;
+    }
+    if values.iter().all(|value| matches!(value, Cell::Int(_))) {
+        return Cell::Int(total as i64);
+    }
+    Cell::Double(total)
+}
+
+/// The value a scalar function call answers over one row's values.
+fn scalar_function(
+    function: &::sqlparser::ast::Function,
+    columns: &[Column],
+    scope: &Scope<'_>,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Cell, ExecuteQueryError> {
+    use ::sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let name = bare_name(&function.name).to_ascii_uppercase();
+    if !SCALAR_FUNCTIONS.contains(&name.as_str()) {
+        return Err(unknown_function(&name));
+    }
+    let FunctionArguments::List(list) = &function.args else {
+        return Err(bad_arguments(&name));
+    };
+    let mut values: Vec<Cell> = Vec::new();
+    for argument in &list.args {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) = argument else {
+            return Err(bad_arguments(&name));
+        };
+        values.push(eval(argument, columns, scope, run, depth + 1)?);
+    }
+    match (name.as_str(), values.as_slice()) {
+        ("ABS", [value]) => Ok(match (value, value.as_number()) {
+            (_, None) => Cell::Null,
+            (Cell::Int(_), Some(number)) => Cell::Int(number.abs() as i64),
+            (_, Some(number)) => Cell::Double(number.abs()),
+        }),
+        ("LENGTH", [value]) => Ok(value.as_text().map_or(Cell::Null, |text| {
+            Cell::Int(i64::try_from(text.chars().count()).unwrap_or(i64::MAX))
+        })),
+        ("LOWER" | "UPPER", [value]) => {
+            let Some(text) = value.as_text() else {
+                return Ok(Cell::Null);
+            };
+            // The rebuilt string is as long as the one read, so it is charged
+            // before it is built.
+            run.budget.charge_chars(text.len())?;
+            Ok(Cell::Str(if name == "LOWER" {
+                text.to_lowercase()
+            } else {
+                text.to_uppercase()
+            }))
+        }
+        // The first value that is not null, and null when every one of them is.
+        ("COALESCE", [_, ..]) => Ok(values
+            .iter()
+            .find(|value| **value != Cell::Null)
+            .cloned()
+            .unwrap_or(Cell::Null)),
+        _ => Err(bad_arguments(&name)),
+    }
+}
+
+/// HTTP 400 `InvalidRequestException`: the statement called a function the query
+/// language this service answers does not carry.
+fn unknown_function(name: &str) -> ExecuteQueryError {
+    invalid_request(format!(
+        "The function {name} is not one the query language this service answers \
+         carries."
+    ))
+}
+
+/// HTTP 400 `InvalidRequestException`: a function the query language carries,
+/// called over arguments it is not called over.
+fn bad_arguments(name: &str) -> ExecuteQueryError {
+    invalid_request(format!(
+        "The function {name} is not called over the arguments this statement gives it."
+    ))
+}
+
+/// The one value a subquery used as a VALUE answers: the single cell of its single
+/// row, and null when it answers no row.
+fn scalar_subquery(
+    query: &::sqlparser::ast::Query,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Cell, ExecuteQueryError> {
+    let relation = subquery_relation(query, run, depth)?;
+    if relation.columns.len() != 1 {
+        return Err(invalid_request(format!(
+            "A subquery used as a value answers one column, but this one answers {}.",
+            relation.columns.len()
+        )));
+    }
+    if relation.rows.len() > 1 {
+        return Err(invalid_request(format!(
+            "A subquery used as a value answers at most one row, but this one answers {}.",
+            relation.rows.len()
+        )));
+    }
+    Ok(relation
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .cloned()
+        .unwrap_or(Cell::Null))
+}
+
+/// The relation a subquery answers, run once and read back by the text it was
+/// written as (see [`Run`]).
+fn subquery_relation(
+    query: &::sqlparser::ast::Query,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<::std::sync::Arc<Relation>, ExecuteQueryError> {
+    run.budget.depth(depth)?;
+    let text = query.to_string();
+    let held = run.memo.borrow().get(&text).cloned();
+    if let Some(held) = held {
+        return Ok(held);
+    }
+    let relation = ::std::sync::Arc::new(run_query(query, run.catalog, run.budget, depth + 1)?);
+    run.memo.borrow_mut().insert(text, relation.clone());
+    Ok(relation)
+}
+
+/// The values a subquery used as a LIST answers — one column, every row.
+fn subquery_values(
+    query: &::sqlparser::ast::Query,
+    run: &Run<'_>,
+    depth: usize,
+) -> Result<Vec<Cell>, ExecuteQueryError> {
+    let relation = subquery_relation(query, run, depth)?;
+    if relation.columns.len() != 1 {
+        return Err(invalid_request(format!(
+            "A subquery compared against a value answers one column, but this one \
+             answers {}.",
+            relation.columns.len()
+        )));
+    }
+    run.budget.charge(relation.rows.len())?;
+    Ok(relation
+        .rows
+        .iter()
+        .map(|row| row.first().cloned().unwrap_or(Cell::Null))
+        .collect())
+}
+
+/// The `ScalarType` the result reports for a computed column.
+///
+/// Taken from the expression and not from the cells it produced, so a result with no
+/// rows reports the same column types as one with rows.
+fn type_of(expr: &::sqlparser::ast::Expr, columns: &[Column]) -> &'static str {
+    type_of_nested(expr, columns, 0)
+}
+
+/// [`type_of`], carrying how deeply the walk has nested.
+///
+/// Bounded at the ceiling the evaluator's own walk is bounded at
+/// ([`MAX_EXPRESSION_DEPTH`]): past it the walk answers the default rather than
+/// descending further, because a statement nesting that deeply is refused when it
+/// RUNS and the type this would answer is never reported.
+fn type_of_nested(
+    expr: &::sqlparser::ast::Expr,
+    columns: &[Column],
+    depth: usize,
+) -> &'static str {
+    use ::sqlparser::ast::{BinaryOperator, Expr, Value};
+    if depth > MAX_EXPRESSION_DEPTH {
+        return "STRING";
+    }
+    if is_boolean_form(expr) {
+        return "BOOLEAN";
+    }
+    if let Some(parts) = identifier_parts(expr) {
+        return find_column(columns, &parts)
+            .and_then(|at| columns.get(at))
+            .map_or("STRING", |column| column.scalar_type);
+    }
+    match expr {
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+            type_of_nested(inner, columns, depth + 1)
+        }
+        Expr::Value(value) => match &value.value {
+            Value::Number(number, _) => {
+                if number.parse::<i64>().is_ok() {
+                    "INT"
+                } else {
+                    "DOUBLE"
+                }
+            }
+            Value::Boolean(_) => "BOOLEAN",
+            _ => "STRING",
+        },
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::StringConcat => "STRING",
+            BinaryOperator::Divide => "DOUBLE",
+            _ => {
+                if type_of_nested(left, columns, depth + 1) == "INT"
+                    && type_of_nested(right, columns, depth + 1) == "INT"
+                {
+                    "INT"
+                } else {
+                    "DOUBLE"
+                }
+            }
+        },
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => conditions
+            .first()
+            .map(|when| type_of_nested(&when.result, columns, depth + 1))
+            .or_else(|| {
+                else_result
+                    .as_ref()
+                    .map(|result| type_of_nested(result, columns, depth + 1))
+            })
+            .unwrap_or("STRING"),
+        Expr::Function(function) => function_type(function, columns, depth),
+        _ => "STRING",
+    }
+}
+
+/// The `ScalarType` a function call answers: what it computes decides it, not what
+/// it is called over, except where the function answers one of its arguments.
+fn function_type(
+    function: &::sqlparser::ast::Function,
+    columns: &[Column],
+    depth: usize,
+) -> &'static str {
+    use ::sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let name = bare_name(&function.name).to_ascii_uppercase();
+    let first = match &function.args {
+        FunctionArguments::List(list) => list.args.iter().find_map(|argument| match argument {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) => Some(argument),
+            _ => None,
+        }),
+        _ => None,
+    };
+    let argument = |fallback: &'static str| {
+        first.map_or(fallback, |argument| {
+            type_of_nested(argument, columns, depth + 1)
+        })
+    };
+    match name.as_str() {
+        "COUNT" | "LENGTH" => "INT",
+        "AVG" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" => "DOUBLE",
+        // A sum keeps whole numbers whole; an extreme and an absolute value keep the
+        // type of what they are over, and a coalesce the type of its first argument.
+        "SUM" | "ABS" => {
+            if argument("DOUBLE") == "INT" {
+                "INT"
+            } else {
+                "DOUBLE"
+            }
+        }
+        "MIN" | "MAX" | "COALESCE" => argument("STRING"),
+        "LOWER" | "UPPER" => "STRING",
+        _ => "STRING",
+    }
+}
+
+/// Whether `expr` is a form that answers a BOOLEAN, which is the set of forms
+/// [`predicate_of`] answers and [`eval`] hands to it.
+///
+/// A parenthesised expression is the form it wraps, unwrapped ITERATIVELY so a chain
+/// of brackets costs no stack.
+fn is_boolean_form(expr: &::sqlparser::ast::Expr) -> bool {
+    use ::sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
+    let mut expr = expr;
+    while let Expr::Nested(inner) = expr {
+        expr = inner;
+    }
+    match expr {
+        Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::Like { .. }
+        | Expr::InList { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Between { .. }
+        | Expr::Exists { .. } => true,
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            ..
+        } => true,
+        Expr::BinaryOp { op, .. } => matches!(
+            op,
+            BinaryOperator::And
+                | BinaryOperator::Or
+                | BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq
+        ),
+        _ => false,
+    }
+}
+
+/// Whether a row — or a GROUP of rows — satisfies a predicate.
 ///
 /// SQL's three-valued logic: the answer is `Some(true)`, `Some(false)` or `None`
 /// for UNKNOWN, and ONLY `Some(true)` keeps a row. UNKNOWN is what a comparison
@@ -1481,27 +4006,43 @@ fn value_of(
 /// side is false, `OR` is true as soon as either side is true, and either is
 /// unknown otherwise.
 ///
+/// Every form that is not boolean-valued is a VALUE, so it is evaluated by [`eval`]
+/// and read as a boolean here — which is what lets a `WHERE`, an `ON` and a `HAVING`
+/// clause carry the same expressions.
+///
 /// `depth` is how far this walk has nested; every recursive step charges it against
 /// the budget, so a statement cannot drive the walk past
 /// [`MAX_EXPRESSION_DEPTH`] however deeply it nests.
-fn evaluate(
+fn predicate_of(
     predicate: &::sqlparser::ast::Expr,
     columns: &[Column],
-    row: &[Cell],
-    from: &Qualified,
-    budget: &Budget,
+    scope: &Scope<'_>,
+    run: &Run<'_>,
     depth: usize,
 ) -> Result<Option<bool>, ExecuteQueryError> {
     use ::sqlparser::ast::{BinaryOperator, Expr};
     use ::std::cmp::Ordering;
+    let budget = run.budget;
     budget.depth(depth)?;
     // One step per recursion of the walk, so the work ONE row's predicate costs is
     // charged as the walk does it and the deadline is read between its steps — a
     // charge taken once per row cannot see inside the walk at all.
     budget.charge(1)?;
-    let value = |expr| value_of(expr, columns, row, from, budget, depth + 1);
+    if !is_boolean_form(predicate) {
+        // A value used as a predicate: a boolean cell is itself, a null is UNKNOWN,
+        // and anything else is not a predicate at all.
+        return match eval(predicate, columns, scope, run, depth + 1)? {
+            Cell::Bool(known) => Ok(Some(known)),
+            Cell::Null => Ok(None),
+            other => Err(invalid_request(format!(
+                "The expression {predicate} answers {}, which is not a predicate.",
+                other.as_text().unwrap_or_default()
+            ))),
+        };
+    }
+    let value = |expr| eval(expr, columns, scope, run, depth + 1);
     match predicate {
-        Expr::Nested(inner) => evaluate(inner, columns, row, from, budget, depth + 1),
+        Expr::Nested(inner) => predicate_of(inner, columns, scope, run, depth + 1),
         // `IS [NOT] NULL` is the one form that ANSWERS a null rather than
         // propagating it: it is never unknown.
         Expr::IsNull(inner) => Ok(Some(value(inner)? == Cell::Null)),
@@ -1509,7 +4050,49 @@ fn evaluate(
         Expr::UnaryOp {
             op: ::sqlparser::ast::UnaryOperator::Not,
             expr,
-        } => Ok(evaluate(expr, columns, row, from, budget, depth + 1)?.map(|known| !known)),
+        } => Ok(predicate_of(expr, columns, scope, run, depth + 1)?.map(|known| !known)),
+        // `BETWEEN` is the pair of comparisons it stands for, so it is unknown
+        // exactly where either of them is.
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let numeric = numeric_comparison(&[expr, low, high], columns);
+            let subject = value(expr)?;
+            let low = value(low)?;
+            let high = value(high)?;
+            budget.charge_chars(
+                subject
+                    .chars()
+                    .saturating_add(low.chars())
+                    .saturating_add(high.chars()),
+            )?;
+            let (Some(above), Some(below)) = (
+                subject.compare(&low, numeric),
+                subject.compare(&high, numeric),
+            ) else {
+                return Ok(None);
+            };
+            let inside = above != Ordering::Less && below != Ordering::Greater;
+            Ok(Some(inside != *negated))
+        }
+        // `EXISTS` asks whether the subquery answers any row at all, so it is never
+        // unknown.
+        Expr::Exists { subquery, negated } => {
+            let relation = subquery_relation(subquery, run, depth + 1)?;
+            Ok(Some(!relation.rows.is_empty() != *negated))
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let candidates = subquery_values(subquery, run, depth + 1)?;
+            let numeric = numeric_comparison(&[expr], columns);
+            in_values(&value(expr)?, &candidates, numeric, *negated, budget)
+        }
         Expr::InList {
             expr,
             list,
@@ -1526,35 +4109,13 @@ fn evaluate(
             }
             // The column the list is about decides how its values compare, exactly
             // as it does for a comparison operator.
-            let numeric = numeric_comparison(&[expr], columns, from);
+            let numeric = numeric_comparison(&[expr], columns);
             let left = value(expr)?;
-            if left == Cell::Null {
-                return Ok(None);
-            }
-            let mut found = false;
-            let mut unknown = false;
+            let mut candidates = Vec::with_capacity(list.len());
             for candidate in list {
-                let candidate = value(candidate)?;
-                // One step per element, plus the characters comparing it costs:
-                // `compare` renders both sides as text for a non-numeric column,
-                // and a stored cell's length is the one input the model does not
-                // bound.
-                budget.charge(1)?;
-                budget.charge_chars(left.chars().saturating_add(candidate.chars()))?;
-                match left.compare(&candidate, numeric) {
-                    Some(Ordering::Equal) => found = true,
-                    // A candidate that cannot be compared — a null in the list —
-                    // leaves "not in this list" unknown, though a match elsewhere
-                    // in it still answers true.
-                    None => unknown = true,
-                    Some(_) => {}
-                }
+                candidates.push(value(candidate)?);
             }
-            Ok(match (found, unknown) {
-                (true, _) => Some(!*negated),
-                (false, true) => None,
-                (false, false) => Some(*negated),
-            })
+            in_values(&left, &candidates, numeric, *negated, budget)
         }
         Expr::Like {
             negated,
@@ -1563,10 +4124,10 @@ fn evaluate(
             escape_char,
             any,
         } => {
-            // `LIKE ANY (…)` compares the value against a LIST of patterns, which is
-            // a different predicate and not one this engine runs.
+            // `LIKE ANY (…)` compares the value against a LIST of patterns, which
+            // the query language this service answers does not carry.
             if *any {
-                return Err(unsupported("a LIKE ANY predicate"));
+                return Err(not_in_the_language("a LIKE ANY predicate"));
             }
             let left = value(expr)?;
             let pattern = value(pattern)?;
@@ -1587,8 +4148,8 @@ fn evaluate(
         }
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => {
-                let left = evaluate(left, columns, row, from, budget, depth + 1)?;
-                let right = evaluate(right, columns, row, from, budget, depth + 1)?;
+                let left = predicate_of(left, columns, scope, run, depth + 1)?;
+                let right = predicate_of(right, columns, scope, run, depth + 1)?;
                 Ok(match (left, right) {
                     (Some(false), _) | (_, Some(false)) => Some(false),
                     (Some(true), Some(true)) => Some(true),
@@ -1596,21 +4157,16 @@ fn evaluate(
                 })
             }
             BinaryOperator::Or => {
-                let left = evaluate(left, columns, row, from, budget, depth + 1)?;
-                let right = evaluate(right, columns, row, from, budget, depth + 1)?;
+                let left = predicate_of(left, columns, scope, run, depth + 1)?;
+                let right = predicate_of(right, columns, scope, run, depth + 1)?;
                 Ok(match (left, right) {
                     (Some(true), _) | (_, Some(true)) => Some(true),
                     (Some(false), Some(false)) => Some(false),
                     _ => None,
                 })
             }
-            BinaryOperator::Eq
-            | BinaryOperator::NotEq
-            | BinaryOperator::Lt
-            | BinaryOperator::LtEq
-            | BinaryOperator::Gt
-            | BinaryOperator::GtEq => {
-                let numeric = numeric_comparison(&[left, right], columns, from);
+            _ => {
+                let numeric = numeric_comparison(&[left, right], columns);
                 let left = value(left)?;
                 let right = value(right)?;
                 // Charged before the comparison, which renders both sides as text
@@ -1626,13 +4182,54 @@ fn evaluate(
                     BinaryOperator::Lt => order == Ordering::Less,
                     BinaryOperator::LtEq => order != Ordering::Greater,
                     BinaryOperator::Gt => order == Ordering::Greater,
+                    // The remaining comparison, since `is_boolean_form` admits these
+                    // six operators and the two above are answered already.
                     _ => order != Ordering::Less,
                 }))
             }
-            other => Err(unsupported(&format!("the operator {other}"))),
         },
-        other => Err(unsupported(&format!("the predicate {other}"))),
+        // Unreachable: every form `is_boolean_form` admits is answered above, and
+        // everything else was handed to `eval` at the top of this walk.
+        other => Err(invalid_request(format!(
+            "The expression {other} is not one the query language this service \
+             answers carries."
+        ))),
     }
+}
+
+/// Whether a value is one of `candidates`, as SQL's `IN` answers it: unknown when
+/// the value is null, or when no candidate matches and one of them could not be
+/// compared, since a null in the list leaves "not in this list" unknown.
+fn in_values(
+    left: &Cell,
+    candidates: &[Cell],
+    numeric: bool,
+    negated: bool,
+    budget: &Budget,
+) -> Result<Option<bool>, ExecuteQueryError> {
+    use ::std::cmp::Ordering;
+    if *left == Cell::Null {
+        return Ok(None);
+    }
+    let mut found = false;
+    let mut unknown = false;
+    for candidate in candidates {
+        // One step per candidate, plus the characters comparing it costs: `compare`
+        // renders both sides as text for a non-numeric column, and a stored cell's
+        // length is the one input the model does not bound.
+        budget.charge(1)?;
+        budget.charge_chars(left.chars().saturating_add(candidate.chars()))?;
+        match left.compare(candidate, numeric) {
+            Some(Ordering::Equal) => found = true,
+            None => unknown = true,
+            Some(_) => {}
+        }
+    }
+    Ok(match (found, unknown) {
+        (true, _) => Some(!negated),
+        (false, true) => None,
+        (false, false) => Some(negated),
+    })
 }
 
 /// Whether a comparison between `operands` is a NUMERIC one: it is when a column
@@ -1644,17 +4241,13 @@ fn evaluate(
 /// while `WHERE int_value = '10'` compares two numbers. A comparison naming no
 /// column at all — two literals — compares as text unless both sides are numbers,
 /// which is what the caller wrote them as.
-fn numeric_comparison(
-    operands: &[&::sqlparser::ast::Expr],
-    columns: &[Column],
-    from: &Qualified,
-) -> bool {
+fn numeric_comparison(operands: &[&::sqlparser::ast::Expr], columns: &[Column]) -> bool {
     let mut named_a_column = false;
     for operand in operands {
         if let Some(parts) = identifier_parts(operand) {
-            if let Some(at) = column_at(columns, &parts, from) {
+            if let Some(at) = find_column(columns, &parts) {
                 named_a_column = true;
-                if matches!(columns[at].scalar_type, "INT" | "DOUBLE" | "TIMESTAMP") {
+                if columns.get(at).is_some_and(Column::numeric) {
                     return true;
                 }
             }
@@ -1663,14 +4256,12 @@ fn numeric_comparison(
     if named_a_column {
         return false;
     }
-    // No column: a literal-only comparison, which is numeric when the literals are.
-    operands.iter().all(|operand| {
-        matches!(
-            operand,
-            ::sqlparser::ast::Expr::Value(value)
-                if matches!(value.value, ::sqlparser::ast::Value::Number(..))
-        )
-    })
+    // No column: a comparison of computed values, which is numeric when every one of
+    // them is a number — a literal the caller wrote as one, or an expression that
+    // answers one.
+    operands
+        .iter()
+        .all(|operand| is_numeric(type_of(operand, columns)))
 }
 
 /// SQL `LIKE`: `%` stands for any run of characters and `_` for exactly one, and
@@ -1740,79 +4331,6 @@ fn like(
     Ok(matched[value.len()])
 }
 
-/// Sort `rows` by the statement's `ORDER BY`, if it has one.
-///
-/// One pass over the rows per key, each charged against the budget, and at most
-/// [`MAX_ORDER_BY_KEYS`] keys — so the sort cannot be made to cost more than the
-/// budget allows and cannot run past the deadline unnoticed. The comparisons
-/// themselves are charged BEFORE `sort_by` runs, in characters: a comparator
-/// cannot read the deadline, so the only place the `n log n` key-character work can
-/// be bounded is here, and [`MAX_SORT_KEY_CHARS`] is what bounds one comparison.
-fn order_rows(
-    query: &::sqlparser::ast::Query,
-    columns: &[Column],
-    from: &Qualified,
-    rows: &mut Vec<Vec<Cell>>,
-    budget: &Budget,
-) -> Result<(), ExecuteQueryError> {
-    use ::sqlparser::ast::OrderByKind;
-    let Some(order_by) = query.order_by.as_ref() else {
-        return Ok(());
-    };
-    let OrderByKind::Expressions(expressions) = &order_by.kind else {
-        return Err(unsupported("ORDER BY ALL"));
-    };
-    if expressions.len() > MAX_ORDER_BY_KEYS {
-        return Err(invalid_request(format!(
-            "An ORDER BY names at most {MAX_ORDER_BY_KEYS} keys, but this one names {}.",
-            expressions.len()
-        )));
-    }
-    // Applied from the last key to the first, which a stable sort turns into
-    // ordering by the first key with the later ones breaking its ties.
-    for expression in expressions.iter().rev() {
-        let parts = identifier_parts(&expression.expr)
-            .ok_or_else(|| unsupported("an ORDER BY key that is not a column"))?;
-        let at = column_at(columns, &parts, from).ok_or_else(|| {
-            invalid_request(format!("The column {} does not exist.", parts.join(".")))
-        })?;
-        let descending = expression.options.asc == Some(false);
-        // One pass costs one unit of work per row it orders.
-        budget.charge(rows.len())?;
-        // The key is computed ONCE per row and is a TOTAL order (see [`SortKey`]):
-        // the comparison a `WHERE` clause makes is SQL's, where two values can be
-        // incomparable, and a sort cannot be driven by that — a comparator that is
-        // not a total order is what makes a sort's own behaviour undefined.
-        let numeric = matches!(columns[at].scalar_type, "INT" | "DOUBLE" | "TIMESTAMP");
-        // A sort makes about `n * log2(n)` comparisons and each costs up to its
-        // key's length, so that product is charged here — BEFORE the keys are built
-        // and before `sort_by` runs, whose comparator can neither charge the budget
-        // nor read the deadline. The per-key amount is what [`SortKey`] keeps, so
-        // the charge is the work that will actually be done; `+ 1` covers building
-        // the keys themselves.
-        let key_chars: usize = rows
-            .iter()
-            .map(|row| row[at].chars().min(MAX_SORT_KEY_CHARS))
-            .sum();
-        let comparisons = usize::BITS as usize - rows.len().leading_zeros() as usize;
-        budget.charge_chars(key_chars.saturating_mul(comparisons.saturating_add(1)))?;
-        let mut keyed: Vec<(SortKey, Vec<Cell>)> = ::std::mem::take(rows)
-            .into_iter()
-            .map(|row| (SortKey::of(&row[at], numeric), row))
-            .collect();
-        keyed.sort_by(|(left, _), (right, _)| {
-            let order = left.cmp(right);
-            if descending {
-                order.reverse()
-            } else {
-                order
-            }
-        });
-        *rows = keyed.into_iter().map(|(_, row)| row).collect();
-    }
-    Ok(())
-}
-
 /// The sort key of one cell: a TOTAL order, so a sort over it is well defined
 /// whatever the rows hold.
 ///
@@ -1830,6 +4348,19 @@ enum SortKey {
 
 impl SortKey {
     fn of(cell: &Cell, numeric: bool) -> Self {
+        Self::keyed(cell, numeric, MAX_SORT_KEY_CHARS)
+    }
+
+    /// The key that decides whether two cells are the SAME value — for grouping,
+    /// for `DISTINCT` and for a set operation — which is the whole cell and not a
+    /// prefix of it: two values agreeing on a long prefix are two values, and
+    /// merging them would answer a row the store does not hold.
+    fn identity(cell: &Cell, numeric: bool) -> Self {
+        Self::keyed(cell, numeric, usize::MAX)
+    }
+
+    /// [`Self::of`] with the number of characters of a cell the key keeps.
+    fn keyed(cell: &Cell, numeric: bool, chars: usize) -> Self {
         if cell == &Cell::Null {
             return Self::Null;
         }
@@ -1838,16 +4369,10 @@ impl SortKey {
                 return Self::Number(NumberKey(number));
             }
         }
-        // Truncated to [`MAX_SORT_KEY_CHARS`], so ONE comparison costs a bounded
-        // amount however long the stored cell is — the comparator is the one place
-        // in this engine that cannot charge the budget.
-        Self::Text(
-            cell.as_text()
-                .unwrap_or_default()
-                .chars()
-                .take(MAX_SORT_KEY_CHARS)
-                .collect(),
-        )
+        // Truncated to [`MAX_SORT_KEY_CHARS`] where it orders a sort, so ONE
+        // comparison costs a bounded amount however long the stored cell is — the
+        // comparator is the one place in this engine that cannot charge the budget.
+        Self::Text(cell.as_text().unwrap_or_default().chars().take(chars).collect())
     }
 }
 
@@ -1877,30 +4402,16 @@ impl Ord for NumberKey {
 }
 
 /// The statement's `OFFSET` and `LIMIT`, as row counts.
-fn limits(
-    query: &::sqlparser::ast::Query,
-) -> Result<(usize, Option<usize>), ExecuteQueryError> {
-    use ::sqlparser::ast::{Expr, LimitClause, Value};
-    let Some(clause) = query.limit_clause.as_ref() else {
-        return Ok((0, None));
-    };
-    let (limit, offset) = match clause {
-        LimitClause::LimitOffset {
-            limit,
-            offset,
-            limit_by,
-        } => {
-            if !limit_by.is_empty() {
-                return Err(unsupported("LIMIT BY"));
-            }
-            (limit.as_ref(), offset.as_ref().map(|offset| &offset.value))
-        }
-        LimitClause::OffsetCommaLimit { offset, limit } => (Some(limit), Some(offset)),
-    };
-    // A LIMIT or OFFSET is a non-negative whole NUMBER — "LIMIT -1", "LIMIT 1.5" and
-    // an expression naming a column are all the clause being wrong rather than
-    // something this engine has not written, so each is the terminal request error.
-    let count = |expr: Option<&Expr>| match expr {
+/// A `LIMIT`, `OFFSET`, `FETCH` or `TOP` count, as a number of rows.
+///
+/// A row count is a non-negative whole NUMBER — "LIMIT -1", "LIMIT 1.5" and an
+/// expression naming a column are all the clause being wrong, so each is the
+/// terminal request error.
+fn row_count(
+    expr: Option<&::sqlparser::ast::Expr>,
+) -> Result<Option<usize>, ExecuteQueryError> {
+    use ::sqlparser::ast::{Expr, Value};
+    match expr {
         None => Ok(None),
         Some(Expr::Value(value)) => match &value.value {
             Value::Number(number, _) => number.parse::<usize>().map(Some).map_err(|_| {
@@ -1915,98 +4426,7 @@ fn limits(
         Some(other) => Err(invalid_request(format!(
             "A LIMIT or OFFSET must be a non-negative whole number, not {other}."
         ))),
-    };
-    Ok((count(offset)?.unwrap_or(0), count(limit)?))
-}
-
-/// Apply the statement's projection: the columns it selects, in the order it
-/// selects them, with `*` standing for every column of the view.
-fn project(
-    select: &::sqlparser::ast::Select,
-    columns: &'static [Column],
-    from: &Qualified,
-    rows: Vec<Vec<Cell>>,
-    budget: &Budget,
-) -> Result<ResultSet, ExecuteQueryError> {
-    use ::sqlparser::ast::SelectItem;
-    let mut projected: Vec<(String, &'static str)> = Vec::new();
-    // Which source column each projected column reads, so the rows are rebuilt
-    // without re-resolving a name per row.
-    let mut picks: Vec<usize> = Vec::new();
-    for item in &select.projection {
-        match item {
-            SelectItem::Wildcard(_) => {
-                for (at, column) in columns.iter().enumerate() {
-                    projected.push((column.name.to_string(), column.scalar_type));
-                    picks.push(at);
-                }
-            }
-            SelectItem::QualifiedWildcard(qualifier, _) => {
-                // `<qualifier>.*` stands for every column OF THAT RELATION, so a
-                // qualifier naming none of the statement's relations names no
-                // columns — the same refusal a qualified single column gets, rather
-                // than the whole view under a name the statement never read.
-                let qualifier = qualifier.to_string();
-                // The qualifier renders with the `.*` that makes it a wildcard; the
-                // relation is what comes before it.
-                let named = qualifier
-                    .trim_end_matches('*')
-                    .trim_end_matches('.')
-                    .rsplit('.')
-                    .next()
-                    .is_some_and(|qualifier| from.admits(qualifier));
-                if !named {
-                    return Err(invalid_request(format!(
-                        "The relation {qualifier} is not one this statement reads."
-                    )));
-                }
-                for (at, column) in columns.iter().enumerate() {
-                    projected.push((column.name.to_string(), column.scalar_type));
-                    picks.push(at);
-                }
-            }
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                let parts = identifier_parts(expr).ok_or_else(|| {
-                    unsupported("a selected expression that is not a column")
-                })?;
-                let at = column_at(columns, &parts, from).ok_or_else(|| {
-                    invalid_request(format!("The column {} does not exist.", parts.join(".")))
-                })?;
-                // An alias names the column in the result; without one it keeps the
-                // view's own column name.
-                let name = match item {
-                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-                    _ => columns[at].name.to_string(),
-                };
-                projected.push((name, columns[at].scalar_type));
-                picks.push(at);
-            }
-        }
     }
-    // Rebuilding a row costs one unit of work per cell it carries, so a projection
-    // that asks for every column of every row is charged for all of them — and a
-    // statement that asks for more than the budget allows ends in the modelled
-    // timeout instead of being materialised. The CHARACTERS the row's cells hold are
-    // charged BEFORE the copies are made, because copying a cell and rendering it to
-    // the wire's `scalarValue` both cost its length and not one unit, and an
-    // allocation already made cannot be refused.
-    if picks.len() > MAX_PROJECTED_COLUMNS {
-        return Err(invalid_request(format!(
-            "A result row carries at most {MAX_PROJECTED_COLUMNS} columns, but this \
-             statement's projection expands to {}.",
-            picks.len()
-        )));
-    }
-    let mut projected_rows: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
-    for row in rows {
-        budget.charge(picks.len())?;
-        budget.charge_chars(picks.iter().map(|at| row[*at].chars()).sum())?;
-        projected_rows.push(picks.iter().map(|at| row[*at].clone()).collect());
-    }
-    Ok(ResultSet {
-        columns: projected,
-        rows: projected_rows,
-    })
 }
 
 /// HTTP 400 `InvalidRequestException` carrying `message`.
@@ -2026,20 +4446,24 @@ fn query_timeout(message: String) -> ExecuteQueryError {
     ))
 }
 
-/// HTTP 501 `NotImplemented` for a construct this query engine does not run.
+/// HTTP 400 `InvalidRequestException` for a clause the query language this service
+/// answers does not carry.
 ///
-/// Deliberately NOT a modelled refusal: the statement is valid SQL and a real
-/// service would answer it, so reporting it as an invalid request would be a false
-/// statement about the caller's query. 501 says what is true — this construct is
-/// not written yet — and is the answer the emulator reserves for exactly that.
+/// A MODELLED refusal, and the terminal one: `queryStatement` is read by the IoT
+/// SiteWise query language, which is a subset of SQL, so a clause outside that
+/// subset makes the REQUEST invalid — exactly as a clause naming a view the catalog
+/// does not hold does. The errors this operation models are the only ones a
+/// generated client carries a class for, so a refusal outside them is one no
+/// caller's `except` can catch.
 ///
 /// The message names the CONSTRUCT and no operation, because every operation that
 /// runs a statement through this engine ([`run_statement`]) answers it, and a
 /// message naming one of them would be wrong for the others.
-fn unsupported(construct: &str) -> ExecuteQueryError {
-    ExecuteQueryError::NotImplemented(crate::scaffolded::NotImplemented {
-        message: format!("this emulator does not implement {construct} in a query statement"),
-    })
+fn not_in_the_language(construct: &str) -> ExecuteQueryError {
+    invalid_request(format!(
+        "The query statement carries {construct}, which the query language this \
+         service answers does not carry."
+    ))
 }
 
 /// WHICH enumeration of a query's rows a page token was issued for.

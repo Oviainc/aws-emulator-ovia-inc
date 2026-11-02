@@ -25,7 +25,7 @@ use crate::asset_lifecycle::{
 use crate::support::now_seconds;
 
 /// `POST /queries/execution` with `statement`.
-async fn query(router: &MultiServiceRouter, statement: &str) -> (u16, Value) {
+pub(crate) async fn query(router: &MultiServiceRouter, statement: &str) -> (u16, Value) {
     call(
         router,
         "POST",
@@ -36,7 +36,7 @@ async fn query(router: &MultiServiceRouter, statement: &str) -> (u16, Value) {
 }
 
 /// The column names a result reports, in order.
-fn column_names(body: &Value) -> Vec<String> {
+pub(crate) fn column_names(body: &Value) -> Vec<String> {
     body["columns"]
         .as_array()
         .unwrap_or_else(|| panic!("no columns in {body}"))
@@ -47,7 +47,7 @@ fn column_names(body: &Value) -> Vec<String> {
 
 /// The rows a result reports, each as the `scalarValue`s of its data points (an
 /// absent value for a `nullValue` datum).
-fn rows(body: &Value) -> Vec<Vec<Option<String>>> {
+pub(crate) fn rows(body: &Value) -> Vec<Vec<Option<String>>> {
     body["rows"]
         .as_array()
         .unwrap_or_else(|| panic!("no rows in {body}"))
@@ -1080,48 +1080,16 @@ async fn a_statement_past_the_engine_budget_ends_in_a_modelled_error() {
 }
 
 #[tokio::test]
-async fn a_construct_this_query_engine_does_not_run_is_not_reported_as_a_bad_request() {
+async fn a_construct_outside_the_query_language_is_refused_with_a_modelled_error() {
     let router = router();
-    let (asset_id, _other, _temperature) = asset_fixture(&router).await;
+    let (_asset_id, _other, _temperature) = asset_fixture(&router).await;
 
-    // These statements are valid SQL that a real service would answer, and this
-    // engine does not plan them. Reporting them as InvalidRequestException would be
-    // a false statement about the caller's query, so they answer 501 — "not written
-    // yet" — which is what the emulator reserves for exactly that.
+    // These statements carry clauses the IoT SiteWise query language does not carry,
+    // so the REQUEST cannot be read — which is exactly what this operation models
+    // `InvalidRequestException` for. An error outside the operation's modelled set is
+    // one no generated client carries an exception class for, so a caller's
+    // `except InvalidRequestException` would never fire.
     let cases: Vec<(&str, String)> = vec![
-        (
-            "a join",
-            "SELECT a.asset_id FROM asset a JOIN asset_property p ON a.asset_id = p.asset_id"
-                .to_string(),
-        ),
-        (
-            "an aggregate",
-            "SELECT COUNT(asset_id) FROM asset".to_string(),
-        ),
-        (
-            "a group by",
-            "SELECT asset_model_id FROM asset GROUP BY asset_model_id".to_string(),
-        ),
-        (
-            "a union",
-            "SELECT asset_id FROM asset UNION SELECT asset_id FROM asset".to_string(),
-        ),
-        (
-            "a subquery",
-            format!(
-                "SELECT asset_id FROM asset WHERE asset_id IN \
-                 (SELECT asset_id FROM asset_property WHERE asset_id = '{asset_id}')"
-            ),
-        ),
-        (
-            "SELECT DISTINCT",
-            "SELECT DISTINCT asset_model_id FROM asset".to_string(),
-        ),
-        (
-            "a FETCH clause",
-            "SELECT asset_id FROM asset FETCH FIRST 1 ROW ONLY".to_string(),
-        ),
-        ("SELECT TOP", "SELECT TOP 1 asset_id FROM asset".to_string()),
         (
             "a QUALIFY clause",
             "SELECT asset_id FROM asset QUALIFY asset_name = 'Boiler1'".to_string(),
@@ -1134,24 +1102,70 @@ async fn a_construct_this_query_engine_does_not_run_is_not_reported_as_a_bad_req
             "a CLUSTER BY clause",
             "SELECT asset_id FROM asset CLUSTER BY asset_name".to_string(),
         ),
-        // A view the IoT SiteWise query catalog documents but this engine does not
-        // compute: it EXISTS, so "the view does not exist" would be a false
-        // statement about the caller's query.
         (
-            "a documented view this engine does not compute",
-            "SELECT asset_id FROM precomputed_aggregates".to_string(),
+            "a DISTRIBUTE BY clause",
+            "SELECT asset_id FROM asset DISTRIBUTE BY asset_name".to_string(),
+        ),
+        (
+            "an ORDER BY ALL clause",
+            "SELECT asset_id FROM asset ORDER BY ALL".to_string(),
+        ),
+        (
+            "a GROUP BY ALL clause",
+            "SELECT asset_id FROM asset GROUP BY ALL".to_string(),
+        ),
+        (
+            "a recursive WITH clause",
+            "WITH RECURSIVE held AS (SELECT asset_id FROM asset) \
+             SELECT asset_id FROM held"
+                .to_string(),
+        ),
+        (
+            "a subquery read as a relation with no alias",
+            "SELECT asset_id FROM (SELECT asset_id FROM asset)".to_string(),
+        ),
+        (
+            "a function the language does not carry",
+            "SELECT SQRT(asset_id) FROM asset".to_string(),
+        ),
+        (
+            "a window function",
+            "SELECT COUNT(*) OVER () FROM asset".to_string(),
+        ),
+        (
+            "a column that is neither grouped nor aggregated",
+            "SELECT asset_name, COUNT(*) FROM asset GROUP BY asset_model_id".to_string(),
+        ),
+        (
+            "a column two joined relations both carry",
+            "SELECT asset_id FROM asset a JOIN asset_property p ON a.asset_id = p.asset_id"
+                .to_string(),
+        ),
+        (
+            "more than one row limit",
+            "SELECT asset_id FROM asset LIMIT 1 FETCH FIRST 1 ROW ONLY".to_string(),
+        ),
+        (
+            "a relation name carrying a catalog or schema qualifier",
+            "SELECT asset_id FROM some_catalog.asset".to_string(),
         ),
     ];
     for (case, statement) in &cases {
         let (status, body) = query(&router, statement).await;
         assert_eq!(
-            status, 501,
+            status, 400,
             "case {case:?}: {statement:?} got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            "NotImplemented",
+            "InvalidRequestException",
             "case {case:?}: unexpected error code in {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "case {case:?}: the refusal must say what was wrong, got {body}"
         );
     }
 }

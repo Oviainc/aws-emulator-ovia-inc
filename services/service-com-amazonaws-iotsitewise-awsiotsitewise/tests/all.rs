@@ -625,6 +625,8 @@ mod enrichment_jobs;
 mod execute_query;
 #[path = "all/execute_query_follows_the_store.rs"]
 mod execute_query_follows_the_store;
+#[path = "all/execute_query_relational_statements.rs"]
+mod execute_query_relational_statements;
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
 #[path = "all/hierarchies_etags_and_refusals.rs"]

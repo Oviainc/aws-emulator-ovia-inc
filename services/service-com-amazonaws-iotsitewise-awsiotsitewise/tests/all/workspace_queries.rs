@@ -16,8 +16,8 @@
 //!   span the clock owes has elapsed, with its completion instant and statistics
 //!   appearing only then;
 //! * a statement the query engine cannot read is the modelled invalid-request
-//!   refusal and starts NO query, while valid SQL the engine has not written is the
-//!   501 the emulator reserves for that and also starts none;
+//!   refusal and starts NO query, and so is a statement carrying a clause the query
+//!   language this service answers does not carry;
 //! * a query is addressed only inside the workspace it was started in, and a
 //!   workspace this service does not hold is the modelled not-found refusal;
 //! * a retry carrying the client token of a query that was already started — the
@@ -432,15 +432,59 @@ async fn a_statement_the_query_engine_cannot_read_starts_no_query() {
 }
 
 #[tokio::test]
-async fn a_construct_the_query_engine_does_not_run_is_a_501_and_starts_no_query() {
+async fn a_construct_outside_the_query_language_is_a_modelled_refusal_and_starts_no_query() {
     let (router, engine) = router_with_engine();
     fixture(&router).await;
 
-    // These statements are valid SQL a real service would answer and this engine
-    // does not run, so reporting them as invalid requests would be a false
-    // statement about the caller's query: they answer 501, exactly as the
-    // synchronous path does.
+    // These statements carry clauses the query language this service answers does
+    // not: the request cannot be read, which is the error this operation models for
+    // it, so no query is started at all. A refusal outside the operation's modelled
+    // set would be one no generated client carries an exception class for.
     let cases: Vec<(&str, &str)> = vec![
+        (
+            "a QUALIFY clause",
+            "SELECT asset_id FROM asset QUALIFY asset_name = 'Boiler1'",
+        ),
+        (
+            "a CLUSTER BY clause",
+            "SELECT asset_id FROM asset CLUSTER BY asset_name",
+        ),
+        (
+            "a SORT BY clause",
+            "SELECT asset_id FROM asset SORT BY asset_name",
+        ),
+        ("an ORDER BY ALL clause", "SELECT asset_id FROM asset ORDER BY ALL"),
+        ("a GROUP BY ALL clause", "SELECT asset_id FROM asset GROUP BY ALL"),
+        (
+            "a recursive WITH clause",
+            "WITH RECURSIVE held AS (SELECT asset_id FROM asset) SELECT asset_id FROM held",
+        ),
+        ("a window function", "SELECT COUNT(*) OVER () FROM asset"),
+        ("a function the language does not carry", "SELECT SQRT(2) FROM asset"),
+    ];
+
+    for (case, statement) in &cases {
+        let (status, body) = start_in(&router, WORKSPACE, statement, None).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400 for {statement:?}, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidRequestException",
+            "case {case:?}: unexpected error code in {body}"
+        );
+    }
+    assert_eq!(
+        queries_held(&engine),
+        0,
+        "a construct outside the query language starts no query"
+    );
+
+    // The constructs a real client writes are RUN, so each starts a query of its
+    // own: the engine admits the same statements through this path as through the
+    // synchronous one.
+    let run: Vec<(&str, &str)> = vec![
         ("SELECT DISTINCT", "SELECT DISTINCT asset_model_id FROM asset"),
         (
             "a union",
@@ -452,31 +496,25 @@ async fn a_construct_the_query_engine_does_not_run_is_a_501_and_starts_no_query(
         ),
         ("SELECT TOP", "SELECT TOP 1 asset_id FROM asset"),
         (
-            "a QUALIFY clause",
-            "SELECT asset_id FROM asset QUALIFY asset_name = 'Boiler1'",
+            "a join",
+            "SELECT a.asset_name FROM asset a JOIN asset_property p ON a.asset_id = p.asset_id",
         ),
         (
-            "a CLUSTER BY clause",
-            "SELECT asset_id FROM asset CLUSTER BY asset_name",
+            "an aggregate over a group",
+            "SELECT asset_model_id, COUNT(*) FROM asset GROUP BY asset_model_id",
         ),
     ];
-
-    for (case, statement) in &cases {
+    for (case, statement) in &run {
         let (status, body) = start_in(&router, WORKSPACE, statement, None).await;
         assert_eq!(
-            status, 501,
-            "case {case:?}: expected 501 for {statement:?}, got {status} {body}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "NotImplemented",
-            "case {case:?}: unexpected error code in {body}"
+            status, 202,
+            "case {case:?}: {statement:?} must be run, got {status} {body}"
         );
     }
     assert_eq!(
         queries_held(&engine),
-        0,
-        "a construct the engine does not run starts no query"
+        run.len(),
+        "every statement the engine runs starts a query of its own"
     );
 }
 
