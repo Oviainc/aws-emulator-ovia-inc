@@ -181,7 +181,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // states every error that walk reports), so "The result value will be OK when
         // your workflow definition can be successfully created or updated" holds by
         // construction rather than by two validators agreeing.
-        let found = crate::state::asl::diagnose(&input.definition);
+        //
+        // The walk is CPU work a caller's definition sizes, so it runs on a blocking
+        // thread rather than on the async worker serving this request —
+        // `spawn_blocking(..).await` is a real await point, so the health endpoint, a
+        // request timeout and shutdown keep working while a 1 MiB definition is being
+        // walked. The definition is MOVED onto that thread rather than copied: it is
+        // the one member of the request the walk reads.
+        let definition = input.definition;
+        let Ok(found) =
+            ::tokio::task::spawn_blocking(move || crate::state::asl::diagnose(&definition)).await
+        else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::INTERPRETER_UNAVAILABLE,
+            ));
+        };
 
         // "The result value will be FAIL when the workflow definition contains
         // errors that would prevent you from creating or updating your state

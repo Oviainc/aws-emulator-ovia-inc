@@ -973,14 +973,14 @@ async fn a_definition_past_what_the_interpreter_bounds_fails_rather_than_running
         ),
         (
             "a definition that doubles its document on every transition",
-            r#"{"StartAt":"G","States":{"G":{"Type":"Pass","Parameters":{"a.$":"$","b.$":"$"},"Next":"G"}}}"#
+            r#"{"StartAt":"G","States":{"G":{"Type":"Pass","Parameters":{"a.$":"$","b.$":"$"},"Next":"G"},"Done":{"Type":"Succeed"}}}"#
                 .to_string(),
             format!(r#"{{"seed":"{}"}}"#, "s".repeat(1_024)),
             "States.DataLimitExceeded",
         ),
         (
             "a definition that nests its document one level deeper on every transition",
-            r#"{"StartAt":"W","States":{"W":{"Type":"Pass","Parameters":{"a.$":"$"},"Next":"W"}}}"#
+            r#"{"StartAt":"W","States":{"W":{"Type":"Pass","Parameters":{"a.$":"$"},"Next":"W"},"Done":{"Type":"Succeed"}}}"#
                 .to_string(),
             "{}".to_string(),
             "States.DataLimitExceeded",

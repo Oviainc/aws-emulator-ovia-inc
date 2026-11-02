@@ -1077,6 +1077,10 @@ pub const MISSING_TRANSITION_TARGET: &str = "MISSING_TRANSITION_TARGET";
 /// `INVALID_STATE_NAME`: "The state name does not follow the naming convention".
 pub const INVALID_STATE_NAME: &str = "INVALID_STATE_NAME";
 
+/// `MISSING_END_STATE`: "The workflow does not have a terminal state" — no state the
+/// state machine DECLARES ends an execution, so nothing it can run ever stops.
+pub const MISSING_END_STATE: &str = "MISSING_END_STATE";
+
 /// `MISSING_DESCRIPTION`: "Received a null or empty workflow input" — the request
 /// carried no document to validate at all.
 pub const MISSING_DESCRIPTION: &str = "MISSING_DESCRIPTION";
@@ -1096,6 +1100,13 @@ pub const NO_PATH: &str = "NO_PATH";
 /// `PASS_RESULT_IS_STATIC`: "Attempt to use a path in the result of a pass state"
 /// — a WARNING: a `Pass` state's `Result` is its literal result.
 pub const PASS_RESULT_IS_STATIC: &str = "PASS_RESULT_IS_STATIC";
+
+/// `POSSIBLY_UNDEFINED_VARIABLE`: a field reads a variable that some run of the
+/// definition can reach that field without having assigned — a WARNING, because the
+/// read resolves to nothing rather than preventing the definition from being created.
+/// The model's list of codes is not closed ("might add new diagnostics in the
+/// future"), so a code it does not list is still a code the service reports.
+pub const POSSIBLY_UNDEFINED_VARIABLE: &str = "POSSIBLY_UNDEFINED_VARIABLE";
 
 /// The most diagnostics `ValidateStateMachineDefinition` reports in one call, which
 /// is also what it reports when the request asks for none in particular
@@ -1329,13 +1340,40 @@ fn field_not_supported_message(field: &str) -> String {
     format!("Field '{}' is not supported", echoed(field))
 }
 
+/// What a diagnostic says about a transition target no state declares: the member
+/// that names the target, and the name it named.
+///
+/// RECORDED text. One construction serves every member a transition is named
+/// through — a state's own `Next`, a `Choice` rule's, a `Catch` catcher's and the
+/// `Default` beside them, and the machine's own `StartAt` — because they are one
+/// problem: a name that resolves to no state of the enclosing `States` map. The
+/// target is the caller's own string, so it is clipped by [`echoed`].
+fn missing_target_message(member: &str, target: &str) -> String {
+    format!("Missing '{member}' target: {}", echoed(target))
+}
+
+/// What the diagnostic for a state machine that cannot stop says.
+///
+/// RECORDED text. It names no state and no member: what is missing is a terminal
+/// state anywhere in the machine, so there is no position in the document to place it
+/// at.
+const MISSING_END_STATE_MESSAGE: &str = "Workflow has no terminal state";
+
+/// What a diagnostic says about a variable a field reads and nothing reaching that
+/// field assigns: the variable, quoted.
+///
+/// RECORDED text. The name is the caller's own, so it is clipped by [`echoed`].
+fn possibly_undefined_variable_message(name: &str) -> String {
+    format!("Variable '{}' is possibly not defined.", echoed(name))
+}
+
 /// Everything ONE walk of a definition found: the diagnostics it reports, and
 /// whether it had to drop any of them.
 ///
 /// The walk collects at most [`MAX_DIAGNOSTICS`] of each severity, so a caller is
 /// told that more exist (`truncated`) rather than being handed a list that grows
 /// with the definition.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Diagnosis {
     /// What was found, in the order it was found.
     pub diagnostics: Vec<Diagnostic>,
@@ -1354,6 +1392,26 @@ pub struct Diagnosis {
     /// Whether this walk reads the FIRST error and nothing else, so there is no reason
     /// to keep walking past that error.
     first_error_only: bool,
+    /// What is LEFT of this diagnosis's variable-scope budget
+    /// ([`MAX_SCOPE_VISITS`]), spent by every state that analysis visits, in this
+    /// definition and in every machine nested in it.
+    scope_visits: usize,
+}
+
+/// A walk with every budget of it unspent.
+impl Default for Diagnosis {
+    fn default() -> Self {
+        Self {
+            diagnostics: Vec::new(),
+            errors_dropped: false,
+            warnings_dropped: false,
+            errors: 0,
+            warnings: 0,
+            errors_only: false,
+            first_error_only: false,
+            scope_visits: MAX_SCOPE_VISITS,
+        }
+    }
 }
 
 impl Diagnosis {
@@ -1405,6 +1463,28 @@ impl Diagnosis {
         }
         *reported += 1;
         self.diagnostics.push(found);
+    }
+
+    /// Whether this walk reports WARNINGS at all: the lints that cost a walk of their
+    /// own are built only where one can be reported.
+    fn warnings_wanted(&self) -> bool {
+        !self.errors_only
+    }
+
+    /// Spend `visits` states of the variable-scope budget, or report that what is left
+    /// does not cover them.
+    ///
+    /// The budget is the ONE this diagnosis has for every machine it walks, so the
+    /// analysis's cost cannot be the product of the machines a definition declares and
+    /// the states each of them holds.
+    fn spend_scope_visits(&mut self, visits: usize) -> bool {
+        match self.scope_visits.checked_sub(visits) {
+            Some(left) => {
+                self.scope_visits = left;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether the walk keeps looking: it stops once it can report no further ERROR
@@ -1496,7 +1576,15 @@ fn collect(definition: &str, mut found: Diagnosis) -> Diagnosis {
         return found;
     }
     match serde_json::from_str::<Value>(definition) {
-        Ok(document) => diagnose_machine(&document, "", JSONPATH, 1, false, &mut found),
+        Ok(document) => diagnose_machine(
+            &document,
+            "",
+            JSONPATH,
+            1,
+            false,
+            Outer::Nothing,
+            &mut found,
+        ),
         // The diagnostic is the service's own, naming where the definition stopped
         // parsing, the mark it left unmatched and what was expected there — the one
         // construction every document this service reads is reported through — and
@@ -1515,13 +1603,15 @@ fn collect(definition: &str, mut found: Diagnosis) -> Diagnosis {
 /// it — carrying where it was found (`prefix`), the query language it inherits from
 /// the state that declares it, how deeply it is nested, and whether it is a `Map`
 /// state's PROCESSOR, which admits one field more than a definition or a `Parallel`
-/// branch does ([`machine_fields`]).
+/// branch does ([`machine_fields`]), and what was already in scope where it is
+/// declared ([`Outer`]).
 fn diagnose_machine(
     document: &Value,
     prefix: &str,
     inherited: &str,
     depth: usize,
     processor: bool,
+    outer: Outer<'_>,
     into: &mut Diagnosis,
 ) {
     if !into.looking() {
@@ -1591,17 +1681,16 @@ fn diagnose_machine(
     let states = document.get("States").and_then(Value::as_object);
     // A field the object DOES carry is judged on its own: that it is absent is
     // already stated above, so what is left to say about it is its value.
-    if let Some(start_at) = document.get("StartAt") {
-        match start_at.as_str() {
-            Some(start_at) => {
-                if states.is_some_and(|states| !states.contains_key(start_at)) {
+    let mut start_at: Option<&str> = None;
+    if let Some(declared) = document.get("StartAt") {
+        match declared.as_str() {
+            Some(declared) => {
+                start_at = Some(declared);
+                if states.is_some_and(|states| !states.contains_key(declared)) {
                     into.push(error(
                         MISSING_TRANSITION_TARGET,
                         at(prefix, "/StartAt"),
-                        format!(
-                            "'StartAt' names '{}', which 'States' does not declare",
-                            echoed(start_at)
-                        ),
+                        missing_target_message("StartAt", declared),
                     ));
                 }
             }
@@ -1630,25 +1719,104 @@ fn diagnose_machine(
         ));
         return;
     }
+    // Which variables each state of THIS machine can count on having been assigned
+    // by the time it runs, which is what its own reads are judged against. Built
+    // once per machine, before any state is judged, because it is a property of the
+    // whole graph rather than of one state; only a walk that reports WARNINGS needs
+    // it ([`POSSIBLY_UNDEFINED_VARIABLE`] is one).
+    let scopes = if into.warnings_wanted() {
+        Scopes::of(states, start_at, outer, into)
+    } else {
+        Scopes::none()
+    };
+    // Whether the machine declares a state that ENDS an execution, read before the
+    // states are judged and reported after them: the diagnostic is about the machine,
+    // so it follows the ones about its states.
+    let terminal = states.values().any(ends_an_execution);
     for (name, state) in states {
         if !into.looking() {
-            return;
+            break;
         }
-        diagnose_state(name, state, states, language, prefix, depth, into);
+        diagnose_state(
+            name,
+            state,
+            &Machine {
+                states,
+                language,
+                prefix,
+                depth,
+            },
+            &scopes,
+            into,
+        );
     }
+    // "MISSING_END_STATE: The workflow does not have a terminal state." A state
+    // machine is a graph that must be able to STOP, so at least one of the states it
+    // declares ends an execution; one that declares none describes a workflow no run
+    // of it can leave. It is read BEFORE the states are judged and reported AFTER
+    // them, so it follows the diagnostics about them; whether there is room left to
+    // report it is `push`'s own answer, as it is for every other diagnostic.
+    if !terminal {
+        into.push(error(
+            MISSING_END_STATE,
+            at(prefix, ""),
+            MISSING_END_STATE_MESSAGE,
+        ));
+    }
+}
+
+/// What every state of ONE state machine is judged in: the state list its transition
+/// targets resolve against, the query language it inherits from the machine, where
+/// that machine was found and how deeply it is nested.
+struct Machine<'a> {
+    states: &'a Map<String, Value>,
+    language: &'a str,
+    prefix: &'a str,
+    depth: usize,
+}
+
+/// Whether `state` ENDS an execution: a state of a type that terminates one
+/// ([`TERMINAL_STATE_TYPES`]), or any state declaring `"End": true`.
+///
+/// This is what [`MISSING_END_STATE`] is read off, over every state a machine
+/// DECLARES: what that diagnostic reports is that the workflow has no terminal state,
+/// and a state machine that declares one has one — where this definition's
+/// transitions lead is a different question, and no diagnostic this service reports is
+/// about a state nothing reaches.
+fn ends_an_execution(state: &Value) -> bool {
+    let Some(state) = state.as_object() else {
+        return false;
+    };
+    if state.get("End").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    state
+        .get("Type")
+        .and_then(Value::as_str)
+        .is_some_and(|state_type| TERMINAL_STATE_TYPES.contains(&state_type))
 }
 
 /// [`diagnose_machine`] for ONE state of a state machine: the rules the state's own
 /// members must satisfy, then the state machines nested inside it.
-fn diagnose_state(
-    name: &str,
+///
+/// `scopes` is its machine's variable-scope analysis, which answers what every run
+/// reaching this state has already assigned — what its own reads are judged against.
+fn diagnose_state<'a>(
+    name: &'a str,
     state: &Value,
-    states: &Map<String, Value>,
-    inherited: &str,
-    prefix: &str,
-    depth: usize,
+    machine: &Machine<'_>,
+    scopes: &'a Scopes<'a>,
     into: &mut Diagnosis,
 ) {
+    let Machine {
+        states,
+        language: inherited,
+        prefix,
+        depth,
+    } = *machine;
+    // The name the state is DECLARED under, which is what its machine's analysis
+    // answers for; the one quoted below is the clipped one.
+    let declared = name;
     // A state name is a caller-chosen JSON object key and lands in every history
     // event of that state, so its LENGTH is bounded here, not only the number of
     // events: this is what keeps a history's bytes bounded. The name a message
@@ -1721,20 +1889,22 @@ fn diagnose_state(
             }
         }
     }
+    // Every member the state names a transition through — its own `Next`, the
+    // `Default` of a `Choice`, each `Choice` rule's own `Next` and each `Catch`
+    // catcher's `Next` — resolves by ONE rule: the name must be one the enclosing
+    // `States` map declares. Each is reported at the member that names it.
+    for transition in transitions(state) {
+        if !states.contains_key(transition.target.as_str()) {
+            into.push(error(
+                MISSING_TRANSITION_TARGET,
+                at(&here, &transition.path),
+                missing_target_message(transition.member, &transition.target),
+            ));
+        }
+    }
     match state.get("Next") {
         Some(next) => match next.as_str() {
-            Some(next) => {
-                if !states.contains_key(next) {
-                    into.push(error(
-                        MISSING_TRANSITION_TARGET,
-                        at(&here, "/Next"),
-                        format!(
-                            "state '{name}' transitions to '{}', which 'States' does not \
-                             declare",
-                            echoed(next)
-                        ),
-                    ));
-                }
+            Some(_) => {
                 if TERMINAL_STATE_TYPES.contains(&state_type) {
                     into.push(error(
                         SCHEMA_VALIDATION_FAILED,
@@ -1806,8 +1976,38 @@ fn diagnose_state(
     } else {
         diagnose_jsonpath_state(name, state, state_type, &here, into);
     }
+    // A variable the state ASSIGNS is in scope for the state's own expressions,
+    // because the language evaluates a state's assignments before the output they
+    // feed; everything else it may read is what reaching this state already assigned.
+    let own = assigned_variables(state);
+    if into.warnings_wanted() {
+        // POSSIBLY_UNDEFINED_VARIABLE: one diagnostic per FIELD that reads a
+        // variable nothing reaching that field assigns, which is the granularity
+        // `location` documents (`/States/<StateName>/<FieldName>`).
+        for (field, read) in variable_reads(state) {
+            if own.contains(&read) || scopes.holds(declared, &read) {
+                continue;
+            }
+            into.push(warning(
+                POSSIBLY_UNDEFINED_VARIABLE,
+                at(&here, &field),
+                possibly_undefined_variable_message(&read),
+            ));
+        }
+    }
+    // What the state machines nested in this state inherit: what reaching this state
+    // had in scope, asked of its machine rather than copied into each of them.
+    //
+    // NOT this state's own `Assign`: only a `Map` and a `Parallel` declare a machine,
+    // and their own assignments are evaluated when the work those machines DO has
+    // completed, so a state inside one cannot count on them.
+    let outer = Outer::State {
+        machine: scopes,
+        state: declared,
+    };
     // A nested state machine's names reach the same history as this one's, so every
-    // rule above holds for it too, and its states inherit this state's language.
+    // rule above holds for it too, and its states inherit this state's language — and
+    // the variables this state has in scope, which the states it declares read.
     for member in ["ItemProcessor", "Iterator"] {
         if let Some(processor) = state.get(member) {
             diagnose_machine(
@@ -1818,6 +2018,7 @@ fn diagnose_state(
                 // A processor is the one position the language declares
                 // `ProcessorConfig` at.
                 true,
+                outer,
                 into,
             );
         }
@@ -1830,10 +2031,366 @@ fn diagnose_state(
                 language,
                 depth + 1,
                 false,
+                outer,
                 into,
             );
         }
     }
+}
+
+/// The most distinct variables one state machine's scope analysis follows through its
+/// state graph ([`Scopes`]).
+///
+/// Following one variable costs one walk of the graph and a definition is
+/// caller-sized, so the number followed is bounded like every other dimension of this
+/// walk, and the bound is the one the reported list already carries
+/// ([`DEFAULT_MAX_DIAGNOSTICS`]). A variable NO state assigns needs no walk at all and
+/// is not counted against it: it is out of scope wherever it is read. A variable past
+/// the bound is taken to be in scope, so the bound can only leave a warning unsaid,
+/// never invent one.
+///
+/// It is also what fits one state's scope in a single [`ScopeMask`], which is what
+/// keeps the analysis from holding the PRODUCT of the state count and the variable
+/// count.
+const MAX_SCOPED_VARIABLES: usize = DEFAULT_MAX_DIAGNOSTICS;
+
+/// The most states the variable-scope analysis visits across ONE diagnosis.
+///
+/// Following one variable costs one walk of its machine's graph, so the analysis's
+/// cost is the PRODUCT of the variables it follows and the states it walks, and a
+/// definition chooses both — as it chooses how many machines it nests. The product is
+/// therefore spent from ONE budget for the whole diagnosis
+/// ([`Diagnosis::spend_scope_visits`]) rather than bounded per machine: the budget is
+/// the diagnostics one call reports ([`DEFAULT_MAX_DIAGNOSTICS`]) times the
+/// transitions one execution may make ([`MAX_STATE_TRANSITIONS`]), which is the
+/// largest state graph this service walks at all. Past it no further variable is
+/// followed, and a variable that was not followed is taken to be in scope, so a spent
+/// budget can only leave a warning unsaid.
+const MAX_SCOPE_VISITS: usize = DEFAULT_MAX_DIAGNOSTICS * MAX_STATE_TRANSITIONS;
+
+/// Which of the variables one machine's analysis followed a state can count on: one
+/// BIT each, at the index [`Scopes::assigned`] records for the variable.
+///
+/// A set of NAMES per state would cost the product of the state count and the variable
+/// count, and a definition chooses both, so a state's scope is a mask: the analysis
+/// holds one of these per state and nothing that grows with the names.
+type ScopeMask = u128;
+
+/// [`MAX_SCOPED_VARIABLES`] variables must fit the mask that carries them.
+const _: () = assert!(MAX_SCOPED_VARIABLES <= ScopeMask::BITS as usize);
+
+/// The member a state assigns variables in: "Assign".
+const ASSIGN_MEMBER: &str = "Assign";
+
+/// What was already in scope where a state machine is DECLARED, which its states
+/// inherit.
+///
+/// A QUESTION asked up the chain of enclosing states, never a set copied into each
+/// level: a copy per level would hold the caller's variable names once per nesting
+/// level, and the nesting is the caller's too.
+#[derive(Clone, Copy)]
+enum Outer<'a> {
+    /// The definition itself: a run has assigned nothing where it starts.
+    Nothing,
+    /// A machine one state declares: what reaching that state had in scope, which is
+    /// its own machine's answer for it.
+    State {
+        machine: &'a Scopes<'a>,
+        state: &'a str,
+    },
+}
+
+impl Outer<'_> {
+    /// Whether the enclosing scope holds `name`.
+    fn holds(&self, name: &str) -> bool {
+        match self {
+            Outer::Nothing => false,
+            Outer::State { machine, state } => machine.holds(state, name),
+        }
+    }
+}
+
+/// Which variables each state of ONE state machine can count on having been assigned
+/// by the time it runs: those EVERY path from the machine's entry point to that state
+/// assigns, together with the ones inherited from the state that declares the machine.
+///
+/// A variable is in a state's scope only when no run can reach that state without
+/// having assigned it — which is what makes the ones outside it "possibly" undefined:
+/// the read resolves on some runs and not on others. A state no run reaches has
+/// nothing but the inherited variables in scope.
+struct Scopes<'a> {
+    /// Every variable some state of this machine assigns, and which bit of a state's
+    /// [`ScopeMask`] answers for it. A variable the analysis did NOT follow — the
+    /// enclosing scope already holds it, or the bound or the budget is spent — carries
+    /// no bit and is taken to be in scope.
+    assigned: BTreeMap<String, Option<usize>>,
+    /// Per state, which of the followed variables every run reaching it has assigned.
+    masks: BTreeMap<&'a str, ScopeMask>,
+    /// What this machine is declared inside.
+    outer: Outer<'a>,
+}
+
+impl<'a> Scopes<'a> {
+    /// A machine whose variables are not judged at all: what a walk that reports no
+    /// WARNING needs, since the lint this feeds is one.
+    fn none() -> Self {
+        Self {
+            assigned: BTreeMap::new(),
+            masks: BTreeMap::new(),
+            outer: Outer::Nothing,
+        }
+    }
+
+    /// Follow each variable `states` assigns through the transition graph from
+    /// `start_at`, with `outer` already in scope.
+    ///
+    /// Each variable is followed with ONE walk of the graph, from the entry point
+    /// along the transitions that do NOT assign it, and each walk is spent from the
+    /// diagnosis's own [`MAX_SCOPE_VISITS`] budget, so the analysis holds one walk's
+    /// states at a time and costs the same whatever the definition declares.
+    fn of(
+        states: &'a Map<String, Value>,
+        start_at: Option<&str>,
+        outer: Outer<'a>,
+        into: &mut Diagnosis,
+    ) -> Self {
+        // Which assignment block runs on the way along each transition: a state's own
+        // when its work completed, and a `Catch` catcher's when it did not. The blocks
+        // are held ONCE and the transitions name them by index, so a state with many
+        // transitions does not hold its block once per transition.
+        let mut blocks: Vec<BTreeSet<String>> = Vec::new();
+        let mut graph: BTreeMap<&str, Vec<ScopeEdge>> = BTreeMap::new();
+        for (name, state) in states {
+            let mut out = Vec::new();
+            if let Some(state) = state.as_object() {
+                let Assignments { own, caught } = assignments(state);
+                let own_block = blocks.len();
+                blocks.push(own);
+                let caught_blocks: Vec<usize> = caught
+                    .into_iter()
+                    .map(|block| {
+                        blocks.push(block);
+                        blocks.len() - 1
+                    })
+                    .collect();
+                for transition in transitions(state) {
+                    if !states.contains_key(transition.target.as_str()) {
+                        continue;
+                    }
+                    let assigns = transition
+                        .caught
+                        .and_then(|index| caught_blocks.get(index).copied())
+                        .unwrap_or(own_block);
+                    out.push(ScopeEdge {
+                        target: transition.target,
+                        assigns,
+                    });
+                }
+            }
+            graph.insert(name.as_str(), out);
+        }
+        // Each walk below visits each state at most once, so one walk costs at most
+        // this many visits of the budget.
+        let per_walk = states.len();
+        let mut scopes = Self {
+            assigned: BTreeMap::new(),
+            masks: states.keys().map(|name| (name.as_str(), 0)).collect(),
+            outer,
+        };
+        // Every variable this machine assigns somewhere. One set per MACHINE, so what
+        // this holds is the machine's own text rather than that text once per state.
+        let declared: BTreeSet<&String> = blocks.iter().flatten().collect();
+        if !into.spend_scope_visits(per_walk) {
+            // Nothing can be followed, so nothing this machine assigns is judged.
+            scopes.assigned = declared.into_iter().map(|name| (name.clone(), None)).collect();
+            return scopes;
+        }
+        // A machine whose entry point names no declared state has no run to reason
+        // about, so no state of it reaches a read with anything assigned.
+        let entry = start_at.filter(|start_at| states.contains_key(*start_at));
+        let reachable = reached_from(entry, &graph, &blocks, None);
+        let mut followed = 0_usize;
+        for name in declared {
+            // A variable the enclosing scope already holds is in scope at every state
+            // of this machine whatever this machine does with it, and one the bound or
+            // the budget cannot reach is taken to be, so neither is followed.
+            if followed >= MAX_SCOPED_VARIABLES
+                || scopes.outer.holds(name)
+                || !into.spend_scope_visits(per_walk)
+            {
+                scopes.assigned.insert(name.clone(), None);
+                continue;
+            }
+            let index = followed;
+            followed += 1;
+            // Where the variable is NOT yet assigned: every state a run can reach
+            // without having taken a transition that assigns it.
+            let unassigned = reached_from(entry, &graph, &blocks, Some(name));
+            for (state, mask) in &mut scopes.masks {
+                if reachable.contains(state) && !unassigned.contains(state) {
+                    *mask |= 1 << index;
+                }
+            }
+            scopes.assigned.insert(name.clone(), Some(index));
+        }
+        scopes
+    }
+
+    /// Whether `state` can count on `name` having been assigned by the time it runs.
+    fn holds(&self, state: &str, name: &str) -> bool {
+        match self.assigned.get(name) {
+            // A variable this machine assigns and the analysis followed: in scope
+            // where every run reaching the state has passed an assignment of it.
+            Some(Some(index)) => {
+                self.masks.get(state).copied().unwrap_or(0) & (1 << index) != 0
+            }
+            // One it did not follow, which is taken to be in scope.
+            Some(None) => true,
+            // One no state of this machine assigns: only the enclosing scope can hold
+            // it.
+            None => self.outer.holds(name),
+        }
+    }
+}
+
+/// One transition of a machine's graph as the scope analysis walks it: where it goes,
+/// and which of the machine's assignment blocks runs on the way there.
+struct ScopeEdge {
+    target: String,
+    /// Index into the machine's blocks.
+    assigns: usize,
+}
+
+/// The states one run can reach from `entry`, following `graph` — past a transition
+/// whose own block assigns `without`, that run has assigned it, so such a transition
+/// is not followed.
+///
+/// `without` `None` makes this the states reachable at all. The walk visits each state
+/// once, so it costs one pass over the graph.
+fn reached_from<'a>(
+    entry: Option<&'a str>,
+    graph: &BTreeMap<&'a str, Vec<ScopeEdge>>,
+    blocks: &[BTreeSet<String>],
+    without: Option<&str>,
+) -> BTreeSet<&'a str> {
+    let mut reached = BTreeSet::new();
+    let mut pending: Vec<&str> = entry.into_iter().collect();
+    while let Some(state) = pending.pop() {
+        let Some((state, edges)) = graph.get_key_value(state) else {
+            continue;
+        };
+        if !reached.insert(*state) {
+            continue;
+        }
+        for edge in edges {
+            let assigned = without.is_some_and(|name| {
+                blocks
+                    .get(edge.assigns)
+                    .is_some_and(|block| block.contains(name))
+            });
+            if !assigned {
+                pending.push(edge.target.as_str());
+            }
+        }
+    }
+    reached
+}
+
+/// What one state ASSIGNS, by the path the assignment runs on.
+///
+/// A key written as a JSONPath reference field (`"<name>.$"`) assigns the variable
+/// `<name>`, the suffix being how that language spells a value read from a path. A
+/// state machine NESTED in this state assigns in a scope of its own, so its states'
+/// blocks are not read here.
+struct Assignments {
+    /// The keys of the state's own `Assign` block, which the language evaluates when
+    /// the state's work completed.
+    own: BTreeSet<String>,
+    /// The keys of each `Catch` catcher's own `Assign`, in the catchers' own order,
+    /// which are evaluated INSTEAD when the work failed and that catcher took over.
+    caught: Vec<BTreeSet<String>>,
+}
+
+/// [`Assignments`] of one state.
+fn assignments(state: &Map<String, Value>) -> Assignments {
+    let names = |block: Option<&Value>| -> BTreeSet<String> {
+        block
+            .and_then(Value::as_object)
+            .map(|block| {
+                block
+                    .keys()
+                    .map(|key| key.strip_suffix(".$").unwrap_or(key).to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Assignments {
+        own: names(state.get(ASSIGN_MEMBER)),
+        caught: state
+            .get(CATCH_MEMBER)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|catcher| names(catcher.get(ASSIGN_MEMBER)))
+            .collect(),
+    }
+}
+
+/// Every variable one state can assign, on whichever path it runs: what its OWN
+/// fields may read, since the language evaluates a state's assignments — its own, or
+/// its catcher's where that catcher took over — before the output they feed.
+///
+/// Which of them a state the transition LEADS TO can count on is a different question,
+/// and the one [`Scopes`] answers per transition.
+fn assigned_variables(state: &Map<String, Value>) -> BTreeSet<String> {
+    let Assignments { mut own, caught } = assignments(state);
+    for block in caught {
+        own.extend(block);
+    }
+    own
+}
+
+/// Every variable one state's own fields READ: the path from the state to the field
+/// that reads it, and the variable's name, each pair once and in a deterministic
+/// order.
+///
+/// A read is what [`variable_references`] reports a state referencing a variable
+/// through, so the lint below and `DescribeStateMachine`'s `variableReferences` cannot
+/// disagree about what a read is: a `$name` term of a JSONata expression (which the
+/// language delimits with `{%` and `%}`) or of a JSONPath reference field (a member
+/// whose name ends in `.$`). A state machine NESTED in this state is walked as the
+/// states it declares, so its reads are reported under their own names.
+///
+/// The walk is the one [`walk_fields`] does for every field this module reads, so the
+/// path a field is reported at is the same one every other diagnostic about it
+/// carries.
+fn variable_reads(state: &Map<String, Value>) -> Vec<(String, String)> {
+    let mut found: BTreeSet<(String, String)> = BTreeSet::new();
+    let roots: Vec<(String, &Value, bool)> = state
+        .iter()
+        .filter(|(member, _)| !NESTED_MACHINE_MEMBERS.contains(&member.as_str()))
+        .map(|(member, value)| {
+            (
+                nested_at("", format_args!("/{}", echoed(member))),
+                value,
+                member.ends_with(".$"),
+            )
+        })
+        .collect();
+    walk_fields(roots, |path, text, reference_field| {
+        let mut names = BTreeSet::new();
+        for expression in jsonata_expressions(text) {
+            scan_expression(expression, &mut names);
+        }
+        if reference_field {
+            scan_expression(text, &mut names);
+        }
+        for name in names {
+            found.insert((path.to_string(), name));
+        }
+    });
+    found.into_iter().collect()
 }
 
 /// The query language `declared` names, `None` when the member is absent, or why it
@@ -2055,41 +2612,60 @@ fn diagnose_jsonata_rule(
 /// itself such an expression — paired with the field expression that read the term
 /// there ([`field_read`]).
 ///
-/// The walk is ITERATIVE: `value` is a caller-shaped document, so it carries its own
-/// stack rather than the thread's. Each path is built through [`nested_at`], so it is
-/// bounded as it grows, and the list is sorted lexicographically, which is what makes
-/// the per-field list of one member deterministic whatever shape the document has.
+/// The list is sorted lexicographically, which is what makes the per-field list of one
+/// member deterministic whatever shape the document has.
 fn fields_reading(value: &Value, term: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
-    let mut pending = vec![(String::new(), value)];
-    while let Some((path, value)) = pending.pop() {
+    walk_fields(vec![(String::new(), value, false)], |path, text, _| {
+        // One field is one problem to fix, so it is reported once: the field
+        // expression reported for it is the FIRST its expressions read the term
+        // through.
+        if let Some(read) = jsonata_expressions(text)
+            .iter()
+            .find_map(|expression| field_read(expression, term))
+        {
+            found.push((path.to_string(), read));
+        }
+    });
+    found.sort();
+    found
+}
+
+/// Visit every string `roots` carries, with the path from its root down to it and
+/// whether it is the value of a JSONPath reference field (a member whose name ends in
+/// `.$`), which is what makes a string a reference rather than a literal.
+///
+/// The one walk of a caller-shaped document this module reads a state's fields with,
+/// so the path a field is reported at cannot differ between what reads it. It is
+/// ITERATIVE: the document is a caller's, so it carries its own stack rather than the
+/// thread's, and each path is built through [`nested_at`], so it is bounded as it
+/// grows.
+fn walk_fields(roots: Vec<(String, &Value, bool)>, mut visit: impl FnMut(&str, &str, bool)) {
+    let mut pending = roots;
+    while let Some((path, value, reference_field)) = pending.pop() {
         match value {
-            Value::String(text) => {
-                // One field is one problem to fix, so it is reported once: the field
-                // expression reported for it is the FIRST its expressions read the
-                // term through.
-                if let Some(read) = jsonata_expressions(text)
-                    .iter()
-                    .find_map(|expression| field_read(expression, term))
-                {
-                    found.push((path, read));
-                }
-            }
+            Value::String(text) => visit(&path, text, reference_field),
             Value::Array(items) => {
                 for (index, item) in items.iter().enumerate() {
-                    pending.push((nested_at(&path, format_args!("/{index}")), item));
+                    pending.push((
+                        nested_at(&path, format_args!("/{index}")),
+                        item,
+                        reference_field,
+                    ));
                 }
             }
             Value::Object(members) => {
                 for (member, child) in members {
-                    pending.push((nested_at(&path, format_args!("/{}", echoed(member))), child));
+                    pending.push((
+                        nested_at(&path, format_args!("/{}", echoed(member))),
+                        child,
+                        member.ends_with(".$"),
+                    ));
                 }
             }
             _ => {}
         }
     }
-    found.sort();
-    found
 }
 
 /// The FIELD a JSONata `expression` reads `term` through, or `None` when it reads it
@@ -2244,34 +2820,75 @@ fn looks_like_an_intrinsic(text: &str) -> bool {
 /// one.
 const SINGLE_STATE_NAME: &str = "TheStateUnderTest";
 
-/// The transition targets `state` names: its own `Next`, a `Choice` rule's `Next` and
-/// the `Default` beside them, and a `Catch` catcher's `Next`.
+/// One transition a state declares: where it goes, where in the state the member that
+/// names it sits, that member's own NAME — which a diagnostic about an unresolved
+/// target reports, since `Default` and `Next` are different fields to fix — and
+/// whether it is taken because the state FAILED.
+struct Transition {
+    target: String,
+    /// The path from the state to the member naming the target.
+    path: String,
+    member: &'static str,
+    /// `Some(index)` for the `Next` of the `Catch` catcher at that index: a
+    /// transition the state's own work never completed, so the state's own `Assign`
+    /// did not run and that catcher's did.
+    caught: Option<usize>,
+}
+
+/// Every transition `state` declares, in the order the members that name them are
+/// judged: its own `Next`, the `Default` of a `Choice`, each `Choice` rule's own
+/// `Next`, and each `Catch` catcher's `Next`.
+///
+/// ONE enumeration, read both by the diagnostic that resolves a target against the
+/// enclosing `States` map and by the state graph the variable-scope analysis walks, so
+/// the two cannot disagree about where a state can go.
 ///
 /// Linear in the state's own size, which the modelled `Definition` (1 MiB) bounds, so
 /// the list this builds is bounded by the request exactly as the state is.
-fn transition_targets(state: &Value) -> Vec<String> {
-    let mut targets = Vec::new();
-    let Some(state) = state.as_object() else {
-        return targets;
-    };
+fn transitions(state: &Map<String, Value>) -> Vec<Transition> {
+    let mut transitions = Vec::new();
     for member in ["Next", "Default"] {
         if let Some(target) = state.get(member).and_then(Value::as_str) {
-            targets.push(target.to_string());
+            transitions.push(Transition {
+                target: target.to_string(),
+                path: format!("/{member}"),
+                member,
+                caught: None,
+            });
         }
     }
-    for member in ["Choices", "Catch"] {
+    for (member, caught) in [("Choices", false), (CATCH_MEMBER, true)] {
         let entries = state
             .get(member)
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        for entry in entries {
+        for (index, entry) in entries.iter().enumerate() {
             if let Some(target) = entry.get("Next").and_then(Value::as_str) {
-                targets.push(target.to_string());
+                transitions.push(Transition {
+                    target: target.to_string(),
+                    path: nested_at("", format_args!("/{member}/{index}/Next")),
+                    member: "Next",
+                    caught: caught.then_some(index),
+                });
             }
         }
     }
-    targets
+    transitions
+}
+
+/// The states `state` can transition to, however it names them: what the lone state
+/// of a [`validate_single_state`] has declared beside it.
+fn transition_targets(state: &Value) -> Vec<String> {
+    state
+        .as_object()
+        .map(|state| {
+            transitions(state)
+                .into_iter()
+                .map(|transition| transition.target)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Why `definition` is not the definition of a SINGLE state this service accepts, or
@@ -2336,7 +2953,15 @@ pub fn validate_single_state(definition: &str) -> Result<(), String> {
     }
     let machine = json!({ "StartAt": SINGLE_STATE_NAME, "States": Value::Object(states) });
     let mut found = Diagnosis::until_first_error();
-    diagnose_machine(&machine, "", JSONPATH, 1, false, &mut found);
+    diagnose_machine(
+        &machine,
+        "",
+        JSONPATH,
+        1,
+        false,
+        Outer::Nothing,
+        &mut found,
+    );
     match found.diagnostics.iter().find(|found| found.is_error()) {
         Some(found) => Err(about_the_single_state(found)),
         None => Ok(()),

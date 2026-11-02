@@ -614,8 +614,8 @@ async fn create_state_machine_checks_the_definition_structure() {
             r#"{"StartAt":"A","States":{"A":{"Type":"Pass","ResultPath":"$.out","End":true}}}"#,
         ),
         (
-            "a definition whose Next chain is a cycle",
-            r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Next":"B"},"B":{"Type":"Pass","Next":"A"}}}"#,
+            "a definition whose Next chain is a cycle out of which a state ends",
+            r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Next":"B"},"B":{"Type":"Choice","Choices":[{"Variable":"$.go","IsPresent":true,"Next":"A"}],"Default":"Done"},"Done":{"Type":"Succeed"}}}"#,
         ),
     ];
     for (index, (case, definition)) in accepted.into_iter().enumerate() {
@@ -1178,8 +1178,8 @@ async fn an_execution_runs_the_definition_to_its_own_outcome() {
             error: None,
         },
         RunCase {
-            case: "a Next chain that is a cycle",
-            definition: r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Next":"B"},"B":{"Type":"Pass","Next":"A"}}}"#,
+            case: "a Next chain that is a cycle the execution never leaves",
+            definition: r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Next":"B"},"B":{"Type":"Choice","Choices":[{"Variable":"$.stop","IsPresent":true,"Next":"Done"}],"Default":"A"},"Done":{"Type":"Succeed"}}}"#,
             input: "{}",
             status: "FAILED",
             output: None,

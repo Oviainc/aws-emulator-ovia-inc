@@ -37,6 +37,8 @@ mod client_error_wrappers;
 mod client_refusal_status;
 #[path = "all/completed_map_run_refusal.rs"]
 mod completed_map_run_refusal;
+#[path = "all/definition_graph_diagnostics.rs"]
+mod definition_graph_diagnostics;
 #[path = "all/definition_path_diagnostics.rs"]
 mod definition_path_diagnostics;
 #[path = "all/definition_refusal_text.rs"]

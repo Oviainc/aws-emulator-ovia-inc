@@ -100,6 +100,16 @@ fn cases() -> Vec<Case> {
             false,
         ),
         (
+            "a definition no state of which ends an execution",
+            r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Next":"B"},"B":{"Type":"Pass","Next":"A"}}}"#.to_string(),
+            false,
+        ),
+        (
+            "a Parallel branch no state of which ends an execution",
+            r#"{"StartAt":"P","States":{"P":{"Type":"Parallel","Branches":[{"StartAt":"B","States":{"B":{"Type":"Pass","Next":"B"}}}],"End":true}}}"#.to_string(),
+            false,
+        ),
+        (
             "a state name one character past the bound",
             format!(r#"{{"StartAt":"{long_name}","States":{{"{long_name}":{{"Type":"Succeed"}}}}}}"#),
             false,
@@ -179,8 +189,10 @@ fn cases() -> Vec<Case> {
             true,
         ),
         (
-            "a definition whose Next chain is a cycle",
-            r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Next":"B"},"B":{"Type":"Pass","Next":"A"}}}"#.to_string(),
+            // A cycle is valid ASL as long as the machine declares somewhere to
+            // stop: the loop is bounded at RUN time, not at create time.
+            "a definition whose Next chain is a cycle out of which a state ends",
+            r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Next":"B"},"B":{"Type":"Choice","Choices":[{"Variable":"$.go","IsPresent":true,"Next":"A"}],"Default":"Done"},"Done":{"Type":"Succeed"}}}"#.to_string(),
             true,
         ),
         (
@@ -226,7 +238,10 @@ fn cases() -> Vec<Case> {
 }
 
 /// One `ValidateStateMachineDefinition` call, requiring a 200.
-async fn validate(emulator: &Emulator, case: &str, body: &Value) -> Value {
+///
+/// `pub(crate)` because the sibling suites read a validation the same way: one
+/// reader, so two suites cannot disagree about what the response says.
+pub(crate) async fn validate(emulator: &Emulator, case: &str, body: &Value) -> Value {
     let (status, parsed) = emulator.call("ValidateStateMachineDefinition", body).await;
     assert_eq!(
         status, 200,
@@ -237,14 +252,14 @@ async fn validate(emulator: &Emulator, case: &str, body: &Value) -> Value {
 }
 
 /// The `result` a validation reported.
-fn result_of(body: &Value) -> &str {
+pub(crate) fn result_of(body: &Value) -> &str {
     body.get("result")
         .and_then(Value::as_str)
         .unwrap_or("<no result>")
 }
 
 /// The diagnostics a validation reported, in the order it reported them.
-fn diagnostics(body: &Value) -> Vec<Value> {
+pub(crate) fn diagnostics(body: &Value) -> Vec<Value> {
     body.get("diagnostics")
         .and_then(Value::as_array)
         .cloned()
@@ -252,7 +267,7 @@ fn diagnostics(body: &Value) -> Vec<Value> {
 }
 
 /// One member of every reported diagnostic.
-fn members(body: &Value, member: &str) -> Vec<String> {
+pub(crate) fn members(body: &Value, member: &str) -> Vec<String> {
     diagnostics(body)
         .iter()
         .map(|diagnostic| {
@@ -455,8 +470,7 @@ async fn severity_selects_which_diagnostics_are_reported() {
 
     // A definition carrying one of each: a `Next` that names no state (ERROR) and a
     // `Result` that reads as a path (WARNING).
-    const BOTH: &str =
-        r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Result":"$.x","Next":"Nowhere"}}}"#;
+    const BOTH: &str = r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Result":"$.x","Next":"Nowhere"},"Done":{"Type":"Succeed"}}}"#;
     // A definition carrying warnings only: a static `Result` that reads as a path,
     // and two payload-template members that read as a path and as an intrinsic.
     const WARNINGS_ONLY: &str = r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Result":"$.x","Parameters":{"copy":"$.y","built":"States.Format('{}', $.y)"},"End":true}}}"#;
@@ -542,9 +556,12 @@ async fn max_results_bounds_the_reported_diagnostics() {
     // One state per diagnostic: each transitions to a state no definition declares,
     // so the count of errors is known exactly.
     const STATES: usize = 12;
-    let states: Vec<String> = (0..STATES)
+    let mut states: Vec<String> = (0..STATES)
         .map(|index| format!(r#""S{index}":{{"Type":"Pass","Next":"Nowhere"}}"#))
         .collect();
+    // Somewhere to stop, so the twelve dangling transitions are the only problem
+    // this definition carries.
+    states.push(r#""Done":{"Type":"Succeed"}"#.to_string());
     let definition = format!(
         r#"{{"StartAt":"S0","States":{{{}}}}}"#,
         states.join(",")

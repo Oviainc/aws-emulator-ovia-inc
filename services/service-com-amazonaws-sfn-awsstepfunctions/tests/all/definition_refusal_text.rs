@@ -413,6 +413,12 @@ async fn invalid_definition_states_the_diagnostic_and_joins_its_location_with_at
             .filter(|diagnostic| diagnostic[0] == SEVERITY_ERROR)
             .map(|diagnostic| {
                 let (code, location, message) = (&diagnostic[1], &diagnostic[2], &diagnostic[3]);
+                // A diagnostic about the state machine AS A WHOLE carries no
+                // location — there is no field in the document to place it at — so
+                // the subject for one is the code and the detail alone.
+                if location == "<absent>" {
+                    return format!("{code}: {message}");
+                }
                 format!("{code}: {message} at {location}")
             })
             .collect();
