@@ -124,6 +124,8 @@ mod record_stamp_monotonicity;
 mod reserved_tag_keys;
 #[path = "all/route_server_peer_references.rs"]
 mod route_server_peer_references;
+#[path = "all/self_deployed_license_info_inertness.rs"]
+mod self_deployed_license_info_inertness;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_resource_idempotent_stamp.rs"]

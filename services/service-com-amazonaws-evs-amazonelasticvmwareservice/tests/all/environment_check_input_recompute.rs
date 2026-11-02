@@ -146,7 +146,7 @@ pub(crate) async fn get_environment(router: &Emulator, case: &str, environment_i
 }
 
 /// The summary `ListEnvironments` reports for one environment.
-async fn listed_summary(router: &Emulator, case: &str, environment_id: &str) -> Value {
+pub(crate) async fn listed_summary(router: &Emulator, case: &str, environment_id: &str) -> Value {
     let (status, body) = call(router, "ListEnvironments", &json!({})).await;
     assert_eq!(
         status, 200,

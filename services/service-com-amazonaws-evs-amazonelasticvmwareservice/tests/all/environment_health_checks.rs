@@ -78,19 +78,19 @@ fn reported_check_types() -> Vec<&'static str> {
 /// One VCF license key of the modelled shape
 /// (`^[a-zA-Z0-9]{5}-[a-zA-Z0-9]{5}-[a-zA-Z0-9]{5}-[a-zA-Z0-9]{5}-[a-zA-Z0-9]{5}$`),
 /// built from `seed` so two rows can ask for the same key or for different ones.
-fn license_key(seed: &str) -> String {
+pub(crate) fn license_key(seed: &str) -> String {
     let group: String = format!("{seed}XXXXX").chars().take(5).collect();
     vec![group; 5].join("-")
 }
 
 /// A `licenseInfo` list (modelled `@length(1..1)`) carrying one solution key and one
 /// vSAN key.
-fn license_info(solution: &str, vsan: &str) -> Value {
+pub(crate) fn license_info(solution: &str, vsan: &str) -> Value {
     json!([{ "solutionKey": license_key(solution), "vsanKey": license_key(vsan) }])
 }
 
 /// A `hosts` list for a create request: one entry per name, all on `instance_type`.
-fn hosts_json(names: &[&str], instance_type: &str) -> Value {
+pub(crate) fn hosts_json(names: &[&str], instance_type: &str) -> Value {
     names
         .iter()
         .map(|name| json!({ "hostName": name, "keyName": "evs-key", "instanceType": instance_type }))
@@ -99,7 +99,7 @@ fn hosts_json(names: &[&str], instance_type: &str) -> Value {
 
 /// Create an environment with `extra` merged into the request every rule accepts, and
 /// return its id.
-async fn create_with(router: &Emulator, case: &str, name: &str, extra: Value) -> String {
+pub(crate) async fn create_with(router: &Emulator, case: &str, name: &str, extra: Value) -> String {
     let mut request = router.create_request(Some(name));
     for (member, value) in extra.as_object().expect("the extra members are an object") {
         request[member] = value.clone();
@@ -133,7 +133,13 @@ async fn get_environment(router: &Emulator, case: &str, environment_id: &str) ->
 }
 
 /// Add one host to a deployed environment.
-async fn add_host(router: &Emulator, case: &str, environment_id: &str, name: &str, instance_type: &str) {
+pub(crate) async fn add_host(
+    router: &Emulator,
+    case: &str,
+    environment_id: &str,
+    name: &str,
+    instance_type: &str,
+) {
     let (status, body) = call(
         router,
         "CreateEnvironmentHost",
@@ -185,7 +191,7 @@ fn cores(instance_type: &str) -> u64 {
 }
 
 /// Write the account's ported VCF license core count for the Region the tests address.
-async fn put_ported_cores(router: &Emulator, case: &str, cores: u64) {
+pub(crate) async fn put_ported_cores(router: &Emulator, case: &str, cores: u64) {
     let (status, body) = call(
         router,
         "PutAccountSettings",

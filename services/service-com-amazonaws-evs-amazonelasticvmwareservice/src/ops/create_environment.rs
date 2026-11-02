@@ -122,6 +122,13 @@
 //! members are therefore accepted and stored as supplied, exactly as `clientToken` is
 //! ("If you supply input for this parameter, it will have no effect").
 //!
+//! "No effect" is what the rest of the service then owes them: a member this mode does
+//! not support is reported back and nothing else reads a fact out of it — no host is
+//! added for `hosts` ([`add_requested_hosts`]) and no license key is carried for
+//! `licenseInfo` ([`crate::state::StoredEnvironment::license_keys`]), so neither this
+//! environment's health checks nor another environment's see anything the mode does
+//! nothing with.
+//!
 //! The account's AWS Premium Support subscription is not a precondition either: this
 //! emulator holds no account-subscription state to decide it from, and a guess either
 //! way would refuse or admit every request alike. Only preconditions this service can
@@ -399,7 +406,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // subnets; no hosts are added and no VCF installation is performed", and "When
         // you specify any other VCF version, Amazon EVS installs and configures VCF for
         // you" (this operation's doc).
-        let installs_vcf = input.vcf_version != crate::state::VCF_VERSION_SELF_DEPLOYED;
+        let installs_vcf = crate::state::installs_vcf(&input.vcf_version);
 
         let mut failures: Vec<ValidationExceptionField> = Vec::new();
         failures.extend(terms_accepted_failure(&input));

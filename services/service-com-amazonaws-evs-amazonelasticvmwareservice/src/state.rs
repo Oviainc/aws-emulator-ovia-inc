@@ -2069,6 +2069,19 @@ impl StoredEnvironment {
         roll_up_results(self.checks.iter().filter_map(|check| check.result.as_deref()))
     }
 
+    /// Whether Amazon EVS INSTALLS VCF in this environment: true for every
+    /// `VcfVersion` but [`VCF_VERSION_SELF_DEPLOYED`], the mode in which "Amazon EVS
+    /// provisions only the VLAN subnets; no hosts are added and no VCF installation is
+    /// performed" (`CreateEnvironment` doc).
+    ///
+    /// The members that mode "does not support" — `licenseInfo`, `hosts`,
+    /// `vcfHostnames`, `siteId` and `connectivityInfo` — are accepted and reported back
+    /// as supplied, and this is what says they are INERT: the environment installs no
+    /// VCF, so nothing the service derives may read a fact out of one of them.
+    pub fn installs_vcf(&self) -> bool {
+        installs_vcf(&self.vcf_version)
+    }
+
     /// Every VCF license key this environment carries: the solution key and the vSAN key
     /// of each `licenseInfo` entry.
     ///
@@ -2076,7 +2089,19 @@ impl StoredEnvironment {
     /// is a Broadcom-issued license key ("Amazon EVS requires two license keys: a VCF
     /// solution key and a vSAN license key", `LicenseInfo` doc) and reuse is about the
     /// KEY, not about which member carried it; a key given twice is one key.
+    ///
+    /// EMPTY where Amazon EVS installs no VCF ([`Self::installs_vcf`]): `licenseInfo` is
+    /// "Not supported when `vcfVersion` is `SELF_DEPLOYED`"
+    /// (`CreateEnvironmentRequest$licenseInfo` doc), so such an environment licenses no
+    /// VCF software and holds no key against which anything can be verified, whatever
+    /// the create stored. A key is then neither used by it — so it does not make another
+    /// environment's `KEY_REUSE` report a second user of that key — nor verifiable for
+    /// it, which is why its own `KEY_REUSE` and `KEY_COVERAGE` report `UNKNOWN`, the
+    /// result of a check whose facts the environment does not carry.
     pub fn license_keys(&self) -> BTreeSet<String> {
+        if !self.installs_vcf() {
+            return BTreeSet::new();
+        }
         self.license_info
             .iter()
             .flat_map(|license| [license.solution_key.clone(), license.vsan_key.clone()])
@@ -2690,6 +2715,17 @@ pub const VERSION_STATUS_RESTRICTED: &str = "RESTRICTED";
 /// of its own to report for it.
 pub const VCF_VERSION_SELF_DEPLOYED: &str = "SELF_DEPLOYED";
 
+/// Whether Amazon EVS INSTALLS VCF for `vcf_version`: every `VcfVersion` but
+/// [`VCF_VERSION_SELF_DEPLOYED`] — "When you specify any other VCF version, Amazon EVS
+/// installs and configures VCF for you" (`CreateEnvironment` doc).
+///
+/// The one place this service decides the deployment MODE, so the request members that
+/// mode does not support ([`StoredEnvironment::installs_vcf`]) and the installation
+/// steps it does not perform are judged by one rule.
+pub fn installs_vcf(vcf_version: &str) -> bool {
+    vcf_version != VCF_VERSION_SELF_DEPLOYED
+}
+
 /// One VCF release line Amazon EVS installs, and the ESX version Broadcom's Bill Of
 /// Materials pairs that line with — the source `VcfVersionInfo$defaultEsxVersion` names:
 /// "The default ESX version for this VCF version. It is based on Broadcom's Bill Of
@@ -2978,6 +3014,9 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
             if environment.state == STATE_DELETED {
                 continue;
             }
+            // What a record is taken to CARRY is [`StoredEnvironment::license_keys`],
+            // which is empty for an environment Amazon EVS installs no VCF for: a key
+            // that mode does nothing with makes no user of it.
             for key in environment.license_keys() {
                 key_carriers.entry(key).or_default().push(KeyCarrier {
                     environment_id: environment.environment_id.clone(),
