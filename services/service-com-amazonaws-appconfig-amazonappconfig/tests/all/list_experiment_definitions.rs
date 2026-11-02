@@ -41,7 +41,7 @@ use service_com_amazonaws_appconfig_amazonappconfig::ops::types::EXPERIMENT_DEFI
 use service_com_amazonaws_appconfig_amazonappconfig::state::MAX_LIST_PAGE_SIZE;
 
 use crate::appconfig_workflow::{
-    create_application, create_environment, create_profile, json_call, router, Answer,
+    create_application, create_environment, create_flags_profile, json_call, router, Answer,
 };
 use crate::experiment_definitions::{create_definition, flag, get_definition, treatment};
 use crate::resource_tags::{filler, pct};
@@ -151,7 +151,7 @@ async fn tenant(
     }
     let mut created_profiles = Vec::new();
     for profile in profiles {
-        let id = create_profile(router, &application, profile).await;
+        let id = create_flags_profile(router, &application, profile).await;
         created_profiles.push((id, (*profile).to_string()));
     }
     Tenant {

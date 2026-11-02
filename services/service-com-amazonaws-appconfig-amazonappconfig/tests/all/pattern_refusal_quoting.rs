@@ -24,7 +24,8 @@
 use serde_json::{json, Value};
 
 use crate::appconfig_workflow::{
-    create_application, create_environment, create_profile, json_call, router, send, Answer,
+    create_application, create_environment, create_flags_profile, create_profile, json_call,
+    router, send, Answer,
 };
 
 /// One request that breaks a `@pattern`, and the expression its refusal must quote.
@@ -279,7 +280,7 @@ async fn the_check_is_still_the_models_own_pattern() {
     let router = router();
     let application = create_application(&router, "pattern-accepts").await;
     let environment = create_environment(&router, &application, "prod").await;
-    let profile = create_profile(&router, &application, "config").await;
+    let profile = create_flags_profile(&router, &application, "config").await;
 
     // Flag keys the modelled `^[a-z][a-zA-Z0-9_-]{1,64}$` admits, differing along length
     // and along which of the admitted characters they use: the shortest the quantifier

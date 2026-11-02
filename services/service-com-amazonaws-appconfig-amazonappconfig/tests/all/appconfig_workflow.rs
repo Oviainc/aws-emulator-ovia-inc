@@ -237,6 +237,34 @@ pub(crate) async fn create_profile(
         .unwrap_or_else(|| panic!("case {name:?}: CreateConfigurationProfile answered no Id"))
 }
 
+/// Create a hosted configuration profile that stores FEATURE FLAGS under `application_id`
+/// and return its minted id.
+///
+/// [`create_profile`] declares no `Type`, so AppConfig stores that profile as
+/// `AWS.Freeform` — and an experiment definition targets a feature flag, so it can only be
+/// bound to a profile of `state::FEATURE_FLAGS_PROFILE_TYPE`. Every suite that creates a
+/// definition builds its profile here.
+pub(crate) async fn create_flags_profile(
+    router: &MultiServiceRouter,
+    application_id: &str,
+    name: &str,
+) -> String {
+    let answer = create_profile_from(
+        router,
+        application_id,
+        name,
+        &serde_json::json!({
+            "Name": name,
+            "LocationUri": "hosted",
+            "Type": service_com_amazonaws_appconfig_amazonappconfig::state::FEATURE_FLAGS_PROFILE_TYPE,
+        }),
+    )
+    .await;
+    answer
+        .string("Id")
+        .unwrap_or_else(|| panic!("case {name:?}: CreateConfigurationProfile answered no Id"))
+}
+
 /// Create a configuration profile under `application_id` from `body` and answer what
 /// `CreateConfigurationProfile` reported, so a suite can assert against the created
 /// record rather than only against its id.

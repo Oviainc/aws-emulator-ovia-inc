@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateExperimentDefinition
-//! IMPLEMENTED: creates an experiment definition under an application and persists it.
+//! IMPLEMENTED: creates an experiment definition under an application and persists it,
+//! once the configuration profile it names is one that stores feature flags.
 //!
 //! ## Shape of an operation
 //!
@@ -270,9 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(configuration_profile_id) = application
-            .resolve_profile(&input.configuration_profile_identifier)
-            .map(|profile| profile.id.clone())
+        let Some(profile) = application.resolve_profile(&input.configuration_profile_identifier)
         else {
             return Err(CreateExperimentDefinitionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -285,6 +284,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // An experiment definition runs ONE feature flag — `ConfigurationProfileIdentifier`
+        // is documented as "the configuration profile ID or name that stores the feature
+        // flag", and `FlagKey` as "the key of the existing feature flag to use with the
+        // experiment". Only a profile whose `Type` is
+        // `crate::state::FEATURE_FLAGS_PROFILE_TYPE` stores flags at all; a profile of any
+        // other Type holds configuration data in which no flag key can be addressed, so the
+        // create is refused before an id is minted rather than binding an experiment to a
+        // flag its profile cannot hold.
+        if profile.profile_type != crate::state::FEATURE_FLAGS_PROFILE_TYPE {
+            return Err(CreateExperimentDefinitionErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::configuration_profile_not_for_experiments(
+                        &profile.id,
+                    )),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+        let configuration_profile_id = profile.id.clone();
 
         // A definition's name ADDRESSES it: every `ExperimentDefinitionIdentifier` in
         // this service resolves "ID or name", so two definitions under one application

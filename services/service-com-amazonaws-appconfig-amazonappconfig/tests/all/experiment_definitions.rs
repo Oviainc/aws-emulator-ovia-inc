@@ -33,8 +33,8 @@ use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::appconfig_workflow::{
-    create_application, create_environment, create_profile, is_modelled_id, json_call, router,
-    Answer,
+    create_application, create_environment, create_flags_profile, is_modelled_id, json_call,
+    router, Answer,
 };
 use crate::resource_tags::pct;
 
@@ -80,7 +80,7 @@ pub(crate) struct Scope {
 pub(crate) async fn scope(router: &MultiServiceRouter, label: &str) -> Scope {
     let application = create_application(router, &format!("app-{label}")).await;
     let environment = create_environment(router, &application, &format!("env-{label}")).await;
-    let profile = create_profile(router, &application, &format!("profile-{label}")).await;
+    let profile = create_flags_profile(router, &application, &format!("profile-{label}")).await;
     Scope {
         application,
         environment,
@@ -853,7 +853,7 @@ async fn identifiers_resolve_a_resource_by_id_or_by_name() {
     let profile_name = "profile-identifiers";
     let application = create_application(&router, application_name).await;
     let environment = create_environment(&router, &application, environment_name).await;
-    let profile = create_profile(&router, &application, profile_name).await;
+    let profile = create_flags_profile(&router, &application, profile_name).await;
 
     // Rows span which of the three identifiers is written as a name rather than an id:
     // none, each one alone, and all three at once.

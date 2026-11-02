@@ -458,16 +458,18 @@ const BEYOND_TIME_BUDGET: &str = "the schema could not be applied to this config
                                   inside the time this emulator allows, so the \
                                   configuration was not shown valid";
 
-/// The schema resources a `JSON_SCHEMA` validator resolves a `$ref` against: NOTHING but
-/// the validator's own document.
+/// The schema resources a compiled schema resolves a `$ref` against: NOTHING but the
+/// document the compilation was handed.
 ///
 /// A validator's `Content` is a document any caller stores and `$ref` is a dynamic
 /// resolution mechanism, so a schema could name a resource by any URL — including a `file:`
 /// one. Registering this as the compiler's loader REPLACES the one it comes with, so a
-/// reference the validator's own document does not satisfy resolves to an error instead of
-/// reaching the host's filesystem or network.
+/// reference the compiled document does not satisfy resolves to an error instead of
+/// reaching the host's filesystem or network. `pub(crate)` because the feature-flags
+/// attribute-constraint check compiles a schema through the same evaluator and resolves
+/// just as little ([`super::feature_flags`]).
 #[derive(Debug)]
-struct NoSchemaResources;
+pub(crate) struct NoSchemaResources;
 
 impl ::boon::UrlLoader for NoSchemaResources {
     fn load(&self, _url: &str) -> Result<Value, Box<dyn ::std::error::Error>> {

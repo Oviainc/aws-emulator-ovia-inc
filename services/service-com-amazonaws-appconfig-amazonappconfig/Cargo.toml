@@ -49,7 +49,9 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # invocation in the refusal the gated call answers with.
 aws-types = { version = "1", default-features = false }
 # JSON Schema evaluator: the verdict a `JSON_SCHEMA` validator of a configuration
-# profile gives about a candidate configuration (`state::validators`).
+# profile gives about a candidate configuration (`state::validators`), and the one a
+# feature flag's declared attribute constraints give about its authored values
+# (`state::feature_flags`).
 boon = "0.6"
 
 [build-dependencies]

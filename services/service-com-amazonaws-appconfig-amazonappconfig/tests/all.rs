@@ -53,6 +53,8 @@ mod deployment_wire_fidelity;
 mod environment_state_wire_form;
 #[path = "all/environment_update.rs"]
 mod environment_update;
+#[path = "all/experiment_definition_profile_type.rs"]
+mod experiment_definition_profile_type;
 #[path = "all/experiment_definition_wire_fidelity.rs"]
 mod experiment_definition_wire_fidelity;
 #[path = "all/experiment_definitions.rs"]
@@ -69,6 +71,8 @@ mod extension_association_refusal_messages;
 mod extension_associations;
 #[path = "all/extensions.rs"]
 mod extensions;
+#[path = "all/feature_flag_attribute_constraints.rs"]
+mod feature_flag_attribute_constraints;
 #[path = "all/feature_flag_metadata.rs"]
 mod feature_flag_metadata;
 #[path = "all/get_configuration.rs"]

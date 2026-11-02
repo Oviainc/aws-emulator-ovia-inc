@@ -39,7 +39,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::appconfig_workflow::{
-    account, create_environment, create_profile, json_call, router_on, send, Answer,
+    account, create_environment, create_flags_profile, create_profile, json_call, router_on,
+    send, Answer,
 };
 use crate::delete_hosted_configuration_version::held_bytes;
 use crate::experiment_definitions::{create_definition, flag, treatment};
@@ -281,12 +282,17 @@ async fn build(router: &MultiServiceRouter, row: &Row) -> Built {
     };
 
     let definition = if row.definition {
+        // An experiment definition targets a feature flag, so it can only be bound to a
+        // profile that stores flags: the row that carries one holds such a profile beside
+        // the free-form profiles its hosted content lives in, and the delete walk below
+        // tears it down with them.
+        let flags_profile = create_flags_profile(router, &application, "flags-profile").await;
         let created = create_definition(
             router,
             &application,
             &json!({
                 "Name": "checkout-experiment",
-                "ConfigurationProfileIdentifier": profiles[0],
+                "ConfigurationProfileIdentifier": flags_profile,
                 "EnvironmentIdentifier": environments[0],
                 "FlagKey": "checkout-flow",
                 "AudienceRule": "attribute(\"tier\") == \"beta\"",
@@ -295,6 +301,7 @@ async fn build(router: &MultiServiceRouter, row: &Row) -> Built {
             }),
         )
         .await;
+        profiles.push(flags_profile);
         assert_eq!(
             created.status,
             201,

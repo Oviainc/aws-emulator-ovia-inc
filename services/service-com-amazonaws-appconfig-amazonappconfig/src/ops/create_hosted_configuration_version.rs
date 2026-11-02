@@ -144,6 +144,18 @@ impl From<CreateHostedConfigurationVersionErrorModeled> for CreateHostedConfigur
     }
 }
 
+/// A `BadRequestException` (HTTP 400) refusing the write because the feature-flags helper
+/// extension did not accept the document: its envelope, or the constraints the document's
+/// own flag attributes declare.
+fn invalid_feature_flags_content() -> CreateHostedConfigurationVersionError {
+    CreateHostedConfigurationVersionErrorModeled::BadRequestException(BadRequestException {
+        message: Some(crate::state::feature_flags::INVALID_FEATURE_FLAGS_CONTENT_MESSAGE.to_string()),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
 /// A `BadRequestException` (HTTP 400) refusing the write because the extension action
 /// AppConfig consults before creating a hosted configuration version did not answer.
 fn extension_failed(message: String) -> CreateHostedConfigurationVersionError {
@@ -200,16 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        // Everything this write is refused on is decided under the lock; the
-        // `PRE_CREATE_HOSTED_CONFIGURATION_VERSION` invocation below cannot be made while
-        // it is held, so the guard is confined to this block and the version is stored
-        // from a second look at the store afterwards.
-        let (mut content, targets, event, profile_type, previously_stored) = {
-        let mut store = state.lock();
 
         // The one member of this service's API that stores caller-supplied bytes, so the
-        // write is bounded before anything is kept: see
-        // `state::MAX_HOSTED_CONFIGURATION_BYTES`. `PayloadTooLargeException` reports
+        // write is bounded before anything is kept, and before the store is even read:
+        // see `state::MAX_HOSTED_CONFIGURATION_BYTES`. `PayloadTooLargeException` reports
         // the limit and the size in KILOBYTES, the unit the model's `BytesMeasure` enum
         // offers, so a client can read both.
         let content_length = input.content.len();
@@ -230,6 +236,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // A feature-flags profile's document declares the constraints its own flag values
+        // are authored under, and a document whose values break them is refused rather
+        // than stored. That check is bounded and runs on a blocking thread, so it cannot
+        // run while the store is locked: what the profile IS — its `Type`, and whether it
+        // uses the hosted store this operation writes to — is read on its own here, and
+        // the check is made before the write's own lock is taken, so a document AppConfig
+        // would refuse reaches neither the store nor the action point.
+        //
+        // A profile this request does not resolve, and one that is not hosted, are both
+        // read as "no document to check": the walk below answers each of them with the
+        // refusal that belongs to it, so this check does not take their place.
+        let hosted_feature_flags_profile = {
+            let store = state.lock();
+            store
+                .application(&input.application_id)
+                .and_then(|application| {
+                    application.profiles.get(&input.configuration_profile_id)
+                })
+                .is_some_and(|profile| {
+                    profile.profile_type == crate::state::FEATURE_FLAGS_PROFILE_TYPE
+                        && profile.location_uri == crate::state::HOSTED_LOCATION_URI
+                })
+        };
+        if hosted_feature_flags_profile
+            && crate::state::feature_flags::violates_declared_constraints(&input.content).await
+        {
+            return Err(invalid_feature_flags_content());
+        }
+
+        // Everything else this write is refused on is decided under the lock; the
+        // `PRE_CREATE_HOSTED_CONFIGURATION_VERSION` invocation below cannot be made while
+        // it is held, so the guard is confined to this block and the version is stored
+        // from a second look at the store afterwards.
+        let (mut content, targets, event, profile_type, previously_stored) = {
+        let mut store = state.lock();
 
         let Some(application) = store.application(&input.application_id) else {
             return Err(CreateHostedConfigurationVersionErrorModeled::ResourceNotFoundException(
@@ -280,7 +322,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not arbitrary bytes: AppConfig runs the content through its feature-flags
         // helper extension before storing it, and refuses a document the extension
         // rejects. Storing one anyway would leave a version a deployment could serve
-        // that AppConfig would have refused at write time.
+        // that AppConfig would have refused at write time. The document's ENVELOPE is
+        // what is checked here; the constraints its own flag attributes declare were
+        // checked before this lock was taken.
         //
         // The helper does not only check the document, it REWRITES it: what AppConfig
         // stores — and serves to a configuration consumer afterwards — is the document
@@ -290,17 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut content = input.content;
         if profile.profile_type == crate::state::FEATURE_FLAGS_PROFILE_TYPE {
             if !crate::state::feature_flags::is_valid_feature_flags_content(&content) {
-                return Err(CreateHostedConfigurationVersionErrorModeled::BadRequestException(
-                    BadRequestException {
-                        message: Some(
-                            crate::state::feature_flags::INVALID_FEATURE_FLAGS_CONTENT_MESSAGE
-                                .to_string(),
-                        ),
-                        reason: None,
-                        details: None,
-                    },
-                )
-                .into());
+                return Err(invalid_feature_flags_content());
             }
             // The latest version this profile already holds: the stamps record when each
             // entry first appeared in the profile and when it last changed, so the
@@ -477,17 +511,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // holding a document a write would have been refused for, or one served
                 // without the metadata the Type reference puts on every entry.
                 if !crate::state::feature_flags::is_valid_feature_flags_content(&content) {
-                    return Err(CreateHostedConfigurationVersionErrorModeled::BadRequestException(
-                        BadRequestException {
-                            message: Some(
-                                crate::state::feature_flags::INVALID_FEATURE_FLAGS_CONTENT_MESSAGE
-                                    .to_string(),
-                            ),
-                            reason: None,
-                            details: None,
-                        },
-                    )
-                    .into());
+                    return Err(invalid_feature_flags_content());
+                }
+                // Held to the flag's own declared constraints as well, on the same
+                // bounded check the caller's document went through; nothing is locked
+                // here, so it is awaited in place.
+                if crate::state::feature_flags::violates_declared_constraints(&content).await {
+                    return Err(invalid_feature_flags_content());
                 }
                 let Some(stamped) = crate::state::feature_flags::stamped_feature_flags_content(
                     &content,

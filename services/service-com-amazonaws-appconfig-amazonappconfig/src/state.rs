@@ -3373,6 +3373,26 @@ pub fn predefined_deployment_strategy_immutable(
     )
 }
 
+/// `Message` for a create refused because the configuration profile it names does not
+/// store feature flags, as the recorded refusal words it:
+///
+/// ```text
+/// Configuration profile <id> cannot be used for experiments. Experiment definitions \
+///     require a configuration profile of type AWS.AppConfig.FeatureFlags.
+/// ```
+///
+/// DERIVED from the request and the store: the id of the profile the call resolved, and the
+/// profile `Type` the operation requires, named from [`FEATURE_FLAGS_PROFILE_TYPE`] rather
+/// than written out a second time. Nothing of any one run is kept here — the id is the one
+/// the call itself addressed.
+pub fn configuration_profile_not_for_experiments(configuration_profile_id: &str) -> String {
+    format!(
+        "Configuration profile {configuration_profile_id} cannot be used for experiments. \
+         Experiment definitions require a configuration profile of type \
+         {FEATURE_FLAGS_PROFILE_TYPE}."
+    )
+}
+
 /// `Message` for a revert refused because the deployment completed too long ago.
 ///
 /// A window-level refusal is a DIFFERENT refusal from [`deployment_cannot_be_stopped`]
