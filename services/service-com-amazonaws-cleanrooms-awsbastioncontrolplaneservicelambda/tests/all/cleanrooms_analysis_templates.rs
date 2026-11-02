@@ -46,12 +46,12 @@ const PARAMETER_TYPES: [&str; 3] = ["INTEGER", "VARCHAR", "TIMESTAMP"];
 
 /// The published maximum of `CreateAnalysisTemplateInput$name` (model `TableAlias`,
 /// `len ..128`) and of `AnalysisTemplate$name` (model `ResourceAlias`, same bound).
-const NAME_MAX_LEN: usize = 128;
+pub(crate) const NAME_MAX_LEN: usize = 128;
 
 /// Create a collaboration and join it, answering the new membership's id. Each call
 /// uses its own collaboration, because one account holds at most one membership per
 /// collaboration.
-async fn membership_id(emulator: &Emulator, collaboration_name: &str) -> String {
+pub(crate) async fn membership_id(emulator: &Emulator, collaboration_name: &str) -> String {
     let (status, created) = emulator
         .create_collaboration(minimal_collaboration(collaboration_name))
         .await;
@@ -80,7 +80,7 @@ async fn membership_id(emulator: &Emulator, collaboration_name: &str) -> String 
         .to_string()
 }
 
-async fn create_analysis_template(
+pub(crate) async fn create_analysis_template(
     emulator: &Emulator,
     membership: &str,
     body: Value,
@@ -94,7 +94,7 @@ async fn create_analysis_template(
         .await
 }
 
-async fn get_analysis_template(
+pub(crate) async fn get_analysis_template(
     emulator: &Emulator,
     membership: &str,
     template: &str,
@@ -111,7 +111,7 @@ async fn get_analysis_template(
 /// A PySpark analysis whose code lives in S3. The artifact members follow the model's
 /// `AnalysisTemplateArtifacts` (`entryPoint`, `additionalArtifacts` of `len 1..1`,
 /// `roleArn` matching `^arn:aws:iam::[\w]+:role/[\w+=./@-]+$`).
-fn artifacts_source() -> Value {
+pub(crate) fn artifacts_source() -> Value {
     json!({
         "artifacts": {
             "entryPoint": { "location": { "bucket": "analysis-artifacts", "key": "jobs/main.py" } },
@@ -126,7 +126,7 @@ fn artifacts_source() -> Value {
 /// `SyntheticDataParameters` with the smallest `columnMapping` the model allows
 /// (`ColumnClassificationDetails$columnMapping`, `len 5..1000`) and both
 /// `SyntheticDataColumnType` values.
-fn synthetic_data_parameters() -> Value {
+pub(crate) fn synthetic_data_parameters() -> Value {
     let columns: Vec<Value> = ["age", "income", "region", "clicks", "converted"]
         .iter()
         .enumerate()

@@ -161,7 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.memberships.contains_key(&input.membership_identifier) {
             return Err(GetAnalysisTemplateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("membership {} not found", input.membership_identifier),
+                    message: st::membership_not_found_message(
+                        &input.membership_identifier,
+                        st::caller_account_id(),
+                    ),
                     resource_id: input.membership_identifier,
                     resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
                 },
@@ -178,9 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             None => Err(GetAnalysisTemplateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "analysis template {} not found in membership {}",
-                        input.analysis_template_identifier, input.membership_identifier
+                    message: st::analysis_template_not_found_message(
+                        &input.analysis_template_identifier,
+                        &input.membership_identifier,
                     ),
                     resource_id: input.analysis_template_identifier,
                     resource_type: st::RESOURCE_TYPE_ANALYSIS_TEMPLATE.to_string(),

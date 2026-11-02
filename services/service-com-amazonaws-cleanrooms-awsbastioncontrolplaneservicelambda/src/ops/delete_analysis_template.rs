@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAnalysisTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAnalysisTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAnalysisTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the analysis template the request addresses from [`crate::state`] — the
+//! record, its position in the listing order, its name index entry and its tags — so
+//! `GetAnalysisTemplate` and `ListAnalysisTemplates` report it gone and the membership
+//! can hold a new template under the name it was using.
+//!
+//! An analysis template is a sub-resource of ONE membership, so both path identifiers
+//! have to resolve: a template that exists under another membership is not deletable
+//! through this one, exactly as it is not readable through it.
 //!
 //! ## Shape of an operation
 //!
@@ -143,20 +143,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAnalysisTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAnalysisTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAnalysisTemplate"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(DeleteAnalysisTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // The template is addressed under the membership that holds it, so an unknown
+        // membership reaches no template at all.
+        if !store.memberships.contains_key(&input.membership_identifier) {
+            return Err(DeleteAnalysisTemplateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: st::membership_not_found_message(
+                        &input.membership_identifier,
+                        st::caller_account_id(),
+                    ),
+                    resource_id: input.membership_identifier,
+                    resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Scoped to the membership in the path, exactly as the read is: a template of
+        // another membership is neither visible nor deletable here, and a template a
+        // previous call already removed is not found either — which is what makes a
+        // repeat delete report what a read of the same resource reports.
+        let Some(template) = store
+            .analysis_template_in(
+                &input.membership_identifier,
+                &input.analysis_template_identifier,
+            )
+            .cloned()
+        else {
+            return Err(DeleteAnalysisTemplateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: st::analysis_template_not_found_message(
+                        &input.analysis_template_identifier,
+                        &input.membership_identifier,
+                    ),
+                    resource_id: input.analysis_template_identifier,
+                    resource_type: st::RESOURCE_TYPE_ANALYSIS_TEMPLATE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        store.analysis_templates.remove(&template.id);
+        store.analysis_template_order.retain(|id| id != &template.id);
+        // The uniqueness entry goes with the record, so the membership can hold a new
+        // template under this name afterwards.
+        store
+            .analysis_template_by_name
+            .remove(&(template.membership_id.clone(), template.name.clone()));
+        // Tags are keyed by the resource's ARN, so they go with the resource rather than
+        // staying reachable through an ARN nothing is stored at.
+        store.tags.remove(&template.arn);
+
+        // Attribution for the removed resource. The analysis itself is NOT logged:
+        // `AnalysisSource$text` is modelled `@sensitive`.
+        ::tracing::debug!(
+            membership = %template.membership_id,
+            analysis_template = %template.id,
+            name = %template.name,
+            "deleted an analysis template"
+        );
+
+        Ok(DeleteAnalysisTemplateOutput {})
     }
 }

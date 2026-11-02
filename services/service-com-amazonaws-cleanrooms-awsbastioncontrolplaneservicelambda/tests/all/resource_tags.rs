@@ -62,7 +62,7 @@ const NEVER_MINTED_IDS: [&str; 3] = [
 /// Only `/` is escaped: RFC 3986 lets a path segment carry `:` unescaped, and `/` is the
 /// one character in a Clean Rooms ARN that would otherwise split the segment. The
 /// framework percent-decodes the label before the handler sees it.
-fn label(arn: &str) -> String {
+pub(crate) fn label(arn: &str) -> String {
     arn.replace('/', "%2F")
 }
 

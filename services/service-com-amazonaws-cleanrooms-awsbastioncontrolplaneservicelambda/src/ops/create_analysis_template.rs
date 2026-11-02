@@ -191,7 +191,7 @@ fn claim(
     let Some(membership) = store.memberships.get(membership_id).cloned() else {
         return Err(CreateAnalysisTemplateErrorModeled::ResourceNotFoundException(
             ResourceNotFoundException {
-                message: format!("membership {membership_id} not found"),
+                message: st::membership_not_found_message(membership_id, st::caller_account_id()),
                 resource_id: membership_id.to_string(),
                 resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
             },
