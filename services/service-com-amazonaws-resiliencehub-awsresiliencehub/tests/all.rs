@@ -29,6 +29,8 @@ mod list_app_versions;
 mod minted_identifier_shape;
 #[path = "all/publish_app_version.rs"]
 mod publish_app_version;
+#[path = "all/published_version_alias_addressing.rs"]
+mod published_version_alias_addressing;
 #[path = "all/reported_output_members.rs"]
 mod reported_output_members;
 #[path = "all/resiliency_policy_deletion.rs"]
