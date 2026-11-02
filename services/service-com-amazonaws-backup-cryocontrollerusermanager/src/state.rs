@@ -50,7 +50,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupRule, BackupRuleInput,
-    BackupSelection, CalculatedLifecycle, CopyJob, FrameworkControl,
+    BackupSelection, CalculatedLifecycle, ConflictException, CopyJob, FrameworkControl,
     InvalidParameterValueException, InvalidRequestException, LegalHold, Lifecycle,
     MissingParameterValueException, RecoveryPointSelection, ResourceNotFoundException, ScanSetting,
 };
@@ -303,14 +303,14 @@ pub const BACKUP_JOB_LIST_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 
 /// for it.
 pub const VAULT_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
-/// How long after a create the framework settles from `CREATE_IN_PROGRESS` to
+/// How long after a create or an update the framework's deployment settles to
 /// `COMPLETED`.
 ///
 /// A CHOSEN span, not a documented one: AWS takes as long as deploying the
 /// framework's controls needs. It is deliberately non-zero so a caller that
-/// describes or deletes the framework straight after creating it still observes
-/// the transient `CREATE_IN_PROGRESS` deployment status and the refusals that go
-/// with it, and the due instant is stored on the framework
+/// describes, updates or deletes the framework straight after creating it still
+/// observes the transient `*_IN_PROGRESS` deployment status and the refusals
+/// that go with it, and the due instant is stored on the framework
 /// ([`FrameworkRecord::settles_at`]) so no handler ever sleeps for it.
 pub const FRAMEWORK_SETTLE_AFTER: Duration = Duration::from_secs(3);
 
@@ -335,6 +335,10 @@ pub const LEGAL_HOLD_STATUS_ACTIVE: &str = "ACTIVE";
 /// (`CREATE_IN_PROGRESS | UPDATE_IN_PROGRESS | DELETE_IN_PROGRESS | COMPLETED |
 /// FAILED`).
 pub const FRAMEWORK_DEPLOYMENT_STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+
+/// `DeploymentStatus` of a framework whose controls are being re-deployed by an
+/// update that has not settled yet (same list).
+pub const FRAMEWORK_DEPLOYMENT_STATUS_UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
 
 /// `DeploymentStatus` of a framework whose deployment has settled (same list).
 pub const FRAMEWORK_DEPLOYMENT_STATUS_COMPLETED: &str = "COMPLETED";
@@ -757,6 +761,14 @@ pub const MESSAGE_FRAMEWORK_NOT_FOUND: &str = "Cannot find Framework";
 /// ([`MESSAGE_VAULT_ALREADY_EXISTS`]) — fixed, and with no observed `Code`.
 pub const MESSAGE_FRAMEWORK_ALREADY_EXISTS: &str = "Framework with the same name already exists";
 
+/// The sentence AWS states for "a previous action on this resource is still
+/// running, so the one just requested cannot be performed" — the documented
+/// text of `ConflictException` itself, which names no part of the request. No
+/// `Code`: this condition has no observed token.
+pub const MESSAGE_PREVIOUS_ACTION_IN_PROGRESS: &str =
+    "Backup can't perform the action that you requested until it finishes performing a \
+     previous action. Try again later.";
+
 /// `Code` for "`MaxResults` is outside the range the model declares".
 pub const ERROR_CODE_MAX_RESULTS_INVALID: &str = "ERROR_3607";
 /// The sentence AWS states for that condition — fixed, like the ones above.
@@ -998,6 +1010,17 @@ pub fn framework_not_found() -> ResourceNotFoundException {
 pub fn framework_already_exists() -> AlreadyExistsException {
     AlreadyExistsException {
         message: Some(MESSAGE_FRAMEWORK_ALREADY_EXISTS.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for an action on a resource whose previous action has
+/// not finished — see [`MESSAGE_PREVIOUS_ACTION_IN_PROGRESS`]. AWS Backup
+/// serializes the deployment of one resource, so the action that loses the race
+/// is refused rather than blended into the one already running.
+pub fn previous_action_in_progress() -> ConflictException {
+    ConflictException {
+        message: Some(MESSAGE_PREVIOUS_ACTION_IN_PROGRESS.to_string()),
         ..Default::default()
     }
 }
@@ -1785,6 +1808,11 @@ pub struct FrameworkRecord {
     /// The `IdempotencyToken` the create carried, which every later read of the
     /// framework reports and which a repeated create replays.
     pub idempotency_token: Option<String>,
+    /// The `IdempotencyToken` of the update that last wrote this framework, so
+    /// retrying that update "results in a success message with no action taken"
+    /// (model doc for `UpdateFrameworkInput$IdempotencyToken`). `None` until an
+    /// update carrying one is applied.
+    pub update_idempotency_token: Option<String>,
     /// The tags `FrameworkTags` assigned to the framework.
     pub tags: BTreeMap<String, String>,
     /// Where the framework is in its deployment: one of the statuses the model
@@ -1795,6 +1823,19 @@ pub struct FrameworkRecord {
 }
 
 impl FrameworkRecord {
+    /// Whether a deployment action on this framework is still in flight: its
+    /// `DeploymentStatus` is one of the model's non-terminal `*_IN_PROGRESS`
+    /// values. AWS Backup deploys a framework's controls one action at a time,
+    /// so another action on it is refused while this one runs
+    /// ([`previous_action_in_progress`]).
+    ///
+    /// Read AFTER [`ComAmazonawsBackupCryocontrollerusermanagerState::settle_frameworks`],
+    /// so a deployment the clock has already made due is terminal here.
+    pub fn deployment_in_flight(&self) -> bool {
+        self.deployment_status == FRAMEWORK_DEPLOYMENT_STATUS_CREATE_IN_PROGRESS
+            || self.deployment_status == FRAMEWORK_DEPLOYMENT_STATUS_UPDATE_IN_PROGRESS
+    }
+
     /// The `FrameworkStatus` a read reports, which follows the deployment: a
     /// framework whose controls are deployed has its recording status validated
     /// ([`FRAMEWORK_STATUS_ACTIVE`]), and one still deploying has nothing to
@@ -2042,6 +2083,16 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         self.frameworks.get(name).ok_or_else(framework_not_found)
     }
 
+    /// The same resolution for a call that WRITES the framework it names, so a
+    /// read-modify-write of one framework resolves it exactly as a read does and
+    /// the two cannot disagree about which names the account holds.
+    pub fn framework_mut(
+        &mut self,
+        name: &str,
+    ) -> Result<&mut FrameworkRecord, ResourceNotFoundException> {
+        self.frameworks.get_mut(name).ok_or_else(framework_not_found)
+    }
+
     /// The framework an `IdempotencyToken` created, if this account still holds
     /// one: "Retrying a successful request with the same idempotency token
     /// results in a success message with no action taken" (model doc for the
@@ -2054,16 +2105,14 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     }
 
     /// Materialise the transition the clock has already made due for every
-    /// framework: the `CREATE_IN_PROGRESS` -> `COMPLETED` deployment a create
-    /// that reports a non-terminal status owes. Like [`Self::settle_vaults`]
-    /// this is the only write a reporting operation performs — each framework
-    /// was owed its deployment at its own `settles_at` whether or not anybody
-    /// called.
+    /// framework: the deployment a create or an update that reports a
+    /// non-terminal status owes, which finishes as `COMPLETED`. Like
+    /// [`Self::settle_vaults`] this is the only write a reporting operation
+    /// performs — each framework was owed its deployment at its own
+    /// `settles_at` whether or not anybody called.
     pub fn settle_frameworks(&mut self, now: SystemTime) {
         for framework in self.frameworks.values_mut() {
-            if framework.deployment_status == FRAMEWORK_DEPLOYMENT_STATUS_CREATE_IN_PROGRESS
-                && now >= framework.settles_at
-            {
+            if framework.deployment_in_flight() && now >= framework.settles_at {
                 framework.deployment_status = FRAMEWORK_DEPLOYMENT_STATUS_COMPLETED.to_string();
             }
         }

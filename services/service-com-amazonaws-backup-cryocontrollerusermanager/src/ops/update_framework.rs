@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFramework
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFramework`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFramework::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members the request names to the stored framework, under the
+//! serialization AWS Backup gives a framework's deployment: the whole
+//! read-modify-write happens while this service's state lock is held, so two
+//! updates of one `FrameworkName` cannot interleave, and an update that arrives
+//! while a previous deployment action on that framework is still in flight is
+//! refused with the modelled `ConflictException` (409) rather than blended into
+//! the one already running.
+//!
+//! Four steps, in the order AWS Backup applies them:
+//!
+//! * a `FrameworkControls` list outside what AWS accepts is refused by the ONE
+//!   control check this service shares with the create
+//!   ([`crate::state::rejected_framework_controls`]), and one past the quota by
+//!   `LimitExceededException`;
+//! * the framework is resolved by the step every framework-scoped call shares
+//!   ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::framework_mut`]):
+//!   a name the account does not hold is the one not-found refusal;
+//! * an `IdempotencyToken` that repeats the update which last wrote the
+//!   framework takes no action and answers success, as the member's doc states;
+//! * otherwise the framework is deployed again: the members the request carries
+//!   are applied and the framework re-enters a non-terminal `UPDATE_IN_PROGRESS`
+//!   deployment status that its own clock settles
+//!   ([`crate::state::FRAMEWORK_SETTLE_AFTER`]), which is the window the loser of
+//!   a race is refused in.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +187,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFramework` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFrameworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFramework"))
+        let _ = ctx;
+        // `FrameworkName` is `@required` and targets a patterned, length-bound
+        // shape, as is each supplied control's `ControlName`: an absent or
+        // malformed one is refused before this handler runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateFrameworkErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // A control list the request carries is checked exactly as the create
+        // checks one: same quota, same rules, same wording, so the two cannot
+        // drift. Request-only checks, so a refused update never takes the lock.
+        if let Some(controls) = input.framework_controls.as_deref() {
+            if controls.len() > crate::state::MAX_CONTROLS_PER_FRAMEWORK {
+                return Err(UpdateFrameworkErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "a framework may hold at most {} controls",
+                            crate::state::MAX_CONTROLS_PER_FRAMEWORK
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
+            if let Some(refusal) = crate::state::rejected_framework_controls(controls) {
+                return Err(
+                    UpdateFrameworkErrorModeled::InvalidParameterValueException(refusal).into(),
+                );
+            }
+        }
+
+        // ONE lock for the whole read-modify-write: resolving the framework,
+        // deciding whether a previous action on it is still running and applying
+        // this one are a single critical section, so concurrent updates of one
+        // name serialize and exactly one of them can be the winner.
+        let mut store = state.lock();
+        // The deployments the clock has already made due, materialised first, so
+        // an update is refused only while an action is REALLY still running.
+        store.settle_frameworks(now);
+
+        let framework = store
+            .framework_mut(&input.framework_name)
+            .map_err(UpdateFrameworkErrorModeled::ResourceNotFoundException)?;
+
+        // "Retrying a successful request with the same idempotency token results
+        // in a success message with no action taken" (model doc for the member):
+        // the retry of the update that last wrote this framework changes nothing,
+        // and is answered before the conflict check — a retry is not a second
+        // action competing with the first.
+        let replays_last_update = input.idempotency_token.is_some()
+            && input.idempotency_token == framework.update_idempotency_token;
+        if replays_last_update {
+            return Ok(framework_updated(framework));
+        }
+
+        // The loser of a race, and any update of a framework whose create or
+        // previous update has not finished deploying: AWS Backup performs one
+        // action on a framework at a time.
+        if framework.deployment_in_flight() {
+            return Err(UpdateFrameworkErrorModeled::ConflictException(
+                crate::state::previous_action_in_progress(),
+            )
+            .into());
+        }
+
+        // The update changes the members it names; one it does not name is left
+        // as the framework already held it. The name, the ARN and the creation
+        // instant are not updatable members at all, so they are what every later
+        // read still reports.
+        if let Some(description) = input.framework_description {
+            framework.description = Some(description);
+        }
+        if let Some(controls) = input.framework_controls {
+            framework.controls = controls;
+        }
+        framework.update_idempotency_token = input.idempotency_token;
+        // Re-deploying the controls is not instant, so the framework re-enters
+        // the non-terminal status AWS reports for one and settles when the clock
+        // makes that due — the same span a create's deployment takes.
+        framework.deployment_status =
+            crate::state::FRAMEWORK_DEPLOYMENT_STATUS_UPDATE_IN_PROGRESS.to_string();
+        framework.settles_at = now
+            .checked_add(crate::state::FRAMEWORK_SETTLE_AFTER)
+            .unwrap_or(now);
+        Ok(framework_updated(framework))
+    }
+}
+
+/// What this operation answers for the framework it wrote — the same answer a
+/// replayed `IdempotencyToken` gets, so a retry cannot report identifiers that
+/// differ from the ones the first call reported.
+fn framework_updated(record: &crate::state::FrameworkRecord) -> UpdateFrameworkOutput {
+    UpdateFrameworkOutput {
+        framework_name: Some(record.name.clone()),
+        framework_arn: Some(record.arn.clone()),
+        creation_time: Some(::aws_smithy_types::DateTime::from(record.creation_time)),
     }
 }

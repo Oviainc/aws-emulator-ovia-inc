@@ -23,6 +23,8 @@ mod copy_job;
 mod error_bodies;
 #[path = "all/framework.rs"]
 mod framework;
+#[path = "all/framework_update.rs"]
+mod framework_update;
 #[path = "all/legal_hold.rs"]
 mod legal_hold;
 #[path = "all/logically_air_gapped_vault.rs"]

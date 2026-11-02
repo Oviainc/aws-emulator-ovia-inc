@@ -41,14 +41,14 @@ use super::vault_and_backup_job::{call, error_code, router, ACCOUNT, REGION};
 /// A blocking sleep rather than `tokio::time::sleep`, for the reason given on
 /// `vault_and_backup_job::PAST_SETTLE`: the workspace's `tokio` dependency does
 /// not enable the `time` feature, and the handlers read the wall clock anyway.
-const PAST_FRAMEWORK_SETTLE: Duration = Duration::from_millis(3_400);
+pub(crate) const PAST_FRAMEWORK_SETTLE: Duration = Duration::from_millis(3_400);
 
 /// The shortest `FrameworkName` the model admits (`smithy_query` operation
 /// `CreateFramework`: `FrameworkName`, `@length` 1..256).
 const MIN_FRAMEWORK_NAME_LENGTH: usize = 1;
 
 /// The longest `FrameworkName` the model admits (same `@length`).
-const MAX_FRAMEWORK_NAME_LENGTH: usize = 256;
+pub(crate) const MAX_FRAMEWORK_NAME_LENGTH: usize = 256;
 
 /// The alphabet the `FrameworkName` pattern admits after the leading letter
 /// (`^[a-zA-Z][_a-zA-Z0-9]*$`).
@@ -59,17 +59,17 @@ const NAME_TAIL_ALPHABET: &[u8] =
 /// one whose deployment has settled — two of the statuses the model lists for
 /// `Framework$DeploymentStatus`.
 const DEPLOYMENT_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
-const DEPLOYMENT_COMPLETED: &str = "COMPLETED";
+pub(crate) const DEPLOYMENT_COMPLETED: &str = "COMPLETED";
 
 /// `FrameworkStatus` values the model documents for
 /// `DescribeFrameworkOutput$FrameworkStatus`: `ACTIVE` once recording is
 /// validated for every resource the framework governs, `UNAVAILABLE` while
 /// Backup cannot validate it.
-const FRAMEWORK_STATUS_ACTIVE: &str = "ACTIVE";
-const FRAMEWORK_STATUS_UNAVAILABLE: &str = "UNAVAILABLE";
+pub(crate) const FRAMEWORK_STATUS_ACTIVE: &str = "ACTIVE";
+pub(crate) const FRAMEWORK_STATUS_UNAVAILABLE: &str = "UNAVAILABLE";
 
 /// `POST /audit/frameworks` — `CreateFramework`'s HTTP binding.
-async fn create_framework(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
+pub(crate) async fn create_framework(router: &MultiServiceRouter, request: &Value) -> (u16, Value) {
     call(
         router,
         "POST",
@@ -80,12 +80,12 @@ async fn create_framework(router: &MultiServiceRouter, request: &Value) -> (u16,
 }
 
 /// `GET /audit/frameworks/{FrameworkName}` — `DescribeFramework`'s HTTP binding.
-async fn describe_framework(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
+pub(crate) async fn describe_framework(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
     call(router, "GET", &format!("/audit/frameworks/{name}"), None).await
 }
 
 /// A string member of a JSON object, or the empty string.
-fn text(body: &Value, member: &str) -> String {
+pub(crate) fn text(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -96,7 +96,7 @@ fn text(body: &Value, member: &str) -> String {
 /// model's pattern: a leading letter, then characters drawn from the whole
 /// admitted tail alphabet, so the length bound is exercised across it rather
 /// than on one hand-picked spelling.
-fn framework_name_of_length(length: usize) -> String {
+pub(crate) fn framework_name_of_length(length: usize) -> String {
     (0..length)
         .map(|index| {
             if index == 0 {

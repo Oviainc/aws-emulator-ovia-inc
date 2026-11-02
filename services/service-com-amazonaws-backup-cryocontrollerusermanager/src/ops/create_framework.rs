@@ -259,6 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             controls: input.framework_controls,
             creation_time: now,
             idempotency_token: input.idempotency_token,
+            // No update has written this framework yet, so there is no update
+            // for a repeated token to replay.
+            update_idempotency_token: None,
             tags: input
                 .framework_tags
                 .unwrap_or_default()
