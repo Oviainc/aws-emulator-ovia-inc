@@ -1953,6 +1953,12 @@ pub const LISTING_CONFIGURATION_SETS: &str = "ListConfigurationSets";
 /// reason: a cursor cut from the identity list resumes only that listing.
 pub const LISTING_IDENTITIES: &str = "ListIdentities";
 
+/// The listing name stamped into a `ListCustomVerificationEmailTemplates` page
+/// token, for the same reason: a cursor cut from the custom verification email
+/// template list resumes only that listing.
+pub const LISTING_CUSTOM_VERIFICATION_EMAIL_TEMPLATES: &str =
+    "ListCustomVerificationEmailTemplates";
+
 /// The bytes every page token of this service digests before the listing and the
 /// key, so a token of this service is not a token of any other.
 const PAGE_TOKEN_DOMAIN: &[u8] = b"com.amazonaws.ses#page-token\0";

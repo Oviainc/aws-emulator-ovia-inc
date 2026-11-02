@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCustomVerificationEmailTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCustomVerificationEmailTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCustomVerificationEmailTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's custom verification email templates — every member the
+//! modelled `CustomVerificationEmailTemplate` carries — in one stable order, a
+//! page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +100,16 @@ impl From<ListCustomVerificationEmailTemplatesErrorModeled> for ListCustomVerifi
     }
 }
 
+/// The page sizes `MaxResults` admits, from its own documentation: "This value
+/// must be at least 1 and less than or equal to 50." The model carries those same
+/// bounds as `@range` on `MaxResults`, so the boundary validator refuses a value
+/// outside them before this handler runs; the member's next sentence — "If you do
+/// not specify a value, or if you specify a value less than 1 or greater than 50,
+/// the operation returns up to 50 results" — is what the page size falls back to
+/// here, so an absent value (and anything the boundary ever let through) takes the
+/// ceiling rather than the whole store.
+const MAX_RESULTS_RANGE: std::ops::RangeInclusive<i32> = 1..=50;
+
 /// The `ListCustomVerificationEmailTemplates` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -141,18 +146,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCustomVerificationEmailTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCustomVerificationEmailTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCustomVerificationEmailTemplates"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+
+        // "The operation returns up to 50 results" whenever the request names no
+        // page size, which is the member's own ceiling and never the whole store.
+        let page_size = match input.max_results {
+            Some(max_results) if MAX_RESULTS_RANGE.contains(&max_results) => max_results as usize,
+            _ => *MAX_RESULTS_RANGE.end() as usize,
+        };
+
+        // A page token is OPAQUE and self-verifying: only a cursor this listing
+        // issued names a position in it, so anything else is refused instead of
+        // being read as some arbitrary position. Checked before the store is
+        // reached, because the answer does not depend on it. The refusal quotes
+        // the rejected value in angle brackets, as this service words it.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(
+                    crate::state::LISTING_CUSTOM_VERIFICATION_EMAIL_TEMPLATES,
+                    token,
+                )
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                        "Invalid PageToken <{token}>."
+                    ))
+                })?,
+            ),
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no error of
+            // its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListCustomVerificationEmailTemplates",
+            ));
+        };
+        // A read: the stored records are projected, never written.
+        let state = state.lock();
+
+        // The store is keyed by the template name, so iteration is in one stable
+        // (lexicographic) order for every caller — which is what makes a
+        // `NextToken` resumable at all. The cursor names the template the next
+        // page starts at, so a page boundary never repeats or skips an entry even
+        // when templates are created or deleted between calls.
+        let page = match resume_from.as_deref() {
+            Some(resume_from) => (
+                std::ops::Bound::Included(resume_from),
+                std::ops::Bound::Unbounded,
+            ),
+            None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        };
+        let mut templates: Vec<CustomVerificationEmailTemplate> = Vec::new();
+        let mut next_token = None;
+        for (name, template) in state.custom_verification_email_templates.range::<str, _>(page) {
+            if templates.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::LISTING_CUSTOM_VERIFICATION_EMAIL_TEMPLATES,
+                    name,
+                ));
+                break;
+            }
+            // Every member of the modelled shape, from the stored record. That
+            // shape carries no `TemplateContent` — only
+            // `GetCustomVerificationEmailTemplate` reports one — so the content the
+            // record holds is not part of a listing.
+            templates.push(CustomVerificationEmailTemplate {
+                template_name: Some(template.template_name.clone()),
+                from_email_address: Some(template.from_email_address.clone()),
+                template_subject: Some(template.template_subject.clone()),
+                success_redirection_url: Some(template.success_redirection_url.clone()),
+                failure_redirection_url: Some(template.failure_redirection_url.clone()),
+            });
+        }
+
+        Ok(ListCustomVerificationEmailTemplatesOutput {
+            // Present even when empty: an account with no custom verification
+            // email templates has an empty list, which is a different answer from
+            // an absent member.
+            custom_verification_email_templates: Some(templates),
+            next_token,
+        })
     }
 }
