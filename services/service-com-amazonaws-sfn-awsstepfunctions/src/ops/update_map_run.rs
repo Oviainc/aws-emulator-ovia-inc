@@ -207,10 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // A Map Run that has finished has no in-progress configuration to change,
             // which this operation's own `ValidationException` reports, carrying the
-            // reason the model declares for exactly that.
+            // reason the model declares for exactly that and naming the Map Run the
+            // request addressed, so a caller retuning several of them knows which one
+            // was refused.
             Err(crate::state::MapRunUpdateRejection::Completed) => Err(
                 UpdateMapRunErrorModeled::ValidationException(ValidationException {
-                    message: Some(crate::state::COMPLETED_MAP_RUN_MESSAGE.to_string()),
+                    message: Some(crate::state::completed_map_run_message(&input.map_run_arn)),
                     reason: Some(crate::state::VALIDATION_REASON_COMPLETED_MAP_RUN.to_string()),
                 })
                 .into(),

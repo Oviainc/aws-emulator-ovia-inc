@@ -73,7 +73,11 @@ fn distributed_map(items: Value, configuration: Value, processor: Value) -> Valu
 }
 
 /// A processor whose every iteration succeeds.
-fn passing_processor() -> Value {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a
+/// sibling suite that needs a Distributed Map's processor reads THIS fixture rather
+/// than carrying a second copy of it.
+pub(crate) fn passing_processor() -> Value {
     json!({
         "ProcessorConfig": { "Mode": "DISTRIBUTED" },
         "StartAt": "P",
@@ -82,7 +86,9 @@ fn passing_processor() -> Value {
 }
 
 /// A processor that FAILS the items whose `ok` member is `false`.
-fn ok_or_fail_processor() -> Value {
+///
+/// `pub(crate)` for the same reason [`passing_processor`] is.
+pub(crate) fn ok_or_fail_processor() -> Value {
     json!({
         "ProcessorConfig": { "Mode": "DISTRIBUTED" },
         "StartAt": "C",
@@ -140,7 +146,9 @@ async fn running_map_run(emulator: &Emulator, name: &str, state: Value) -> (Stri
 }
 
 /// The Map Run record, as `DescribeMapRun` answers for it.
-async fn describe(emulator: &Emulator, map_run_arn: &str) -> Value {
+///
+/// `pub(crate)` for the same reason [`passing_processor`] is.
+pub(crate) async fn describe(emulator: &Emulator, map_run_arn: &str) -> Value {
     emulator
         .ok("DescribeMapRun", &json!({ "mapRunArn": map_run_arn }))
         .await

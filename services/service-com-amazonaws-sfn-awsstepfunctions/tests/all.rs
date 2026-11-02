@@ -35,6 +35,8 @@ mod arn_validation;
 mod client_error_wrappers;
 #[path = "all/client_refusal_status.rs"]
 mod client_refusal_status;
+#[path = "all/completed_map_run_refusal.rs"]
+mod completed_map_run_refusal;
 #[path = "all/definition_path_diagnostics.rs"]
 mod definition_path_diagnostics;
 #[path = "all/definition_refusal_text.rs"]

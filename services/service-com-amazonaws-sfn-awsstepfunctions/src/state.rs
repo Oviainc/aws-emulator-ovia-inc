@@ -155,15 +155,22 @@ pub const VALIDATION_REASON_COMPLETED_MAP_RUN: &str = "CANNOT_UPDATE_COMPLETED_M
 /// What the modelled `ValidationException` says when the Map Run a configuration
 /// change was asked of has already reached a terminal status: `UpdateMapRun`
 /// "updates an IN-PROGRESS Map Run's configuration", so there is nothing left for
-/// the change to govern. It states that rule and names no value of the request, the
-/// way [`LABELED_ARN_MESSAGE`] does.
-pub const COMPLETED_MAP_RUN_MESSAGE: &str = "Cannot update a completed Map Run";
+/// the change to govern.
+///
+/// RECORDED text: the condition, and then the Map Run the request ADDRESSED — the
+/// `mapRunArn` member it carried — so a caller retuning many Map Runs at once reads
+/// which one had already finished out of the refusal itself, rather than having to
+/// re-read each of them. Where [`LABELED_ARN_MESSAGE`] states a rule that no value
+/// of the request appears in, this one identifies the resource it refused.
+pub fn completed_map_run_message(map_run_arn: &str) -> String {
+    format!("Cannot update completed MapRun {map_run_arn}")
+}
 
 /// What the modelled `ValidationException` says when a configuration change names
 /// none of the settings it can change: `UpdateMapRun`'s three threshold members are
 /// each optional with a null default, so a request that carries none of them states
-/// no change at all. It names nothing from the request, the way
-/// [`COMPLETED_MAP_RUN_MESSAGE`] does.
+/// no change at all. It names nothing from the request, because no member of it is
+/// what was refused.
 pub const EMPTY_MAP_RUN_UPDATE_MESSAGE: &str =
     "Either the max concurrency, the tolerated failure count, or the tolerated failure \
      percentage must be specified";
