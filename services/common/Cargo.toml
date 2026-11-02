@@ -9,6 +9,11 @@ publish = false
 # `iam_client`: the in-process IAM client a service resolving a caller-supplied IAM
 # entity asks, built once here instead of per service.
 aws-sdk-iam = { version = "1", default-features = false }
+# `kinesis_client`: the in-process Kinesis client a service DELIVERING a data record
+# writes through, built once here for the same reason. Only the generated client is
+# needed — the emulator supplies the transport, so the SDK's own HTTPS stack and runtime
+# are left out and the client can reach nothing off this process.
+aws-sdk-kinesis = { version = "1", default-features = false }
 # `resolve_route_key` / `ROOT_PATH_SEGMENT`: the framework's own routing-key rule,
 # which this crate narrows rather than replaces.
 emulator-server = { workspace = true }

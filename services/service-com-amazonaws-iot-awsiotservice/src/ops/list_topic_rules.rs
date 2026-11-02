@@ -199,7 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.topic.as_deref().is_none_or(|topic| {
                     rule.topic_pattern
                         .as_deref()
-                        .is_some_and(|pattern| topic_filter_matches(pattern, topic))
+                        .is_some_and(|pattern| {
+                            crate::state::topic_filter_matches(pattern, topic)
+                        })
                 })
             })
             // One rule beyond the page: its presence is what says the listing is
@@ -251,60 +253,10 @@ fn topic_rule_list_item(rule: &crate::state::RegisteredTopicRule) -> TopicRuleLi
     }
 }
 
-/// Whether the MQTT topic filter `pattern` covers the topic name `topic`.
-///
-/// A rule's `FROM` clause names an MQTT topic filter, whose matching rules are the MQTT
-/// 3.1.1 specification's (§4.7, the rules AWS IoT Core's "Topics" documentation
-/// restates): levels are separated by `/`; `+` matches exactly one level; `#` is legal
-/// only as the LAST level, and there it matches the remaining levels and the parent
-/// level too (`sport/#` covers `sport`); and a filter starting with a wildcard never
-/// matches a topic beginning with `$`, the prefix AWS IoT reserves for its own topics.
-/// A filter with no wildcard therefore covers exactly the topic equal to it, and a
-/// filter that puts `#` anywhere but last is not a topic filter at all, so it covers
-/// nothing.
-fn topic_filter_matches(pattern: &str, topic: &str) -> bool {
-    let filter: Vec<&str> = pattern.split(TOPIC_LEVEL_SEPARATOR).collect();
-    let levels: Vec<&str> = topic.split(TOPIC_LEVEL_SEPARATOR).collect();
-
-    if topic.starts_with(RESERVED_TOPIC_PREFIX)
-        && matches!(
-            filter.first(),
-            Some(&MULTI_LEVEL_WILDCARD) | Some(&SINGLE_LEVEL_WILDCARD)
-        )
-    {
-        return false;
-    }
-
-    let mut index = 0;
-    while index < filter.len() {
-        match filter[index] {
-            // The multi-level wildcard ends the walk either way: as the last level it
-            // covers every level that is left and the parent level as well, and
-            // anywhere else it makes the filter malformed, which covers nothing. Every
-            // level before it has already matched, so nothing more is read.
-            MULTI_LEVEL_WILDCARD => return index + 1 == filter.len(),
-            SINGLE_LEVEL_WILDCARD if index < levels.len() => {}
-            level if index < levels.len() && level == levels[index] => {}
-            _ => return false,
-        }
-        index += 1;
-    }
-    // No wildcard ended the walk, so the filter covers the topic only when the two have
-    // the same number of levels.
-    index == levels.len()
-}
-
-/// The character that separates the levels of an MQTT topic name or filter.
-const TOPIC_LEVEL_SEPARATOR: char = '/';
-
-/// The MQTT single-level wildcard: one topic level, whatever it is.
-const SINGLE_LEVEL_WILDCARD: &str = "+";
-
-/// The MQTT multi-level wildcard: the rest of the topic.
-const MULTI_LEVEL_WILDCARD: &str = "#";
-
-/// The prefix AWS IoT reserves for its own topics, which a wildcard does not reach.
-const RESERVED_TOPIC_PREFIX: char = '$';
+// Whether a rule's topic filter covers the requested topic is
+// `crate::state::topic_filter_matches`: the ONE reading of an MQTT topic filter in this
+// service, which the rules engine selects the rules of a published message with as well, so
+// a listing and a delivery cannot disagree about which rules a topic has.
 
 /// The character that separates the fields of a token's SCOPE. A control character, so
 /// it cannot occur in either field it joins: both are built here out of hex digits and

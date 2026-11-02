@@ -308,6 +308,10 @@ pub mod iam_role;
 pub mod iam_trust_policy;
 pub mod iot_commands;
 pub mod iot_job_executions;
+/// The ONE construction of the in-process Kinesis client a service DELIVERS a data record
+/// through, so that hop — and the fact that it opens no socket — is configured once rather
+/// than per service.
+pub mod kinesis_client;
 /// The ONE reading of an ISO 8601 DURATION a service is handed as a caller-supplied
 /// string, for every service whose API takes a span that way — so two services asked how
 /// long a duration is cannot answer differently.

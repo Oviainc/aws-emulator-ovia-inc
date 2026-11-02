@@ -59,6 +59,8 @@ mod thing_type_registry;
 mod topic_rule_deletion;
 #[path = "all/topic_rule_enablement.rs"]
 mod topic_rule_enablement;
+#[path = "all/topic_rule_kinesis_action.rs"]
+mod topic_rule_kinesis_action;
 #[path = "all/topic_rule_listing.rs"]
 mod topic_rule_listing;
 #[path = "all/topic_rule_registry.rs"]

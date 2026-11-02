@@ -32,8 +32,37 @@ sha2 = { workspace = true }
 # filters and the last thing name it emitted (see `ops::list_things`).
 hex = { workspace = true }
 
+# A `kinesis` topic-rule action writes the selected message onto its stream with
+# `PutRecord`, built as the SDK's generated client only: the transport is the emulator's own
+# in-process callback (`service_common::kinesis_client`), so the SDK's HTTPS stack and
+# runtime are left out and nothing off this process is reachable.
+aws-sdk-kinesis = { version = "1", default-features = false }
+
+# `sqlparser`: the SELECT clause and the WHERE condition of a topic rule's SQL statement
+# are PARSED with it (`state::rule_sql`), so the statement a caller stores is read by a
+# maintained SQL parser rather than matched here. A parser only — it yields an AST and has
+# no host primitives — and what runs over that AST is this crate's own bounded walk of the
+# published message.
+sqlparser = "0.59"
+
+# The IAM store a topic-rule action's `roleArn` is resolved against, to decide whether the
+# rules engine may assume that role and make the action's API call under it
+# (`state::rule_action_role`): the IAM service's own state struct, in the SAME shared
+# engine, read through its own accessors rather than through a second copy of them.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# `tokio::time` drives the tests' wait past a stream's activation transition.
+tokio = { workspace = true, features = ["time"] }
+# The rules-engine tests observe a rule's action where a client observes it, so the
+# services a `kinesis` action reaches are mounted beside IoT on one engine: the data plane
+# a message is published through, the stream the record is written to, and the IAM store
+# the action's role lives in.
+service-com-amazonaws-iotdataplane-iotmoonrakerservice = { workspace = true }
+service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 
 [lints]
 workspace = true

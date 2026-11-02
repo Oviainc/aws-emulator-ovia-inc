@@ -27,6 +27,10 @@ tracing = { workspace = true }
 # dependencies, and already used by this crate's tests.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The IoT control plane's TOPIC RULES, in the SAME shared engine: an accepted `Publish` is
+# what the rules engine runs on, so the data plane drives that service's evaluation
+# (`state::rules_engine`) rather than holding a second copy of the rules.
+service-com-amazonaws-iot-awsiotservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

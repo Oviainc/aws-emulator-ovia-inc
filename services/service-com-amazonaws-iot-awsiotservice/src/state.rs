@@ -948,7 +948,7 @@ impl ComAmazonawsIotAwsiotserviceState {
 /// uuid-backed id newtype (`BatchId::random()` is `uuid::Uuid::new_v4()` rendered
 /// canonically) — a crate this service ALREADY depends on. Nothing here is a
 /// hand-rolled generator, and the service adds no dependency.
-fn fresh_uuid() -> String {
+pub(crate) fn fresh_uuid() -> String {
     ::emulator_telemetry::BatchId::random().as_str().to_string()
 }
 
@@ -1894,6 +1894,32 @@ pub const MAX_SQL_SCAN_CHARACTERS: usize = 64 * 1024;
 /// pattern is then unknown, and a reader reports the member as absent rather than
 /// inventing one.
 pub fn topic_pattern_of_sql(sql: &str) -> Option<String> {
+    selected_topic(sql).map(|selected| selected.filter)
+}
+
+/// The topic filter a rule's SQL statement selects from, WITH the place in the statement
+/// that names it.
+///
+/// `start` and `end` are character offsets into the statement: `start` is its opening quote
+/// and `end` one past its closing quote, so the text between them is exactly the quoted
+/// literal. A reader that has to re-read the REST of the statement — the rules engine, which
+/// reads the select clause and the condition through a SQL parser
+/// ([`rule_sql::selected_message`]) — replaces that one span, because a topic filter
+/// written as a string literal is AWS IoT's own dialect and no SQL grammar parses it as a
+/// relation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedTopic {
+    /// The topic filter itself, with a doubled quote inside it read as one quote.
+    pub filter: String,
+    /// The offset, in characters of the statement, of the literal's opening quote.
+    pub start: usize,
+    /// The offset, in characters of the statement, one past the literal's closing quote.
+    pub end: usize,
+}
+
+/// The one scan of a rule's statement both readings above take; see
+/// [`topic_pattern_of_sql`] for the clause it reads and why it is lexed here.
+pub fn selected_topic(sql: &str) -> Option<SelectedTopic> {
     let characters: Vec<char> = sql.chars().take(MAX_SQL_SCAN_CHARACTERS).collect();
     let mut index = 0;
     let mut after_from = false;
@@ -1922,6 +1948,7 @@ pub fn topic_pattern_of_sql(sql: &str) -> Option<String> {
             // else (a selected constant, a `WHERE` comparand) it is skipped.
             '\'' => {
                 let mut literal = String::new();
+                let start = index;
                 index += 1;
                 loop {
                     match characters.get(index) {
@@ -1943,7 +1970,11 @@ pub fn topic_pattern_of_sql(sql: &str) -> Option<String> {
                     }
                 }
                 if after_from {
-                    return Some(literal);
+                    return Some(SelectedTopic {
+                        filter: literal,
+                        start,
+                        end: index,
+                    });
                 }
             }
             // A bare word. `FROM` is the one this looks for, whatever its casing; a
@@ -2371,6 +2402,79 @@ pub fn thing_index_schema(configuration: &ThingIndexingConfiguration) -> Option<
 pub fn missing_fleet_index_message(index_name: &str) -> String {
     format!("Index {index_name} does not exist")
 }
+
+/// Whether the MQTT topic filter `pattern` covers the topic name `topic`.
+///
+/// A rule's `FROM` clause names an MQTT topic filter, whose matching rules are the MQTT
+/// 3.1.1 specification's (§4.7, the rules AWS IoT Core's "Topics" documentation
+/// restates): levels are separated by `/`; `+` matches exactly one level; `#` is legal
+/// only as the LAST level, and there it matches the remaining levels and the parent
+/// level too (`sport/#` covers `sport`); and a filter starting with a wildcard never
+/// matches a topic beginning with `$`, the prefix AWS IoT reserves for its own topics.
+/// A filter with no wildcard therefore covers exactly the topic equal to it, and a
+/// filter that puts `#` anywhere but last is not a topic filter at all, so it covers
+/// nothing.
+///
+/// The ONE reading of a topic filter in this service: `ListTopicRules` selects "the rules
+/// for the specific topic" with it, and the rules engine selects the rules a published
+/// message is evaluated against with it ([`rules_engine`]), so a listing and a delivery
+/// cannot disagree about which rules a topic has.
+pub fn topic_filter_matches(pattern: &str, topic: &str) -> bool {
+    let filter: Vec<&str> = pattern.split(TOPIC_LEVEL_SEPARATOR).collect();
+    let levels: Vec<&str> = topic.split(TOPIC_LEVEL_SEPARATOR).collect();
+
+    if topic.starts_with(RESERVED_TOPIC_PREFIX)
+        && matches!(
+            filter.first(),
+            Some(&MULTI_LEVEL_WILDCARD) | Some(&SINGLE_LEVEL_WILDCARD)
+        )
+    {
+        return false;
+    }
+
+    let mut index = 0;
+    while index < filter.len() {
+        match filter[index] {
+            // The multi-level wildcard ends the walk either way: as the last level it
+            // covers every level that is left and the parent level as well, and
+            // anywhere else it makes the filter malformed, which covers nothing. Every
+            // level before it has already matched, so nothing more is read.
+            MULTI_LEVEL_WILDCARD => return index + 1 == filter.len(),
+            SINGLE_LEVEL_WILDCARD if index < levels.len() => {}
+            level if index < levels.len() && level == levels[index] => {}
+            _ => return false,
+        }
+        index += 1;
+    }
+    // No wildcard ended the walk, so the filter covers the topic only when the two have
+    // the same number of levels.
+    index == levels.len()
+}
+
+/// The character that separates the levels of an MQTT topic name or filter.
+pub const TOPIC_LEVEL_SEPARATOR: char = '/';
+
+/// The MQTT single-level wildcard: one topic level, whatever it is.
+pub const SINGLE_LEVEL_WILDCARD: &str = "+";
+
+/// The MQTT multi-level wildcard: the rest of the topic.
+pub const MULTI_LEVEL_WILDCARD: &str = "#";
+
+/// The prefix AWS IoT reserves for its own topics, which a wildcard does not reach.
+pub const RESERVED_TOPIC_PREFIX: char = '$';
+
+// What a published message DOES to the rules this store holds — which rules it is
+// evaluated against, what each selects out of it and the action each one then performs —
+// lives in `state/rules_engine.rs`; the reading of a rule's SQL statement the engine
+// selects a message with in `state/rule_sql.rs`, and the bounded walk of one expression of
+// that statement in `state/rule_expression.rs`. The engine's names are re-exported here so
+// a handler reaches them as `crate::state::<name>`. Declared beside the store accessor,
+// away from the import list, the constants and the records above.
+pub mod rule_action_role;
+pub mod rule_expression;
+pub mod rule_sql;
+pub mod rules_engine;
+pub use rules_engine::{dispatch_published_message, SERVICE_PRINCIPAL};
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

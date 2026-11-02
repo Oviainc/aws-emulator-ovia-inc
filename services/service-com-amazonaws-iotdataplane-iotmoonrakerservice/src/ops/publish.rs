@@ -2,10 +2,18 @@
 
 //! @op Publish
 //! Publishes an MQTT message. The emulator has no MQTT subscribers, so a plain
-//! publish is accepted and leaves no trace — exactly what a broker does for a topic
+//! publish leaves no trace of its own — exactly what a broker does for a topic
 //! nobody is subscribed to. A publish with `retain=true` IS persistent state: it
 //! stores the message as the topic's retained message, and an empty retained payload
 //! clears it, which is how MQTT deletes a retained message.
+//!
+//! An accepted message is also what the RULES ENGINE runs on: every enabled topic rule
+//! of the account whose SQL statement selects the published topic has its actions
+//! performed for this message
+//! (`service_com_amazonaws_iot_awsiotservice::state::dispatch_published_message`), which
+//! is what a rule is for. None of that changes this response — AWS IoT answers an
+//! accepted publish the same way whatever the rules did with the message, and what a
+//! client observes is the effect on each action's target.
 //!
 //! A publish is refused before any of that when the topic is not one a client may
 //! publish to: a topic in the reserved `$` namespace (the service's own system
@@ -278,7 +286,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PublishErrorModeled::InternalFailureException(InternalFailureException::new(
                 "An unexpected error has occurred.",
@@ -345,7 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.topic.clone(),
                     crate::state::RetainedMessage {
                         topic: input.topic.clone(),
-                        payload,
+                        payload: payload.clone(),
                         qos: input.qos,
                         last_modified_time_millis: crate::state::now_millis(),
                         user_properties: input
@@ -356,6 +363,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         }
+
+        // The broker took the message, so the RULES ENGINE evaluates it: every enabled
+        // topic rule whose SQL statement selects this topic runs its actions for this
+        // message, which is what a rule is for. Nothing about that is reported here — AWS
+        // IoT answers an accepted publish the same way whatever the rules did with it, and
+        // what a client observes is the effect on each action's target.
+        ::service_com_amazonaws_iot_awsiotservice::state::dispatch_published_message(
+            &*self.engine,
+            ctx,
+            &input.topic,
+            &payload,
+        )
+        .await;
 
         Ok(PublishOutput::accepted())
     }
