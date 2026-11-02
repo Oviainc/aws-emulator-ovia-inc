@@ -177,27 +177,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A job ingests one data source of one knowledge base, so both have to
         // exist: a data source is identified by the pair, which makes an id of
         // another knowledge base's data source as absent here as one nothing
-        // holds.
-        if !state.knowledge_bases.contains_key(&input.knowledge_base_id) {
+        // holds. A resource a delete has already been accepted for is as absent
+        // too: it serves no ingestion it would not serve after its removal.
+        if state.live_knowledge_base(&input.knowledge_base_id).is_none() {
             return Err(StartIngestionJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "could not find knowledge base with identifier {}",
-                        input.knowledge_base_id
+                    message: Some(crate::state::knowledge_base_not_found_message(
+                        &input.knowledge_base_id,
                     )),
                 },
             )
             .into());
         }
         if state
-            .data_source_of(&input.knowledge_base_id, &input.data_source_id)
+            .live_data_source_of(&input.knowledge_base_id, &input.data_source_id)
             .is_none()
         {
             return Err(StartIngestionJobErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "could not find data source with identifier {} in knowledge base {}",
-                        input.data_source_id, input.knowledge_base_id
+                    message: Some(crate::state::data_source_not_found_message(
+                        &input.data_source_id,
                     )),
                 },
             )

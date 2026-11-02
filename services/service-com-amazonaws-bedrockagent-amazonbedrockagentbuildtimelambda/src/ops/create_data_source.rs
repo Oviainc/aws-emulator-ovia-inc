@@ -206,14 +206,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialise_due_transitions(now);
 
         // A data source belongs to a knowledge base, so the knowledge base the
-        // URI names has to exist: this operation "connects a knowledge base to
-        // a data source".
-        let Some(knowledge_base) = state.knowledge_bases.get(&input.knowledge_base_id) else {
+        // URI names has to exist — and not be on its way out of the store: this
+        // operation "connects a knowledge base to a data source".
+        let Some(knowledge_base) = state.live_knowledge_base(&input.knowledge_base_id) else {
             return Err(CreateDataSourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "could not find knowledge base with identifier {}",
-                        input.knowledge_base_id
+                    message: Some(crate::state::knowledge_base_not_found_message(
+                        &input.knowledge_base_id,
                     )),
                 },
             )
@@ -231,7 +230,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cloned();
         if let Some(existing) = replayed
             .as_deref()
-            .and_then(|data_source_id| state.data_source_of(&input.knowledge_base_id, data_source_id))
+            .and_then(|data_source_id| {
+                state.live_data_source_of(&input.knowledge_base_id, data_source_id)
+            })
         {
             return Ok(CreateDataSourceOutput {
                 data_source: existing.to_data_source(),
@@ -291,6 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // a data source that has been created and is ready for ingestion,
             // so no transition is owed here.
             status: crate::state::DataSourceStatus::Available,
+            // Nothing has been deleted: a removal is owed only once a delete is
+            // accepted for this data source or for the knowledge base that
+            // contains it.
+            removal_due_at: None,
             // Nothing has failed on a data source this call just created.
             failure_reasons: Vec::new(),
             client_token: input.client_token.clone(),

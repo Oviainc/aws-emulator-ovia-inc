@@ -197,8 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialise_due_transitions(now);
 
         // A data source belongs to a knowledge base, so the knowledge base the
-        // URI names has to exist before a data source under it can be updated.
-        let Some(knowledge_base) = state.knowledge_bases.get(&input.knowledge_base_id) else {
+        // URI names has to exist before a data source under it can be updated,
+        // and must not be on its way out of the store.
+        let Some(knowledge_base) = state.live_knowledge_base(&input.knowledge_base_id) else {
             return Err(UpdateDataSourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::knowledge_base_not_found_message(
@@ -212,8 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A data source is identified by the knowledge base it belongs to as well
         // as its own id, so an id of another knowledge base's data source is as
-        // absent here as one nothing holds.
-        let Some(record) = state.data_source_of_mut(&input.knowledge_base_id, &input.data_source_id)
+        // absent here as one nothing holds — and so is one a delete has already
+        // been accepted for.
+        let Some(record) =
+            state.live_data_source_of_mut(&input.knowledge_base_id, &input.data_source_id)
         else {
             return Err(UpdateDataSourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

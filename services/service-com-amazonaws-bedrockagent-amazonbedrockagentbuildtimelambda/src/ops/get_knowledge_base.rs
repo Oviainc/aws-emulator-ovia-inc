@@ -156,17 +156,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
-        // The ONLY write a read performs: a status the CLOCK already made due
-        // (CREATING -> ACTIVE) was owed at this instant whether or not anybody
-        // called. Nothing else about the stored record changes here.
+        // The ONLY write a read performs: a change the CLOCK already made due
+        // (CREATING -> ACTIVE, or the removal an accepted delete put on the
+        // clock) was owed at this instant whether or not anybody called.
+        // Nothing else about the stored record changes here.
         state.materialise_due_transitions(now);
 
+        // A knowledge base whose deletion is still under way IS reported, in
+        // the `DELETING` status the modelled `KnowledgeBase$status` documents
+        // for it; once the removal comes due it is gone and this answers the
+        // modelled 404.
         let Some(record) = state.knowledge_bases.get(&input.knowledge_base_id) else {
             return Err(GetKnowledgeBaseErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "could not find knowledge base with identifier {}",
-                        input.knowledge_base_id
+                    message: Some(crate::state::knowledge_base_not_found_message(
+                        &input.knowledge_base_id,
                     )),
                 },
             )

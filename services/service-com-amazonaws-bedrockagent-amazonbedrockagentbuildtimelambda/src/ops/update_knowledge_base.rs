@@ -204,7 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialise_due_transitions(now);
 
-        let Some(record) = state.knowledge_bases.get_mut(&input.knowledge_base_id) else {
+        // A knowledge base a delete has already been accepted for serves no
+        // update: it is on its way out of the store, so it answers what it will
+        // answer once the removal has happened.
+        let Some(record) = state.live_knowledge_base_mut(&input.knowledge_base_id) else {
             return Err(UpdateKnowledgeBaseErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::knowledge_base_not_found_message(

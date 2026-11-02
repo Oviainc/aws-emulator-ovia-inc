@@ -216,12 +216,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` is an @idempotencyToken: a repeat of the same request
         // returns the knowledge base it already created rather than minting a
-        // second one.
+        // second one — unless a delete has since been accepted for it, which
+        // leaves nothing to replay.
         if let Some(existing) = input
             .client_token
             .as_deref()
             .and_then(|token| state.knowledge_base_client_tokens.get(token))
-            .and_then(|knowledge_base_id| state.knowledge_bases.get(knowledge_base_id))
+            .cloned()
+            .and_then(|knowledge_base_id| state.live_knowledge_base(&knowledge_base_id))
         {
             return Ok(CreateKnowledgeBaseOutput {
                 knowledge_base: existing.to_knowledge_base(),
@@ -281,6 +283,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now + crate::state::KNOWLEDGE_BASE_ACTIVATION_SPAN,
                 crate::state::KnowledgeBaseStatus::Active,
             )),
+            // Nothing has been deleted: a removal is owed only once a delete
+            // is accepted for this knowledge base.
+            removal_due_at: None,
             // Nothing has failed on a knowledge base this call just created.
             failure_reasons: Vec::new(),
             tags: input.tags.unwrap_or_default(),

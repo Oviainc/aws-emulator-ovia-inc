@@ -210,10 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.flows.get(flow_id) else {
             return Err(GetFlowErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "could not find flow with identifier {}",
-                        input.flow_identifier
-                    )),
+                    message: Some(crate::state::flow_not_found_message(Self::NAME)),
                 },
             )
             .into());

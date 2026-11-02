@@ -15,6 +15,8 @@
 mod agent_lifecycle;
 #[path = "all/data_source_lifecycle.rs"]
 mod data_source_lifecycle;
+#[path = "all/delete_removes_the_resource.rs"]
+mod delete_removes_the_resource;
 #[path = "all/flow_definition_validation.rs"]
 mod flow_definition_validation;
 #[path = "all/flow_lifecycle.rs"]

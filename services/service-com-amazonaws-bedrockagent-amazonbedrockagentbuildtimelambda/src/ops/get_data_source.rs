@@ -155,17 +155,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // The ONLY write a read performs: a removal the CLOCK already made due
+        // — the delete that was accepted for this data source, or for the
+        // knowledge base containing it, completing — was owed at this instant
+        // whether or not anybody called. Nothing else about the store changes
+        // here.
+        state.materialise_due_transitions(now);
+
         // A data source is identified by the knowledge base it belongs to as
         // well as its own id, so an id of another knowledge base's data source
-        // is as absent here as one nothing holds.
+        // is as absent here as one nothing holds. A data source whose deletion
+        // is still under way IS reported, in the `DELETING` status the modelled
+        // `DataSource$status` documents for it.
         let Some(record) = state.data_source_of(&input.knowledge_base_id, &input.data_source_id)
         else {
             return Err(GetDataSourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "could not find data source with identifier {} in knowledge base {}",
-                        input.data_source_id, input.knowledge_base_id
+                    message: Some(crate::state::data_source_not_found_message(
+                        &input.data_source_id,
                     )),
                 },
             )

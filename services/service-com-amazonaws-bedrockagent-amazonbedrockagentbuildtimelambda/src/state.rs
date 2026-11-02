@@ -38,6 +38,23 @@
 //! behind those refusals lives here, in [`immutable_member_verdict`] and
 //! [`immutable_member_message`], so neither handler can decide it differently.
 //!
+//! A delete the service accepts (`DeleteKnowledgeBase`, `DeleteDataSource`,
+//! `DeleteFlow`) is what takes the resource out of those maps, so no later
+//! operation can still reach it. A knowledge base and a data source carry the
+//! modelled transient `DELETING` status while the removal the clock owes is
+//! outstanding (
+//! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::begin_knowledge_base_deletion`]
+//! /
+//! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::begin_data_source_deletion`]),
+//! and
+//! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::materialise_due_transitions`]
+//! removes them once it comes due; a flow, whose modelled `FlowStatus` has no
+//! such value, goes at once
+//! ([`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::remove_flow`]).
+//! A resource being deleted still reports its status to a read, and serves no
+//! other operation: the `live_*` accessors here are what every operation that
+//! acts ON a resource resolves it through.
+//!
 //! A data source's ingestion jobs (`StartIngestionJob`, `GetIngestionJob`) are
 //! backed by the
 //! [`ingestion_jobs`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::ingestion_jobs)
@@ -500,6 +517,20 @@ pub const KNOWLEDGE_BASE_QUOTA: usize = 1_000;
 /// being created"), and short enough that a client script converges promptly.
 pub const KNOWLEDGE_BASE_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
 
+/// How long after a delete is accepted the resource it named is removed from
+/// the store, after which a read of it answers the modelled
+/// `ResourceNotFoundException` rather than reporting it as `DELETING`.
+///
+/// CHOSEN, not documented: AWS publishes no duration for the deletion of a
+/// knowledge base or of a data source. It is deliberately non-zero, and a few
+/// seconds rather than a few milliseconds, so a caller that reads the resource
+/// back immediately still observes the transient status both modelled shapes
+/// document (`KnowledgeBase$status`: "DELETING – The knowledge base is being
+/// deleted"; `DataSource$status`: "Deleting – The data source is being
+/// deleted") and can act on it, while a client polling for the resource to
+/// disappear still converges promptly.
+pub const DELETION_SPAN: Duration = Duration::from_secs(3);
+
 /// The `KnowledgeBaseType` discriminator of a self-managed vector knowledge
 /// base: the one `CreateKnowledgeBase` documents a vector store for ("For
 /// self-managed knowledge bases, provide the configuration for your vector
@@ -621,6 +652,9 @@ pub enum KnowledgeBaseStatus {
     Creating,
     /// The knowledge base is ready to be queried.
     Active,
+    /// `DeleteKnowledgeBase` accepted; the knowledge base is removed from the
+    /// store once [`DELETION_SPAN`] has elapsed.
+    Deleting,
 }
 
 impl KnowledgeBaseStatus {
@@ -629,6 +663,7 @@ impl KnowledgeBaseStatus {
         match self {
             Self::Creating => "CREATING",
             Self::Active => "ACTIVE",
+            Self::Deleting => "DELETING",
         }
     }
 }
@@ -649,6 +684,9 @@ pub struct KnowledgeBaseRecord {
     /// due. A reporting operation may materialise it once that instant has
     /// passed; it never invents a transition of its own.
     pub pending_status: Option<(SystemTime, KnowledgeBaseStatus)>,
+    /// The instant the CLOCK owes this knowledge base's removal, set by the
+    /// delete that was accepted for it and `None` while none was.
+    pub removal_due_at: Option<SystemTime>,
     /// Reasons the last API operation on the knowledge base failed; empty while
     /// nothing has failed.
     pub failure_reasons: Vec<String>,
@@ -659,6 +697,12 @@ pub struct KnowledgeBaseRecord {
 }
 
 impl KnowledgeBaseRecord {
+    /// Whether a delete has already been accepted for this knowledge base, so
+    /// it is on its way out of the store.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
     /// This record as the modelled `KnowledgeBase` shape: every member is
     /// populated from the stored record, never from the request being served.
     pub fn to_knowledge_base(&self) -> KnowledgeBase {
@@ -820,6 +864,11 @@ pub enum DataSourceStatus {
     /// `DataSource$status` documents this as the status of a data source that
     /// "has been created and is ready for ingestion into the knowledge base".
     Available,
+    /// `DeleteDataSource` accepted, or the deletion of the knowledge base that
+    /// contains it — the modelled `DataSource$status` documents this as the
+    /// status of a data source that "is being deleted". The record is removed
+    /// from the store once [`DELETION_SPAN`] has elapsed.
+    Deleting,
 }
 
 impl DataSourceStatus {
@@ -827,6 +876,7 @@ impl DataSourceStatus {
     pub fn as_wire(self) -> &'static str {
         match self {
             Self::Available => "AVAILABLE",
+            Self::Deleting => "DELETING",
         }
     }
 }
@@ -844,6 +894,10 @@ pub struct DataSourceRecord {
     pub vector_ingestion_configuration: Option<VectorIngestionConfiguration>,
     pub data_deletion_policy: Option<String>,
     pub status: DataSourceStatus,
+    /// The instant the CLOCK owes this data source's removal, set by the delete
+    /// that was accepted for it — or for the knowledge base that contains it —
+    /// and `None` while none was.
+    pub removal_due_at: Option<SystemTime>,
     /// Reasons the last API operation on the data source failed; empty while
     /// nothing has failed.
     pub failure_reasons: Vec<String>,
@@ -853,6 +907,13 @@ pub struct DataSourceRecord {
 }
 
 impl DataSourceRecord {
+    /// Whether a delete has already been accepted for this data source, or for
+    /// the knowledge base that contains it, so it is on its way out of the
+    /// store.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
     /// This record as the modelled `DataSource` shape: every member is
     /// populated from the stored record, never from the request being served.
     pub fn to_data_source(&self) -> DataSource {
@@ -1219,6 +1280,50 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .filter(|record| record.knowledge_base_id == knowledge_base_id)
     }
 
+    /// The stored knowledge base `knowledge_base_id` names, but only while no
+    /// delete has been accepted for it: a resource on its way out of the store
+    /// reports its own `DELETING` status to a read and serves no operation that
+    /// acts on it, which is what it answers once the removal has happened too.
+    pub fn live_knowledge_base(&self, knowledge_base_id: &str) -> Option<&KnowledgeBaseRecord> {
+        self.knowledge_bases
+            .get(knowledge_base_id)
+            .filter(|record| !record.is_deleting())
+    }
+
+    /// The same record as [`Self::live_knowledge_base`], for an operation that
+    /// writes it.
+    pub fn live_knowledge_base_mut(
+        &mut self,
+        knowledge_base_id: &str,
+    ) -> Option<&mut KnowledgeBaseRecord> {
+        self.knowledge_bases
+            .get_mut(knowledge_base_id)
+            .filter(|record| !record.is_deleting())
+    }
+
+    /// The same record as [`Self::data_source_of`], but only while no delete has
+    /// been accepted for it or for the knowledge base that contains it — the
+    /// same rule as [`Self::live_knowledge_base`].
+    pub fn live_data_source_of(
+        &self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+    ) -> Option<&DataSourceRecord> {
+        self.data_source_of(knowledge_base_id, data_source_id)
+            .filter(|record| !record.is_deleting())
+    }
+
+    /// The same record as [`Self::live_data_source_of`], for an operation that
+    /// writes it.
+    pub fn live_data_source_of_mut(
+        &mut self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+    ) -> Option<&mut DataSourceRecord> {
+        self.data_source_of_mut(knowledge_base_id, data_source_id)
+            .filter(|record| !record.is_deleting())
+    }
+
     /// Mint an unused `ingestionJobId`, which the modelled `Id` shape
     /// constrains to the same `^[0-9a-zA-Z]{10}$` as an `agentId`. `None` when
     /// every one of [`MINT_ATTEMPTS`] draws collided.
@@ -1325,6 +1430,117 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                     .map(|(span, after)| (due + span, after));
             }
         }
+        // A removal an accepted delete put on the clock is owed the same way:
+        // once its instant has passed the resource is gone, whether or not
+        // anybody called. A knowledge base takes the data sources it contains
+        // with it, which the delete marked for the same instant.
+        let due_data_sources: Vec<String> = self
+            .data_sources
+            .values()
+            .filter(|record| record.removal_due_at.is_some_and(|due| now >= due))
+            .map(|record| record.data_source_id.clone())
+            .collect();
+        for data_source_id in due_data_sources {
+            self.remove_data_source(&data_source_id);
+        }
+        let due_knowledge_bases: Vec<String> = self
+            .knowledge_bases
+            .values()
+            .filter(|record| record.removal_due_at.is_some_and(|due| now >= due))
+            .map(|record| record.knowledge_base_id.clone())
+            .collect();
+        for knowledge_base_id in due_knowledge_bases {
+            self.remove_knowledge_base(&knowledge_base_id);
+        }
+    }
+
+    /// Accept the deletion of `knowledge_base_id`: the knowledge base, and every
+    /// data source it contains, report the modelled `DELETING` status from now
+    /// on, and the clock owes their removal one [`DELETION_SPAN`] later.
+    ///
+    /// Deleting a knowledge base deletes the data sources inside it: a data
+    /// source is identified by the knowledge base it belongs to, so none of them
+    /// outlives it.
+    pub fn begin_knowledge_base_deletion(&mut self, knowledge_base_id: &str, now: SystemTime) {
+        let removal_due_at = now + DELETION_SPAN;
+        if let Some(record) = self.knowledge_bases.get_mut(knowledge_base_id) {
+            record.status = KnowledgeBaseStatus::Deleting;
+            // A status the clock still owed this knowledge base is not owed any
+            // more: it is being deleted, not created or updated.
+            record.pending_status = None;
+            record.removal_due_at = Some(removal_due_at);
+            record.updated_at = now;
+        }
+        for record in self
+            .data_sources
+            .values_mut()
+            .filter(|record| record.knowledge_base_id == knowledge_base_id)
+        {
+            record.status = DataSourceStatus::Deleting;
+            record.removal_due_at = Some(removal_due_at);
+            record.updated_at = now;
+        }
+    }
+
+    /// Accept the deletion of one data source of `knowledge_base_id`: it reports
+    /// the modelled `DELETING` status from now on, and the clock owes its
+    /// removal one [`DELETION_SPAN`] later.
+    pub fn begin_data_source_deletion(
+        &mut self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+        now: SystemTime,
+    ) {
+        let removal_due_at = now + DELETION_SPAN;
+        if let Some(record) = self.data_source_of_mut(knowledge_base_id, data_source_id) {
+            record.status = DataSourceStatus::Deleting;
+            record.removal_due_at = Some(removal_due_at);
+            record.updated_at = now;
+        }
+    }
+
+    /// Forget a data source and everything keyed to it: the ingestion jobs that
+    /// ran for it, and the index that let a repeated create replay it.
+    pub fn remove_data_source(&mut self, data_source_id: &str) -> Option<DataSourceRecord> {
+        let record = self.data_sources.remove(data_source_id)?;
+        self.ingestion_jobs
+            .retain(|_, job| job.data_source_id != data_source_id);
+        self.ingestion_job_client_tokens
+            .retain(|(_, data_source, _), _| data_source != data_source_id);
+        self.data_source_client_tokens
+            .retain(|_, id| id != data_source_id);
+        Some(record)
+    }
+
+    /// Forget a knowledge base, every data source it contained and every index
+    /// that pointed at any of them.
+    pub fn remove_knowledge_base(
+        &mut self,
+        knowledge_base_id: &str,
+    ) -> Option<KnowledgeBaseRecord> {
+        let record = self.knowledge_bases.remove(knowledge_base_id)?;
+        let contained: Vec<String> = self
+            .data_sources
+            .values()
+            .filter(|data_source| data_source.knowledge_base_id == knowledge_base_id)
+            .map(|data_source| data_source.data_source_id.clone())
+            .collect();
+        for data_source_id in contained {
+            self.remove_data_source(&data_source_id);
+        }
+        self.knowledge_base_client_tokens
+            .retain(|_, id| id != knowledge_base_id);
+        Some(record)
+    }
+
+    /// Forget a flow, the versions cut from it and the index that let a repeated
+    /// create replay it.
+    pub fn remove_flow(&mut self, flow_id: &str) -> Option<FlowRecord> {
+        let record = self.flows.remove(flow_id)?;
+        self.flow_versions
+            .retain(|(versioned_flow_id, _), _| versioned_flow_id != flow_id);
+        self.flow_client_tokens.retain(|_, id| id != flow_id);
+        Some(record)
     }
 
     /// One `ListAgents` page: the agents after `cursor` in creation order, at most
