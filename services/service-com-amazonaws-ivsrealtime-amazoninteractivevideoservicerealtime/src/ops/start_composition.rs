@@ -197,23 +197,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // A composition runs ONE layout. Refused before anything is minted or persisted,
-        // so a refused request starts no composition.
+        // so a refused request starts no composition — through the one decision this
+        // service holds for every set of members only one of which may be given.
         if let Some(layout) = input.layout.as_ref() {
-            let supplied: Vec<&str> = LAYOUT_MEMBERS
-                .iter()
-                .zip([layout.grid.is_some(), layout.pip.is_some()])
-                .filter_map(|(member, given)| given.then_some(*member))
-                .collect();
-            if supplied.len() > 1 {
-                return Err(crate::state::validation_failed(
+            let [grid, pip] = LAYOUT_MEMBERS;
+            crate::state::check_at_most_one_member(
+                &format!("{}.layout", Self::NAME),
+                &[(grid, layout.grid.is_some()), (pip, layout.pip.is_some())],
+            )
+            .map_err(|message| {
+                crate::state::validation_failed(
                     StartCompositionErrorModeled::ValidationException,
-                    crate::state::mutually_exclusive_members_message(
-                        &format!("{}.layout", Self::NAME),
-                        &supplied,
-                        &LAYOUT_MEMBERS,
-                    ),
-                ));
-            }
+                    message,
+                )
+            })?;
         }
 
         // Each destination publishes to exactly one place, and the composition publishes

@@ -187,24 +187,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Only one filter (by stage ARN or by state) can be used at a time", as both
         // filter members' own doc states it. A request carrying both is refused rather
         // than served by applying both, the same way `ListParticipants` refuses two of
-        // its four — one rule, one wording.
-        let supplied: Vec<&str> = filters
-            .iter()
-            .filter(|(_, value)| value.is_some())
-            .map(|(member, _)| *member)
-            .collect();
-        if supplied.len() > 1 {
-            return Err(crate::state::validation_failed(
+        // its four — one rule, one decision, one wording. The whole exclusive set is the
+        // filter members this listing has, in the order the model's own doc names them.
+        crate::state::check_at_most_one_member(
+            Self::NAME,
+            &filters.map(|(member, value)| (member, value.is_some())),
+        )
+        .map_err(|message| {
+            crate::state::validation_failed(
                 ListIngestConfigurationsErrorModeled::ValidationException,
-                crate::state::mutually_exclusive_members_message(
-                    Self::NAME,
-                    &supplied,
-                    // The whole exclusive set is the filter members this listing has, in
-                    // the order the model's own doc names them.
-                    &filters.map(|(member, _)| member),
-                ),
-            ));
-        }
+                message,
+            )
+        })?;
 
         // A `nextToken` this listing did not issue names no position, so it is refused
         // rather than read as "start from the beginning" — including a token from this

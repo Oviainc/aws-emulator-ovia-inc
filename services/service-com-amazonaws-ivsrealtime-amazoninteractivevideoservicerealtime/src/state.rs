@@ -5874,6 +5874,32 @@ pub fn mutually_exclusive_members_message(
     )
 }
 
+/// The DECISION [`mutually_exclusive_members_message`] words, held once for every
+/// operation whose model documents such a set: a request satisfies the set unless it
+/// carried more than one of its members, and one that carried more is refused with that
+/// sentence. `Err` is the sentence to put on the `ValidationException`, the way
+/// [`check_resource_arn`] and [`check_tag_count`] hand theirs back.
+///
+/// `members` is the WHOLE exclusive set, in the order the model declares it, each member
+/// paired with whether this request carried it — so the set the sentence names and the
+/// presence flags it is decided from cannot disagree. What "carried" means stays with the
+/// call site, since it is the member's own: an absent `Option` for most, and for a member
+/// carrying a documented default (`ListParticipants$filterByPublished` is `@default
+/// false`) the value that actually asks for the member's effect.
+pub fn check_at_most_one_member(operation: &str, members: &[(&str, bool)]) -> Result<(), String> {
+    let carried = members.iter().filter(|(_, provided)| *provided);
+    // The served answer needs no list at all, so the names are collected only for the
+    // sentence a refusal states.
+    if carried.clone().count() <= 1 {
+        return Ok(());
+    }
+    let supplied: Vec<&str> = carried.map(|(member, _)| *member).collect();
+    let exclusive: Vec<&str> = members.iter().map(|(member, _)| *member).collect();
+    Err(mutually_exclusive_members_message(
+        operation, &supplied, &exclusive,
+    ))
+}
+
 /// How this service states a request that supplied the wrong number of a set of members
 /// exactly one of which must be given: it names the members the request actually carried
 /// (none, when it carried none) and then the whole set, in the construction every other

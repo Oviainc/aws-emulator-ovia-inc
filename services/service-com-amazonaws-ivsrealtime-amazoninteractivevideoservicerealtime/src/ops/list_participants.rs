@@ -223,23 +223,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.filter_by_recording_state.as_deref(),
             ),
         ];
-        let supplied: Vec<&str> = filters
-            .iter()
-            .filter(|(_, value)| value.is_some())
-            .map(|(member, _)| *member)
-            .collect();
-        if supplied.len() > 1 {
-            return Err(crate::state::validation_failed(
+        // The whole exclusive set is the filter members this listing has, in the order
+        // the model's own doc lists them, and the decision over it is the one this
+        // service holds in one place for every such set.
+        crate::state::check_at_most_one_member(
+            Self::NAME,
+            &filters.map(|(member, value)| (member, value.is_some())),
+        )
+        .map_err(|message| {
+            crate::state::validation_failed(
                 ListParticipantsErrorModeled::ValidationException,
-                crate::state::mutually_exclusive_members_message(
-                    Self::NAME,
-                    &supplied,
-                    // The whole exclusive set is the filter members this listing has, in
-                    // the order the model's own doc lists them.
-                    &filters.map(|(member, _)| member),
-                ),
-            ));
-        }
+                message,
+            )
+        })?;
 
         // A `nextToken` this operation did not issue names no position, so it is
         // refused rather than read as "start from the beginning" — including a token
