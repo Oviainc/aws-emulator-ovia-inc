@@ -1,0 +1,48 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudformation__s3__s3tables__s3vectors.cfn-s3-bucket-variant-physical-ids-resolve-in-owning-services
+Issue-Key: s3tables|GetTableBucket|BadRequestException
+Issue-Commit: 7216446cc3c31175158854d642481a94c8b1c026
+
+# CloudFormation AWS::S3Tables::TableBucket physical resource id / Ref is not a table bucket ARN, so S3 Tables GetTableBucket refuses it with 400 BadRequestException
+
+> _Note: this issue was identified against the code base at commit `7216446cc3c31175158854d642481a94c8b1c026`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateStack
+
+## Description
+One root cause.
+
+=== Cause 1 of 1: the identifier CloudFormation reports for AWS::S3Tables::TableBucket (resource-row PhysicalResourceId and the matching `Ref`) is not a table bucket ARN, so S3 Tables structurally cannot resolve it ===
+
+AWS: a CloudFormation resource type's physical resource id is the identifier shape the OWNING service accepts, and that shape differs per S3 bucket variant. AWS::S3::Bucket is identified by the bare bucket name (S3 takes `Bucket=<name>`); AWS::S3Vectors::VectorBucket and AWS::S3Tables::TableBucket are identified by the bucket ARN, because those services' read operations are keyed by ARN. `Ref` of the logical id returns that same value, so a stack Output built from `{"Ref": "<TableBucketLogicalId>"}` carries the table bucket ARN and can be passed straight to S3 Tables. The receiving constraint is modeled: Smithy GetTableBucket.tableBucketARN is a required @httpLabel on TableBucketARN with @pattern ^(arn:aws[-a-z0-9]*:[a-z0-9]+:[-a-z0-9]*:[0-9]{12}:bucket/[a-z0-9_-]{3,63})$, and GetTableBucket models BadRequestException (HTTP 400, "The request is invalid or malformed") — i.e. the value must be an ARN whose last segment is `bucket/<TableBucketName>`, where partition, region and the 12-digit account id come from the stack's own partition/region/account and the name from the TableBucketName property. The per-variant identifier rule itself is CloudFormation resource-type documentation, not Smithy (recorded behavior only for that part): the other two variants of the same recorded check resolve, a regular bucket by NAME in S3 (GetBucketLocation) and a vector bucket by ARN in S3 Vectors (GetVectorBucket).
+
+Emulator: the stack reaches CREATE_COMPLETE, its ListStackResources rows and its `Ref` Outputs agree with each other, the AWS::S3::Bucket row resolves in S3 by name and the AWS::S3Vectors::VectorBucket row resolves in S3 Vectors by ARN — but the AWS::S3Tables::TableBucket row is not a value S3 Tables accepts. Passing it to s3tables GetTableBucket(tableBucketARN=<row>) is refused with HTTP 400, error code `BadRequestException`, message "The specified table bucket ARN is not valid." The refusal comes from the centralized deserialize→validate step on the modeled @pattern, before the handler in services/service-com-amazonaws-s3tables-s3tablebuckets/src/ops/get_table_bucket.rs ever looks the bucket up in `store.table_buckets` (that handler's own not-found refusal is NotFoundException "The specified table bucket does not exist.", which is not what is returned). The whole message here is fixed text for this error class — it interpolates nothing from the request — so the diverging requirement is not its wording but that this refusal happens at all for an identifier the stack itself just published. The check errors at that call and never reaches its closing assertion that the ARN rows end in `:bucket/<name>`.
+
+Why: a client that reads a table bucket out of a stack — through ListStackResources/DescribeStackResources PhysicalResourceId, or through a `Ref` stack Output — receives a value S3 Tables rejects at the wire-validation layer, so every CloudFormation-driven S3 Tables workflow (get or update the bucket, create a namespace or table under it, attach a bucket policy) dies at its first call instead of operating on the bucket the stack declared. Because the emulator's own rows and Outputs agree with each other and the stack reports CREATE_COMPLETE, the stack looks healthy and the breakage only surfaces one hop downstream. It also makes the variants indistinguishable: a consumer cannot tell a name-keyed bucket from an ARN-keyed one from the stack data alone.
+
+Fix: the CloudFormation provisioning path for the AWS::S3Tables::TableBucket resource type — the physical-id derivation in that resource handler, and the `Ref` resolution that copies it into stack Outputs — must publish the table bucket ARN (arn:<partition>:s3tables:<region>:<account-id>:bucket/<TableBucketName>), ideally the `arn` the s3tables CreateTableBucket it routes through returned, rather than any other form. AWS::S3::Bucket must stay on the bare name and AWS::S3Vectors::VectorBucket (already ARN-shaped) must be left as is.
+
+NOTE on prior art: open issue 20261025T013226Z-cloudformation-s3-s3tables-s3vectors-cloudformation-aws-s3tables-tablebucket-physical-resource-id-ref.md describes this same resource type and names this same check, but its recorded replay key is `s3tables|GetTableBucket|ValidationException` — the emulator no longer answers ValidationException on this path, it now answers BadRequestException with a different, non-interpolating message, so that issue no longer carries this failure's key and the replay no longer maps onto it. Also related but NOT this cause: 20261101T233620Z-s3tables-via-cloudformation-fn-getatt-on-aws-s3tables.md (Fn::GetAtt TableBucketARN resolving to an Output row with no OutputValue at all) and 20261024T043150Z-cloudformation-step-functions-lambda-resources-physical-resource-id.md (the same name-instead-of-ARN shape for Step Functions/Lambda resource types).
+
+Traces: cloudformation__s3__s3tables__s3vectors.cfn-s3-bucket-variant-physical-ids-resolve-in-owning-services (verdict: error).
+
+## Evidence
+Replay of simparity-behavioral-aws-v1 against this checkout. One failing check:
+
+[error] cloudformation__s3__s3tables__s3vectors.cfn-s3-bucket-variant-physical-ids-resolve-in-owning-services
+  botocore.errorfactory.BadRequestException: An error occurred (BadRequestException) when calling the GetTableBucket operation: The specified table bucket ARN is not valid.
+
+Expected: for a stack whose Resources are Plain = AWS::S3::Bucket, Vectors = AWS::S3Vectors::VectorBucket (VectorBucketName=<v>), Tables = AWS::S3Tables::TableBucket (TableBucketName=<t>), with Outputs {Plain,Vectors,Tables} each {"Value": {"Ref": <logical id>}} — each resource row's PhysicalResourceId (and the equal Ref Output) is the identifier its owning service accepts: a bare name for S3, an ARN ending in `:bucket/<v>` for S3 Vectors, and an ARN ending in `:bucket/<t>` for S3 Tables. s3tables GetTableBucket(tableBucketARN=<the Tables row>) then answers HTTP 200 with name=<t> and arn equal to that row.
+
+Actual: the stack settles CREATE_COMPLETE; Outputs equal the resource rows; s3 GetBucketLocation(Bucket=<Plain row>) succeeds and reports the stack's region; s3vectors GetVectorBucket(vectorBucketArn=<Vectors row>) succeeds and round-trips the name and ARN — so the check gets past all three of those assertions. Then s3tables GetTableBucket(tableBucketARN=<Tables row>) is refused: HTTP 400, error code BadRequestException, message "The specified table bucket ARN is not valid." That whole sentence is fixed text for this error class; no part of it is taken from the request or from state. The refusal is produced by the modeled @pattern check on tableBucketARN (^(arn:aws[-a-z0-9]*:[a-z0-9]+:[-a-z0-9]*:[0-9]{12}:bucket/[a-z0-9_-]{3,63})$) and not by the handler's store lookup, whose own not-found refusal would be 404 NotFoundException "The specified table bucket does not exist." (services/service-com-amazonaws-s3tables-s3tablebuckets/src/ops/get_table_bucket.rs:170-177) — so the value the stack published does not have the ARN shape at all. The final assertion that rows["Vectors"] and rows["Tables"] end in `:bucket/<name>` is never reached. Stack names, bucket names and the generated token in any one run are per-run values and are not part of the requirement; the requirement is the identifier SHAPE of the AWS::S3Tables::TableBucket row.
+
+## Steps to Reproduce
+1. Clone the repo and run the behavioral suite (run_behavioral_suite) against the built emulator.
+2. CreateStack with TemplateBody {"AWSTemplateFormatVersion":"2010-09-09","Resources":{"Plain":{"Type":"AWS::S3::Bucket"},"Vectors":{"Type":"AWS::S3Vectors::VectorBucket","Properties":{"VectorBucketName":"<tok>-v"}},"Tables":{"Type":"AWS::S3Tables::TableBucket","Properties":{"TableBucketName":"<tok>-t"}}},"Outputs":{"Plain":{"Value":{"Ref":"Plain"}},"Vectors":{"Value":{"Ref":"Vectors"}},"Tables":{"Value":{"Ref":"Tables"}}}}.
+3. Poll DescribeStacks until the status leaves *_IN_PROGRESS — it reaches CREATE_COMPLETE.
+4. ListStackResources (paginated) and read DescribeStacks Stacks[0].Outputs: the Tables PhysicalResourceId / OutputValue is not an ARN ending in `:bucket/<tok>-t`.
+5. Call s3tables GetTableBucket(tableBucketARN=<that Tables row value>) — observe HTTP 400 BadRequestException "The specified table bucket ARN is not valid." instead of a 200 whose name is `<tok>-t` and whose arn equals the row.
+6. For contrast, in the same run s3 GetBucketLocation(Bucket=<Plain row>) and s3vectors GetVectorBucket(vectorBucketArn=<Vectors row>) both succeed, confirming only the S3 Tables variant's identifier shape is wrong.
