@@ -1,0 +1,93 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: bedrock-agent__cloudformation__ssm.kbcfn-embedding-model-replacement-rejected-while-kb-ids-imported bedrock-agent__cloudformation__ssm.kbcfn-export-name-already-claimed-by-the-kb-stack-rejected bedrock-agent__cloudformation__ssm.kbcfn-import-of-a-missing-kb-export-rejected bedrock-agent__cloudformation__ssm.kbcfn-kb-stack-delete-cancelled-by-its-one-remaining-import bedrock-agent__cloudformation__ssm.kbcfn-non-replacing-kb-update-succeeds-while-kb-ids-imported
+Issue-Key: bedrock-agent__cloudformation__ssm.kbcfn-embedding-model-replacement-rejected-while-kb-ids-imported|run#6|AssertionError|assert status == "UPDATE_ROLLBACK_COMPLETE", (
+Issue-Key: bedrock-agent__cloudformation__ssm.kbcfn-export-name-already-claimed-by-the-kb-stack-rejected|run#9|AssertionError|assert dup["status"] == "ROLLBACK_COMPLETE", (
+Issue-Key: bedrock-agent__cloudformation__ssm.kbcfn-import-of-a-missing-kb-export-rejected|run#8|AssertionError|assert len(hits) == 1, f"stack reasons: {_stack_reasons(ctx, bad['stack'])!r}"
+Issue-Key: bedrock-agent__cloudformation__ssm.kbcfn-kb-stack-delete-cancelled-by-its-one-remaining-import|run#15|AssertionError|assert cancels == [
+Issue-Key: bedrock-agent__cloudformation__ssm.kbcfn-non-replacing-kb-update-succeeds-while-kb-ids-imported|run#9|AssertionError|assert after[key] == kb["outputs"][key], (
+Issue-Commit: fb0a9c1858b32d12ecab08653c5d3b6198801bbb
+
+# bedrock-agent__cloudformation__ssm: 5 net-new causes — CloudFormation never protects an export in use (update completes, duplicate export name accepted), the missing-export rollback reason is emitted three times, the delete-cancelled reason loses its trailing period, and a knowledge base's physical id tracks its Name
+
+> _Note: this issue was identified against the code base at commit `fb0a9c1858b32d12ecab08653c5d3b6198801bbb`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UpdateStack
+
+## Description
+FIVE net-new root causes of service `bedrock-agent__cloudformation__ssm` (the service heading the suite report lists these checks under), each grounded in its own failing behavioral check that the replay report left unmarked (neither ALREADY FILED nor OWNED). A fixer must close ALL FIVE before submitting; they are separate defects that happen to share this service token.
+
+=== Cause 1 of 5: an UpdateStack that changes the VALUE of an output another stack imports is allowed to complete, instead of being cancelled and rolled back ===
+AWS: recorded behavior only (CloudFormation's cross-stack export protection is not expressed in any Smithy model; the cloudformation model supplies only the operations UpdateStack / DescribeStacks / DescribeStackEvents / ListExports / ListImports used to observe it). Recorded behavior: when stack B imports export `<exporter-stack>-<OutputKey>` of stack A via Fn::ImportValue, an update of A that would change that export's value is CANCELLED: the stack ends `UPDATE_ROLLBACK_COMPLETE`, exactly ONE stack-level DescribeStackEvents reason matches `Cannot update export <export-name> as it is in use by <importer-stack>.` — fixed text `Cannot update export `, ` as it is in use by ` and the trailing `.`, with `<export-name>` the exporter's export name and `<importer-stack>` the name of the stack holding the import, both taken from state — the export keeps its previous value, and any replacement resources the attempted update created are deleted during the rollback.
+Emulator: the same update ends `UPDATE_COMPLETE`. The only stack-level reasons present are `['User Initiated', 'User Initiated']`; no 'Cannot update export … in use by …' cancellation is ever emitted, the export silently moves to the new value, and the replacement resources stay. There is no export-in-use pre-condition on the update path at all.
+Why: export protection is the single guarantee that makes cross-stack references safe — a client relying on it expects that a replacing change to an exported resource is refused while a consumer still imports it, so the consumer never observes its imported value changing underneath it. Against the emulator an operator who tries a forbidden replacement gets UPDATE_COMPLETE, the consumer stack is silently repointed, and no CI gate built on UPDATE_ROLLBACK_COMPLETE or on the cancellation reason ever fires.
+Fix: the UpdateStack execution path in the cloudformation service (services/service-com-amazonaws-cloudformation-cloudformation) — before applying a change set, compare the resolved Outputs/Exports against the recorded importers (the same registry ListImports reads) and, when an in-use export's value would change, cancel the update, emit the stack-level cancellation reason and run the rollback that deletes what the update created.
+Traces: bedrock-agent__cloudformation__ssm.kbcfn-embedding-model-replacement-rejected-while-kb-ids-imported.
+
+=== Cause 2 of 5: a stack that exports under a name another stack already exports is accepted, instead of failing and rolling back ===
+AWS: recorded behavior only. Export names are account/region-unique: CreateStack for a template whose Output Export.Name is already exported by another stack ends `ROLLBACK_COMPLETE`, and a stack-level event reason reads exactly `Export with name <export-name> is already exported by stack <owning-stack>. Rollback requested by user.` — fixed text `Export with name `, ` is already exported by stack `, `. Rollback requested by user.`, with `<export-name>` the name the rejected template asked for and `<owning-stack>` the name of the stack that already holds it, both from state. The incumbent export keeps its value and its importer set unchanged, and the same template under an unused export name still reaches CREATE_COMPLETE.
+Emulator: the rival stack reaches `CREATE_COMPLETE`; the duplicate claim is accepted and no 'already exported by stack' reason is produced, so two stacks hold the same export name.
+Why: uniqueness of export names is what makes Fn::ImportValue deterministic. Against the emulator a typo or a copy-pasted stack silently hijacks another stack's export name, and consumers resolve an import whose owner is now ambiguous; a client relying on AWS's behavior expects the rival create to fail fast with that exact sentence.
+Fix: the Outputs/Export registration step of CreateStack (and UpdateStack) in the cloudformation service — make export-name claims unique per account/region, refuse a claim already held by another stack, and fail the stack with that reason and a rollback rather than registering a second claim.
+Traces: bedrock-agent__cloudformation__ssm.kbcfn-export-name-already-claimed-by-the-kb-stack-rejected.
+
+=== Cause 3 of 5: the unresolvable-import failure reason is recorded THREE times among the stack-level events instead of once ===
+AWS: recorded behavior only. A create whose Fn::ImportValue names a nonexistent export ends `ROLLBACK_COMPLETE` and the stack-level events (those whose LogicalResourceId is the stack itself and which carry a ResourceStatusReason) contain exactly ONE reason matching `No export named <export-name> found.` — the one that explains the rollback, whose text is `No export named `, ` found.` plus the rollback suffix `. Rollback requested by user.`, with `<export-name>` the name the template asked to import. One failure produces one stack-level explanation; the per-resource copy belongs to the resource's own LogicalResourceId, not the stack's.
+Emulator: the stack-level reasons are `['No export named <name> found.', 'No export named <name> found. Rollback requested by user.', 'No export named <name> found.', 'User Initiated']` — the bare sentence is recorded twice MORE in addition to the rollback reason, so a client counting the failure sees three failures where AWS reports one. (The status itself, ROLLBACK_COMPLETE, and the sentence's wording are correct; only the number of stack-level events carrying it is wrong.)
+Why: DescribeStackEvents is the audit trail deploy tooling reads — it counts and de-duplicates failures to report "what went wrong" and to decide whether a single root cause or several resources failed. Duplicated stack-level reasons inflate that count, make "exactly one failure" assertions impossible, and misattribute a resource-level failure to the stack.
+Fix: the stack-event recorder in the cloudformation service — emit the failure reason once at the stack level (on the rollback transition) and attach the per-resource copy to the failing resource's LogicalResourceId, instead of appending the stack-level reason on every transition that observes the failure.
+Traces: bedrock-agent__cloudformation__ssm.kbcfn-import-of-a-missing-kb-export-rejected.
+
+=== Cause 4 of 5: the delete-cancelled-by-an-import reason is missing its terminating period ===
+AWS: recorded behavior only. Deleting a stack whose export is still imported is cancelled, the stack is restored to its prior terminal status (`CREATE_COMPLETE` here), and the stack-level reason reads exactly `Delete canceled. Cannot delete export <export-name> as it is in use by <importer-stack>.` — fixed text `Delete canceled. Cannot delete export `, ` as it is in use by ` and a TERMINATING `.`; `<export-name>` and `<importer-stack>` come from state, and only the export(s) still imported are named.
+Emulator: everything about this path is right except the punctuation — it emits `Delete canceled. Cannot delete export <export-name> as it is in use by <importer-stack>` with NO trailing period, so an exact-match comparison against AWS's sentence fails.
+Why: the reason string is the only machine-readable discriminator on a cancelled delete (there is no error code on the event), so tooling and tests that match AWS's sentence exactly — or that parse it with an anchored pattern ending at the period — do not recognise the cancellation and treat the delete as having failed for an unknown reason.
+Fix: the delete-cancellation reason formatter in the cloudformation service's DeleteStack path — terminate the sentence with a period, as the sibling 'Cannot update export … in use by ….' reason of Cause 1 must also be.
+Traces: bedrock-agent__cloudformation__ssm.kbcfn-kb-stack-delete-cancelled-by-its-one-remaining-import.
+
+=== Cause 5 of 5: the physical id of an AWS::Bedrock::KnowledgeBase is derived from its template Name, so a NON-replacing update that edits the Name changes the id the stack publishes ===
+AWS: Smithy: every bedrock-agent knowledge-base read takes `knowledgeBaseId` with @pattern `^[0-9a-zA-Z]{10}$` — an opaque, service-minted ten-character id. Recorded behavior for the CFN side: `Fn::GetAtt [<kb>, KnowledgeBaseId]` resolves to that minted id, and an in-place (RequiresRecreation: Never) update of the resource's Description and Name leaves the knowledge base's id UNCHANGED — the stack Outputs and exports keep the same value across the update and the importing stack keeps its registered import, while GetKnowledgeBase reports the new name and description.
+Emulator: the published id tracks the template Name, so editing the Name across an otherwise non-replacing update changes it: the export/Output moved from `<prefix>-escalation-kb-g1` to `<prefix>-escalation-kb-g1r` (those two strings are this run's generated names filling the template, not the requirement — the requirement is that the id is minted, matches ^[0-9a-zA-Z]{10}$, and is stable across a non-replacing update).
+Why: a client relying on AWS's behavior treats the id as the resource's immutable identity — it is cached, written into SSM parameters, baked into IAM resource ARNs and consumed by importing stacks. Against the emulator an innocuous rename silently re-identifies the resource, every consumer that cached the old value breaks, and the value is not a legal knowledgeBaseId to begin with, so bedrock-agent refuses it against the modeled pattern.
+Fix: the AWS::Bedrock::KnowledgeBase provisioner in the cloudformation service's resource-provider layer — create the knowledge base through bedrock-agent, store the returned ten-character knowledgeBaseId as the physical resource id, and resolve Ref/GetAtt/Outputs/exports from it so a Name change does not move it. NOTE: open issue 20261029T214321Z-bedrock-agent-cloudformation-ssm-a-cloudformation-created-aws.md records the same physical-id defect for this service token but carries only the replay key of kbcfn-remove-imports-then-replace-kb-swaps-embedding-model; it does not carry this check's key, and it does not state the across-a-non-replacing-update stability requirement. Re-replay this check; this cause may close together with that issue if its fix lands first.
+Traces: bedrock-agent__cloudformation__ssm.kbcfn-non-replacing-kb-update-succeeds-while-kb-ids-imported.
+
+## Evidence
+Cause 1 — bedrock-agent__cloudformation__ssm.kbcfn-embedding-model-replacement-rejected-while-kb-ids-imported [mismatch]:
+  AssertionError: an embedding-model change on an imported KB stack ended 'UPDATE_COMPLETE'; real AWS rolls it back. Stack reasons: ['User Initiated', 'User Initiated']
+  (check line 42) Expected StackStatus 'UPDATE_ROLLBACK_COMPLETE' plus exactly one stack-level reason matching 'Cannot update export <export> as it is in use by <importer>.'; actual 'UPDATE_COMPLETE' with no cancellation reason at all.
+
+Cause 2 — bedrock-agent__cloudformation__ssm.kbcfn-export-name-already-claimed-by-the-kb-stack-rejected [mismatch]:
+  AssertionError: a duplicate export name ended 'CREATE_COMPLETE'; real AWS rolls the create back
+  (check line 47) Expected StackStatus 'ROLLBACK_COMPLETE' and the stack-level reason 'Export with name <export> is already exported by stack <owning-stack>. Rollback requested by user.'; actual 'CREATE_COMPLETE'.
+
+Cause 3 — bedrock-agent__cloudformation__ssm.kbcfn-import-of-a-missing-kb-export-rejected [mismatch]:
+  AssertionError: stack reasons: ['No export named <ghost>-MetadataKBKnowledgeBaseId found.', 'No export named <ghost>-MetadataKBKnowledgeBaseId found. Rollback requested by user.', 'No export named <ghost>-MetadataKBKnowledgeBaseId found.', 'User Initiated']
+  (check line 43) Expected exactly ONE stack-level reason matching ^No export named (\S+) found\.; actual three. The status (ROLLBACK_COMPLETE) and the sentence are correct; the event count is not. The quoted export name is this run's generated name filling the template slot.
+
+Cause 4 — bedrock-agent__cloudformation__ssm.kbcfn-kb-stack-delete-cancelled-by-its-one-remaining-import [mismatch]:
+  AssertionError: the cancellation must name only the export still imported; reasons: ['Delete canceled. Cannot delete export <kb-stack>-MetadataKBKnowledgeBaseId as it is in use by <agent-stack>']
+  (check line 74) Expected exactly 'Delete canceled. Cannot delete export <export> as it is in use by <importer>.'; actual the identical sentence WITHOUT the terminating period. Only the punctuation differs — the names in it are correct state-derived values.
+
+Cause 5 — bedrock-agent__cloudformation__ssm.kbcfn-non-replacing-kb-update-succeeds-while-kb-ids-imported [mismatch]:
+  AssertionError: EscalationWriteupsKBKnowledgeBaseId changed id 'sim2real-kbcfn-7b07544bcd5a-escalation-kb-g1' -> 'sim2real-kbcfn-7b07544bcd5a-escalation-kb-g1r' on a non-replacing update
+  (check line 49) The update itself reached UPDATE_COMPLETE as required; what diverges is that the published id is the template Name (and so is not a ^[0-9a-zA-Z]{10}$ knowledgeBaseId at all) and moved when the Name changed. Both quoted strings are this run's generated names, not the requirement.
+
+## Steps to Reproduce
+0. git_clone, then run_behavioral_suite and read the `### bedrock-agent__cloudformation__ssm` section of the failing-check list.
+
+Shared setup (all five causes): CreateStack 'KB stack' with Capabilities=['CAPABILITY_IAM'] from a template holding an AWS::S3Vectors::VectorBucket, two AWS::S3Vectors::Index (1024-d, cosine), an AWS::IAM::Role and two AWS::Bedrock::KnowledgeBase resources (S3_VECTORS storage, embeddingModelArn arn:aws:bedrock:<region>::foundation-model/amazon.titan-embed-text-v2:0), whose Outputs export each KnowledgeBaseId as '${AWS::StackName}-<OutputKey>'; wait for CREATE_COMPLETE. Then CreateStack 'agent stack' from a template whose AWS::SSM::Parameter Value Fn::Joins both ids via Fn::ImportValue '${KbStackName}-<OutputKey>'; wait for CREATE_COMPLETE. ListImports on each export must name the agent stack.
+
+Cause 1: UpdateStack the KB stack with the same template but EmbeddingModelId=cohere.embed-english-v3 and a new Generation suffix (a replacing change to both knowledge bases). Observe UPDATE_COMPLETE. Required: UPDATE_ROLLBACK_COMPLETE with one stack-level reason 'Cannot update export <kb-stack>-<OutputKey> as it is in use by <agent-stack>.', the exports and ids unchanged, and the replacement knowledge bases deleted.
+
+Cause 2: CreateStack a third stack whose single Output exports under the name '<kb-stack>-MetadataKBKnowledgeBaseId' (already exported by the KB stack). Observe CREATE_COMPLETE. Required: ROLLBACK_COMPLETE with the stack-level reason 'Export with name <that name> is already exported by stack <kb-stack>. Rollback requested by user.' Control: the same template under an unused export name must reach CREATE_COMPLETE.
+
+Cause 3: CreateStack the agent template with KbStackName pointing at a stack that does not exist. The stack does reach ROLLBACK_COMPLETE; now page DescribeStackEvents and collect every event whose LogicalResourceId == the stack name and which has a ResourceStatusReason. Observe three reasons matching 'No export named <name> found.'; required: exactly one.
+
+Cause 4: UpdateStack the agent stack so its parameter imports only ONE of the two KB exports (UPDATE_COMPLETE), then DeleteStack the KB stack. The delete is cancelled and the stack returns to CREATE_COMPLETE as required; read the stack-level reasons and observe the 'Delete canceled. Cannot delete export … as it is in use by <agent-stack>' reason WITHOUT a trailing period.
+
+Cause 5: UpdateStack the KB stack with the same template, Capabilities=['CAPABILITY_IAM'], an edited Description on one knowledge base and Generation='g1r' (a RequiresRecreation:Never change). Observe UPDATE_COMPLETE, then read the stack Outputs: the two KnowledgeBaseId values have changed with the Name. Required: the ids are ten-character ^[0-9a-zA-Z]{10}$ values and are unchanged, the imports stay registered, and GetKnowledgeBase reports the new name/description.
+
+Re-replay all five: the check ids listed in trace_ids.
