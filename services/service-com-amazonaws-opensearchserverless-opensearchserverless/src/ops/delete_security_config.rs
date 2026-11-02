@@ -3,7 +3,8 @@
 //! @op DeleteSecurityConfig
 //! IMPLEMENTED: removes the `SecurityConfigRecord` stored in [`crate::state`] under the
 //! requested `SecurityConfigId`, so every later read reports its absence, and answers a
-//! 404 `ResourceNotFoundException` for an id that names none.
+//! 404 `ResourceNotFoundException` for an id that names none. Every exit leaves one
+//! structured `emulator::audit` record for the call.
 //!
 //! ## Shape of an operation
 //!
@@ -140,8 +141,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        use crate::state::AuditOutcome;
+
+        // Every exit below leaves exactly one audit record naming the configuration this
+        // request addresses, so a state-changing call is observable whatever it answered.
+        let resource = crate::state::audit_security_config_resource(&input.id);
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             return Err(DeleteSecurityConfigErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -155,6 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `clientToken` on a delete is not a replay index: the second delete of an id
         // that is already gone is the 404 below, whatever token it carries.
         if store.remove_security_config(&input.id).is_none() {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::NotFound, Some(&resource));
             return Err(
                 DeleteSecurityConfigErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -166,6 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        drop(store);
+
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyDeleted, Some(&resource));
         // The model declares no output members for this operation, so a successful delete
         // is an empty 200 body; the observable effect is the record's absence.
         Ok(DeleteSecurityConfigOutput {})

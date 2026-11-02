@@ -3,7 +3,7 @@
 //! @op GetSecurityConfig
 //! IMPLEMENTED: answers the `SecurityConfigRecord` stored in [`crate::state`] under the
 //! requested `SecurityConfigId`, and a 404 `ResourceNotFoundException` for an id that
-//! names none.
+//! names none. Every exit leaves one structured `emulator::audit` record for the call.
 //!
 //! ## Shape of an operation
 //!
@@ -138,8 +138,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        use crate::state::AuditOutcome;
+
+        // Every exit below leaves exactly one audit record naming the configuration this
+        // request addresses, so the read of a configuration is observable whatever it
+        // answered.
+        let resource = crate::state::audit_security_config_resource(&input.id);
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             return Err(GetSecurityConfigErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -153,15 +164,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // probe and an id that names no stored record is the modelled 404 rather than an
         // empty success.
         let record = store.security_configs.get(&input.id).ok_or_else(|| {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::NotFound, Some(&resource));
             GetSecurityConfigError::from(GetSecurityConfigErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::security_config_not_found_message(&input.id)),
                 },
             ))
         })?;
+        let detail = record.detail();
+        drop(store);
 
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyRead, Some(&resource));
         Ok(GetSecurityConfigOutput {
-            security_config_detail: Some(record.detail()),
+            security_config_detail: Some(detail),
         })
     }
 }

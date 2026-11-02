@@ -6,7 +6,8 @@
 //! and answers from the record it wrote — so a following `GetSecurityPolicy` reports
 //! exactly what this call stored, for every `SecurityPolicyType`. The request's
 //! `policyVersion` is the optimistic-concurrency precondition: a version that is not the
-//! stored one is refused and writes nothing.
+//! stored one is refused and writes nothing. Every exit leaves one structured
+//! `emulator::audit` record for the call.
 //!
 //! ## Shape of an operation
 //!
@@ -163,8 +164,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        use crate::state::AuditOutcome;
+
+        // Every exit below leaves exactly one audit record naming this `(type, name)` pair,
+        // so a state-changing call is observable whatever it answered.
+        let resource = crate::state::audit_security_policy_resource(&input.r#type, &input.name);
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             return Err(UpdateSecurityPolicyErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -176,6 +187,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SecurityPolicyType` is an enum the boundary validator does not narrow; a value
         // outside the model's list names no policy type at all.
         if !SECURITY_POLICY_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::ValidationRefused,
+                Some(&resource),
+            );
             return Err(UpdateSecurityPolicyErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
@@ -197,6 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let policy = match input.policy.as_deref() {
             Some(text) => {
                 let document = crate::state::policy_document_from_text(text).map_err(|message| {
+                    crate::state::audit(
+                        Self::NAME,
+                        ctx,
+                        AuditOutcome::ValidationRefused,
+                        Some(&resource),
+                    );
                     UpdateSecurityPolicyErrorModeled::ValidationException(ValidationException {
                         message: Some(message),
                     })
@@ -219,6 +242,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|record| record.kind == key.0 && record.name == key.1)
                 .map(crate::state::SecurityPolicyRecord::detail);
             if let Some(detail) = replayed {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    AuditOutcome::IdempotentReplay,
+                    Some(&resource),
+                );
                 return Ok(UpdateSecurityPolicyOutput {
                     security_policy_detail: Some(detail),
                 });
@@ -230,6 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&key)
             .map(|record| record.policy_version.clone())
         else {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::NotFound, Some(&resource));
             return Err(
                 UpdateSecurityPolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -251,6 +281,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than a conflict a retry of the same request could clear. Nothing is written when
         // it fails.
         if stored_version != input.policy_version {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::VersionMismatch,
+                Some(&resource),
+            );
             return Err(UpdateSecurityPolicyErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(crate::state::STALE_POLICY_VERSION_MESSAGE.to_string()),
@@ -268,6 +304,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             written_at,
         };
         let Some(record) = store.security_policies.get_mut(&key) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             return Err(UpdateSecurityPolicyErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -283,7 +325,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let value = crate::state::policy_token_value(&key.0, &key.1);
             store.remember_token(Self::NAME, token, &value);
         }
+        drop(store);
 
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyUpdated, Some(&resource));
         Ok(UpdateSecurityPolicyOutput {
             security_policy_detail: Some(detail),
         })

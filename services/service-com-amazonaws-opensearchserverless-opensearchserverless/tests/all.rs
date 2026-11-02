@@ -81,6 +81,8 @@ mod reported_pattern;
 mod security_config_update;
 #[path = "all/security_configs.rs"]
 mod security_configs;
+#[path = "all/security_plane_audit.rs"]
+mod security_plane_audit;
 #[path = "all/security_policy_listing.rs"]
 mod security_policy_listing;
 #[path = "all/state_roundtrip.rs"]

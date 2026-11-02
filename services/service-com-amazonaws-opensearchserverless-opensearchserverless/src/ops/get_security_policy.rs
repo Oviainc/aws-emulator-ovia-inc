@@ -3,7 +3,8 @@
 //! @op GetSecurityPolicy
 //! IMPLEMENTED: reports the `SecurityPolicyRecord` stored in [`crate::state`] under the
 //! requested `(type, name)` pair — the read-back half of `CreateSecurityPolicy` — and
-//! answers `ResourceNotFoundException` when no policy is stored under that pair.
+//! answers `ResourceNotFoundException` when no policy is stored under that pair. Every
+//! exit leaves one structured `emulator::audit` record for the call.
 //!
 //! ## Shape of an operation
 //!
@@ -141,8 +142,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        use crate::state::AuditOutcome;
+
+        // Every exit below leaves exactly one audit record naming this `(type, name)` pair,
+        // so the read of a policy is observable whatever it answered.
+        let resource = crate::state::audit_security_policy_resource(&input.r#type, &input.name);
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             return Err(GetSecurityPolicyErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -154,6 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SecurityPolicyType` is an enum the boundary validator does not narrow; a value
         // outside the model's list names no policy type at all.
         if !SECURITY_POLICY_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::ValidationRefused,
+                Some(&resource),
+            );
             return Err(GetSecurityPolicyErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
@@ -171,6 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .security_policies
             .get(&(input.r#type.clone(), input.name.clone()))
             .ok_or_else(|| {
+                crate::state::audit(Self::NAME, ctx, AuditOutcome::NotFound, Some(&resource));
                 GetSecurityPolicyError::from(
                     GetSecurityPolicyErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
@@ -182,8 +200,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 )
             })?;
+        let detail = record.detail();
+        drop(store);
+
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyRead, Some(&resource));
         Ok(GetSecurityPolicyOutput {
-            security_policy_detail: Some(record.detail()),
+            security_policy_detail: Some(detail),
         })
     }
 }

@@ -6,7 +6,8 @@
 //! ones that apply to a resource the request's `resource` filter names (when it names
 //! one), and cuts the page `maxResults` and `nextToken` select — handing back a
 //! `nextToken` only while records remain after the page. The filter's matching runs on a
-//! bounded copy taken under the state lock, never while holding it.
+//! bounded copy taken under the state lock, never while holding it. Every exit leaves one
+//! structured `emulator::audit` record for the call.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +132,28 @@ impl<Eng> ListSecurityPolicies<Eng> {
     }
 }
 
+/// A refusal of this listing's own bounds: the record this exit owes, and the modelled
+/// `ValidationException` carrying `result`'s message. Every exit of the handler leaves
+/// exactly one audit record, so the record is written here rather than at each call site.
+fn refused<T>(
+    operation: &str,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    result: Result<T, String>,
+) -> Result<T, ListSecurityPoliciesError> {
+    result.map_err(|message| {
+        crate::state::audit(
+            operation,
+            ctx,
+            crate::state::AuditOutcome::ValidationRefused,
+            None,
+        );
+        ListSecurityPoliciesErrorModeled::ValidationException(ValidationException {
+            message: Some(message),
+        })
+        .into()
+    })
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListSecurityPolicies<Eng>
 {
@@ -148,8 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        use crate::state::AuditOutcome;
+
+        // This read addresses every policy of one type rather than one `(type, name)`
+        // pair, so its audit records name no single resource — the terms the other
+        // many-record policy readers in this crate are recorded on.
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::StoreUnreachable, None);
             return Err(ListSecurityPoliciesErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -161,6 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SecurityPolicyType` is an enum the boundary validator does not narrow, so a
         // value outside the model's own value list names no policy type at all.
         if !SECURITY_POLICY_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::ValidationRefused, None);
             return Err(ListSecurityPoliciesErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
@@ -191,27 +220,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names — an absent filter narrows nothing. A filter past the bounds this emulator
         // evaluates is the modelled refusal, never unbounded work.
         let candidates = match input.resource.as_deref() {
-            Some(filter) => crate::state::resource_filtered(candidates, filter).map_err(
-                |message| {
-                    ListSecurityPoliciesErrorModeled::ValidationException(ValidationException {
-                        message: Some(message),
-                    })
-                },
-            )?,
-            None => candidates,
+            Some(filter) => crate::state::resource_filtered(candidates, filter),
+            None => Ok(candidates),
         };
+        let candidates = refused(Self::NAME, ctx, candidates)?;
 
-        let page = crate::state::page(
-            candidates.iter().collect(),
-            input.next_token.as_deref(),
-            input.max_results,
-        )
-        .map_err(|message| {
-            ListSecurityPoliciesErrorModeled::ValidationException(ValidationException {
-                message: Some(message),
-            })
-        })?;
+        let page = refused(
+            Self::NAME,
+            ctx,
+            crate::state::page(
+                candidates.iter().collect(),
+                input.next_token.as_deref(),
+                input.max_results,
+            ),
+        )?;
 
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyRead, None);
         Ok(ListSecurityPoliciesOutput {
             security_policy_summaries: Some(
                 page.items

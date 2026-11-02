@@ -6,6 +6,7 @@
 //! `configVersion` and stamping `lastModifiedDate`, and answers that stored record —
 //! refusing an id that names no configuration, a `configVersion` that is not the stored one
 //! and options belonging to another identity-provider type than the configuration's own.
+//! Every exit leaves one structured `emulator::audit` record for the call.
 //!
 //! ## Shape of an operation
 //!
@@ -159,8 +160,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        use crate::state::AuditOutcome;
+
+        // Every exit below leaves exactly one audit record naming the configuration this
+        // request addresses, so a state-changing call is observable whatever it answered.
+        let resource = crate::state::audit_security_config_resource(&input.id);
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             return Err(UpdateSecurityConfigErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -171,8 +182,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A 400 `ValidationException` for anything the model constrains but the boundary
         // validator does not narrow — an enum's value list, and which options member the
-        // addressed configuration's own type accepts.
+        // addressed configuration's own type accepts. The refusal's own audit record is
+        // written here, so every exit through it leaves exactly one.
         let refuse = |message: String| -> UpdateSecurityConfigError {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::ValidationRefused,
+                Some(&resource),
+            );
             UpdateSecurityConfigErrorModeled::ValidationException(ValidationException {
                 message: Some(message),
             })
@@ -218,6 +236,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|record| record.id == input.id)
                 .map(crate::state::SecurityConfigRecord::detail);
             if let Some(detail) = replayed {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    AuditOutcome::IdempotentReplay,
+                    Some(&resource),
+                );
                 return Ok(UpdateSecurityConfigOutput {
                     security_config_detail: Some(detail),
                 });
@@ -231,6 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.id)
             .map(|record| (record.kind.clone(), record.config_version.clone()))
         else {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::NotFound, Some(&resource));
             return Err(
                 UpdateSecurityConfigErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -278,6 +303,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ValidationException` (400) rather than a conflict a retry of the same request
         // could clear. Nothing is written when it fails.
         if stored_version != input.config_version {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::VersionMismatch,
+                Some(&resource),
+            );
             return Err(UpdateSecurityConfigErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(crate::state::STALE_POLICY_VERSION_MESSAGE.to_string()),
@@ -309,6 +340,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             written_at,
         };
         let Some(record) = store.security_configs.get_mut(&input.id) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             return Err(UpdateSecurityConfigErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -323,7 +360,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             store.remember_token(Self::NAME, token, &input.id);
         }
+        drop(store);
 
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyUpdated, Some(&resource));
         Ok(UpdateSecurityConfigOutput {
             security_config_detail: Some(detail),
         })

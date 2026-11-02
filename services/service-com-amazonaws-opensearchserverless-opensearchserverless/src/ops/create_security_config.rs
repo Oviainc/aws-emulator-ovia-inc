@@ -5,7 +5,8 @@
 //! `<type>/<account-id>/<name>` id this API addresses a configuration by, applying the
 //! documented defaults of the identity-provider options, and answers that stored record —
 //! refusing a name already taken under the type, a type whose own options are missing, and
-//! a create past the type's quota.
+//! a create past the type's quota. Every exit leaves one structured `emulator::audit`
+//! record for the call.
 //!
 //! ## Shape of an operation
 //!
@@ -158,8 +159,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        use crate::state::AuditOutcome;
+
+        // Every exit below leaves exactly one audit record naming the configuration id this
+        // request's type and name resolve to, so a state-changing call is observable
+        // whatever it answered.
+        let id = crate::state::security_config_id(&input.r#type, &input.name);
+        let resource = crate::state::audit_security_config_resource(&id);
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             return Err(CreateSecurityConfigErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -170,8 +183,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A 400 `ValidationException` for anything the model constrains but the boundary
         // validator does not narrow — an enum's value list, and which options member the
-        // requested type requires.
+        // requested type requires. The refusal's own audit record is written here, so every
+        // exit through it leaves exactly one.
         let refuse = |message: String| -> CreateSecurityConfigError {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::ValidationRefused,
+                Some(&resource),
+            );
             CreateSecurityConfigErrorModeled::ValidationException(ValidationException {
                 message: Some(message),
             })
@@ -245,7 +265,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let id = crate::state::security_config_id(&input.r#type, &input.name);
         let mut store = state.lock();
 
         // A replayed `clientToken` is a retry of the call that created the configuration,
@@ -259,6 +278,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|record| record.id == id)
                 .map(crate::state::SecurityConfigRecord::detail);
             if let Some(detail) = replayed {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    AuditOutcome::IdempotentReplay,
+                    Some(&resource),
+                );
                 return Ok(CreateSecurityConfigOutput {
                     security_config_detail: Some(detail),
                 });
@@ -266,6 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if store.security_configs.contains_key(&id) {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::AlreadyExists, Some(&resource));
             return Err(CreateSecurityConfigErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(format!(
@@ -280,6 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.security_config_count_of(&input.r#type)
             >= crate::state::MAX_SECURITY_CONFIGS_PER_TYPE
         {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::QuotaExceeded, Some(&resource));
             return Err(
                 CreateSecurityConfigErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
@@ -357,6 +384,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answered from the STORED record, so the create cannot report anything a later
         // `GetSecurityConfig` or `ListSecurityConfigs` would not.
         let stored = store.security_configs.get(&id).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             CreateSecurityConfigError::from(
                 CreateSecurityConfigErrorModeled::InternalServerException(
                     InternalServerException {
@@ -365,8 +398,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
+        let detail = stored.detail();
+        drop(store);
+
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyCreated, Some(&resource));
         Ok(CreateSecurityConfigOutput {
-            security_config_detail: Some(stored.detail()),
+            security_config_detail: Some(detail),
         })
     }
 }

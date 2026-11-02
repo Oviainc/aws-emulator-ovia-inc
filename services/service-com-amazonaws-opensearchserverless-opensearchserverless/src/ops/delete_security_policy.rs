@@ -3,7 +3,8 @@
 //! @op DeleteSecurityPolicy
 //! IMPLEMENTED: removes the `SecurityPolicyRecord` stored in [`crate::state`] under the
 //! requested `(type, name)` pair, so a later `GetSecurityPolicy` or delete of the same
-//! pair answers `ResourceNotFoundException`.
+//! pair answers `ResourceNotFoundException`. Every exit leaves one structured
+//! `emulator::audit` record for the call.
 //!
 //! ## Shape of an operation
 //!
@@ -140,8 +141,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        use crate::state::AuditOutcome;
+
+        // Every exit below leaves exactly one audit record naming this `(type, name)` pair,
+        // so a state-changing call is observable whatever it answered.
+        let resource = crate::state::audit_security_policy_resource(&input.r#type, &input.name);
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             return Err(DeleteSecurityPolicyErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -153,6 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SecurityPolicyType` is an enum the boundary validator does not narrow; a value
         // outside the model's list names no policy type at all.
         if !SECURITY_POLICY_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::ValidationRefused,
+                Some(&resource),
+            );
             return Err(DeleteSecurityPolicyErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
@@ -170,6 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove_security_policy(&input.r#type, &input.name)
             .is_none()
         {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::NotFound, Some(&resource));
             return Err(
                 DeleteSecurityPolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -182,6 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        drop(store);
+
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyDeleted, Some(&resource));
         // The model declares no output members for this operation, so a successful delete
         // is an empty 200 body; the observable effect is the record's absence.
         Ok(DeleteSecurityPolicyOutput {})

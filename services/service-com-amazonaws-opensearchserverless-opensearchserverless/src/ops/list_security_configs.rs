@@ -4,7 +4,8 @@
 //! IMPLEMENTED: enumerates the `SecurityConfigRecord`s of the requested
 //! `SecurityConfigType` stored in [`crate::state`], in security-config-id order, and cuts
 //! the page `maxResults` and `nextToken` select — handing back a `nextToken` only while
-//! records remain after the page.
+//! records remain after the page. Every exit leaves one structured `emulator::audit`
+//! record for the call.
 //!
 //! ## Shape of an operation
 //!
@@ -145,8 +146,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        use crate::state::AuditOutcome;
+
+        // This read addresses every configuration of one type rather than one id, so its
+        // audit records name no single resource — the terms the other many-record policy
+        // readers in this crate are recorded on.
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::StoreUnreachable, None);
             return Err(ListSecurityConfigsErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -158,6 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SecurityConfigType` is an enum the boundary validator does not narrow, so a
         // value outside the model's own value list names no configuration type at all.
         if !SECURITY_CONFIG_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::ValidationRefused, None);
             return Err(ListSecurityConfigsErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
@@ -182,16 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page = crate::state::page(matching, input.next_token.as_deref(), input.max_results)
             .map_err(|message| {
+                crate::state::audit(Self::NAME, ctx, AuditOutcome::ValidationRefused, None);
                 ListSecurityConfigsErrorModeled::ValidationException(ValidationException {
                     message: Some(message),
                 })
             })?;
 
+        let summaries: Vec<SecurityConfigSummary> =
+            page.items.iter().map(|record| record.summary()).collect();
+        let next_token = page.next_token;
+        drop(store);
+
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyRead, None);
         Ok(ListSecurityConfigsOutput {
-            security_config_summaries: Some(
-                page.items.iter().map(|record| record.summary()).collect(),
-            ),
-            next_token: page.next_token,
+            security_config_summaries: Some(summaries),
+            next_token,
         })
     }
 }

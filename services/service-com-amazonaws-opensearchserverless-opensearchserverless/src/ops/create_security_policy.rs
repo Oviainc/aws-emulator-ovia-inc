@@ -4,7 +4,8 @@
 //! IMPLEMENTED: parses the `policy` text, stores a `SecurityPolicyRecord` in
 //! [`crate::state`] under its `(type, name)` pair with a freshly minted `policyVersion`,
 //! and answers from the stored record. A second create for the same pair is a
-//! `ConflictException`.
+//! `ConflictException`. Every exit leaves one structured `emulator::audit` record for the
+//! call.
 //!
 //! ## Shape of an operation
 //!
@@ -157,8 +158,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        use crate::state::AuditOutcome;
+
+        // Every exit below leaves exactly one audit record naming this `(type, name)` pair,
+        // so a state-changing call is observable whatever it answered.
+        let resource = crate::state::audit_security_policy_resource(&input.r#type, &input.name);
         let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             return Err(CreateSecurityPolicyErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(crate::state::STORE_UNREACHABLE.to_string()),
@@ -170,6 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SecurityPolicyType` is an enum the boundary validator does not narrow, so the
         // handler refuses a value outside the model's own value list.
         if !SECURITY_POLICY_TYPE_VALUES.contains(&input.r#type.as_str()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::ValidationRefused,
+                Some(&resource),
+            );
             return Err(CreateSecurityPolicyErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
@@ -189,6 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // wording all live in `crate::state::policy_document_from_text`; this handler only
         // names the error the message travels in.
         let policy = crate::state::policy_document_from_text(&input.policy).map_err(|message| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::ValidationRefused,
+                Some(&resource),
+            );
             CreateSecurityPolicyErrorModeled::ValidationException(ValidationException {
                 message: Some(message),
             })
@@ -208,6 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|record| record.kind == key.0 && record.name == key.1)
                 .map(crate::state::SecurityPolicyRecord::detail);
             if let Some(detail) = replayed {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    AuditOutcome::IdempotentReplay,
+                    Some(&resource),
+                );
                 return Ok(CreateSecurityPolicyOutput {
                     security_policy_detail: Some(detail),
                 });
@@ -215,6 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if store.security_policies.contains_key(&key) {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::AlreadyExists, Some(&resource));
             return Err(CreateSecurityPolicyErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(format!(
@@ -229,6 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.security_policy_count_of(&input.r#type)
             >= crate::state::MAX_SECURITY_POLICIES_PER_TYPE
         {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::QuotaExceeded, Some(&resource));
             return Err(
                 CreateSecurityPolicyErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
@@ -269,6 +300,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answered from the STORED record, so the create cannot report anything a later
         // `GetSecurityPolicy` would not.
         let stored = store.security_policies.get(&key).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                AuditOutcome::StoreUnreachable,
+                Some(&resource),
+            );
             CreateSecurityPolicyError::from(
                 CreateSecurityPolicyErrorModeled::InternalServerException(
                     InternalServerException {
@@ -277,8 +314,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
+        let detail = stored.detail();
+        drop(store);
+
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyCreated, Some(&resource));
         Ok(CreateSecurityPolicyOutput {
-            security_policy_detail: Some(stored.detail()),
+            security_policy_detail: Some(detail),
         })
     }
 }

@@ -3973,6 +3973,20 @@ pub fn audit_lifecycle_policy_resource(kind: &str, name: &str) -> String {
     format!("lifecycle-policy/{kind}/{name}")
 }
 
+/// The `resource` field naming one security policy: its type and name, which is its
+/// identity in this API (`SecurityPolicyType` plus `PolicyName` is what every
+/// security-policy request addresses one by).
+pub fn audit_security_policy_resource(kind: &str, name: &str) -> String {
+    format!("security-policy/{kind}/{name}")
+}
+
+/// The `resource` field naming one security configuration: its `SecurityConfigId`, which is
+/// the whole of its identity in this API — so a create, which is addressed by type and
+/// name, names the id those two resolve to ([`security_config_id`]).
+pub fn audit_security_config_resource(id: &str) -> String {
+    format!("security-config/{id}")
+}
+
 /// The `resource` field naming the account's own settings, which `UpdateAccountSettings`
 /// writes. A single resource per account, so it is a constant rather than a function:
 /// nothing request-derived identifies it.
