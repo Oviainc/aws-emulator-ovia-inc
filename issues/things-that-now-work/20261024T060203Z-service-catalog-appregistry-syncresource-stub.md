@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudformation__service-catalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action
+Issue-Trace-Ids: cloudformation__servicecatalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action
 Issue-Key: service-catalog-appregistry|SyncResource|NotImplemented
 Issue-Commit: df1261813c70037074c7525ba4fddd96df97f3b7
 

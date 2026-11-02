@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: glue__resource-groups-tagging-api.glue-database-tags-visible-via-resource-groups-tagging-api
-Issue-Key: glue__resource-groups-tagging-api.glue-database-tags-visible-via-resource-groups-tagging-api|_poll_until#9|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: glue__resourcegroupstaggingapi.glue-database-tags-visible-via-resource-groups-tagging-api
+Issue-Key: glue__resourcegroupstaggingapi.glue-database-tags-visible-via-resource-groups-tagging-api|_poll_until#9|Timeout|time.sleep(interval_s)
 Issue-Commit: 6b8dcd825499bdd91675cbbb3bc6eaac525bf5b8
 
 # Glue CreateDatabase Tags are not indexed by the Resource Groups Tagging API: GetResources by the database ARN returns nothing

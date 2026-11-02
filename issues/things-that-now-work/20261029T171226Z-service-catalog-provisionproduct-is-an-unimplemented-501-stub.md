@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: service-catalog.provision-unassociated-product-rejected
+Issue-Trace-Ids: servicecatalog.provision-unassociated-product-rejected
 Issue-Shape-Id: com.amazonaws.servicecatalog#AWS242ServiceCatalogService
-Issue-Key: service-catalog.provision-unassociated-product-rejected|run#10|AssertionError|assert code == "ResourceNotFoundException", (
+Issue-Key: servicecatalog.provision-unassociated-product-rejected|run#10|AssertionError|assert code == "ResourceNotFoundException", (
 Issue-Commit: ff63bbd76f191efb9689374a4f98215607f4bd70
 
 # service-catalog ProvisionProduct is an unimplemented 501 stub: provisioning an unassociated product answers NotImplemented instead of ResourceNotFoundException "No launch paths found for resource: <ProductId>" (1 cause)

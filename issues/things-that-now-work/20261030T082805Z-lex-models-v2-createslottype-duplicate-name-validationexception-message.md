@@ -1,9 +1,9 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2.create-slot-type-rejects-duplicate-name
+Issue-Trace-Ids: lexv2-models.create-slot-type-rejects-duplicate-name
 Issue-Shape-Id: com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2
-Issue-Key: lex-models-v2.create-slot-type-rejects-duplicate-name|run#8|AssertionError|assert message == (
+Issue-Key: lexv2-models.create-slot-type-rejects-duplicate-name|run#8|AssertionError|assert message == (
 Issue-Commit: 614aa2f240af017c8d67ce8cf3a870b05aeb16dc
 
 # lex-models-v2 CreateSlotType duplicate-name ValidationException message is emulator-worded, not AWS's "Slot Type with name <name> already exists. Use another name."

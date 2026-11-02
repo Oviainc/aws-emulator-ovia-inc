@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: kms__sfn.xsvc-sfn-3-disabled-cmk-execution-reads-rejected-until-reenabled
-Issue-Key: kms__sfn.xsvc-sfn-3-disabled-cmk-execution-reads-rejected-until-reenabled|run#18|Timeout|time.sleep(3.0)
+Issue-Trace-Ids: kms__stepfunctions.xsvc-sfn-3-disabled-cmk-execution-reads-rejected-until-reenabled
+Issue-Key: kms__stepfunctions.xsvc-sfn-3-disabled-cmk-execution-reads-rejected-until-reenabled|run#18|Timeout|time.sleep(3.0)
 Issue-Commit: d558c4fc1331790598d7d8dd6ea4bd673681392c
 
 # kms__sfn: Step Functions execution reads are never refused after the state machine's CMK is disabled, so the disabled-CMK/re-enable contract hangs to the 60 s cap (1 cause)

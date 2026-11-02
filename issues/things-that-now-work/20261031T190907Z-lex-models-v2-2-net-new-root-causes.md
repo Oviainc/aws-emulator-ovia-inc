@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2.build-rejects-locale-with-no-utterances lex-models-v2.create-slot-rejects-unknown-slot-type
+Issue-Trace-Ids: lexv2-models.build-rejects-locale-with-no-utterances lexv2-models.create-slot-rejects-unknown-slot-type
 Issue-Shape-Id: com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2
-Issue-Key: lex-models-v2.build-rejects-locale-with-no-utterances|run#9|AssertionError|assert failed["botLocaleStatus"] == "Failed", (
-Issue-Key: lex-models-v2.create-slot-rejects-unknown-slot-type|run#10|AssertionError|assert code == "PreconditionFailedException", (
+Issue-Key: lexv2-models.build-rejects-locale-with-no-utterances|run#9|AssertionError|assert failed["botLocaleStatus"] == "Failed", (
+Issue-Key: lexv2-models.create-slot-rejects-unknown-slot-type|run#10|AssertionError|assert code == "PreconditionFailedException", (
 Issue-Commit: 30fa5e7e24c2e7ff08a1ee60d32c6c6e65abb481
 
 # lex-models-v2: 2 net-new root causes — BuildBotLocale always settles Built (a locale with no utterances never reaches Failed with failureReasons), and CreateSlot never refuses an unknown slotTypeId with 412 PreconditionFailedException

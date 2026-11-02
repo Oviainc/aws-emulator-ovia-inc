@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: apigateway__lambda__logs__resource-groups-tagging-api__sqs.api-key-discovered-tagged-and-removed-from-index-on-delete
-Issue-Key: apigateway__lambda__logs__resource-groups-tagging-api__sqs.api-key-discovered-tagged-and-removed-from-index-on-delete|_poll_until#10|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: apigateway__lambda__logs__resourcegroupstaggingapi__sqs.api-key-discovered-tagged-and-removed-from-index-on-delete
+Issue-Key: apigateway__lambda__logs__resourcegroupstaggingapi__sqs.api-key-discovered-tagged-and-removed-from-index-on-delete|_poll_until#10|Timeout|time.sleep(interval_s)
 Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529
 
 # apigateway__lambda__logs__resource-groups-tagging-api__sqs: a tagged API Gateway API key never appears in ResourceGroupsTaggingAPI GetResources, so the discovery check polls to the 60 s cap (1 cause)

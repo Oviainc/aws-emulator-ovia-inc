@@ -1,11 +1,11 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.reject-delete-nonempty-activity-in-use sfn.send-task-failure-kms-access-denied sfn.update-map-run-validation-exception
+Issue-Trace-Ids: stepfunctions.reject-delete-nonempty-activity-in-use stepfunctions.send-task-failure-kms-access-denied stepfunctions.update-map-run-validation-exception
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.reject-delete-nonempty-activity-in-use|_wait_execution_terminal#24|Timeout|time.sleep(interval_s)
-Issue-Key: sfn.send-task-failure-kms-access-denied|_revoke_kms_crypto_access#11|Timeout|time.sleep(3)
-Issue-Key: sfn.update-map-run-validation-exception|run#7|AssertionError|assert code == "ValidationException", f"expected ValidationException, got {code}"
+Issue-Key: stepfunctions.reject-delete-nonempty-activity-in-use|_wait_execution_terminal#24|Timeout|time.sleep(interval_s)
+Issue-Key: stepfunctions.send-task-failure-kms-access-denied|_revoke_kms_crypto_access#11|Timeout|time.sleep(3)
+Issue-Key: stepfunctions.update-map-run-validation-exception|run#7|AssertionError|assert code == "ValidationException", f"expected ValidationException, got {code}"
 Issue-Commit: 62a489da4fc45e0eadb1189eb41434873a830e66
 
 # Step Functions activity tasks are never delivered to a worker (GetActivityTask returns no token), and UpdateMapRun rejects a no-field update with NotImplemented instead of ValidationException (2 causes)

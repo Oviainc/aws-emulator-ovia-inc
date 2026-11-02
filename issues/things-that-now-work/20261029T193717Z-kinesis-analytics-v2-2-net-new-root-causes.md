@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: kinesis-analytics-v2.add-application-input-on-flink-application-rejected kinesis-analytics-v2.update-with-stale-version-id-rejected
+Issue-Trace-Ids: kinesisanalyticsv2.add-application-input-on-flink-application-rejected kinesisanalyticsv2.update-with-stale-version-id-rejected
 Issue-Shape-Id: com.amazonaws.kinesisanalyticsv2#KinesisAnalytics_20180523
-Issue-Key: kinesis-analytics-v2.add-application-input-on-flink-application-rejected|run#21|AssertionError|assert err["Code"] == "InvalidArgumentException", (
-Issue-Key: kinesis-analytics-v2.update-with-stale-version-id-rejected|_parallelism#10|KeyError|flink = kda.describe_application(ApplicationName=app)["ApplicationDetail"][
+Issue-Key: kinesisanalyticsv2.add-application-input-on-flink-application-rejected|run#21|AssertionError|assert err["Code"] == "InvalidArgumentException", (
+Issue-Key: kinesisanalyticsv2.update-with-stale-version-id-rejected|_parallelism#10|KeyError|flink = kda.describe_application(ApplicationName=app)["ApplicationDetail"][
 Issue-Commit: 954781cef49baf7406aef764139782df619c6255
 
 # kinesis-analytics-v2: 2 net-new root causes — AddApplicationInput is an unimplemented 501 scaffold (never refuses SQL input on a Flink runtime), and DescribeApplication omits ApplicationConfigurationDescription for a freshly created Flink application

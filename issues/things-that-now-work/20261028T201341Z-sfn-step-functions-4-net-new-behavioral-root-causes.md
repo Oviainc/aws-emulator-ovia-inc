@@ -1,12 +1,12 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.deep-sfn-1-sfn-sync-express-machine-sync-task-rejected-at-runtime sfn.deep-sfn-1-sfn-sync-start-unpermitted-child-rejected sfn.input-output-processing-stages-apply-in-the-documented-order sfn.nested-fire-and-forget-start-execution-does-not-block-on-child
+Issue-Trace-Ids: stepfunctions.deep-sfn-1-sfn-sync-express-machine-sync-task-rejected-at-runtime stepfunctions.deep-sfn-1-sfn-sync-start-unpermitted-child-rejected stepfunctions.input-output-processing-stages-apply-in-the-documented-order stepfunctions.nested-fire-and-forget-start-execution-does-not-block-on-child
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.deep-sfn-1-sfn-sync-express-machine-sync-task-rejected-at-runtime|run#18|AssertionError|assert _EXPRESS_SYNC_CAUSE in (resp.get("cause") or "") and \
-Issue-Key: sfn.deep-sfn-1-sfn-sync-start-unpermitted-child-rejected|run#16|AssertionError|assert bad["status"] == "FAILED", (
-Issue-Key: sfn.input-output-processing-stages-apply-in-the-documented-order|run#24|KeyError|state_output = json.loads(exited[0]["stateExitedEventDetails"]["output"])
-Issue-Key: sfn.nested-fire-and-forget-start-execution-does-not-block-on-child|run#9|AssertionError|assert "SdkHttpMetadata" in output and "SdkResponseMetadata" in output, (
+Issue-Key: stepfunctions.deep-sfn-1-sfn-sync-express-machine-sync-task-rejected-at-runtime|run#18|AssertionError|assert _EXPRESS_SYNC_CAUSE in (resp.get("cause") or "") and \
+Issue-Key: stepfunctions.deep-sfn-1-sfn-sync-start-unpermitted-child-rejected|run#16|AssertionError|assert bad["status"] == "FAILED", (
+Issue-Key: stepfunctions.input-output-processing-stages-apply-in-the-documented-order|run#24|KeyError|state_output = json.loads(exited[0]["stateExitedEventDetails"]["output"])
+Issue-Key: stepfunctions.nested-fire-and-forget-start-execution-does-not-block-on-child|run#9|AssertionError|assert "SdkHttpMetadata" in output and "SdkResponseMetadata" in output, (
 Issue-Commit: c6f8380220d2b80f1162c28669d8bc5048f04f8c
 
 # Step Functions: 4 net-new behavioral root causes — .sync task on an EXPRESS machine reports emulator-local wording, an unpermitted states:startExecution.sync child is started and the parent SUCCEEDS, StateExited history events carry no output, and the fire-and-forget states:startExecution task result omits the SDK response envelope

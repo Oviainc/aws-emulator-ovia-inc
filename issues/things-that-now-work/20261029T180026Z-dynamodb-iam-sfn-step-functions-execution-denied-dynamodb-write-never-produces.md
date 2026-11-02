@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: dynamodb__iam__sfn.sfn-no-permission-to-write-ddb
-Issue-Key: dynamodb__iam__sfn.sfn-no-permission-to-write-ddb|_poll_until#20|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: dynamodb__iam__stepfunctions.sfn-no-permission-to-write-ddb
+Issue-Key: dynamodb__iam__stepfunctions.sfn-no-permission-to-write-ddb|_poll_until#20|Timeout|time.sleep(interval_s)
 Issue-Commit: f4e5251e6df88363d8e23ace2ff5bff3be31b423
 
 # Step Functions execution denied DynamoDB write never produces an outcome

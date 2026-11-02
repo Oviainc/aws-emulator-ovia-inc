@@ -1,12 +1,12 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.deep-sfn-2-sfn-jsonata-error-output-outside-catch-rejected sfn.deep-sfn-2-sfn-jsonata-jsonpath-state-under-jsonata-machine-rejected sfn.deep-sfn-2-sfn-jsonata-pass-states-result-rejected sfn.error-kms-access-denied-describe-execution
+Issue-Trace-Ids: stepfunctions.deep-sfn-2-sfn-jsonata-error-output-outside-catch-rejected stepfunctions.deep-sfn-2-sfn-jsonata-jsonpath-state-under-jsonata-machine-rejected stepfunctions.deep-sfn-2-sfn-jsonata-pass-states-result-rejected stepfunctions.error-kms-access-denied-describe-execution
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.deep-sfn-2-sfn-jsonata-error-output-outside-catch-rejected|run#12|AssertionError|assert messages == [
-Issue-Key: sfn.deep-sfn-2-sfn-jsonata-jsonpath-state-under-jsonata-machine-rejected|run#10|AssertionError|assert v["diagnostics"][0]["message"] == (
-Issue-Key: sfn.deep-sfn-2-sfn-jsonata-pass-states-result-rejected|run#17|AssertionError|assert message == (
-Issue-Key: sfn.error-kms-access-denied-describe-execution|run#38|AssertionError|assert _stable(message) == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: stepfunctions.deep-sfn-2-sfn-jsonata-error-output-outside-catch-rejected|run#12|AssertionError|assert messages == [
+Issue-Key: stepfunctions.deep-sfn-2-sfn-jsonata-jsonpath-state-under-jsonata-machine-rejected|run#10|AssertionError|assert v["diagnostics"][0]["message"] == (
+Issue-Key: stepfunctions.deep-sfn-2-sfn-jsonata-pass-states-result-rejected|run#17|AssertionError|assert message == (
+Issue-Key: stepfunctions.error-kms-access-denied-describe-execution|run#38|AssertionError|assert _stable(message) == expected, f"expected message {expected!r}, got {message!r}"
 Issue-Commit: a7f4b46fd13e3042ad499c1371bfc738191ffa75
 
 # sfn: 4 net-new behavioral root causes — ASL validation diagnostics name only the reserved term, the JSONata/JSONPath clash message is emulator-authored, InvalidDefinition parenthesizes the location, and the relayed KMS refusal trailer uses the old SDK format

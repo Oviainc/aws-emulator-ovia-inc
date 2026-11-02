@@ -1,9 +1,9 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.error-conflict-publish-version-stale-revision
+Issue-Trace-Ids: stepfunctions.error-conflict-publish-version-stale-revision
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.error-conflict-publish-version-stale-revision|run#17|AssertionError|assert message == expected_message, (
+Issue-Key: stepfunctions.error-conflict-publish-version-stale-revision|run#17|AssertionError|assert message == expected_message, (
 Issue-Commit: a97363f812621dd47aa0891b39cb5eeebafd4acb
 
 # PublishStateMachineVersion stale-revisionId ConflictException message is rewritten in emulator-local wording instead of AWS's "Failed to publish the State Machine version for revision ... The current State Machine revision is ..."

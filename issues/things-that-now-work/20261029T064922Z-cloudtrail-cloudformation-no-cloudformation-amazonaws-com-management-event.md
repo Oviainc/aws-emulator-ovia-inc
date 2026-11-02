@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudtrail__cloudformation.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited
-Issue-Key: cloudtrail__cloudformation.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited|run#59|TimeoutError|raise TimeoutError(
+Issue-Trace-Ids: cloudformation__cloudtrail.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited
+Issue-Key: cloudformation__cloudtrail.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited|run#59|TimeoutError|raise TimeoutError(
 Issue-Commit: 004a13bc6b62a404600c0a09686b1d7dd87c7440
 
 # cloudtrail__cloudformation: no cloudformation.amazonaws.com management event is ever recorded, so an accepted and a refused CreateStack are never auditable through LookupEvents

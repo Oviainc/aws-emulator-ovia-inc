@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.error-invalid-output-send-task-success sfn.start-execution-invalid-json-input-rejected
+Issue-Trace-Ids: stepfunctions.error-invalid-output-send-task-success stepfunctions.start-execution-invalid-json-input-rejected
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.error-invalid-output-send-task-success|run#13|AssertionError|assert code == "InvalidOutput", f"expected InvalidOutput, got {code!r}"
-Issue-Key: sfn.start-execution-invalid-json-input-rejected|run#10|AssertionError|assert error.get("Message") == _INVALID_INPUT_MESSAGE, (
+Issue-Key: stepfunctions.error-invalid-output-send-task-success|run#13|AssertionError|assert code == "InvalidOutput", f"expected InvalidOutput, got {code!r}"
+Issue-Key: stepfunctions.start-execution-invalid-json-input-rejected|run#10|AssertionError|assert error.get("Message") == _INVALID_INPUT_MESSAGE, (
 Issue-Commit: d6f5c34e1c81f18f6d6574ea7d7977035cbea7fb
 
 # Step Functions data plane: SendTaskSuccess refuses with unmodeled NotImplemented instead of validating output, and InvalidExecutionInput's message carries a Rust parser diagnostic instead of the documented one (2 causes)

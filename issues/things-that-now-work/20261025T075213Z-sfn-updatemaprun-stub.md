@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.map-run-tolerated-failure-enforced sfn.update-map-run-adjusts-concurrency-limits
+Issue-Trace-Ids: stepfunctions.map-run-tolerated-failure-enforced stepfunctions.update-map-run-adjusts-concurrency-limits
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: sfn|UpdateMapRun|NotImplemented
 Issue-Commit: 62a489da4fc45e0eadb1189eb41434873a830e66

@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: service-catalog.launch-constraint-role-governs-plan-execution service-catalog.launch-path-requires-product-and-principal-association service-catalog.provision-invalid-template-parameter-fails-asynchronously service-catalog.provisioned-product-creates-cloudformation-stack service-catalog.terminate-provisioned-product-deletes-cloudformation-stack
+Issue-Trace-Ids: servicecatalog.launch-constraint-role-governs-plan-execution servicecatalog.launch-path-requires-product-and-principal-association servicecatalog.provision-invalid-template-parameter-fails-asynchronously servicecatalog.provisioned-product-creates-cloudformation-stack servicecatalog.terminate-provisioned-product-deletes-cloudformation-stack
 Issue-Shape-Id: com.amazonaws.servicecatalog#AWS242ServiceCatalogService
 Issue-Key: service-catalog|ListLaunchPaths|NotImplemented
 Issue-Commit: ff63bbd76f191efb9689374a4f98215607f4bd70

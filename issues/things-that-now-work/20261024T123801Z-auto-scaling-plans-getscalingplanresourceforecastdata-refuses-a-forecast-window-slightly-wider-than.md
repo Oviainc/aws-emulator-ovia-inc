@@ -1,7 +1,7 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: auto-scaling-plans.asp-forecast-window-is-rejected-before-plan-lookup
+Issue-Trace-Ids: autoscaling-plans.asp-forecast-window-is-rejected-before-plan-lookup
 Issue-Shape-Id: com.amazonaws.autoscalingplans#AnyScaleScalingPlannerFrontendService
 Issue-Key: auto-scaling-plans|GetScalingPlanResourceForecastData|ValidationException
 Issue-Commit: 3e20db6d733c4a1cf0674d75bed6ce3984e4f3c1

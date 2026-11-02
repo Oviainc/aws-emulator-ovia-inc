@@ -1,10 +1,10 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.get-execution-history-invalid-token sfn.express-sync-failure-returns-a-result-not-an-error-with-billing-details
+Issue-Trace-Ids: stepfunctions.get-execution-history-invalid-token stepfunctions.express-sync-failure-returns-a-result-not-an-error-with-billing-details
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.get-execution-history-invalid-token|run#11|AssertionError|assert message == expected_message, f"expected message {expected_message!r}, got {message!r}"
-Issue-Key: sfn.express-sync-failure-returns-a-result-not-an-error-with-billing-details|run#22|AssertionError|assert message == expected_message, f"expected message {expected_message!r}, got {message!r}"
+Issue-Key: stepfunctions.get-execution-history-invalid-token|run#11|AssertionError|assert message == expected_message, f"expected message {expected_message!r}, got {message!r}"
+Issue-Key: stepfunctions.express-sync-failure-returns-a-result-not-an-error-with-billing-details|run#22|AssertionError|assert message == expected_message, f"expected message {expected_message!r}, got {message!r}"
 Issue-Commit: 6402e991ee1ffb1f37749ece0148ecf3009a760a
 
 # Step Functions GetExecutionHistory refusal messages are emulator-authored: InvalidToken wraps and re-quotes its own sentence, and the Express-execution-ARN InvalidArn message reports a different rule than AWS (2 causes)

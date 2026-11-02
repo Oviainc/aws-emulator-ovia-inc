@@ -1,33 +1,33 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.error-resource-not-found-describe-alias sfn.alias-delete-then-describe-not-found sfn.delete-state-machine-alias-after-sm-delete-not-found sfn.delete-state-machine-alias-conflict sfn.sm-alias-create-describe-delete sfn.concurrent-alias-update-delete-race sfn.describe-map-run-not-found sfn.describe-map-run-invalid-arn sfn.update-map-run-resource-not-found sfn.tag-untagged-resource-not-found sfn.create-alias-conflict-duplicate-name sfn.create-alias-numeric-name-rejected sfn.reject-create-state-machine-alias-invalid-name sfn.create-state-machine-alias-invalid-routing-weights-fails sfn.update-state-machine-alias-invalid-routing-weights-rejected sfn.delete-state-machine-version-referenced-by-alias-rejected sfn.delete-version-referenced-by-alias-conflict sfn.error-conflict-delete-state-machine-version-in-use sfn.delete-state-machine-version-validation-guard sfn.create-state-machine-definition-exceeds-size-limit-rejected sfn.error-invalid-definition sfn.test-state-invalid-definition-rejected sfn.test-state-invalid-execution-input-rejected sfn.update-state-machine-missing-required-parameter sfn.update-state-machine-missing-required-parameter-fails
+Issue-Trace-Ids: stepfunctions.error-resource-not-found-describe-alias stepfunctions.alias-delete-then-describe-not-found stepfunctions.delete-state-machine-alias-after-sm-delete-not-found stepfunctions.delete-state-machine-alias-conflict stepfunctions.sm-alias-create-describe-delete stepfunctions.concurrent-alias-update-delete-race stepfunctions.describe-map-run-not-found stepfunctions.describe-map-run-invalid-arn stepfunctions.update-map-run-resource-not-found stepfunctions.tag-untagged-resource-not-found stepfunctions.create-alias-conflict-duplicate-name stepfunctions.create-alias-numeric-name-rejected stepfunctions.reject-create-state-machine-alias-invalid-name stepfunctions.create-state-machine-alias-invalid-routing-weights-fails stepfunctions.update-state-machine-alias-invalid-routing-weights-rejected stepfunctions.delete-state-machine-version-referenced-by-alias-rejected stepfunctions.delete-version-referenced-by-alias-conflict stepfunctions.error-conflict-delete-state-machine-version-in-use stepfunctions.delete-state-machine-version-validation-guard stepfunctions.create-state-machine-definition-exceeds-size-limit-rejected stepfunctions.error-invalid-definition stepfunctions.test-state-invalid-definition-rejected stepfunctions.test-state-invalid-execution-input-rejected stepfunctions.update-state-machine-missing-required-parameter stepfunctions.update-state-machine-missing-required-parameter-fails
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.error-resource-not-found-describe-alias|run#14|AssertionError|assert message == expected_message, (
-Issue-Key: sfn.alias-delete-then-describe-not-found|run#18|AssertionError|assert err == expected, f"DescribeStateMachineAlias on a deleted alias: expected {expected}, got {err}"
-Issue-Key: sfn.delete-state-machine-alias-after-sm-delete-not-found|run#11|AssertionError|assert message == f"Resource not found: '{alias_arn}'", f"unexpected ResourceNotFound message {message!r}"
-Issue-Key: sfn.delete-state-machine-alias-conflict|run#17|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
-Issue-Key: sfn.sm-alias-create-describe-delete|run#14|AssertionError|assert error.get("Message") == expected_message, (
-Issue-Key: sfn.concurrent-alias-update-delete-race|run#15|AssertionError|assert message == f"Resource not found: '{alias_arn}'", (
-Issue-Key: sfn.describe-map-run-not-found|run#11|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
-Issue-Key: sfn.describe-map-run-invalid-arn|run#7|AssertionError|assert control_message == expected, f"expected message {expected!r}, got {control_message!r}"
-Issue-Key: sfn.update-map-run-resource-not-found|run#7|AssertionError|assert message == f"Resource not found: '{bogus}'", f"unexpected ResourceNotFound message: {message!r}"
-Issue-Key: sfn.tag-untagged-resource-not-found|run#17|AssertionError|assert message == f"Resource not found: '{arn}'", f"unexpected ResourceNotFound message: {message!r}"
-Issue-Key: sfn.create-alias-conflict-duplicate-name|run#11|AssertionError|assert message == (
-Issue-Key: sfn.create-alias-numeric-name-rejected|run#8|AssertionError|assert code == "ValidationException", f"expected ValidationException for a purely numeric alias name, got {code}"
-Issue-Key: sfn.reject-create-state-machine-alias-invalid-name|run#14|AssertionError|assert code == "ValidationException", f"expected ValidationException, got {code}"
-Issue-Key: sfn.create-state-machine-alias-invalid-routing-weights-fails|run#14|AssertionError|assert message == "Sum of routing configuration weights must equal 100. Received: [42]", (
-Issue-Key: sfn.update-state-machine-alias-invalid-routing-weights-rejected|run#14|AssertionError|assert message == "Sum of routing configuration weights must equal 100. Received: [40]", (
-Issue-Key: sfn.delete-state-machine-version-referenced-by-alias-rejected|run#15|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
-Issue-Key: sfn.delete-version-referenced-by-alias-conflict|run#16|AssertionError|assert message == _conflict_message(alias_name), (
-Issue-Key: sfn.error-conflict-delete-state-machine-version-in-use|run#14|AssertionError|assert message == expected_message, (
-Issue-Key: sfn.delete-state-machine-version-validation-guard|run#17|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
-Issue-Key: sfn.create-state-machine-definition-exceeds-size-limit-rejected|run#13|AssertionError|assert message_oversized == (
-Issue-Key: sfn.error-invalid-definition|run#13|AssertionError|assert message == expected_message, (
-Issue-Key: sfn.test-state-invalid-definition-rejected|run#9|AssertionError|assert error.get("Message") == "The state definition must be valid JSON", (
-Issue-Key: sfn.test-state-invalid-execution-input-rejected|run#9|AssertionError|assert message == _MALFORMED_INPUT_MESSAGE, f"unexpected InvalidExecutionInput message: {message!r}"
-Issue-Key: sfn.update-state-machine-missing-required-parameter|run#7|AssertionError|assert message == _MISSING_MESSAGE, f"expected message {_MISSING_MESSAGE!r}, got {message!r}"
-Issue-Key: sfn.update-state-machine-missing-required-parameter-fails|run#9|AssertionError|assert message == _MISSING_MESSAGE, f"expected message {_MISSING_MESSAGE!r}, got {message!r}"
+Issue-Key: stepfunctions.error-resource-not-found-describe-alias|run#14|AssertionError|assert message == expected_message, (
+Issue-Key: stepfunctions.alias-delete-then-describe-not-found|run#18|AssertionError|assert err == expected, f"DescribeStateMachineAlias on a deleted alias: expected {expected}, got {err}"
+Issue-Key: stepfunctions.delete-state-machine-alias-after-sm-delete-not-found|run#11|AssertionError|assert message == f"Resource not found: '{alias_arn}'", f"unexpected ResourceNotFound message {message!r}"
+Issue-Key: stepfunctions.delete-state-machine-alias-conflict|run#17|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: stepfunctions.sm-alias-create-describe-delete|run#14|AssertionError|assert error.get("Message") == expected_message, (
+Issue-Key: stepfunctions.concurrent-alias-update-delete-race|run#15|AssertionError|assert message == f"Resource not found: '{alias_arn}'", (
+Issue-Key: stepfunctions.describe-map-run-not-found|run#11|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: stepfunctions.describe-map-run-invalid-arn|run#7|AssertionError|assert control_message == expected, f"expected message {expected!r}, got {control_message!r}"
+Issue-Key: stepfunctions.update-map-run-resource-not-found|run#7|AssertionError|assert message == f"Resource not found: '{bogus}'", f"unexpected ResourceNotFound message: {message!r}"
+Issue-Key: stepfunctions.tag-untagged-resource-not-found|run#17|AssertionError|assert message == f"Resource not found: '{arn}'", f"unexpected ResourceNotFound message: {message!r}"
+Issue-Key: stepfunctions.create-alias-conflict-duplicate-name|run#11|AssertionError|assert message == (
+Issue-Key: stepfunctions.create-alias-numeric-name-rejected|run#8|AssertionError|assert code == "ValidationException", f"expected ValidationException for a purely numeric alias name, got {code}"
+Issue-Key: stepfunctions.reject-create-state-machine-alias-invalid-name|run#14|AssertionError|assert code == "ValidationException", f"expected ValidationException, got {code}"
+Issue-Key: stepfunctions.create-state-machine-alias-invalid-routing-weights-fails|run#14|AssertionError|assert message == "Sum of routing configuration weights must equal 100. Received: [42]", (
+Issue-Key: stepfunctions.update-state-machine-alias-invalid-routing-weights-rejected|run#14|AssertionError|assert message == "Sum of routing configuration weights must equal 100. Received: [40]", (
+Issue-Key: stepfunctions.delete-state-machine-version-referenced-by-alias-rejected|run#15|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: stepfunctions.delete-version-referenced-by-alias-conflict|run#16|AssertionError|assert message == _conflict_message(alias_name), (
+Issue-Key: stepfunctions.error-conflict-delete-state-machine-version-in-use|run#14|AssertionError|assert message == expected_message, (
+Issue-Key: stepfunctions.delete-state-machine-version-validation-guard|run#17|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: stepfunctions.create-state-machine-definition-exceeds-size-limit-rejected|run#13|AssertionError|assert message_oversized == (
+Issue-Key: stepfunctions.error-invalid-definition|run#13|AssertionError|assert message == expected_message, (
+Issue-Key: stepfunctions.test-state-invalid-definition-rejected|run#9|AssertionError|assert error.get("Message") == "The state definition must be valid JSON", (
+Issue-Key: stepfunctions.test-state-invalid-execution-input-rejected|run#9|AssertionError|assert message == _MALFORMED_INPUT_MESSAGE, f"unexpected InvalidExecutionInput message: {message!r}"
+Issue-Key: stepfunctions.update-state-machine-missing-required-parameter|run#7|AssertionError|assert message == _MISSING_MESSAGE, f"expected message {_MISSING_MESSAGE!r}, got {message!r}"
+Issue-Key: stepfunctions.update-state-machine-missing-required-parameter-fails|run#9|AssertionError|assert message == _MISSING_MESSAGE, f"expected message {_MISSING_MESSAGE!r}, got {message!r}"
 Issue-Commit: dfc2bec1feea4e1eda9981ef982ae4c91760421c
 
 # sfn control-plane refusal vocabulary: ten refusal families answer emulator-authored prose (and in two cases the wrong error code) instead of AWS's messages (10 causes)

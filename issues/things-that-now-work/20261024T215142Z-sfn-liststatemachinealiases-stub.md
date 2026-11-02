@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.alias-create-describe-update-delete-lifecycle sfn.alias-list-ordering-consistent sfn.list-aliases-pagination
+Issue-Trace-Ids: stepfunctions.alias-create-describe-update-delete-lifecycle stepfunctions.alias-list-ordering-consistent stepfunctions.list-aliases-pagination
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: sfn|ListStateMachineAliases|NotImplemented
 Issue-Commit: aa34a7732176a121f53f6fa0a60cefb8de4c89bc

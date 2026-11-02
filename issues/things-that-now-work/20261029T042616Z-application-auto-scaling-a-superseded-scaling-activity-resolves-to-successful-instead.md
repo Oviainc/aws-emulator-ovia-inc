@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: application-auto-scaling.superseded-scaling-activity-resolves-to-overridden
+Issue-Trace-Ids: application-autoscaling.superseded-scaling-activity-resolves-to-overridden
 Issue-Shape-Id: com.amazonaws.applicationautoscaling#AnyScaleFrontendService
-Issue-Key: application-auto-scaling.superseded-scaling-activity-resolves-to-overridden|run#19|AssertionError|assert oldest["StatusCode"] == "Overridden", (
+Issue-Key: application-autoscaling.superseded-scaling-activity-resolves-to-overridden|run#19|AssertionError|assert oldest["StatusCode"] == "Overridden", (
 Issue-Commit: 1fd13cac8c9d59f908c3acc103dd89ab8a3a1d61
 
 # A superseded scaling activity resolves to Successful instead of Overridden, so a displaced capacity change is indistinguishable from a fulfilled one

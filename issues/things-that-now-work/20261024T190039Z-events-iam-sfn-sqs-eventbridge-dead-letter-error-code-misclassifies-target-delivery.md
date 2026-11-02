@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__iam__sfn__sqs.xsvc-iam-3-role-without-events-trust-rejected-at-delivery-failed-to-assume-role events__iam__sfn__sqs.xsvc-iam-3-role-without-start-execution-denied-dead-letters-and-counts-failed-invocations
-Issue-Key: events__iam__sfn__sqs.xsvc-iam-3-role-without-events-trust-rejected-at-delivery-failed-to-assume-role|_differential_rounds#29|AssertionError|assert code == "FAILED_TO_ASSUME_ROLE", (
-Issue-Key: events__iam__sfn__sqs.xsvc-iam-3-role-without-start-execution-denied-dead-letters-and-counts-failed-invocations|_differential_rounds#28|AssertionError|assert code == "FAILED_TO_ASSUME_ROLE", (
+Issue-Trace-Ids: events__iam__sqs__stepfunctions.xsvc-iam-3-role-without-events-trust-rejected-at-delivery-failed-to-assume-role events__iam__sqs__stepfunctions.xsvc-iam-3-role-without-start-execution-denied-dead-letters-and-counts-failed-invocations
+Issue-Key: events__iam__sqs__stepfunctions.xsvc-iam-3-role-without-events-trust-rejected-at-delivery-failed-to-assume-role|_differential_rounds#29|AssertionError|assert code == "FAILED_TO_ASSUME_ROLE", (
+Issue-Key: events__iam__sqs__stepfunctions.xsvc-iam-3-role-without-start-execution-denied-dead-letters-and-counts-failed-invocations|_differential_rounds#28|AssertionError|assert code == "FAILED_TO_ASSUME_ROLE", (
 Issue-Commit: ee21bdc0559bb252101e2375a2c132d26bd8f920
 
 # EventBridge dead-letter ERROR_CODE misclassifies target-delivery failures: trust failure reported NO_PERMISSIONS and authorization failure reported ACCESS_DENIED (2 causes)

@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ecs__resource-groups-tagging-api.tag-resources-nonexistent-cluster-rejected-per-resource
-Issue-Key: ecs__resource-groups-tagging-api|ListTagsForResource|NotImplemented
+Issue-Trace-Ids: ecs__resourcegroupstaggingapi.tag-resources-nonexistent-cluster-rejected-per-resource
+Issue-Key: ecs__resourcegroupstaggingapi|ListTagsForResource|NotImplemented
 Issue-Commit: 6b8dcd825499bdd91675cbbb3bc6eaac525bf5b8
 
 # ECS ListTagsForResource answers 501 NotImplemented, so tags applied to a live cluster through the Tagging API can never be read back

@@ -1,10 +1,10 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: resource-groups-tagging-api.tag-resources-malformed-arn-rejected resource-groups-tagging-api.tag-resources-cross-region-arn-rejected
+Issue-Trace-Ids: resourcegroupstaggingapi.tag-resources-malformed-arn-rejected resourcegroupstaggingapi.tag-resources-cross-region-arn-rejected
 Issue-Shape-Id: com.amazonaws.resourcegroupstaggingapi#ResourceGroupsTaggingAPI_20170126
-Issue-Key: resource-groups-tagging-api.tag-resources-malformed-arn-rejected|run#12|AssertionError|assert message == expected, (
-Issue-Key: resource-groups-tagging-api.tag-resources-cross-region-arn-rejected|run#16|AssertionError|assert message == expected_message, (
+Issue-Key: resourcegroupstaggingapi.tag-resources-malformed-arn-rejected|run#12|AssertionError|assert message == expected, (
+Issue-Key: resourcegroupstaggingapi.tag-resources-cross-region-arn-rejected|run#16|AssertionError|assert message == expected_message, (
 Issue-Commit: 907b6e75f03592bc638357f3d5c791839011739f
 
 # TagResources InvalidParameterException messages do not match AWS wording for malformed and cross-region ARNs

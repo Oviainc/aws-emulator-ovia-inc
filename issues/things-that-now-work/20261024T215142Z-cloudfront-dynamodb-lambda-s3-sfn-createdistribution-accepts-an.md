@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudfront__dynamodb__lambda__s3__sfn.cftenant-distribution-naming-a-deleted-origin-access-control-rejected
-Issue-Key: cloudfront__dynamodb__lambda__s3__sfn.cftenant-distribution-naming-a-deleted-origin-access-control-rejected|_refusal#11|AssertionError|raise AssertionError("the call was expected to be refused, but it succeeded")
+Issue-Trace-Ids: cloudfront__dynamodb__lambda__s3__stepfunctions.cftenant-distribution-naming-a-deleted-origin-access-control-rejected
+Issue-Key: cloudfront__dynamodb__lambda__s3__stepfunctions.cftenant-distribution-naming-a-deleted-origin-access-control-rejected|_refusal#11|AssertionError|raise AssertionError("the call was expected to be refused, but it succeeded")
 Issue-Commit: aa34a7732176a121f53f6fa0a60cefb8de4c89bc
 
 # cloudfront__dynamodb__lambda__s3__sfn: CreateDistribution accepts an S3 origin naming a DELETED origin access control instead of refusing it with InvalidOriginAccessControl (1 cause)

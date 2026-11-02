@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.conc-distributed-map-child-executions-listed-and-describable-per-item sfn.deep-sfn-language-states-runtime-escapes-retry-and-catch-rejected
+Issue-Trace-Ids: stepfunctions.conc-distributed-map-child-executions-listed-and-describable-per-item stepfunctions.deep-sfn-language-states-runtime-escapes-retry-and-catch-rejected
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.conc-distributed-map-child-executions-listed-and-describable-per-item|run#14|AssertionError|assert len(children) == len(_ITEMS) == len(child_arns), (
-Issue-Key: sfn.deep-sfn-language-states-runtime-escapes-retry-and-catch-rejected|run#13|AssertionError|assert bad["status"] == "FAILED", (
+Issue-Key: stepfunctions.conc-distributed-map-child-executions-listed-and-describable-per-item|run#14|AssertionError|assert len(children) == len(_ITEMS) == len(child_arns), (
+Issue-Key: stepfunctions.deep-sfn-language-states-runtime-escapes-retry-and-catch-rejected|run#13|AssertionError|assert bad["status"] == "FAILED", (
 Issue-Commit: f869d1ee30dbd1fe652bf17033c00c4415346847
 
 # Step Functions: Distributed Map spawns no child executions (ListExecutions(mapRunArn) empty) and a States.Runtime failure is wrongly retried and caught (2 causes)

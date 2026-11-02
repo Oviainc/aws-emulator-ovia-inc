@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: iot-wireless.create-wireless-gateway-task-rejects-unknown-task-definition
+Issue-Trace-Ids: iotwireless.create-wireless-gateway-task-rejects-unknown-task-definition
 Issue-Shape-Id: com.amazonaws.iotwireless#iotwireless
 Issue-Key: iot-wireless|CreateWirelessGateway|NotImplemented
 Issue-Commit: 2e707008848158ee4bc91f1419f4a05920706f3a

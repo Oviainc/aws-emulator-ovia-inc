@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2.bot-locale-build-transitions-to-built lex-models-v2.bot-version-snapshots-draft-intent lex-models-v2.build-rejects-locale-with-no-utterances lex-models-v2.build-rejects-required-slot-without-priority lex-models-v2.create-slot-rejects-unknown-slot-type lex-models-v2.create-slot-type-rejects-duplicate-name lex-models-v2.delete-bot-locale-cascades-to-intents lex-models-v2__lex-runtime-v2.recognize-text-elicits-then-resolves-slot-synonym lex-models-v2__lex-runtime-v2.recognize-text-fills-slot-from-utterance lex-models-v2__lex-runtime-v2.recognize-text-rejects-out-of-vocabulary-slot-value lex-models-v2__lex-runtime-v2.unbuilt-bot-locale-recognize-text-is-rejected
+Issue-Trace-Ids: lexv2-models.bot-locale-build-transitions-to-built lexv2-models.bot-version-snapshots-draft-intent lexv2-models.build-rejects-locale-with-no-utterances lexv2-models.build-rejects-required-slot-without-priority lexv2-models.create-slot-rejects-unknown-slot-type lexv2-models.create-slot-type-rejects-duplicate-name lexv2-models.delete-bot-locale-cascades-to-intents lexv2-models__lexv2-runtime.recognize-text-elicits-then-resolves-slot-synonym lexv2-models__lexv2-runtime.recognize-text-fills-slot-from-utterance lexv2-models__lexv2-runtime.recognize-text-rejects-out-of-vocabulary-slot-value lexv2-models__lexv2-runtime.unbuilt-bot-locale-recognize-text-is-rejected
 Issue-Key: lex-models-v2|CreateSlotType|NotImplemented
 Issue-Commit: c1b8e21acf710dd592fea1840f63adefca5c3a99
 

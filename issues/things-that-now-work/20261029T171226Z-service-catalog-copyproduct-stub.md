@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: service-catalog.copy-product-result-rejected-until-portfolio-access
+Issue-Trace-Ids: servicecatalog.copy-product-result-rejected-until-portfolio-access
 Issue-Shape-Id: com.amazonaws.servicecatalog#AWS242ServiceCatalogService
 Issue-Key: service-catalog|CopyProduct|NotImplemented
 Issue-Commit: ff63bbd76f191efb9689374a4f98215607f4bd70

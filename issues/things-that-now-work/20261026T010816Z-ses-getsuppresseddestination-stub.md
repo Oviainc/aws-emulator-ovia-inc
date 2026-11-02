@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.suppressed-destination-sandbox-refusal-effect-absent
+Issue-Trace-Ids: sesv2.suppressed-destination-sandbox-refusal-effect-absent
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
-Issue-Key: ses.suppressed-destination-sandbox-refusal-effect-absent|run#8|AssertionError|assert pre.response['Error']['Code'] == 'NotFoundException', (
+Issue-Key: sesv2.suppressed-destination-sandbox-refusal-effect-absent|run#8|AssertionError|assert pre.response['Error']['Code'] == 'NotFoundException', (
 Issue-Commit: a40a343f88e572ec4b58650c779b2f3da5268f37
 
 # Implement ses GetSuppressedDestination: unimplemented scaffold stub

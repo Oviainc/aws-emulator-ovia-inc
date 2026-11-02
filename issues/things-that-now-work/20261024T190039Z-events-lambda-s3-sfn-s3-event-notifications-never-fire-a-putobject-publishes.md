@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__lambda__s3__sfn.s3-write-triggers-eventbridge-rule-to-stepfunctions events__lambda__s3__sfn.s3-upload-triggers-lambda-then-putevents-starts-sfn
-Issue-Key: events__lambda__s3__sfn.s3-write-triggers-eventbridge-rule-to-stepfunctions|_poll_for_new_execution#18|Timeout|time.sleep(3)
-Issue-Key: events__lambda__s3__sfn.s3-upload-triggers-lambda-then-putevents-starts-sfn|_fire_until#20|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: events__lambda__s3__stepfunctions.s3-write-triggers-eventbridge-rule-to-stepfunctions events__lambda__s3__stepfunctions.s3-upload-triggers-lambda-then-putevents-starts-sfn
+Issue-Key: events__lambda__s3__stepfunctions.s3-write-triggers-eventbridge-rule-to-stepfunctions|_poll_for_new_execution#18|Timeout|time.sleep(3)
+Issue-Key: events__lambda__s3__stepfunctions.s3-upload-triggers-lambda-then-putevents-starts-sfn|_fire_until#20|Timeout|time.sleep(interval_s)
 Issue-Commit: ee21bdc0559bb252101e2375a2c132d26bd8f920
 
 # S3 event notifications never fire: a PutObject publishes no aws.s3 'Object Created' event to EventBridge and never invokes a LambdaFunctionConfiguration target (2 causes)

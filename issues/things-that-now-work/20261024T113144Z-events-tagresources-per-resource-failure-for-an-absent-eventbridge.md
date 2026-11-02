@@ -1,8 +1,8 @@
 Issue-Severity: LOW
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__resource-groups-tagging-api.tag-resources-nonexistent-rule-rejected-per-resource
-Issue-Key: events__resource-groups-tagging-api.tag-resources-nonexistent-rule-rejected-per-resource|run#18|AssertionError|assert detail["ErrorMessage"] == expected_message, (
+Issue-Trace-Ids: events__resourcegroupstaggingapi.tag-resources-nonexistent-rule-rejected-per-resource
+Issue-Key: events__resourcegroupstaggingapi.tag-resources-nonexistent-rule-rejected-per-resource|run#18|AssertionError|assert detail["ErrorMessage"] == expected_message, (
 Issue-Commit: 6b8dcd825499bdd91675cbbb3bc6eaac525bf5b8
 
 # TagResources per-resource failure for an absent EventBridge rule carries a generic ARN-echoing message instead of naming the rule and its event bus

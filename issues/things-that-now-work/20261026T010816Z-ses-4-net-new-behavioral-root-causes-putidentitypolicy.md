@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.identity-policy-wildcard-resource-rejected ses.put-identity-policy-oversized-document-rejected ses.account-dedicated-ip-auto-warmup-togglable ses.send-unverified-identity-rejected-quota-unchanged
+Issue-Trace-Ids: ses.identity-policy-wildcard-resource-rejected ses.put-identity-policy-oversized-document-rejected sesv2.account-dedicated-ip-auto-warmup-togglable ses.send-unverified-identity-rejected-quota-unchanged
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
 Issue-Key: ses.identity-policy-wildcard-resource-rejected|_err#11|AssertionError|raise AssertionError(f"expected a rejection, but the call SUCCEEDED and returned {result!r}")
 Issue-Key: ses.put-identity-policy-oversized-document-rejected|run#15|AssertionError|assert msg == expected_msg, f"expected message {expected_msg!r}, got {msg!r}"

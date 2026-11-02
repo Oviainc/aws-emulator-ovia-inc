@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: service-catalog.delete-associated-portfolio-and-product-rejected
+Issue-Trace-Ids: servicecatalog.delete-associated-portfolio-and-product-rejected
 Issue-Shape-Id: com.amazonaws.servicecatalog#AWS242ServiceCatalogService
 Issue-Key: service-catalog|ListPortfoliosForProduct|NotImplemented
 Issue-Commit: ff63bbd76f191efb9689374a4f98215607f4bd70

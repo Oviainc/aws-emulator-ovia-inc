@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__cloudfront__sns__sqs.obs-cloudfront-2-4xx-error-rate-alarm-notifies-sqs-untouched-control-stays-ok
-Issue-Key: cloudwatch__cloudfront__sns__sqs.obs-cloudfront-2-4xx-error-rate-alarm-notifies-sqs-untouched-control-stays-ok|run#18|AssertionError|assert "NonBreaching" in settled["StateReason"], (
+Issue-Trace-Ids: cloudfront__cloudwatch__sns__sqs.obs-cloudfront-2-4xx-error-rate-alarm-notifies-sqs-untouched-control-stays-ok
+Issue-Key: cloudfront__cloudwatch__sns__sqs.obs-cloudfront-2-4xx-error-rate-alarm-notifies-sqs-untouched-control-stays-ok|run#18|AssertionError|assert "NonBreaching" in settled["StateReason"], (
 Issue-Commit: 35f0669fbed72946ad7349f4657cbc8fac9f7c2b
 
 # cloudwatch__cloudfront__sns__sqs: an alarm with TreatMissingData=notBreaching over a metric with no datapoints reports a graded-datapoint OK instead of the missing-data reason (1 cause)

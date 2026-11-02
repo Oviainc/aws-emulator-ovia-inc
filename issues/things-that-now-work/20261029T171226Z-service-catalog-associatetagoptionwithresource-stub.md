@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: service-catalog.portfolio-tagoption-reaches-cloudformation-stack
+Issue-Trace-Ids: servicecatalog.portfolio-tagoption-reaches-cloudformation-stack
 Issue-Shape-Id: com.amazonaws.servicecatalog#AWS242ServiceCatalogService
 Issue-Key: service-catalog|AssociateTagOptionWithResource|NotImplemented
 Issue-Commit: ff63bbd76f191efb9689374a4f98215607f4bd70

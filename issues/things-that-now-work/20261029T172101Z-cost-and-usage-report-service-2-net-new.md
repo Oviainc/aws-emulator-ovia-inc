@@ -1,11 +1,11 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cost-and-usage-report-service.duplicate-name-put-rejected-leaves-definition-and-tags-unchanged cost-and-usage-report-service.tag-operations-on-deleted-report-are-rejected-not-silently-accepted cost-and-usage-report-service.two-independent-report-definitions-have-isolated-tag-and-delete-lifecycles
+Issue-Trace-Ids: cur.duplicate-name-put-rejected-leaves-definition-and-tags-unchanged cur.tag-operations-on-deleted-report-are-rejected-not-silently-accepted cur.two-independent-report-definitions-have-isolated-tag-and-delete-lifecycles
 Issue-Shape-Id: com.amazonaws.costandusagereportservice#AWSOrigamiServiceGatewayService
-Issue-Key: cost-and-usage-report-service.duplicate-name-put-rejected-leaves-definition-and-tags-unchanged|run#16|AssertionError|assert message == "", f"expected an empty message, got {message!r}"
-Issue-Key: cost-and-usage-report-service.tag-operations-on-deleted-report-are-rejected-not-silently-accepted|run#13|AssertionError|assert message == "", f"expected an empty message, got {message!r}"
-Issue-Key: cost-and-usage-report-service.two-independent-report-definitions-have-isolated-tag-and-delete-lifecycles|run#23|AssertionError|assert message == "", f"expected an empty message, got {message!r}"
+Issue-Key: cur.duplicate-name-put-rejected-leaves-definition-and-tags-unchanged|run#16|AssertionError|assert message == "", f"expected an empty message, got {message!r}"
+Issue-Key: cur.tag-operations-on-deleted-report-are-rejected-not-silently-accepted|run#13|AssertionError|assert message == "", f"expected an empty message, got {message!r}"
+Issue-Key: cur.two-independent-report-definitions-have-isolated-tag-and-delete-lifecycles|run#23|AssertionError|assert message == "", f"expected an empty message, got {message!r}"
 Issue-Commit: c2c15166cf9b7cee19d5a54b2d3b1c8d8385cb40
 
 # cost-and-usage-report-service: 2 net-new causes — DuplicateReportNameException and ResourceNotFoundException are returned with an emulator-authored Message where CUR returns none

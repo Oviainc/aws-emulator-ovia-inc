@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.suppressed-destination-sandbox-refusal-effect-absent
+Issue-Trace-Ids: sesv2.suppressed-destination-sandbox-refusal-effect-absent
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
-Issue-Key: ses.suppressed-destination-sandbox-refusal-effect-absent|run#13|AssertionError|assert code == 'BadRequestException', (
+Issue-Key: sesv2.suppressed-destination-sandbox-refusal-effect-absent|run#13|AssertionError|assert code == 'BadRequestException', (
 Issue-Commit: 3d58e892724a4dea7104d79d915d87cd1968e39f
 
 # Implement ses PutSuppressedDestination: unimplemented scaffold stub

@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: iot-wireless.multicast-group-device-association-tracks-membership-count
+Issue-Trace-Ids: iotwireless.multicast-group-device-association-tracks-membership-count
 Issue-Shape-Id: com.amazonaws.iotwireless#iotwireless
 Issue-Key: iot-wireless|CreateMulticastGroup|NotImplemented
 Issue-Commit: 2e707008848158ee4bc91f1419f4a05920706f3a

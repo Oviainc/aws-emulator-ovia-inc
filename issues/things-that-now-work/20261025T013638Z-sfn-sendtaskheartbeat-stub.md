@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.activity-heartbeat-timeout-closes-task-before-task-timeout sfn.e2e-activity-worker-heartbeat-success-pipeline sfn.send-task-heartbeat-task-does-not-exist sfn.task-heartbeat-keeps-execution-alive sfn.task-timed-out-error-on-heartbeat-after-window
+Issue-Trace-Ids: stepfunctions.activity-heartbeat-timeout-closes-task-before-task-timeout stepfunctions.e2e-activity-worker-heartbeat-success-pipeline stepfunctions.send-task-heartbeat-task-does-not-exist stepfunctions.task-heartbeat-keeps-execution-alive stepfunctions.task-timed-out-error-on-heartbeat-after-window
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: sfn|SendTaskHeartbeat|NotImplemented
 Issue-Commit: e5b04c00ada8052fad6ddec319a50738ff12651d

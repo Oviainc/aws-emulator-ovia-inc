@@ -1,16 +1,16 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__lambda__sfn__sqs.eventbridge-to-sqs-delivers-envelope events__lambda__sfn__sqs.eventbridge-to-lambda-invokes-with-resource-policy events__lambda__sfn__sqs.eventbridge-to-lambda-blocked-without-resource-policy events__lambda__sfn__sqs.eventbridge-fanout-lambda-sqs-sfn events__lambda__sfn__sqs.sqs-to-lambda-esm-preserves-attributes events__lambda__sfn__sqs.sqs-to-lambda-esm-handler-error-returns-message events__lambda__sfn__sqs.sqs-to-lambda-esm-rejects-role-without-receive events__lambda__sfn__sqs.sfn-task-lambda-fails-without-invoke-permission events__lambda__sfn__sqs.sfn-task-sqs-denied-without-permission
-Issue-Key: events__lambda__sfn__sqs.eventbridge-to-sqs-delivers-envelope|run#22|ValueError|event_time = datetime.datetime.strptime(
-Issue-Key: events__lambda__sfn__sqs.eventbridge-to-lambda-invokes-with-resource-policy|_receive_raw#8|Timeout|resp = ctx.client("sqs").receive_message(
-Issue-Key: events__lambda__sfn__sqs.eventbridge-to-lambda-blocked-without-resource-policy|_receive_and_drain#13|Timeout|resp = sqs.receive_message(
-Issue-Key: events__lambda__sfn__sqs.eventbridge-fanout-lambda-sqs-sfn|_receive_raw#22|Timeout|resp = ctx.client("sqs").receive_message(
-Issue-Key: events__lambda__sfn__sqs.sqs-to-lambda-esm-preserves-attributes|_wait_for_messages#8|Timeout|resp = sqs.receive_message(
-Issue-Key: events__lambda__sfn__sqs.sqs-to-lambda-esm-handler-error-returns-message|_wait_for_messages#9|AssertionError|raise AssertionError(
-Issue-Key: events__lambda__sfn__sqs.sqs-to-lambda-esm-rejects-role-without-receive|_error#4|AssertionError|raise AssertionError(f"expected the call to be rejected, but it SUCCEEDED and returned {result!r}")
-Issue-Key: events__lambda__sfn__sqs.sfn-task-lambda-fails-without-invoke-permission|run#11|AssertionError|assert "AccessDenied" in blob, f"expected an access-denied cause, got: {blob[:600]}"
-Issue-Key: events__lambda__sfn__sqs.sfn-task-sqs-denied-without-permission|_poll_until#12|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: events__lambda__sqs__stepfunctions.eventbridge-to-sqs-delivers-envelope events__lambda__sqs__stepfunctions.eventbridge-to-lambda-invokes-with-resource-policy events__lambda__sqs__stepfunctions.eventbridge-to-lambda-blocked-without-resource-policy events__lambda__sqs__stepfunctions.eventbridge-fanout-lambda-sqs-sfn events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-preserves-attributes events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-handler-error-returns-message events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-rejects-role-without-receive events__lambda__sqs__stepfunctions.sfn-task-lambda-fails-without-invoke-permission events__lambda__sqs__stepfunctions.sfn-task-sqs-denied-without-permission
+Issue-Key: events__lambda__sqs__stepfunctions.eventbridge-to-sqs-delivers-envelope|run#22|ValueError|event_time = datetime.datetime.strptime(
+Issue-Key: events__lambda__sqs__stepfunctions.eventbridge-to-lambda-invokes-with-resource-policy|_receive_raw#8|Timeout|resp = ctx.client("sqs").receive_message(
+Issue-Key: events__lambda__sqs__stepfunctions.eventbridge-to-lambda-blocked-without-resource-policy|_receive_and_drain#13|Timeout|resp = sqs.receive_message(
+Issue-Key: events__lambda__sqs__stepfunctions.eventbridge-fanout-lambda-sqs-sfn|_receive_raw#22|Timeout|resp = ctx.client("sqs").receive_message(
+Issue-Key: events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-preserves-attributes|_wait_for_messages#8|Timeout|resp = sqs.receive_message(
+Issue-Key: events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-handler-error-returns-message|_wait_for_messages#9|AssertionError|raise AssertionError(
+Issue-Key: events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-rejects-role-without-receive|_error#4|AssertionError|raise AssertionError(f"expected the call to be rejected, but it SUCCEEDED and returned {result!r}")
+Issue-Key: events__lambda__sqs__stepfunctions.sfn-task-lambda-fails-without-invoke-permission|run#11|AssertionError|assert "AccessDenied" in blob, f"expected an access-denied cause, got: {blob[:600]}"
+Issue-Key: events__lambda__sqs__stepfunctions.sfn-task-sqs-denied-without-permission|_poll_until#12|Timeout|time.sleep(interval_s)
 Issue-Commit: b1cd28f1ca277d6a032df605f83af5017e934043
 
 # The EventBridge envelope `time` field carries sub-second precision AWS never emits, and the EventBridge→Lambda, SQS ESM and SFN lambda-integration paths are inert (5 causes)

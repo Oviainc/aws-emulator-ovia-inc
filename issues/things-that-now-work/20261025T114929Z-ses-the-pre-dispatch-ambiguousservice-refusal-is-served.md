@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.contact-list-and-contacts-paginators-walk-every-item-once
+Issue-Trace-Ids: sesv2.contact-list-and-contacts-paginators-walk-every-item-once
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
-Issue-Key: ses.contact-list-and-contacts-paginators-walk-every-item-once|_create_contact_list#2|Timeout|for existing in sesv2.list_contact_lists().get('ContactLists', []):
+Issue-Key: sesv2.contact-list-and-contacts-paginators-walk-every-item-once|_create_contact_list#2|Timeout|for existing in sesv2.list_contact_lists().get('ContactLists', []):
 Issue-Commit: a97363f812621dd47aa0891b39cb5eeebafd4acb
 
 # ses: the pre-dispatch AmbiguousService refusal is served as a retryable 5xx, so a client with a larger retry budget never gets any answer — the SESv2 contact-list paginator walk hangs to the harness cap instead of failing

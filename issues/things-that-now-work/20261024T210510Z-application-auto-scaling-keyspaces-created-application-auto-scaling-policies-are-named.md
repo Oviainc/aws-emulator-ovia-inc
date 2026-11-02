@@ -1,9 +1,9 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: application-auto-scaling.keyspaces-table-auto-scaling-specification-registers-the-targets-and-policies
+Issue-Trace-Ids: application-autoscaling.keyspaces-table-auto-scaling-specification-registers-the-targets-and-policies
 Issue-Shape-Id: com.amazonaws.applicationautoscaling#AnyScaleFrontendService
-Issue-Key: application-auto-scaling.keyspaces-table-auto-scaling-specification-registers-the-targets-and-policies|run#21|AssertionError|assert (p['PolicyName'], p['PolicyType']) == (
+Issue-Key: application-autoscaling.keyspaces-table-auto-scaling-specification-registers-the-targets-and-policies|run#21|AssertionError|assert (p['PolicyName'], p['PolicyType']) == (
 Issue-Commit: 5184dca560a9e5da85ae3e6d8907d5afc24dbecc
 
 # Keyspaces-created Application Auto Scaling policies are named with the DynamoDB-style '<MetricType>:<resourceId>' convention instead of '<keyspace>-<table>-scaling-policy'

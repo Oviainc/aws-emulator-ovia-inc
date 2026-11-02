@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.update-map-run-validation-exception sfn.map-run-tolerated-failure-enforced
+Issue-Trace-Ids: stepfunctions.update-map-run-validation-exception stepfunctions.map-run-tolerated-failure-enforced
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.update-map-run-validation-exception|_error#6|AssertionError|raise AssertionError(f"real AWS rejects this call, but it SUCCEEDED and returned {result!r}")
-Issue-Key: sfn.map-run-tolerated-failure-enforced|run#16|AssertionError|assert after_first["status"] == "RUNNING", (
+Issue-Key: stepfunctions.update-map-run-validation-exception|_error#6|AssertionError|raise AssertionError(f"real AWS rejects this call, but it SUCCEEDED and returned {result!r}")
+Issue-Key: stepfunctions.map-run-tolerated-failure-enforced|run#16|AssertionError|assert after_first["status"] == "RUNNING", (
 Issue-Commit: 5dcd1bd7969c2f584c7eb42c4a26285019dddcd0
 
 # Step Functions UpdateMapRun: a no-field update is accepted with 200 instead of ValidationException, and toleratedFailureCount is never enforced server-side (2 causes)

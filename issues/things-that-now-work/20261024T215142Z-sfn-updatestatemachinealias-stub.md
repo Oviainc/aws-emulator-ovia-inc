@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.sm-alias-update-routing-weights sfn.update-alias-concurrent-modification-converges sfn.update-state-machine-alias-shifts-routing
+Issue-Trace-Ids: stepfunctions.sm-alias-update-routing-weights stepfunctions.update-alias-concurrent-modification-converges stepfunctions.update-state-machine-alias-shifts-routing
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: sfn|UpdateStateMachineAlias|NotImplemented
-Issue-Key: sfn.update-alias-concurrent-modification-converges|run#13|AssertionError|assert n_success >= 1, f"at least one concurrent UpdateStateMachineAlias must succeed: {results}"
+Issue-Key: stepfunctions.update-alias-concurrent-modification-converges|run#13|AssertionError|assert n_success >= 1, f"at least one concurrent UpdateStateMachineAlias must succeed: {results}"
 Issue-Commit: aa34a7732176a121f53f6fa0a60cefb8de4c89bc
 
 # Implement sfn UpdateStateMachineAlias: unimplemented scaffold stub

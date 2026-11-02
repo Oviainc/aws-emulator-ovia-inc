@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.account-sending-enabled-toggle ses.get-send-statistics-datapoint-shape ses.account-dedicated-ip-auto-warmup-togglable ses.get-send-quota-reflects-state ses.send-unverified-identity-rejected-quota-unchanged ses.suppressed-destination-sandbox-refusal-effect-absent ses.dedicated-ip-pool-paginator-walks-every-pool-once ses.list-dedicated-ip-pools-forged-next-token-rejected ses.iam-from-address-condition-gates-a-real-signed-send ses.send-email-missing-destination-rejected ses.list-identities-invalid-identity-type-rejected
+Issue-Trace-Ids: ses.account-sending-enabled-toggle ses.get-send-statistics-datapoint-shape sesv2.account-dedicated-ip-auto-warmup-togglable ses.get-send-quota-reflects-state ses.send-unverified-identity-rejected-quota-unchanged sesv2.suppressed-destination-sandbox-refusal-effect-absent sesv2.dedicated-ip-pool-paginator-walks-every-pool-once sesv2.list-dedicated-ip-pools-forged-next-token-rejected ses.iam-from-address-condition-gates-a-real-signed-send ses.send-email-missing-destination-rejected ses.list-identities-invalid-identity-type-rejected
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
 Issue-Key: ses|GetAccountSendingEnabled|InvalidAction
 Issue-Key: ses|GetSendStatistics|InvalidAction

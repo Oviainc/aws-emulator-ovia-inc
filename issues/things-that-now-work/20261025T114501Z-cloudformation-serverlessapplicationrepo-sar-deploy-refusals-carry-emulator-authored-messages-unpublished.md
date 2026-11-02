@@ -1,9 +1,9 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudformation__serverlessapplicationrepository__sqs.deploy-sar-changeset-for-unpublished-version-rejected cloudformation__serverlessapplicationrepository__sqs.rejects-changeset-for-versionless-application
-Issue-Key: cloudformation__serverlessapplicationrepository__sqs.deploy-sar-changeset-for-unpublished-version-rejected|run#13|AssertionError|assert message == expected, f"rejection message {message!r} != {expected!r}"
-Issue-Key: cloudformation__serverlessapplicationrepository__sqs.rejects-changeset-for-versionless-application|run#10|AssertionError|assert (code, message) == ("BadRequestException", _NO_VERSION_CHANGE_SET), (
+Issue-Trace-Ids: cloudformation__serverlessrepo__sqs.deploy-sar-changeset-for-unpublished-version-rejected cloudformation__serverlessrepo__sqs.rejects-changeset-for-versionless-application
+Issue-Key: cloudformation__serverlessrepo__sqs.deploy-sar-changeset-for-unpublished-version-rejected|run#13|AssertionError|assert message == expected, f"rejection message {message!r} != {expected!r}"
+Issue-Key: cloudformation__serverlessrepo__sqs.rejects-changeset-for-versionless-application|run#10|AssertionError|assert (code, message) == ("BadRequestException", _NO_VERSION_CHANGE_SET), (
 Issue-Commit: a97363f812621dd47aa0891b39cb5eeebafd4acb
 
 # SAR deploy refusals carry emulator-authored messages: unpublished-version 404 and versionless-application 400 do not use AWS's wording

@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: bedrock-agent-runtime.agentcore-memory-record-delete-removes-only-that-record
+Issue-Trace-Ids: bedrock-agentcore.agentcore-memory-record-delete-removes-only-that-record
 Issue-Shape-Id: com.amazonaws.bedrockagentruntime#AmazonBedrockAgentRunTimeService
 Issue-Key: bedrock-agentcore|BatchCreateMemoryRecords|NotImplemented
 Issue-Commit: d7c92a359e65b119da339df847b0735e9ef403e3

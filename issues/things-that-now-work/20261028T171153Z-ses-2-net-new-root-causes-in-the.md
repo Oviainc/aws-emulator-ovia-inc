@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.configuration-set-sending-disabled-blocks-v2-send-email-then-restored ses.configuration-set-tracking-options-lifecycle-with-verified-domain
+Issue-Trace-Ids: sesv2.configuration-set-sending-disabled-blocks-v2-send-email-then-restored ses.configuration-set-tracking-options-lifecycle-with-verified-domain
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
-Issue-Key: ses.configuration-set-sending-disabled-blocks-v2-send-email-then-restored|_send_expect_paused#14|Timeout|time.sleep(2.0)
+Issue-Key: sesv2.configuration-set-sending-disabled-blocks-v2-send-email-then-restored|_send_expect_paused#14|Timeout|time.sleep(2.0)
 Issue-Key: ses.configuration-set-tracking-options-lifecycle-with-verified-domain|run#17|AssertionError|assert dup == expected_dup, (
 Issue-Commit: e09687ccd784c01fa8090fa7f40964051dd69a6c
 

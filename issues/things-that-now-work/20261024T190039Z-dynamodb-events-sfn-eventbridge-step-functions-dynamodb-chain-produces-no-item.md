@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: dynamodb__events__sfn.eventbridge-to-sfn-to-ddb-chain
-Issue-Key: dynamodb__events__sfn.eventbridge-to-sfn-to-ddb-chain|run#28|Timeout|time.sleep(3)
+Issue-Trace-Ids: dynamodb__events__stepfunctions.eventbridge-to-sfn-to-ddb-chain
+Issue-Key: dynamodb__events__stepfunctions.eventbridge-to-sfn-to-ddb-chain|run#28|Timeout|time.sleep(3)
 Issue-Commit: ee21bdc0559bb252101e2375a2c132d26bd8f920
 
 # EventBridge -> Step Functions -> DynamoDB chain produces no item: the dynamodb:putItem Task state is never executed, so the chain's far-end effect never appears

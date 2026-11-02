@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__iam__sfn__sqs.xsvc-iam-3-role-without-start-execution-denied-dead-letters-and-counts-failed-invocations
-Issue-Key: events__iam__sfn__sqs.xsvc-iam-3-role-without-start-execution-denied-dead-letters-and-counts-failed-invocations|_poll_until#35|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: events__iam__sqs__stepfunctions.xsvc-iam-3-role-without-start-execution-denied-dead-letters-and-counts-failed-invocations
+Issue-Key: events__iam__sqs__stepfunctions.xsvc-iam-3-role-without-start-execution-denied-dead-letters-and-counts-failed-invocations|_poll_until#35|Timeout|time.sleep(interval_s)
 Issue-Commit: 415bc37b6ebe55c6c7e638f2212d4379947a3e7c
 
 # events__iam__sfn__sqs: an EventBridge rule whose Step Functions target role lacks states:StartExecution produces no delivery, no DLQ dead-letter and no FailedInvocations datapoint, so the check hangs to the 60 s cap

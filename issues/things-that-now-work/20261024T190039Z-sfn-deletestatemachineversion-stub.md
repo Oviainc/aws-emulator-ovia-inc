@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.sm-version-publish-list-delete
+Issue-Trace-Ids: stepfunctions.sm-version-publish-list-delete
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: sfn|DeleteStateMachineVersion|NotImplemented
 Issue-Commit: ee21bdc0559bb252101e2375a2c132d26bd8f920

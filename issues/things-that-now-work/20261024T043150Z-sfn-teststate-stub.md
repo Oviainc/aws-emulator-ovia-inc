@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.test-state-executes-single-state-without-execution sfn.test-state-pass-state
+Issue-Trace-Ids: stepfunctions.test-state-executes-single-state-without-execution stepfunctions.test-state-pass-state
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: sfn|TestState|NotImplemented
 Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529

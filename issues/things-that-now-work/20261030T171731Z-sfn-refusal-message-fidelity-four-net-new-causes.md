@@ -1,13 +1,13 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.log-sfn-apigw-agreement-update-to-unqualified-log-group-arn-rejected-and-delivery-unchanged sfn.create-state-machine-definition-exceeds-size-limit-rejected sfn.test-state-invalid-execution-input-rejected sfn.reject-test-state-invalid-execution-input sfn.delete-state-machine-alias-after-sm-delete-not-found
+Issue-Trace-Ids: stepfunctions.log-sfn-apigw-agreement-update-to-unqualified-log-group-arn-rejected-and-delivery-unchanged stepfunctions.create-state-machine-definition-exceeds-size-limit-rejected stepfunctions.test-state-invalid-execution-input-rejected stepfunctions.reject-test-state-invalid-execution-input stepfunctions.delete-state-machine-alias-after-sm-delete-not-found
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: sfn|UpdateStateMachine|InvalidLoggingConfiguration
-Issue-Key: sfn.create-state-machine-definition-exceeds-size-limit-rejected|run#22|AssertionError|assert message_malformed == (
-Issue-Key: sfn.test-state-invalid-execution-input-rejected|run#9|AssertionError|assert message == _MALFORMED_INPUT_MESSAGE, f"unexpected InvalidExecutionInput message: {message!r}"
-Issue-Key: sfn.reject-test-state-invalid-execution-input|run#9|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
-Issue-Key: sfn.delete-state-machine-alias-after-sm-delete-not-found|run#14|AssertionError|assert mutate_message == f"Resource not found: '{alias_arn}'", (
+Issue-Key: stepfunctions.create-state-machine-definition-exceeds-size-limit-rejected|run#22|AssertionError|assert message_malformed == (
+Issue-Key: stepfunctions.test-state-invalid-execution-input-rejected|run#9|AssertionError|assert message == _MALFORMED_INPUT_MESSAGE, f"unexpected InvalidExecutionInput message: {message!r}"
+Issue-Key: stepfunctions.reject-test-state-invalid-execution-input|run#9|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: stepfunctions.delete-state-machine-alias-after-sm-delete-not-found|run#14|AssertionError|assert mutate_message == f"Resource not found: '{alias_arn}'", (
 Issue-Commit: 0deae0340a86101143c629cc9b774419f34d5675
 
 # sfn refusal-message fidelity: four net-new causes — InvalidLoggingConfiguration qualifier text, InvalidDefinition JSON locator, TestState InvalidExecutionInput locator (and leaked sensitive input), and the alias-mutation ResourceNotFound after a parent-state-machine delete

@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.deep-sfn-2-sfn-jsonata-error-output-outside-catch-rejected sfn.deep-sfn-2-sfn-jsonata-jsonpath-state-under-jsonata-machine-rejected sfn.deep-sfn-2-sfn-jsonata-pass-states-result-rejected sfn.reject-validate-definition-catches-invalid-asl sfn.validate-state-machine-definition-reports-errors
+Issue-Trace-Ids: stepfunctions.deep-sfn-2-sfn-jsonata-error-output-outside-catch-rejected stepfunctions.deep-sfn-2-sfn-jsonata-jsonpath-state-under-jsonata-machine-rejected stepfunctions.deep-sfn-2-sfn-jsonata-pass-states-result-rejected stepfunctions.reject-validate-definition-catches-invalid-asl stepfunctions.validate-state-machine-definition-reports-errors
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: sfn|ValidateStateMachineDefinition|NotImplemented
 Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529

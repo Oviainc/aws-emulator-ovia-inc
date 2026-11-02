@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: athena__s3__sfn.xsvc-sfn-1-athena-sync-stop-execution-cancels-the-running-query
-Issue-Key: athena__s3__sfn.xsvc-sfn-1-athena-sync-stop-execution-cancels-the-running-query|_start_until_submitted#8|AssertionError|raise AssertionError(
+Issue-Trace-Ids: athena__s3__stepfunctions.xsvc-sfn-1-athena-sync-stop-execution-cancels-the-running-query
+Issue-Key: athena__s3__stepfunctions.xsvc-sfn-1-athena-sync-stop-execution-cancels-the-running-query|_start_until_submitted#8|AssertionError|raise AssertionError(
 Issue-Commit: c80575fbbaf36d0a7150291b1a3e8f1ca5d00b60
 
 # Step Functions refuses the `.sync` service-integration pattern outright: a Task on arn:aws:states:::athena:startQueryExecution.sync fails the execution with States.Runtime, so StopExecution can never propagate an abort to the downstream query

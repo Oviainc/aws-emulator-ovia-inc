@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: glue__s3__sfn.xsvc-sfn-1-glue-sync-stop-execution-stops-the-running-job-run
-Issue-Key: glue__s3__sfn.xsvc-sfn-1-glue-sync-stop-execution-stops-the-running-job-run|_start_until_submitted#10|AssertionError|raise AssertionError(f"the task never submitted its job run: {last!r}")
+Issue-Trace-Ids: glue__s3__stepfunctions.xsvc-sfn-1-glue-sync-stop-execution-stops-the-running-job-run
+Issue-Key: glue__s3__stepfunctions.xsvc-sfn-1-glue-sync-stop-execution-stops-the-running-job-run|_start_until_submitted#10|AssertionError|raise AssertionError(f"the task never submitted its job run: {last!r}")
 Issue-Commit: da7bc09c8c1c199d36cb9fc39c5c5796d768dc3a
 
 # glue__s3__sfn: Step Functions refuses the `.sync` service-integration pattern outright, so a glue:startJobRun.sync task never submits a job run and StopExecution can never be shown to stop it

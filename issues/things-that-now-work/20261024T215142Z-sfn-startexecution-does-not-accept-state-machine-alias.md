@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.alias-repoint-to-foreign-state-machine-version-rejected sfn.e2e-alias-weighted-routing-traffic-split-observed sfn.alias-routing-config-invalid-version-rejected
+Issue-Trace-Ids: stepfunctions.alias-repoint-to-foreign-state-machine-version-rejected stepfunctions.e2e-alias-weighted-routing-traffic-split-observed stepfunctions.alias-routing-config-invalid-version-rejected
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: sfn|StartExecution|StateMachineDoesNotExist
-Issue-Key: sfn.alias-routing-config-invalid-version-rejected|run#14|AssertionError|assert err == expected, f"expected {expected}, got {err}"
+Issue-Key: stepfunctions.alias-routing-config-invalid-version-rejected|run#14|AssertionError|assert err == expected, f"expected {expected}, got {err}"
 Issue-Commit: aa34a7732176a121f53f6fa0a60cefb8de4c89bc
 
 # sfn: StartExecution does not accept state machine ALIAS ARNs (StateMachineDoesNotExist), and CreateStateMachineAlias' ResourceNotFound carries a generic lookup message (2 causes)

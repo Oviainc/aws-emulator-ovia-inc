@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: glue__kinesis-analytics-v2.studio-notebook-naming-a-catalog-database-that-does-not-exist-rejected glue__kinesis-analytics-v2.dropping-the-catalog-database-strands-the-notebook-until-it-is-recreated
-Issue-Key: glue__kinesis-analytics-v2.studio-notebook-naming-a-catalog-database-that-does-not-exist-rejected|_error#13|AssertionError|raise AssertionError(f"the call succeeded where real AWS rejects it: {result!r}"[:600])
-Issue-Key: glue__kinesis-analytics-v2.dropping-the-catalog-database-strands-the-notebook-until-it-is-recreated|run#16|AssertionError|assert code == "InvalidArgumentException", (
+Issue-Trace-Ids: glue__kinesisanalyticsv2.studio-notebook-naming-a-catalog-database-that-does-not-exist-rejected glue__kinesisanalyticsv2.dropping-the-catalog-database-strands-the-notebook-until-it-is-recreated
+Issue-Key: glue__kinesisanalyticsv2.studio-notebook-naming-a-catalog-database-that-does-not-exist-rejected|_error#13|AssertionError|raise AssertionError(f"the call succeeded where real AWS rejects it: {result!r}"[:600])
+Issue-Key: glue__kinesisanalyticsv2.dropping-the-catalog-database-strands-the-notebook-until-it-is-recreated|run#16|AssertionError|assert code == "InvalidArgumentException", (
 Issue-Commit: 060392db00c5b3260ef85f15c64a4c64c2352242
 
 # glue__kinesis-analytics-v2: the Glue Data Catalog is never resolved by Studio-notebook CreateApplication, and UpdateApplication is still a 501 scaffold stub (2 causes)

@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__glue__lambda__logs__s3__sfn.cdk-bootstrapped-sfn-etl-workflow
-Issue-Key: cloudwatch__glue__lambda__logs__s3__sfn.cdk-bootstrapped-sfn-etl-workflow|_cdk_failed#8|AssertionError|raise AssertionError(f"{STATE_MARKER}: {what} rc={done.returncode}: {tail}")
+Issue-Trace-Ids: cloudwatch__glue__lambda__logs__s3__stepfunctions.cdk-bootstrapped-sfn-etl-workflow
+Issue-Key: cloudwatch__glue__lambda__logs__s3__stepfunctions.cdk-bootstrapped-sfn-etl-workflow|_cdk_failed#8|AssertionError|raise AssertionError(f"{STATE_MARKER}: {what} rc={done.returncode}: {tail}")
 Issue-Commit: 483d650f1d2fec6203edc8ec91bc65f69df3bd2d
 
 # cloudwatch__glue__lambda__logs__s3__sfn: CloudFormation CreateChangeSet with TemplateURL is unimplemented, so no CDK-bootstrapped deploy can run (1 cause)

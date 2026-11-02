@@ -1,10 +1,10 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: signer-data.certificate-hashes-empty-list-rejected signer-data.platform-id-pattern-rejected
+Issue-Trace-Ids: signer.certificate-hashes-empty-list-rejected signer.platform-id-pattern-rejected
 Issue-Shape-Id: com.amazonaws.signerdata#SignerDataPlane
-Issue-Key: signer-data.certificate-hashes-empty-list-rejected|run#8|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
-Issue-Key: signer-data.platform-id-pattern-rejected|run#9|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: signer.certificate-hashes-empty-list-rejected|run#8|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: signer.platform-id-pattern-rejected|run#9|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
 Issue-Commit: b67cec46cc74cc34fd8af0c0592a7b189d0e9cd6
 
 # GetRevocationStatus words two input refusals wrongly: generic framework text for an empty certificateHashes, and a platform-not-found error for a platformId that violates @pattern
