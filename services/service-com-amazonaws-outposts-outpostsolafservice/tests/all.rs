@@ -123,6 +123,8 @@ mod quote_lifecycle;
 mod quote_listing;
 #[path = "all/quote_options.rs"]
 mod quote_options;
+#[path = "all/quote_price_range.rs"]
+mod quote_price_range;
 #[path = "all/quote_store_bound.rs"]
 mod quote_store_bound;
 #[path = "all/quote_update.rs"]

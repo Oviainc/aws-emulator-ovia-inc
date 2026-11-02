@@ -3041,9 +3041,19 @@ pub const PAYMENT_OPTION_UPFRONT_SHARE: &[(&str, f32)] = &[
 /// twice as much, and a longer term costs more over the term than a shorter one.
 pub const SUBSCRIPTION_PRICE_PER_VCPU_MONTH: f32 = 20.0;
 
-/// `amount` rounded to the cent, the precision a price is quoted to.
-fn to_the_cent(amount: f32) -> f32 {
-    (amount * 100.0).round() / 100.0
+/// `amount` rounded to the cent — the precision a price is quoted to — as the
+/// modelled price member carries it, or `None` for an amount no price member can
+/// carry.
+///
+/// A price is modelled a single-precision number (`SubscriptionPricingDetails$UpfrontPrice`
+/// and `$MonthlyRecurringPrice` both target `NullableFloat`), so the figure answered
+/// has to be a FINITE value of that type: an amount whose rounded value is beyond
+/// that range is no figure this service can quote, and the non-finite values such an
+/// amount saturates to are not numbers JSON can carry at all. The rounding itself is
+/// done in double precision, so it can never push an in-range amount out of range.
+fn to_the_cent(amount: f64) -> Option<f32> {
+    let rounded = ((amount * 100.0).round() / 100.0) as f32;
+    rounded.is_finite().then_some(rounded)
 }
 
 /// What a subscription on `vcpus` vCPUs of EC2 capacity costs under `payment_option`
@@ -3060,14 +3070,23 @@ fn to_the_cent(amount: f32) -> f32 {
 /// ([`PAYMENT_OPTION_UPFRONT_SHARE`]) is paid up front and the rest in equal monthly
 /// instalments. Every figure follows from the capacity it was given, so one price is
 /// answered the same in every process and on every call.
+///
+/// It is also `None` when the figures that rule gives are beyond what a modelled
+/// price member can carry ([`to_the_cent`]): a price this service cannot state is not
+/// a price, so the option is left out exactly as it is for capacity there is no
+/// figure for — never answered as the non-finite value the arithmetic saturates to.
+/// The whole computation is carried out in double precision, so that only the
+/// FIGURE's own range decides that, and not an intermediate step of a rule stated on
+/// amounts.
 pub fn subscription_price(
-    vcpus: f32,
+    vcpus: f64,
     payment_option: &str,
     payment_term: &str,
 ) -> Option<SubscriptionPricingDetails> {
     let (_, share) = PAYMENT_OPTION_UPFRONT_SHARE
         .iter()
         .find(|(option, _)| *option == payment_option)?;
+    let share = f64::from(*share);
     let (_, months) = PAYMENT_TERM_MONTHS
         .iter()
         .find(|(term, _)| *term == payment_term)?;
@@ -3076,13 +3095,13 @@ pub fn subscription_price(
         // priced at all.
         return None;
     }
-    let monthly_rate = vcpus * SUBSCRIPTION_PRICE_PER_VCPU_MONTH;
-    let term = monthly_rate * *months as f32;
+    let monthly_rate = vcpus * f64::from(SUBSCRIPTION_PRICE_PER_VCPU_MONTH);
+    let term = monthly_rate * f64::from(*months);
     Some(SubscriptionPricingDetails {
         payment_option: Some(payment_option.to_string()),
         payment_term: Some(payment_term.to_string()),
-        upfront_price: Some(to_the_cent(term * share)),
-        monthly_recurring_price: Some(to_the_cent(monthly_rate * (1.0 - share))),
+        upfront_price: Some(to_the_cent(term * share)?),
+        monthly_recurring_price: Some(to_the_cent(monthly_rate * (1.0 - share))?),
         currency: Some(CURRENCY_USD.to_string()),
     })
 }
@@ -4145,7 +4164,7 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         payment_term: &str,
     ) -> Option<SubscriptionPricingDetails> {
         subscription_price(
-            self.subscribed_capacity_vcpus(region, outpost_id) as f32,
+            self.subscribed_capacity_vcpus(region, outpost_id) as f64,
             payment_option,
             payment_term,
         )
@@ -4212,7 +4231,9 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// service prices a subscription by — on the EC2 capacity the option provides
     /// ([`Self::quoted_capacity_vcpus`]), so what a quote quotes and what a renewal
     /// of the same capacity costs cannot disagree. A combination there is nothing to
-    /// price under is left out rather than reported at a figure the emulator invented.
+    /// price under is left out rather than reported at a figure the emulator invented
+    /// — including one whose figures are beyond what a modelled price member can
+    /// carry, for the reason [`subscription_price`] states.
     fn quote_pricing(
         &self,
         capacities: &[QuoteCapacity],
@@ -4262,7 +4283,14 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// catalog publishes no instance type for, and one asking for no instances at all
     /// contribute nothing: capacity this service publishes no figure for is not
     /// capacity the emulator can price, and never one it invents.
-    pub fn quoted_capacity_vcpus(&self, capacities: &[QuoteCapacity]) -> f32 {
+    ///
+    /// Totalled in double precision, which is wide enough for every total the
+    /// modelled request can describe — the largest `QuoteCapacity$Quantity` its
+    /// single-precision type carries, times the largest vCPU figure the catalog
+    /// publishes, over the whole `QuoteCapacityList` — so the capacity a quote is
+    /// priced on is the capacity it asked for, and never a value the arithmetic
+    /// saturated to.
+    pub fn quoted_capacity_vcpus(&self, capacities: &[QuoteCapacity]) -> f64 {
         capacities
             .iter()
             .filter(|capacity| {
@@ -4273,7 +4301,7 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
                 let quantity = capacity
                     .quantity
                     .filter(|quantity| quantity.is_finite() && *quantity > 0.0)?;
-                Some(quantity * vcpus as f32)
+                Some(f64::from(quantity) * f64::from(vcpus))
             })
             .sum()
     }

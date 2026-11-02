@@ -205,7 +205,7 @@ fn every_combination() -> Vec<(String, String)> {
 /// How many vCPUs the orderable-instance-type catalog publishes for one instance
 /// type, read through the store seam [`crate::quote_lifecycle`] ages a quote through
 /// — the catalog's own published figure, never one this suite picked.
-fn published_vcpus(outposts: &Outposts, instance_type: &str) -> f64 {
+pub(crate) fn published_vcpus(outposts: &Outposts, instance_type: &str) -> f64 {
     let published = outposts.store().lock().published_vcpus(instance_type);
     f64::from(
         published
@@ -300,7 +300,7 @@ type CheckCase<'a> = (
 type RepriceCase<'a> = (&'a str, Value, bool, f64, Vec<(String, String)>, &'a str);
 
 /// One requested capacity of `quantity` instances of `instance_type`.
-fn ec2(instance_type: &str, quantity: f64) -> Value {
+pub(crate) fn ec2(instance_type: &str, quantity: f64) -> Value {
     json!({ "QuoteCapacityType": "EC2", "Unit": instance_type, "Quantity": quantity })
 }
 
