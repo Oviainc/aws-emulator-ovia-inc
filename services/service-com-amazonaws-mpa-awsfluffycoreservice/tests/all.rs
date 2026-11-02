@@ -63,6 +63,8 @@ mod key_token_pagination;
 mod management_account_gate_order;
 #[path = "all/pagination_token_provenance.rs"]
 mod pagination_token_provenance;
+#[path = "all/pagination_token_spelling.rs"]
+mod pagination_token_spelling;
 #[path = "all/pending_baseline_session_uniqueness.rs"]
 mod pending_baseline_session_uniqueness;
 #[path = "all/pending_team_update.rs"]

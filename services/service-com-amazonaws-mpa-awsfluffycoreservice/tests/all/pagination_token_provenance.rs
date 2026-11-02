@@ -33,7 +33,7 @@ use crate::approval_team_lifecycle::{encode_label, error_code, text, Harness, RE
 
 /// `MaxResults` is modelled `range(min: 1, max: 20)`: the narrowest page a client may ask
 /// for, so a fixture of several records always hands out a token on its first page.
-const NARROWEST_PAGE: i64 = 1;
+pub(crate) const NARROWEST_PAGE: i64 = 1;
 
 /// `MaxResults`' modelled maximum, which is also its modelled `default`: wide enough that
 /// one page reports every record each fixture below holds.
@@ -323,7 +323,7 @@ fn policies_with_versions(harness: &Harness, least: usize) -> Vec<String> {
 
 /// A store holding, for every paginated listing of this service, a fixture of several
 /// records — and the listing calls that page over them.
-async fn fixtures() -> (Harness, Vec<Listing>) {
+pub(crate) async fn fixtures() -> (Harness, Vec<Listing>) {
     let harness = Harness::new();
 
     // Two ACTIVE teams, each with its own sessions: the same operation over two

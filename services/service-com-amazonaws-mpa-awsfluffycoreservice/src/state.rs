@@ -185,7 +185,10 @@
 //! [`listing_token`]) — and is only resumable there: a token this listing cannot read, a
 //! token another listing issued, and a token naming a record this listing does not hold
 //! are all refused ([`token_key`], [`page_after_position`], [`page_after_key`]) rather
-//! than answered with a page.
+//! than answered with a page. A listing hands a key out by RENDERING the value it names,
+//! so one value has exactly one spelling in a token of this service's and a key is read
+//! back only in that spelling (`canonical_key`): a key that merely parses to a value
+//! this listing holds is a key no page of it ever handed out.
 //!
 //! Whether a token was handed out is decided against every record the listing pages over,
 //! never against the narrower set a request's own narrowing admits
@@ -605,15 +608,38 @@ pub fn position_token(listing: Listing<'_>, position: u64) -> String {
 }
 
 /// The position `listing` resumes AFTER, read out of the request's `NextToken` — `None`
-/// when the request carries no token: [`token_key`] read as a position.
+/// when the request carries no token: [`token_key`] read as a position, in the one
+/// spelling [`position_token`] renders a position in (`canonical_key`).
 pub fn token_position(
     listing: Listing<'_>,
     next_token: Option<&str>,
 ) -> Result<Option<u64>, ValidationException> {
     match token_key(listing, next_token)? {
         None => Ok(None),
-        Some(key) => key.parse::<u64>().map(Some).map_err(|_| foreign_next_token()),
+        Some(key) => canonical_key::<u64>(&key).map(Some),
     }
+}
+
+/// The value `key` names, read back only in the spelling this service MINTS for it —
+/// [`foreign_next_token`] for any other text.
+///
+/// A listing hands a key out by RENDERING the value it names: a position through `u64`'s
+/// `Display` ([`position_token`]), a catalog key through the map key's own
+/// ([`page_after_key`]). So one value has exactly one spelling in a token of this
+/// service's, and reading a key back has to reproduce the text a page handed out. Rust's
+/// integer `FromStr` also accepts a leading sign and any amount of zero padding, and those
+/// spellings render differently — they belong to no token this listing ever issued, so
+/// they are refused here with the rest of the grammar rather than carried on as the value
+/// they happen to parse as, which a held record would then answer with a page.
+fn canonical_key<K>(key: &str) -> Result<K, ValidationException>
+where
+    K: ::std::str::FromStr + ::std::fmt::Display,
+{
+    let value = key.parse::<K>().map_err(|_| foreign_next_token())?;
+    if value.to_string() != key {
+        return Err(foreign_next_token());
+    }
+    Ok(value)
 }
 
 /// The ordering key `listing` resumes AFTER, read out of the request's `NextToken` in the
@@ -623,8 +649,9 @@ pub fn token_position(
 ///
 /// This is the GRAMMAR half of the token rule, and it needs none of the records: a token
 /// naming another listing (or the same listing of another resource), and one whose key is
-/// not a key of this map's type at all, is refused with [`foreign_next_token`] here. That
-/// the key was also HANDED OUT is decided against the records themselves, by
+/// not a key of this map's type at all — or is not the spelling this listing renders such
+/// a key as (`canonical_key`) — is refused with [`foreign_next_token`] here. That the
+/// key was also HANDED OUT is decided against the records themselves, by
 /// [`page_after_key`]. So a listing scoped to one named resource can read its token with
 /// the rest of the request's shape, before it decides whether that resource exists.
 pub fn token_map_key<K>(
@@ -632,11 +659,11 @@ pub fn token_map_key<K>(
     next_token: Option<&str>,
 ) -> Result<Option<K>, ValidationException>
 where
-    K: ::std::str::FromStr,
+    K: ::std::str::FromStr + ::std::fmt::Display,
 {
     match token_key(listing, next_token)? {
         None => Ok(None),
-        Some(key) => key.parse::<K>().map(Some).map_err(|_| foreign_next_token()),
+        Some(key) => canonical_key::<K>(&key).map(Some),
     }
 }
 
