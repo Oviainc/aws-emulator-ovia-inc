@@ -16,10 +16,13 @@
 //! `issues/things-that-now-work/20261022T031134Z-b2bi-tagging-test-harness-and-transformer-operations-answer.md`
 //! asserts `ValidationException` for tagging a deleted profile's well-formed ARN, i.e.
 //! this write validates `ResourceARN` as the request parameter it is rather than
-//! reporting the resource absent. The REPORTING `ListTagsForResource` keeps the two-way
-//! split (400 for a value that is not an ARN, 404 for a well-formed ARN naming no
-//! resource), and both operations resolve an ARN through the same `crate::state` helpers,
-//! so they cannot disagree about which resource an ARN names.
+//! reporting the resource absent. The wording differs per step: the rejected value itself
+//! for something that is not an ARN (`crate::state::invalid_arn`), and the one fixed
+//! sentence for an ARN that parses and addresses nothing
+//! (`crate::state::INVALID_INPUT_ARN`). `ListTagsForResource` and `UntagResource` validate
+//! the member in the same two steps, with the same two sentences, and all three resolve an
+//! ARN through the same `crate::state` helpers, so they cannot disagree about which
+//! resource an ARN names.
 //!
 //! A call that would carry a resource past [`crate::state::MAX_TAGS_PER_RESOURCE`] tags,
 //! or that claims a key under the prefix AWS reserves for its own tags, is refused with
@@ -200,14 +203,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request's signing scope takes part in this.
         let _ = ctx;
 
-        // Syntax first, and before the store is locked: something that is not an ARN at
-        // all cannot name a resource, so answering it is a pure function of the request —
-        // a malformed ARN therefore never contends for the state lock.
-        // (`ListTagsForResource` orders the same two steps the same way.) The modelled
-        // `len 1..1011` bound on `ResourceARN` is already enforced before this handler
-        // runs; the grammar is not.
+        // Syntax first, and before the store is locked: a value that is not an ARN at all
+        // cannot name a resource, so answering it is a pure function of the request — a
+        // malformed ARN therefore never contends for the state lock — and the recorded
+        // wording for it names the value that was rejected. (`ListTagsForResource` orders
+        // the same two steps the same way.) The modelled `len 1..1011` bound on
+        // `ResourceARN` is already enforced before this handler runs; the grammar is not.
         if !crate::state::is_arn(&input.resource_arn) {
-            return Err(invalid(format!("Invalid ARN {}", input.resource_arn)));
+            return Err(invalid(crate::state::invalid_arn(&input.resource_arn)));
         }
 
         let Some(store) = crate::state::service_state(&*self.engine) else {
@@ -221,14 +224,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = store.lock();
 
-        // A well-formed ARN that no stored resource carries — a stale ARN whose resource
-        // has been deleted, or one that differs from a stored one in its region, account
-        // or resource type — is refused the same way here, and nothing is stored.
+        // An ARN that parses is RESOLVED: one no stored resource carries — a stale ARN
+        // whose resource has been deleted, or one differing from a stored one in its
+        // region, account or resource type — is the invalid input ARN this service states
+        // for an ARN that addresses nothing (`ListTagsForResource` and `UntagResource`
+        // answer it the same way), and nothing is stored.
         let Some(held) = state.tags_by_arn_mut(&input.resource_arn) else {
-            return Err(invalid(format!(
-                "Invalid ARN {}: it names no resource in this account",
-                input.resource_arn
-            )));
+            return Err(invalid(crate::state::INVALID_INPUT_ARN.to_string()));
         };
 
         // The merge itself enforces what a tag write cannot do — grow the set past the

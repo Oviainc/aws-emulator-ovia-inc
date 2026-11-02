@@ -177,6 +177,39 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The fully-qualified shape id each modelled error of this service travels under on the
+/// wire, as its recorded error bodies name it.
+///
+/// This service's wire `__type` is the qualified shape id in the namespace the service
+/// uses internally, which is NOT the namespace its public model is written in, so the
+/// qualified form cannot be derived from the model and is listed here. The entries are
+/// this service's error shapes
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException,ValidationException,AccessDeniedException,ConflictException,ServiceQuotaExceededException,ThrottlingException,InternalServerException")`);
+/// an error shape absent from the list keeps its bare name, which is what every error
+/// carried before.
+///
+/// `__type` is the discriminator an SDK resolves the error CLASS from, and it resolves it
+/// by the shape name after the `#`, so a qualified id names the same class to a client as
+/// the bare name does.
+const WIRE_SHAPE_IDS: &[&str] = &[
+    "com.amazonaws.visby#AccessDeniedException",
+    "com.amazonaws.visby#ConflictException",
+    "com.amazonaws.visby#InternalServerException",
+    "com.amazonaws.visby#ResourceNotFoundException",
+    "com.amazonaws.visby#ServiceQuotaExceededException",
+    "com.amazonaws.visby#ThrottlingException",
+    "com.amazonaws.visby#ValidationException",
+];
+
+/// The qualified wire id for the error shape named `shape_name`, or `None` for a name
+/// [`WIRE_SHAPE_IDS`] does not list.
+pub fn wire_shape_id(shape_name: &str) -> Option<&'static str> {
+    WIRE_SHAPE_IDS
+        .iter()
+        .copied()
+        .find(|id| id.split('#').next_back() == Some(shape_name))
+}
+
 /// The HTTP status this service puts on the wire for every modelled refusal that says
 /// the resource a request names does not exist.
 ///
@@ -304,12 +337,21 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
 
     /// The wire error code (`__type` on JSON/CBOR, `<Code>` on XML).
     ///
-    /// Keep the literal as it is: changing it changes the wire error code clients match
-    /// on. It is intentionally not tied to the Rust variant name.
+    /// A MODELED error travels under the fully-qualified shape id this service's recorded
+    /// error bodies carry ([`wire_shape_id`]); an SDK resolves the class from the shape
+    /// name after the `#`, so the class a client reads is the one the model declares.
+    ///
+    /// The two synthetic shapes keep their bare names: neither is in this service's model,
+    /// so neither HAS a shape id of this service to qualify. For the scaffold signal that
+    /// is right — no modelled shape describes a request nobody has implemented. For the
+    /// request-refusal shape it is a KNOWN LIMITATION: the real service answers input
+    /// validation with its OWN `ValidationException`, so a handler that refuses a bad
+    /// request should prefer the modelled variant (see [`Scaffolded::validation`]) wherever
+    /// its operation lists one.
     fn shape_name(&self) -> &'static str {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
-            Self::Modeled(e) => e.shape_name(),
+            Self::Modeled(e) => wire_shape_id(e.shape_name()).unwrap_or_else(|| e.shape_name()),
             Self::ValidationException(_) => "ValidationException",
         }
     }

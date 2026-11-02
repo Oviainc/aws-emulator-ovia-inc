@@ -24,7 +24,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::onboarding_loop::{
     b2bi_router, call, call_signed_for, capability_configuration, error_code, given_capability,
-    given_partnership, given_profile, given_transformer, text, SIGNING_REGION,
+    given_capability_buckets, given_partnership, given_profile, given_transformer, text,
+    SIGNING_REGION,
 };
 
 /// Well-formed ids no store holds: they satisfy the modelled `len 1..64` /
@@ -90,6 +91,9 @@ async fn creating_a_capability_for_an_unknown_transformer_is_refused_as_not_foun
     // A transformer a client really created, so the positive row below is the same
     // request as the refused ones with one id changed.
     let transformer_id = given_transformer(&router, "edi-850-to-json").await;
+    // The locations the configuration names are this account's own, so what refuses the
+    // rows below is the transformer reference rather than the buckets.
+    given_capability_buckets(&router).await;
 
     let (_, before) = call(&router, "ListCapabilities", json!({})).await;
     let capabilities_before = before["capabilities"].as_array().map(Vec::len).unwrap_or(0);

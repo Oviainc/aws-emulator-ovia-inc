@@ -7,9 +7,14 @@
 //! empty `TagKeys` list (the modelled `len 0..200` allows one) changes nothing. There is
 //! no response body.
 //!
-//! An ARN that does not satisfy the ARN grammar is refused with the modelled
-//! `ValidationException` (400) without any lookup; a well-formed ARN that names no
-//! resource this service holds answers the modelled `ResourceNotFoundException` (404).
+//! The `ResourceARN` is validated in two steps, each with its own wording, and this
+//! operation raises no not-found refusal at all: a value that does not satisfy the ARN
+//! grammar is refused with the modelled `ValidationException` (400) reporting that value
+//! (`crate::state::invalid_arn`), without any lookup, and an ARN that parses and addresses
+//! no resource of this account is the same `ValidationException` carrying the one fixed
+//! sentence this service states for it (`crate::state::INVALID_INPUT_ARN`). Neither
+//! refusal removes a key. `ListTagsForResource` and `TagResource` validate the same member
+//! the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -185,24 +190,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Syntax first, and without touching the store: the same split `TagResource` and
-        // `ListTagsForResource` make between a value that is not an ARN at all (400) and
-        // a well-formed ARN naming nothing (404).
+        // Syntax first, and without touching the store: the same two steps `TagResource`
+        // and `ListTagsForResource` take, in the same order — a value that is not an ARN at
+        // all is reported with that value.
         if !crate::state::is_arn(&input.resource_arn) {
             return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
-                message: format!("Invalid ARN {}", input.resource_arn),
+                message: crate::state::invalid_arn(&input.resource_arn),
             })
             .into());
         }
 
         let mut state = store.lock();
         let resource_arn = input.resource_arn;
+        // An ARN that parses is RESOLVED, exactly as `TagResource` and
+        // `ListTagsForResource` resolve it: one this account holds no resource for is the
+        // invalid input ARN this service states for an ARN that addresses nothing, and no
+        // key is removed.
         let Some(stored) = state.tags_by_arn_mut(&resource_arn) else {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Could not find resource with ARN {resource_arn}"),
-                },
-            )
+            return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
+                message: crate::state::INVALID_INPUT_ARN.to_string(),
+            })
             .into());
         };
 

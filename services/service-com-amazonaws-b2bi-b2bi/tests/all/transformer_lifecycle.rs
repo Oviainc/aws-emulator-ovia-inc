@@ -495,6 +495,7 @@ async fn getting_an_unknown_transformer_is_refused_as_not_found() {
     // The capability this test borrows an id from needs a transformer to name, so one is
     // created first; its own id is NOT among the rows below.
     let host_transformer = given_transformer(&router, "host-transformer").await;
+    crate::onboarding_loop::given_capability_buckets(&router).await;
     let (status, created) = call(
         &router,
         "CreateCapability",

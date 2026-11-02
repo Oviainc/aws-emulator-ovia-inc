@@ -524,12 +524,11 @@ fn validation(message: impl Into<String>) -> TestParsingError {
 
 /// The modelled `ResourceNotFoundException` (HTTP 404) for an `inputFile` that names no
 /// stored object — "occurs when the requested resource does not exist, or cannot be
-/// found".
-fn not_found(bucket: &str, key: &str, detail: &str) -> TestParsingError {
+/// found" — worded as this service words a missing object
+/// ([`crate::state::s3_object_not_found`]).
+fn not_found(bucket: &str, key: &str) -> TestParsingError {
     TestParsingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: bounded_message(format!(
-            "The input file s3://{bucket}/{key} could not be read: {detail}"
-        )),
+        message: bounded_message(crate::state::s3_object_not_found(bucket, key)),
     })
     .into()
 }
@@ -1404,7 +1403,7 @@ async fn read_input_file(
             let code = error.code().unwrap_or_default().to_string();
             let detail = ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string();
             if ABSENT_OBJECT_CODES.contains(&code.as_str()) {
-                return Err(not_found(bucket, key, &code));
+                return Err(not_found(bucket, key));
             }
             if DENIED_READ_CODES.contains(&code.as_str()) {
                 return Err(access_denied(bucket, key, &code));

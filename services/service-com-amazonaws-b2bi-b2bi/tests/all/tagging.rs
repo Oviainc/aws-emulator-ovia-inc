@@ -5,23 +5,24 @@
 //!
 //! RULE under test: `ListTagsForResource` reports the tag list persisted on the
 //! resource whose ARN it is given — for every taggable resource kind this service
-//! holds, and whatever the size of that list, an untagged resource included. An ARN
-//! that does not satisfy the ARN grammar is a client-side mistake, refused with the
-//! modelled `ValidationException` (400); a well-formed ARN naming no resource this
-//! service holds is the modelled `ResourceNotFoundException`.
+//! holds, and whatever the size of that list, an untagged resource included. An ARN this
+//! service cannot act on is refused with the modelled `ValidationException` (400), worded
+//! per the way it failed: a value that does not satisfy the ARN grammar is reported WITH
+//! that value, and an ARN that parses and addresses no resource of this account is the one
+//! fixed sentence that echoes nothing.
 //!
 //! Each test asserts that rule over a TABLE of inputs rather than one recorded
 //! request: the rows differ along the resource kind, the number of tags, the tag
 //! key/value spellings, the ARN's shape and the signing region.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
+use service_com_amazonaws_b2bi_b2bi::state::{invalid_arn, INVALID_INPUT_ARN};
 use smithy_server_runtime::MultiServiceRouter;
 
 // The request harness is shared with the onboarding suite — same router, same signing.
 use crate::onboarding_loop::{
-    b2bi_router, call, call_signed_for, capability_configuration, error_code, given_transformer,
-    text, ACCOUNT, SIGNING_REGION,
+    b2bi_router, call, call_signed_for, capability_configuration, error_code,
+    given_capability_buckets, given_transformer, text, ACCOUNT, SIGNING_REGION,
 };
 
 /// A `tags` list for a create request, from `(key, value)` pairs. Member names are
@@ -120,6 +121,9 @@ pub(crate) async fn given_tagged_resource(
             }
         })
         .collect();
+    // A capability's locations have to be buckets this account owns, so the two the
+    // configuration below names are created before any row asks for one.
+    given_capability_buckets(router).await;
     let (operation, mut request, arn_member) = match kind {
         Kind::Profile => (
             "CreateProfile",
@@ -225,6 +229,7 @@ async fn list_tags_reports_the_tags_each_resource_was_created_with() {
     ];
 
     let router = b2bi_router();
+    given_capability_buckets(&router).await;
     // The references a partnership row needs, created once and untagged themselves.
     let profile_id = text(
         &call(
@@ -312,8 +317,9 @@ async fn list_tags_reports_the_tags_each_resource_was_created_with() {
 
 /// RULE: a `ResourceARN` that does not satisfy the ARN grammar
 /// `arn:<partition>:<service>:<region>:<account-id>:<resource>` is refused with the
-/// modelled `ValidationException` (HTTP 400) — a client-side syntax error, answered
-/// without any lookup, so it is NOT the not-found refusal a well-formed ARN gets.
+/// modelled `ValidationException` (HTTP 400) reporting the value that was rejected — the
+/// recorded wording for a value that is not an ARN at all, which is a different sentence
+/// from the one an ARN that parses and resolves to nothing gets (the other test below).
 ///
 /// The rows span a value with no colons at all, a truncated ARN at each field count
 /// the grammar needs, an empty partition / service / resource field, the `arn` prefix
@@ -377,24 +383,26 @@ async fn a_resource_arn_that_is_not_an_arn_is_a_validation_exception() {
             "ValidationException",
             "case {case:?}: expected ValidationException, got {body}"
         );
-        assert!(
-            message(&body).contains(candidate.as_str()),
-            "case {case:?}: the refusal must name the rejected ARN, got {body}"
+        assert_eq!(
+            message(&body),
+            invalid_arn(candidate),
+            "case {case:?}: the refusal must report the rejected value, got {body}"
         );
     }
 }
 
-/// RULE: a well-formed ARN that names no resource this service holds is the modelled
-/// `ResourceNotFoundException` — including a stored resource's own ARN once
-/// that resource is deleted, and an ARN that differs from a stored one only in the
-/// region or the account it names (AWS: "the resource exists in a region other than the
-/// region specified in the API call").
+/// RULE: an ARN that PARSES and names no resource this service holds is refused with the
+/// modelled `ValidationException` (HTTP 400) too, carrying the one fixed sentence this
+/// service states for an ARN that addresses nothing — because a well-formed ARN is
+/// RESOLVED rather than merely parsed: it addressed no resource, including a stored
+/// resource's own ARN once that resource is deleted, and one that differs from a stored one
+/// only in the region or the account it names.
 ///
 /// The rows span an unknown id of each resource kind, another service's ARN, a global
 /// ARN with the region and account fields empty, a different partition, a rewritten
 /// region, a rewritten account, and a deleted profile's ARN.
 #[tokio::test]
-async fn a_well_formed_arn_naming_nothing_stored_is_refused_as_not_found() {
+async fn a_well_formed_arn_naming_nothing_stored_is_refused_as_an_invalid_input_arn() {
     let router = b2bi_router();
     let live = given_tagged_resource(
         &router,
@@ -472,19 +480,23 @@ async fn a_well_formed_arn_naming_nothing_stored_is_refused_as_not_found() {
     for (case, candidate) in cases {
         let (status, body) = list_tags(&router, candidate).await;
         assert_eq!(
-            status,
-            NOT_FOUND_STATUS,
-            "case {case:?}: ListTagsForResource({candidate}) must be {NOT_FOUND_STATUS}, got \
-             {status} {body}"
+            status, 400,
+            "case {case:?}: ListTagsForResource({candidate}) must be 400, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body}"
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
+        );
+        assert_eq!(
+            message(&body),
+            INVALID_INPUT_ARN,
+            "case {case:?}: the refusal is this service's one fixed sentence, got {body}"
         );
         assert!(
-            message(&body).contains(candidate.as_str()),
-            "case {case:?}: the refusal must name the ARN that resolved to nothing, got {body}"
+            !message(&body).contains(candidate.as_str()),
+            "case {case:?}: the refusal must not echo the ARN that resolved to nothing, got \
+             {body}"
         );
     }
 

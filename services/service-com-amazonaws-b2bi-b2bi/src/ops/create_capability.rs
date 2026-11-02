@@ -230,6 +230,34 @@ pub(crate) fn referenced_transformers(configuration: &CapabilityConfiguration) -
     }
 }
 
+/// Every Amazon S3 bucket a capability's `configuration` will read from and write to — its
+/// input location's bucket and its output location's bucket.
+///
+/// Walked over the union rather than reaching into `edi`, for the same reason
+/// [`referenced_transformers`] is: a configuration variant the model adds stops this
+/// matching until its own locations are listed here. A location naming no bucket yields
+/// the empty name, which no account owns.
+fn configured_buckets(configuration: &CapabilityConfiguration) -> Vec<&str> {
+    match configuration {
+        CapabilityConfiguration::Edi(edi) => vec![
+            edi.input_location.bucket_name.as_deref().unwrap_or_default(),
+            edi.output_location
+                .bucket_name
+                .as_deref()
+                .unwrap_or_default(),
+        ],
+    }
+}
+
+/// The modelled refusal for a configuration naming an input or output bucket this account
+/// does not own ([`crate::state::BUCKETS_NOT_OWNED`]).
+fn buckets_not_owned() -> CreateCapabilityError {
+    CreateCapabilityErrorModeled::ValidationException(ValidationException {
+        message: crate::state::BUCKETS_NOT_OWNED.to_string(),
+    })
+    .into()
+}
+
 /// The response for a stored capability — every member read back off the record, so a
 /// create and a later `GetCapability` cannot disagree.
 fn stored_capability_response(capability: &crate::state::Capability) -> CreateCapabilityOutput {
@@ -287,6 +315,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateCapabilityErrorModeled::AccessDeniedException(denied).into());
         }
+        let region = crate::state::request_region(ctx.parts());
+
+        // A capability READS the EDI documents its input location holds and WRITES the
+        // transformed ones to its output location, so both buckets have to be this
+        // account's own: a capability over a bucket the customer does not own could never
+        // do either, and is refused as invalid input rather than minted. Validated here,
+        // BEFORE the references the configuration names are resolved, so a request that is
+        // wrong in both ways answers the input it got wrong rather than the resource it
+        // could not find — and before the store is locked, since resolving a bucket is a
+        // call into the account's object storage.
+        for bucket in configured_buckets(&input.configuration) {
+            if !crate::state::owns_bucket(ctx, &region, bucket).await {
+                return Err(buckets_not_owned());
+            }
+        }
+
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(CreateCapabilityErrorModeled::InternalServerException(
                 InternalServerException {
@@ -361,7 +405,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         while state.capabilities.contains_key(&capability_id) {
             capability_id = crate::state::new_resource_id("ca");
         }
-        let region = crate::state::request_region(ctx.parts());
         let capability = crate::state::Capability {
             capability_arn: ::engine::emulator_arn(
                 "b2bi",

@@ -7,17 +7,17 @@
 //! RULE under test: `UntagResource` detaches the keys it names from the resource whose ARN
 //! it names — a key the resource carries is REMOVED with its value, a key it does not
 //! carry is ignored, and every other tag on that resource, and every other resource, is
-//! left as it was. An ARN that does not satisfy the ARN grammar is refused with the
-//! modelled `ValidationException` (400); a well-formed ARN naming no resource this service
-//! holds is the modelled `ResourceNotFoundException`; and neither refusal removes
-//! anything.
+//! left as it was. An ARN this service cannot act on is refused with the modelled
+//! `ValidationException` (400) — a value that fails the ARN grammar reported with that
+//! value, a well-formed ARN naming nothing reported with the fixed sentence for an ARN that
+//! addresses nothing — and no refusal removes anything.
 //!
 //! Each test asserts that rule over a TABLE of inputs rather than one recorded request:
 //! the rows differ along the resource kind, the tags the resource carries, the number and
 //! spelling of the keys removed, and whether those keys are present at all.
 
 use serde_json::json;
-use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
+use service_com_amazonaws_b2bi_b2bi::state::{invalid_arn, INVALID_INPUT_ARN};
 use smithy_server_runtime::MultiServiceRouter;
 
 // One copy of the wire harness and of the tagging fixtures, shared with the other suites.
@@ -264,10 +264,11 @@ async fn untag_resource_removes_only_from_the_resource_its_arn_names() {
     }
 }
 
-/// RULE: a `ResourceARN` that is not an ARN at all is the modelled `ValidationException`
-/// (400) and a well-formed ARN naming nothing stored is the modelled
-/// `ResourceNotFoundException` — the same split the other tagging operations make —
-/// and neither refusal removes a tag.
+/// RULE: a `ResourceARN` this service cannot act on is refused with the modelled
+/// `ValidationException` (400) — the same answer, and the same two wordings, the other
+/// tagging operations give: the rejected value for something that is not an ARN, and the
+/// one fixed sentence for an ARN that parses and addresses nothing — and no refusal removes
+/// a tag.
 ///
 /// The rows span malformed candidates (no colons, truncated at each field count, an empty
 /// partition / service / resource field, the prefix mis-cased) and well-formed but
@@ -308,103 +309,88 @@ async fn untag_resource_refuses_an_arn_it_cannot_resolve() {
         "DeleteProfile({doomed_id}) failed: {status} {body}"
     );
 
-    // (case, the candidate ARN, the status and error code it must answer)
-    let cases: &[(&str, String, u16, &str)] = &[
+    // (case, the candidate ARN, whether it satisfies the ARN grammar at all)
+    let cases: &[(&str, String, bool)] = &[
         (
             "no colons at all",
             "this-is-not-an-arn-at-all".to_string(),
-            400,
-            "ValidationException",
+            false,
         ),
-        ("prefix only", "arn".to_string(), 400, "ValidationException"),
-        (
-            "partition only",
-            "arn:aws".to_string(),
-            400,
-            "ValidationException",
-        ),
+        ("prefix only", "arn".to_string(), false),
+        ("partition only", "arn:aws".to_string(), false),
         (
             "no resource field",
             format!("arn:aws:b2bi:{SIGNING_REGION}:{ACCOUNT}"),
-            400,
-            "ValidationException",
+            false,
         ),
         (
             "empty resource field",
             format!("arn:aws:b2bi:{SIGNING_REGION}:{ACCOUNT}:"),
-            400,
-            "ValidationException",
+            false,
         ),
         (
             "empty service field",
             format!("arn:aws::{SIGNING_REGION}:{ACCOUNT}:profile/p-0123456789abcdef0"),
-            400,
-            "ValidationException",
+            false,
         ),
         (
             "prefix upper-cased",
             live.replacen("arn:", "ARN:", 1),
-            400,
-            "ValidationException",
+            false,
         ),
         (
             "unknown profile id",
             format!("arn:aws:b2bi:{SIGNING_REGION}:{ACCOUNT}:profile/p-0123456789abcdef0"),
-            NOT_FOUND_STATUS,
-            "ResourceNotFoundException",
+            true,
         ),
         (
             "unknown capability id",
             format!("arn:aws:b2bi:{SIGNING_REGION}:{ACCOUNT}:capability/ca-0123456789abcdef0"),
-            NOT_FOUND_STATUS,
-            "ResourceNotFoundException",
+            true,
         ),
         (
             "unknown transformer id",
             format!("arn:aws:b2bi:{SIGNING_REGION}:{ACCOUNT}:transformer/tr-0123456789abcdef0"),
-            NOT_FOUND_STATUS,
-            "ResourceNotFoundException",
+            true,
         ),
         (
             "another service's ARN",
             format!("arn:aws:s3:{SIGNING_REGION}:{ACCOUNT}:bucket/not-a-b2bi-resource"),
-            NOT_FOUND_STATUS,
-            "ResourceNotFoundException",
+            true,
         ),
         (
             "a stored ARN with the region rewritten",
             live.replacen(SIGNING_REGION, "eu-central-1", 1),
-            NOT_FOUND_STATUS,
-            "ResourceNotFoundException",
+            true,
         ),
         (
             "a stored ARN with the account rewritten",
             live.replacen(ACCOUNT, "123456789012", 1),
-            NOT_FOUND_STATUS,
-            "ResourceNotFoundException",
+            true,
         ),
-        (
-            "a deleted profile's ARN",
-            doomed_arn.clone(),
-            NOT_FOUND_STATUS,
-            "ResourceNotFoundException",
-        ),
+        ("a deleted profile's ARN", doomed_arn.clone(), true),
     ];
 
-    for (case, candidate, expected_status, expected_code) in cases {
+    for (case, candidate, parses) in cases {
         let (status, body) = untag_resource(&router, candidate, &["env"]).await;
         assert_eq!(
-            status, *expected_status,
-            "case {case:?}: UntagResource({candidate}) must be {expected_status}, got {status} {body}"
+            status, 400,
+            "case {case:?}: UntagResource({candidate}) must be 400, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            *expected_code,
-            "case {case:?}: expected {expected_code}, got {body}"
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
         );
-        assert!(
-            message(&body).contains(candidate.as_str()),
-            "case {case:?}: the refusal must name the ARN it was given, got {body}"
+        let expected = if *parses {
+            INVALID_INPUT_ARN.to_string()
+        } else {
+            invalid_arn(candidate)
+        };
+        assert_eq!(
+            message(&body),
+            expected,
+            "case {case:?}: expected {expected:?}, got {body}"
         );
     }
 

@@ -8,10 +8,13 @@
 //! instance of ([`TAG_WIRE_SHAPE_ID`]) — on every entry of the list, whatever stored the
 //! tag. [`Discriminated`] is what writes it.
 //!
-//! An ARN that does not satisfy the ARN grammar is refused with the modelled
-//! `ValidationException` (400); a well-formed ARN that names no resource this service
-//! holds answers the modelled `ResourceNotFoundException` (404). A resource that exists
-//! and carries no tags answers 200 with an empty list.
+//! The `ResourceARN` is validated in two steps, each with its own wording, and this
+//! operation raises no not-found refusal at all: a value that does not satisfy the ARN
+//! grammar is refused with the modelled `ValidationException` (400) reporting that value
+//! (`crate::state::invalid_arn`), and an ARN that parses and addresses no resource of this
+//! account is the same `ValidationException` carrying the one fixed sentence this service
+//! states for it (`crate::state::INVALID_INPUT_ARN`). A resource that exists and carries
+//! no tags answers 200 with an empty list.
 //!
 //! ## Shape of an operation
 //!
@@ -287,25 +290,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Syntax first, and without touching the store: something that is not an ARN at
-        // all cannot name a resource, so it is a client-side mistake
-        // (`ValidationException`) rather than a resource that is missing
-        // (`ResourceNotFoundException`). The modelled `len 1..1011` bound on
-        // `ResourceARN` is already enforced before this handler runs; the grammar is not.
+        // Syntax first, and without touching the store: a value that is not an ARN at all
+        // is reported WITH that value, which is the recorded wording for it. The modelled
+        // `len 1..1011` bound on `ResourceARN` is already enforced before this handler
+        // runs; the grammar is not.
         if !crate::state::is_arn(&input.resource_arn) {
             return Err(ListTagsForResourceErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!("Invalid ARN {}", input.resource_arn),
+                    message: crate::state::invalid_arn(&input.resource_arn),
                 },
             )
             .into());
         }
 
+        // An ARN that parses is then RESOLVED, and one that addresses no resource of this
+        // account is an invalid input ARN — the fixed sentence this service states for it,
+        // not a resource reported missing. (`TagResource` and `UntagResource` validate the
+        // same member the same way.)
         let state = store.lock();
         let Some(tags) = state.tags_by_arn(&input.resource_arn) else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Could not find resource with ARN {}", input.resource_arn),
+            return Err(ListTagsForResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::INVALID_INPUT_ARN.to_string(),
                 },
             )
             .into());

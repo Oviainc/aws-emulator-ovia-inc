@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ResourceNotFoundException {
                     message: crate::state::transformer_job_not_found(
                         &input.transformer_job_id,
-                        &input.transformer_id,
+                        ::engine::emulator_account_id(),
                     ),
                 },
             )

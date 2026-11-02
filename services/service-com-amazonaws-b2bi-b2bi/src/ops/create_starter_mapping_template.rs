@@ -978,10 +978,10 @@ fn sample_unreadable(failure: crate::state::ObjectError) -> CreateStarterMapping
         crate::state::ObjectError::NotFound(message) => {
             CreateStarterMappingTemplateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "the sample EDI file at outputSampleLocation cannot be read: \
-                         {message}"
-                    ),
+                    // The reader's own sentence, unadorned: this service words a missing
+                    // object ONE way (`crate::state::s3_object_not_found`), and a prefix
+                    // naming the member would make that two wordings for one failure.
+                    message: message.clone(),
                 },
             )
             .into()

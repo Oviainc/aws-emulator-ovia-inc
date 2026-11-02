@@ -14,9 +14,11 @@
 //! service's own template built from the request's identifier.
 //!
 //! The rows span what the rule generalises over: the operation and its kind (reader,
-//! writer, delete, tag reporter, reference resolver), the resource kind the id names, the
-//! member the id arrives in, and how the id fails to resolve (never minted, deleted, or
-//! holding an id of another resource kind).
+//! writer, delete, reference resolver), the resource kind the id names, the member the id
+//! arrives in, and how the id fails to resolve (never minted, deleted, or holding an id of
+//! another resource kind). The tagging operations are not among them: they validate their
+//! `ResourceARN` by resolving it and answer `ValidationException` for an ARN that resolves
+//! to nothing (see `tagging.rs`).
 
 use serde_json::{json, Value};
 use service_com_amazonaws_b2bi_b2bi::scaffolded::{wire_status, NOT_FOUND_STATUS};
@@ -28,7 +30,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::onboarding_loop::{
     b2bi_router, call, capability_configuration, error_code, given_capability, given_partnership,
-    given_profile, given_transformer, text, ACCOUNT, SIGNING_REGION,
+    given_profile, given_transformer, text, ACCOUNT,
 };
 
 /// The statuses the model annotates this service's error shapes with
@@ -42,11 +44,6 @@ const MODELLED_STATUSES: &[(&str, u16)] = &[
     ("ThrottlingException", 429),
     ("InternalServerException", 500),
 ];
-
-/// A well-formed b2bi ARN for `kind`/`id` in the region these tests sign for.
-fn b2bi_arn(kind: &str, id: &str) -> String {
-    format!("arn:aws:b2bi:{SIGNING_REGION}:{ACCOUNT}:{kind}/{id}")
-}
 
 /// Create one resource of every kind, delete a transformer and a profile, and answer the
 /// ids the table below asks about: `(live_profile, live_capability, live_partnership,
@@ -209,31 +206,13 @@ async fn every_not_found_refusal_of_this_service_carries_one_client_error_status
             capability_not_found(unknown_capability),
         ),
         (
-            "ListTagsForResource on a well-formed ARN naming nothing",
-            "ListTagsForResource",
-            json!({ "ResourceARN": b2bi_arn("transformer", unknown_transformer) }),
-            format!(
-                "Could not find resource with ARN {}",
-                b2bi_arn("transformer", unknown_transformer)
-            ),
-        ),
-        (
-            "ListTagsForResource on a deleted profile's own ARN",
-            "ListTagsForResource",
-            json!({ "ResourceARN": b2bi_arn("profile", &deleted_profile) }),
-            format!(
-                "Could not find resource with ARN {}",
-                b2bi_arn("profile", &deleted_profile)
-            ),
-        ),
-        (
             "GetTransformerJob under a transformer nobody holds",
             "GetTransformerJob",
             json!({
                 "transformerId": unknown_transformer,
                 "transformerJobId": "0123456789abcdef012345678"
             }),
-            transformer_job_not_found("0123456789abcdef012345678", unknown_transformer),
+            transformer_job_not_found("0123456789abcdef012345678", ACCOUNT),
         ),
         (
             "StartTransformerJob on a never-minted transformerId",

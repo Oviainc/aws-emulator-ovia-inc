@@ -24,7 +24,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 
-use crate::onboarding_loop::{b2bi_router, call, error_code, s3, SIGNING_REGION};
+use crate::onboarding_loop::{b2bi_router, call, error_code, given_bucket, s3};
 
 /// The bucket every row of these tables stores its EDI object in.
 pub(crate) const BUCKET: &str = "edi-inbound";
@@ -95,31 +95,12 @@ const X12_850_UNCLOSED: &str = concat!(
 const ISA_WITHOUT_SEPARATOR: &str = "ISAX00X   nothing here declares a delimiter";
 
 /// Store `body` at `key` in [`BUCKET`], creating the bucket first.
-///
-/// The create names its `LocationConstraint`: this suite signs for [`SIGNING_REGION`], and
-/// S3 serves a create that names none only at the endpoint the unspecified constraint
-/// stands for (us-east-1).
 pub(crate) async fn given_object(
     router: &smithy_server_runtime::MultiServiceRouter,
     key: &str,
     body: &str,
 ) {
-    let (status, _) = s3(
-        router,
-        "PUT",
-        &format!("/{BUCKET}"),
-        format!(
-            "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-             <LocationConstraint>{SIGNING_REGION}</LocationConstraint>\
-             </CreateBucketConfiguration>"
-        )
-        .as_bytes(),
-    )
-    .await;
-    assert!(
-        status == 200 || status == 409,
-        "creating s3://{BUCKET} must succeed or already exist, got {status}"
-    );
+    given_bucket(router, BUCKET).await;
     let (status, response) = s3(router, "PUT", &format!("/{BUCKET}/{key}"), body.as_bytes()).await;
     assert_eq!(
         status,

@@ -21,7 +21,7 @@
 //! one `onboarding_loop` already drives the emulator through.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
+use service_com_amazonaws_b2bi_b2bi::state::{invalid_arn, INVALID_INPUT_ARN};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::onboarding_loop::{
@@ -148,11 +148,11 @@ async fn tags_written_by_tag_resource_are_merged_onto_the_resource_and_read_back
 /// RULE: `TagResource` stores nothing for a `ResourceARN` it cannot resolve to a live
 /// resource of this service, and refuses it with the modelled `ValidationException`
 /// (HTTP 400) — the ARN is the parameter it validates before it writes. The reporting
-/// `ListTagsForResource` keeps the two-way split for the same ARNs: `ValidationException`
-/// only when the value is not an ARN at all, `ResourceNotFoundException` when it is a
-/// well-formed ARN naming nothing — both at this service's client-error status.
+/// `ListTagsForResource` answers the SAME refusal for the same ARNs, worded by the step
+/// that failed: the rejected value itself when it is not an ARN at all, and the one fixed
+/// sentence when it parses and addresses no resource of this account.
 ///
-/// The rows span both classes: strings that fail the ARN grammar (no colons, a
+/// The rows span both ways an ARN fails: strings that fail the ARN grammar (no colons, a
 /// truncated ARN, an empty partition / service / resource field, the prefix mis-cased)
 /// and well-formed ARNs that resolve to nothing (an id that never existed, a DELETED
 /// profile's own ARN, a live id under another resource type, a live resource's ARN with
@@ -169,7 +169,8 @@ async fn an_arn_tag_resource_cannot_resolve_is_refused_and_stores_nothing() {
     let (status, body) = call(&router, "DeleteProfile", json!({ "profileId": doomed })).await;
     assert_eq!(status, 200, "DeleteProfile failed: {status} {body}");
 
-    // (case, the ResourceARN, is it an ARN at all?)
+    // (case, the ResourceARN, does it satisfy the ARN grammar at all?) — the class is the
+    // same either way and the sentence is not, so the flag carries which one to expect.
     let cases: &[(&str, String, bool)] = &[
         ("no colons at all", "this-is-not-an-arn-at-all".to_string(), false),
         ("truncated ARN", format!("arn:aws:b2bi:{SIGNING_REGION}:{ACCOUNT}"), false),
@@ -214,7 +215,12 @@ async fn an_arn_tag_resource_cannot_resolve_is_refused_and_stores_nothing() {
         ),
     ];
 
-    for (case, arn, is_an_arn) in cases {
+    for (case, arn, parses) in cases {
+        let expected_message = if *parses {
+            INVALID_INPUT_ARN.to_string()
+        } else {
+            invalid_arn(arn)
+        };
         let (status, body) = tag_resource(&router, arn, tags_json(&[("env", "test")])).await;
         assert_eq!(
             status, 400,
@@ -225,23 +231,28 @@ async fn an_arn_tag_resource_cannot_resolve_is_refused_and_stores_nothing() {
             "ValidationException",
             "case {case:?}: expected ValidationException, got {body}"
         );
-
-        // The same ARN through the reporting operation: `ValidationException` only when it
-        // is not an ARN at all, and the not-found refusal when it is.
-        let (status, body) = list_tags(&router, arn).await;
-        let (expected_status, expected_code) = if *is_an_arn {
-            (NOT_FOUND_STATUS, "ResourceNotFoundException")
-        } else {
-            (400, "ValidationException")
-        };
         assert_eq!(
-            status, expected_status,
-            "case {case:?}: expected ListTagsForResource to answer {expected_status}, got {status} {body}"
+            text(&body, "Message"),
+            expected_message,
+            "case {case:?}: expected {expected_message:?}, got {body}"
+        );
+
+        // The same ARN through the reporting operation: the same refusal, because the same
+        // two validation steps decide it.
+        let (status, body) = list_tags(&router, arn).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected ListTagsForResource to answer 400, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            expected_code,
-            "case {case:?}: expected {expected_code}, got {body}"
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
+        );
+        assert_eq!(
+            text(&body, "Message"),
+            expected_message,
+            "case {case:?}: expected {expected_message:?}, got {body}"
         );
     }
 

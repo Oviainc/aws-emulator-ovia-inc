@@ -9,10 +9,12 @@
 //! already carries has its value REPLACED, and every other tag on that resource, and
 //! every other resource, is left as it was. An ARN this write cannot act on is refused
 //! with the modelled `ValidationException` (400) and writes nothing — both a value that
-//! does not satisfy the ARN grammar and a well-formed ARN naming no resource this service
-//! holds, which is the answer RECORDED against AWS for this operation (trace
-//! `b2bi.tag-resource-nonexistent-arn-not-found`). The reporting `ListTagsForResource`
-//! keeps `ResourceNotFoundException` for that second class (see `tagging.rs`).
+//! does not satisfy the ARN grammar, reported with that value, and a well-formed ARN
+//! naming no resource this service holds, reported with the fixed sentence this service
+//! states for an ARN that addresses nothing. `ValidationException` for the second class is
+//! the answer RECORDED against AWS for this operation (trace
+//! `b2bi.tag-resource-nonexistent-arn-not-found`) and for the reporting
+//! `ListTagsForResource` too (see `tagging.rs`).
 //!
 //! Each test asserts that rule over a TABLE of inputs rather than one recorded request:
 //! the rows differ along the resource kind, the tags the resource already carries, the
@@ -20,6 +22,7 @@
 //! published `TagList` bound (`len 0..200`) at and past its maximum.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_b2bi_b2bi::state::{invalid_arn, INVALID_INPUT_ARN};
 use smithy_server_runtime::MultiServiceRouter;
 
 // The wire harness is shared with the onboarding suite, and the tagging fixtures with the
@@ -350,9 +353,10 @@ async fn an_arn_that_is_not_an_arn_is_refused_with_validation_exception() {
             "ValidationException",
             "case {case:?}: expected ValidationException, got {body}"
         );
-        assert!(
-            message(&body).contains(candidate.as_str()),
-            "case {case:?}: the refusal must name the rejected ARN, got {body}"
+        assert_eq!(
+            message(&body),
+            invalid_arn(candidate),
+            "case {case:?}: the refusal must report the rejected value, got {body}"
         );
     }
 
@@ -366,17 +370,15 @@ async fn an_arn_that_is_not_an_arn_is_refused_with_validation_exception() {
 /// RULE: a well-formed ARN that this WRITE cannot act on — one that names no resource this
 /// service holds — is refused with the modelled `ValidationException` (HTTP 400) and
 /// writes nothing, including a stored resource's own ARN once it is deleted and an ARN
-/// differing from a stored one only in the partition, the region or the account it names
-/// (AWS: "the resource exists in a region other than the region specified in the API
-/// call").
+/// differing from a stored one only in the partition, the region or the account it names.
 ///
 /// `ValidationException` rather than `ResourceNotFoundException` is the RECORDED answer
-/// for this operation: trace `b2bi.tag-resource-nonexistent-arn-not-found`, in
-/// `issues/things-that-now-work/20261022T031134Z-b2bi-tagging-test-harness-and-transformer-operations-answer.md`
-/// (cause 1), asserts `ValidationException` for tagging a deleted profile's well-formed
-/// ARN — this write validates `ResourceARN` as the request parameter it is. The REPORTING
-/// `ListTagsForResource` keeps `ResourceNotFoundException` for the same class of ARN (see
-/// `tagging.rs`), which is the split the recordings show.
+/// for every tagging operation of this service: trace
+/// `b2bi.tag-resource-nonexistent-arn-not-found` records it for this write, and the
+/// recorded `b2bi-tagging-workflow` step records the same class, with the one fixed
+/// sentence asserted here, for the REPORTING `ListTagsForResource` (see `tagging.rs`) — a
+/// well-formed ARN is resolved, and one that resolves to nothing addressed no resource
+/// wherever it arrives.
 ///
 /// The rows span an unknown id of each resource kind, another service's ARN, a global ARN
 /// with the region and account fields empty, a rewritten partition / region / account, and
@@ -467,9 +469,15 @@ async fn a_well_formed_arn_naming_nothing_stored_is_refused_and_writes_nothing()
             "ValidationException",
             "case {case:?}: expected ValidationException, got {body}"
         );
+        assert_eq!(
+            message(&body),
+            INVALID_INPUT_ARN,
+            "case {case:?}: the refusal is this service's one fixed sentence, got {body}"
+        );
         assert!(
-            message(&body).contains(candidate.as_str()),
-            "case {case:?}: the refusal must name the ARN that resolved to nothing, got {body}"
+            !message(&body).contains(candidate.as_str()),
+            "case {case:?}: the refusal must not echo the ARN that resolved to nothing, got \
+             {body}"
         );
     }
 

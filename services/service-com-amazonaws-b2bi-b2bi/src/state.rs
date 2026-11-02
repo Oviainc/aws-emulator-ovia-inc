@@ -653,14 +653,15 @@ pub fn transformer_reference_not_found(transformer_id: &str) -> String {
 }
 
 /// The `ResourceNotFoundException` message for a `transformerJobId` this service holds no
-/// run for under that `transformerId` — including a job AWS has already dropped, which it
-/// does 30 days after the run ("if 30 days have elapsed since your transformer job was
-/// started, the system deletes it … you receive a 404 response", `GetTransformerJob`).
-pub fn transformer_job_not_found(transformer_job_id: &str, transformer_id: &str) -> String {
-    format!(
-        "Transformer job with transformerJobId {transformer_job_id} not found for \
-         transformerId {transformer_id}"
-    )
+/// run for — including a job AWS has already dropped, which it does 30 days after the run
+/// ("if 30 days have elapsed since your transformer job was started, the system deletes it
+/// … you receive a 404 response", `GetTransformerJob`).
+///
+/// The recorded form words the refusal around the JOB and the CUSTOMER the job would have
+/// belonged to — a job id is unique to an account, so the account is what scopes the
+/// lookup — and says nothing of the transformer the request paired it with.
+pub fn transformer_job_not_found(transformer_job_id: &str, account_id: &str) -> String {
+    format!("Found no transformer job {transformer_job_id} for customer {account_id}")
 }
 
 /// The CloudWatch Logs log group a logging-ENABLED profile reports as `logGroupName`,
@@ -683,16 +684,16 @@ pub fn idempotency_key(resource_type: &str, client_token: &str) -> String {
 
 /// Whether `candidate` satisfies the AWS ARN grammar
 /// `arn:<partition>:<service>:<region>:<account-id>:<resource>`: six colon-delimited
-/// fields, the first literally `arn`, with a non-empty partition, service and
-/// resource. `region` and `account-id` are the two fields AWS itself leaves empty on
-/// the ARNs of global services, so neither is required to be filled in; the resource
-/// field may itself contain colons and slashes, so it is whatever follows the fifth
-/// colon.
+/// fields, the first literally `arn`, with a non-empty partition, service and resource.
+/// `region` and `account-id` are the two fields AWS itself leaves empty on the ARNs of
+/// global services, so neither is required to be filled in; the resource field may itself
+/// contain colons and slashes, so it is whatever follows the fifth colon.
 ///
-/// This is a SYNTAX test only, and the tagging operations keep it separate from the
-/// lookup on purpose: a candidate that is not an ARN at all is a client-side mistake
-/// (`ValidationException`), which is a different answer from a well-formed ARN
-/// that names no resource this service holds (`ResourceNotFoundException`).
+/// A SYNTAX test, which the tagging operations ask BEFORE they resolve anything, because
+/// the two failures are worded differently: a value that is not an ARN at all is reported
+/// with the value ([`invalid_arn`]), while an ARN that parses and addresses no resource of
+/// this account is the fixed sentence ([`INVALID_INPUT_ARN`]). Both are the modelled
+/// `ValidationException`.
 pub fn is_arn(candidate: &str) -> bool {
     let fields: Vec<&str> = candidate.splitn(6, ':').collect();
     fields.len() == 6
@@ -700,6 +701,39 @@ pub fn is_arn(candidate: &str) -> bool {
         && !fields[1].is_empty()
         && !fields[2].is_empty()
         && !fields[5].is_empty()
+}
+
+/// The `ValidationException` message for a `ResourceARN` that does not satisfy the ARN
+/// grammar: the recorded form names the value that was rejected, which is what tells the
+/// caller WHICH of its inputs is not an ARN.
+pub fn invalid_arn(candidate: &str) -> String {
+    format!("Invalid ARN {candidate}")
+}
+
+/// The `ValidationException` message every tagging operation refuses a `ResourceARN` that
+/// PARSES as an ARN and addresses no b2bi resource of this account with.
+///
+/// ONE fixed sentence, carrying nothing of the value it rejected — the recorded form. A
+/// well-formed ARN is resolved rather than merely parsed, and one that resolves to nothing
+/// is an invalid input ARN rather than a resource reported missing; a value that is not an
+/// ARN at all never reaches this point and is reported by [`invalid_arn`] instead.
+pub const INVALID_INPUT_ARN: &str = "Invalid input ARN!";
+
+/// The `ValidationException` message a capability whose configuration names an Amazon S3
+/// bucket this account does not own is refused with.
+///
+/// Fixed text: it names neither the bucket nor which of the two locations failed, so a
+/// caller learns that the input and/or the output bucket is not theirs and nothing more.
+pub const BUCKETS_NOT_OWNED: &str = "Customer does not own input and/or output buckets.";
+
+/// The `ResourceNotFoundException` message for an Amazon S3 object a request names and
+/// object storage does not hold.
+///
+/// States the `s3://<bucket>/<key>` URI the request addressed and that it is not there,
+/// and NOTHING of the error code S3 answered with: the dependency's own code is not part
+/// of what this service tells its caller.
+pub fn s3_object_not_found(bucket: &str, key: &str) -> String {
+    format!("The S3 object s3://{bucket}/{key} does not exist")
 }
 
 /// The current wall-clock instant, as the modelled `CreatedDate`/`ModifiedDate` timestamp.
@@ -976,6 +1010,49 @@ pub fn s3_client(
     ::aws_sdk_s3::Client::from_conf(config)
 }
 
+/// Whether the account this emulator serves owns the Amazon S3 bucket `bucket`.
+///
+/// Asked of the emulator's own S3 service, which serves ONE account and therefore holds
+/// exactly the buckets that account owns: a bucket S3 reports it does not hold is a bucket
+/// the caller does not own. An empty name owns nothing and is not asked about.
+///
+/// Any failure that is NOT S3 reporting the bucket absent (the S3 service not mounted, a
+/// transport fault) answers `true`: a refusal has to be grounded in S3 saying the bucket
+/// is not there, never in this emulator failing to ask. That distinction is why this reads
+/// `HeadBucket`'s own modelled `NotFound` rather than going through [`bucket_region`],
+/// which asks the other question of the same client — WHICH Region holds the bucket — and
+/// collapses every non-Region answer into `None`.
+pub async fn owns_bucket(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+) -> bool {
+    if bucket.is_empty() {
+        return false;
+    }
+    match s3_client(ctx, region)
+        .head_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            let absent = error
+                .as_service_error()
+                .is_some_and(::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found);
+            if !absent {
+                ::tracing::warn!(
+                    %bucket,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "the bucket could not be resolved against Amazon S3"
+                );
+            }
+            !absent
+        }
+    }
+}
+
 /// The Region an Amazon S3 bucket is in when its location carries no constraint:
 /// "Buckets in Region us-east-1 have a LocationConstraint of null"
 /// (`GetBucketLocationOutput$LocationConstraint`), so an absent constraint names that one
@@ -1071,9 +1148,9 @@ pub async fn read_edi_object(
             use ::aws_sdk_s3::error::ProvideErrorMetadata;
             let detail = ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string();
             match error.code() {
-                Some("NoSuchKey" | "NoSuchBucket" | "NotFound") => ObjectError::NotFound(format!(
-                    "no object is stored at s3://{bucket}/{key}"
-                )),
+                Some("NoSuchKey" | "NoSuchBucket" | "NotFound") => {
+                    ObjectError::NotFound(s3_object_not_found(&bucket, &key))
+                }
                 _ => ObjectError::Unreadable(format!(
                     "the object at s3://{bucket}/{key} could not be read: {detail}"
                 )),

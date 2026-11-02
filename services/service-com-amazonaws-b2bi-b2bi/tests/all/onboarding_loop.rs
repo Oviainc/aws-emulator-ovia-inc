@@ -177,8 +177,23 @@ pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Val
     call_signed_for(router, SIGNING_REGION, operation, body).await
 }
 
-/// The wire error code (`__type`) of an error body.
+/// The error CLASS of an error body: the shape name an SDK resolves out of `__type`.
+///
+/// This service sends `__type` as the fully-qualified shape id its recorded error bodies
+/// carry (`scaffolded::wire_shape_id`), and an SDK resolves the class from the shape name
+/// after the `#` — so that is what this returns, and a row comparing it against a shape
+/// name reads the same class a client would. [`error_type`] returns the raw value for the
+/// one test that asserts the qualified form itself.
 pub(crate) fn error_code(body: &Value) -> String {
+    error_type(body)
+        .split('#')
+        .next_back()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The raw `__type` of an error body, exactly as it travels on the wire.
+pub(crate) fn error_type(body: &Value) -> String {
     body["__type"].as_str().unwrap_or("<no __type>").to_string()
 }
 
@@ -205,9 +220,52 @@ pub(crate) fn is_generated_id(id: &str, prefix: &str) -> bool {
 /// the optional `capabilityDirection`, and the optional `instructionsDocuments`.
 type CapabilityCase<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, Option<Value>);
 
+/// The bucket a capability's `inputLocation` names in every row below.
+pub(crate) const CAPABILITY_INPUT_BUCKET: &str = "inbound-bucket";
+
+/// The bucket a capability's `outputLocation` names in every row below.
+pub(crate) const CAPABILITY_OUTPUT_BUCKET: &str = "outbound-bucket";
+
+/// Create the Amazon S3 bucket `bucket`, which this account then owns. Already existing
+/// counts as created, so a test may ask for the same bucket twice.
+///
+/// The create names its `LocationConstraint`: these suites sign for [`SIGNING_REGION`], and
+/// S3 serves a create that names none only at the endpoint the unspecified constraint
+/// stands for (us-east-1).
+pub(crate) async fn given_bucket(router: &MultiServiceRouter, bucket: &str) {
+    let (status, _) = s3(
+        router,
+        "PUT",
+        &format!("/{bucket}"),
+        format!(
+            "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <LocationConstraint>{SIGNING_REGION}</LocationConstraint>\
+             </CreateBucketConfiguration>"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert!(
+        status == 200 || status == 409,
+        "creating s3://{bucket} must succeed or already exist, got {status}"
+    );
+}
+
+/// Create the two buckets [`capability_configuration`] names, so a capability over them is
+/// one this account owns both ends of — which `CreateCapability` resolves against S3
+/// before it mints anything.
+pub(crate) async fn given_capability_buckets(router: &MultiServiceRouter) {
+    given_bucket(router, CAPABILITY_INPUT_BUCKET).await;
+    given_bucket(router, CAPABILITY_OUTPUT_BUCKET).await;
+}
+
 /// A valid `CapabilityConfiguration` naming `transformer_id`, for tests that only need
 /// capabilities to exist. Member names are the union/structure members of
 /// `com.amazonaws.b2bi#CapabilityConfiguration`.
+///
+/// The buckets are the two [`given_capability_buckets`] creates: a capability's locations
+/// have to be buckets this account owns, so a test driving `CreateCapability` with this
+/// configuration asks for them first.
 pub(crate) fn capability_configuration(
     transformer_id: &str,
     transaction_set: &str,
@@ -216,8 +274,8 @@ pub(crate) fn capability_configuration(
     json!({
         "edi": {
             "type": { "x12Details": { "transactionSet": transaction_set, "version": version } },
-            "inputLocation": { "bucketName": "inbound-bucket", "key": "in/" },
-            "outputLocation": { "bucketName": "outbound-bucket", "key": "out/" },
+            "inputLocation": { "bucketName": CAPABILITY_INPUT_BUCKET, "key": "in/" },
+            "outputLocation": { "bucketName": CAPABILITY_OUTPUT_BUCKET, "key": "out/" },
             "transformerId": transformer_id
         }
     })
@@ -275,9 +333,11 @@ pub(crate) async fn given_profile(router: &MultiServiceRouter, name: &str) -> St
     text(&body, "profileId")
 }
 
-/// Create a capability — and the transformer it names — and return its `capabilityId`.
+/// Create a capability — and the transformer it names, and the buckets its locations name
+/// — and return its `capabilityId`.
 pub(crate) async fn given_capability(router: &MultiServiceRouter, name: &str) -> String {
     let transformer_id = given_transformer(router, &format!("{name}-transformer")).await;
+    given_capability_buckets(router).await;
     let (status, body) = call(
         router,
         "CreateCapability",
@@ -492,6 +552,7 @@ async fn a_created_capability_round_trips_its_configuration_and_instructions_doc
 
     let router = b2bi_router();
     let transformer_id = given_transformer(&router, "edi-850-to-json").await;
+    given_capability_buckets(&router).await;
     let mut minted = HashSet::new();
 
     for (case, transaction_set, version, direction, instructions) in cases {
@@ -1416,6 +1477,7 @@ async fn a_create_is_refused_once_its_store_is_full() {
             (String::new(), String::new())
         };
         let transformer_id = if case == "capability" {
+            given_capability_buckets(&router).await;
             given_transformer(&router, "bound-transformer").await
         } else {
             String::new()

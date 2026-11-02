@@ -17,8 +17,8 @@ use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::onboarding_loop::{
-    b2bi_router, call, call_signed_for, capability_configuration, error_code, given_profile,
-    given_transformer, text, SIGNING_REGION,
+    b2bi_router, call, call_signed_for, capability_configuration, error_code,
+    given_capability_buckets, given_profile, given_transformer, text, SIGNING_REGION,
 };
 use crate::transformer_lifecycle::{current_members, legacy_members};
 
@@ -44,6 +44,7 @@ async fn capability_using(
     transaction_set: &str,
     version: &str,
 ) -> String {
+    given_capability_buckets(router).await;
     let (status, body) = call(
         router,
         "CreateCapability",

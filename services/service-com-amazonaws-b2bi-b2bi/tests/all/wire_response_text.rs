@@ -31,8 +31,8 @@ use service_com_amazonaws_b2bi_b2bi::state::INVALID_PAGE_TOKEN_MESSAGE;
 
 use crate::edi_parsing::{given_object, BUCKET, X12_850};
 use crate::onboarding_loop::{
-    b2bi_router, call, capability_configuration, error_code, given_capability, given_profile,
-    given_transformer,
+    b2bi_router, call, capability_configuration, error_code, given_capability,
+    given_capability_buckets, given_profile, given_transformer,
 };
 
 /// The X12 transaction set and version every row that needs one names.
@@ -73,6 +73,7 @@ async fn every_success_of_this_service_answers_200() {
     let profile_id = given_profile(&router, "status-profile").await;
     let capability_id = given_capability(&router, "status-capability").await;
     let transformer_id = given_transformer(&router, "status-capability-transformer").await;
+    given_capability_buckets(&router).await;
 
     // Each row: the operation and a request body satisfying its modelled required members
     // (`smithy_query(query="operation",operation=...)`).
