@@ -458,6 +458,14 @@ async fn attaching_to_a_service_linked_role_is_refused() {
             "case {principal:?}: CreateServiceLinkedRole must succeed, got {status}: {created}"
         );
         let role_name = element(&created, "RoleName");
+        // What the role carries before the refused attach: the policy its own service
+        // attached when the role was created, which only that service controls.
+        let (status, body) = list(&router, &role_name, &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {principal:?}: expected 200, got {status}: {body}"
+        );
+        let before = reported(&body);
 
         let (status, body) = attach(&router, &role_name, AWS_MANAGED_POLICIES[0]).await;
         assert_eq!(
@@ -471,15 +479,23 @@ async fn attaching_to_a_service_linked_role_is_refused() {
             error_code(&body)
         );
 
-        // The refusal left the role's attachment set empty, which the reporting
-        // half of this pair is what shows.
+        // The refusal left the role's attachment set exactly as it was, which the
+        // reporting half of this pair is what shows.
         let (status, body) = list(&router, &role_name, &[]).await;
         assert_eq!(
             status, 200,
             "case {principal:?}: expected 200, got {status}: {body}"
         );
+        assert_eq!(
+            reported(&body),
+            before,
+            "case {principal:?}: a refused attach persists nothing, got {:?}",
+            reported(&body)
+        );
         assert!(
-            reported(&body).is_empty(),
+            !reported(&body)
+                .iter()
+                .any(|(_, arn)| arn == AWS_MANAGED_POLICIES[0]),
             "case {principal:?}: a refused attach persists nothing, got {:?}",
             reported(&body)
         );

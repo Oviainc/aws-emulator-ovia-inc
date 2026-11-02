@@ -1772,6 +1772,24 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// `GetServiceLinkedRoleDeletionStatus` is what reports one entry. A finished task
     /// stays readable, up to [`MAX_RETAINED_SERVICE_LINKED_ROLE_DELETION_TASKS`] of them.
     pub service_linked_role_deletions: BTreeMap<String, ServiceLinkedRoleDeletionTask>,
+    /// The service-linked role names the account has asked IAM to DELETE, by
+    /// [`name_key`] of the role name.
+    ///
+    /// A `DeleteServiceLinkedRole` submit is the account saying that service-linked role
+    /// is to be gone, so from then on nothing reports a role under that name: the
+    /// account's own record is removed, and the record the OWNING SERVICE keeps
+    /// provisioned under a published name ([`service_provisioned_role`]) is withdrawn
+    /// here — otherwise the derived record would step straight back in and a client
+    /// waiting for the role to disappear (the documented pattern, since the name is
+    /// fixed per service principal) would wait forever.
+    ///
+    /// A name is taken out of this set by a role being CREATED under it again
+    /// ([`insert_service_linked_role`]), which is what makes the set a record of what the
+    /// account has given up rather than a permanent ban. Only a name some service
+    /// publishes is held, so the set is bounded by
+    /// [`PUBLISHED_SERVICE_LINKED_ROLE_NAMES`]
+    /// ([`Self::withdraw_provisioned_role`]).
+    pub withdrawn_service_provisioned_roles: BTreeSet<String>,
     /// Monotonic counter feeding every report job's `JobId`
     /// ([`next_access_report_job_id`](Self::next_access_report_job_id) and
     /// [`next_service_last_accessed_job_id`](Self::next_service_last_accessed_job_id)).
@@ -1889,6 +1907,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             organizations_access_reports: BTreeMap::new(),
             service_last_accessed_reports: BTreeMap::new(),
             service_linked_role_deletions: BTreeMap::new(),
+            withdrawn_service_provisioned_roles: BTreeSet::new(),
             report_job_seq: 0,
             service_linked_role_deletion_seq: 0,
             delegation_request_id_seq: 0,
@@ -2302,7 +2321,48 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         self.roles
             .get(&name_key(role_name))
             .map(|role| role.path.clone())
-            .or_else(|| service_provisioned_role(role_name).map(|role| role.path))
+            .or_else(|| self.provisioned_role(role_name).map(|role| role.path))
+    }
+
+    /// The role the OWNING SERVICE keeps provisioned under the published name
+    /// `role_name` ([`service_provisioned_role`]), unless this ACCOUNT has asked for that
+    /// service-linked role to be deleted ([`Self::withdrawn_service_provisioned_roles`]),
+    /// in which case the account holds no role under that name and nothing reports one.
+    ///
+    /// The ONE place the derived record is resolved against the account's state, so every
+    /// operation that resolves a role beyond the account's own collection — the role
+    /// report, the description write and the protections, all of which reach it through
+    /// [`Self::addressed_role_path`] — agrees about whether a role exists under that name.
+    ///
+    /// A READ: the store is only consulted.
+    pub fn provisioned_role(&self, role_name: &str) -> Option<Role> {
+        if self
+            .withdrawn_service_provisioned_roles
+            .contains(&name_key(role_name))
+        {
+            return None;
+        }
+        service_provisioned_role(role_name)
+    }
+
+    /// Record that the account has given up the service-linked role keyed by `role_key`:
+    /// the record the owning service keeps provisioned under that name stops resolving
+    /// ([`Self::provisioned_role`]).
+    ///
+    /// Called by `DeleteServiceLinkedRole`, the operation through which the account asks
+    /// for such a role to be gone, and undone by a role being created under that name
+    /// again ([`insert_service_linked_role`]).
+    ///
+    /// Only a name some service PUBLISHES is recorded, because only such a name resolves
+    /// a provisioned record at all — which is also what bounds the set: it can never hold
+    /// more entries than [`PUBLISHED_SERVICE_LINKED_ROLE_NAMES`] has rows, however many
+    /// names submits are made for.
+    pub fn withdraw_provisioned_role(&mut self, role_key: &str) {
+        if published_service_linked_role(role_key).is_none() {
+            return;
+        }
+        self.withdrawn_service_provisioned_roles
+            .insert(name_key(role_key));
     }
 
     /// The groups the user keyed by `user_key` belongs to, by the key
@@ -3423,6 +3483,73 @@ pub fn published_service_linked_role(
         .map(|(row, (principal, published))| (row, *principal, *published))
 }
 
+/// The AWS-managed policy AWS attaches to the service-linked role of each service
+/// principal: the policy the SERVICE controls the role's permissions through.
+///
+/// "The service controls the attached policies and when the role can be deleted"
+/// (`CreateServiceLinkedRole`), and the policy it attaches is the one it owns under the
+/// path AWS reserves for service-linked roles ([`SERVICE_LINKED_ROLE_PATH_PREFIX`]) —
+/// "Amazon Web Services service role policies can only be attached to the
+/// service-linked role for that service" (`PolicyNotAttachableException`). No part of
+/// the IAM model names which policy belongs to which service, so the pairing is listed
+/// here, keyed by principal exactly as [`PUBLISHED_SERVICE_LINKED_ROLE_NAMES`] is.
+///
+/// Source: the "Using service-linked roles for <service>" page of each service's own
+/// user guide, which names the role AND the policy that role carries; every policy
+/// named here is one [`AWS_MANAGED_POLICIES`] already carries under that path, so the
+/// attachment this table makes resolves to a policy a reader of it can report. A
+/// principal this table does not name attaches nothing: AWS's policy name for it is not
+/// knowable here, and an invented one would name no policy.
+///
+/// Sorted by principal, which is also the lookup key ([`service_linked_role_policy`]).
+pub const SERVICE_LINKED_ROLE_POLICIES: &[(&str, &str)] = &[
+    ("autoscaling.amazonaws.com", "AutoScalingServiceRolePolicy"),
+    ("backup.amazonaws.com", "AWSBackupServiceLinkedRolePolicyForBackup"),
+    ("config.amazonaws.com", "AWSConfigServiceRolePolicy"),
+    ("ecs.amazonaws.com", "AmazonECSServiceRolePolicy"),
+    ("eks.amazonaws.com", "AmazonEKSServiceRolePolicy"),
+    (
+        "elasticbeanstalk.amazonaws.com",
+        "AWSElasticBeanstalkServiceRolePolicy",
+    ),
+    (
+        "elasticloadbalancing.amazonaws.com",
+        "ElasticLoadBalancingServiceRolePolicy",
+    ),
+    ("guardduty.amazonaws.com", "AmazonGuardDutyServiceRolePolicy"),
+    (
+        "lakeformation.amazonaws.com",
+        "LakeFormationDataAccessServiceRolePolicy",
+    ),
+    ("macie.amazonaws.com", "AmazonMacieServiceRolePolicy"),
+    ("organizations.amazonaws.com", "AWSOrganizationsServiceTrustPolicy"),
+    ("rds.amazonaws.com", "AmazonRDSServiceRolePolicy"),
+    ("spot.amazonaws.com", "AWSEC2SpotServiceRolePolicy"),
+    ("ssm.amazonaws.com", "AmazonSSMServiceRolePolicy"),
+    ("sso.amazonaws.com", "AWSSSOServiceRolePolicy"),
+    ("support.amazonaws.com", "AWSSupportServiceRolePolicy"),
+    ("trustedadvisor.amazonaws.com", "AWSTrustedAdvisorServiceRolePolicy"),
+];
+
+/// The policy the service `service_principal` attaches to its service-linked role, as
+/// [`AWS_MANAGED_POLICIES`] carries it, or `None` when no policy is paired with that
+/// principal ([`SERVICE_LINKED_ROLE_POLICIES`]).
+///
+/// Matched without regard to ASCII case, for the same reason
+/// [`published_service_linked_role_name`] is: a service principal is a DNS-style name,
+/// so a differently-cased spelling addresses the same service. The pairing is resolved
+/// against the catalog rather than trusted, so a row whose policy the catalog does not
+/// carry attaches nothing instead of an ARN nothing resolves.
+pub fn service_linked_role_policy(service_principal: &str) -> Option<&'static AwsManagedPolicy> {
+    let policy_name = SERVICE_LINKED_ROLE_POLICIES
+        .iter()
+        .find(|(principal, _)| principal.eq_ignore_ascii_case(service_principal))
+        .map(|(_, policy_name)| *policy_name)?;
+    AWS_MANAGED_POLICIES
+        .iter()
+        .find(|entry| entry.policy_name == policy_name && is_service_linked_role_path(entry.path))
+}
+
 /// The path a service-linked role for `service_principal` is filed under:
 /// [`SERVICE_LINKED_ROLE_PATH_PREFIX`] — the path AWS reserves for service-linked
 /// roles, since a role's path is what tells every operation the role is
@@ -3453,10 +3580,11 @@ pub fn service_linked_role_trust_policy(service_principal: &str) -> String {
 /// account's roles, and answer the record written.
 ///
 /// The ONE place a service-linked role's record is built: the path IAM reserves for such a
-/// role, the trust policy that lets the linked service assume it, this store's own id minter
-/// and the default session duration. `CreateServiceLinkedRole` calls it for the account's own
-/// create, and a SERVICE that links a role to itself on first use calls it from its own crate,
-/// so what such a role carries cannot differ between the two.
+/// role, the trust policy that lets the linked service assume it, the policy the service
+/// controls its permissions through ([`service_linked_role_policy`]), this store's own id
+/// minter and the default session duration. `CreateServiceLinkedRole` calls it for the
+/// account's own create, and a SERVICE that links a role to itself on first use calls it
+/// from its own crate, so what such a role carries cannot differ between the two.
 ///
 /// What this does NOT decide stays with the caller, because the two paths answer them
 /// differently: the role quota, a name the account already holds, and authorization. It
@@ -3487,6 +3615,27 @@ pub fn insert_service_linked_role(
         role_name: role_name.to_string(),
     };
     store.roles.insert(name_key(role_name), role.clone());
+    // "The service controls the attached policies" (`CreateServiceLinkedRole`): the role
+    // comes into existence carrying the policy its service owns
+    // ([`service_linked_role_policy`]), which is why an account auditing such a role sees
+    // a permissioned one. The attachment is made HERE rather than through the caller's
+    // `AttachRolePolicy`, which refuses one of those policies to any identity, because it
+    // is the SERVICE's attachment — "to attach a policy to this service-linked role, you
+    // must make the request using the Amazon Web Services service that depends on this
+    // role".
+    if let Some(policy) = service_linked_role_policy(service_principal) {
+        store
+            .role_attached_policies
+            .entry(name_key(role_name))
+            .or_default()
+            .insert(policy.arn());
+    }
+    // A role exists under this name again, so a deletion the account submitted earlier no
+    // longer withholds the record the owning service keeps provisioned under it
+    // ([`ComAmazonawsIamAwsidentitymanagementv20100508State::provisioned_role`]).
+    store
+        .withdrawn_service_provisioned_roles
+        .remove(&name_key(role_name));
     role
 }
 
@@ -3636,6 +3785,12 @@ const SERVICE_PROVISIONED_ROLE_CREATE_MILLIS: i64 = 0;
 /// ([`SERVICE_PROVISIONED_ROLE_CREATE_MILLIS`]) — so two reads answer the same
 /// record. A record the account creates for that name (`CreateServiceLinkedRole`)
 /// takes precedence: a reader looks in the store first.
+///
+/// NOT called directly by an operation: every resolution goes through
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::provisioned_role`], which
+/// withholds the record once the ACCOUNT has asked for that service-linked role to be
+/// deleted — a role the account gave up is gone, and a client waiting for it to
+/// disappear before recreating it depends on that.
 ///
 /// WHAT RESOLVES THROUGH THIS, and what deliberately does not:
 ///

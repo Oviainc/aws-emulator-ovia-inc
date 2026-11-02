@@ -205,7 +205,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service's own, carried over unchanged. A name neither the account nor any
         // service holds "referenced a resource entity that does not exist".
         if !store.roles.contains_key(&key) {
-            if let Some(provisioned) = crate::state::service_provisioned_role(&input.role_name) {
+            let provisioned = store.provisioned_role(&input.role_name);
+            if let Some(provisioned) = provisioned {
                 store.roles.insert(key.clone(), provisioned);
             }
         }

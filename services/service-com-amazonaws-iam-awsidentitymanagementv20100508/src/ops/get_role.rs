@@ -181,19 +181,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &resource,
                 &format!("role {}", input.role_name),
             )?;
+            // The account holds no record of its own under that name. A role name AWS
+            // PUBLISHES for a service still names a role: a service-linked role is
+            // predefined and controlled by the service rather than by the account, and
+            // the service keeps it provisioned for an account that uses the service — so
+            // this read reports THAT role instead of claiming nothing by that name
+            // exists. Unless the account has asked for that service-linked role to be
+            // DELETED, which is what `provisioned_role` reads: a role the account gave up
+            // is gone, and nothing reports one under its name again until one is created.
             held.cloned()
+                .or_else(|| store.provisioned_role(&input.role_name))
         };
         if let Some(role) = stored {
-            return Ok(GetRoleOutput { role });
-        }
-
-        // The account holds no record of its own under that name. A role name AWS
-        // PUBLISHES for a service still names a role: a service-linked role is
-        // predefined and controlled by the service rather than by the account, and
-        // the service keeps it provisioned for an account that uses the service — so
-        // this read reports THAT role (`crate::state::service_provisioned_role`)
-        // instead of claiming nothing by that name exists.
-        if let Some(role) = crate::state::service_provisioned_role(&input.role_name) {
             return Ok(GetRoleOutput { role });
         }
 

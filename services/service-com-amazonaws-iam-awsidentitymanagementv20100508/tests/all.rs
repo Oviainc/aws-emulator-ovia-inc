@@ -281,6 +281,8 @@ mod service_last_accessed_details;
 mod service_linked_role_deletion;
 #[path = "all/service_linked_role_published_names.rs"]
 mod service_linked_role_published_names;
+#[path = "all/service_linked_role_removal.rs"]
+mod service_linked_role_removal;
 #[path = "all/service_linked_roles.rs"]
 mod service_linked_roles;
 #[path = "all/service_provisioned_roles.rs"]

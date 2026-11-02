@@ -97,6 +97,14 @@
 //! (`smithy_query(query="shape", shape="Role")`), so the record is removed when the
 //! deletion is submitted: the task is the handle the progress of that submitted deletion
 //! is read through.
+//!
+//! A submit also WITHDRAWS the record the owning service keeps provisioned under a
+//! published service-linked role name
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::provisioned_role`]):
+//! the account has asked for that service-linked role to be gone, so no read reports one
+//! under that name until a role is created under it again — which is what lets a client
+//! that waits for the role to disappear before recreating it (the documented pattern,
+//! since the name is fixed per service principal) converge.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -245,6 +253,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     deletion_task_id: deletion_task_id.to_string(),
                 });
             }
+            // The account holds no service-linked role of its own under that name, which
+            // is what this refusal states — but the request IS the account asking for the
+            // service-linked role of that name to be gone, so the record the OWNING
+            // SERVICE keeps provisioned under a published name stops resolving too
+            // (`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::provisioned_role`).
+            // Without that, this operation would report no such role while every read
+            // kept reporting one, and a client polling for the role to disappear before
+            // recreating it would never converge.
+            store.withdraw_provisioned_role(&key);
             return Err(DeleteServiceLinkedRoleErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some("Cannot find the service role to delete.".to_string()),
@@ -291,10 +308,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The role is gone, and so are the policy sets that hung off it: leaving them
         // behind would make a later role of the same name look like it inherited the
-        // deleted one's policies, which is the same cleanup `DeleteRole` does.
+        // deleted one's policies, which is the same cleanup `DeleteRole` does. The record
+        // the OWNING SERVICE keeps provisioned under a published name is withdrawn with
+        // it, so the deleted role does not reappear as the service's own the moment it is
+        // read — the role is deleted, whichever record resolved it.
         store.roles.remove(&key);
         store.role_attached_policies.remove(&key);
         store.role_inline_policies.remove(&key);
+        store.withdraw_provisioned_role(&key);
 
         // Audit record for the change: the acting principal, the operation and the task it
         // recorded, so a state-changing call leaves a local record.

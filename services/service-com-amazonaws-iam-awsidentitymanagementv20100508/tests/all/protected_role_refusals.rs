@@ -287,6 +287,19 @@ async fn a_protected_change_is_refused_in_one_fixed_sentence() {
 
     for (principal, custom_suffix) in LINKED_SERVICES {
         let minted = service_linked_role(&router, principal, *custom_suffix).await;
+        // What the role carries before the refused calls: the policy its own service
+        // attached when the role was created, which only that service controls.
+        let (status, body) = call(
+            &router,
+            "ListAttachedRolePolicies",
+            &[("RoleName", &minted)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {principal:?}: ListAttachedRolePolicies failed: {body}"
+        );
+        let attached_before = elements(&body, "PolicyArn");
         // Rows spanning the spelling the request names the role by: the refusal quotes
         // what the REQUEST carried, not what the store holds.
         let spellings = [
@@ -352,8 +365,15 @@ async fn a_protected_change_is_refused_in_one_fixed_sentence() {
             status, 200,
             "case {principal:?}: ListAttachedRolePolicies failed: {body}"
         );
+        // The role carries exactly what it carried before — the policy its own service
+        // attached — and nothing the refused attach named.
+        assert_eq!(
+            elements(&body, "PolicyArn"),
+            attached_before,
+            "case {principal:?}: a refused attach must persist nothing: {body}"
+        );
         assert!(
-            elements(&body, "PolicyArn").is_empty(),
+            !elements(&body, "PolicyArn").contains(&MANAGED_POLICY_ARN.to_string()),
             "case {principal:?}: a refused attach must persist nothing: {body}"
         );
     }
