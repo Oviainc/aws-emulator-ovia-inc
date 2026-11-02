@@ -93,6 +93,22 @@ pub const IMAGE_POLICY_TYPE: &str = "IMAGE_MANAGEMENT";
 /// from the volumes for an instance".
 pub const INSTANCE_DEFAULT_POLICY_TYPE: &str = "INSTANCE";
 
+/// The `DefaultPolicyTypeValues` member a DEFAULT policy names when what it
+/// manages is EBS snapshots: `DefaultPolicy` documents "To create a default
+/// policy for EBS snapshots, that creates snapshots of all volumes in the Region
+/// that do not have recent backups, specify `VOLUME`".
+pub const VOLUME_DEFAULT_POLICY_TYPE: &str = "VOLUME";
+
+/// The `PolicyTypeValues` a DEFAULT policy can manage, in the order
+/// `DefaultPolicyTypeValues` pairs them with: the snapshot management a `VOLUME`
+/// default policy performs and the AMI management an `INSTANCE` one performs.
+///
+/// `EVENT_BASED_POLICY` is not among them: an event-based policy "performs
+/// specific actions when a defined event occurs", which is neither of the two
+/// kinds of default policy `DefaultPolicy` offers, so only a custom policy
+/// manages it.
+pub const DEFAULT_POLICY_MANAGED_TYPES: [&str; 2] = [DEFAULT_POLICY_TYPE, IMAGE_POLICY_TYPE];
+
 /// The `PolicyLanguage` value that marks a policy as a DEFAULT policy:
 /// `PolicyDetails$PolicyLanguage` documents `SIMPLIFIED` as "To create a default
 /// policy" and `STANDARD` as "To create a custom policy".
@@ -334,6 +350,124 @@ pub fn configures_event_based_policy(details: &PolicyDetails) -> bool {
     details.policy_type.as_deref() == Some(EVENT_BASED_POLICY_TYPE)
 }
 
+/// What a DEFAULT policy of the kind `resource_type` names MANAGES, as a
+/// `PolicyTypeValues`.
+///
+/// `DefaultPolicy` / `PolicyDetails$ResourceType` and
+/// `PolicyDetails$PolicyType` state ONE fact about a default policy from the two
+/// ends: "To create a default policy for EBS-backed AMIs ... specify `INSTANCE`"
+/// is the same policy as "Specify `IMAGE_MANAGEMENT` to create a lifecycle
+/// policy that manages the lifecycle of EBS-backed AMIs", and `VOLUME`'s
+/// snapshots of volumes are `EBS_SNAPSHOT_MANAGEMENT`'s snapshots. So the kind
+/// of default policy decides the type it manages, and this is the ONE place that
+/// correspondence is written.
+///
+/// A default policy whose kind nothing has stated manages the type
+/// `PolicyDetails$PolicyType`'s own documented default names ("The default is
+/// `EBS_SNAPSHOT_MANAGEMENT`"), which is the type the snapshot kind manages.
+pub fn default_policy_managed_type(resource_type: Option<&str>) -> &'static str {
+    match resource_type {
+        Some(INSTANCE_DEFAULT_POLICY_TYPE) => IMAGE_POLICY_TYPE,
+        _ => DEFAULT_POLICY_TYPE,
+    }
+}
+
+/// The correspondence above read the other way: the kind of DEFAULT policy that
+/// manages `policy_type`, or `None` when no kind of default policy manages it.
+pub fn default_policy_kind_managing(policy_type: &str) -> Option<&'static str> {
+    [VOLUME_DEFAULT_POLICY_TYPE, INSTANCE_DEFAULT_POLICY_TYPE]
+        .into_iter()
+        .find(|kind| default_policy_managed_type(Some(kind)) == policy_type)
+}
+
+/// Which KIND of policy a write path is storing a configuration for — the input
+/// to [`materialized_policy_details`], which materializes the members that kind
+/// of policy carries.
+///
+/// The kind is the write path's to decide, because only it knows one: a create
+/// reads it off the request and an update off the policy it addresses, whose
+/// kind it cannot change ([`immutable_member_changed`]).
+#[derive(Debug, Clone, Copy)]
+pub enum PolicyKind<'resource_type> {
+    /// A DEFAULT policy, beside the kind of default policy it is — the
+    /// `DefaultPolicyTypeValues` the record holds, which is what decides the
+    /// type such a policy manages ([`default_policy_managed_type`]).
+    Default {
+        resource_type: Option<&'resource_type str>,
+    },
+    /// A CUSTOM policy, whose own configuration states its type.
+    Custom,
+}
+
+/// The kind of DEFAULT policy a request describes, or why the `PolicyType` its
+/// configuration states cannot describe one at all.
+///
+/// A default policy's kind and the type it manages are two statements of one
+/// fact ([`default_policy_managed_type`]), so a request may state either member
+/// — `DefaultPolicy` or `PolicyDetails$ResourceType` as `stated_resource_type`,
+/// `PolicyDetails$PolicyType` inside `details` — and:
+///
+/// * stating both is accepted only when they agree, since a pair that disagrees
+///   asks for a policy that manages one thing and targets the resources of the
+///   other, which no default policy does;
+/// * stating the type alone names the kind that manages it, so the member
+///   decides what the policy manages exactly as its documentation says;
+/// * stating a type no kind of default policy manages (`EVENT_BASED_POLICY`, the
+///   type of a policy that "performs specific actions when a defined event
+///   occurs") describes no default policy, so it is refused rather than stored
+///   as one;
+/// * stating neither leaves the kind unstated, and the policy manages the type
+///   `PolicyDetails$PolicyType`'s documented default names.
+pub fn default_policy_kind(
+    stated_resource_type: Option<&str>,
+    details: Option<&PolicyDetails>,
+) -> Result<Option<String>, InvalidRequestException> {
+    let stated_policy_type = details.and_then(|details| details.policy_type.as_deref());
+    match (stated_resource_type, stated_policy_type) {
+        (Some(resource_type), Some(policy_type)) => {
+            let managed = default_policy_managed_type(Some(resource_type));
+            if policy_type != managed {
+                return Err(default_policy_manages_another_type(
+                    resource_type,
+                    managed,
+                    policy_type,
+                ));
+            }
+            Ok(Some(resource_type.to_string()))
+        }
+        (Some(resource_type), None) => Ok(Some(resource_type.to_string())),
+        (None, Some(policy_type)) => default_policy_kind_managing(policy_type)
+            .map(|kind| Some(kind.to_string()))
+            .ok_or_else(|| no_default_policy_manages(policy_type)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The `InvalidRequestException` for a request whose configuration states a
+/// `PolicyType` other than the one the kind of default policy it asks for
+/// manages. Built from the request: it names the member refused, the kind of
+/// default policy asked for, the type that kind manages and the type stated.
+pub fn default_policy_manages_another_type(
+    resource_type: &str,
+    managed: &str,
+    stated: &str,
+) -> InvalidRequestException {
+    invalid_request(format!(
+        "The parameter {POLICY_DETAILS_PREFIX}{POLICY_TYPE_MEMBER} must be {managed} for a \
+         default policy that targets {resource_type}, but {stated} was requested."
+    ))
+}
+
+/// The `InvalidRequestException` for a request that asks for a default policy
+/// whose configuration states a `PolicyType` no kind of default policy manages.
+pub fn no_default_policy_manages(stated: &str) -> InvalidRequestException {
+    invalid_request(format!(
+        "The parameter {POLICY_DETAILS_PREFIX}{POLICY_TYPE_MEMBER} must be {} for a default \
+         policy, but {stated} was requested.",
+        DEFAULT_POLICY_MANAGED_TYPES.join(" or ")
+    ))
+}
+
 /// The `PolicyDetails` this service STORES for a policy whose configuration was
 /// stated as a `PolicyDetails` structure: the submitted structure with every
 /// member the service itself materializes stamped onto it.
@@ -345,7 +479,7 @@ pub fn configures_event_based_policy(details: &PolicyDetails) -> bool {
 /// and never in a read projection.
 ///
 /// WHICH members are materialized follows the KIND of policy the record is —
-/// `default_policy`, a DEFAULT policy against a custom one — and never what the
+/// [`PolicyKind`], a DEFAULT policy against a custom one — and never what the
 /// submitted structure's own `PolicyLanguage` happens to say. The kind is the
 /// caller's to decide, because only the write path knows it: a create derives it
 /// from the request, and an update from the policy it addresses, whose kind it
@@ -362,9 +496,13 @@ pub fn configures_event_based_policy(details: &PolicyDetails) -> bool {
 ///   policy" and `STANDARD` "To create a custom policy". Stamping it is what
 ///   leaves no stored configuration whose language contradicts the kind of policy
 ///   holding it.
-/// * `PolicyType` — the documented default `EBS_SNAPSHOT_MANAGEMENT` for a
-///   configuration that names no type ("The default is
-///   `EBS_SNAPSHOT_MANAGEMENT`"), whatever the policy targets.
+/// * `PolicyType` — the type the policy MANAGES, by the same rule: for a DEFAULT
+///   policy the type the kind of default policy it is manages
+///   ([`default_policy_managed_type`]), and for a custom one the documented
+///   default `EBS_SNAPSHOT_MANAGEMENT` when its configuration names no type
+///   ("The default is `EBS_SNAPSHOT_MANAGEMENT`"), whatever the policy targets.
+///   Stamping it is what leaves no stored configuration whose type contradicts
+///   the type every read of the policy reports.
 /// * `ResourceLocations` — `[CLOUD]`, the in-Region location. The member is
 ///   `@length(min: 1, max: 1)`, so a read of a custom snapshot or AMI policy
 ///   reports exactly one location.
@@ -382,12 +520,18 @@ pub fn configures_event_based_policy(details: &PolicyDetails) -> bool {
 /// fabrication.
 pub fn materialized_policy_details(
     mut details: PolicyDetails,
-    default_policy: bool,
+    kind: PolicyKind<'_>,
 ) -> PolicyDetails {
-    if default_policy {
+    if let PolicyKind::Default { resource_type } = kind {
         // A DEFAULT policy's configuration, which carries none of the custom
-        // members stamped below.
+        // members stamped below. Its type is the one the kind of default policy
+        // it is manages, which is also the type its reads report, so the stored
+        // configuration states that type however the request stated it: a
+        // request may name the type or the kind, and one naming a type the kind
+        // it asks for does not manage is refused before anything is stored
+        // ([`default_policy_kind`]).
         details.policy_language = Some(SIMPLIFIED_POLICY_LANGUAGE.to_string());
+        details.policy_type = Some(default_policy_managed_type(resource_type).to_string());
         return details;
     }
     details.policy_language = Some(STANDARD_POLICY_LANGUAGE.to_string());
@@ -588,6 +732,13 @@ impl LifecyclePolicyRecord {
             return self.policy_details.clone();
         }
         let mut details = self.policy_details.clone().unwrap_or_default();
+        // The language and the type a default policy's kind names. A request may
+        // have stated the configuration in the request body alone, leaving the
+        // record no structure to have stamped them onto, so they are reported
+        // from the record here as well; for a record that holds a structure the
+        // write path already stamped the same two values into it
+        // ([`materialized_policy_details`]), so this reports what is stored
+        // rather than deciding it.
         details.policy_language = Some(self.policy_language().to_string());
         details.policy_type = Some(self.policy_type());
         details.resource_type = self.default_policy_type.clone();
@@ -680,15 +831,14 @@ impl LifecyclePolicyRecord {
     /// A DEFAULT policy is the one case where the target IS the statement of
     /// what the policy manages, because such a policy configures no type of its
     /// own: `DefaultPolicy` `INSTANCE` creates EBS-backed AMIs
-    /// ([`IMAGE_POLICY_TYPE`]) and `VOLUME` creates snapshots. That is judged
-    /// FIRST, so the type a default policy reports follows the kind of default
-    /// policy it is however its configuration structure was written.
+    /// ([`IMAGE_POLICY_TYPE`]) and `VOLUME` creates snapshots
+    /// ([`default_policy_managed_type`], the one place that correspondence is
+    /// written). That is judged FIRST, so the type a default policy reports
+    /// follows the kind of default policy it is, which is also the type the
+    /// write path stamped onto its stored configuration.
     pub fn policy_type(&self) -> String {
         if self.default_policy {
-            return match self.default_policy_type.as_deref() {
-                Some(INSTANCE_DEFAULT_POLICY_TYPE) => IMAGE_POLICY_TYPE.to_string(),
-                _ => DEFAULT_POLICY_TYPE.to_string(),
-            };
+            return default_policy_managed_type(self.default_policy_type.as_deref()).to_string();
         }
         self.policy_details
             .as_ref()

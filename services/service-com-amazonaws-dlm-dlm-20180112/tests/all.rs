@@ -17,6 +17,8 @@ mod configuration_kind_from_policy_type;
 mod create_policy_kind_materialization;
 #[path = "all/default_policy_configuration_precedence.rs"]
 mod default_policy_configuration_precedence;
+#[path = "all/default_policy_managed_type.rs"]
+mod default_policy_managed_type;
 #[path = "all/default_policy_only_body_parameter_set.rs"]
 mod default_policy_only_body_parameter_set;
 #[path = "all/default_policy_only_parameters.rs"]

@@ -365,10 +365,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // above): a replacement configuration for a default policy is
             // stored as a default policy's and one for a custom policy as a
             // custom policy's, whether or not the structure restated its
-            // language.
-            let default_policy = policy.default_policy;
-            let mut details =
-                crate::state::materialized_policy_details(policy_details, default_policy);
+            // language. For a default policy that kind includes which kind of
+            // default policy it is — the resource type the replacement states,
+            // else the one the policy already holds, since an update that omits
+            // it leaves that in place — so the type stamped onto the stored
+            // configuration is the type the policy's reads report.
+            let default_resource_type = policy_details
+                .resource_type
+                .clone()
+                .or_else(|| policy.default_policy_type.clone());
+            let kind = if policy.default_policy {
+                crate::state::PolicyKind::Default {
+                    resource_type: default_resource_type.as_deref(),
+                }
+            } else {
+                crate::state::PolicyKind::Custom
+            };
+            let mut details = crate::state::materialized_policy_details(policy_details, kind);
             let configuration =
                 crate::state::DefaultPolicyConfiguration::taken_from_policy_details(&mut details);
             policy.replace_default_policy_configuration(configuration);

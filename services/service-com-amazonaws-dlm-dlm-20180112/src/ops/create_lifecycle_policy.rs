@@ -323,6 +323,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Which kind of DEFAULT policy this request asks for, resolved ONCE for
+        // the configuration stored below: the resource type the request states
+        // in either of its two places, else the kind that manages the
+        // `PolicyType` its configuration states, since for a default policy
+        // those two members state one fact — the kind of default policy
+        // `DefaultPolicy` offers "for EBS-backed AMIs" is the policy
+        // `PolicyDetails$PolicyType` calls "IMAGE_MANAGEMENT". A configuration
+        // naming a type the kind it asks for does not manage, or one no kind of
+        // default policy manages at all, describes no default policy and is
+        // refused before anything is stored rather than being dropped.
+        let default_policy_kind = if is_default {
+            let stated_resource_type = input.default_policy.clone().or_else(|| {
+                input
+                    .policy_details
+                    .as_ref()
+                    .and_then(|details| details.resource_type.clone())
+            });
+            match crate::state::default_policy_kind(
+                stated_resource_type.as_deref(),
+                input.policy_details.as_ref(),
+            ) {
+                Ok(kind) => kind,
+                Err(refusal) => {
+                    return Err(
+                        CreateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
+                    )
+                }
+            }
+        } else {
+            None
+        };
+
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
@@ -353,10 +385,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // together belongs to the request-body/structure alternatives rule
         // ([`crate::state::configuration_stated_twice`]), which this path leaves
         // as it stands; what is fixed here is that no record is left holding a
-        // configuration whose language contradicts its kind.
+        // configuration whose language or type contradicts its kind.
+        let kind = if is_default {
+            crate::state::PolicyKind::Default {
+                resource_type: default_policy_kind.as_deref(),
+            }
+        } else {
+            crate::state::PolicyKind::Custom
+        };
         let mut policy_details = input
             .policy_details
-            .map(|details| crate::state::materialized_policy_details(details, is_default));
+            .map(|details| crate::state::materialized_policy_details(details, kind));
         // A default policy's `[Default policies only]` configuration is stored in
         // ONE place — the record's own fields — whichever of the two alternative
         // places this request stated it in: the members stated inside the
@@ -368,8 +407,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `default_policy_type`. A request that is not creating a default policy
         // may state none of them anywhere (refused above), so this moves nothing
         // for one.
+        //
+        // The resource type is the kind of default policy resolved above, which
+        // is the one the configuration stored just now was materialized for, so
+        // the record and the structure it holds state the same kind: whichever
+        // of the three members named it — the body's `DefaultPolicy`, the
+        // structure's `ResourceType` or the type the structure states that a
+        // default policy of one kind alone manages — the record keeps the one
+        // copy of it. The structure is still relieved of its own copy below, so
+        // nothing can shadow it.
         let configuration = crate::state::DefaultPolicyConfiguration {
-            resource_type: input.default_policy,
+            resource_type: default_policy_kind,
             create_interval: input.create_interval,
             retain_interval: input.retain_interval,
             copy_tags: input.copy_tags,
