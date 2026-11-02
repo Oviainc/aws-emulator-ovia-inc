@@ -107,11 +107,13 @@ async fn an_empty_service_is_deleted_by_id_or_by_arn() {
         );
 
         // The (namespace, name) index entry went with the record: the name is free, and
-        // the re-created service is a NEW resource, not the deleted one.
+        // the service created under it again is a NEW resource with no instance of the
+        // deleted one — carrying the same `Id`, which is a function of the namespace and
+        // the name rather than of the order in which services were created.
         let recreated = service(&router, &namespace_id, "delete-svc").await;
-        assert_ne!(
+        assert_eq!(
             recreated, service_id,
-            "case {case:?}: re-creating a deleted service mints a fresh id"
+            "case {case:?}: re-creating a deleted service reuses its derived id"
         );
         let read = ok(&router, "GetService", json!({ "Id": recreated })).await;
         assert_eq!(

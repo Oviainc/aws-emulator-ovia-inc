@@ -144,12 +144,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
         let Some(resource) = state.resolve_tagged_resource(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "The operation can't be completed because the resource {} was not found.",
-                        input.resource_arn
-                    )),
-                },
+                // This read carries no message: it reports the class in the error code
+                // and echoes nothing of the request into the body, the same body
+                // `TagResource` answers with.
+                ResourceNotFoundException { message: None },
             )
             .into());
         };

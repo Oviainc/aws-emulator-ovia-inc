@@ -181,8 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if service.instances.remove(&input.instance_id).is_none() {
                 return Err(DeregisterInstanceErrorModeled::InstanceNotFound(
                     InstanceNotFound {
-                        // The instance the request named, and nothing else.
-                        message: Some(input.instance_id.clone()),
+                        // This operation's own template: the instance the request named
+                        // and the service it asked for, as that service's ARN. The
+                        // instance READ reports the instance id alone, so each operation
+                        // keeps its own body.
+                        message: Some(format!(
+                            "instanceId {} doesn't exists for service {}",
+                            input.instance_id, service.arn
+                        )),
                     },
                 )
                 .into());

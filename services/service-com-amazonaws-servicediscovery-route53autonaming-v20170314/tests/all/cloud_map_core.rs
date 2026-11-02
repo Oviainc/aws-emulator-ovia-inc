@@ -115,6 +115,30 @@ pub(crate) async fn namespace(router: &MultiServiceRouter, name: &str) -> (Strin
     (operation_id, namespace_id)
 }
 
+/// Create a public DNS namespace — the kind whose services carry Route 53 records — and
+/// return its id.
+///
+/// `pub(crate)` for the same reason as the helpers above: the suites that need a DNS
+/// namespace share this one rather than each carrying a copy of the create-then-resolve
+/// round trip.
+pub(crate) async fn dns_namespace(router: &MultiServiceRouter, name: &str) -> String {
+    let created = ok(
+        router,
+        "CreatePublicDnsNamespace",
+        json!({ "Name": format!("{name}.example.com") }),
+    )
+    .await;
+    let operation_id = created["OperationId"]
+        .as_str()
+        .expect("CreatePublicDnsNamespace returns an OperationId")
+        .to_string();
+    let filed = ok(router, "GetOperation", json!({ "OperationId": operation_id })).await;
+    filed["Operation"]["Targets"]["NAMESPACE"]
+        .as_str()
+        .expect("the CREATE_NAMESPACE operation targets the namespace it created")
+        .to_string()
+}
+
 /// Create a service in `namespace_id` and return its id.
 pub(crate) async fn service(router: &MultiServiceRouter, namespace_id: &str, name: &str) -> String {
     let created = ok(
@@ -461,9 +485,12 @@ async fn query_parameters_keep_only_instances_matching_every_pair() {
             vec![],
         ),
         (
-            "a well-known attribute key",
-            json!({ "AWS_INSTANCE_IPV4": "10.0.0.3" }),
-            vec!["i-dev"],
+            // A key in the service's own reserved attribute namespace is not a custom
+            // attribute and is refused rather than filtered on, which
+            // `service_identity_and_error_bodies` asserts.
+            "a custom key only one instance carries the value of",
+            json!({ "az": "1b" }),
+            vec!["i-prod-b"],
         ),
     ];
 

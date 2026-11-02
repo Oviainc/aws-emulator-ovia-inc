@@ -108,6 +108,15 @@ impl From<DeleteNamespaceErrorModeled> for DeleteNamespaceError {
     }
 }
 
+/// The sentence `ResourceInUse` carries when the namespace still holds services.
+///
+/// Documented on this operation: "If the namespace still contains one or more services,
+/// the request fails." The refusal says exactly that and names neither the namespace nor
+/// how many services it holds — the recorded response is this fixed text, the namespace
+/// counterpart of `DeleteService`'s instance conflict.
+const NAMESPACE_HAS_SERVICES: &str =
+    "Namespace has associated services; delete the services before deleting the namespace";
+
 /// The `DeleteNamespace` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -179,9 +188,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             return Err(DeleteNamespaceErrorModeled::NamespaceNotFound(
-                // `NamespaceNotFound` carries no message: the service reports the class
-                // of failure and echoes no requested id into the body.
-                NamespaceNotFound { message: None },
+                // The message is the namespace reference the request named and nothing
+                // else: this delete reports which reference it could not resolve, with
+                // no sentence around it, as the namespace updates and the create in a
+                // namespace do. Only the namespace READS report the class alone.
+                NamespaceNotFound {
+                    message: Some(input.id.clone()),
+                },
             )
             .into());
         };
@@ -189,13 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If the namespace still contains one or more services, the request fails."
         // The count is derived from the service map, so it can never disagree with the
         // `ServiceCount` `GetNamespace` reports.
-        let service_count = state.service_count(&namespace_id);
-        if service_count > 0 {
+        if state.service_count(&namespace_id) > 0 {
             return Err(DeleteNamespaceErrorModeled::ResourceInUse(ResourceInUse {
-                message: Some(format!(
-                    "The namespace {namespace_id} can't be deleted because it still contains \
-                     {service_count} service(s)."
-                )),
+                message: Some(NAMESPACE_HAS_SERVICES.to_string()),
             })
             .into());
         }

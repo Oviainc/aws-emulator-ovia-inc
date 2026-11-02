@@ -165,9 +165,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (ARN) of the namespace", so either form resolves to the one stored record.
         let Some(namespace_id) = state.resolve_namespace_id(&input.id) else {
             return Err(UpdatePrivateDnsNamespaceErrorModeled::NamespaceNotFound(
-                // `NamespaceNotFound` carries no message: the service reports the class
-                // of failure and echoes no requested id into the body.
-                NamespaceNotFound { message: None },
+                // The message is the namespace the request named and nothing else: this
+                // update reports which reference it could not resolve, with no sentence
+                // around it. The namespace READS report the class alone, so the two are
+                // told apart by the body.
+                NamespaceNotFound {
+                    message: Some(input.id.clone()),
+                },
             )
             .into());
         };

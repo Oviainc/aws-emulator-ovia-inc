@@ -248,11 +248,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
 
-        // `NamespaceNotFound` carries no message: the service reports the class of
-        // failure and echoes no requested id into the body.
+        // The message is the namespace reference the request named and nothing else:
+        // this create reports which namespace it could not resolve, with no sentence
+        // around it, exactly as the namespace updates do. Only the namespace READS
+        // report the class alone.
         let Some(namespace_id) = state.resolve_namespace_id(&namespace_reference) else {
             return Err(CreateServiceErrorModeled::NamespaceNotFound(NamespaceNotFound {
-                message: None,
+                message: Some(namespace_reference.clone()),
             })
             .into());
         };
@@ -339,7 +341,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let id = state.next_id("srv", 16);
+        // The `Id` is a function of what names the service — its parent namespace and
+        // its `Name` — rather than of a counter, so the pair that was refused above
+        // with `ServiceAlreadyExists` keeps its identifier: once a `DeleteService`
+        // frees the name, creating it again answers with the id the first create
+        // answered with.
+        let id = crate::state::derived_service_id(&namespace_id, &input.name);
         let record = crate::state::ServiceRecord {
             arn: crate::state::service_arn(&region, &format!("service/{id}")),
             id: id.clone(),

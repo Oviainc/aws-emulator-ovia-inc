@@ -310,6 +310,46 @@ pub fn described(description: Option<String>) -> Option<String> {
     description.filter(|text| !text.is_empty())
 }
 
+/// Fold a digest into `digits` id characters.
+///
+/// Cloud Map ids are lowercase alphanumeric, so the digest bytes are folded into base
+/// 36 rather than rendered as hex. `digits` is clamped to the digest width, so an id
+/// body is at most 32 characters long.
+fn fold_id_digits(digest: &[u8], digits: usize) -> String {
+    const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    digest
+        .iter()
+        .take(digits.min(digest.len()))
+        .map(|byte| char::from(ALPHABET[usize::from(*byte) % ALPHABET.len()]))
+        .collect()
+}
+
+/// How many characters a service `Id` carries behind its `srv-` prefix.
+const SERVICE_ID_DIGITS: usize = 16;
+
+/// The `Id` of the service called `name` in the namespace `namespace_id`.
+///
+/// A service is addressed inside its namespace by its `Name` — the pair is what
+/// `ServiceAlreadyExists` is raised for and what `DiscoverInstances` resolves — so the
+/// identifier is a FUNCTION of that pair and of nothing else: no counter and no clock
+/// is read. Two consequences are what callers rely on: the same name created again in
+/// the same namespace, after a `DeleteService` freed it, is answered with the
+/// identifier the first create answered with, and the same name under a different
+/// namespace gets a different identifier.
+pub fn derived_service_id(namespace_id: &str, name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"service");
+    // A zero byte neither identifier can contain separates them, so no two distinct
+    // pairs hash the same bytes.
+    hasher.update(namespace_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(name.as_bytes());
+    format!(
+        "srv-{}",
+        fold_id_digits(&hasher.finalize(), SERVICE_ID_DIGITS)
+    )
+}
+
 /// What a DNS-namespace update asked for, as an idempotency `request` key.
 ///
 /// `UpdaterRequestId` "allows failed Update…Namespace requests to be retried without
@@ -609,15 +649,7 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
         hasher.update(prefix.as_bytes());
         hasher.update(self.id_seq.to_be_bytes());
         hasher.update(nanos.to_be_bytes());
-        let digest = hasher.finalize();
-        // Cloud Map ids are lowercase alphanumeric, so the digest bytes are folded
-        // into base 36 rather than rendered as hex.
-        const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-        let body: String = digest
-            .iter()
-            .take(digits.min(digest.len()))
-            .map(|byte| char::from(ALPHABET[usize::from(*byte) % ALPHABET.len()]))
-            .collect();
+        let body = fold_id_digits(&hasher.finalize(), digits);
         if prefix.is_empty() {
             body
         } else {

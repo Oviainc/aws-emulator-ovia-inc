@@ -513,49 +513,66 @@ async fn an_empty_description_is_omitted_and_a_non_empty_one_round_trips() {
     }
 }
 
-/// Cloud Map's not-found and conflict messages are fixed text, not request echoes:
-/// `NamespaceNotFound` carries no `Message` at all, wherever it is raised, and
-/// `ServiceAlreadyExists` carries one constant string naming neither resource.
+/// Cloud Map's not-found and conflict messages carry no prose: `NamespaceNotFound`
+/// carries no `Message` on a namespace READ, while a call that NAMES a namespace to act
+/// on — an update, a delete, or a create in it — reports the namespace reference the
+/// request named and nothing else, and `ServiceAlreadyExists` carries one constant string
+/// naming neither resource.
 #[tokio::test]
 async fn a_not_found_or_conflict_body_echoes_no_request_value() {
     let router = emulator();
     let (_, namespace_id) = namespace(&router, "msg-ns").await;
 
-    // Every operation that can answer `NamespaceNotFound`, and an id or name that
-    // reaches it — the ids differ in shape so no row can pass by matching one of them.
-    let not_found: Vec<(&str, Value)> = vec![
-        ("GetNamespace", json!({ "Id": "ns-sim2realbeha" })),
-        ("GetNamespace", json!({ "Id": "ns-0123456789abcdef" })),
-        ("DeleteNamespace", json!({ "Id": "ns-nosuchnamespace" })),
+    // Every operation that can answer `NamespaceNotFound`, an id or name that reaches it
+    // — the ids differ in shape so no row can pass by matching one of them — and the
+    // `Message` that operation answers with (`None` for no `Message` member at all).
+    let not_found: Vec<(&str, Value, Option<&str>)> = vec![
+        ("GetNamespace", json!({ "Id": "ns-sim2realbeha" }), None),
+        ("GetNamespace", json!({ "Id": "ns-0123456789abcdef" }), None),
+        (
+            "DeleteNamespace",
+            json!({ "Id": "ns-nosuchnamespace" }),
+            Some("ns-nosuchnamespace"),
+        ),
         (
             "DeleteNamespace",
             json!({ "Id": "arn:aws:servicediscovery:us-west-2:000000000000:namespace/ns-gone" }),
+            Some("arn:aws:servicediscovery:us-west-2:000000000000:namespace/ns-gone"),
         ),
         (
             "UpdateHttpNamespace",
             json!({ "Id": "ns-nosuchnamespace", "Namespace": { "Description": "x" } }),
+            Some("ns-nosuchnamespace"),
         ),
         (
             "CreateService",
             json!({ "Name": "orphan-svc", "NamespaceId": "ns-nosuchnamespace" }),
+            Some("ns-nosuchnamespace"),
         ),
         (
             "DiscoverInstances",
             json!({ "NamespaceName": "no-such-namespace", "ServiceName": "any" }),
+            None,
         ),
     ];
-    for (operation, body) in not_found {
+    for (operation, body, expected_message) in not_found {
         let (status, answer) = call(&router, operation, body.clone()).await;
-        let (code, _) = error_of(&answer);
+        let (code, message) = error_of(&answer);
         assert_eq!(
             (status, code.as_str()),
             (400, "NamespaceNotFound"),
             "case {operation} with {body}: expected 400 NamespaceNotFound, got {answer}"
         );
-        assert!(
-            answer.get("Message").is_none() && answer.get("message").is_none(),
-            "case {operation} with {body}: NamespaceNotFound carries no Message, got {answer}"
-        );
+        match expected_message {
+            None => assert!(
+                answer.get("Message").is_none() && answer.get("message").is_none(),
+                "case {operation} with {body}: NamespaceNotFound carries no Message, got {answer}"
+            ),
+            Some(expected) => assert_eq!(
+                message, expected,
+                "case {operation} with {body}: expected the Message {expected:?}, got {answer}"
+            ),
+        }
     }
 
     // The conflict message is one constant, whatever the service and namespace are

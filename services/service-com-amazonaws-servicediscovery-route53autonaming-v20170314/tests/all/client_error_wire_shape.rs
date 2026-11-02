@@ -355,10 +355,12 @@ async fn an_unresolvable_service_reference_echoes_only_what_the_request_named() 
     }
 }
 
-/// An instance the service never registered is refused with the instance id the request
-/// named and nothing else — whichever form named the service, and whatever the id looks
-/// like (`ResourceId` is `length 0..64` with no pattern, so the empty id and a long one
-/// both reach the handler).
+/// An instance the service never registered is refused with that operation's own body —
+/// the instance read echoes the instance id and nothing else, while the deregister
+/// reports the instance together with the service it was asked for, as that service's
+/// ARN — whichever form named the service, and whatever the id looks like (`ResourceId`
+/// is `length 0..64` with no pattern, so the empty id and a long one both reach the
+/// handler).
 #[tokio::test]
 async fn an_unregistered_instance_echoes_only_the_requested_instance_id() {
     let router = emulator();
@@ -381,14 +383,22 @@ async fn an_unregistered_instance_echoes_only_the_requested_instance_id() {
 
     for (named, reference) in [("by id", &service_id), ("by ARN", &service_arn)] {
         for (case, instance_id) in &instance_ids {
-            for operation in ["GetInstance", "DeregisterInstance"] {
+            for (operation, expected) in [
+                ("GetInstance", Message::Exactly(instance_id.clone())),
+                (
+                    "DeregisterInstance",
+                    Message::Exactly(format!(
+                        "instanceId {instance_id} doesn't exists for service {service_arn}"
+                    )),
+                ),
+            ] {
                 assert_refusal(
                     &router,
                     &format!("{case} named {named}"),
                     operation,
                     json!({ "ServiceId": reference, "InstanceId": instance_id }),
                     "InstanceNotFound",
-                    &Message::Exactly(instance_id.clone()),
+                    &expected,
                 )
                 .await;
             }

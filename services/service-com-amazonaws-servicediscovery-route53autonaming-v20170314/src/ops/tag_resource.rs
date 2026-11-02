@@ -98,13 +98,13 @@ impl From<TagResourceErrorModeled> for TagResourceError {
 }
 
 /// What this operation answers for a `ResourceARN` that names no stored resource:
-/// the modelled `ResourceNotFoundException` (HTTP 404). One function, so the lookup
+/// the modelled `ResourceNotFoundException`, carrying no message — this write reports
+/// the class in the error code and echoes nothing of the request into the body, where
+/// `ListTagsForResource` reports the resource it looked for. One function, so the lookup
 /// and the write-through branch cannot drift apart in what they report.
-fn not_found(resource_arn: &str) -> TagResourceError {
+fn not_found() -> TagResourceError {
     TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!(
-            "The operation can't be completed because the resource {resource_arn} was not found."
-        )),
+        message: None,
     })
     .into()
 }
@@ -158,13 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The call is addressed by ARN; an ARN this store minted for no resource names
         // nothing to tag.
         let Some(resource) = state.resolve_tagged_resource(&input.resource_arn) else {
-            return Err(not_found(&input.resource_arn));
+            return Err(not_found());
         };
 
         // Tagging is a MERGE onto what is stored, never a replace: the tags this call
         // names are set, every other tag the resource carries is left as it is.
         let Some(stored) = state.tags(&resource).map(<[(String, String)]>::to_vec) else {
-            return Err(not_found(&input.resource_arn));
+            return Err(not_found());
         };
         let merged = crate::state::tags_after_applying(
             &stored,
@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // honest answer if it ever were not: a 200 for a write that did not happen
         // would claim something this call did not do.
         let Some(tags) = state.tags_mut(&resource) else {
-            return Err(not_found(&input.resource_arn));
+            return Err(not_found());
         };
         *tags = merged;
 

@@ -25,7 +25,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The router/dispatch harness is this crate's one test harness, in
 // `tests/all/cloud_map_core.rs`.
-use crate::cloud_map_core::{call, emulator, failure, namespace, ok};
+use crate::cloud_map_core::{call, dns_namespace, emulator, failure, namespace, ok};
 
 /// The record types the model's `RecordType` enum publishes and the `RecordTTL` range,
 /// taken from the crate's own catalogs rather than copied
@@ -40,31 +40,6 @@ const MAX_TTL: i64 = 2_147_483_647;
 const HEALTH_CHECK_TYPES: &[&str] = cloudmap::ops::types::HEALTH_CHECK_TYPE_VALUES;
 const MIN_FAILURE_THRESHOLD: i64 = 1;
 const MAX_FAILURE_THRESHOLD: i64 = 10;
-
-/// Create a public DNS namespace — the kind whose services `UpdateService` can update —
-/// and return its id.
-async fn dns_namespace(router: &MultiServiceRouter, label: &str) -> String {
-    let created = ok(
-        router,
-        "CreatePublicDnsNamespace",
-        json!({ "Name": format!("{label}.example.com") }),
-    )
-    .await;
-    let operation_id = created["OperationId"]
-        .as_str()
-        .expect("CreatePublicDnsNamespace returns an OperationId")
-        .to_string();
-    let operation = ok(
-        router,
-        "GetOperation",
-        json!({ "OperationId": operation_id }),
-    )
-    .await;
-    operation["Operation"]["Targets"]["NAMESPACE"]
-        .as_str()
-        .expect("the CREATE_NAMESPACE operation targets the namespace it created")
-        .to_string()
-}
 
 /// Create a service in `namespace_id` from the extra request members a row needs,
 /// returning its id.

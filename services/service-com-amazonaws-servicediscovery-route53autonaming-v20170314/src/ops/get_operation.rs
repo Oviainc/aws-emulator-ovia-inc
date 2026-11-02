@@ -152,10 +152,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before reporting it; an unknown id is a 404, never a synthesized success.
         let Some(record) = state.operation(&input.operation_id, now) else {
             return Err(GetOperationErrorModeled::OperationNotFound(OperationNotFound {
-                message: Some(format!(
-                    "Operation {} was not found.",
-                    input.operation_id
-                )),
+                // This read carries no message: it reports the class in the error code
+                // and echoes nothing of the request into the body, as the resource reads
+                // of this service do.
+                message: None,
             })
             .into());
         };

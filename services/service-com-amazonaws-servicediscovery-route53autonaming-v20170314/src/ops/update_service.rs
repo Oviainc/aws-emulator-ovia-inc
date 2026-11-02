@@ -263,20 +263,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|record| record.r#type.as_str())
             .collect();
         if let Some(change) = input.service.dns_config.as_ref() {
+            let requested_types: Vec<&str> = change
+                .dns_records
+                .iter()
+                .map(|record| record.r#type.as_str())
+                .collect();
+            // The refusal reports both whole type sets — what the service carries and
+            // what the request named — because that is the comparison the caller has to
+            // make to see what it may ask for; neither set names the service.
+            if requested_types
+                .iter()
+                .any(|record_type| !stored_types.contains(record_type))
+            {
+                return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(format!(
+                        "The record types in the request must be the same as those present in \
+                         the existing service. Records in the existing service are [{}], but the \
+                         records in the request are [{}]. The record types of a service cannot \
+                         be changed.",
+                        stored_types.join(", "),
+                        requested_types.join(", ")
+                    )),
+                })
+                .into());
+            }
             let mut named: Vec<&str> = Vec::new();
-            for record in &change.dns_records {
-                let record_type = record.r#type.as_str();
-                if !stored_types.contains(&record_type) {
-                    return Err(UpdateServiceErrorModeled::InvalidInput(InvalidInput {
-                        message: Some(format!(
-                            "The service {service_id} has no {record_type} record configuration. \
-                             The record type of a service specified in a DnsRecord object can't \
-                             be updated. To change a record type, you need to delete the service \
-                             and recreate it with a new DnsConfig."
-                        )),
-                    })
-                    .into());
-                }
+            for record_type in requested_types {
                 // "An array that contains one DnsRecord object for each Route 53 record":
                 // one record type names at most one configuration, so a change stating
                 // the same type twice states two TTLs for one record.

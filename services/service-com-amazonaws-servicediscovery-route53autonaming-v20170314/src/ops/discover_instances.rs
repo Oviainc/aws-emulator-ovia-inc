@@ -164,6 +164,43 @@ impl<Eng> DiscoverInstances<Eng> {
 /// MaxResults, Cloud Map returns up to 100 instances."
 const DEFAULT_MAX_RESULTS: usize = 100;
 
+/// The attribute-key namespace the service keeps for the attributes it defines itself
+/// (`AWS_INSTANCE_IPV4`, `AWS_INSTANCE_PORT`, `AWS_ALIAS_DNS_NAME`, …), matched without
+/// regard to case.
+const RESERVED_ATTRIBUTE_PREFIX: &str = "aws_";
+
+/// The refusal for the reserved keys `filters` names, or `None` when every key it names
+/// is a custom attribute.
+///
+/// Both filter members are documented as filters "based on custom attributes for the
+/// instance", and the reserved prefix above is the service's own attribute namespace,
+/// not a custom one — so a filter that names a key in it is a bad request rather than a
+/// filter nothing matches. The refusal names the member the request put the key in and
+/// the offending keys, in one stable order so two identical requests are refused
+/// identically.
+fn reserved_attribute_message(
+    member: &str,
+    filters: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let mut reserved: Vec<&str> = filters
+        .keys()
+        .filter(|key| {
+            key.get(..RESERVED_ATTRIBUTE_PREFIX.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_ATTRIBUTE_PREFIX))
+        })
+        .map(String::as_str)
+        .collect();
+    if reserved.is_empty() {
+        return None;
+    }
+    reserved.sort_unstable();
+    Some(format!(
+        "Request {member} contains invalid attribute: [{}]. [{RESERVED_ATTRIBUTE_PREFIX}] prefix \
+         is reserved for AWS attributes.",
+        reserved.join(", ")
+    ))
+}
+
 /// Whether `attributes` carries every one of the `filters` key/value pairs, the rule
 /// `QueryParameters` states: "Only instances that match all the specified key-value
 /// pairs are returned."
@@ -200,6 +237,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // The filters are validated before anything is resolved: a request that names a
+        // reserved attribute key is a bad request whatever namespace or service it
+        // names. The members are checked in the order the model declares them.
+        for (member, filters) in [
+            ("QueryParameters", input.query_parameters.as_ref()),
+            ("OptionalParameters", input.optional_parameters.as_ref()),
+        ] {
+            if let Some(message) =
+                filters.and_then(|filters| reserved_attribute_message(member, filters))
+            {
+                return Err(DiscoverInstancesErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(message),
+                })
+                .into());
+            }
+        }
 
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
