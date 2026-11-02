@@ -37,6 +37,11 @@ const ACCOUNT: &str = "000000000000";
 /// The access key id every case signs with.
 const AKID: &str = "AKIDOAMTAGS1";
 
+/// The access key id the sink of a sink/link pair is created with: a link joins a
+/// source account to a sink in a MONITORING account, so the sink is never created by
+/// the credential that then links to it.
+const MONITORING_AKID: &str = "AKIDOAMTAGSSINK";
+
 /// The region most cases sign for.
 const REGION: &str = "us-east-1";
 
@@ -72,13 +77,14 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// A request signed for `oam` in `region`: the signal the router routes on, and the one
-/// the handlers read the region and the source account from.
+/// A request signed for `oam` in `region` by `akid`: the signal the router routes on,
+/// and the one the handlers read the region and the source account from.
 fn request(
     method: &str,
     uri: &str,
     body: &Value,
     region: &str,
+    akid: &str,
 ) -> http::Request<bytes::Bytes> {
     http::Request::builder()
         .method(method)
@@ -88,7 +94,7 @@ fn request(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={AKID}/20260101/{region}/oam/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={akid}/20260101/{region}/oam/aws4_request, \
                  SignedHeaders=host, Signature=0000"
             ),
         )
@@ -98,15 +104,18 @@ fn request(
         .expect("a well-formed test request")
 }
 
-/// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call_with(
+/// Status and parsed body of one call, signed by `akid`.
+async fn call_with_as(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
     body: &Value,
     region: &str,
+    akid: &str,
 ) -> (u16, Value) {
-    let response = router.dispatch(request(method, uri, body, region)).await;
+    let response = router
+        .dispatch(request(method, uri, body, region, akid))
+        .await;
     let status = response.status().as_u16();
     let error_type = response
         .headers()
@@ -133,6 +142,18 @@ async fn call_with(
 /// takes.
 async fn post(router: &MultiServiceRouter, uri: &str, body: &Value, region: &str) -> (u16, Value) {
     call_with(router, "POST", uri, body, region).await
+}
+
+/// Status and parsed body of one call signed by [`AKID`]. An empty body reads as
+/// `Value::Null`.
+async fn call_with(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: &Value,
+    region: &str,
+) -> (u16, Value) {
+    call_with_as(router, method, uri, body, region, AKID).await
 }
 
 /// The modelled error shape a failed call reported.
@@ -243,8 +264,19 @@ async fn stored_tags(
 }
 
 /// Create a sink and a link attached to it in `region`, answering both ARNs.
+///
+/// The sink is created by the monitoring account and the link by [`AKID`]'s source
+/// account: a link may not attach to a sink its own account owns.
 async fn sink_and_link(router: &MultiServiceRouter, name: &str, region: &str) -> (String, String) {
-    let (status, sink) = post(router, "/CreateSink", &json!({ "Name": name }), region).await;
+    let (status, sink) = call_with_as(
+        router,
+        "POST",
+        "/CreateSink",
+        &json!({ "Name": name }),
+        region,
+        MONITORING_AKID,
+    )
+    .await;
     assert_eq!(
         status, 200,
         "CreateSink {name}: expected 200, got {status} {sink:?}"

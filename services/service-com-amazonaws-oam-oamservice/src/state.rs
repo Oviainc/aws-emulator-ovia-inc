@@ -27,9 +27,11 @@
 //! stored copy of it and deleting the sink takes its policy with it.
 //!
 //! A few stored members are not reported by any operation in this slice — a link's
-//! `sink_id` and `created_at`, and a sink's `created_at`. They are written where the
-//! resource is created so the slices that read them (`UntagResource` and `ListSinks`,
-//! still 501 stubs) read the same record rather than a second copy of it.
+//! `sink_id` and `created_at`, and a sink's `owner_account` and `created_at`. They are
+//! written where the resource is created so the slices that read them (`UntagResource`
+//! and `ListSinks`, still 501 stubs) read the same record rather than a second copy of
+//! it, and so the account that owns a sink is the one `CreateLink` compares a source
+//! account against.
 //!
 //! Tags live on the resource record itself, so `TagResource` writes through the very
 //! map `CreateSink`/`CreateLink` seeded and `GetSink`/`GetLink` and
@@ -107,6 +109,12 @@ pub struct Sink {
     pub arn: String,
     /// The region this sink was created in — the ARN's region field.
     pub region: String,
+    /// Which account OWNS this sink: the monitoring account that created it, read
+    /// from the creating request's credential the way a link's source account is
+    /// (see [`caller_source_account`]). A link may not attach a source account to a
+    /// sink this same account owns, so the owner is stored on the sink rather than
+    /// recomputed from one request's credential. Reported by no operation.
+    pub owner_account: String,
     pub tags: BTreeMap<String, String>,
     /// The sink policy, present only once a `PutSinkPolicy` has stored one.
     pub policy: Option<String>,
@@ -646,6 +654,25 @@ pub const POLICY_EFFECTS: &[&str] = &["Allow", "Deny"];
 /// behavioural recording of this service covers answers this one constant string. A
 /// not-found refusal therefore never embeds the identifier the request asked about.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found.";
+
+/// The message a `CreateLink` naming a sink the calling account itself owns is refused
+/// with.
+///
+/// A monitoring link joins TWO accounts — "Creates a link between a source account and
+/// a sink that you have created in a monitoring account" (`CreateLink`'s own
+/// documentation) — so a sink the caller already owns is not a sink it can link to.
+/// The refusal is about that one fact and so has no variable parts: nothing of the
+/// request, and nothing of what is stored, reaches it.
+pub const SAME_ACCOUNT_LINK_MESSAGE: &str = "Cannot create a link to a sink in the same account";
+
+/// The message a `DeleteSink` on a sink that still has links attached is refused with.
+///
+/// `DeleteSink`'s own documentation states the rule in one sentence — "You must delete
+/// all links to a sink before you can delete that sink." — and that rule is the whole
+/// of what the refusal reports, so neither the identifier the request supplied nor how
+/// many links happen to be attached reaches the message.
+pub const SINK_HAS_LINKS_MESSAGE: &str =
+    "You must delete all links to a sink before you can delete that sink.";
 
 /// The most sinks one account may hold in one Region.
 ///

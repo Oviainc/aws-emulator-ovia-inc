@@ -27,6 +27,15 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// second source account signs with a second key id.
 pub(crate) const AKID: &str = "AKIDOAMTEST1";
 
+/// The access key id [`create_sink_ok`] signs with: the MONITORING account that owns
+/// every sink these suites create.
+///
+/// A link joins a source account to a sink in a monitoring account, so it is never
+/// created by the account that owns the sink — a sink is created by this credential
+/// and the links to it by the source-account credentials, which are all distinct from
+/// it.
+pub(crate) const MONITORING_AKID: &str = "AKIDOAMSINKOWNER";
+
 /// Every value the modelled `ResourceType` enum declares, in the model's own order.
 ///
 /// From `smithy_query(query="shape",shape="ResourceType")` — the same catalog the
@@ -59,7 +68,12 @@ pub(crate) fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRo
 
 /// A request signed for `oam` in `region` by `akid`: the signal the router routes
 /// on, and the one the handlers read the region and the source account from.
-fn request(uri: &str, body: &Value, akid: &str, region: &str) -> http::Request<bytes::Bytes> {
+pub(crate) fn request(
+    uri: &str,
+    body: &Value,
+    akid: &str,
+    region: &str,
+) -> http::Request<bytes::Bytes> {
     http::Request::builder()
         .method("POST")
         .uri(uri)
@@ -177,13 +191,21 @@ fn assert_arn(case: &str, arn: &str, resource: &str, region: &str) -> String {
     id.to_string()
 }
 
-/// Create a sink that must succeed, and answer its ARN.
+/// Create a sink owned by the monitoring account ([`MONITORING_AKID`]), which must
+/// succeed, and answer its ARN.
 pub(crate) async fn create_sink_ok(
     router: &MultiServiceRouter,
     name: &str,
     region: &str,
 ) -> String {
-    let (status, created) = call(router, "/CreateSink", &json!({ "Name": name }), region).await;
+    let (status, created) = call_as(
+        router,
+        "/CreateSink",
+        &json!({ "Name": name }),
+        MONITORING_AKID,
+        region,
+    )
+    .await;
     assert_eq!(
         status, 200,
         "CreateSink {name}: expected 200, got {status} {created:?}"
@@ -216,7 +238,7 @@ pub(crate) async fn create_link_ok(
 /// at a time with `max_results`, asserting the page contract as it walks: no page is
 /// longer than asked for, every page but the last carries a `NextToken`, and the
 /// last carries none.
-async fn attached_link_arns(
+pub(crate) async fn attached_link_arns(
     router: &MultiServiceRouter,
     case: &str,
     sink_identifier: &str,

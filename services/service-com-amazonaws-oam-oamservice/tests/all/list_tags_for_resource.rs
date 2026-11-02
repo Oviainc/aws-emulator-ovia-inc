@@ -20,7 +20,7 @@ use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::sinks_and_links::{
-    call, call_as, dispatch_parsed, emulator, error_code, field, ACCOUNT, AKID,
+    call, call_as, dispatch_parsed, emulator, error_code, field, ACCOUNT, AKID, MONITORING_AKID,
 };
 
 /// A second access key id, so a case can attach a second link to one sink: a link
@@ -113,7 +113,9 @@ fn tag_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Create a sink carrying `tags`, which must succeed, and answer its ARN.
+/// Create a sink carrying `tags`, owned by the monitoring account
+/// ([`MONITORING_AKID`]) so the source accounts below can link to it, which must
+/// succeed, and answer its ARN.
 async fn create_tagged_sink(
     router: &MultiServiceRouter,
     case: &str,
@@ -125,7 +127,7 @@ async fn create_tagged_sink(
     if !tags.is_empty() {
         body["Tags"] = tags_json(tags);
     }
-    let (status, created) = call(router, "/CreateSink", &body, region).await;
+    let (status, created) = call_as(router, "/CreateSink", &body, MONITORING_AKID, region).await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected 200 from CreateSink, got {status} {created:?}"

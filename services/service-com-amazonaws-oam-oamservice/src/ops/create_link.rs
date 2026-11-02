@@ -237,9 +237,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // InternalServiceFault, InvalidParameter, MissingRequiredParameter and
         // ServiceQuotaExceeded), and a `SinkIdentifier` naming no sink is exactly "a
         // parameter is specified incorrectly".
-        let (sink_arn, sink_id) = store
+        let (sink_arn, sink_id, sink_owner) = store
             .sink(&region, &input.sink_identifier)
-            .map(|sink| (sink.arn.clone(), sink.id.clone()))
+            .map(|sink| (sink.arn.clone(), sink.id.clone(), sink.owner_account.clone()))
             .ok_or_else(|| {
                 CreateLinkErrorModeled::InvalidParameterException(InvalidParameterException {
                     message: Some(format!(
@@ -249,6 +249,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ..Default::default()
                 })
             })?;
+
+        // A link joins a SOURCE account to a sink in a MONITORING account: "Creates a
+        // link between a source account and a sink that you have created in a
+        // monitoring account" (this operation's own documentation). The two accounts
+        // are therefore never the same one, so a `SinkIdentifier` resolving to a sink
+        // the calling account itself owns is a parameter specified incorrectly — the
+        // modelled `InvalidParameterException` (400) — and nothing is stored for it.
+        if sink_owner == source_account {
+            return Err(CreateLinkErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::SAME_ACCOUNT_LINK_MESSAGE.to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
 
         // One link per source account per sink: a source account that is already
         // attached to this sink cannot attach twice.

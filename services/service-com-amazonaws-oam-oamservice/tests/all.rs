@@ -21,6 +21,8 @@ mod list_tags_for_resource;
 mod refusal_classes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/same_account_link_rejection.rs"]
+mod same_account_link_rejection;
 #[path = "all/sink_policy.rs"]
 mod sink_policy;
 #[path = "all/sinks_and_links.rs"]

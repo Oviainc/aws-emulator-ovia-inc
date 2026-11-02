@@ -165,6 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx.parts());
+        // A sink belongs to the monitoring account that creates it, which is read from
+        // the request's credential exactly as a link's source account is. Storing it
+        // is what lets `CreateLink` tell a cross-account link from a same-account one.
+        let owner_account = crate::state::caller_source_account(ctx.parts());
         let created_at = crate::state::now_epoch_seconds();
 
         let mut store = state.lock();
@@ -210,6 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             name: input.name,
             region,
+            owner_account,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             policy: None,
             created_at,

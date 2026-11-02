@@ -170,14 +170,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You must delete all links to a sink before you can delete that sink"
         // (this operation's own documentation): a sink that still has links attached
-        // is refused rather than deleted, so the links are never orphaned.
-        let attached = store.link_ids_for_sink(&sink_arn).map_or(0, |ids| ids.len());
-        if attached > 0 {
+        // is refused rather than deleted, so the links are never orphaned. The
+        // refusal reports that rule and nothing of this request or of the store.
+        if store
+            .link_ids_for_sink(&sink_arn)
+            .is_some_and(|ids| !ids.is_empty())
+        {
             return Err(DeleteSinkErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "this sink still has {attached} attached link(s); delete every link to the \
-                     sink before deleting the sink"
-                )),
+                message: Some(crate::state::SINK_HAS_LINKS_MESSAGE.to_string()),
                 ..Default::default()
             })
             .into());
