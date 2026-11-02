@@ -11,9 +11,11 @@
 //! A GUI session runs ON the virtual computer the request names, so what this
 //! call can create depends on the state of the stored instance:
 //!
-//! * the instance is RUNNING and holds no session access — the two URLs are
-//!   created now (the session's token comes from the store's own allocator) and
-//!   the session is `starting` until the clock owes it `started`;
+//! * the instance is RUNNING and holds no session — `notStarted`, with no URLs:
+//!   this call reports a session, and "Use StartGUISession to open the session"
+//!   (this operation's own documentation) names the call that opens one, so a
+//!   computer whose session nobody has opened is in the modelled `notStarted`
+//!   state and reading it never starts the hour a session stays active for;
 //! * the instance is RUNNING and holds access that is still inside its active
 //!   hour — the SAME pair of URLs is reported again, because the session is the
 //!   resource and a second call must not silently restart its documented hour;
@@ -28,15 +30,19 @@
 //!   call;
 //! * the instance is still coming up — `settingUpInstance`, with
 //!   `percentageComplete` tracking the transition the clock owes it;
-//! * the instance is stopping or stopped — `notStarted`: no session is up and
-//!   none can be brought up on a computer that is not running, and the session
-//!   access is released by the clock the instant the computer leaves `running`
+//! * the instance is stopping or stopped — `notStarted` as well: no session is
+//!   up and none can be brought up on a computer that is not running, and the
+//!   session is released by the clock the instant the computer leaves `running`
 //!   (`state::advance_clock`), so a stop and a start always lead to a new
 //!   session rather than to URLs that reach nothing.
 //!
 //! The modelled `Status` members this never answers are the three `failed*`
 //! ones, which describe failures this store does not produce; `failureReason` is
 //! therefore absent, because nothing here fails a session.
+//!
+//! Nothing in here writes: the call reports the session the store holds, and the
+//! only state change a caller can observe through it is one the clock already
+//! owed (`state::advance_clock`).
 //!
 //! ## Shape of an operation
 //!
@@ -221,9 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // session runs on it, so nothing is up and nothing this call
                 // does can bring a session up. The store released the session
                 // the instant the computer left `running`
-                // (`state::advance_clock`), so a later call on a running
-                // computer creates fresh URLs rather than handing out ones that
-                // reach nothing.
+                // (`state::advance_clock`), so a later start on a running
+                // computer opens a fresh session rather than handing out URLs
+                // that reach nothing.
                 (crate::state::GUI_SESSION_STATUS_NOT_STARTED, 0, None)
             } else {
                 match stored {
@@ -240,28 +246,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         None,
                     ),
                     // Access that is still live: the same two URLs, and the
-                    // session's own status — this call neither mints a second
-                    // session for one virtual computer nor restarts its hour.
+                    // session's own status — this call reports the session the
+                    // computer holds, so it neither opens a second session for
+                    // one virtual computer nor restarts the hour this one has.
                     Some(session) => (
                         session.status_at(now),
                         session.percentage_complete_at(now),
                         Some(session.views(&name, endpoint.as_deref())),
                     ),
-                    // Nothing is up yet: create the access details. The token
-                    // comes from the store's own allocator, never from the
-                    // request, and the store mints and writes it together, so a
-                    // caller is never handed URLs for a session the store does
-                    // not hold.
-                    None => {
-                        let Some(session) = store.create_gui_session(&name, now) else {
-                            return Err(not_found(&name));
-                        };
-                        (
-                            session.status_at(now),
-                            session.percentage_complete_at(now),
-                            Some(session.views(&name, endpoint.as_deref())),
-                        )
-                    }
+                    // The computer holds no session, so there is no session to
+                    // report URLs for: "Use StartGUISession to open the session"
+                    // is this operation's own documentation, so opening one is
+                    // that call's business and this one answers the state the
+                    // computer is already in — the modelled `notStarted` — with
+                    // nothing coming up and nothing written, rather than
+                    // silently starting the hour a session stays active for.
+                    None => (crate::state::GUI_SESSION_STATUS_NOT_STARTED, 0, None),
                 }
             };
 

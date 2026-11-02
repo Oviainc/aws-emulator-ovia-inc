@@ -5962,8 +5962,11 @@ pub struct MetadataOptionsSelection {
 /// the `Status` enum (`crate::ops::types::STATUS_VALUES`).
 ///
 /// `notStarted` is reported when no session is up and nothing is bringing one
-/// up — which is every state of a virtual computer that is not running, because
-/// an Amazon DCV session runs ON that computer.
+/// up: a running virtual computer whose session nobody has opened yet — opening
+/// one is `StartGUISession`'s business ("Use StartGUISession to open the
+/// session", the modelled `CreateGUISessionAccessDetails` documentation) — and
+/// every state of a computer that is not running, because an Amazon DCV session
+/// runs ON that computer.
 pub const GUI_SESSION_STATUS_NOT_STARTED: &str = "notStarted";
 /// The virtual computer the session would run on is still being set up, so the
 /// session cannot be brought up yet.
@@ -5983,7 +5986,8 @@ pub const GUI_SESSION_STATUS_STOPPED: &str = "stopped";
 /// The session's active window ([`GUI_SESSION_ACTIVE_MILLIS`]) has run out. The
 /// caller resumes it with `StartGUISession` — "Use this action to resume the
 /// session after it expires" (the modelled `StartGUISession` documentation) —
-/// which is why creating access details does NOT silently start a second hour.
+/// which is why creating access details does NOT silently start another hour:
+/// that call reports a session, it does not open one.
 pub const GUI_SESSION_STATUS_START_EXPIRED: &str = "startExpired";
 
 /// How long a GUI session stays active once it has started.

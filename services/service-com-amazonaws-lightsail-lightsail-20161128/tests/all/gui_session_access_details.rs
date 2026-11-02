@@ -4,28 +4,33 @@
 //! computer's graphical user interface session is reached through, driven over
 //! the wire through the same front door a client uses.
 //!
-//! The rule under test: the call answers from the ONE stored instance record the
-//! name resolves to. A running virtual computer that holds no session access
-//! gets a pair of URLs created for it — a primary one for the computer's
+//! The rule under test: the call REPORTS the session the named virtual computer
+//! holds and opens none — "Use StartGUISession to open the session" is this
+//! operation's own documentation — so a running computer whose session nobody has
+//! opened reports the modelled `notStarted` with no URLs, however often it is
+//! read, and the hour AWS documents a session stays active for begins at the
+//! start, never at a read. Once a session has been opened the call reports the
+//! pair of URLs it is reached through — a primary one for the computer's
 //! application session and a secondary one for its operating system, both
-//! addressed by one token the store minted and both under the endpoint the
-//! request arrived at — and the session is `starting` until the clock owes it
-//! `started`, with `percentageComplete` following that span. A computer that is
+//! addressed by the one token the store minted for that session and both under
+//! the endpoint the request arrived at — `starting` until the clock owes the
+//! session `started`, with `percentageComplete` following that span, and a second
+//! call reports the SAME pair rather than a second session. A computer that is
 //! still coming up reports `settingUpInstance` and no URLs; one that is stopping
 //! or stopped reports `notStarted` and no URLs, because an Amazon DCV session
 //! runs ON the computer — and the clock releases that session the instant the
 //! computer leaves `running`, so a stop and a start lead to a new session
-//! whether or not anybody looked in between. A second call while the session is live reports the SAME
-//! pair rather than minting a second session, and the hour AWS documents a
-//! session stays active for ends in `startExpired`. A name nothing is stored
-//! under is refused with the service's `DoesNotExist` envelope.
+//! whether or not anybody looked in between. The hour AWS documents a session
+//! stays active for ends in `startExpired`. A name nothing is stored under is
+//! refused with the service's `DoesNotExist` envelope.
 //!
 //! Each wire case is a TABLE whose rows differ along what the rule generalises
 //! over: the virtual computer's blueprint platform, its bundle size, its Region
 //! and its IP address type — none of which the answer depends on, which is
 //! exactly what the rows prove.
 //!
-//! The HTTP harness is the one `instance_lifecycle.rs` already has.
+//! The HTTP harness is the one `instance_lifecycle.rs` already has, and opening a
+//! session is the `StartGUISession` helper `gui_session_start.rs` already has.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -33,12 +38,14 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_lightsail_lightsail_20161128::ops::types::STATUS_VALUES;
 use service_com_amazonaws_lightsail_lightsail_20161128::state::{
-    elapsed_percentage, StoredGuiSession, GUI_SESSION_ACTIVE_MILLIS, GUI_SESSION_NAME_APPLICATION,
-    GUI_SESSION_NAME_OPERATING_SYSTEM, GUI_SESSION_PATH_PREFIX, GUI_SESSION_STATUS_NOT_STARTED,
-    GUI_SESSION_STATUS_SETTING_UP_INSTANCE, GUI_SESSION_STATUS_STARTED,
-    GUI_SESSION_STATUS_STARTING, GUI_SESSION_STATUS_START_EXPIRED, STATE_TRANSITION_MILLIS,
+    elapsed_percentage, now_ms, StoredGuiSession, GUI_SESSION_ACTIVE_MILLIS,
+    GUI_SESSION_NAME_APPLICATION, GUI_SESSION_NAME_OPERATING_SYSTEM, GUI_SESSION_PATH_PREFIX,
+    GUI_SESSION_STATUS_NOT_STARTED, GUI_SESSION_STATUS_SETTING_UP_INSTANCE,
+    GUI_SESSION_STATUS_STARTED, GUI_SESSION_STATUS_STARTING, GUI_SESSION_STATUS_START_EXPIRED,
+    STATE_TRANSITION_MILLIS,
 };
 
+use crate::gui_session_start::{start_session, stored_session};
 use crate::instance_lifecycle::{error_code, is_uuid_shaped, wait_for_state, Emulator};
 
 /// The endpoint the suite pretends to have reached the emulator on. A session
@@ -300,14 +307,15 @@ fn assert_modelled_status(case: &str, body: &Value) -> String {
 // A running virtual computer
 // ---------------------------------------------------------------------------
 
-/// RULE: a running virtual computer that holds no session access gets a pair of
-/// Amazon DCV URLs created for it — primary (application) and secondary
-/// (operating system), both addressed by one store-minted token under the
-/// endpoint the request arrived at — reported `starting` until the clock owes the
-/// session `started`, and a later call while that session is live reports the
-/// SAME pair rather than creating a second session.
+/// RULE: the session a running virtual computer holds is reported with the pair
+/// of Amazon DCV URLs it is reached through — primary (application) and secondary
+/// (operating system), both addressed by the one store-minted token of that
+/// session and under the endpoint the request arrived at — `starting` until the
+/// clock owes the session `started`, and a later call while that session is live
+/// reports the SAME pair rather than a second session. Before the session is
+/// opened there is nothing to report URLs for, so the answer is `notStarted`.
 #[tokio::test]
-async fn creates_one_pair_of_dcv_urls_for_a_running_virtual_computer() {
+async fn reports_one_pair_of_dcv_urls_for_the_session_a_computer_holds() {
     let emulator = Emulator::new();
 
     for row in ROWS {
@@ -322,6 +330,17 @@ async fn creates_one_pair_of_dcv_urls_for_a_running_virtual_computer() {
             .await;
         wait_for_state(&emulator, row.name, "running").await;
 
+        // Nobody has opened a session on this computer yet.
+        let unopened = access_details(&emulator, Some(HOST), Some(row.region), row.name).await;
+        assert_eq!(
+            assert_status_without_sessions(case, &unopened, GUI_SESSION_STATUS_NOT_STARTED),
+            0,
+            "case {case}: nothing is coming up on a computer whose session is not open, \
+             got {unopened:?}"
+        );
+
+        start_session(&emulator, row.region, row.name).await;
+
         let body = access_details(&emulator, Some(HOST), Some(row.region), row.name).await;
         assert_eq!(
             body["resourceName"].as_str(),
@@ -331,7 +350,7 @@ async fn creates_one_pair_of_dcv_urls_for_a_running_virtual_computer() {
         let status = assert_modelled_status(case, &body);
         assert!(
             status == GUI_SESSION_STATUS_STARTING || status == GUI_SESSION_STATUS_STARTED,
-            "case {case}: a session created on a running computer is coming up or up, \
+            "case {case}: the session opened on a running computer is coming up or up, \
              got {status:?}"
         );
         let percentage = body["percentageComplete"]
@@ -362,7 +381,7 @@ async fn creates_one_pair_of_dcv_urls_for_a_running_virtual_computer() {
             .unwrap_or_else(|| panic!("case {case}: expected a session token, got {started:?}"));
         assert_eq!(
             after_start, created,
-            "case {case}: the session that came up is the one that was created, not a second one"
+            "case {case}: the session that came up is the one the start opened, not a second one"
         );
 
         // A further call hands back the same live session: the documented hour
@@ -377,8 +396,90 @@ async fn creates_one_pair_of_dcv_urls_for_a_running_virtual_computer() {
             .unwrap_or_else(|| panic!("case {case}: expected a session token, got {again:?}"));
         assert_eq!(
             again_token, created,
-            "case {case}: a second call reports the live session, it does not create another"
+            "case {case}: a second call reports the live session, it does not open another"
         );
+    }
+}
+
+/// RULE: this call REPORTS a virtual computer's GUI session and opens none —
+/// "Use StartGUISession to open the session" is its own modelled documentation —
+/// so a running computer whose session nobody has opened answers the modelled
+/// `notStarted` with no URLs however often it is read, holds no session after
+/// those reads, and gets the window AWS documents a session stays active for only
+/// from the start that opens one.
+///
+/// The rows cross the table of computers with the number of times the access
+/// details are read before anything opens a session: polling this operation is
+/// what a caller does, and no number of reads may open a session.
+#[tokio::test]
+async fn reading_the_access_details_never_opens_the_session() {
+    let emulator = Emulator::new();
+
+    /// How many reads a row makes before the session is opened: one single call,
+    /// and then a caller polling.
+    const READ_COUNTS: &[usize] = &[1, 2, 5];
+
+    for row in ROWS {
+        for reads in READ_COUNTS {
+            let case = format!("{} ({reads} read(s) before any start)", row.case);
+            let name = format!("{}-unopened-{reads}", row.name);
+            emulator
+                .ok_at(
+                    Some(HOST),
+                    Some(row.region),
+                    "CreateInstances",
+                    create_body(row, &name),
+                )
+                .await;
+            wait_for_state(&emulator, &name, "running").await;
+
+            for read in 1..=*reads {
+                let read_case = format!("{case}, read {read}");
+                let body = access_details(&emulator, Some(HOST), Some(row.region), &name).await;
+                let percentage = assert_status_without_sessions(
+                    &read_case,
+                    &body,
+                    GUI_SESSION_STATUS_NOT_STARTED,
+                );
+                assert_eq!(
+                    percentage, 0,
+                    "case {read_case}: nothing is coming up on a computer whose session is not \
+                     open, got {percentage}"
+                );
+                assert!(
+                    stored_session(&emulator, &name).is_none(),
+                    "case {read_case}: the read opened a session, got {:?}",
+                    stored_session(&emulator, &name)
+                );
+            }
+
+            // The start is what opens the session, so the session the store ends
+            // up holding was created no earlier than this instant — the reads
+            // above cannot have created it.
+            let before_start_ms = now_ms();
+            start_session(&emulator, row.region, &name).await;
+            let session = stored_session(&emulator, &name)
+                .unwrap_or_else(|| panic!("case {case}: the start must open a session"));
+            assert!(
+                session.created_at_ms >= before_start_ms,
+                "case {case}: the session was opened by the start, not by a read, got {session:?}"
+            );
+            assert_eq!(
+                session.expires_at_ms(),
+                session.starts_at_ms + GUI_SESSION_ACTIVE_MILLIS,
+                "case {case}: the documented active window runs from the instant the session \
+                 the start opened comes up, got {session:?}"
+            );
+
+            // From the start on, the call reports that session and its URLs.
+            let opened = access_details(&emulator, Some(HOST), Some(row.region), &name).await;
+            let token = assert_session_pair(&case, &opened, &name, Some(HOST))
+                .unwrap_or_else(|| panic!("case {case}: expected a session token, got {opened:?}"));
+            assert_eq!(
+                token, session.token,
+                "case {case}: the reported session is the one the start opened, got {opened:?}"
+            );
+        }
     }
 }
 
@@ -401,6 +502,7 @@ async fn a_request_naming_no_endpoint_announces_no_url() {
             )
             .await;
         wait_for_state(&emulator, &name, "running").await;
+        start_session(&emulator, row.region, &name).await;
 
         let body = access_details(&emulator, None, Some(row.region), &name).await;
         assert_modelled_status(case, &body);
@@ -477,9 +579,9 @@ async fn reports_setting_up_instance_while_the_virtual_computer_comes_up() {
 
 /// RULE: a virtual computer that is stopping or stopped has no GUI session and
 /// this call cannot bring one up on it, so it reports `notStarted` with no URLs
-/// — and the access it held is released, so starting the computer again and
-/// asking again creates a NEW session rather than handing back URLs that reach
-/// nothing.
+/// — and the session it held is released, so the computer reports `notStarted`
+/// once it is running again and a start there opens a NEW session rather than
+/// handing back URLs that reach nothing.
 #[tokio::test]
 async fn a_virtual_computer_that_is_not_running_has_no_session() {
     let emulator = Emulator::new();
@@ -496,6 +598,7 @@ async fn a_virtual_computer_that_is_not_running_has_no_session() {
             )
             .await;
         wait_for_state(&emulator, &name, "running").await;
+        start_session(&emulator, row.region, &name).await;
         let before = wait_until_session_started(&emulator, Some(HOST), Some(row.region), &name)
             .await;
         let first = assert_session_pair(case, &before, &name, Some(HOST))
@@ -538,22 +641,32 @@ async fn a_virtual_computer_that_is_not_running_has_no_session() {
             )
             .await;
         wait_for_state(&emulator, &name, "running").await;
+        // The released session is gone and this call opens none, so the computer
+        // is back to holding no session at all.
+        let running_again = access_details(&emulator, Some(HOST), Some(row.region), &name).await;
+        assert_status_without_sessions(
+            &format!("{case}, running again"),
+            &running_again,
+            GUI_SESSION_STATUS_NOT_STARTED,
+        );
+        start_session(&emulator, row.region, &name).await;
         let after = access_details(&emulator, Some(HOST), Some(row.region), &name).await;
         let second = assert_session_pair(case, &after, &name, Some(HOST))
             .unwrap_or_else(|| panic!("case {case}: expected a session token, got {after:?}"));
         assert_ne!(
             second, first,
-            "case {case}: the session the stop released is gone, so a new one is created"
+            "case {case}: the session the stop released is gone, so a start opens a new one"
         );
     }
 }
 
 /// RULE: the session dies with the computer it runs on at the instant that
 /// computer leaves `running` — the clock owes the release, not whoever happens to
-/// look — so a stop and a start with NO call in between still leads to a NEW
-/// session rather than to the pre-stop URLs with the remains of their hour.
+/// look — so a stop and a start with NO call in between leaves the computer
+/// holding no session, and the next start opens a NEW one rather than handing
+/// back the pre-stop URLs with the remains of their hour.
 #[tokio::test]
-async fn a_stop_and_start_with_no_call_in_between_still_creates_a_new_session() {
+async fn a_stop_and_start_with_no_call_in_between_releases_the_session() {
     let emulator = Emulator::new();
 
     for row in ROWS {
@@ -568,6 +681,7 @@ async fn a_stop_and_start_with_no_call_in_between_still_creates_a_new_session() 
             )
             .await;
         wait_for_state(&emulator, &name, "running").await;
+        start_session(&emulator, row.region, &name).await;
         let before = wait_until_session_started(&emulator, Some(HOST), Some(row.region), &name)
             .await;
         let first = assert_session_pair(case, &before, &name, Some(HOST))
@@ -594,6 +708,9 @@ async fn a_stop_and_start_with_no_call_in_between_still_creates_a_new_session() 
             .await;
         wait_for_state(&emulator, &name, "running").await;
 
+        let released = access_details(&emulator, Some(HOST), Some(row.region), &name).await;
+        assert_status_without_sessions(case, &released, GUI_SESSION_STATUS_NOT_STARTED);
+        start_session(&emulator, row.region, &name).await;
         let after = access_details(&emulator, Some(HOST), Some(row.region), &name).await;
         let second = assert_session_pair(case, &after, &name, Some(HOST))
             .unwrap_or_else(|| panic!("case {case}: expected a session token, got {after:?}"));
