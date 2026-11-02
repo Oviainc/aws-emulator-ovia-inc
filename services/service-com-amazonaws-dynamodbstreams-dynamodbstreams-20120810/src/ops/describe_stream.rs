@@ -11,6 +11,10 @@
 //! so a consumer that waits for shards before it reads is never handed a stream that
 //! still reports itself as being enabled.
 //!
+//! `Limit`'s documented ceiling of 100 shard objects is a bound the service ENFORCES:
+//! a wider page request is refused (`ValidationException`), not quietly served a
+//! narrower page.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -86,6 +90,19 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The refusal a `Limit` above this operation's own ceiling draws.
+///
+/// Fixed text whose only figure is the service's limit ([`crate::state::MAX_PAGE_LIMIT`],
+/// from "The maximum number of shard objects to return. The upper limit is 100."),
+/// never the value the caller sent. This sentence is this operation's own: the same
+/// bound on another operation's `Limit` is worded as that operation words it.
+fn limit_above_ceiling() -> DescribeStreamError {
+    crate::scaffolded::Scaffolded::validation(format!(
+        "One or more parameter values were invalid: Limit cannot be greater than the maximum: {}",
+        crate::state::MAX_PAGE_LIMIT
+    ))
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -165,6 +182,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it were still there.
         let _ = ctx;
         let now = std::time::SystemTime::now();
+        // The bound the service enforces on this request's parameters, which the model
+        // does not express (`Limit` is declared 1.. with no maximum): a page wider than
+        // the service serves is refused rather than silently narrowed. Decided before
+        // the stream is resolved — a request whose parameters cannot be served is
+        // refused whatever the store holds.
+        if input
+            .limit
+            .is_some_and(|limit| limit > crate::state::MAX_PAGE_LIMIT)
+        {
+            return Err(limit_above_ceiling());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeStreamErrorModeled::InternalServerError(InternalServerError {
                 message: Some("the DynamoDB Streams store is unavailable".to_string()),
@@ -231,8 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => 0,
         };
-        // `Limit`'s declared range (1..) is enforced at the boundary; the documented
-        // ceiling of 100 shard objects is not modelled, so it is applied here.
+        // `Limit`'s declared range (1..) is enforced at the boundary and its upper
+        // bound above, so what is left here is the page width an absent member means:
+        // the whole of what one page may carry.
         let limit = usize::try_from(
             input
                 .limit

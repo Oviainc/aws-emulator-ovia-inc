@@ -8,6 +8,10 @@
 //! iterator at all and is refused as a `ValidationException`; a caught-up open shard
 //! is an empty `Records` list with a still-usable `NextShardIterator`.
 //!
+//! `Limit`'s documented ceiling of 1000 records is a bound the service ENFORCES: a
+//! larger page request is refused (`ValidationException`), not quietly served a
+//! smaller page.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -113,6 +117,19 @@ const STREAM_NOT_FOUND_MESSAGE: &str = "Requested resource not found: Stream doe
 /// form, naming the kind of resource that is absent.
 const SHARD_NOT_FOUND_MESSAGE: &str = "Requested resource not found: Shard does not exist";
 
+/// The refusal a `Limit` above this operation's own ceiling draws.
+///
+/// Fixed text whose only figure is the service's limit ([`crate::state::MAX_GET_RECORDS_LIMIT`],
+/// from "GetRecords can retrieve a maximum of 1 MB of data or 1000 stream records"),
+/// never the value the caller sent. This sentence is this operation's own: the same
+/// bound on another operation's `Limit` is worded as that operation words it.
+fn limit_above_ceiling() -> GetRecordsError {
+    crate::scaffolded::Scaffolded::validation(format!(
+        "One or more parameter values were invalid: Limit should be less than or equal to {}",
+        crate::state::MAX_GET_RECORDS_LIMIT
+    ))
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -190,6 +207,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call mints is the NEXT position's token, which the spec says it returns.
         let _ = ctx;
         let now = std::time::SystemTime::now();
+        // The bound the service enforces on this request's parameters, which the model
+        // does not express (`Limit` is declared 1.. with no maximum): a page larger
+        // than the service serves is refused rather than silently narrowed. Decided
+        // before the iterator is resolved — a request whose parameters cannot be served
+        // is refused whatever the store holds.
+        if input
+            .limit
+            .is_some_and(|limit| limit > crate::state::MAX_GET_RECORDS_LIMIT)
+        {
+            return Err(limit_above_ceiling());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetRecordsErrorModeled::InternalServerError(InternalServerError {
                 message: Some("the DynamoDB Streams store is unavailable".to_string()),
@@ -227,8 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `Limit`'s declared range (1..) is enforced at the boundary; the documented
-        // ceiling of 1000 records is not modelled, so it is applied here.
+        // `Limit`'s declared range (1..) is enforced at the boundary and its upper
+        // bound above, so what is left here is the page size an absent member means:
+        // the whole of what one call may carry.
         let limit = usize::try_from(
             input
                 .limit

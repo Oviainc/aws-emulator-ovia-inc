@@ -21,6 +21,8 @@ mod record_creation_time_whole_seconds;
 mod record_retention_budget;
 #[path = "all/sequence_number_positions.rs"]
 mod sequence_number_positions;
+#[path = "all/service_enforced_parameter_bounds.rs"]
+mod service_enforced_parameter_bounds;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_consumer.rs"]

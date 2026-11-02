@@ -15,6 +15,12 @@
 //! id it was handed. Reporting on one named stream is `DescribeStream`'s job, and its
 //! message is the one that names the stream asked for.
 //!
+//! An `AT_TIMESTAMP` start point may name only an instant that has already happened:
+//! "If the timestamp is in the future, the request returns a ValidationException"
+//! (`GetShardIteratorInput$Timestamp`). A timestamp older than the trim horizon is NOT
+//! a refusal — it positions at the oldest untrimmed record, as the same member
+//! documents.
+//!
 //! The two refusals a `SequenceNumber` can draw are different claims and are decided
 //! apart: a number the addressed shard's own range does not cover, or a position the
 //! request leaves out altogether, is a bad argument (`ValidationException`), while
@@ -129,6 +135,15 @@ const STREAM_NOT_FOUND_MESSAGE: &str = "Requested resource not found: Stream doe
 /// form, naming the kind of resource that is absent rather than the id requested.
 const SHARD_NOT_FOUND_MESSAGE: &str = "Requested resource not found: Shard does not exist";
 
+/// The refusal an `AT_TIMESTAMP` request whose `Timestamp` has not happened yet
+/// draws: "If the timestamp is in the future, the request returns a
+/// ValidationException" (`GetShardIteratorInput$Timestamp`).
+///
+/// Wholly fixed text: the bound is the clock, so there is no limit to name and the
+/// instant the caller sent is not echoed.
+const TIMESTAMP_IN_FUTURE_MESSAGE: &str = "One or more parameter values were invalid: \
+     Timestamp parameter cannot be greater than the current timestamp";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -209,6 +224,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the DynamoDB Streams store is unavailable".to_string()),
             })
         })?;
+        // The bound the service enforces on this request's parameters, which the
+        // model does not express: an `AT_TIMESTAMP` start point may name a past or
+        // present instant only, because no record can exist at one that has not
+        // happened yet. Decided before any stream or shard is resolved — a request
+        // whose parameters cannot be served is refused whatever the store holds.
+        if input.shard_iterator_type.as_str() == "AT_TIMESTAMP"
+            && input.timestamp.as_ref().is_some_and(|timestamp| {
+                timestamp_millis(timestamp) > crate::state::epoch_millis(now)
+            })
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                TIMESTAMP_IN_FUTURE_MESSAGE,
+            ));
+        }
+
         let mut guard = state.lock();
         // Everything the clock already owes, before the cursor is placed: a trim that
         // was due moves the trim horizon this iterator may be positioned at.
@@ -286,9 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let Some(timestamp) = input.timestamp else {
                         return Err(missing_member("Timestamp"));
                     };
-                    let target_millis = timestamp.secs().saturating_mul(1000).saturating_add(
-                        i64::from(timestamp.subsec_nanos() / 1_000_000),
-                    );
+                    let target_millis = timestamp_millis(&timestamp);
                     shard
                         .records
                         .iter()
@@ -326,6 +354,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// waits. Fixed text — a bad argument is reported as what was wrong with it, and the
 /// caller already holds the shard id and the number it sent.
 const INVALID_SEQUENCE_NUMBER: &str = "Invalid SequenceNumber for the shard";
+
+/// The instant a modelled `Timestamp` member names, in milliseconds since the Unix
+/// epoch — the unit the stored records' creation instants are compared in
+/// ([`crate::state::epoch_millis`]), and the precision the member documents ("a
+/// timestamp is the Unix epoch date with precision in milliseconds").
+fn timestamp_millis(timestamp: &::aws_smithy_types::DateTime) -> i64 {
+    timestamp
+        .secs()
+        .saturating_mul(1000)
+        .saturating_add(i64::from(timestamp.subsec_nanos() / 1_000_000))
+}
 
 /// The refusal a request that leaves out the member its `ShardIteratorType` needs
 /// draws: the type decides which member is required (`SequenceNumber` for the two

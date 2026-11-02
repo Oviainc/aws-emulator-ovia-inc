@@ -166,6 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Limit`'s declared range (1..) is enforced at the boundary; the documented
         // ceiling of 100 is not modelled, so it is applied here.
+        //
+        // Applied as a CAP rather than as the refusal `DescribeStream` and `GetRecords`
+        // answer for their own ceilings: each of those refusals carries that
+        // operation's own sentence, and no observed answer fixes the wording for this
+        // one, so a page of the widest size the operation serves is what an
+        // over-request gets here.
         let limit = usize::try_from(
             input
                 .limit
