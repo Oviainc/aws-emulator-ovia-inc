@@ -9,7 +9,7 @@
 //! the requested `resolution` that holds at least one stored reading of the
 //! identified property inside `(startDate, endDate]` and of the filtered quality,
 //! exactly the `aggregateTypes` computed over the readings of that window, stamped
-//! with the window's own start, in the requested `timeOrdering`, paginated by
+//! with the instant that window ENDS, in the requested `timeOrdering`, paginated by
 //! `maxResults`/`nextToken`. Every row writes its readings through
 //! `BatchPutAssetPropertyValue` first, so the answer is a function of stored state
 //! and of nothing else.
@@ -35,6 +35,22 @@ const REGION: &str = "us-west-2";
 /// Seconds in a day. [`base`] is an exact multiple of it, so it is a UTC midnight
 /// and every modelled resolution's windows align on it.
 const DAY: i64 = 24 * 60 * 60;
+
+/// The length in seconds of the window each modelled `Resolution` names.
+///
+/// Source: `smithy_query(query="shape", shape="Resolution")` — length 2..3 and
+/// pattern `^1m|15m|1h|1d$`, i.e. one minute, fifteen minutes, one hour and one
+/// day. An aggregate is stamped with the END of its window, so this length is
+/// what every expected timestamp below adds to the window's start.
+fn window_seconds(resolution: &str) -> i64 {
+    match resolution {
+        "1m" => 60,
+        "15m" => 900,
+        "1h" => 3_600,
+        "1d" => DAY,
+        other => panic!("{other} is not a modelled Resolution"),
+    }
+}
 
 /// The epoch second every reading in this suite is placed relative to: the UTC
 /// midnight two days before the current one, so the `1d` window boundary is this
@@ -329,13 +345,16 @@ async fn a_resolution_groups_the_readings_into_its_own_aligned_windows() {
         )
         .await;
         assert_eq!(status, 200, "case {resolution:?}: got {status} {body}");
+        // Each window is stamped with the instant it ends: its start plus the
+        // length of the resolution's window.
+        let end_of = |start: i64| base() + start + window_seconds(resolution);
         let expected_sums: Vec<(i64, f64)> = windows
             .iter()
-            .map(|(offset, sum, _)| (base() + offset, *sum))
+            .map(|(offset, sum, _)| (end_of(*offset), *sum))
             .collect();
         let expected_counts: Vec<(i64, f64)> = windows
             .iter()
-            .map(|(offset, _, count)| (base() + offset, *count))
+            .map(|(offset, _, count)| (end_of(*offset), *count))
             .collect();
         assert_eq!(
             reported(&body, "sum"),
@@ -422,8 +441,8 @@ async fn each_aggregate_type_is_that_function_of_the_window_s_readings() {
         }
         assert_eq!(
             aggregates[0]["timestamp"].as_f64().map(|at| at as i64),
-            Some(base()),
-            "case {aggregate_type:?}: the aggregate is stamped with its window start, got {body}"
+            Some(base() + window_seconds("1d")),
+            "case {aggregate_type:?}: the aggregate is stamped with its window end, got {body}"
         );
     }
 
@@ -434,14 +453,15 @@ async fn each_aggregate_type_is_that_function_of_the_window_s_readings() {
     params.push(("aggregateTypes", "SUM".to_string()));
     let (status, body) = call(&router, "GET", &aggregates_uri(&params), None).await;
     assert_eq!(status, 200, "a repeated aggregateType: got {status} {body}");
+    let ends = base() + window_seconds("1d");
     assert_eq!(
         reported(&body, "average"),
-        vec![(base(), mean)],
+        vec![(ends, mean)],
         "a repeated aggregateType: expected average {mean}, got {body}"
     );
     assert_eq!(
         reported(&body, "sum"),
-        vec![(base(), sum)],
+        vec![(ends, sum)],
         "a repeated aggregateType: expected sum {sum}, got {body}"
     );
 }
@@ -493,7 +513,7 @@ async fn the_queried_range_excludes_its_start_and_includes_its_end() {
         match expected {
             Some(sum) => assert_eq!(
                 sums,
-                vec![(base(), sum)],
+                vec![(base() + window_seconds("1h"), sum)],
                 "case {case:?}: expected sum {sum}, got {body}"
             ),
             None => assert!(
@@ -539,14 +559,15 @@ async fn qualities_selects_which_readings_are_aggregated() {
         }
         let (status, body) = call(&router, "GET", &aggregates_uri(&params), None).await;
         assert_eq!(status, 200, "case {case:?}: got {status} {body}");
+        let ends = base() + window_seconds("1h");
         assert_eq!(
             reported(&body, "sum"),
-            vec![(base(), expected_sum)],
+            vec![(ends, expected_sum)],
             "case {case:?}: expected sum {expected_sum}, got {body}"
         );
         assert_eq!(
             reported(&body, "count"),
-            vec![(base(), expected_count)],
+            vec![(ends, expected_count)],
             "case {case:?}: expected count {expected_count}, got {body}"
         );
         assert_eq!(
@@ -563,10 +584,11 @@ async fn time_ordering_and_max_results_page_the_windows() {
     let (asset_id, speed) = asset_with_property(&router, "Fan", "Rpm", "DOUBLE").await;
     write_readings(&router, &asset_id, &speed, &READINGS).await;
 
-    // The `1m` windows of READINGS, ascending.
+    // The `1m` windows of READINGS, ascending, each stamped with the instant it
+    // ends.
     let ascending: Vec<i64> = [0, 60, 960, 3_960, 90_000]
         .iter()
-        .map(|offset| base() + offset)
+        .map(|offset| base() + offset + window_seconds("1m"))
         .collect();
     let mut descending = ascending.clone();
     descending.reverse();
@@ -678,7 +700,7 @@ async fn a_non_numeric_reading_is_counted_but_feeds_no_numeric_aggregate() {
         match expected {
             Some(count) => assert_eq!(
                 reported(&body, member),
-                vec![(base(), count)],
+                vec![(base() + window_seconds("1h"), count)],
                 "case {aggregate_type:?}: expected {member} {count}, got {body}"
             ),
             None => assert_eq!(

@@ -8820,7 +8820,8 @@ impl<'a> AggregateQuery<'a> {
 ///
 /// DERIVED, never stored: the samples `BatchPutAssetPropertyValue` wrote are
 /// bucketed into the epoch-aligned windows `query` names and each bucket is
-/// reduced to the aggregates the caller asked for. A window that no in-range
+/// reduced to the aggregates the caller asked for, stamped with the instant the
+/// window it summarises ENDS. A window that no in-range
 /// sample of the asked-for quality falls in is not reported at all, so the length
 /// of the answer is a function of the stored data and not of the width of the
 /// queried range.
@@ -8874,8 +8875,14 @@ pub fn aggregated_values(
         .filter_map(|(start, bucket)| {
             let value = bucket.reduce(query.aggregate_types);
             reports_an_aggregate(&value).then(|| AggregatedValue {
-                // A window is reported at the instant it starts.
-                timestamp: ::aws_smithy_types::DateTime::from_secs(*start),
+                // A window is reported at the instant it ENDS — the end of the
+                // interval the aggregate summarises, which for a window starting at
+                // `start` is `start` plus the length of the resolution's window. The
+                // saturating add keeps the last window of the representable range on
+                // the largest second the member can carry rather than wrapping.
+                timestamp: ::aws_smithy_types::DateTime::from_secs(
+                    start.saturating_add(query.window_seconds),
+                ),
                 quality: Some(query.quality.to_string()),
                 value,
             })

@@ -475,9 +475,9 @@ async fn the_aggregate_read_serves_every_property_the_asset_reports_at_every_res
                 let count = readings.len() as f64;
                 assert_close(
                     case,
-                    &format!("the {resolution} window {at} start"),
+                    &format!("the {resolution} window {at} end"),
                     reported[at]["timestamp"].as_f64(),
-                    *start as f64,
+                    (*start + window) as f64,
                 );
                 assert_close(
                     case,
@@ -599,10 +599,11 @@ async fn the_aggregate_read_pages_and_orders_every_propertys_windows_alike() {
         write_samples(&router, &asset_id, row).await;
 
         // One window per sample at the shortest resolution, so there is something
-        // to page through and to order.
+        // to page through and to order. Each window is stamped with the instant it
+        // ends, so a `1m` window starting at `start` reports `start + 60`.
         let ascending: Vec<i64> = expected_windows(60, &row.readings)
             .into_iter()
-            .map(|(start, _)| start)
+            .map(|(start, _)| start + 60)
             .collect();
         let mut descending = ascending.clone();
         descending.reverse();

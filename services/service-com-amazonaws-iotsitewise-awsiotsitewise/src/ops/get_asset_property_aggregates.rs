@@ -381,15 +381,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Which enumeration a token of this read belongs to: the stream read and the
         // query that derives and orders its windows — the range, the resolution, the
-        // quality counted, the aggregates computed and the ordering. A window start is
+        // quality counted, the aggregates computed and the ordering. A window edge is
         // no identity of a position on its own, because the epoch-aligned grid gives
-        // every stream the same window starts, so the token carries this scope beside
-        // the window start. The page size is not part of it: it decides where a page
-        // ends, not what is enumerated.
+        // every stream the same windows, so the token carries this scope beside the
+        // window's own instant. The page size is not part of it: it decides where a
+        // page ends, not what is enumerated.
         let scope = crate::state::pagination_scope(&[&stream, &query]);
 
-        // `nextToken` is this enumeration's resume point: the window start of the first
-        // aggregate of the next page, hex-encoded so the token matches the modelled
+        // `nextToken` is this enumeration's resume point: the stamped instant of the
+        // first aggregate of the next page, hex-encoded so the token matches the modelled
         // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
         // refused rather than answered with an empty page — and a token minted for
         // ANOTHER enumeration is one of those, rather than a position in this one.
@@ -433,12 +433,13 @@ const MAX_RESULTS_CEILING: i32 = 2_500;
 /// response bound, neither of which fixes a default page size.
 const DEFAULT_MAX_RESULTS: i32 = 100;
 
-/// The resume point of one aggregate: the start of the window it reports, in the
-/// same `(seconds, nanos)` form the shared token codec carries.
+/// The resume point of one aggregate: the instant it is stamped with — the END of
+/// the window it reports — in the same `(seconds, nanos)` form the shared token
+/// codec carries.
 ///
-/// A window of every modelled `Resolution` starts on a whole second — the grid is
-/// aligned to the epoch and the shortest window is a minute — so the nanosecond
-/// half of the key is always zero here.
+/// A window of every modelled `Resolution` begins and ends on a whole second — the
+/// grid is aligned to the epoch and the shortest window is a minute — so the
+/// nanosecond half of the key is always zero here.
 fn window_key(value: &AggregatedValue) -> (i64, i32) {
     (value.timestamp.secs(), 0)
 }

@@ -424,11 +424,13 @@ async fn every_data_plane_read_serves_a_composite_models_property_like_the_asset
             1,
             "case {case:?}: expected one window, got {success}"
         );
+        // A window is stamped with the instant it ends: its start plus the length
+        // of the `1h` window the entry asked for.
         assert_close(
             case,
             "the window timestamp",
             windows[0]["timestamp"].as_f64(),
-            window_start() as f64,
+            (window_start() + WINDOW) as f64,
         );
         assert_close(case, "count", windows[0]["value"]["count"].as_f64(), 2.0);
         assert_close(case, "sum", windows[0]["value"]["sum"].as_f64(), row.sum());

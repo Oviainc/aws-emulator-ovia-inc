@@ -52,6 +52,22 @@ fn base() -> i64 {
 /// How close two doubles must be to count as the same aggregate.
 const EPSILON: f64 = 1e-9;
 
+/// The length in seconds of the window each modelled `Resolution` names.
+///
+/// Source: `smithy_query(query="shape", shape="Resolution")` — length 2..3 and
+/// pattern `^1m|15m|1h|1d$`, i.e. one minute, fifteen minutes, one hour and one
+/// day. An aggregate is stamped with the END of its window, so this is what every
+/// expected timestamp below adds to the window's start.
+fn window_seconds(resolution: &str) -> i64 {
+    match resolution {
+        "1m" => 60,
+        "15m" => 900,
+        "1h" => 3_600,
+        "1d" => 86_400,
+        other => panic!("{other} is not a modelled Resolution"),
+    }
+}
+
 /// A router with just this service mounted on a fresh shared engine.
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -348,7 +364,14 @@ async fn aggregates_bucket_the_series_on_the_epoch_aligned_resolution_grid() {
         {
             let case = format!("{resolution} window {offset}");
             let value = &values[at];
-            assert_close(&case, "timestamp", &value["timestamp"], (base() + offset) as f64);
+            // A window is stamped with the instant it ENDS: its start plus the
+            // length of the resolution's window.
+            assert_close(
+                &case,
+                "timestamp",
+                &value["timestamp"],
+                (base() + offset + window_seconds(resolution)) as f64,
+            );
             assert_eq!(
                 value["quality"], "GOOD",
                 "case {case:?}: expected quality GOOD, got {value}"
@@ -587,9 +610,10 @@ async fn time_ordering_reverses_the_windows_without_changing_them() {
     .await;
 
     // Rows: the two `TimeOrdering` values, plus the entry that names none — whose
-    // documented default is ASCENDING.
-    let ascending = vec![0_i64, 60, 120];
-    let descending = vec![120_i64, 60, 0];
+    // documented default is ASCENDING. Each window is stamped with the instant it
+    // ends, so the `1m` windows starting at 0, 60 and 120 report 60, 120 and 180.
+    let ascending = vec![60_i64, 120, 180];
+    let descending = vec![180_i64, 120, 60];
     let cases: [(&str, Option<&str>, Vec<i64>); 3] = [
         ("default", None, ascending.clone()),
         ("ASCENDING", Some("ASCENDING"), ascending),
