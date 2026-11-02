@@ -1,0 +1,41 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudcontrol__sqs.cloudcontrol-patch-remove-restores-the-native-sqs-default cloudcontrol__sqs.cloudcontrol-reads-and-writes-through-to-a-natively-created-queue
+Issue-Key: sqs|GetQueueAttributes|AWS.SimpleQueueService.NonExistentQueue
+Issue-Key: cloudcontrol__sqs.cloudcontrol-reads-and-writes-through-to-a-natively-created-queue|_poll_until#8|Timeout|time.sleep(interval_s)
+Issue-Commit: 2d54232ecf89d09f7d71c64df7cdb47dba635b50
+
+# cloudcontrol__sqs: 2 net-new causes — Cloud Control's AWS::SQS::Queue provider neither provisions into SQS on CreateResource nor reads through to SQS on GetResource/ListResources
+
+> _Note: this issue was identified against the code base at commit `2d54232ecf89d09f7d71c64df7cdb47dba635b50`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateResource
+
+## Description
+Two net-new root causes. Cloud Control API keeps a private resource store that is never joined to the owning service's state, so for AWS::SQS::Queue it reports resources it never provisioned and cannot see resources that exist.
+
+Cause 1 of 2: CreateResource for AWS::SQS::Queue reaches a SUCCESS ProgressEvent and hands back a queue-URL Identifier, but no queue is created in SQS.
+AWS: Smithy (cloudcontrol) models CreateResource with required TypeName (pattern ^[A-Za-z0-9]{2,64}::[A-Za-z0-9]{2,64}::[A-Za-z0-9]{2,64}$) and required DesiredState, returning a ProgressEvent; the operation doc for the service states Cloud Control acts on resources in the account "whether those resources were provisioned using Cloud Control API". AWS therefore invokes the type's resource handler, which really calls SQS CreateQueue: once the request's OperationStatus is SUCCESS the ProgressEvent's Identifier is the live queue URL and SQS GetQueueAttributes on it returns the attributes that were asked for in DesiredState (here DelaySeconds).
+Emulator: GetQueueAttributes on the Identifier returned by the SUCCESS create answers HTTP 400 with error code `AWS.SimpleQueueService.NonExistentQueue` and message "The specified queue does not exist." — the fixed text of SQS's absent-queue refusal, with no variable part. The create only wrote a record into Cloud Control's own store (services/service-com-amazonaws-cloudcontrol-cloudapiservice/src/ops/create_resource.rs builds properties, derives the identifier and calls store.materialise_due/store insertion; nothing provisions anything in SQS).
+Why: a client that provisions through Cloud Control and then uses the resource through the owning service's API — the documented and normal pattern — gets a success it cannot use: every subsequent SQS call on the returned queue URL is refused as non-existent, and any attribute the desired state asked for (or a JSON-Patch remove that should restore SQS's own default of DelaySeconds 0) can never be observed.
+Fix: the Cloud Control AWS::SQS::Queue provider behind CreateResource (services/service-com-amazonaws-cloudcontrol-cloudapiservice/src/ops/create_resource.rs and the resource materialisation in src/state.rs) must provision the queue in SQS's state and derive the Identifier from it, rather than recording a model only.
+Traces: cloudcontrol__sqs.cloudcontrol-patch-remove-restores-the-native-sqs-default
+
+Cause 2 of 2: GetResource and ListResources resolve only resources Cloud Control itself created; a queue created natively through SQS CreateQueue is never resolved or enumerated.
+AWS: Smithy (cloudcontrol) models GetResource with required TypeName + Identifier returning a ResourceDescription, ResourceNotFoundException (HTTP 404) for "A resource with the specified identifier can't be found", and ListResources returning paginated ResourceDescriptions. The GetResource doc states it returns information "about an existing resource in your account and Amazon Web Services Region, whether those resources were provisioned using Cloud Control API". So for a queue created by SQS CreateQueue, GetResource(TypeName=AWS::SQS::Queue, Identifier=<queue URL>) succeeds and echoes SQS's own values (QueueName, VisibilityTimeout, Arn), ListResources enumerates that queue URL, and only a URL that genuinely names no queue yields ResourceNotFoundException.
+Emulator: the check never gets past the read-through beat and is killed at the harness's 60 s cap while polling GetResource for a queue it created through SQS. The handler (services/service-com-amazonaws-cloudcontrol-cloudapiservice/src/ops/get_resource.rs, lines 217-232) looks the identifier up with `store.resource(&input.type_name, &input.identifier)` on Cloud Control's private store and otherwise returns ResourceNotFoundException; nothing consults SQS, so a natively created queue can never resolve. Hypothesis: ListResources is backed by the same private store and likewise omits it.
+Why: Cloud Control is sold as a uniform read/write API over resources however they were created. A client that inventories or patches existing infrastructure through it sees an empty or partial account — GetResource reports a live queue as not found and ListResources omits it — so drift detection, tagging sweeps and patch workflows silently act on nothing.
+Fix: the Cloud Control read path for AWS::SQS::Queue — GetResource and ListResources (src/ops/get_resource.rs, src/ops/list_resources.rs and the resource lookup in src/state.rs) must resolve and enumerate from SQS's own queue state, not from a private index of self-created resources.
+Traces: cloudcontrol__sqs.cloudcontrol-reads-and-writes-through-to-a-natively-created-queue
+
+Related but not covering: the open issue 20261029T193114Z-cloudformation-sqs-2-net-new-causes-onfailure-do.md describes CloudFormation's own AWS::SQS::Queue handling (OnFailure=DO_NOTHING retention and update-replacement); it says nothing about the Cloud Control API surface, and the third cloudcontrol__sqs check is the one attributed to it.
+
+## Evidence
+Cause 1 — `botocore.errorfactory.QueueDoesNotExist: An error occurred (AWS.SimpleQueueService.NonExistentQueue) when calling the GetQueueAttributes operation: The specified queue does not exist.` raised on the first SQS read of the queue URL that CreateResource returned as the Identifier of a SUCCESS ProgressEvent. Expected: GetQueueAttributes 200 with Attributes.DelaySeconds equal to the value the DesiredState asked for, then 0 (SQS's documented default) after a JSON-Patch `remove` of /DelaySeconds, then the re-added value.
+Cause 2 — `Check timed out after 60.0s` while polling `cloudcontrol.get_resource(TypeName='AWS::SQS::Queue', Identifier=<queue URL created by sqs.create_queue>)`, which never resolves. Code path: services/service-com-amazonaws-cloudcontrol-cloudapiservice/src/ops/get_resource.rs:222 `store.resource(&input.type_name, &input.identifier)` → ResourceNotFoundException (HTTP 404) for a queue that exists in SQS. Expected: 200 with ResourceDescription whose Identifier is the queue URL and whose Properties carry QueueName, VisibilityTimeout and Arn as SQS reports them, the same URL present in ListResources, and ResourceNotFoundException reserved for a well-formed queue URL that names no queue.
+
+## Steps to Reproduce
+Cause 1: cloudcontrol.create_resource(TypeName='AWS::SQS::Queue', DesiredState=json({QueueName: <name>, DelaySeconds: 60})); poll get_resource_request_status until OperationStatus=SUCCESS; take ProgressEvent.Identifier as the queue URL and call sqs.get_queue_attributes(QueueUrl=<that URL>, AttributeNames=['DelaySeconds']) — it is refused with AWS.SimpleQueueService.NonExistentQueue instead of reporting 60. Then update_resource with PatchDocument [{"op":"remove","path":"/DelaySeconds"}] and re-read: SQS must report 0.
+Cause 2: sqs.create_queue(QueueName=<name>, Attributes={'VisibilityTimeout':'45'}); then cloudcontrol.get_resource(TypeName='AWS::SQS::Queue', Identifier=<that queue URL>) — it answers ResourceNotFoundException forever instead of a ResourceDescription, and cloudcontrol.list_resources(TypeName='AWS::SQS::Queue') does not contain the queue URL. A well-formed queue URL in the same account/region that nothing created must be the only ResourceNotFoundException case.
