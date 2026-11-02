@@ -287,6 +287,12 @@ fn code_rejected(rejection: crate::state::CodeRejection) -> VerifyUserAttributeE
 fn token_rejected(rejection: crate::state::TokenRejection) -> VerifyUserAttributeError {
     match rejection {
         crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
+        // A token this emulator issued and a sign-out or a revocation has since
+        // invalidated, which is told apart from a value that resolves to no access
+        // token at all.
+        crate::state::TokenRejection::Revoked => {
+            not_authorized(crate::state::ACCESS_TOKEN_REVOKED_MESSAGE)
+        }
         crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
         // The token is live and authorizes this operation, but the user it names
         // has to set a new password before any self-service call of its own is

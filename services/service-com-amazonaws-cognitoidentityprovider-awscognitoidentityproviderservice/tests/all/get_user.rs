@@ -19,8 +19,8 @@
 //! `CreateUserPoolClient`, `AddCustomAttributes`, `AdminCreateUser`,
 //! `AdminSetUserPassword`, `SetUserSettings` and `InitiateAuth`, and every read
 //! is cross-checked against the administrative `AdminGetUser`. A token record
-//! that no call can reach — a revoked token (`RevokeToken` is still a scaffold in
-//! this emulator), one the clock has expired, one naming a pool or a user that is
+//! whose state no read of this suite writes — a revoked token, one the clock has
+//! expired, one naming a pool or a user that is
 //! gone — is PLANTED in the store, the way the other suites of this crate plant
 //! state for writers that are not implemented yet.
 //!
@@ -602,8 +602,8 @@ enum SubmittedToken {
     Planted(&'static str),
 }
 
-/// An access token record planted as revoked, which no implemented call can
-/// produce: `RevokeToken` is still a scaffold in this emulator.
+/// An access token record planted as revoked, so the row that reads it does not
+/// depend on which revoking operation wrote that state.
 const REVOKED: &str = "revoked.access.token";
 
 /// An access token record planted with a lifetime the clock is already past.
@@ -646,7 +646,7 @@ const TOKEN_CASES: &[TokenCase] = &[
         token: SubmittedToken::Planted(REVOKED),
         status: 400,
         code: "NotAuthorizedException",
-        message: "Invalid Access Token",
+        message: "Access Token has been revoked",
     },
     TokenCase {
         case: "an access token the clock has expired",

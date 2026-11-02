@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GlobalSignOut
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GlobalSignOut`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GlobalSignOut::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The signed-in user signs ITSELF out: the `AccessToken` the sign-in issued names
+//! the user, and every token this emulator issued to that user — access, id and
+//! refresh alike — is revoked, so no token a caller still holds authorizes a later
+//! request and no refresh token it holds mints a new one. The stored profile is not
+//! touched: this call signs the user out, it neither deactivates nor modifies it.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +174,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GlobalSignOut` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GlobalSignOutErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GlobalSignOut"))
+        // Request metadata only: the user signing out is named by the access token in
+        // the body, not by the request's signature.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // An access token's lifetime is read against the clock, so an expired token is
+        // refused whether or not anything has swept it.
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // Resolve the STORED pool and user the token names FIRST: a refused token
+        // signs nobody out. The stored username is what this user's tokens were
+        // recorded under, which a case-insensitive pool may case differently from the
+        // name the sign-in used.
+        let (user_pool_id, username) = {
+            let (pool, user) = guard
+                .signed_in_user(&input.access_token, now)
+                .map_err(token_rejected)?;
+            (pool.id.clone(), user.username.clone())
+        };
+
+        // "Invalidates the identity, access, and refresh tokens that Amazon Cognito
+        // issued to a user" (this operation in this service's model), so every token
+        // issued to that user is revoked — including the one that authorized this very
+        // call — and its outstanding challenge sessions go with them. A revoked record
+        // stays stored and stays refused, which is what makes a later call made with
+        // the same token report that the token was revoked.
+        guard.revoke_user_tokens(&user_pool_id, &username);
+
+        // This operation models no output member at all: what it asserts is the
+        // revocation state every later token check reads.
+        Ok(GlobalSignOutOutput {})
     }
+}
+
+/// This operation's answer to an `AccessToken` that names no signed-in user.
+///
+/// Every rejection of the token itself answers `NotAuthorizedException`, which "is
+/// thrown when a user isn't authorized" (this service's model). This operation
+/// declares no `UserNotFoundException`, so a token whose pool or user has since been
+/// deleted names no signed-in user to sign out and is a rejection of the token too.
+/// No message names a stored value, so the refusal reports why the token was not
+/// accepted and nothing else.
+fn token_rejected(rejection: crate::state::TokenRejection) -> GlobalSignOutError {
+    match rejection {
+        crate::state::TokenRejection::NotAnAccessToken
+        | crate::state::TokenRejection::PoolGone
+        | crate::state::TokenRejection::UserGone => not_authorized("Invalid Access Token"),
+        // A token this emulator issued and a sign-out or a revocation has since
+        // invalidated: signing out again revokes nothing further, and the refusal
+        // reports that the token presented is no longer live.
+        crate::state::TokenRejection::Revoked => {
+            not_authorized(crate::state::ACCESS_TOKEN_REVOKED_MESSAGE)
+        }
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        // The token is live and authorizes this operation, but the user it names has
+        // to set a new password before any self-service call of its own is served,
+        // which this operation declares its own error for.
+        crate::state::TokenRejection::PasswordResetRequired => {
+            GlobalSignOutErrorModeled::PasswordResetRequiredException(
+                PasswordResetRequiredException {
+                    message: Some(crate::state::PASSWORD_RESET_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
+        crate::state::TokenRejection::MissingRequiredScopes => {
+            not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
+        }
+    }
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> GlobalSignOutError {
+    GlobalSignOutErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> GlobalSignOutError {
+    GlobalSignOutErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

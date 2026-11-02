@@ -408,6 +408,10 @@ const ADMIN_NO_SRP_AUTH: &str = "ADMIN_NO_SRP_AUTH";
 /// (`ChallengeNameType` in this service's model).
 const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
 
+/// The challenge a user that must set up an MFA factor before it can sign in is
+/// answered with (`ChallengeNameType` in this service's model).
+const MFA_SETUP: &str = "MFA_SETUP";
+
 /// `AuthFlowType`'s choice-based entry point: "USER_AUTH — The entry point for
 /// choice-based authentication" (`InitiateAuth.AuthFlow` in this service's model).
 const USER_AUTH: &str = "USER_AUTH";
@@ -515,6 +519,17 @@ async fn password_sign_in(
                 user_attributes: user.attributes.clone(),
                 session_validity,
             }
+        } else if pool.requires_mfa() && user.mfa_setting_list.is_empty() {
+            // The pool requires a second factor from every sign-in and this user
+            // has activated none, so the sign-in cannot complete: it is answered
+            // with the challenge to SET one up, naming the methods the pool
+            // offers for it, and no token is minted until that is done.
+            Outcome::MfaSetup {
+                user_pool_id,
+                username: user.username.clone(),
+                settings_can_setup: pool.mfa_settings_available_for_setup(user),
+                session_validity,
+            }
         } else {
             Outcome::Authenticate {
                 user_pool_id,
@@ -529,6 +544,11 @@ async fn password_sign_in(
     // until the function the pool names has allowed it.
     let (user_pool_id, username) = match &outcome {
         Outcome::Challenge {
+            user_pool_id,
+            username,
+            ..
+        }
+        | Outcome::MfaSetup {
             user_pool_id,
             username,
             ..
@@ -579,6 +599,36 @@ async fn password_sign_in(
                 challenge_name: Some(NEW_PASSWORD_REQUIRED.to_string()),
                 session: Some(session),
                 challenge_parameters: Some(challenge_parameters),
+                authentication_result: None,
+                available_challenges: None,
+            })
+        }
+        Outcome::MfaSetup {
+            user_pool_id,
+            username,
+            settings_can_setup,
+            session_validity,
+        } => {
+            let session = store.lock().start_session(
+                now,
+                crate::state::AuthSession {
+                    user_pool_id,
+                    client_id: client_id.to_string(),
+                    username: username.clone(),
+                    challenge_name: MFA_SETUP.to_string(),
+                    expires_at: now + session_validity,
+                    // This challenge is answered by registering a factor, not
+                    // with a code anything delivered.
+                    code: None,
+                },
+            );
+            Ok(InitiateAuthOutput {
+                challenge_name: Some(MFA_SETUP.to_string()),
+                session: Some(session),
+                challenge_parameters: Some(crate::state::mfa_setup_challenge_parameters(
+                    &username,
+                    &settings_can_setup,
+                )),
                 authentication_result: None,
                 available_challenges: None,
             })
@@ -895,6 +945,14 @@ enum Outcome {
     Authenticate {
         user_pool_id: String,
         username: String,
+    },
+    /// The password is right, the pool requires a second factor and the user has
+    /// activated none, so one has to be set up before the sign-in completes.
+    MfaSetup {
+        user_pool_id: String,
+        username: String,
+        settings_can_setup: Vec<String>,
+        session_validity: ::std::time::Duration,
     },
 }
 

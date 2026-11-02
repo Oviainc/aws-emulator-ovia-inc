@@ -349,6 +349,12 @@ async fn access_token_identifies(
 }
 
 /// Assert that `access_token` authorizes nothing any more.
+///
+/// A token this emulator issued and a revocation has since invalidated is refused AS
+/// revoked — the sentence `GlobalSignOut` documents, "Amazon Cognito returns an
+/// `Access Token has been revoked` error when your app attempts to authorize a user
+/// pools API request with a revoked access token" — rather than with the refusal of a
+/// value that resolves to no access token at all.
 async fn access_token_revoked(router: &MultiServiceRouter, case: &str, access_token: &str) {
     refused(
         router,
@@ -357,7 +363,7 @@ async fn access_token_revoked(router: &MultiServiceRouter, case: &str, access_to
         &json!({ "AccessToken": access_token }),
         400,
         "NotAuthorizedException",
-        "Invalid Access Token",
+        "Access Token has been revoked",
     )
     .await;
 }

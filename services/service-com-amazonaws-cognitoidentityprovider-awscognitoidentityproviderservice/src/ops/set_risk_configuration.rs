@@ -4,8 +4,9 @@
 //!
 //! Sets the threat-protection (risk) configuration of one user pool, or of one app
 //! client of it, and answers the configuration that level holds afterwards, read
-//! back from what was stored. Only the compromised-credentials setting needs the
-//! pool's threat-protection add-on to be on.
+//! back from what was stored. The pool's threat-protection add-on state decides
+//! whether a stored configuration is ever evaluated, not whether it may be stored,
+//! so every level can be configured ahead of switching that add-on on.
 //!
 //! ## Shape of an operation
 //!
@@ -201,13 +202,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let client_id = input.client_id.clone();
         let now = ::std::time::SystemTime::now();
 
-        // Which settings the request carries decides whether the pool's
-        // threat-protection add-on is a precondition of this write: the
-        // compromised-credentials setting is the one the add-on pays for, so only
-        // a request that carries it needs the add-on on. Read before the three
-        // settings are moved into the stored configuration below.
-        let needs_add_ons = input.compromised_credentials_risk_configuration.is_some();
-
         // This call SETS the whole configuration of the level it names, so the
         // stored settings are exactly the ones the request carries: a request
         // that carries none of the three stores a configuration with nothing in
@@ -234,15 +228,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
 
-        // The add-on precondition is scoped to the setting it governs, not to the
-        // operation: a write that carries the compromised-credentials setting is
-        // refused while the pool's add-ons are off, and a write that carries only
-        // the adaptive-authentication or IP-address settings is stored whatever
-        // the pool's add-on state. Asked AFTER the lookup, so a request that names
-        // no pool is a 404 whatever the pool it named would have reported.
-        if needs_add_ons && !pool.add_ons_enabled() {
-            return Err(add_ons_not_enabled());
-        }
+        // The pool's threat-protection add-on is NOT a precondition of this
+        // write: the configuration is stored whatever the pool's add-on state,
+        // and that state decides only whether the stored settings are ever
+        // EVALUATED — "to change threat protection to audit-only or off, update
+        // the value of `UserPoolAddOns` in an `UpdateUserPool` request" (this
+        // operation in this service's model) is a statement about enforcement,
+        // not about what may be configured. So a pool with its add-ons off can be
+        // configured ahead of switching them on, and a later
+        // `DescribeRiskConfiguration` reports what was stored.
 
         // "When you include both ClientId and UserPoolId, Amazon Cognito maps
         // the configuration to the app client only", so a `ClientId` the named
@@ -311,17 +305,6 @@ fn client_not_found(message: String) -> SetRiskConfigurationError {
     SetRiskConfigurationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(message),
     })
-    .into()
-}
-
-/// This operation's refusal of a compromised-credentials write on a pool whose
-/// user pool add-ons are off.
-fn add_ons_not_enabled() -> SetRiskConfigurationError {
-    SetRiskConfigurationErrorModeled::UserPoolAddOnNotEnabledException(
-        UserPoolAddOnNotEnabledException {
-            message: Some(crate::state::USER_POOL_ADD_ONS_NOT_ENABLED_MESSAGE.to_string()),
-        },
-    )
     .into()
 }
 

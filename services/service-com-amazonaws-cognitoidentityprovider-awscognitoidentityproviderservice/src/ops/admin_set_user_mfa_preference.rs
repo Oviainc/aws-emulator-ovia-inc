@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminSetUserMFAPreference
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminSetUserMFAPreference`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminSetUserMFAPreference::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An administrator sets ONE user's MFA preference: which of the factors the user
+//! holds are activated, and which single one is preferred. The user is named by the
+//! `UserPoolId` and `Username` of the request, and the whole submitted preference is
+//! checked before anything is written, so a refused request leaves that user's
+//! activated factors and preferred factor exactly as they were. The self-service
+//! `SetUserMFAPreference` writes the same state through the same store, so the two
+//! cannot disagree about what a preference means.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +182,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminSetUserMFAPreference` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminSetUserMFAPreferenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminSetUserMFAPreference"))
+        // Request metadata only: the user whose preference this is is named in the
+        // body, and this operation is authorized by the caller's IAM credentials.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // Decide the whole write FIRST — the stored user it applies to, and what the
+        // submitted settings ask for — so a refused request leaves that user exactly
+        // as it was.
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        // "The value of this parameter is typically your user's username, but it can
+        // be any of their alias attributes" (`Username`), which is the lookup every
+        // administrative operation of this service resolves a user by.
+        if pool.user(&input.username).is_none() {
+            return Err(user_not_found());
+        }
+
+        let requested = requested_settings(&input);
+        let user = pool
+            .user_mut(&input.username)
+            .ok_or_else(internal_error)?;
+        // Checked as a whole before anything is written, so a refused request
+        // leaves this user's activated factors and preferred factor as they were.
+        user.set_mfa_preference(&requested, now)
+            .map_err(|rejection| invalid_parameter(rejection.message()))?;
+        // Passkey MFA is the one submitted factor that is no `UserMFASettingList`
+        // setting and carries no `PreferredMfa` member — "this type doesn't include
+        // a `PreferredMfa` option because passkey MFA applies only when passkey is
+        // the first authentication factor" (`WebAuthnMfaSettingsType` in this
+        // service's model) — so what it asks for is stored on its own.
+        if let Some(settings) = &input.web_authn_mfa_settings {
+            user.set_web_authn_mfa_enabled(settings.enabled, now);
+        }
+
+        // This operation models no output member: what it asserts is the stored
+        // preference a later read of the same user renders.
+        Ok(AdminSetUserMFAPreferenceOutput {})
     }
+}
+
+/// What the submitted settings ask for, one entry per factor the request names,
+/// in the order this operation's input declares them.
+///
+/// Each of the three structures configures the factor it is named for, and the
+/// `UserMFASettingList` setting that factor is reported under is what the stored
+/// preference is kept as: that member's "possible values ... are `SMS_MFA`,
+/// `EMAIL_OTP`, and `SOFTWARE_TOKEN_MFA`" (this service's model). A structure the
+/// request leaves out asks for nothing, so that factor keeps what it held. The
+/// self-service `SetUserMFAPreference` reads the same three structures the same
+/// way, so an administrator and the user cannot express different preferences.
+fn requested_settings(
+    input: &AdminSetUserMFAPreferenceInput,
+) -> Vec<crate::state::MfaSettingRequest<'static>> {
+    let mut requested = Vec::new();
+    if let Some(settings) = &input.sms_mfa_settings {
+        requested.push(crate::state::MfaSettingRequest {
+            setting: crate::state::SMS_MFA_SETTING,
+            enabled: settings.enabled,
+            preferred: settings.preferred_mfa,
+        });
+    }
+    if let Some(settings) = &input.software_token_mfa_settings {
+        requested.push(crate::state::MfaSettingRequest {
+            setting: crate::state::SOFTWARE_TOKEN_MFA_SETTING,
+            enabled: settings.enabled,
+            preferred: settings.preferred_mfa,
+        });
+    }
+    if let Some(settings) = &input.email_mfa_settings {
+        requested.push(crate::state::MfaSettingRequest {
+            setting: crate::state::EMAIL_OTP_MFA_SETTING,
+            enabled: settings.enabled,
+            preferred: settings.preferred_mfa,
+        });
+    }
+    requested
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminSetUserMFAPreferenceError {
+    AdminSetUserMFAPreferenceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user. Carries the fixed
+/// message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no username.
+fn user_not_found() -> AdminSetUserMFAPreferenceError {
+    AdminSetUserMFAPreferenceErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> AdminSetUserMFAPreferenceError {
+    AdminSetUserMFAPreferenceErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminSetUserMFAPreferenceError {
+    AdminSetUserMFAPreferenceErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

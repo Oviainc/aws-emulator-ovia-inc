@@ -262,15 +262,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(user) = pool.user(&input.username) else {
             // `PreventUserExistenceErrors = ENABLED` "suppresses messages that might
-            // indicate a valid user exists", so the answer for a user nobody registered
-            // names nothing about it; `LEGACY` answers `UserNotFoundException`. No
-            // delivery is reported either way: a `CodeDeliveryDetails` for a code
-            // nothing minted would be an answer about work nothing performed.
-            return Err(if hides_user_existence {
-                not_authorized(crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE)
-            } else {
-                user_not_found()
-            });
+            // indicate a valid user exists" (this service's model), so a request
+            // naming a user nobody registered is answered the way a request naming
+            // one that exists is: with a reported delivery, to a SIMULATED
+            // destination, since nothing was sent and no code is stored for a user
+            // that does not exist. `LEGACY` answers `UserNotFoundException`.
+            if hides_user_existence {
+                return Ok(ForgotPasswordOutput {
+                    code_delivery_details: crate::state::simulated_code_delivery_details(),
+                });
+            }
+            return Err(user_not_found());
         };
         if !user.enabled {
             return Err(not_authorized("User is disabled."));

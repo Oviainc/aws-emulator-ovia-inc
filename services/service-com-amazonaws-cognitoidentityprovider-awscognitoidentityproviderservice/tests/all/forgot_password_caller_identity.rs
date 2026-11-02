@@ -70,6 +70,13 @@ const USERNAME_CLIENT_NOT_FOUND_MESSAGE: &str = "Username/client id combination 
 /// identity.
 const OTHER_USERNAME: &str = "someoneelse";
 
+/// The `Destination` a delivery to a SIMULATED destination reports — the answer owed
+/// to a request naming a user nobody registered, by an app client whose
+/// `PreventUserExistenceErrors` is `ENABLED`. It identifies nobody, and it is the
+/// same value whatever the request named, so no two usernames can be told apart by
+/// the answer they get.
+const SIMULATED_DESTINATION: &str = "a***@b***";
+
 /// The email addresses subject users are created with, as `(local part, domain, the
 /// `Destination` Amazon Cognito reports for that address)`
 /// (`smithy_query(query="doc",shape="CodeDeliveryDetailsType",member="Destination")`:
@@ -486,9 +493,9 @@ async fn forgot_password_answers_only_the_pool_its_app_client_names() {
             client: Client::Hiding,
             subject: Subject::Unregistered,
             hash: Hash::Absent,
-            status: 400,
-            error: Some("NotAuthorizedException"),
-            message: Expected::Fixed(USERNAME_CLIENT_NOT_FOUND_MESSAGE),
+            status: 200,
+            error: None,
+            message: Expected::Served,
         },
         Row {
             case: "a client that suppresses existence errors, for a user of its own pool",
@@ -698,6 +705,39 @@ async fn forgot_password_answers_only_the_pool_its_app_client_names() {
             }
             None => {
                 let details = &payload["CodeDeliveryDetails"];
+                if matches!(row.subject, Subject::Unregistered) {
+                    // A user nobody registered, through a client that suppresses
+                    // user-existence errors: the delivery reported is to a
+                    // SIMULATED destination — nothing distinguishes the answer
+                    // from the one a registered user gets — and nothing was sent,
+                    // so no code is outstanding in either pool.
+                    assert_eq!(
+                        details["DeliveryMedium"],
+                        json!("EMAIL"),
+                        "case {case:?}: a simulated delivery is reported over EMAIL, got \
+                         {payload}"
+                    );
+                    assert_eq!(
+                        details["AttributeName"],
+                        json!("email"),
+                        "case {case:?}: expected the attribute a simulated delivery names, \
+                         got {payload}"
+                    );
+                    assert_eq!(
+                        details["Destination"],
+                        json!(SIMULATED_DESTINATION),
+                        "case {case:?}: expected the simulated destination, got {payload}"
+                    );
+                    for pool in [home, away] {
+                        let sent = outstanding_reset_code(&engine, pool, &username);
+                        assert!(
+                            sent.is_none(),
+                            "case {case:?}: no code is minted for a user that does not exist, \
+                             got {sent:?} outstanding in pool {pool}"
+                        );
+                    }
+                    continue;
+                }
                 assert_eq!(
                     details["DeliveryMedium"],
                     json!("EMAIL"),

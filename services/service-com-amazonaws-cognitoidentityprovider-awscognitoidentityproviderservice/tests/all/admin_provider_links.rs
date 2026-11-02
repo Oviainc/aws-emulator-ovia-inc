@@ -967,12 +967,20 @@ async fn an_identity_links_to_one_profile() {
     let (status, payload) = disable(&router, &user_pool_id, &native_identity("hal")).await;
     assert_not_linked("the profile the refused link named", status, &payload);
 
-    // Linking it again to the profile it already names changes nothing: the one
-    // link is still removed exactly once.
+    // Linking it again to the profile it ALREADY names is refused too: a source
+    // identity carries one link, so the identity has to be deactivated before it
+    // links again, and the one stored link is still removed exactly once.
     let (status, payload) = link(&router, &user_pool_id, &source, &destination("gina")).await;
     assert_eq!(
-        status, 200,
-        "case \"a repeated link to the same profile\": expected success, got {status} with {payload}"
+        (status, error_code(&payload)),
+        (400, "InvalidParameterException"),
+        "case \"a repeated link to the same profile\": expected a 400 \
+         InvalidParameterException, got {status} with {payload}"
+    );
+    assert_eq!(
+        error_message(&payload),
+        "SourceUser is already linked to DestinationUser",
+        "case \"a repeated link to the same profile\": got {payload}"
     );
     let (status, payload) = disable(&router, &user_pool_id, &source).await;
     assert_eq!(

@@ -348,12 +348,27 @@ async fn an_absent_user_of_a_public_operation_is_refused_as_an_unresolved_pair()
         }
 
         // The same pair through a client that suppresses user-existence errors:
-        // the CODE is the one a wrong credential earns, and the sentence is the
-        // same unresolved-pair sentence.
+        // an operation that REPORTS A DELIVERY answers one, to a simulated
+        // destination, so nothing about the answer tells the caller whether the
+        // account exists; for the operations that report no delivery the CODE is
+        // the one a wrong credential earns, and the sentence is the same
+        // unresolved-pair sentence.
         for (operation, body) in public_requests(&hiding_client, username) {
             let case = format!("{operation} with {name_case}, through the hiding client");
             let (status, payload) =
                 dispatch(&emulator, Addressing::Anonymous, operation, &body).await;
+            if matches!(operation, "ResendConfirmationCode" | "ForgotPassword") {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected a reported delivery, got {status} with {payload}"
+                );
+                assert_eq!(
+                    payload["CodeDeliveryDetails"]["Destination"],
+                    json!("a***@b***"),
+                    "case {case:?}: expected a simulated destination, got {payload}"
+                );
+                continue;
+            }
             assert_eq!(
                 (status, error_code(&payload)),
                 (400, "NotAuthorizedException"),

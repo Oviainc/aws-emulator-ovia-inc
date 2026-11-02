@@ -225,7 +225,41 @@ pub fn completed_challenge_parameters() -> HashMap<String, String> {
     HashMap::new()
 }
 
-/// The `ChallengeParameters` of a `NEW_PASSWORD_REQUIRED` challenge for `username`:
+/// The `ChallengeParameters` of an `MFA_SETUP` challenge for `username`: the user
+/// it is for, and the MFA methods that user can set up to satisfy the pool's MFA
+/// requirement.
+///
+/// `MFA_SETUP` is the challenge for a user that "must set up" a second factor
+/// before a sign-in completes, and its parameters report the methods available to
+/// set up under `MFAS_CAN_SETUP` as a JSON array of the `UserMFASettingList`
+/// values they are reported under — "the possible values in this list are
+/// `SMS_MFA`, `EMAIL_OTP`, and `SOFTWARE_TOKEN_MFA`" (this service's model), which
+/// is the order they are listed in — beside the user the challenge belongs to,
+/// named exactly as every other challenge of these operations names it
+/// ([`new_password_required_challenge_parameters`]).
+///
+/// Both `InitiateAuth` and `AdminInitiateAuth` start this challenge, and both read
+/// its parameters here, so the two cannot report it differently.
+#[must_use]
+pub fn mfa_setup_challenge_parameters(
+    username: &str,
+    settings_can_setup: &[String],
+) -> HashMap<String, String> {
+    let mut parameters = HashMap::new();
+    parameters.insert(USER_ID_FOR_SRP.to_string(), username.to_string());
+    parameters.insert(
+        MFAS_CAN_SETUP.to_string(),
+        ::serde_json::Value::Array(
+            settings_can_setup
+                .iter()
+                .map(|setting| ::serde_json::Value::String(setting.clone()))
+                .collect(),
+        )
+        .to_string(),
+    );
+    parameters
+}
+
 /// the user it is for, the attributes the challenge response must supply, and the
 /// values the user already has.
 ///
@@ -287,6 +321,10 @@ const REQUIRED_ATTRIBUTES: &str = "requiredAttributes";
 /// The `ChallengeParameters` entry carrying the values the user already has.
 const USER_ATTRIBUTES: &str = "userAttributes";
 
+/// The `ChallengeParameters` entry of an `MFA_SETUP` challenge that lists the MFA
+/// methods the user can set up to satisfy the pool's MFA requirement.
+const MFAS_CAN_SETUP: &str = "MFAS_CAN_SETUP";
+
 /// The `ChallengeResponses` key prefix an attribute value is submitted under:
 /// `"userAttributes.[attribute_name]": "[attribute_value]"` (this service's model),
 /// which is how `requiredAttributes` names the attributes it asks for — and how
@@ -314,6 +352,19 @@ pub const USER_ADMIN_SCOPE: &str = "aws.cognito.signin.user.admin";
 /// disagree.
 pub const MISSING_REQUIRED_SCOPES_MESSAGE: &str = "Access Token does not have required scopes";
 
+/// The message a self-service operation owes an access token this emulator issued
+/// and has since REVOKED ([`TokenRejection::Revoked`]).
+///
+/// A sign-out "invalidates the identity, access, and refresh tokens that Amazon
+/// Cognito issued to a user", after which "Amazon Cognito returns an `Access Token
+/// has been revoked` error when your app attempts to authorize a user pools API
+/// request with a revoked access token" (`GlobalSignOut` in this service's model).
+/// It names no value from the request, so every such refusal carries this one
+/// sentence, and it is told apart from the refusal of a value that resolves to no
+/// access token at all: the caller holds a token this service did issue and has
+/// since invalidated.
+pub const ACCESS_TOKEN_REVOKED_MESSAGE: &str = "Access Token has been revoked";
+
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
 const DEFAULT_USER_POOL_TIER: &str = ESSENTIALS_USER_POOL_TIER;
 
@@ -335,6 +386,12 @@ const FEATURE_ENABLED: &str = "ENABLED";
 /// optional" in this service's model). It is also the mode in which no MFA factor
 /// has to be deliverable, which a handler that configures factors asks about.
 pub const MFA_OFF: &str = "OFF";
+
+/// `UserPoolMfaType`'s value for a pool in which "MFA tokens are required for all
+/// user sign-ins" (`MfaConfiguration` in this service's model), which is what
+/// makes a second factor a precondition of completing a sign-in
+/// ([`UserPool::requires_mfa`]).
+pub const MFA_REQUIRED: &str = "ON";
 
 /// Deletion protection is opt-in: "When active, `DeletionProtection` prevents
 /// accidental deletion of your user pool" (this service's model), so a pool that
@@ -467,6 +524,19 @@ pub const ACCOUNT_NOT_LINKED_MESSAGE: &str =
 /// number of federated identities linked to a user is five."
 /// (`AdminLinkProviderForUser` in this service's model).
 pub const MAX_LINKED_PROVIDER_IDENTITIES: usize = 5;
+
+/// The message `AdminLinkProviderForUser`'s `InvalidParameterException` carries
+/// for a `SourceUser` that already carries a link.
+///
+/// A federated identity links to ONE local profile — the operation "links an
+/// existing user account ... to an identity from an external IdP" and the link
+/// is what lets that identity sign in as the profile — so an identity the pool
+/// already holds a link for is not one a further call can link, whichever
+/// destination it names. One fixed sentence that names the two MEMBERS of the
+/// request rather than the provider, the identity or the profile they carried,
+/// so the refusal echoes nothing the caller submitted.
+pub const SOURCE_USER_ALREADY_LINKED_MESSAGE: &str =
+    "SourceUser is already linked to DestinationUser";
 
 /// The message a `TermsExistsException` carries for a `TermsName` the app client
 /// already holds terms documents under.
@@ -1627,8 +1697,15 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             .issued_tokens
             .get(access_token)
             .ok_or(TokenRejection::NotAnAccessToken)?;
-        if !record.is_access_token() || record.revoked {
+        if !record.is_access_token() {
             return Err(TokenRejection::NotAnAccessToken);
+        }
+        // A record this emulator issued and has since REVOKED — a sign-out of its
+        // user, or a revocation of its sign-in lineage — is refused AS revoked,
+        // which is a different answer from the one a value this service cannot
+        // resolve to an access token at all gets.
+        if record.revoked {
+            return Err(TokenRejection::Revoked);
         }
         if record.expires_at <= now {
             return Err(TokenRejection::Expired);
@@ -3421,6 +3498,54 @@ impl UserPool {
         self.user_pool_add_ons
             .as_ref()
             .is_some_and(|add_ons| add_ons.advanced_security_mode != ADVANCED_SECURITY_MODE_OFF)
+    }
+
+    /// Whether this pool requires a second authentication factor from every
+    /// sign-in: `MfaConfiguration` "sets multi-factor authentication (MFA) to be
+    /// on, off, or optional" and [`MFA_REQUIRED`] is the mode in which "MFA
+    /// tokens are required for all user sign-ins" (this service's model). Under
+    /// the optional mode a user that has activated no factor signs in without
+    /// one, so only the required mode makes a factor a precondition.
+    pub fn requires_mfa(&self) -> bool {
+        self.mfa_configuration == MFA_REQUIRED
+    }
+
+    /// The `UserMFASettingList` settings `user` can SET UP as an MFA factor of
+    /// this pool, in the order that member documents its values in.
+    ///
+    /// A method is available to set up when this POOL offers it — `SetUserPoolMfaConfig`
+    /// is what "sets the user pool multi-factor authentication (MFA) and passkey
+    /// configuration" and each of `SmsMfaConfiguration`,
+    /// `EmailMfaConfiguration` and `SoftwareTokenMfaConfiguration` is the
+    /// configuration of one method (this service's model) — and the user has not
+    /// activated it already ([`User::mfa_setting_list`]): a factor the user holds
+    /// is one to present, not one to set up. `SoftwareTokenMfaConfigType` carries
+    /// its own activation state ("the activation state of TOTP MFA"), while the
+    /// SMS and email methods are offered exactly while the pool stores the
+    /// configuration each is delivered through. An email or SMS method is set up
+    /// by verifying the address or number it is delivered to, and the software
+    /// token by registering an authenticator, so neither is filtered on what the
+    /// user holds today.
+    pub fn mfa_settings_available_for_setup(&self, user: &User) -> Vec<String> {
+        [
+            (SMS_MFA_SETTING, self.to_sms_mfa_config().is_some()),
+            (
+                EMAIL_OTP_MFA_SETTING,
+                self.email_mfa_configuration.is_some(),
+            ),
+            (
+                SOFTWARE_TOKEN_MFA_SETTING,
+                self.software_token_mfa_configuration
+                    .as_ref()
+                    .is_some_and(|config| config.enabled),
+            ),
+        ]
+        .into_iter()
+        .filter(|(setting, offered)| {
+            *offered && !user.mfa_setting_list.iter().any(|held| held == setting)
+        })
+        .map(|(setting, _)| setting.to_string())
+        .collect()
     }
 
     /// The modelled view of this pool's MFA and passkey configuration, rendered
@@ -5253,8 +5378,11 @@ pub const DEVICE_REMEMBERED_STATUS: &str = "remembered";
 /// The operation that asked maps each one to a modelled error IT declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenRejection {
-    /// Not a token this emulator issued, not an ACCESS token, or revoked.
+    /// Not a token this emulator issued, or not an ACCESS token.
     NotAnAccessToken,
+    /// An access token this emulator issued and has since revoked, which
+    /// authorizes nothing ([`ACCESS_TOKEN_REVOKED_MESSAGE`]).
+    Revoked,
     /// An access token whose lifetime the clock is past.
     Expired,
     /// A live access token whose scopes do not authorize the user self-service
@@ -7745,6 +7873,32 @@ pub fn masked_destination(destination: &str) -> String {
         })
         .collect()
 }
+
+/// The delivery details a message to a SIMULATED destination is reported with.
+///
+/// `PreventUserExistenceErrors` set to `ENABLED` "suppresses messages that might
+/// indicate a valid user exists" (this service's model): the account-confirmation
+/// and password-recovery operations therefore answer a request naming a user
+/// nobody registered exactly as they answer one naming a user that exists —
+/// reporting a delivery — rather than with a refusal that tells the caller the
+/// account does not exist. Nothing was sent and nothing is stored, so the
+/// destination reported is a SIMULATED one: a fixed masked address, which names
+/// nothing of the request and nothing of this emulator's state, so no two
+/// usernames can be told apart by the answer they get.
+pub fn simulated_code_delivery_details() -> Option<CodeDeliveryDetailsType> {
+    code_delivery_details(SIMULATED_DESTINATION_ATTRIBUTE, SIMULATED_DESTINATION)
+}
+
+/// The attribute a simulated delivery is reported against: an email address is
+/// the destination every pool can address a message to, and the medium it
+/// travels by is the one [`delivery_medium`] maps it to.
+const SIMULATED_DESTINATION_ATTRIBUTE: &str = "email";
+
+/// The address [`simulated_code_delivery_details`] reports, which identifies
+/// nobody: it is reported through the same masking every real destination is
+/// reported through ([`masked_destination`]), so the answer for a user nobody
+/// registered has the shape of the answer for one that exists.
+const SIMULATED_DESTINATION: &str = "a@b";
 
 /// The delivery details for a verification message sent to `value` for
 /// `attribute`, or `None` for an attribute no message is sent for.

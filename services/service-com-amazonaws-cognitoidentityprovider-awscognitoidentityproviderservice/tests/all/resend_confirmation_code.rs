@@ -570,9 +570,9 @@ async fn a_resend_is_refused_for_a_request_it_cannot_serve() {
         (
             "the same, through a client that suppresses user-existence errors",
             Subject::UnknownUserHidden,
-            400,
-            "NotAuthorizedException",
-            USER_NOT_FOUND_MESSAGE.to_string(),
+            200,
+            "",
+            String::new(),
         ),
         (
             "a user whose sign-up is already confirmed",
@@ -675,6 +675,23 @@ async fn a_resend_is_refused_for_a_request_it_cannot_serve() {
         let after = outstanding_code(&engine, &user_pool_id, &username);
 
         if expected_error.is_empty() {
+            if matches!(subject, Subject::UnknownUserHidden) {
+                // A user nobody registered, asked for through a client that
+                // suppresses user-existence errors: the delivery reported is to a
+                // SIMULATED destination, and nothing is stored for a user that
+                // does not exist.
+                assert_eq!(
+                    payload["CodeDeliveryDetails"]["Destination"],
+                    json!("a***@b***"),
+                    "case {case:?}: expected a simulated destination, got {payload}"
+                );
+                assert!(
+                    after.is_none(),
+                    "case {case:?}: no code is minted for a user that does not exist, got \
+                     {after:?}"
+                );
+                continue;
+            }
             // The one served row: the code goes to the stored address, masked.
             assert_eq!(
                 payload["CodeDeliveryDetails"]["Destination"],

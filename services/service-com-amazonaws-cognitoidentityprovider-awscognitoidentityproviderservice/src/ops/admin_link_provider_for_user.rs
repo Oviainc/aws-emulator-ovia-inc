@@ -232,17 +232,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .user_storage_key(&destination_value)
             .ok_or_else(user_not_found)?;
 
-        // A source identity links to ONE local profile, so a second call does
-        // not re-point one already linked elsewhere; linking it to the profile
-        // it already names changes nothing.
-        if let Some(linked_key) = pool.linked_user_key(&source) {
-            if linked_key != destination_key {
-                return Err(invalid_parameter(format!(
-                    "Provider {} user {} is already linked to another user.",
-                    source.provider_name, source.provider_attribute_value
-                )));
-            }
-            return Ok(AdminLinkProviderForUserOutput {});
+        // A source identity links to ONE local profile, so an identity that
+        // already carries a link is refused — whether the request re-points it
+        // at another profile or names the profile it already links to. The
+        // caller deactivates the link it holds ("AdminDisableProviderForUser")
+        // before linking that identity again.
+        if pool.linked_user_key(&source).is_some() {
+            return Err(invalid_parameter(
+                crate::state::SOURCE_USER_ALREADY_LINKED_MESSAGE.to_string(),
+            ));
         }
 
         let user = pool
