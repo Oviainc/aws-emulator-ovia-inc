@@ -535,6 +535,72 @@ impl ComAmazonawsComprehendmedicalComprehendmedical20181030State {
     }
 }
 
+/// The Region a request is scoped to: the one its SigV4 credential scope names, or
+/// [`DEFAULT_REGION`] for a request that carries no scope (an unsigned call).
+///
+/// A job record carries no Region of its own, so the only thing the Region decides here is
+/// which emulated Region the in-process IAM question below is addressed to.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The Region a request with no SigV4 credential scope is scoped to. Matches the Region
+/// the emulator's own generated client config defaults to.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The service principal a `DataAccessRoleArn` has to let assume it: an asynchronous job
+/// reads its input documents and writes its output ACTING AS that role, so the role is
+/// handed to this service and this service is the principal that assumes it.
+pub const DATA_ACCESS_ROLE_SERVICE_PRINCIPAL: &str = "comprehendmedical.amazonaws.com";
+
+/// What a start call reports for a well-formed `DataAccessRoleArn` naming a role this
+/// service cannot assume — the whole sentence, with no variable part: the failure is about
+/// the trust relationship, so the caller is pointed at the documentation that states which
+/// trust policy an asynchronous job's role needs rather than at the value it sent.
+///
+/// The sibling failure — an ARN outside the modelled shape — shares the modelled error
+/// code and is worded by `crate::service::validation`, so the MESSAGE is what tells the two
+/// apart: that one asks the caller to correct the string, this one to re-trust the role.
+pub const DATA_ACCESS_ROLE_NOT_TRUSTED: &str =
+    "The provided IAM role does not trust Comprehend Medical service principle. See: \
+     https://docs.aws.amazon.com/comprehend-medical/latest/dev/textanalysis-batchapi.html#batch-iam";
+
+/// Whether this emulator's own IAM ANSWERED that `role_arn` is a role this service cannot
+/// assume: this account holds no such role, or the trust policy it carries does not admit
+/// [`DATA_ACCESS_ROLE_SERVICE_PRINCIPAL`].
+///
+/// An asynchronous job RUNS AS its `DataAccessRoleArn`, so every start operation resolves
+/// that role before it mints a `JobId` or records anything: a role this service cannot
+/// assume backs no job at all. The whole question — which role of this account the value
+/// names, what IAM answers about it, and whether the trust document it carries admits a
+/// service principal — is the ONE reading every emulated service that resolves a
+/// caller-supplied role shares (`service_common::iam_role::role_is_unassumable`), so this
+/// crate states only WHICH principal has to be admitted and WHICH operations ask.
+///
+/// IAM is reached the way any emulated service reaches another: the AWS SDK over the
+/// emulator's OWN in-process callback
+/// ([`smithy_server_runtime::OperationContext::callback`]), so nothing here opens a socket
+/// or reads an ambient credential. `false` — do not refuse — for every case where nothing
+/// is KNOWN about the role, including a value naming another account's role and an
+/// emulator with no IAM mounted to ask: a refusal has to be grounded in what IAM answered,
+/// never assumed. Awaited with NO store guard held.
+pub async fn data_access_role_is_unassumable(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> bool {
+    ::service_common::iam_role::role_is_unassumable(
+        ctx,
+        region,
+        role_arn,
+        DATA_ACCESS_ROLE_SERVICE_PRINCIPAL,
+    )
+    .await
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

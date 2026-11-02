@@ -9,9 +9,11 @@
 //! [`crate::state::AsyncJob`], the same record every job family keeps, so
 //! `ListPHIDetectionJobs` reports exactly what this call was given.
 //!
-//! The role-resolution refusal AWS gives a well-formed `DataAccessRoleArn` that names
-//! no role that trusts the service is NOT made here; it is the subject of its own open
-//! issue, which also covers `DescribePHIDetectionJob`.
+//! The job RUNS AS the `DataAccessRoleArn` it is given, so that role is resolved against
+//! this account's IAM records BEFORE a `JobId` is minted or anything is recorded: a role
+//! this service cannot assume backs no job, so the submission is refused with the modelled
+//! client error and the store is left exactly as it was (see
+//! [`crate::state::data_access_role_is_unassumable`]).
 //!
 //! ## Shape of an operation
 //!
@@ -168,8 +170,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation needs none of it.
-        let _ = ctx;
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(StartPHIDetectionJobErrorModeled::InternalServerException(
                 InternalServerException {
@@ -178,6 +178,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The job reads its input documents and writes its output ACTING AS the role the
+        // request names, so that role is resolved before anything is minted or stored: a
+        // role this account's IAM holds nothing under, or one whose trust policy does not
+        // let this service assume it, backs no job at all, so the submission is refused
+        // with the modelled client error and NOTHING is persisted — which is what keeps a
+        // refused submission out of the describe and list operations.
+        //
+        // The question is put to the emulator's OWN IAM over its OWN in-process callback
+        // (see [`crate::state::data_access_role_is_unassumable`]), awaited before the store
+        // is locked, and only what IAM ANSWERED is refused, so an emulator with no IAM to
+        // ask refuses nothing.
+        let region = crate::state::request_region(ctx);
+        if crate::state::data_access_role_is_unassumable(ctx, &region, &input.data_access_role_arn)
+            .await
+        {
+            return Err(StartPHIDetectionJobErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::DATA_ACCESS_ROLE_NOT_TRUSTED.to_string()),
+                },
+            )
+            .into());
+        }
+
         let now = crate::state::now_epoch_secs();
         let mut state = store.lock();
         state.expire_jobs(now);
