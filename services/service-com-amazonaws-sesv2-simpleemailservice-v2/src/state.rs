@@ -4917,6 +4917,9 @@ pub const EXPORT_JOBS_PAGE_TOKEN_TAG: &str = "sesv2:export-jobs:";
 /// The tag `ListRecommendations`'s own tokens carry.
 pub const RECOMMENDATIONS_PAGE_TOKEN_TAG: &str = "sesv2:recommendations:";
 
+/// The tag `ListConfigurationSets`'s own tokens carry.
+pub const CONFIGURATION_SETS_PAGE_TOKEN_TAG: &str = "sesv2:configuration-sets:";
+
 /// Encode a `NextToken` that resumes the listing tagged `tag` after `last_returned`.
 ///
 /// The token is opaque to the caller: it is the listing's tag and the last key

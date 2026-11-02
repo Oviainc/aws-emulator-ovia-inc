@@ -61,7 +61,7 @@
 //! [`service_common::response_media_type`]'s; [`RESPONSE_MEDIA_TYPE`] is this service's
 //! own pair and [`announced`] applies it under the condition above. The seams it is
 //! applied at are `override_operation` (every routed request, including the responses the
-//! framework renders inside the request walk), the `ListEmailIdentities` wire route this
+//! framework renders inside the request walk), the collection-listing wire routes this
 //! file serves itself, and `override_routing_error`.
 //!
 //! Two responses keep the protocol-implied value because no seam that reaches them is
@@ -84,9 +84,6 @@ pub mod wire;
 /// a host-addressed request resolves to, beside the SigV4 signing name (`ses`) the
 /// generated identity carries.
 pub const ENDPOINT_PREFIX: &str = "email";
-
-/// The routing key the generated table holds `ListEmailIdentities` under.
-const LIST_EMAIL_IDENTITIES: &str = "ListEmailIdentities";
 
 /// The media type the `restJson1` protocol trait this service's model declares implies,
 /// which the framework's renderers stamp on every response — the one value
@@ -177,30 +174,25 @@ impl ErasedOperation for AnnouncedMediaTypeRoute {
     }
 }
 
-/// The method and URI every AWS SDK, and the CLI, sends `ListEmailIdentities` on.
+/// The method every AWS SDK, and the CLI, sends a paged listing of a collection on.
 ///
-/// The checked-in model binds the operation to `POST /v2/email/list-identities`; the
-/// wire form the service answers is a GET over the identity collection, with the
-/// paging members in the query string. Both are served: the modelled route through
-/// the generated routing table, this one through [`SdkListIdentitiesRoute`].
-const SDK_LIST_IDENTITIES_METHOD: &str = "GET";
+/// The checked-in model binds such a listing to a POST on a route of its own (`POST
+/// /v2/email/list-identities`, `POST /v2/email/list-configuration-sets`); the wire form
+/// the service answers is a GET over the collection itself, with the paging members in
+/// the query string. Both are served: the modelled route through the generated routing
+/// table, this one through [`SdkCollectionListingRoute`].
+const SDK_LISTING_METHOD: &str = "GET";
 
-/// The path segments of that URI, as [`request_path`] splits a request's own.
-const SDK_LIST_IDENTITIES_SEGMENTS: [&str; 3] = ["v2", "email", "identities"];
-
-/// The modelled route the adapted request is dispatched on.
-const MODELLED_LIST_IDENTITIES_URI: &str = "/v2/email/list-identities";
-
-/// `ListEmailIdentities`' paging members, which the GET form carries in the query
-/// string under these names and the modelled route carries in the request body.
+/// The paging members a listing's GET form carries in the query string under these
+/// names and its modelled route carries in the request body.
 ///
 /// `Filter` is not among them: the GET form has no query binding for a map, so a
 /// filtered listing is the modelled route's own.
-const LIST_IDENTITIES_QUERY_MEMBERS: [&str; 2] = ["NextToken", "PageSize"];
+const LISTING_QUERY_MEMBERS: [&str; 2] = ["NextToken", "PageSize"];
 
-/// Serves `GET /v2/email/identities` — the wire form of `ListEmailIdentities` real
-/// clients send — by running the modelled operation against the same request
-/// restated on the route the model binds.
+/// Serves the GET-over-the-collection wire form of a paged listing — the form real
+/// clients send — by running the modelled operation against the same request restated
+/// on the route the model binds.
 ///
 /// The paging members are the only difference between the two forms: the GET carries
 /// `NextToken` and `PageSize` in the query string, the modelled route carries them in
@@ -211,10 +203,76 @@ const LIST_IDENTITIES_QUERY_MEMBERS: [&str; 2] = ["NextToken", "PageSize"];
 /// Only the DISPATCHED request is restated; the [`OperationContext`] still carries the
 /// parts the client sent, so a handler reading the URI off `ctx` sees the original
 /// target.
-#[derive(Debug, Default)]
-struct SdkListIdentitiesRoute;
+#[derive(Debug)]
+struct SdkCollectionListingRoute {
+    /// The key the generated routing table holds the modelled operation under.
+    operation: &'static str,
+    /// The path segments of the collection the GET form addresses, as
+    /// [`request_segments`] splits a request's own.
+    segments: &'static [&'static str],
+    /// The URI of the modelled route the adapted request is dispatched on.
+    modelled_uri: &'static str,
+}
 
-impl ErasedOperation for SdkListIdentitiesRoute {
+impl SdkCollectionListingRoute {
+    /// Whether `req` is the GET form this route serves.
+    fn claims(&self, req: &RtRequest) -> bool {
+        req.method() == SDK_LISTING_METHOD && request_segments(req.uri()) == self.segments
+    }
+
+    /// The same request on the route the model binds: a POST to
+    /// [`Self::modelled_uri`] whose body carries the paging members the GET form sent
+    /// in its query string.
+    ///
+    /// `None` when the request cannot be restated — its target did not parse, or the
+    /// runtime API rejected the route — which the caller answers as the framework's own
+    /// "named no modelled operation" rather than serving the operation a request it
+    /// never received.
+    fn on_modelled_route(&self, req: &RtRequest) -> Option<RtRequest> {
+        let query = req
+            .uri()
+            .parse::<http::Uri>()
+            .ok()?
+            .query()
+            .unwrap_or_default()
+            .to_string();
+        let mut members = serde_json::Map::new();
+        for member in LISTING_QUERY_MEMBERS {
+            if let Some(value) = query_value(&query, member) {
+                // `PageSize` is modelled as an integer and `NextToken` as a string: a
+                // query string carries both as text, so a value that reads as a whole
+                // number is restated as one and anything else is restated verbatim, for
+                // the deserializer to accept or refuse exactly as it would on the
+                // modelled route.
+                let restated = match value.parse::<i64>() {
+                    Ok(number) => serde_json::Value::from(number),
+                    Err(_) => serde_json::Value::String(value),
+                };
+                members.insert(member.to_string(), restated);
+            }
+        }
+        let body = serde_json::Value::Object(members).to_string();
+
+        let mut out = RtRequest::new(aws_smithy_types::body::SdkBody::from(body));
+        out.set_uri(self.modelled_uri).ok()?;
+        out.set_method("POST").ok()?;
+        for (name, value) in req.headers().iter() {
+            // The body is this method's own, so the headers describing the one the
+            // client sent are not carried over; everything else is kept, as the
+            // router's own request rebuild keeps it.
+            if name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("content-type")
+            {
+                continue;
+            }
+            out.headers_mut().append(name.to_string(), value.to_string());
+        }
+        out.headers_mut().append("content-type", "application/json");
+        Some(out)
+    }
+}
+
+impl ErasedOperation for SdkCollectionListingRoute {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -225,8 +283,8 @@ impl ErasedOperation for SdkListIdentitiesRoute {
             let routed = svc
                 .definition()
                 .routing_table()
-                .get(LIST_EMAIL_IDENTITIES)
-                .and_then(|operation| Some((operation, on_modelled_route(req)?)));
+                .get(self.operation)
+                .and_then(|operation| Some((operation, self.on_modelled_route(req)?)));
             let answered = match routed {
                 Some((operation, adapted)) => operation.run(svc, &adapted, ctx).await,
                 // The request could not be restated, so nothing modelled answers it
@@ -241,54 +299,25 @@ impl ErasedOperation for SdkListIdentitiesRoute {
     }
 }
 
-/// The same `ListEmailIdentities` request on the route the model binds: a POST to
-/// [`MODELLED_LIST_IDENTITIES_URI`] whose body carries the paging members the GET
-/// form sent in its query string.
+/// Every listing this service serves on the GET-over-the-collection form as well as on
+/// the route its model binds.
 ///
-/// `None` when the request cannot be restated — its target did not parse, or the
-/// runtime API rejected the route — which the caller answers as the framework's own
-/// "named no modelled operation" rather than serving the operation a request it never
-/// received.
-fn on_modelled_route(req: &RtRequest) -> Option<RtRequest> {
-    let query = req
-        .uri()
-        .parse::<http::Uri>()
-        .ok()?
-        .query()
-        .unwrap_or_default()
-        .to_string();
-    let mut members = serde_json::Map::new();
-    for member in LIST_IDENTITIES_QUERY_MEMBERS {
-        if let Some(value) = query_value(&query, member) {
-            // `PageSize` is modelled as an integer and `NextToken` as a string: a
-            // query string carries both as text, so a value that reads as a whole
-            // number is restated as one and anything else is restated verbatim, for
-            // the deserializer to accept or refuse exactly as it would on the
-            // modelled route.
-            let restated = match value.parse::<i64>() {
-                Ok(number) => serde_json::Value::from(number),
-                Err(_) => serde_json::Value::String(value),
-            };
-            members.insert(member.to_string(), restated);
-        }
-    }
-    let body = serde_json::Value::Object(members).to_string();
-
-    let mut out = RtRequest::new(aws_smithy_types::body::SdkBody::from(body));
-    out.set_uri(MODELLED_LIST_IDENTITIES_URI).ok()?;
-    out.set_method("POST").ok()?;
-    for (name, value) in req.headers().iter() {
-        // The body is this function's own, so the headers describing the one the
-        // client sent are not carried over; everything else is kept, as the router's
-        // own request rebuild keeps it.
-        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("content-type") {
-            continue;
-        }
-        out.headers_mut().append(name.to_string(), value.to_string());
-    }
-    out.headers_mut().append("content-type", "application/json");
-    Some(out)
-}
+/// One row per operation whose modelled route the model puts beside the collection
+/// rather than on it: `ListEmailIdentities` (`POST /v2/email/list-identities`, the GET
+/// form over `/v2/email/identities`) and `ListConfigurationSets` (`POST
+/// /v2/email/list-configuration-sets`, the GET form over `/v2/email/configuration-sets`).
+const SDK_COLLECTION_LISTINGS: [SdkCollectionListingRoute; 2] = [
+    SdkCollectionListingRoute {
+        operation: "ListEmailIdentities",
+        segments: &["v2", "email", "identities"],
+        modelled_uri: "/v2/email/list-identities",
+    },
+    SdkCollectionListingRoute {
+        operation: "ListConfigurationSets",
+        segments: &["v2", "email", "configuration-sets"],
+        modelled_uri: "/v2/email/list-configuration-sets",
+    },
+];
 
 /// The value of the query parameter `name`, percent-decoded, or `None` when the query
 /// string does not carry it.
@@ -333,9 +362,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// document of [`wire`]. Built once here because [`Service::override_protocol`]
     /// hands back a borrow of it.
     protocol: wire::NullMessageRestJson,
-    /// Serves `ListEmailIdentities` on the method and URI real clients send it on;
-    /// [`Service::override_operation`] hands such a request to it.
-    sdk_list_identities_route: SdkListIdentitiesRoute,
+    /// Serves each listing of [`SDK_COLLECTION_LISTINGS`] on the method and URI real
+    /// clients send it on; [`Service::override_operation`] hands such a request to the
+    /// row that claims it.
+    sdk_collection_listings: [SdkCollectionListingRoute; 2],
     /// The wrapper every routable request is served through, so the media type this
     /// service announces is on the responses the framework renders inside the request
     /// walk too. Held in a field because [`Service::override_operation`] hands back a
@@ -351,7 +381,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             protocol: wire::NullMessageRestJson::new(),
-            sdk_list_identities_route: SdkListIdentitiesRoute,
+            sdk_collection_listings: SDK_COLLECTION_LISTINGS,
             media_type: AnnouncedMediaTypeRoute,
         }
     }
@@ -400,18 +430,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if service_common::response_media_type::routes(&self.entry, req) {
             return Some(&self.media_type);
         }
-        // What it cannot: `ListEmailIdentities`. The checked-in model binds it to
-        // `POST /v2/email/list-identities`, while the wire form the service answers —
-        // the one every AWS SDK and the CLI send, and the only one a paginator can
-        // follow — is a GET over the identity collection with the paging members in
-        // the query string. The route table resolves that request to no operation at
-        // all, so it is claimed here and served by the modelled operation itself.
-        if req.method() == SDK_LIST_IDENTITIES_METHOD
-            && request_segments(req.uri()) == SDK_LIST_IDENTITIES_SEGMENTS
-        {
-            return Some(&self.sdk_list_identities_route);
-        }
-        None
+        // What it cannot: the listings of `SDK_COLLECTION_LISTINGS`. The checked-in
+        // model binds each of them to a POST on a route beside the collection, while
+        // the wire form the service answers — the one every AWS SDK and the CLI send,
+        // and the only one a paginator can follow — is a GET over the collection with
+        // the paging members in the query string. The route table resolves such a
+        // request to no operation at all, so it is claimed here and served by the
+        // modelled operation itself.
+        self.sdk_collection_listings
+            .iter()
+            .find(|listing| listing.claims(req))
+            .map(|listing| listing as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

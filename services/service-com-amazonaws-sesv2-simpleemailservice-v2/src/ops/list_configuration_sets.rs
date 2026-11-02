@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurationSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurationSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurationSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the names of the configuration sets the account holds, in name order,
+//! narrowed by the request's filter and windowed by its `PageSize`. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +146,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurationSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurationSets"))
+        // The listing covers the account's whole configuration-set table, so no request
+        // metadata is needed — the same reading the rest of this surface takes.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListConfigurationSets without the shared emulator state",
+            ));
+        };
+
+        let filter = ConfigurationSetFilter::from_request(input.filter.unwrap_or_default())?;
+
+        // "The number of results to show in a single call": `PageSize` targets
+        // `MaxItems`, on which the model puts no bound, so only a positive count
+        // truncates a page; a non-positive one is read as no truncation, which keeps a
+        // caller that sends 0 from being stuck on an empty page forever. The same
+        // reading as this service's other listings.
+        let page_size = usize::try_from(input.page_size.unwrap_or_default())
+            .ok()
+            .filter(|size| *size > 0);
+
+        // The token is this operation's own: it names the last set the previous page
+        // reported, so the next page resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(
+                    crate::state::CONFIGURATION_SETS_PAGE_TOKEN_TAG,
+                    token,
+                )
+                .ok_or_else(|| bad_request(crate::state::invalid_next_token()))?,
+            ),
+        };
+
+        // Reporting only: nothing here writes, so a read leaves every later caller
+        // seeing exactly what it saw.
+        let matching: Vec<String> = {
+            let store = state.lock();
+            // The table is keyed by `ConfigurationSetName`, so it enumerates in name
+            // order whatever order the sets were created in; the filter narrows the
+            // sequence a page is a window over, so a token is a position in the NARROWED
+            // listing.
+            store
+                .configuration_sets
+                .values()
+                .map(|record| record.name.clone())
+                .filter(|name| filter.matches(name))
+                .collect()
+        };
+
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => matching.partition_point(|name| name.as_str() <= last),
+        };
+        let remaining = &matching[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+        // A token only when sets remain behind this page, so a walk terminates.
+        let next_token = page.last().filter(|_| page.len() < remaining.len()).map(|name| {
+            crate::state::encode_tagged_page_token(
+                crate::state::CONFIGURATION_SETS_PAGE_TOKEN_TAG,
+                name,
+            )
+        });
+
+        Ok(ListConfigurationSetsOutput {
+            configuration_sets: Some(page.to_vec()),
+            next_token,
+        })
     }
+}
+
+/// The `ConfigurationSetFilter` a request carried, resolved to what it constrains.
+///
+/// `ConfigurationSetFilterKey` names one key and it constrains the name of a listed
+/// set: `CONFIGURATION_SET_NAME_CONTAINS` a substring of it. A filter naming no key
+/// narrows nothing. The key set is the generated
+/// [`CONFIGURATION_SET_FILTER_KEY_VALUES`], so it cannot drift from the model.
+#[derive(Debug, Default)]
+struct ConfigurationSetFilter {
+    /// `CONFIGURATION_SET_NAME_CONTAINS`: any substring of a `ConfigurationSetName`,
+    /// whose only constraint is the modelled length of a filter value.
+    name_contains: Option<String>,
+}
+
+impl ConfigurationSetFilter {
+    /// Read the filter map, refusing a key the enum does not name.
+    ///
+    /// The filter arrives as a map of plain strings, so the key is the handler's to
+    /// check: the modelled constraints a boundary validator can enforce are already
+    /// enforced by the time this runs, and an enum member is not one of them. Read in
+    /// key order, so a filter naming several unmodelled keys is refused the same way
+    /// every time.
+    fn from_request(
+        filter: ::std::collections::HashMap<String, String>,
+    ) -> Result<Self, ListConfigurationSetsError> {
+        let mut entries: Vec<(String, String)> = filter.into_iter().collect();
+        entries.sort();
+        let mut resolved = Self::default();
+        for (key, value) in entries {
+            let key = crate::state::modelled_enum_value(
+                "Filter key",
+                key,
+                CONFIGURATION_SET_FILTER_KEY_VALUES,
+            )
+            .map_err(bad_request)?;
+            match key.as_str() {
+                // The only key the check above leaves, which filters on a free-form
+                // substring. Named rather than taken as a fallthrough, so a key added
+                // to the enum without a branch here is a visible gap instead of a
+                // silent name filter.
+                "CONFIGURATION_SET_NAME_CONTAINS" => resolved.name_contains = Some(value),
+                other => {
+                    return Err(bad_request(format!(
+                        "Filter key {other} is not one of {}.",
+                        CONFIGURATION_SET_FILTER_KEY_VALUES.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Whether the set named `name` satisfies every key this filter named.
+    fn matches(&self, name: &str) -> bool {
+        self.name_contains
+            .as_deref()
+            .is_none_or(|needle| name.contains(needle))
+    }
+}
+
+/// Refuse the request with this operation's input error.
+fn bad_request(message: impl Into<String>) -> ListConfigurationSetsError {
+    ListConfigurationSetsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
