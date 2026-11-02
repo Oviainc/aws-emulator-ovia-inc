@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.byodkim-external-signing-attributes-rejected
+Issue-Trace-Ids: sesv2.byodkim-external-signing-attributes-rejected
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
-Issue-Key: ses.byodkim-external-signing-attributes-rejected|run#13|AssertionError|assert code_key == 'BadRequestException', (
+Issue-Key: sesv2.byodkim-external-signing-attributes-rejected|run#13|AssertionError|assert code_key == 'BadRequestException', (
 Issue-Commit: ca265ed85df5a1b6b7b5ff6c2c813551ab1096d8
 
 # Implement ses PutEmailIdentityDkimSigningAttributes: unimplemented scaffold stub

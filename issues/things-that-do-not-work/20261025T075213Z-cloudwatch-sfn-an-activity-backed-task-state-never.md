@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__sfn.metrics-states-stream-late-activity-result-rejected-after-task-timeout-and-only-timed-out-moves
-Issue-Key: cloudwatch__sfn.metrics-states-stream-late-activity-result-rejected-after-task-timeout-and-only-timed-out-moves|_poll#29|Timeout|time.sleep(_POLL_S)
+Issue-Trace-Ids: cloudwatch__stepfunctions.metrics-states-stream-late-activity-result-rejected-after-task-timeout-and-only-timed-out-moves
+Issue-Key: cloudwatch__stepfunctions.metrics-states-stream-late-activity-result-rejected-after-task-timeout-and-only-timed-out-moves|_poll#29|Timeout|time.sleep(_POLL_S)
 Issue-Commit: 62a489da4fc45e0eadb1189eb41434873a830e66
 
 # cloudwatch__sfn: an activity-backed Task state never delivers a task to GetActivityTask, so task-timeout refusal and the AWS/States activity counters cannot be observed (1 cause)

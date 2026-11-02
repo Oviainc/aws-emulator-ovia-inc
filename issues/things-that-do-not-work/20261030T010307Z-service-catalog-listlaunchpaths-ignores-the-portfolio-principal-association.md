@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: service-catalog.launch-path-requires-product-and-principal-association
+Issue-Trace-Ids: servicecatalog.launch-path-requires-product-and-principal-association
 Issue-Shape-Id: com.amazonaws.servicecatalog#AWS242ServiceCatalogService
-Issue-Key: service-catalog.launch-path-requires-product-and-principal-association|run#17|AssertionError|assert still == [], (
+Issue-Key: servicecatalog.launch-path-requires-product-and-principal-association|run#17|AssertionError|assert still == [], (
 Issue-Commit: d5912a3a34a2e2faa23a606635408f9fea83c969
 
 # service-catalog ListLaunchPaths ignores the portfolio-principal association: a product becomes launchable on the product association alone

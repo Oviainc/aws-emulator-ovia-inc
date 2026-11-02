@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: kms__resource-groups-tagging-api.key-tags-visible-through-get-resources-both-directions
-Issue-Key: kms__resource-groups-tagging-api|TagResource|NotImplemented
+Issue-Trace-Ids: kms__resourcegroupstaggingapi.key-tags-visible-through-get-resources-both-directions
+Issue-Key: kms__resourcegroupstaggingapi|TagResource|NotImplemented
 Issue-Commit: 5ef273b5ec187d9b55db2ccfdad00816d8c5c39a
 
 # Implement kms TagResource: the operation answers NotImplemented, so no KMS key can be tagged natively

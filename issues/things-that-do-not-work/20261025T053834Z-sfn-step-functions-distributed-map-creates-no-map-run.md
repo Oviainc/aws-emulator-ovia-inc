@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: s3__sfn.sfn-redrive-of-a-partly-failed-map-run-reruns-only-the-failed-items
-Issue-Key: s3__sfn.sfn-redrive-of-a-partly-failed-map-run-reruns-only-the-failed-items|_one_map_run#10|AssertionError|assert len(runs) == 1, f"expected exactly one map run for {exec_arn!r}, got {runs!r}"
+Issue-Trace-Ids: s3__stepfunctions.sfn-redrive-of-a-partly-failed-map-run-reruns-only-the-failed-items
+Issue-Key: s3__stepfunctions.sfn-redrive-of-a-partly-failed-map-run-reruns-only-the-failed-items|_one_map_run#10|AssertionError|assert len(runs) == 1, f"expected exactly one map run for {exec_arn!r}, got {runs!r}"
 Issue-Commit: 67bdaa95f371a43447a945b4dd8bda66772a6b0f
 
 # Step Functions Distributed Map creates no map run: ListMapRuns answers empty for an execution containing a Distributed Map state, so a redrive cannot be targeted or observed

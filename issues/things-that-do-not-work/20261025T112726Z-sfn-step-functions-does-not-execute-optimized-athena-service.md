@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: athena__s3__sfn.xsvc-sfn-1-athena-sync-succeeds-only-after-the-query-completes athena__s3__sfn.xsvc-sfn-1-athena-sync-without-get-query-execution-is-denied
-Issue-Key: athena__s3__sfn.xsvc-sfn-1-athena-sync-succeeds-only-after-the-query-completes|run#11|AssertionError|assert exe["status"] == "SUCCEEDED", (
-Issue-Key: athena__s3__sfn.xsvc-sfn-1-athena-sync-without-get-query-execution-is-denied|run#12|AssertionError|assert good["status"] == "SUCCEEDED", (
+Issue-Trace-Ids: athena__s3__stepfunctions.xsvc-sfn-1-athena-sync-succeeds-only-after-the-query-completes athena__s3__stepfunctions.xsvc-sfn-1-athena-sync-without-get-query-execution-is-denied
+Issue-Key: athena__s3__stepfunctions.xsvc-sfn-1-athena-sync-succeeds-only-after-the-query-completes|run#11|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: athena__s3__stepfunctions.xsvc-sfn-1-athena-sync-without-get-query-execution-is-denied|run#12|AssertionError|assert good["status"] == "SUCCEEDED", (
 Issue-Commit: ec04c0da7dcd461e0ce3efb10993d5c9331936ba
 
 # Step Functions does not execute optimized Athena service integrations: a startQueryExecution.sync Task fails the execution with States.Runtime instead of running and polling the query (1 cause)

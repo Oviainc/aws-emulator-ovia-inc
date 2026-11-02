@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: iot__dynamodb.topic-rule-dynamodbv2-action-missing-put-item-permission-rejected
-Issue-Key: iot__dynamodb.topic-rule-dynamodbv2-action-missing-put-item-permission-rejected|_publish_until_written#24|Timeout|time.sleep(2)
+Issue-Trace-Ids: dynamodb__iot.topic-rule-dynamodbv2-action-missing-put-item-permission-rejected
+Issue-Key: dynamodb__iot.topic-rule-dynamodbv2-action-missing-put-item-permission-rejected|_publish_until_written#24|Timeout|time.sleep(2)
 Issue-Commit: c17c6e54c038586d9d6328bb68b9d1b3d6bcf360
 
 # iot__dynamodb: a topic rule whose dynamoDBv2 action lacks dynamodb:PutItem never executes, so the permission-denied contract is unobservable and the check hangs to the 60 s cap (1 cause)

@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudtrail__sfn.obs-sfn-2-lookup-events-audits-start-execution-and-a-rejected-describe-state-machine cloudtrail__sfn.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added
-Issue-Key: cloudtrail__sfn.obs-sfn-2-lookup-events-audits-start-execution-and-a-rejected-describe-state-machine|run#40|Timeout|time.sleep(_POLL_INTERVAL_S)
-Issue-Key: cloudtrail__sfn.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added|run#25|Timeout|time.sleep(_POLL_INTERVAL_S)
+Issue-Trace-Ids: cloudtrail__stepfunctions.obs-sfn-2-lookup-events-audits-start-execution-and-a-rejected-describe-state-machine cloudtrail__stepfunctions.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added
+Issue-Key: cloudtrail__stepfunctions.obs-sfn-2-lookup-events-audits-start-execution-and-a-rejected-describe-state-machine|run#40|Timeout|time.sleep(_POLL_INTERVAL_S)
+Issue-Key: cloudtrail__stepfunctions.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added|run#25|Timeout|time.sleep(_POLL_INTERVAL_S)
 Issue-Commit: ebfe4f059696b431f00c6abb397dd11b94b7073a
 
 # CloudTrail never records Step Functions (states.amazonaws.com) calls: LookupEvents has no StartExecution/DescribeStateMachine record and a StateMachine data selector delivers no StartSyncExecution log file

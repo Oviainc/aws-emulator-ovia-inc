@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: service-catalog.launch-constraint-role-governs-plan-execution service-catalog.provision-invalid-template-parameter-fails-asynchronously
+Issue-Trace-Ids: servicecatalog.launch-constraint-role-governs-plan-execution servicecatalog.provision-invalid-template-parameter-fails-asynchronously
 Issue-Shape-Id: com.amazonaws.servicecatalog#AWS242ServiceCatalogService
 Issue-Key: service-catalog|DescribeProvisioningParameters|NotImplemented
 Issue-Commit: d5912a3a34a2e2faa23a606635408f9fea83c969

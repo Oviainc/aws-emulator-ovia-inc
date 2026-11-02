@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__glue__lambda__logs__s3__sfn.cdk-bootstrapped-sfn-etl-workflow
-Issue-Key: cloudwatch__glue__lambda__logs__s3__sfn.cdk-bootstrapped-sfn-etl-workflow|verdict#19|AssertionError|raise AssertionError(self._summary(leg, evidence))
+Issue-Trace-Ids: cloudwatch__glue__lambda__logs__s3__stepfunctions.cdk-bootstrapped-sfn-etl-workflow
+Issue-Key: cloudwatch__glue__lambda__logs__s3__stepfunctions.cdk-bootstrapped-sfn-etl-workflow|verdict#19|AssertionError|raise AssertionError(self._summary(leg, evidence))
 Issue-Commit: 48b00a2ec8a92094223b124c2e7d5eacc8c9104d
 
 # cloudwatch__glue__lambda__logs__s3__sfn: a CDK-deployed stack's StateMachineArn output resolves to a synthesized logical name, not the state machine ARN, so sfn:StartExecution refuses it with InvalidArn (1 cause)

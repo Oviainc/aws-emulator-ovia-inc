@@ -1,22 +1,22 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lambda__s3__sfn.sfn-invokes-lambda-via-task-positive lambda__s3__sfn.sfn-task-lambda-passes-input-output lambda__s3__sfn.sfn-pipeline-lambda-writes-s3 lambda__s3__sfn.sfn-map-state-parallel-lambda-invocations lambda__s3__sfn.sfn-express-workflow-lambda-sync-positive lambda__s3__sfn.sfn-catch-lambda-error-and-write-s3 lambda__s3__sfn.sfn-task-lambda-missing-invoke-permission-negative lambda__s3__sfn.sfn-task-nonexistent-lambda-arn-negative lambda__s3__sfn.s3-notification-triggers-lambda-positive lambda__s3__sfn.s3-notification-payload-format-preserved lambda__s3__sfn.s3-event-filter-prefix-negative lambda__s3__sfn.s3-trigger-lambda-starts-sfn-pipeline lambda__s3__sfn.sfn-pipeline-lambda-broken-s3-permission-negative lambda__s3__sfn.s3-notification-missing-invoke-permission-negative lambda__s3__sfn.cfn-deploy-s3-notification-to-lambda-positive
-Issue-Key: lambda__s3__sfn.sfn-invokes-lambda-via-task-positive|run#20|AssertionError|assert result["status"] == "SUCCEEDED", (
-Issue-Key: lambda__s3__sfn.sfn-task-lambda-passes-input-output|run#22|AssertionError|assert result["status"] == "SUCCEEDED", (
-Issue-Key: lambda__s3__sfn.sfn-pipeline-lambda-writes-s3|run#22|AssertionError|assert result["status"] == "SUCCEEDED", (
-Issue-Key: lambda__s3__sfn.sfn-map-state-parallel-lambda-invocations|run#20|AssertionError|assert result["status"] == "SUCCEEDED", (
-Issue-Key: lambda__s3__sfn.sfn-express-workflow-lambda-sync-positive|run#22|AssertionError|assert sync_resp["status"] == "SUCCEEDED", (
-Issue-Key: lambda__s3__sfn.sfn-catch-lambda-error-and-write-s3|run#25|AssertionError|assert result["status"] == "SUCCEEDED", (
-Issue-Key: lambda__s3__sfn.sfn-task-lambda-missing-invoke-permission-negative|run#24|AssertionError|assert positive["status"] == "SUCCEEDED", (
-Issue-Key: lambda__s3__sfn.sfn-task-nonexistent-lambda-arn-negative|run#13|AssertionError|assert positive_result["status"] == "SUCCEEDED", (
-Issue-Key: lambda__s3__sfn.s3-notification-triggers-lambda-positive|_poll_until#12|Timeout|time.sleep(interval_s)
-Issue-Key: lambda__s3__sfn.s3-notification-payload-format-preserved|_poll_until#13|Timeout|time.sleep(interval_s)
-Issue-Key: lambda__s3__sfn.s3-event-filter-prefix-negative|_poll_until#15|Timeout|time.sleep(interval_s)
-Issue-Key: lambda__s3__sfn.s3-trigger-lambda-starts-sfn-pipeline|_poll_until#23|Timeout|time.sleep(interval_s)
-Issue-Key: lambda__s3__sfn.sfn-pipeline-lambda-broken-s3-permission-negative|_run_until#26|Timeout|time.sleep(backoff_s)
-Issue-Key: lambda__s3__sfn.s3-notification-missing-invoke-permission-negative|_error_code#9|AssertionError|raise AssertionError(
-Issue-Key: lambda__s3__sfn.cfn-deploy-s3-notification-to-lambda-positive|_deploy_cfn#4|AssertionError|raise AssertionError(f"Stack {name} ended in {stack['StackStatus']}")
+Issue-Trace-Ids: lambda__s3__stepfunctions.sfn-invokes-lambda-via-task-positive lambda__s3__stepfunctions.sfn-task-lambda-passes-input-output lambda__s3__stepfunctions.sfn-pipeline-lambda-writes-s3 lambda__s3__stepfunctions.sfn-map-state-parallel-lambda-invocations lambda__s3__stepfunctions.sfn-express-workflow-lambda-sync-positive lambda__s3__stepfunctions.sfn-catch-lambda-error-and-write-s3 lambda__s3__stepfunctions.sfn-task-lambda-missing-invoke-permission-negative lambda__s3__stepfunctions.sfn-task-nonexistent-lambda-arn-negative lambda__s3__stepfunctions.s3-notification-triggers-lambda-positive lambda__s3__stepfunctions.s3-notification-payload-format-preserved lambda__s3__stepfunctions.s3-event-filter-prefix-negative lambda__s3__stepfunctions.s3-trigger-lambda-starts-sfn-pipeline lambda__s3__stepfunctions.sfn-pipeline-lambda-broken-s3-permission-negative lambda__s3__stepfunctions.s3-notification-missing-invoke-permission-negative lambda__s3__stepfunctions.cfn-deploy-s3-notification-to-lambda-positive
+Issue-Key: lambda__s3__stepfunctions.sfn-invokes-lambda-via-task-positive|run#20|AssertionError|assert result["status"] == "SUCCEEDED", (
+Issue-Key: lambda__s3__stepfunctions.sfn-task-lambda-passes-input-output|run#22|AssertionError|assert result["status"] == "SUCCEEDED", (
+Issue-Key: lambda__s3__stepfunctions.sfn-pipeline-lambda-writes-s3|run#22|AssertionError|assert result["status"] == "SUCCEEDED", (
+Issue-Key: lambda__s3__stepfunctions.sfn-map-state-parallel-lambda-invocations|run#20|AssertionError|assert result["status"] == "SUCCEEDED", (
+Issue-Key: lambda__s3__stepfunctions.sfn-express-workflow-lambda-sync-positive|run#22|AssertionError|assert sync_resp["status"] == "SUCCEEDED", (
+Issue-Key: lambda__s3__stepfunctions.sfn-catch-lambda-error-and-write-s3|run#25|AssertionError|assert result["status"] == "SUCCEEDED", (
+Issue-Key: lambda__s3__stepfunctions.sfn-task-lambda-missing-invoke-permission-negative|run#24|AssertionError|assert positive["status"] == "SUCCEEDED", (
+Issue-Key: lambda__s3__stepfunctions.sfn-task-nonexistent-lambda-arn-negative|run#13|AssertionError|assert positive_result["status"] == "SUCCEEDED", (
+Issue-Key: lambda__s3__stepfunctions.s3-notification-triggers-lambda-positive|_poll_until#12|Timeout|time.sleep(interval_s)
+Issue-Key: lambda__s3__stepfunctions.s3-notification-payload-format-preserved|_poll_until#13|Timeout|time.sleep(interval_s)
+Issue-Key: lambda__s3__stepfunctions.s3-event-filter-prefix-negative|_poll_until#15|Timeout|time.sleep(interval_s)
+Issue-Key: lambda__s3__stepfunctions.s3-trigger-lambda-starts-sfn-pipeline|_poll_until#23|Timeout|time.sleep(interval_s)
+Issue-Key: lambda__s3__stepfunctions.sfn-pipeline-lambda-broken-s3-permission-negative|_run_until#26|Timeout|time.sleep(backoff_s)
+Issue-Key: lambda__s3__stepfunctions.s3-notification-missing-invoke-permission-negative|_error_code#9|AssertionError|raise AssertionError(
+Issue-Key: lambda__s3__stepfunctions.cfn-deploy-s3-notification-to-lambda-positive|_deploy_cfn#4|AssertionError|raise AssertionError(f"Stack {name} ended in {stack['StackStatus']}")
 Issue-Commit: dfc2bec1feea4e1eda9981ef982ae4c91760421c
 
 # lambda__s3__sfn: four net-new causes — raw-ARN Lambda Tasks are never invoked, S3 notifications never reach Lambda, PutBucketNotificationConfiguration skips the invoke-permission check, and the CFN notification stack rolls back (4 causes)

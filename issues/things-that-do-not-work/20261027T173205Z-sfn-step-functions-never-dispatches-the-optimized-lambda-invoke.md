@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.deep-sfn-1-sfn-sync-lambda-function-timeout-is-sandbox-timedout-not-states-timeout sfn.deep-sfn-1-sfn-sync-lambda-unhandled-exception-error-and-json-cause
+Issue-Trace-Ids: stepfunctions.deep-sfn-1-sfn-sync-lambda-function-timeout-is-sandbox-timedout-not-states-timeout stepfunctions.deep-sfn-1-sfn-sync-lambda-unhandled-exception-error-and-json-cause
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.deep-sfn-1-sfn-sync-lambda-function-timeout-is-sandbox-timedout-not-states-timeout|run#11|AssertionError|assert d.get("error") == "Sandbox.Timedout", (
-Issue-Key: sfn.deep-sfn-1-sfn-sync-lambda-unhandled-exception-error-and-json-cause|run#13|AssertionError|assert d.get("error") == "CustomBoomError", (
+Issue-Key: stepfunctions.deep-sfn-1-sfn-sync-lambda-function-timeout-is-sandbox-timedout-not-states-timeout|run#11|AssertionError|assert d.get("error") == "Sandbox.Timedout", (
+Issue-Key: stepfunctions.deep-sfn-1-sfn-sync-lambda-unhandled-exception-error-and-json-cause|run#13|AssertionError|assert d.get("error") == "CustomBoomError", (
 Issue-Commit: ae39651d3d6fa8c047ec612a360f74eed7077718
 
 # Step Functions never dispatches the optimized lambda:invoke Task integration: a Lambda task fails States.Runtime instead of surfacing the function's error (Sandbox.Timedout / the thrown exception name) (1 cause)

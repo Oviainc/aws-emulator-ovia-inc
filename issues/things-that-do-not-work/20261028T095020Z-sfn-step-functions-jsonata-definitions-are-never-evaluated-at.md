@@ -1,11 +1,11 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.deep-sfn-2-sfn-jsonata-pass-states-result-rejected sfn.deep-sfn-2-sfn-jsonata-jsonpath-state-under-jsonata-machine-rejected sfn.deep-sfn-2-sfn-jsonata-error-output-outside-catch-rejected
+Issue-Trace-Ids: stepfunctions.deep-sfn-2-sfn-jsonata-pass-states-result-rejected stepfunctions.deep-sfn-2-sfn-jsonata-jsonpath-state-under-jsonata-machine-rejected stepfunctions.deep-sfn-2-sfn-jsonata-error-output-outside-catch-rejected
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.deep-sfn-2-sfn-jsonata-pass-states-result-rejected|run#24|AssertionError|assert exe["status"] == "SUCCEEDED", (
-Issue-Key: sfn.deep-sfn-2-sfn-jsonata-jsonpath-state-under-jsonata-machine-rejected|run#22|AssertionError|assert exe["status"] == "SUCCEEDED", (
-Issue-Key: sfn.deep-sfn-2-sfn-jsonata-error-output-outside-catch-rejected|run#18|AssertionError|assert message == (
+Issue-Key: stepfunctions.deep-sfn-2-sfn-jsonata-pass-states-result-rejected|run#24|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.deep-sfn-2-sfn-jsonata-jsonpath-state-under-jsonata-machine-rejected|run#22|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.deep-sfn-2-sfn-jsonata-error-output-outside-catch-rejected|run#18|AssertionError|assert message == (
 Issue-Commit: 11987c6da263e982c4d9dc23065f7f10f256112a
 
 # Step Functions: JSONata definitions are never evaluated at run time (whole-machine and per-state override), and the InvalidDefinition message orders diagnostics lexicographically instead of in definition order (3 causes)

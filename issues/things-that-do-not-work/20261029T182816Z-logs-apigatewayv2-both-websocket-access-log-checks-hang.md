@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: logs__apigatewayv2.obs-apigatewayv2-3-websocket-access-log-connect-message-disconnect logs__apigatewayv2.obs-apigatewayv2-3-websocket-connect-rejected-logs-connect-only
-Issue-Key: logs__apigatewayv2.obs-apigatewayv2-3-websocket-access-log-connect-message-disconnect|_await_log_delivery#16|Timeout|time.sleep(5.0)
-Issue-Key: logs__apigatewayv2.obs-apigatewayv2-3-websocket-connect-rejected-logs-connect-only|_await_log_delivery#12|Timeout|time.sleep(5.0)
+Issue-Trace-Ids: apigatewayv2__logs.obs-apigatewayv2-3-websocket-access-log-connect-message-disconnect apigatewayv2__logs.obs-apigatewayv2-3-websocket-connect-rejected-logs-connect-only
+Issue-Key: apigatewayv2__logs.obs-apigatewayv2-3-websocket-access-log-connect-message-disconnect|_await_log_delivery#16|Timeout|time.sleep(5.0)
+Issue-Key: apigatewayv2__logs.obs-apigatewayv2-3-websocket-connect-rejected-logs-connect-only|_await_log_delivery#12|Timeout|time.sleep(5.0)
 Issue-Commit: ec258a82c643322f3f1b10a7ea424abc4c176038
 
 # logs__apigatewayv2: both WebSocket access-log checks hang to the 60 s cap because the stage's access logs are never delivered (1 cause)

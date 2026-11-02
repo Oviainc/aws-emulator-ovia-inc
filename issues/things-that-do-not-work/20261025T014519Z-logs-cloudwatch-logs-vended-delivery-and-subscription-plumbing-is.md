@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: logs.e2e-delivery-pipeline-log-flow logs__cloudfront.obs-cloudfront-3-delivery-source-unsupported-log-type-rejected cloudfront__logs.xsvc-cloudfront-3-access-logs-delivery-source-outside-us-east-1-rejected logs.destination-policy-enforces-cross-account-subscription logs.e2e-subscription-filter-invalid-role-rejected logs.deep-logs-3-logacct-put-transformer-vended-parser-not-first-rejected
+Issue-Trace-Ids: logs.e2e-delivery-pipeline-log-flow cloudfront__logs.obs-cloudfront-3-delivery-source-unsupported-log-type-rejected cloudfront__logs.xsvc-cloudfront-3-access-logs-delivery-source-outside-us-east-1-rejected logs.destination-policy-enforces-cross-account-subscription logs.e2e-subscription-filter-invalid-role-rejected logs.deep-logs-3-logacct-put-transformer-vended-parser-not-first-rejected
 Issue-Key: logs.e2e-delivery-pipeline-log-flow|_error#21|AssertionError|raise AssertionError(f"expected a rejection, but the call succeeded and returned {result!r}")
-Issue-Key: logs__cloudfront.obs-cloudfront-3-delivery-source-unsupported-log-type-rejected|_error#9|AssertionError|raise AssertionError(f"expected the call to fail, but it succeeded: {result!r}")
+Issue-Key: cloudfront__logs.obs-cloudfront-3-delivery-source-unsupported-log-type-rejected|_error#9|AssertionError|raise AssertionError(f"expected the call to fail, but it succeeded: {result!r}")
 Issue-Key: cloudfront__logs.xsvc-cloudfront-3-access-logs-delivery-source-outside-us-east-1-rejected|_error#9|AssertionError|raise AssertionError(f"expected the call to be rejected, but it succeeded: {result!r}")
 Issue-Key: logs.destination-policy-enforces-cross-account-subscription|run#25|AssertionError|assert code_before_policy == "AccessDeniedException", (
 Issue-Key: logs.e2e-subscription-filter-invalid-role-rejected|_error#32|AssertionError|raise AssertionError(

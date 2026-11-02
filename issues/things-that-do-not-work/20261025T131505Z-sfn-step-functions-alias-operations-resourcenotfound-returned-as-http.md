@@ -1,11 +1,11 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.alias-create-describe-update-delete-lifecycle sfn.alias-repoint-to-foreign-state-machine-version-rejected sfn.deep-sfn-2-sfn-jsonata-context-redrive-count-joins-describe-execution
+Issue-Trace-Ids: stepfunctions.alias-create-describe-update-delete-lifecycle stepfunctions.alias-repoint-to-foreign-state-machine-version-rejected stepfunctions.deep-sfn-2-sfn-jsonata-context-redrive-count-joins-describe-execution
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.alias-create-describe-update-delete-lifecycle|run#25|AssertionError|assert (err["Code"], err["Status"]) == ("ResourceNotFound", 400), (
-Issue-Key: sfn.alias-repoint-to-foreign-state-machine-version-rejected|run#14|AssertionError|assert err == expected, (
-Issue-Key: sfn.deep-sfn-2-sfn-jsonata-context-redrive-count-joins-describe-execution|_wait_status#18|Timeout|time.sleep(interval_s)
+Issue-Key: stepfunctions.alias-create-describe-update-delete-lifecycle|run#25|AssertionError|assert (err["Code"], err["Status"]) == ("ResourceNotFound", 400), (
+Issue-Key: stepfunctions.alias-repoint-to-foreign-state-machine-version-rejected|run#14|AssertionError|assert err == expected, (
+Issue-Key: stepfunctions.deep-sfn-2-sfn-jsonata-context-redrive-count-joins-describe-execution|_wait_status#18|Timeout|time.sleep(interval_s)
 Issue-Commit: db7835caf474b2d4a8aed951b553bbb17b75b096
 
 # Step Functions alias operations: ResourceNotFound returned as HTTP 404 with emulator-local wording, UpdateStateMachineAlias mis-codes a foreign-version re-point as ValidationException, and a RedriveCount context-object run never progresses (3 causes)

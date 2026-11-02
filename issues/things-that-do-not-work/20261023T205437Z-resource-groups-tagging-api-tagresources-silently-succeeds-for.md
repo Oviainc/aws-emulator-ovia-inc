@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: elbv2__resource-groups-tagging-api.tag-resources-nonexistent-target-group-rejected-per-resource
-Issue-Key: elbv2__resource-groups-tagging-api.tag-resources-nonexistent-target-group-rejected-per-resource|run#16|AssertionError|assert set(failed) == {ghost_arn}, (
+Issue-Trace-Ids: elbv2__resourcegroupstaggingapi.tag-resources-nonexistent-target-group-rejected-per-resource
+Issue-Key: elbv2__resourcegroupstaggingapi.tag-resources-nonexistent-target-group-rejected-per-resource|run#16|AssertionError|assert set(failed) == {ghost_arn}, (
 Issue-Commit: 8bb3e31d2bc3a99611966740f58be573e66087fa
 
 # Resource Groups Tagging API TagResources silently succeeds for a nonexistent ARN: FailedResourcesMap comes back empty

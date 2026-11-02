@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.iam-from-address-condition-gates-a-real-signed-send ses.list-dedicated-ip-pools-forged-next-token-rejected
+Issue-Trace-Ids: ses.iam-from-address-condition-gates-a-real-signed-send sesv2.list-dedicated-ip-pools-forged-next-token-rejected
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
 Issue-Key: ses.iam-from-address-condition-gates-a-real-signed-send|run#23|AssertionError|assert codes == ["AccessDenied", "AccessDenied", "AccessDenied"], (
 Issue-Key: ses|ListDedicatedIpPools|BadRequestException

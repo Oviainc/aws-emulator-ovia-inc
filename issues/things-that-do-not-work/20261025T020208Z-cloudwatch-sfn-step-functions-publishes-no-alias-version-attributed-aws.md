@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__sfn.obs-sfn-1-alias-split-executions-attribute-to-alias-and-routed-version
-Issue-Key: cloudwatch__sfn.obs-sfn-1-alias-split-executions-attribute-to-alias-and-routed-version|_ledger#28|Timeout|time.sleep(_POLL_S)
+Issue-Trace-Ids: cloudwatch__stepfunctions.obs-sfn-1-alias-split-executions-attribute-to-alias-and-routed-version
+Issue-Key: cloudwatch__stepfunctions.obs-sfn-1-alias-split-executions-attribute-to-alias-and-routed-version|_ledger#28|Timeout|time.sleep(_POLL_S)
 Issue-Commit: d26de989ce4778e024797c8509c4713b425f0550
 
 # Step Functions publishes no alias/version-attributed AWS/States execution metrics, so an alias traffic split cannot be observed (1 cause)

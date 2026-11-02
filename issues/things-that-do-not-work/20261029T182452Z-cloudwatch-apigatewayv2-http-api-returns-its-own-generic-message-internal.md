@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__apigatewayv2.obs-apigatewayv2-3-http-api-5xx-alarm-actions-disabled-notification-blocked cloudwatch__apigatewayv2.obs-apigatewayv2-3-http-api-5xx-alarm-notifies-sqs-via-sns
-Issue-Key: cloudwatch__apigatewayv2.obs-apigatewayv2-3-http-api-5xx-alarm-actions-disabled-notification-blocked|run#25|AssertionError|assert text == marker, (
-Issue-Key: cloudwatch__apigatewayv2.obs-apigatewayv2-3-http-api-5xx-alarm-notifies-sqs-via-sns|run#25|AssertionError|assert text == marker, (
+Issue-Trace-Ids: apigatewayv2__cloudwatch.obs-apigatewayv2-3-http-api-5xx-alarm-actions-disabled-notification-blocked apigatewayv2__cloudwatch.obs-apigatewayv2-3-http-api-5xx-alarm-notifies-sqs-via-sns
+Issue-Key: apigatewayv2__cloudwatch.obs-apigatewayv2-3-http-api-5xx-alarm-actions-disabled-notification-blocked|run#25|AssertionError|assert text == marker, (
+Issue-Key: apigatewayv2__cloudwatch.obs-apigatewayv2-3-http-api-5xx-alarm-notifies-sqs-via-sns|run#25|AssertionError|assert text == marker, (
 Issue-Commit: ec258a82c643322f3f1b10a7ea424abc4c176038
 
 # HTTP API returns its own generic '{"message":"Internal Server Error"}' body instead of the integration's 5xx response, so 5XX alarm checks cannot attribute the error

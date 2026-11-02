@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lambda__sfn__sqs.sqs-esm-disabled-mapping-no-invocation-negative
-Issue-Key: lambda__sfn__sqs.sqs-esm-disabled-mapping-no-invocation-negative|run#20|Timeout|resp = sqs.receive_message(QueueUrl=results["url"], MaxNumberOfMessages=10, WaitTimeSeconds=5)
+Issue-Trace-Ids: lambda__sqs__stepfunctions.sqs-esm-disabled-mapping-no-invocation-negative
+Issue-Key: lambda__sqs__stepfunctions.sqs-esm-disabled-mapping-no-invocation-negative|run#20|Timeout|resp = sqs.receive_message(QueueUrl=results["url"], MaxNumberOfMessages=10, WaitTimeSeconds=5)
 Issue-Commit: 6c829b3943454ada5df5dfe2630a7a4c6694ce1c
 
 # lambda__sfn__sqs: the Enabled=False event source mapping check makes no progress - an SQS mapping neither accounts for the parked message nor delivers it once re-enabled (1 cause)

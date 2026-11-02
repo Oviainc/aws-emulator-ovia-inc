@@ -1,12 +1,12 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.choice-comparators-are-type-strict-and-never-coerce-rejected sfn.choice-timestamp-comparators-compare-instants-not-lexical-strings sfn.choice-path-comparators-dereference-the-referenced-field sfn.deep-sfn-language-wait-seconds-path-invalid-value-rejected
+Issue-Trace-Ids: stepfunctions.choice-comparators-are-type-strict-and-never-coerce-rejected stepfunctions.choice-timestamp-comparators-compare-instants-not-lexical-strings stepfunctions.choice-path-comparators-dereference-the-referenced-field stepfunctions.deep-sfn-language-wait-seconds-path-invalid-value-rejected
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.choice-comparators-are-type-strict-and-never-coerce-rejected|run#4|AssertionError|assert _output(desc) == "fell-back", (
-Issue-Key: sfn.choice-timestamp-comparators-compare-instants-not-lexical-strings|run#4|AssertionError|assert desc["status"] == "SUCCEEDED", (
-Issue-Key: sfn.choice-path-comparators-dereference-the-referenced-field|run#4|AssertionError|assert _INVALID_PATH_CAUSE in cause, (
-Issue-Key: sfn.deep-sfn-language-wait-seconds-path-invalid-value-rejected|run#7|AssertionError|assert "SecondsPath" in (bad.get("cause") or ""), (
+Issue-Key: stepfunctions.choice-comparators-are-type-strict-and-never-coerce-rejected|run#4|AssertionError|assert _output(desc) == "fell-back", (
+Issue-Key: stepfunctions.choice-timestamp-comparators-compare-instants-not-lexical-strings|run#4|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.choice-path-comparators-dereference-the-referenced-field|run#4|AssertionError|assert _INVALID_PATH_CAUSE in cause, (
+Issue-Key: stepfunctions.deep-sfn-language-wait-seconds-path-invalid-value-rejected|run#7|AssertionError|assert "SecondsPath" in (bad.get("cause") or ""), (
 Issue-Commit: 6402e991ee1ffb1f37749ece0148ecf3009a760a
 
 # Step Functions Choice and Wait evaluation diverges: NumericEquals coerces across JSON types, timestamp comparators reject RFC-3339 offsets via a Smithy timestamp parser, and the States.Runtime causes do not name the offending ASL field (4 causes)

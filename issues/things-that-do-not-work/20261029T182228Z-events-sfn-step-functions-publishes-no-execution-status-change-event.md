@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__sfn.execution-status-change-event-reaches-the-default-bus
-Issue-Key: events__sfn.execution-status-change-event-reaches-the-default-bus|_receive#24|Timeout|resp = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=wait)
+Issue-Trace-Ids: events__stepfunctions.execution-status-change-event-reaches-the-default-bus
+Issue-Key: events__stepfunctions.execution-status-change-event-reaches-the-default-bus|_receive#24|Timeout|resp = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=wait)
 Issue-Commit: b1cd28f1ca277d6a032df605f83af5017e934043
 
 # Step Functions publishes no Execution Status Change event to the default EventBridge bus

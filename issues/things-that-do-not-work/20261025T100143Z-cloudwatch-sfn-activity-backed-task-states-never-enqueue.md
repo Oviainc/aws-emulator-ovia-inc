@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__sfn.metrics-states-stream-activity-metrics-attribute-worker-outcomes-to-the-activity-arn-series cloudwatch__sfn.obs-sfn-1-redrive-to-succeeded-counts-once-and-second-redrive-rejected
-Issue-Key: cloudwatch__sfn.metrics-states-stream-activity-metrics-attribute-worker-outcomes-to-the-activity-arn-series|_poll#27|Timeout|time.sleep(_POLL_S)
-Issue-Key: cloudwatch__sfn.obs-sfn-1-redrive-to-succeeded-counts-once-and-second-redrive-rejected|_ledger#34|Timeout|time.sleep(_POLL_S)
+Issue-Trace-Ids: cloudwatch__stepfunctions.metrics-states-stream-activity-metrics-attribute-worker-outcomes-to-the-activity-arn-series cloudwatch__stepfunctions.obs-sfn-1-redrive-to-succeeded-counts-once-and-second-redrive-rejected
+Issue-Key: cloudwatch__stepfunctions.metrics-states-stream-activity-metrics-attribute-worker-outcomes-to-the-activity-arn-series|_poll#27|Timeout|time.sleep(_POLL_S)
+Issue-Key: cloudwatch__stepfunctions.obs-sfn-1-redrive-to-succeeded-counts-once-and-second-redrive-rejected|_ledger#34|Timeout|time.sleep(_POLL_S)
 Issue-Commit: e9d80a3410239f9e9b1338b43cf9bb86ccbcdb95
 
 # cloudwatch__sfn: activity-backed Task states never enqueue a task, so GetActivityTask hands out no token and the AWS/States ActivityArn series and redrive ledger are unobservable

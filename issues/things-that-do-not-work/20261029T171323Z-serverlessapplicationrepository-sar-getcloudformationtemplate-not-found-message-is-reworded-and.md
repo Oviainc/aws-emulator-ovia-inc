@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: serverlessapplicationrepository.cloudformation-template-expiry-window serverlessapplicationrepository.sar-deploy-denied-for-role-scoped-to-another-application
+Issue-Trace-Ids: serverlessrepo.cloudformation-template-expiry-window serverlessrepo.sar-deploy-denied-for-role-scoped-to-another-application
 Issue-Shape-Id: com.amazonaws.serverlessapplicationrepository#ServerlessApplicationRepository
-Issue-Key: serverlessapplicationrepository.cloudformation-template-expiry-window|run#24|AssertionError|assert message == expected, (
-Issue-Key: serverlessapplicationrepository.sar-deploy-denied-for-role-scoped-to-another-application|run#20|AssertionError|raise AssertionError(
+Issue-Key: serverlessrepo.cloudformation-template-expiry-window|run#24|AssertionError|assert message == expected, (
+Issue-Key: serverlessrepo.sar-deploy-denied-for-role-scoped-to-another-application|run#20|AssertionError|raise AssertionError(
 Issue-Commit: a9006feb831fdd789c02a15722f93d2f2e52852a
 
 # SAR: GetCloudFormationTemplate not-found message is reworded, and CreateCloudFormationChangeSet/GetApplication ignore the caller's identity-policy resource scope

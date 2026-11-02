@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: dynamodb__resource-groups-tagging-api.table-native-tags-visible-through-get-resources
-Issue-Key: dynamodb__resource-groups-tagging-api.table-native-tags-visible-through-get-resources|_poll_until#11|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: dynamodb__resourcegroupstaggingapi.table-native-tags-visible-through-get-resources
+Issue-Key: dynamodb__resourcegroupstaggingapi.table-native-tags-visible-through-get-resources|_poll_until#11|Timeout|time.sleep(interval_s)
 Issue-Commit: 6b8dcd825499bdd91675cbbb3bc6eaac525bf5b8
 
 # DynamoDB native TagResource/UntagResource writes never reach the Resource Groups Tagging index, so GetResources(dynamodb:table) never finds a tagged table

@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: global-accelerator.listener-delete-survives-accelerator-attributes-unaffected
+Issue-Trace-Ids: globalaccelerator.listener-delete-survives-accelerator-attributes-unaffected
 Issue-Shape-Id: com.amazonaws.globalaccelerator#GlobalAccelerator_V20180706
 Issue-Key: global-accelerator|DescribeAcceleratorAttributes|NotImplemented
 Issue-Commit: 611eef386f1100e1b77f5a1515bab52b7a7a6aeb

@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lambda__sfn__sqs.sqs-esm-fifo-queue-message-group-ordering-preserved
-Issue-Key: lambda__sfn__sqs.sqs-esm-fifo-queue-message-group-ordering-preserved|run#13|Timeout|resp = sqs.receive_message(QueueUrl=results["url"], MaxNumberOfMessages=10, WaitTimeSeconds=5)
+Issue-Trace-Ids: lambda__sqs__stepfunctions.sqs-esm-fifo-queue-message-group-ordering-preserved
+Issue-Key: lambda__sqs__stepfunctions.sqs-esm-fifo-queue-message-group-ordering-preserved|run#13|Timeout|resp = sqs.receive_message(QueueUrl=results["url"], MaxNumberOfMessages=10, WaitTimeSeconds=5)
 Issue-Commit: 14860775d16e18fa487d5e79f3258080516d0017
 
 # lambda__sfn__sqs: a FIFO SQS event-source mapping never delivers, so per-MessageGroupId ordering and strict serial processing within a group are unobservable

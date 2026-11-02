@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.activity-task-timeout-starts-at-the-claim-not-the-schedule sfn.send-task-failure-kms-access-denied
+Issue-Trace-Ids: stepfunctions.activity-task-timeout-starts-at-the-claim-not-the-schedule stepfunctions.send-task-failure-kms-access-denied
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.activity-task-timeout-starts-at-the-claim-not-the-schedule|run#9|Timeout|time.sleep(_SAMPLE_INTERVAL_S)
-Issue-Key: sfn.send-task-failure-kms-access-denied|run#13|Timeout|time.sleep(5)
+Issue-Key: stepfunctions.activity-task-timeout-starts-at-the-claim-not-the-schedule|run#9|Timeout|time.sleep(_SAMPLE_INTERVAL_S)
+Issue-Key: stepfunctions.send-task-failure-kms-access-denied|run#13|Timeout|time.sleep(5)
 Issue-Commit: 415bc37b6ebe55c6c7e638f2212d4379947a3e7c
 
 # sfn: 2 net-new behavioral root causes — an activity task is never claimable so its TimeoutSeconds clock (claim-time, States.Timeout, ActivityTimedOut) is never exercised, and SendTaskFailure on a CMK-encrypted state machine never produces the KmsAccessDeniedException refusal

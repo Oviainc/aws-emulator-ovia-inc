@@ -1,16 +1,16 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: signer-data.certificate-hash-entry-too-short-rejected signer-data.certificate-hash-length-boundaries-accepted signer-data.multiple-certificate-hashes-batch signer-data.signature-timestamp-future-rejected signer-data.unknown-platform-id-rejected signer-data.profile-version-arn-format-rejected signer-data.job-arn-too-long-rejected signer-data.access-denied-rejected
+Issue-Trace-Ids: signer.certificate-hash-entry-too-short-rejected signer.certificate-hash-length-boundaries-accepted signer.multiple-certificate-hashes-batch signer.signature-timestamp-future-rejected signer.unknown-platform-id-rejected signer.profile-version-arn-format-rejected signer.job-arn-too-long-rejected signer.access-denied-rejected
 Issue-Shape-Id: com.amazonaws.signerdata#SignerDataPlane
-Issue-Key: signer-data.certificate-hash-entry-too-short-rejected|_client_error#6|AssertionError|raise AssertionError(
-Issue-Key: signer-data.certificate-hash-length-boundaries-accepted|_client_error#8|AssertionError|raise AssertionError("expected ClientError for a 257-char certificateHashes entry, call succeeded")
-Issue-Key: signer-data.multiple-certificate-hashes-batch|_client_error#8|AssertionError|raise AssertionError(f"real AWS rejects this batch, but it SUCCEEDED and returned {result!r}")
-Issue-Key: signer-data.signature-timestamp-future-rejected|_client_error#7|AssertionError|raise AssertionError(
-Issue-Key: signer-data.unknown-platform-id-rejected|run#9|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
-Issue-Key: signer-data.profile-version-arn-format-rejected|run#11|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
-Issue-Key: signer-data.job-arn-too-long-rejected|run#13|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
-Issue-Key: signer-data.access-denied-rejected|_poll_until#19|Timeout|time.sleep(interval_s)
+Issue-Key: signer.certificate-hash-entry-too-short-rejected|_client_error#6|AssertionError|raise AssertionError(
+Issue-Key: signer.certificate-hash-length-boundaries-accepted|_client_error#8|AssertionError|raise AssertionError("expected ClientError for a 257-char certificateHashes entry, call succeeded")
+Issue-Key: signer.multiple-certificate-hashes-batch|_client_error#8|AssertionError|raise AssertionError(f"real AWS rejects this batch, but it SUCCEEDED and returned {result!r}")
+Issue-Key: signer.signature-timestamp-future-rejected|_client_error#7|AssertionError|raise AssertionError(
+Issue-Key: signer.unknown-platform-id-rejected|run#9|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: signer.profile-version-arn-format-rejected|run#11|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: signer.job-arn-too-long-rejected|run#13|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: signer.access-denied-rejected|_poll_until#19|Timeout|time.sleep(interval_s)
 Issue-Commit: 712591afcbaa8fe04acc2e16b4d0dd73e216350b
 
 # signer-data GetRevocationStatus: 6 net-new causes — certificateHashes and signatureTimestamp are never validated, the call is never authorized, and three refusals are misworded

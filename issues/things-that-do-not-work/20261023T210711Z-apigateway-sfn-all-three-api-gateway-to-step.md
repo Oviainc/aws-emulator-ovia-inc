@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: apigateway__sfn.xsvc-apigateway-2-sfn-role-missing-start-execution-denied-surfaces-access-denied apigateway__sfn.xsvc-apigateway-2-sfn-start-execution-input-visible-in-describe-execution apigateway__sfn.xsvc-apigateway-2-sfn-start-sync-execution-maps-output-and-failed-shape
-Issue-Key: apigateway__sfn.xsvc-apigateway-2-sfn-role-missing-start-execution-denied-surfaces-access-denied|_poll_http#16|Timeout|time.sleep(interval_s)
-Issue-Key: apigateway__sfn.xsvc-apigateway-2-sfn-start-execution-input-visible-in-describe-execution|_poll_http#18|Timeout|time.sleep(interval_s)
-Issue-Key: apigateway__sfn.xsvc-apigateway-2-sfn-start-sync-execution-maps-output-and-failed-shape|_poll_http#16|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: apigateway__stepfunctions.xsvc-apigateway-2-sfn-role-missing-start-execution-denied-surfaces-access-denied apigateway__stepfunctions.xsvc-apigateway-2-sfn-start-execution-input-visible-in-describe-execution apigateway__stepfunctions.xsvc-apigateway-2-sfn-start-sync-execution-maps-output-and-failed-shape
+Issue-Key: apigateway__stepfunctions.xsvc-apigateway-2-sfn-role-missing-start-execution-denied-surfaces-access-denied|_poll_http#16|Timeout|time.sleep(interval_s)
+Issue-Key: apigateway__stepfunctions.xsvc-apigateway-2-sfn-start-execution-input-visible-in-describe-execution|_poll_http#18|Timeout|time.sleep(interval_s)
+Issue-Key: apigateway__stepfunctions.xsvc-apigateway-2-sfn-start-sync-execution-maps-output-and-failed-shape|_poll_http#16|Timeout|time.sleep(interval_s)
 Issue-Commit: 8bb3e31d2bc3a99611966740f58be573e66087fa
 
 # apigateway__sfn: all three API Gateway-to-Step Functions checks hang to the 60 s cap at the deployed stage

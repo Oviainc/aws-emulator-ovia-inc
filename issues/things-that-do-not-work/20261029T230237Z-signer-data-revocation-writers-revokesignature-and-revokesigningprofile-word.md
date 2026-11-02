@@ -1,10 +1,10 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: signer-data.revoke-signature-marks-job-revoked signer-data.revoke-signing-profile-effective-time-boundary
+Issue-Trace-Ids: signer-data.revoke-signature-marks-job-revoked signer.revoke-signing-profile-effective-time-boundary
 Issue-Shape-Id: com.amazonaws.signerdata#SignerDataPlane
 Issue-Key: signer-data.revoke-signature-marks-job-revoked|run#21|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
-Issue-Key: signer-data.revoke-signing-profile-effective-time-boundary|run#8|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: signer.revoke-signing-profile-effective-time-boundary|run#8|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
 Issue-Commit: 712591afcbaa8fe04acc2e16b4d0dd73e216350b
 
 # signer-data revocation writers: RevokeSignature and RevokeSigningProfile word their not-found refusals themselves, and the profile refusal drops the version it was asked about

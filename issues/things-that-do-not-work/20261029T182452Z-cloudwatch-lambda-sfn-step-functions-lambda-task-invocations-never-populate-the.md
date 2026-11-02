@@ -1,10 +1,10 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__lambda__sfn.metrics-states-stream-lambda-invoke-denied-role-fails-execution-and-function-series-stays-empty cloudwatch__lambda__sfn.metrics-states-stream-lambda-task-metrics-attribute-to-the-function-arn-series cloudwatch__lambda__sfn.obs-sfn-1-optimized-lambda-invoke-denied-and-ok-never-populate-function-arn-series
-Issue-Key: cloudwatch__lambda__sfn.metrics-states-stream-lambda-invoke-denied-role-fails-execution-and-function-series-stays-empty|_warm#8|Timeout|time.sleep(5.0) # the invoke grant is still propagating; the retry is the wait
-Issue-Key: cloudwatch__lambda__sfn.metrics-states-stream-lambda-task-metrics-attribute-to-the-function-arn-series|_warm#6|Timeout|time.sleep(5.0) # the invoke grant is still propagating; the retry is the wait
-Issue-Key: cloudwatch__lambda__sfn.obs-sfn-1-optimized-lambda-invoke-denied-and-ok-never-populate-function-arn-series|_warm#10|Timeout|time.sleep(5.0) # the invoke grant is still propagating; the retry is the wait
+Issue-Trace-Ids: cloudwatch__lambda__stepfunctions.metrics-states-stream-lambda-invoke-denied-role-fails-execution-function-series-empty cloudwatch__lambda__stepfunctions.metrics-states-stream-lambda-task-metrics-attribute-to-the-function-arn-series cloudwatch__lambda__stepfunctions.obs-sfn-1-optimized-lambda-invoke-denied-and-ok-never-populate-function-arn-series
+Issue-Key: cloudwatch__lambda__stepfunctions.metrics-states-stream-lambda-invoke-denied-role-fails-execution-function-series-empty|_warm#8|Timeout|time.sleep(5.0) # the invoke grant is still propagating; the retry is the wait
+Issue-Key: cloudwatch__lambda__stepfunctions.metrics-states-stream-lambda-task-metrics-attribute-to-the-function-arn-series|_warm#6|Timeout|time.sleep(5.0) # the invoke grant is still propagating; the retry is the wait
+Issue-Key: cloudwatch__lambda__stepfunctions.obs-sfn-1-optimized-lambda-invoke-denied-and-ok-never-populate-function-arn-series|_warm#10|Timeout|time.sleep(5.0) # the invoke grant is still propagating; the retry is the wait
 Issue-Commit: ec258a82c643322f3f1b10a7ea424abc4c176038
 
 # Step Functions Lambda task invocations never populate the AWS/Lambda function-ARN metric series (optimized and stream invoke paths)

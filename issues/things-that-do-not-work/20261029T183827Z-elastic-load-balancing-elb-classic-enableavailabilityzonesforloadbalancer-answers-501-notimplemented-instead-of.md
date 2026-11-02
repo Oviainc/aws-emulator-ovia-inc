@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: elastic-load-balancing.enable-availability-zones-on-a-vpc-load-balancer-rejected elastic-load-balancing.health-check-timeout-not-below-interval-rejected
+Issue-Trace-Ids: elb.enable-availability-zones-on-a-vpc-load-balancer-rejected elb.health-check-timeout-not-below-interval-rejected
 Issue-Shape-Id: com.amazonaws.elasticloadbalancing#ElasticLoadBalancing_v7
-Issue-Key: elastic-load-balancing.enable-availability-zones-on-a-vpc-load-balancer-rejected|run#8|AssertionError|assert code == "ValidationError", (
-Issue-Key: elastic-load-balancing.health-check-timeout-not-below-interval-rejected|run#11|AssertionError|assert equal_message == "HealthCheck timeout must be less than interval. ", (
+Issue-Key: elb.enable-availability-zones-on-a-vpc-load-balancer-rejected|run#8|AssertionError|assert code == "ValidationError", (
+Issue-Key: elb.health-check-timeout-not-below-interval-rejected|run#11|AssertionError|assert equal_message == "HealthCheck timeout must be less than interval. ", (
 Issue-Commit: e5bbef2d2760924537f10016f55a30b12c0b7775
 
 # ELB Classic: EnableAvailabilityZonesForLoadBalancer answers 501 NotImplemented instead of the ValidationError refusal, and the ConfigureHealthCheck timeout/interval message drops AWS's trailing space

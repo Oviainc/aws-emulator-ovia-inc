@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: logs__cognito-idp.obs-cognito-idp-1-log-delivery-config logs__cognito-idp.obs-cognito-idp-1-security-audit-telemetry
-Issue-Key: logs__cognito-idp.obs-cognito-idp-1-log-delivery-config|run#12|AssertionError|assert code == "InvalidParameterException", (
+Issue-Trace-Ids: cognito-idp__logs.obs-cognito-idp-1-log-delivery-config cognito-idp__logs.obs-cognito-idp-1-security-audit-telemetry
+Issue-Key: cognito-idp__logs.obs-cognito-idp-1-log-delivery-config|run#12|AssertionError|assert code == "InvalidParameterException", (
 Issue-Key: cognito-identity-provider|SetLogDeliveryConfiguration|NotImplemented
 Issue-Commit: 048778663a26e363156c6db724999c4fb229af36
 

@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: dynamodb__events__lambda__s3__sfn.s3-eventbridge-sfn-lambda-ddb-payload-fidelity
-Issue-Key: dynamodb__events__lambda__s3__sfn.s3-eventbridge-sfn-lambda-ddb-payload-fidelity|_poll_until#20|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: dynamodb__events__lambda__s3__stepfunctions.s3-eventbridge-sfn-lambda-ddb-payload-fidelity
+Issue-Key: dynamodb__events__lambda__s3__stepfunctions.s3-eventbridge-sfn-lambda-ddb-payload-fidelity|_poll_until#20|Timeout|time.sleep(interval_s)
 Issue-Commit: f4e5251e6df88363d8e23ace2ff5bff3be31b423
 
 # S3 -> EventBridge -> Step Functions -> Lambda -> DynamoDB payload fidelity check never completes

@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__lambda__sfn.deep-sfn-3-http-task-echo-roundtrip events__lambda__sfn.deep-sfn-3-http-task-deauthorized-connection-rejected events__lambda__sfn.deep-sfn-3-http-task-unknown-connection-rejected
-Issue-Key: events__lambda__sfn.deep-sfn-3-http-task-echo-roundtrip|run#9|AssertionError|assert desc["status"] == "SUCCEEDED", (
-Issue-Key: events__lambda__sfn.deep-sfn-3-http-task-deauthorized-connection-rejected|run#9|AssertionError|assert first["status"] == "SUCCEEDED", (
-Issue-Key: events__lambda__sfn.deep-sfn-3-http-task-unknown-connection-rejected|run#11|AssertionError|assert good["status"] == "SUCCEEDED", (
+Issue-Trace-Ids: events__lambda__stepfunctions.deep-sfn-3-http-task-echo-roundtrip events__lambda__stepfunctions.deep-sfn-3-http-task-deauthorized-connection-rejected events__lambda__stepfunctions.deep-sfn-3-http-task-unknown-connection-rejected
+Issue-Key: events__lambda__stepfunctions.deep-sfn-3-http-task-echo-roundtrip|run#9|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: events__lambda__stepfunctions.deep-sfn-3-http-task-deauthorized-connection-rejected|run#9|AssertionError|assert first["status"] == "SUCCEEDED", (
+Issue-Key: events__lambda__stepfunctions.deep-sfn-3-http-task-unknown-connection-rejected|run#11|AssertionError|assert good["status"] == "SUCCEEDED", (
 Issue-Commit: ee21bdc0559bb252101e2375a2c132d26bd8f920
 
 # HTTP Task (arn:aws:states:::http:invoke) is never executed: every execution containing one fails immediately with States.Runtime, so neither the authorized round-trip nor the connection-rejection negatives can be observed

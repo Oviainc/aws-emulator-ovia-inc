@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.tag-resource-reserved-prefix-and-key-limit-rejected ses.receipt-rule-s3-action-kms-key-policy-is-evaluated-apart-from-the-bucket-grant
+Issue-Trace-Ids: sesv2.tag-resource-reserved-prefix-and-key-limit-rejected ses.receipt-rule-s3-action-kms-key-policy-is-evaluated-apart-from-the-bucket-grant
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
-Issue-Key: ses.tag-resource-reserved-prefix-and-key-limit-rejected|run#14|AssertionError|assert msg_reserved == 'Failed to tag resource', (
+Issue-Key: sesv2.tag-resource-reserved-prefix-and-key-limit-rejected|run#14|AssertionError|assert msg_reserved == 'Failed to tag resource', (
 Issue-Key: ses.receipt-rule-s3-action-kms-key-policy-is-evaluated-apart-from-the-bucket-grant|_client_error#29|AssertionError|raise AssertionError(
 Issue-Commit: e09687ccd784c01fa8090fa7f40964051dd69a6c
 

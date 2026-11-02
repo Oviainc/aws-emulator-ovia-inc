@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.duplicate-template-create-rejected-and-the-original-body-still-renders ses.test-render-email-template-assembles-a-multipart-alternative-mime-message ses.test-render-email-template-does-not-html-escape-substituted-values ses.test-render-email-template-mime-encodes-non-ascii-rendering-data ses.test-render-email-template-selects-the-mime-type-from-the-stored-parts ses.test-render-with-incomplete-template-data-rejected-complete-data-renders ses.updating-a-template-changes-what-the-renderer-produces
+Issue-Trace-Ids: sesv2.duplicate-template-create-rejected-and-the-original-body-still-renders sesv2.test-render-email-template-assembles-a-multipart-alternative-mime-message sesv2.test-render-email-template-does-not-html-escape-substituted-values sesv2.test-render-email-template-mime-encodes-non-ascii-rendering-data sesv2.test-render-email-template-selects-the-mime-type-from-the-stored-parts sesv2.test-render-with-incomplete-template-data-rejected-complete-data-renders sesv2.updating-a-template-changes-what-the-renderer-produces
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
 Issue-Key: sesv2|TestRenderEmailTemplate|NotImplemented
-Issue-Key: ses.test-render-with-incomplete-template-data-rejected-complete-data-renders|run#10|AssertionError|assert code == 'BadRequestException', (
+Issue-Key: sesv2.test-render-with-incomplete-template-data-rejected-complete-data-renders|run#10|AssertionError|assert code == 'BadRequestException', (
 Issue-Commit: de2a758d888a26724f6774bb8d661e6e5775621b
 
 # Implement ses TestRenderEmailTemplate: unimplemented scaffold stub

@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lambda__resource-groups-tagging-api.blueprint-tag-applied-after-create-surfaces-in-the-tag-query lambda__resource-groups-tagging-api.blueprint-tag-untag-removes-the-function-from-the-tag-query lambda__resource-groups-tagging-api.blueprint-tag-e2e-find-tagged-functions-lifecycle
-Issue-Key: lambda__resource-groups-tagging-api.blueprint-tag-applied-after-create-surfaces-in-the-tag-query|_poll#5|Timeout|time.sleep(interval_s)
-Issue-Key: lambda__resource-groups-tagging-api.blueprint-tag-untag-removes-the-function-from-the-tag-query|_poll#5|Timeout|time.sleep(interval_s)
-Issue-Key: lambda__resource-groups-tagging-api|ListTags|ResourceNotFoundException
+Issue-Trace-Ids: lambda__resourcegroupstaggingapi.blueprint-tag-applied-after-create-surfaces-in-the-tag-query lambda__resourcegroupstaggingapi.blueprint-tag-untag-removes-the-function-from-the-tag-query lambda__resourcegroupstaggingapi.blueprint-tag-e2e-find-tagged-functions-lifecycle
+Issue-Key: lambda__resourcegroupstaggingapi.blueprint-tag-applied-after-create-surfaces-in-the-tag-query|_poll#5|Timeout|time.sleep(interval_s)
+Issue-Key: lambda__resourcegroupstaggingapi.blueprint-tag-untag-removes-the-function-from-the-tag-query|_poll#5|Timeout|time.sleep(interval_s)
+Issue-Key: lambda__resourcegroupstaggingapi|ListTags|ResourceNotFoundException
 Issue-Commit: 6b8dcd825499bdd91675cbbb3bc6eaac525bf5b8
 
 # Lambda function tags are absent from the Resource Groups Tagging index, and a CloudFormation-deployed AWS::Lambda::Function does not exist afterwards (2 causes)

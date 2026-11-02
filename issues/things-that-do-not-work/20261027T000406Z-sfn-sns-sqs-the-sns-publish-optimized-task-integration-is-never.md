@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn__sns__sqs.sfn-sns-publish-missing-permission-catch-denied-negative
-Issue-Key: sfn__sns__sqs.sfn-sns-publish-missing-permission-catch-denied-negative|run#20|AssertionError|assert good["status"] == "SUCCEEDED", (
+Issue-Trace-Ids: sns__sqs__stepfunctions.sfn-sns-publish-missing-permission-catch-denied-negative
+Issue-Key: sns__sqs__stepfunctions.sfn-sns-publish-missing-permission-catch-denied-negative|run#20|AssertionError|assert good["status"] == "SUCCEEDED", (
 Issue-Commit: 6402e991ee1ffb1f37749ece0148ecf3009a760a
 
 # The sns:publish optimized Task integration is never executed: the positive control execution ends FAILED, so a Step Functions Task can never deliver to an SNS topic (1 cause)

@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: elbv2__resource-groups-tagging-api.load-balancer-and-target-group-tags-visible-through-get-resources
-Issue-Key: elbv2__resource-groups-tagging-api.load-balancer-and-target-group-tags-visible-through-get-resources|_poll_until#10|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: elbv2__resourcegroupstaggingapi.load-balancer-and-target-group-tags-visible-through-get-resources
+Issue-Key: elbv2__resourcegroupstaggingapi.load-balancer-and-target-group-tags-visible-through-get-resources|_poll_until#10|Timeout|time.sleep(interval_s)
 Issue-Commit: 71cff0481dbaf9b41262283aed7350a64aff149f
 
 # ELBv2 tags written with AddTags never reach the Resource Groups Tagging index: GetResources with a matching tag filter never returns the load balancer or the target group

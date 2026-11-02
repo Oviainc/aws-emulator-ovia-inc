@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: dynamodb__events__lambda__sfn__sqs.eventbridge-fanout-lambda-sqs-sfn
-Issue-Key: dynamodb__events__lambda__sfn__sqs.eventbridge-fanout-lambda-sqs-sfn|_poll_until#25|AssertionError|raise AssertionError(
+Issue-Trace-Ids: dynamodb__events__lambda__sqs__stepfunctions.eventbridge-fanout-lambda-sqs-sfn
+Issue-Key: dynamodb__events__lambda__sqs__stepfunctions.eventbridge-fanout-lambda-sqs-sfn|_poll_until#25|AssertionError|raise AssertionError(
 Issue-Commit: ee21bdc0559bb252101e2375a2c132d26bd8f920
 
 # EventBridge fan-out never invokes its Lambda target: the consumer function is never run, so its DynamoDB write never appears

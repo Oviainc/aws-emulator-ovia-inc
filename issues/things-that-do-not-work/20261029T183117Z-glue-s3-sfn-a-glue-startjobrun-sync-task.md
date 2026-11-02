@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: glue__s3__sfn.xsvc-sfn-1-glue-sync-failing-job-run-fails-as-task-failed
-Issue-Key: glue__s3__sfn.xsvc-sfn-1-glue-sync-failing-job-run-fails-as-task-failed|run#11|AssertionError|assert good["status"] == "SUCCEEDED", (
+Issue-Trace-Ids: glue__s3__stepfunctions.xsvc-sfn-1-glue-sync-failing-job-run-fails-as-task-failed
+Issue-Key: glue__s3__stepfunctions.xsvc-sfn-1-glue-sync-failing-job-run-fails-as-task-failed|run#11|AssertionError|assert good["status"] == "SUCCEEDED", (
 Issue-Commit: dfc2bec1feea4e1eda9981ef982ae4c91760421c
 
 # glue__s3__sfn: a glue:startJobRun.sync Task is refused outright, so a failing Glue job run never surfaces as States.TaskFailed (1 cause)

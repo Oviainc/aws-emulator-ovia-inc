@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cost-explorer.anomaly-monitor-delete-orphans-subscription cost-explorer.anomaly-subscription-accepts-unreachable-sns cost-explorer.anomaly-subscription-threshold-shorthand-expands cost-explorer.tag-resource-scopes-tags-per-resource cost-explorer.update-anomaly-subscription-rejects-conflicting-threshold
+Issue-Trace-Ids: ce.anomaly-monitor-delete-orphans-subscription ce.anomaly-subscription-accepts-unreachable-sns ce.anomaly-subscription-threshold-shorthand-expands ce.tag-resource-scopes-tags-per-resource ce.update-anomaly-subscription-rejects-conflicting-threshold
 Issue-Shape-Id: com.amazonaws.costexplorer#AWSInsightsIndexService
 Issue-Key: cost-explorer|CreateAnomalyMonitor|NotImplemented
 Issue-Commit: e5bbef2d2760924537f10016f55a30b12c0b7775

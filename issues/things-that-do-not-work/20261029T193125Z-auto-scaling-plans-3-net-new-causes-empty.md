@@ -1,11 +1,11 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: auto-scaling-plans.asp-create-rejects-capacity-and-target-bounds auto-scaling-plans.asp-plan-activates-with-readable-instructions auto-scaling-plans.asp-update-replaces-instruction-without-new-version
+Issue-Trace-Ids: autoscaling-plans.asp-create-rejects-capacity-and-target-bounds autoscaling-plans.asp-plan-activates-with-readable-instructions autoscaling-plans.asp-update-replaces-instruction-without-new-version
 Issue-Shape-Id: com.amazonaws.autoscalingplans#AnyScaleScalingPlannerFrontendService
 Issue-Key: auto-scaling-plans|CreateScalingPlan|ValidationException
-Issue-Key: auto-scaling-plans.asp-plan-activates-with-readable-instructions|run#37|AssertionError|assert pol["PolicyName"].startswith(f"AutoScaling-{plan}-"), (
-Issue-Key: auto-scaling-plans.asp-update-replaces-instruction-without-new-version|_await_target_value#19|Timeout|time.sleep(3)
+Issue-Key: autoscaling-plans.asp-plan-activates-with-readable-instructions|run#37|AssertionError|assert pol["PolicyName"].startswith(f"AutoScaling-{plan}-"), (
+Issue-Key: autoscaling-plans.asp-update-replaces-instruction-without-new-version|_await_target_value#19|Timeout|time.sleep(3)
 Issue-Commit: 24dcbcf55b45bb9d0573a38e9c06262a825c087d
 
 # auto-scaling-plans: 3 net-new causes — empty-ScalingInstructions refusal wording, derived target-tracking PolicyName not built from the plan name, and UpdateScalingPlan never converging

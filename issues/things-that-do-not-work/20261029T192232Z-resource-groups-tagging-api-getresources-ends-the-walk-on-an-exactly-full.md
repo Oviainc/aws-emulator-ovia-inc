@@ -1,9 +1,9 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: resource-groups-tagging-api.get-resources-out-of-range-page-size-rejected
+Issue-Trace-Ids: resourcegroupstaggingapi.get-resources-out-of-range-page-size-rejected
 Issue-Shape-Id: com.amazonaws.resourcegroupstaggingapi#ResourceGroupsTaggingAPI_20170126
-Issue-Key: resource-groups-tagging-api.get-resources-out-of-range-page-size-rejected|run#20|AssertionError|assert full["PaginationToken"], (
+Issue-Key: resourcegroupstaggingapi.get-resources-out-of-range-page-size-rejected|run#20|AssertionError|assert full["PaginationToken"], (
 Issue-Commit: 907b6e75f03592bc638357f3d5c791839011739f
 
 # GetResources ends the walk on an exactly-full page: no PaginationToken is minted when the page consumes the last matching resource

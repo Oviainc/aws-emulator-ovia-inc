@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: iot__dynamodb.topic-rule-dynamodbv2-action-writes-item-from-published-message iot__dynamodb.topic-rule-dynamodbv2-action-missing-put-item-permission-rejected iot__s3.rule-s3-action-substitution-template-computes-the-object-key iot__lambda.iot-rule-disabled-rule-no-invocation-negative iot__lambda.lambda-iot-data-publish-positive
-Issue-Key: iot__dynamodb.topic-rule-dynamodbv2-action-writes-item-from-published-message|run#30|Timeout|time.sleep(2)
-Issue-Key: iot__dynamodb.topic-rule-dynamodbv2-action-missing-put-item-permission-rejected|run#25|Timeout|time.sleep(3)
+Issue-Trace-Ids: dynamodb__iot.topic-rule-dynamodbv2-action-writes-item-from-published-message dynamodb__iot.topic-rule-dynamodbv2-action-missing-put-item-permission-rejected iot__s3.rule-s3-action-substitution-template-computes-the-object-key iot__lambda.iot-rule-disabled-rule-no-invocation-negative iot__lambda.lambda-iot-data-publish-positive
+Issue-Key: dynamodb__iot.topic-rule-dynamodbv2-action-writes-item-from-published-message|run#30|Timeout|time.sleep(2)
+Issue-Key: dynamodb__iot.topic-rule-dynamodbv2-action-missing-put-item-permission-rejected|run#25|Timeout|time.sleep(3)
 Issue-Key: iot__s3.rule-s3-action-substitution-template-computes-the-object-key|run#35|Timeout|time.sleep(2)
 Issue-Key: iot__lambda.iot-rule-disabled-rule-no-invocation-negative|_receive_all#17|Timeout|resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=max_messages, WaitTimeSeconds=5)
 Issue-Key: iot__lambda|TagResource|NotImplemented

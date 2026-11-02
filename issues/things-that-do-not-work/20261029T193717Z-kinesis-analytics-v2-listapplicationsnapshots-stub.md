@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: kinesis-analytics-v2.snapshot-of-ready-application-rejected
+Issue-Trace-Ids: kinesisanalyticsv2.snapshot-of-ready-application-rejected
 Issue-Shape-Id: com.amazonaws.kinesisanalyticsv2#KinesisAnalytics_20180523
 Issue-Key: kinesis-analytics-v2|ListApplicationSnapshots|NotImplemented
 Issue-Commit: 954781cef49baf7406aef764139782df619c6255

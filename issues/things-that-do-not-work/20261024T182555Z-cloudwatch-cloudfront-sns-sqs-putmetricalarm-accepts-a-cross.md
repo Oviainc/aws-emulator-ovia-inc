@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__cloudfront__sns__sqs.cloudfront-4xx-alarm-cross-region-sns-action-rejected cloudwatch__cloudfront__sns__sqs.obs-cloudfront-2-4xx-error-rate-alarm-notifies-sqs-untouched-control-stays-ok
-Issue-Key: cloudwatch__cloudfront__sns__sqs.cloudfront-4xx-alarm-cross-region-sns-action-rejected|_error#13|AssertionError|raise AssertionError("the call was ACCEPTED but real AWS rejects it")
-Issue-Key: cloudwatch__cloudfront__sns__sqs.obs-cloudfront-2-4xx-error-rate-alarm-notifies-sqs-untouched-control-stays-ok|_poll_until#18|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: cloudfront__cloudwatch__sns__sqs.cloudfront-4xx-alarm-cross-region-sns-action-rejected cloudfront__cloudwatch__sns__sqs.obs-cloudfront-2-4xx-error-rate-alarm-notifies-sqs-untouched-control-stays-ok
+Issue-Key: cloudfront__cloudwatch__sns__sqs.cloudfront-4xx-alarm-cross-region-sns-action-rejected|_error#13|AssertionError|raise AssertionError("the call was ACCEPTED but real AWS rejects it")
+Issue-Key: cloudfront__cloudwatch__sns__sqs.obs-cloudfront-2-4xx-error-rate-alarm-notifies-sqs-untouched-control-stays-ok|_poll_until#18|Timeout|time.sleep(interval_s)
 Issue-Commit: 0de7718ade8f368be0e47aca52d0dd18a585e082
 
 # cloudwatch__cloudfront__sns__sqs: PutMetricAlarm accepts a cross-region SNS AlarmAction, and no edge traffic is served so a CloudFront 4xx alarm can never fire

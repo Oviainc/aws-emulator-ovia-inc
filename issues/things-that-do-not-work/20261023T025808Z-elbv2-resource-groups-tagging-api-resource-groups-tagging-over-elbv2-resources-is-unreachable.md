@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: elbv2__resource-groups-tagging-api.load-balancer-and-target-group-tags-visible-through-get-resources elbv2__resource-groups-tagging-api.tag-resources-nonexistent-target-group-rejected-per-resource
-Issue-Key: elbv2__resource-groups-tagging-api|CreateTargetGroup|InvalidAction
+Issue-Trace-Ids: elbv2__resourcegroupstaggingapi.load-balancer-and-target-group-tags-visible-through-get-resources elbv2__resourcegroupstaggingapi.tag-resources-nonexistent-target-group-rejected-per-resource
+Issue-Key: elbv2__resourcegroupstaggingapi|CreateTargetGroup|InvalidAction
 Issue-Commit: 1b15cfcf83a9fafcaa69f938ed17066b612a8ba0
 
 # Resource Groups Tagging over ELBv2 resources is unreachable: CreateTargetGroup answers InvalidAction at version 2015-12-01

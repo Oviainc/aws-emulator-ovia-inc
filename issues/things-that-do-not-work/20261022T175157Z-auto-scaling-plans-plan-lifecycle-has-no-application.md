@@ -1,13 +1,13 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: auto-scaling-plans.asp-delete-deregisters-the-scalable-target-it-created auto-scaling-plans.asp-plan-activates-with-readable-instructions auto-scaling-plans.asp-update-replaces-instruction-without-new-version auto-scaling-plans.asp-absent-resource-plan-is-rejected-asynchronously auto-scaling-plans.asp-concurrent-update-is-rejected
+Issue-Trace-Ids: autoscaling-plans.asp-delete-deregisters-the-scalable-target-it-created autoscaling-plans.asp-plan-activates-with-readable-instructions autoscaling-plans.asp-update-replaces-instruction-without-new-version autoscaling-plans.asp-absent-resource-plan-is-rejected-asynchronously autoscaling-plans.asp-concurrent-update-is-rejected
 Issue-Shape-Id: com.amazonaws.autoscalingplans#AnyScaleScalingPlannerFrontendService
-Issue-Key: auto-scaling-plans.asp-delete-deregisters-the-scalable-target-it-created|run#16|AssertionError|assert len(targets) == 1, (
-Issue-Key: auto-scaling-plans.asp-plan-activates-with-readable-instructions|run#15|KeyError|assert settled["StatusMessage"] == (
-Issue-Key: auto-scaling-plans.asp-update-replaces-instruction-without-new-version|_await_status_message#12|Timeout|time.sleep(3)
-Issue-Key: auto-scaling-plans.asp-absent-resource-plan-is-rejected-asynchronously|run#11|AssertionError|assert settled["StatusCode"] == "ActiveWithProblems", (
-Issue-Key: auto-scaling-plans.asp-concurrent-update-is-rejected|run#18|AssertionError|assert rejection is not None, (
+Issue-Key: autoscaling-plans.asp-delete-deregisters-the-scalable-target-it-created|run#16|AssertionError|assert len(targets) == 1, (
+Issue-Key: autoscaling-plans.asp-plan-activates-with-readable-instructions|run#15|KeyError|assert settled["StatusMessage"] == (
+Issue-Key: autoscaling-plans.asp-update-replaces-instruction-without-new-version|_await_status_message#12|Timeout|time.sleep(3)
+Issue-Key: autoscaling-plans.asp-absent-resource-plan-is-rejected-asynchronously|run#11|AssertionError|assert settled["StatusCode"] == "ActiveWithProblems", (
+Issue-Key: autoscaling-plans.asp-concurrent-update-is-rejected|run#18|AssertionError|assert rejection is not None, (
 Issue-Commit: 242e2a822ca6eb3fec2aad3ba89160f0a6f40669
 
 # auto-scaling-plans: plan lifecycle has no Application Auto Scaling side effects, no status narrative, no deferred resource validation and no update interlock

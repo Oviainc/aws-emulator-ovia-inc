@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__lambda__logs__sfn.obs-sfn-3-express-fail-events-to-unpermitted-lambda-subscriber-rejected
-Issue-Key: cloudwatch__lambda__logs__sfn.obs-sfn-3-express-fail-events-to-unpermitted-lambda-subscriber-rejected|_error#11|AssertionError|raise AssertionError(f"the call was expected to be refused but SUCCEEDED: {resp!r}")
+Issue-Trace-Ids: cloudwatch__lambda__logs__stepfunctions.obs-sfn-3-express-fail-events-to-unpermitted-lambda-subscriber-rejected
+Issue-Key: cloudwatch__lambda__logs__stepfunctions.obs-sfn-3-express-fail-events-to-unpermitted-lambda-subscriber-rejected|_error#11|AssertionError|raise AssertionError(f"the call was expected to be refused but SUCCEEDED: {resp!r}")
 Issue-Commit: ec258a82c643322f3f1b10a7ea424abc4c176038
 
 # PutSubscriptionFilter to a Lambda destination with no logs.amazonaws.com invoke permission is accepted instead of refused

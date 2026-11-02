@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__lambda__s3__sfn.s3-upload-triggers-lambda-then-putevents-starts-sfn
-Issue-Key: events__lambda__s3__sfn.s3-upload-triggers-lambda-then-putevents-starts-sfn|_fire_until#20|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: events__lambda__s3__stepfunctions.s3-upload-triggers-lambda-then-putevents-starts-sfn
+Issue-Key: events__lambda__s3__stepfunctions.s3-upload-triggers-lambda-then-putevents-starts-sfn|_fire_until#20|Timeout|time.sleep(interval_s)
 Issue-Commit: b46de20c42d1d13a6a9554983f2e031495be43a2
 
 # events__lambda__s3__sfn: an S3 ObjectCreated upload never reaches its Lambda notification target, so the S3 -> Lambda -> PutEvents -> rule -> Step Functions chain starts no execution and the check hangs to the 60 s cap (1 cause)

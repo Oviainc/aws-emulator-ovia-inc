@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: logs__cognito-idp.obs-cognito-idp-1-log-delivery-config
-Issue-Key: logs__cognito-idp.obs-cognito-idp-1-log-delivery-config|_error#11|AssertionError|raise AssertionError(f"expected a rejection, but the call SUCCEEDED and returned {result!r}")
+Issue-Trace-Ids: cognito-idp__logs.obs-cognito-idp-1-log-delivery-config
+Issue-Key: cognito-idp__logs.obs-cognito-idp-1-log-delivery-config|_error#11|AssertionError|raise AssertionError(f"expected a rejection, but the call SUCCEEDED and returned {result!r}")
 Issue-Commit: 3b8e580b43dad03fd4ed613a27e30f57a2ae4b6e
 
 # cognito-idp SetLogDeliveryConfiguration accepts a CloudWatch Logs destination that does not resolve instead of refusing with InvalidParameterException

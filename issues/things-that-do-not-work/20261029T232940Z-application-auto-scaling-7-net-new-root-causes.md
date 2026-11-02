@@ -1,16 +1,16 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: application-auto-scaling.lambda-latest-and-unqualified-targets-rejected application-auto-scaling.lambda-target-on-a-missing-alias-rejected application-auto-scaling.lambda-utilization-target-given-as-a-percentage-rejected application-auto-scaling.scheduled-action-lifecycle application-auto-scaling.superseded-scaling-activity-resolves-to-overridden application-auto-scaling.custom-resource-stage-the-api-never-deployed-rejected application-auto-scaling.custom-resource-registration-floor-patches-the-endpoint application-auto-scaling.keyspaces-registration-floor-raises-the-table-write-capacity
+Issue-Trace-Ids: application-autoscaling.lambda-latest-and-unqualified-targets-rejected application-autoscaling.lambda-target-on-a-missing-alias-rejected application-autoscaling.lambda-utilization-target-given-as-a-percentage-rejected application-autoscaling.scheduled-action-lifecycle application-autoscaling.superseded-scaling-activity-resolves-to-overridden application-autoscaling.custom-resource-stage-the-api-never-deployed-rejected application-autoscaling.custom-resource-registration-floor-patches-the-endpoint application-autoscaling.keyspaces-registration-floor-raises-the-table-write-capacity
 Issue-Shape-Id: com.amazonaws.applicationautoscaling#AnyScaleFrontendService
-Issue-Key: application-auto-scaling.lambda-latest-and-unqualified-targets-rejected|run#8|AssertionError|assert (code, message) == ("ValidationException",
-Issue-Key: application-auto-scaling.lambda-target-on-a-missing-alias-rejected|_error#7|AssertionError|raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
-Issue-Key: application-auto-scaling.lambda-utilization-target-given-as-a-percentage-rejected|run#12|AssertionError|assert message == expected, f"refusal message {message!r}, expected {expected!r}"
-Issue-Key: application-auto-scaling.scheduled-action-lifecycle|run#23|AssertionError|assert error.get("Message") == (
-Issue-Key: application-auto-scaling.superseded-scaling-activity-resolves-to-overridden|run#20|AssertionError|assert oldest["StatusMessage"] == (
-Issue-Key: application-auto-scaling.custom-resource-stage-the-api-never-deployed-rejected|_error#9|AssertionError|raise AssertionError(f'expected the call to be refused, but it succeeded: {result!r}')
-Issue-Key: application-auto-scaling.custom-resource-registration-floor-patches-the-endpoint|_poll_until#5|Timeout|time.sleep(interval_s)
-Issue-Key: application-auto-scaling.keyspaces-registration-floor-raises-the-table-write-capacity|_poll_until#7|Timeout|time.sleep(interval_s)
+Issue-Key: application-autoscaling.lambda-latest-and-unqualified-targets-rejected|run#8|AssertionError|assert (code, message) == ("ValidationException",
+Issue-Key: application-autoscaling.lambda-target-on-a-missing-alias-rejected|_error#7|AssertionError|raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
+Issue-Key: application-autoscaling.lambda-utilization-target-given-as-a-percentage-rejected|run#12|AssertionError|assert message == expected, f"refusal message {message!r}, expected {expected!r}"
+Issue-Key: application-autoscaling.scheduled-action-lifecycle|run#23|AssertionError|assert error.get("Message") == (
+Issue-Key: application-autoscaling.superseded-scaling-activity-resolves-to-overridden|run#20|AssertionError|assert oldest["StatusMessage"] == (
+Issue-Key: application-autoscaling.custom-resource-stage-the-api-never-deployed-rejected|_error#9|AssertionError|raise AssertionError(f'expected the call to be refused, but it succeeded: {result!r}')
+Issue-Key: application-autoscaling.custom-resource-registration-floor-patches-the-endpoint|_poll_until#5|Timeout|time.sleep(interval_s)
+Issue-Key: application-autoscaling.keyspaces-registration-floor-raises-the-table-write-capacity|_poll_until#7|Timeout|time.sleep(interval_s)
 Issue-Commit: 54073c01592ce4e56a3cca58cb5387afed010108
 
 # Application Auto Scaling: 7 net-new root causes — Lambda/custom-resource target validation missing or misworded, refusal messages diverge, and a registration floor never drives a scaling activity

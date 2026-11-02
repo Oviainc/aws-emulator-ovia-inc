@@ -1,12 +1,12 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-handler-error-redelivers-whole-batch dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-invalid-item-identifier-rejected-whole-batch-redelivered dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-partial-batch-redelivers-exactly-reported-items lambda__sfn__sqs.sqs-esm-disabled-mapping-no-invocation-negative
+Issue-Trace-Ids: dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-handler-error-redelivers-whole-batch dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-invalid-item-identifier-rejected-whole-batch-redelivered dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-partial-batch-redelivers-exactly-reported-items lambda__sqs__stepfunctions.sqs-esm-disabled-mapping-no-invocation-negative
 Issue-Shape-Id: com.amazonaws.lambda#AWSGirApiService
 Issue-Key: dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-handler-error-redelivers-whole-batch|_poll_tally#5|Timeout|time.sleep(3)
 Issue-Key: dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-invalid-item-identifier-rejected-whole-batch-redelivered|_poll_tally#5|Timeout|time.sleep(3)
 Issue-Key: dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-partial-batch-redelivers-exactly-reported-items|_poll_tally#5|Timeout|time.sleep(3)
-Issue-Key: lambda__sfn__sqs.sqs-esm-disabled-mapping-no-invocation-negative|run#21|Timeout|resp = sqs.receive_message(QueueUrl=results["url"], MaxNumberOfMessages=10, WaitTimeSeconds=5)
+Issue-Key: lambda__sqs__stepfunctions.sqs-esm-disabled-mapping-no-invocation-negative|run#21|Timeout|resp = sqs.receive_message(QueueUrl=results["url"], MaxNumberOfMessages=10, WaitTimeSeconds=5)
 Issue-Commit: 029c92a6d753af7d483a2e508209908fa6f0a80e
 
 # lambda: an SQS event source mapping never consumes or delivers, so every delivery/redelivery flow built on one makes no progress and is killed at the suite's 60 s cap

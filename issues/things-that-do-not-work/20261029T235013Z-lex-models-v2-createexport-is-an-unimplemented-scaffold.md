@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2.create-export-rejects-locale-of-nonexistent-bot
+Issue-Trace-Ids: lexv2-models.create-export-rejects-locale-of-nonexistent-bot
 Issue-Shape-Id: com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2
-Issue-Key: lex-models-v2.create-export-rejects-locale-of-nonexistent-bot|run#4|AssertionError|assert code == "PreconditionFailedException", (
+Issue-Key: lexv2-models.create-export-rejects-locale-of-nonexistent-bot|run#4|AssertionError|assert code == "PreconditionFailedException", (
 Issue-Commit: c1b8e21acf710dd592fea1840f63adefca5c3a99
 
 # lex-models-v2 CreateExport is an unimplemented scaffold stub: a locale export of a nonexistent bot answers 501 NotImplemented instead of 412 PreconditionFailedException

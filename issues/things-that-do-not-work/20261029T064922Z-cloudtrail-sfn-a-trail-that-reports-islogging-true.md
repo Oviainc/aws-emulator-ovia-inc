@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudtrail__sfn.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added
-Issue-Key: cloudtrail__sfn.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added|run#26|TimeoutError|raise TimeoutError(
+Issue-Trace-Ids: cloudtrail__stepfunctions.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added
+Issue-Key: cloudtrail__stepfunctions.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added|run#26|TimeoutError|raise TimeoutError(
 Issue-Commit: 004a13bc6b62a404600c0a09686b1d7dd87c7440
 
 # cloudtrail__sfn: a trail that reports IsLogging=true delivers no log file to its S3 bucket/prefix at all, so neither a states.amazonaws.com management event nor an added Data selector's StartSyncExecution event ever arrives

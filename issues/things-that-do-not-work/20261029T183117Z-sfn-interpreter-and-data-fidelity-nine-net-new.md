@@ -1,25 +1,25 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.jsonata-output-and-states-input-transform sfn.choice-jsonata-condition-reads-assigned-variables sfn.choice-jsonata-assign-is-scoped-to-the-selected-rule sfn.deep-sfn-2-sfn-jsonata-catch-output-from-states-error-output sfn.deep-sfn-2-sfn-jsonata-map-items-expression-and-item-context sfn.deep-sfn-2-sfn-jsonata-mixed-query-language-state-override sfn.intrinsic-function-library-evaluates-exactly sfn.deep-sfn-language-hash-unsupported-algorithm-rejected sfn.deep-sfn-language-choice-nested-and-or-not-path-comparators sfn.execution-output-numeric-precision-preserved sfn.sfn-retry-with-backoff sfn.sfn-task-timeout sfn.deep-sfn-1-sfn-sync-child-fail-surfaces-as-task-failed-in-parent sfn.stop-execution-aborted-event-details-with-and-without-cause sfn.stop-execution-oversized-error-rejected-execution-keeps-running sfn.reject-update-state-machine-on-version-arn sfn.list-executions-missing-required-filter-rejected
+Issue-Trace-Ids: stepfunctions.jsonata-output-and-states-input-transform stepfunctions.choice-jsonata-condition-reads-assigned-variables stepfunctions.choice-jsonata-assign-is-scoped-to-the-selected-rule stepfunctions.deep-sfn-2-sfn-jsonata-catch-output-from-states-error-output stepfunctions.deep-sfn-2-sfn-jsonata-map-items-expression-and-item-context stepfunctions.deep-sfn-2-sfn-jsonata-mixed-query-language-state-override stepfunctions.intrinsic-function-library-evaluates-exactly stepfunctions.deep-sfn-language-hash-unsupported-algorithm-rejected stepfunctions.deep-sfn-language-choice-nested-and-or-not-path-comparators stepfunctions.execution-output-numeric-precision-preserved stepfunctions.sfn-retry-with-backoff stepfunctions.sfn-task-timeout stepfunctions.deep-sfn-1-sfn-sync-child-fail-surfaces-as-task-failed-in-parent stepfunctions.stop-execution-aborted-event-details-with-and-without-cause stepfunctions.stop-execution-oversized-error-rejected-execution-keeps-running stepfunctions.reject-update-state-machine-on-version-arn stepfunctions.list-executions-missing-required-filter-rejected
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.jsonata-output-and-states-input-transform|run#5|AssertionError|assert big["status"] == "SUCCEEDED", (
-Issue-Key: sfn.choice-jsonata-condition-reads-assigned-variables|run#6|AssertionError|assert desc["status"] == "SUCCEEDED", (
-Issue-Key: sfn.choice-jsonata-assign-is-scoped-to-the-selected-rule|run#5|AssertionError|assert desc["status"] == "SUCCEEDED", (
-Issue-Key: sfn.deep-sfn-2-sfn-jsonata-catch-output-from-states-error-output|run#8|AssertionError|assert exe["status"] == "SUCCEEDED", (
-Issue-Key: sfn.deep-sfn-2-sfn-jsonata-map-items-expression-and-item-context|run#6|AssertionError|assert exe["status"] == "SUCCEEDED", (
-Issue-Key: sfn.deep-sfn-2-sfn-jsonata-mixed-query-language-state-override|run#5|AssertionError|assert exe["status"] == "SUCCEEDED", (
-Issue-Key: sfn.intrinsic-function-library-evaluates-exactly|run#4|AssertionError|assert desc["status"] == "SUCCEEDED", (
-Issue-Key: sfn.deep-sfn-language-hash-unsupported-algorithm-rejected|run#4|AssertionError|assert good["status"] == "SUCCEEDED", (
-Issue-Key: sfn.deep-sfn-language-choice-nested-and-or-not-path-comparators|run#5|AssertionError|assert desc["status"] == "SUCCEEDED", (
-Issue-Key: sfn.execution-output-numeric-precision-preserved|run#14|AssertionError|assert output["bigInt"] == big_int, f"{output['bigInt']} != {big_int}"
-Issue-Key: sfn.sfn-retry-with-backoff|run#7|AssertionError|assert desc["status"] == "SUCCEEDED", (
-Issue-Key: sfn.sfn-task-timeout|run#8|AssertionError|assert desc.get("error") == "States.Timeout", (
-Issue-Key: sfn.deep-sfn-1-sfn-sync-child-fail-surfaces-as-task-failed-in-parent|run#19|JSONDecodeError|inner = json.loads(d["cause"])
-Issue-Key: sfn.stop-execution-aborted-event-details-with-and-without-cause|_wait_entered#6|Timeout|time.sleep(1)
-Issue-Key: sfn.stop-execution-oversized-error-rejected-execution-keeps-running|_wait_entered#5|Timeout|time.sleep(1)
-Issue-Key: sfn.reject-update-state-machine-on-version-arn|run#18|AssertionError|assert code == "StateMachineDoesNotExist", (
-Issue-Key: sfn.list-executions-missing-required-filter-rejected|run#11|AssertionError|assert message == "Must provide a StateMachine ARN or MapRun ARN", f"unexpected ValidationException message {message!r}"
+Issue-Key: stepfunctions.jsonata-output-and-states-input-transform|run#5|AssertionError|assert big["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.choice-jsonata-condition-reads-assigned-variables|run#6|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.choice-jsonata-assign-is-scoped-to-the-selected-rule|run#5|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.deep-sfn-2-sfn-jsonata-catch-output-from-states-error-output|run#8|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.deep-sfn-2-sfn-jsonata-map-items-expression-and-item-context|run#6|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.deep-sfn-2-sfn-jsonata-mixed-query-language-state-override|run#5|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.intrinsic-function-library-evaluates-exactly|run#4|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.deep-sfn-language-hash-unsupported-algorithm-rejected|run#4|AssertionError|assert good["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.deep-sfn-language-choice-nested-and-or-not-path-comparators|run#5|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.execution-output-numeric-precision-preserved|run#14|AssertionError|assert output["bigInt"] == big_int, f"{output['bigInt']} != {big_int}"
+Issue-Key: stepfunctions.sfn-retry-with-backoff|run#7|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: stepfunctions.sfn-task-timeout|run#8|AssertionError|assert desc.get("error") == "States.Timeout", (
+Issue-Key: stepfunctions.deep-sfn-1-sfn-sync-child-fail-surfaces-as-task-failed-in-parent|run#19|JSONDecodeError|inner = json.loads(d["cause"])
+Issue-Key: stepfunctions.stop-execution-aborted-event-details-with-and-without-cause|_wait_entered#6|Timeout|time.sleep(1)
+Issue-Key: stepfunctions.stop-execution-oversized-error-rejected-execution-keeps-running|_wait_entered#5|Timeout|time.sleep(1)
+Issue-Key: stepfunctions.reject-update-state-machine-on-version-arn|run#18|AssertionError|assert code == "StateMachineDoesNotExist", (
+Issue-Key: stepfunctions.list-executions-missing-required-filter-rejected|run#11|AssertionError|assert message == "Must provide a StateMachine ARN or MapRun ARN", f"unexpected ValidationException message {message!r}"
 Issue-Commit: dfc2bec1feea4e1eda9981ef982ae4c91760421c
 
 # sfn interpreter and data fidelity: nine net-new causes — JSONata never evaluated, States.Hash missing, Choice path comparators error on type mismatch, large integers lose precision, lambda:invoke never dispatched, StartSyncExecution returns a non-JSON body, StopExecution contracts never converge, and two control-plane classifications diverge (9 causes)

@@ -1,12 +1,12 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudtrail__iam.obs-iam-1-denied-create-user-is-audited-as-access-denied-naming-the-session cloudtrail.lookup-events-records-a-denied-call-with-errorcode-and-correlates-the-sdk-request-id cloudtrail__iam.obs-iam-1-absent-user-get-is-audited-as-no-such-entity-exception cloudtrail__cognito-idp.obs-cognito-idp-3-failed-and-denied-admin-get-user-calls-are-audited-with-their-error-code cloudtrail__sfn.obs-sfn-2-lookup-events-audits-start-execution-and-a-rejected-describe-state-machine
+Issue-Trace-Ids: cloudtrail__iam.obs-iam-1-denied-create-user-is-audited-as-access-denied-naming-the-session cloudtrail.lookup-events-records-a-denied-call-with-errorcode-and-correlates-the-sdk-request-id cloudtrail__iam.obs-iam-1-absent-user-get-is-audited-as-no-such-entity-exception cloudtrail__cognito-idp.obs-cognito-idp-3-failed-and-denied-admin-get-user-calls-are-audited-with-their-error-code cloudtrail__stepfunctions.obs-sfn-2-lookup-events-audits-start-execution-and-a-rejected-describe-state-machine
 Issue-Key: cloudtrail__iam.obs-iam-1-denied-create-user-is-audited-as-access-denied-naming-the-session|_error_of#33|AssertionError|raise AssertionError("the call succeeded; expected it to be refused")
 Issue-Key: cloudtrail.lookup-events-records-a-denied-call-with-errorcode-and-correlates-the-sdk-request-id|run#21|AssertionError|raise AssertionError(
 Issue-Key: cloudtrail__iam|GetUser|NoSuchEntity
 Issue-Key: cloudtrail__cognito-idp.obs-cognito-idp-3-failed-and-denied-admin-get-user-calls-are-audited-with-their-error-code|run#23|KeyError|ok_request_id = ok["ResponseMetadata"]["RequestId"]
-Issue-Key: cloudtrail__sfn.obs-sfn-2-lookup-events-audits-start-execution-and-a-rejected-describe-state-machine|run#23|KeyError|start_request_id = started["ResponseMetadata"]["RequestId"]
+Issue-Key: cloudtrail__stepfunctions.obs-sfn-2-lookup-events-audits-start-execution-and-a-rejected-describe-state-machine|run#23|KeyError|start_request_id = started["ResponseMetadata"]["RequestId"]
 Issue-Commit: c50178ef0adb9f41de3fed65acf95f496e080c81
 
 # No IAM authorization is evaluated (calls a session's policy does not grant succeed), and responses carry no RequestId in ResponseMetadata

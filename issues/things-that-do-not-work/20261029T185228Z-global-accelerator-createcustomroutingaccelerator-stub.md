@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: global-accelerator.custom-routing-listener-delete-rejects-associated-endpoint-group
+Issue-Trace-Ids: globalaccelerator.custom-routing-listener-delete-rejects-associated-endpoint-group
 Issue-Shape-Id: com.amazonaws.globalaccelerator#GlobalAccelerator_V20180706
 Issue-Key: global-accelerator|CreateCustomRoutingAccelerator|NotImplemented
 Issue-Commit: 611eef386f1100e1b77f5a1515bab52b7a7a6aeb

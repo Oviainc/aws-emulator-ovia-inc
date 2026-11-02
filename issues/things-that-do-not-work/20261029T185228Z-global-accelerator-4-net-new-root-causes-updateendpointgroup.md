@@ -1,12 +1,12 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: global-accelerator.endpoint-group-rejects-duplicate-region global-accelerator.traffic-dial-rejects-percentage-above-hundred global-accelerator.listener-delete-rejects-associated-endpoint-group global-accelerator.health-check-interval-rejects-unsupported-value
+Issue-Trace-Ids: globalaccelerator.endpoint-group-rejects-duplicate-region globalaccelerator.traffic-dial-rejects-percentage-above-hundred globalaccelerator.listener-delete-rejects-associated-endpoint-group globalaccelerator.health-check-interval-rejects-unsupported-value
 Issue-Shape-Id: com.amazonaws.globalaccelerator#GlobalAccelerator_V20180706
-Issue-Key: global-accelerator.endpoint-group-rejects-duplicate-region|run#9|AssertionError|assert message == "Endpoint group already exists.", (
-Issue-Key: global-accelerator.traffic-dial-rejects-percentage-above-hundred|run#8|AssertionError|assert message == _DIAL_150_MESSAGE, (
-Issue-Key: global-accelerator.listener-delete-rejects-associated-endpoint-group|run#10|AssertionError|assert message == expected, (
-Issue-Key: global-accelerator.health-check-interval-rejects-unsupported-value|run#9|AssertionError|assert code == "InvalidArgumentException", (
+Issue-Key: globalaccelerator.endpoint-group-rejects-duplicate-region|run#9|AssertionError|assert message == "Endpoint group already exists.", (
+Issue-Key: globalaccelerator.traffic-dial-rejects-percentage-above-hundred|run#8|AssertionError|assert message == _DIAL_150_MESSAGE, (
+Issue-Key: globalaccelerator.listener-delete-rejects-associated-endpoint-group|run#10|AssertionError|assert message == expected, (
+Issue-Key: globalaccelerator.health-check-interval-rejects-unsupported-value|run#9|AssertionError|assert code == "InvalidArgumentException", (
 Issue-Commit: 611eef386f1100e1b77f5a1515bab52b7a7a6aeb
 
 # global-accelerator: 4 net-new root causes — UpdateEndpointGroup is a 501 stub, and three refusal messages (duplicate endpoint group, traffic-dial constraint, DeleteListener conflict) use emulator-authored wording

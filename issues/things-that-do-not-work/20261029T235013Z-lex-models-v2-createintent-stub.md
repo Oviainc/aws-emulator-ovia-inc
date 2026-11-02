@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2.bot-locale-export-download-serves-created-content
+Issue-Trace-Ids: lexv2-models.bot-locale-export-download-serves-created-content
 Issue-Shape-Id: com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2
 Issue-Key: lex-models-v2|CreateIntent|NotImplemented
 Issue-Commit: c1b8e21acf710dd592fea1840f63adefca5c3a99

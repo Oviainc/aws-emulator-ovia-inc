@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: logs__cloudfront.obs-cloudfront-3-vended-access-logs-match-requests-and-stop-after-delete-delivery
-Issue-Key: logs__cloudfront.obs-cloudfront-3-vended-access-logs-match-requests-and-stop-after-delete-delivery|_poll_until#32|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: cloudfront__logs.obs-cloudfront-3-vended-access-logs-match-requests-and-stop-after-delete-delivery
+Issue-Key: cloudfront__logs.obs-cloudfront-3-vended-access-logs-match-requests-and-stop-after-delete-delivery|_poll_until#32|Timeout|time.sleep(interval_s)
 Issue-Commit: 3fc7e3e957d43d95045575b42258a9f9788f891e
 
 # logs__cloudfront: CloudFront vended access logs are never delivered and DeleteDelivery's severing contract is unreachable, because the edge serves no request to log (1 cause)

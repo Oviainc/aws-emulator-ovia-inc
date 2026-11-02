@@ -1,12 +1,12 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.configuration-set-sending-disabled-blocks-v2-send-email-then-restored ses.configuration-set-tracking-options-lifecycle-with-verified-domain ses.custom-verification-template-not-found-semantics ses.send-bulk-email-simulator-per-entry-message-ids
+Issue-Trace-Ids: sesv2.configuration-set-sending-disabled-blocks-v2-send-email-then-restored ses.configuration-set-tracking-options-lifecycle-with-verified-domain ses.custom-verification-template-not-found-semantics sesv2.send-bulk-email-simulator-per-entry-message-ids
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
-Issue-Key: ses.configuration-set-sending-disabled-blocks-v2-send-email-then-restored|_sending_domain#3|AssertionError|raise AssertionError(
+Issue-Key: sesv2.configuration-set-sending-disabled-blocks-v2-send-email-then-restored|_sending_domain#3|AssertionError|raise AssertionError(
 Issue-Key: ses.configuration-set-tracking-options-lifecycle-with-verified-domain|_verified_apex#4|AssertionError|raise AssertionError(
 Issue-Key: ses.custom-verification-template-not-found-semantics|_sending_domain#3|AssertionError|raise AssertionError(
-Issue-Key: ses.send-bulk-email-simulator-per-entry-message-ids|_dns_baseline_domain#5|AssertionError|raise AssertionError(
+Issue-Key: sesv2.send-bulk-email-simulator-per-entry-message-ids|_dns_baseline_domain#5|AssertionError|raise AssertionError(
 Issue-Commit: 5289dd65a4144c77c241afe8c5587a00323c4392
 
 # ses: the account's DNS-baseline public hosted zone is not discoverable through route53 ListHostedZones/ListTagsForResource, so four ses sending/configuration-set checks abort before any SES call is exercised

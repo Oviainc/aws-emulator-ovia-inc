@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.configuration-set-sending-disabled-blocks-v2-send-email-then-restored ses.tag-resource-reserved-prefix-and-key-limit-rejected ses.feedback-forwarding-toggle ses.identity-headers-in-notifications-toggle ses.identity-notification-topic-bogus-arn-rejected ses.deploy-ses-configuration-set-cfn-usable ses.deploy-ses-receipt-rule-set-cfn-activatable
+Issue-Trace-Ids: sesv2.configuration-set-sending-disabled-blocks-v2-send-email-then-restored sesv2.tag-resource-reserved-prefix-and-key-limit-rejected ses.feedback-forwarding-toggle ses.identity-headers-in-notifications-toggle ses.identity-notification-topic-bogus-arn-rejected ses.deploy-ses-configuration-set-cfn-usable ses.deploy-ses-receipt-rule-set-cfn-activatable
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
 Issue-Key: ses|PutConfigurationSetSendingOptions|NotImplemented
 Issue-Key: ses|TagResource|NotImplemented

@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: logs__cloudfront.obs-cloudfront-3-vended-access-logs-match-requests-and-stop-after-delete-delivery logs__s3.xsvc-logs-3-s3-access-log-delivery-denied-without-destination-grant
+Issue-Trace-Ids: cloudfront__logs.obs-cloudfront-3-vended-access-logs-match-requests-and-stop-after-delete-delivery logs__s3.xsvc-logs-3-s3-access-log-delivery-denied-without-destination-grant
 Issue-Key: cloudwatch-logs|CreateDelivery|NotImplemented
 Issue-Key: logs__s3.xsvc-logs-3-s3-access-log-delivery-denied-without-destination-grant|run#27|AssertionError|assert code == "AccessDeniedException", f"expected AccessDeniedException, got {code!r} ({message!r})"
 Issue-Commit: 461d317fc71f56ed8ab822edc66618d36d651bfa

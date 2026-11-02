@@ -1,10 +1,10 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.concurrent-template-create-exactly-one-body-renders ses.email-template-contract-limits-rejected
+Issue-Trace-Ids: sesv2.concurrent-template-create-exactly-one-body-renders sesv2.email-template-contract-limits-rejected
 Issue-Shape-Id: com.amazonaws.ses#SimpleEmailService
-Issue-Key: ses.concurrent-template-create-exactly-one-body-renders|run#15|AssertionError|assert code in refusals and message == refusals[code], (
-Issue-Key: ses.email-template-contract-limits-rejected|run#12|AssertionError|assert msg_data == expected_data_msg, f"expected message {expected_data_msg!r}, got {msg_data!r}"
+Issue-Key: sesv2.concurrent-template-create-exactly-one-body-renders|run#15|AssertionError|assert code in refusals and message == refusals[code], (
+Issue-Key: sesv2.email-template-contract-limits-rejected|run#12|AssertionError|assert msg_data == expected_data_msg, f"expected message {expected_data_msg!r}, got {msg_data!r}"
 Issue-Commit: de2a758d888a26724f6774bb8d661e6e5775621b
 
 # ses (sesv2 template plane): 3 net-new refusal-message divergences — the tagged CreateEmailTemplate duplicate refusal names the template and account, the templateData length violation echoes the whole 262145-byte value, and the 500 KB template-size refusal is reworded
