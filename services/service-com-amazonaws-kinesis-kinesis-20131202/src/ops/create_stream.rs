@@ -455,7 +455,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Shard-level metrics are `EnableEnhancedMonitoring`'s to turn on.
             shard_level_metrics: Vec::new(),
             warm_throughput_mi_bps: input.warm_throughput_mi_bps,
-            max_record_size_in_ki_b: input.max_record_size_in_ki_b,
+            // "The maximum record size of a single record in kibibyte (KiB) that you can
+            // write to, and read from a stream" (`StreamDescriptionSummary`): every stream
+            // is configured for one, so a create that names none takes the documented
+            // default record size, which is also the smallest value the member admits.
+            max_record_size_in_ki_b: input
+                .max_record_size_in_ki_b
+                .unwrap_or(crate::state::DEFAULT_MAX_RECORD_SIZE_KI_B),
             record_distribution_strategy: input.record_distribution_strategy,
             // Nothing has deleted the stream, so no removal is owed for it, and nothing
             // has rescaled it, so no re-tiling is owed either.

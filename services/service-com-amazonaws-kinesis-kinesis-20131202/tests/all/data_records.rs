@@ -102,10 +102,10 @@ impl Emulator {
                 }),
             )
             .await;
-        assert_eq!(
-            answer["EncryptionType"].as_str(),
-            Some(ENCRYPTION_TYPE_NONE),
-            "case {case}: a stream nothing encrypted stores records unencrypted, got {answer}"
+        assert!(
+            answer.get("EncryptionType").is_none(),
+            "case {case}: a stream nothing encrypted applies no encryption to a write, so \
+             the answer names no encryption type, got {answer}"
         );
         (
             answer["ShardId"]

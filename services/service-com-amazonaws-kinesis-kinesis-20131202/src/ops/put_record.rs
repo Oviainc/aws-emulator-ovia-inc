@@ -423,7 +423,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(PutRecordOutput {
             shard_id,
             sequence_number,
-            encryption_type: Some(encryption_type),
+            // "You can verify that encryption is applied by inspecting the API response
+            // from PutRecord or PutRecords" (`StartStreamEncryption`): the member reports
+            // the encryption this write APPLIED, so a stream with none reports no type at
+            // all rather than naming the enum's `NONE`.
+            encryption_type: crate::state::applied_encryption_type(&encryption_type),
         })
     }
 }

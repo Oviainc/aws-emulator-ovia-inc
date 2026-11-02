@@ -38,11 +38,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    stream_not_found_message, ACTIVATION_DELAY, DEFAULT_RETENTION_PERIOD_HOURS,
-    ENCRYPTION_TYPE_NONE, MAX_DESCRIBE_STREAM_SHARD_LIMIT, MAX_SHARDS_PER_REGION,
-    MAX_SHARDS_TOTAL, MAX_STREAM_TAGS, ON_DEMAND_INITIAL_SHARDS, SHARD_WRITE_MI_BPS,
-    STREAM_ACTIVE, STREAM_CREATING, STREAM_IDENTIFIER_REQUIRED_MESSAGE, STREAM_MODE_ON_DEMAND,
-    STREAM_MODE_PROVISIONED,
+    stream_not_found_message, ACTIVATION_DELAY, DEFAULT_MAX_RECORD_SIZE_KI_B,
+    DEFAULT_RETENTION_PERIOD_HOURS, ENCRYPTION_TYPE_NONE, MAX_DESCRIBE_STREAM_SHARD_LIMIT,
+    MAX_SHARDS_PER_REGION, MAX_SHARDS_TOTAL, MAX_STREAM_TAGS, ON_DEMAND_INITIAL_SHARDS,
+    SHARD_WRITE_MI_BPS, STREAM_ACTIVE, STREAM_CREATING, STREAM_IDENTIFIER_REQUIRED_MESSAGE,
+    STREAM_MODE_ON_DEMAND, STREAM_MODE_PROVISIONED,
 };
 use service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -442,9 +442,14 @@ async fn a_created_stream_is_reported_by_name_and_by_arn() {
         );
         assert_eq!(
             member(&summary, "MaxRecordSizeInKiB").and_then(Value::as_i64),
-            case.max_record_size_in_ki_b,
-            "case {label}: MaxRecordSizeInKiB must be exactly what the create named, got \
-             {summary}"
+            // Every stream is configured for a maximum record size: the value the create
+            // named, or the default record size a create that names none falls back to.
+            Some(
+                case.max_record_size_in_ki_b
+                    .unwrap_or(i64::from(DEFAULT_MAX_RECORD_SIZE_KI_B))
+            ),
+            "case {label}: MaxRecordSizeInKiB must be the maximum the stream is configured \
+             for, got {summary}"
         );
         assert_eq!(
             member(&summary, "RecordDistributionStrategy").and_then(Value::as_str),

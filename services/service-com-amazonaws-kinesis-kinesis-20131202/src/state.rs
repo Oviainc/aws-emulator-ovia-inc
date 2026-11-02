@@ -216,6 +216,20 @@ pub const ENCRYPTION_TYPE_NONE: &str = "NONE";
 /// type. The only valid value is KMS" (`StopStreamEncryptionInput$EncryptionType`).
 pub const ENCRYPTION_TYPE_KMS: &str = "KMS";
 
+/// The `EncryptionType` a data-plane answer reports for data the service encrypted under
+/// `encryption_type`, and nothing at all when it encrypted nothing.
+///
+/// The member is optional wherever it reports encryption APPLIED to data — "The encryption
+/// type to use on the record" (`PutRecordOutput$EncryptionType`), "The encryption type used
+/// on the records" (`PutRecordsOutput$EncryptionType`) — so its presence is what tells a
+/// producer that server-side encryption took effect, and a write to a stream with no
+/// encryption reports no type. A stream's own description reports the CONFIGURATION instead
+/// ("The encryption type used", `StreamDescriptionSummary$EncryptionType`), which every
+/// stream has, so that member keeps naming `NONE`.
+pub fn applied_encryption_type(encryption_type: &str) -> Option<String> {
+    (encryption_type != ENCRYPTION_TYPE_NONE).then(|| encryption_type.to_string())
+}
+
 /// How long after an encryption change the stream's `UPDATING` -> `ACTIVE` transition falls
 /// due. A CHOSEN span, not an AWS-documented duration ("Stopping encryption normally takes a
 /// few seconds to complete, but it can take minutes" names no value): it only has to be
@@ -946,8 +960,11 @@ pub struct Stream {
     pub shard_level_metrics: Vec<String>,
     /// `WarmThroughputMiBps`, when a create or an update asked for a target warm throughput.
     pub warm_throughput_mi_bps: Option<i32>,
-    /// `MaxRecordSizeInKiB`, when the create named one.
-    pub max_record_size_in_ki_b: Option<i32>,
+    /// `MaxRecordSizeInKiB`: the maximum size of one record this stream is configured for.
+    /// Every stream carries one — the value its create or a later update named, else
+    /// [`DEFAULT_MAX_RECORD_SIZE_KI_B`] — so the value a read reports is the value every
+    /// write to the stream is measured against ([`Stream::max_record_size_bytes`]).
+    pub max_record_size_in_ki_b: i32,
     /// `RecordDistributionStrategy`, which only an on-demand stream carries.
     pub record_distribution_strategy: Option<String>,
     /// When the stream's `DELETING` -> gone transition falls due, set by the
@@ -1067,15 +1084,12 @@ impl Stream {
     }
 
     /// The most bytes one record written to this stream may carry: the stream's own
-    /// `MaxRecordSizeInKiB` when the create named one, else the documented default — "Each
+    /// `MaxRecordSizeInKiB`, which is the value a read of the stream reports — "Each
     /// data record can be up to 1 MiB in size by default. Amazon Kinesis Data Streams
     /// supports large records up to 10 MiB in size" (`GetRecords`), the larger sizes being
     /// what `MaxRecordSizeInKiB` opts into.
     pub fn max_record_size_bytes(&self) -> usize {
-        let ki_b = self
-            .max_record_size_in_ki_b
-            .unwrap_or(DEFAULT_MAX_RECORD_SIZE_KI_B)
-            .max(1);
+        let ki_b = self.max_record_size_in_ki_b.max(1);
         usize::try_from(ki_b).unwrap_or(usize::MAX).saturating_mul(1024)
     }
 
@@ -1672,7 +1686,10 @@ impl Stream {
             // here; no channel is associated until `CreateChannel` creates one.
             consumer_count: Some(self.consumer_count()),
             warm_throughput: self.warm_throughput(),
-            max_record_size_in_ki_b: self.max_record_size_in_ki_b,
+            // Every stream is configured for a maximum record size, so every summary
+            // reports one: the value a create or an update named, or the default the
+            // stream fell back to.
+            max_record_size_in_ki_b: Some(self.max_record_size_in_ki_b),
             channel_count: Some(0),
             record_distribution_strategy: self.record_distribution_strategy.clone(),
         }
@@ -3100,12 +3117,18 @@ pub fn channel_already_exists_message(channel_name: &str) -> String {
 
 /// How an operation that needs a ready channel refuses one that is not ready yet: the rule
 /// `ResourceInUseException` publishes ("The resource is not available for this operation. For
-/// successful operation, the resource must be in the ACTIVE state"). Built FROM the request
-/// and the stored record, so the identifier and the status at fault name it.
-pub fn channel_not_active_message(identifier: &str, status: &str) -> String {
+/// successful operation, the resource must be in the ACTIVE state"), worded the way the
+/// service words that refusal for a channel — the channel named by the `ChannelName` it is
+/// stored under, the account that holds it, and the state it is in INSTEAD of `ACTIVE`.
+///
+/// Built from the STORED record rather than the request, the same way
+/// [`stream_not_active_message`] is: a channel is refused by the name it is stored under
+/// whichever identifier the request addressed it by.
+pub fn channel_not_active_message(channel_name: &str, status: &str) -> String {
     format!(
-        "channel {identifier} is in state {status}, not {CHANNEL_ACTIVE}; the channel must be \
-         {CHANNEL_ACTIVE} for this operation"
+        "Channel {channel_name} under account {} not {CHANNEL_ACTIVE}, instead in state \
+         {status}.",
+        ::engine::emulator_account_id()
     )
 }
 
@@ -3585,10 +3608,12 @@ pub const PARTITION_KEY_REQUIRED_MESSAGE: &str =
     "PartitionKey is required for a stream that uses the USER_PARTITION_KEY record \
      distribution strategy";
 
-/// The maximum size of one data record when the stream names no `MaxRecordSizeInKiB`:
-/// "Each data record can be up to 1 MiB in size by default. Amazon Kinesis Data Streams
-/// supports large records up to 10 MiB in size" (`GetRecords`) — which is also the
-/// smallest value `MaxRecordSizeInKiB` is modelled to take (`range 1024..10240`).
+/// The maximum record size a stream is configured for when its create names no
+/// `MaxRecordSizeInKiB`, in KiB: "Each data record can be up to 1 MiB in size by default.
+/// Amazon Kinesis Data Streams supports large records up to 10 MiB in size" (`GetRecords`)
+/// — which is also the smallest value `MaxRecordSizeInKiB` is modelled to take (`range
+/// 1024..10240`). Every stream carries a maximum, so this is what a create that names none
+/// stores and what a read of such a stream reports.
 pub const DEFAULT_MAX_RECORD_SIZE_KI_B: i32 = 1_024;
 
 /// The most bytes one `PutRecords` request carries across its entries: "Each PutRecords

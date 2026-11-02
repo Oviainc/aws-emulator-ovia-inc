@@ -24,7 +24,6 @@
 //! and bodies asserted here are the ones a client sees.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_kinesis_kinesis_20131202::state::ENCRYPTION_TYPE_NONE;
 
 // The one wire harness this crate's suites share — a router carrying exactly this service
 // over one shared engine, with the signing and error-body helpers around it.
@@ -219,10 +218,10 @@ async fn an_accepted_batch_always_reports_its_failure_count() {
                 "case {case}: expected a batch every entry of which was stored to report 0, got \
                  {reported} in {answer}"
             );
-            assert_eq!(
-                answer["EncryptionType"].as_str(),
-                Some(ENCRYPTION_TYPE_NONE),
-                "case {case}: a stream nothing encrypted stores records unencrypted, got {answer}"
+            assert!(
+                answer.get("EncryptionType").is_none(),
+                "case {case}: a stream nothing encrypted applies no encryption to a batch, so \
+                 the answer names no encryption type, got {answer}"
             );
             for (index, entry) in answer["Records"]
                 .as_array()

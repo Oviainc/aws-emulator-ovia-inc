@@ -562,8 +562,9 @@ async fn deleting_a_stream_nothing_created_is_refused() {
         "a missing stream is refused with the service's stream-not-found sentence"
     );
 
-    // A stream whose creation has not fallen due yet is not ACTIVE, so it cannot be deleted
-    // yet either.
+    // A stream whose creation has not fallen due yet is deleted all the same: the removal
+    // does not wait for the stream to reach ACTIVE, it only needs a stream this account
+    // holds whose removal has not already been accepted.
     emulator
         .ok(
             "creating",
@@ -571,6 +572,19 @@ async fn deleting_a_stream_nothing_created_is_refused() {
             &json!({"StreamName": "delete-creating", "ShardCount": 1}),
         )
         .await;
+    emulator
+        .ok(
+            "creating",
+            "DeleteStream",
+            &json!({"StreamName": "delete-creating"}),
+        )
+        .await;
+    assert_eq!(
+        stream_status(&emulator, "delete-creating").await,
+        Ok(STREAM_DELETING.to_string()),
+        "case creating: a stream a delete was accepted for reports DELETING"
+    );
+    // The accepted delete is the only one: a second request has nothing left to accept.
     let (code, message) = refused(
         &emulator,
         "creating",
@@ -580,14 +594,19 @@ async fn deleting_a_stream_nothing_created_is_refused() {
     .await;
     assert_eq!(
         code, "ResourceInUseException",
-        "case creating: expected ResourceInUseException, got {code} with message {message:?}"
+        "case creating: a stream already DELETING is refused, got {code} with message \
+         {message:?}"
     );
-    tokio::time::sleep(past_activation()).await;
-    emulator
-        .ok(
-            "creating",
-            "DeleteStream",
-            &json!({"StreamName": "delete-creating"}),
-        )
-        .await;
+    tokio::time::sleep(past_deletion()).await;
+    let (code, _) = refused(
+        &emulator,
+        "creating",
+        "DeleteStream",
+        &json!({"StreamName": "delete-creating"}),
+    )
+    .await;
+    assert_eq!(
+        code, "ResourceNotFoundException",
+        "case creating: once the removal falls due the stream names no resource at all"
+    );
 }

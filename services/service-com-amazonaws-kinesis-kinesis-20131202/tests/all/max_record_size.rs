@@ -136,9 +136,10 @@ fn write_of(stream_arn: &str, total: usize) -> Value {
     })
 }
 
-/// The `MaxRecordSizeInKiB` `DescribeStreamSummary` reports for the stream named `name`,
-/// `None` when the stream carries none.
-async fn reported_maximum(emulator: &Emulator, case: &str, name: &str) -> Option<i64> {
+/// The `MaxRecordSizeInKiB` `DescribeStreamSummary` reports for the stream named `name`.
+/// Every stream is configured for one, so a summary that carries no such member is a
+/// failure rather than an absent value.
+async fn reported_maximum(emulator: &Emulator, case: &str, name: &str) -> i64 {
     let summary = emulator
         .ok(
             case,
@@ -150,6 +151,16 @@ async fn reported_maximum(emulator: &Emulator, case: &str, name: &str) -> Option
         .get("StreamDescriptionSummary")
         .and_then(|summary| summary.get("MaxRecordSizeInKiB"))
         .and_then(Value::as_i64)
+        .unwrap_or_else(|| {
+            panic!("case {case}: the summary must report a MaxRecordSizeInKiB, got {summary}")
+        })
+}
+
+/// The maximum the stream of `row` carries before anything updates it: what its create
+/// named, else the default a create that names none falls back to.
+fn created_maximum(row: &Row) -> i64 {
+    row.created_with
+        .unwrap_or(i64::from(DEFAULT_MAX_RECORD_SIZE_KI_B))
 }
 
 /// The `StreamStatus` `DescribeStreamSummary` reports for the stream named `name`.
@@ -189,10 +200,10 @@ async fn an_update_stores_the_maximum_every_later_read_and_write_uses() {
         // asserted after it is the one the UPDATE stored.
         assert_eq!(
             reported_maximum(&emulator, case, case).await,
-            row.created_with,
-            "case {case}: before the update the stream carries what its create named \
-             ({:?}), got {:?}",
-            row.created_with,
+            created_maximum(&row),
+            "case {case}: before the update the stream carries what its create named, else \
+             the default ({}), got {}",
+            created_maximum(&row),
             reported_maximum(&emulator, case, case).await
         );
 
@@ -208,7 +219,7 @@ async fn an_update_stores_the_maximum_every_later_read_and_write_uses() {
         let read = reported_maximum(&emulator, case, case).await;
         assert_eq!(
             read,
-            Some(row.updated_to),
+            row.updated_to,
             "case {case}: expected the stored MaxRecordSizeInKiB {}, got {read:?}",
             row.updated_to
         );
@@ -279,7 +290,7 @@ async fn an_update_stores_the_maximum_every_later_read_and_write_uses() {
         let read = reported_maximum(&emulator, case, case).await;
         assert_eq!(
             read,
-            Some(row.updated_to),
+            row.updated_to,
             "case {case}: re-applying {} changes nothing, got {read:?}",
             row.updated_to
         );
@@ -319,8 +330,9 @@ async fn an_update_changes_only_the_stream_it_names() {
 
     assert_eq!(
         reported_maximum(&emulator, case, untouched).await,
-        None,
-        "case {case}: the stream the update did not name carries no maximum of its own"
+        i64::from(DEFAULT_MAX_RECORD_SIZE_KI_B),
+        "case {case}: the stream the update did not name keeps the default maximum its \
+         create fell back to"
     );
 
     // The default maximum a stream that names none falls back to still bounds the untouched
@@ -480,7 +492,7 @@ async fn a_request_naming_no_stream_of_this_account_and_region_is_refused() {
     // The stream this account does hold is untouched by the refusals.
     assert_eq!(
         reported_maximum(&emulator, "after the refusals", name).await,
-        None,
+        i64::from(DEFAULT_MAX_RECORD_SIZE_KI_B),
         "case after the refusals: a refused update stores nothing"
     );
 }
@@ -549,7 +561,7 @@ async fn an_update_of_a_stream_that_is_not_active_is_refused() {
         );
         assert_eq!(
             reported_maximum(&emulator, name, name).await,
-            None,
+            i64::from(DEFAULT_MAX_RECORD_SIZE_KI_B),
             "case {name}: a refused update stores nothing"
         );
     }
@@ -584,7 +596,7 @@ async fn a_value_outside_the_published_range_is_refused() {
             .await;
         assert_eq!(
             reported_maximum(&emulator, name, name).await,
-            Some(accepted),
+            accepted,
             "case {accepted}: a value on a published bound is stored"
         );
     }
@@ -624,7 +636,7 @@ async fn a_value_outside_the_published_range_is_refused() {
 
     assert_eq!(
         reported_maximum(&emulator, name, name).await,
-        Some(stored),
+        stored,
         "case after the refusals: a refused update leaves the stored maximum as it was"
     );
 }

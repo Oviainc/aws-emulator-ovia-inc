@@ -369,7 +369,6 @@ async fn an_update_writes_exactly_the_members_it_names() {
 async fn one_winner(
     emulator: &Emulator,
     case: &str,
-    arn: &str,
     bodies: [Value; 4],
     reported: fn(&Value) -> Value,
 ) -> Value {
@@ -402,10 +401,14 @@ async fn one_winner(
             "case {case}: expected a loser to be refused with ResourceInUseException, got \
              {response}"
         );
-        let says = format!("channel {arn} is in state {UPDATING}");
-        assert!(
-            error_message(response).contains(&says),
-            "case {case}: expected the refusal to name {says:?}, got {:?}",
+        let says = format!(
+            "Channel {case} under account {} not {ACTIVE}, instead in state {UPDATING}.",
+            engine::EMULATOR_ACCOUNT_ID
+        );
+        assert_eq!(
+            error_message(response),
+            says,
+            "case {case}: expected the refusal to state {says:?}, got {:?}",
             error_message(response)
         );
     }
@@ -458,7 +461,6 @@ async fn overlapping_changes_admit_exactly_one_winner() {
     let won = one_winner(
         &emulator,
         freshness_case,
-        &freshness_arn,
         freshness_bodies,
         |description| description["S3DestinationConfiguration"]["DataFreshnessInSeconds"].clone(),
     )
@@ -481,7 +483,6 @@ async fn overlapping_changes_admit_exactly_one_winner() {
     let won = one_winner(
         &emulator,
         logging_case,
-        &logging_arn,
         logging_bodies,
         |description| description["LoggingConfiguration"]["CloudWatchLogs"]["LogStreamName"].clone(),
     )
@@ -580,10 +581,14 @@ async fn a_channel_that_is_not_active_admits_no_change() {
         "ResourceInUseException",
         "case {case}: expected ResourceInUseException, got {response}"
     );
-    let says = format!("channel {arn} is in state {CREATING}");
-    assert!(
-        error_message(&response).contains(&says),
-        "case {case}: expected the refusal to name {says:?}, got {:?}",
+    let says = format!(
+        "Channel {case} under account {} not {ACTIVE}, instead in state {CREATING}.",
+        engine::EMULATOR_ACCOUNT_ID
+    );
+    assert_eq!(
+        error_message(&response),
+        says,
+        "case {case}: expected the refusal to state {says:?}, got {:?}",
         error_message(&response)
     );
 
@@ -609,10 +614,14 @@ async fn a_channel_that_is_not_active_admits_no_change() {
         "ResourceInUseException",
         "case {case}: expected ResourceInUseException, got {response}"
     );
-    let says = format!("channel {arn} is in state {UPDATING}");
-    assert!(
-        error_message(&response).contains(&says),
-        "case {case}: expected the refusal to name {says:?}, got {:?}",
+    let says = format!(
+        "Channel {case} under account {} not {ACTIVE}, instead in state {UPDATING}.",
+        engine::EMULATOR_ACCOUNT_ID
+    );
+    assert_eq!(
+        error_message(&response),
+        says,
+        "case {case}: expected the refusal to state {says:?}, got {:?}",
         error_message(&response)
     );
 

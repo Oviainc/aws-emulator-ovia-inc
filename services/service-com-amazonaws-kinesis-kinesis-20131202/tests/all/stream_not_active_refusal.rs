@@ -166,7 +166,6 @@ const ACTIVE_ONLY_OPERATIONS: &[&str] = &[
     "UpdateMaxRecordSize",
     "UpdateShardCount",
     "RegisterStreamConsumer",
-    "DeleteStream",
     "IncreaseStreamRetentionPeriod",
     "DecreaseStreamRetentionPeriod",
     "EnableEnhancedMonitoring",
@@ -313,6 +312,70 @@ async fn a_serving_operation_states_the_same_sentence_in_its_own_modelled_error(
         )
         .await;
     }
+}
+
+/// `DeleteStream` is NOT one of them: a stream is "ready for read and write operations or
+/// deletion" once `ACTIVE`, but the removal does not WAIT for that state — the delete of a
+/// stream whose create or whose change is still in flight is accepted, and only a stream
+/// whose removal has already been accepted has nothing left to accept, which is what the one
+/// sentence names for `DELETING`.
+#[tokio::test]
+async fn a_delete_is_accepted_before_the_stream_is_active_and_refused_once_it_is_deleting() {
+    let emulator = Emulator::new();
+
+    // A stream still inside the transition its create armed.
+    let creating = "delete-while-creating";
+    creating_stream(&emulator, creating).await;
+    emulator
+        .ok(
+            creating,
+            "DeleteStream",
+            &json!({ "StreamName": creating }),
+        )
+        .await;
+    // That accepted delete is what put the stream in `DELETING`, so a second one has
+    // nothing left to accept.
+    assert_refused_with_the_sentence(
+        &emulator,
+        creating,
+        "DeleteStream",
+        creating,
+        "ResourceInUseException",
+        STREAM_DELETING,
+    )
+    .await;
+
+    // And a stream whose shard-count change is still in flight.
+    let updating = "delete-while-updating";
+    creating_stream(&emulator, updating).await;
+    tokio::time::sleep(past_activation()).await;
+    emulator
+        .ok(
+            updating,
+            "UpdateShardCount",
+            &json!({
+                "StreamName": updating,
+                "TargetShardCount": 3,
+                "ScalingType": "UNIFORM_SCALING",
+            }),
+        )
+        .await;
+    emulator
+        .ok(
+            updating,
+            "DeleteStream",
+            &json!({ "StreamName": updating }),
+        )
+        .await;
+    assert_refused_with_the_sentence(
+        &emulator,
+        updating,
+        "DeleteStream",
+        updating,
+        "ResourceInUseException",
+        STREAM_DELETING,
+    )
+    .await;
 }
 
 /// The stream a refusal names is the STORED one: a request that addresses the stream by its

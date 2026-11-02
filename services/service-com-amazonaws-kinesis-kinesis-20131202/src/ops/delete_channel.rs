@@ -217,7 +217,8 @@ fn delete_channel(
     let status = channel.status(now);
     if status != crate::state::CHANNEL_ACTIVE {
         return Err(resource_in_use(crate::state::channel_not_active_message(
-            identifier, status,
+            &channel.name,
+            status,
         )));
     }
 

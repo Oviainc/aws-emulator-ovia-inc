@@ -247,13 +247,15 @@ fn delete_stream(
         )
         .map_err(|failure| lookup_refusal(failure, input))?;
 
-    // "If the stream is in the ACTIVE state, you can delete it" (`DeleteStream`), so a
-    // stream still inside the transition its create armed, and one a delete has already
-    // been accepted for, are refused with the error that rule publishes ("The resource is
-    // not available for this operation. For successful operation, the resource must be in
-    // the ACTIVE state").
+    // A stream is "ready for read and write operations or deletion" in `ACTIVE`
+    // (`StreamStatus`), but reaching that state is not a precondition of the removal: a
+    // stream whose create or whose change is still in flight is deleted the moment the
+    // request arrives, and only a stream whose removal has ALREADY been accepted is refused
+    // with the error that rule publishes ("The resource is not available for this operation.
+    // For successful operation, the resource must be in the ACTIVE state") — there is
+    // nothing left to accept for it.
     let status = stream.status(now);
-    if status != crate::state::STREAM_ACTIVE {
+    if status == crate::state::STREAM_DELETING {
         return Err(DeleteStreamErrorModeled::ResourceInUseException(
             ResourceInUseException {
                 message: Some(crate::state::stream_not_active_message(

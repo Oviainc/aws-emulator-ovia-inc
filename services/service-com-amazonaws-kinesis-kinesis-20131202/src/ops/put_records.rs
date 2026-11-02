@@ -451,7 +451,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // idiom reads the count on every response to decide whether any entry needs
             // writing again.
             failed_record_count: Some(failed),
-            encryption_type: Some(encryption_type),
+            // "You can verify that encryption is applied by inspecting the API response
+            // from PutRecord or PutRecords" (`StartStreamEncryption`): the member reports
+            // the encryption this batch was stored under, so a stream with none reports no
+            // type at all rather than naming the enum's `NONE`.
+            encryption_type: crate::state::applied_encryption_type(&encryption_type),
         })
     }
 }

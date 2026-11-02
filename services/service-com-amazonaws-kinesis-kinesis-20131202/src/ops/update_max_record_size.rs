@@ -210,7 +210,7 @@ fn apply_update(
     // value that is out of this range, UpdateMaxRecordSize sends back an ValidationException
     // message" (`UpdateMaxRecordSizeInput$MaxRecordSizeInKiB`) — so a value that reaches
     // here is one a stream may carry.
-    stream.max_record_size_in_ki_b = Some(input.max_record_size_in_ki_b);
+    stream.max_record_size_in_ki_b = input.max_record_size_in_ki_b;
     Ok(())
 }
 

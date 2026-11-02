@@ -9,10 +9,11 @@
 //! to the stream... you can verify that encryption is applied by inspecting the API response
 //! from PutRecord or PutRecords" (`StartStreamEncryption`) — and `Record$EncryptionType` is
 //! "the encryption type used on the record", so a reader served that record later is told the
-//! type it was written under, whatever the stream's encryption is by then. A stream nothing
-//! has encrypted reports `NONE` for its records, one `StartStreamEncryption` has encrypted
-//! reports `KMS`, and one `StopStreamEncryption` has disabled reports `NONE` again — while
-//! the records written in between keep theirs.
+//! type it was written under, whatever the stream's encryption is by then. A write to a
+//! stream nothing has encrypted applied no encryption, so its answer names no type at all; a
+//! write to one `StartStreamEncryption` has encrypted names `KMS`, and a write once
+//! `StopStreamEncryption` has disabled it names none again — while the records written in
+//! between keep theirs.
 //!
 //! `stream_encryption.rs` covers what the two encryption operations STORE and what a
 //! description reports; this suite covers the other reader of that stored configuration, the
@@ -52,8 +53,14 @@ fn data(bytes: &[u8]) -> Value {
     json!(aws_smithy_types::base64::encode(bytes))
 }
 
-/// Write one record to `name` and answer the `EncryptionType` `PutRecord` reports for it.
-async fn write_one(emulator: &Emulator, case: &str, name: &str, payload: &str) -> String {
+/// Write one record to `name` and answer the `EncryptionType` `PutRecord` reports for it,
+/// `None` when the answer names none.
+async fn write_one(
+    emulator: &Emulator,
+    case: &str,
+    name: &str,
+    payload: &str,
+) -> Option<String> {
     let answer = emulator
         .ok(
             case,
@@ -65,12 +72,17 @@ async fn write_one(emulator: &Emulator, case: &str, name: &str, payload: &str) -
             }),
         )
         .await;
-    reported_type(case, "PutRecord", &answer)
+    reported_type(&answer)
 }
 
 /// Write `payloads` as ONE batch to `name` and answer the `EncryptionType` `PutRecords`
-/// reports for the batch.
-async fn write_batch(emulator: &Emulator, case: &str, name: &str, payloads: &[&str]) -> String {
+/// reports for the batch, `None` when the answer names none.
+async fn write_batch(
+    emulator: &Emulator,
+    case: &str,
+    name: &str,
+    payloads: &[&str],
+) -> Option<String> {
     let entries: Vec<Value> = payloads
         .iter()
         .map(|payload| {
@@ -89,18 +101,17 @@ async fn write_batch(emulator: &Emulator, case: &str, name: &str, payloads: &[&s
         Some(0),
         "case {case}: expected every entry of the batch to be stored, got {answer}"
     );
-    reported_type(case, "PutRecords", &answer)
+    reported_type(&answer)
 }
 
-/// The `EncryptionType` a write's answer carries.
-fn reported_type(case: &str, operation: &str, answer: &Value) -> String {
+/// The `EncryptionType` a write's answer carries, `None` when it carries none: the member is
+/// optional and reports the encryption the write APPLIED, so a write that encrypted nothing
+/// names no type.
+fn reported_type(answer: &Value) -> Option<String> {
     answer
         .get("EncryptionType")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            panic!("case {case}: {operation} must report an EncryptionType, got {answer}")
-        })
-        .to_string()
+        .map(str::to_string)
 }
 
 /// Turn encryption on for `name` and wait for the change to fall due.
@@ -209,18 +220,18 @@ async fn a_record_is_reported_under_the_encryption_in_force_when_it_was_written(
         .await;
     tokio::time::sleep(past_activation()).await;
 
-    // Before anything encrypts the stream: a single write and a batch are both NONE.
+    // Before anything encrypts the stream: neither a single write nor a batch names a type.
     let single_before = write_one(&emulator, case, case, "plain-single").await;
     assert_eq!(
-        single_before, ENCRYPTION_TYPE_NONE,
-        "case {case}: expected a record written to an unencrypted stream to be reported under \
-         {ENCRYPTION_TYPE_NONE}, got {single_before}"
+        single_before, None,
+        "case {case}: expected a write to an unencrypted stream to name no encryption type, \
+         got {single_before:?}"
     );
     let batch_before = write_batch(&emulator, case, case, &["plain-batch-1", "plain-batch-2"]).await;
     assert_eq!(
-        batch_before, ENCRYPTION_TYPE_NONE,
-        "case {case}: expected a batch written to an unencrypted stream to be reported under \
-         {ENCRYPTION_TYPE_NONE}, got {batch_before}"
+        batch_before, None,
+        "case {case}: expected a batch written to an unencrypted stream to name no \
+         encryption type, got {batch_before:?}"
     );
 
     // "Once the status of the stream is ACTIVE, encryption begins for records written to the
@@ -229,24 +240,27 @@ async fn a_record_is_reported_under_the_encryption_in_force_when_it_was_written(
     encrypt(&emulator, case, case).await;
     let single_encrypted = write_one(&emulator, case, case, "kms-single").await;
     assert_eq!(
-        single_encrypted, ENCRYPTION_TYPE_KMS,
+        single_encrypted.as_deref(),
+        Some(ENCRYPTION_TYPE_KMS),
         "case {case}: expected a record written to the encrypted stream to be reported under \
-         {ENCRYPTION_TYPE_KMS}, got {single_encrypted}"
+         {ENCRYPTION_TYPE_KMS}, got {single_encrypted:?}"
     );
     let batch_encrypted = write_batch(&emulator, case, case, &["kms-batch-1", "kms-batch-2"]).await;
     assert_eq!(
-        batch_encrypted, ENCRYPTION_TYPE_KMS,
+        batch_encrypted.as_deref(),
+        Some(ENCRYPTION_TYPE_KMS),
         "case {case}: expected a batch written to the encrypted stream to be reported under \
-         {ENCRYPTION_TYPE_KMS}, got {batch_encrypted}"
+         {ENCRYPTION_TYPE_KMS}, got {batch_encrypted:?}"
     );
 
-    // Encryption disabled again: what is written from then on is not encrypted.
+    // Encryption disabled again: what is written from then on is not encrypted, so the
+    // answer names no type.
     decrypt(&emulator, case, case).await;
     let single_after = write_one(&emulator, case, case, "plain-again").await;
     assert_eq!(
-        single_after, ENCRYPTION_TYPE_NONE,
-        "case {case}: expected a record written once encryption was disabled to be reported \
-         under {ENCRYPTION_TYPE_NONE}, got {single_after}"
+        single_after, None,
+        "case {case}: expected a write once encryption was disabled to name no encryption \
+         type, got {single_after:?}"
     );
 
     // Every record is served under the type it was WRITTEN under, so the two changes of the
