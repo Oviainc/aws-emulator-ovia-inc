@@ -47,7 +47,10 @@ const QUERY_STATEMENT_FIELD: &str = "Export.DataQuery.QueryStatement";
 const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
 /// A column name no table of the catalog publishes — the one the issue cited.
-const UNPUBLISHED_COLUMN: &str = "not_a_real_column";
+///
+/// `pub(crate)` so a suite asserting the same rule over another part of a statement names
+/// the SAME unpublished column rather than growing a second spelling of it.
+pub(crate) const UNPUBLISHED_COLUMN: &str = "not_a_real_column";
 
 /// The `Export` a row submits: a definition that satisfies every modelled constraint, with
 /// the name, the query statement and the table configurations substituted.
@@ -80,7 +83,14 @@ pub(crate) fn export_name(label: &str) -> String {
 /// The columns `table` PUBLISHES under `properties`, as `GetTable` reports them — the
 /// service's own published schema for that configuration, which is what a query statement
 /// is judged against.
-async fn published_columns(client: &Client, table: &str, properties: Option<&Value>) -> Vec<String> {
+///
+/// `pub(crate)` so every suite in this target reads the published column set through the
+/// service's own `GetTable` rather than restating a column list of its own.
+pub(crate) async fn published_columns(
+    client: &Client,
+    table: &str,
+    properties: Option<&Value>,
+) -> Vec<String> {
     let mut request = Map::new();
     request.insert("TableName".to_string(), json!(table));
     if let Some(properties) = properties {
@@ -197,7 +207,12 @@ pub(crate) fn assert_column_refused(case: &str, status: u16, body: &Value, colum
 ///
 /// Read off the service's published catalog (`TABLE_CATALOG`, which `ListTables` reports),
 /// so a gated column no issue ever cited is covered too.
-fn gated_columns(spec: &TableSpec) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+///
+/// `pub(crate)` so a suite asserting another half of the column rule walks the SAME gated
+/// columns rather than listing them again.
+pub(crate) fn gated_columns(
+    spec: &TableSpec,
+) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     spec.columns()
         .filter_map(|column| {
             let (property, publishing) = column.requires?;

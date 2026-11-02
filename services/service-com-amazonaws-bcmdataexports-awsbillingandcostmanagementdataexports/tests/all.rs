@@ -61,6 +61,8 @@ mod page_token_refusal;
 mod page_token_spelling;
 #[path = "all/property_gated_columns.rs"]
 mod property_gated_columns;
+#[path = "all/query_alias_scope.rs"]
+mod query_alias_scope;
 #[path = "all/query_column_selection.rs"]
 mod query_column_selection;
 #[path = "all/query_statement_subset.rs"]

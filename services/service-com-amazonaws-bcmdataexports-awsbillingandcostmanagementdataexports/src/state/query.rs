@@ -33,8 +33,13 @@
 //!
 //! Two kinds of name are NOT column references, and neither is checked:
 //!
-//! * a name the statement ITSELF defines — the alias of a select item, which a later
-//!   clause of the same statement can name;
+//! * a name the statement ITSELF defines, WHERE THAT NAME IS IN SCOPE — the alias of a
+//!   select item, which a later clause of the same statement, or a query reading that
+//!   one, can name. A select list is not such a clause: the names a select list defines
+//!   are not in scope in the expressions of that same select list, so an identifier
+//!   standing in one of them is a column reference like any other and is checked against
+//!   the published columns — which is what keeps an unpublished name aliased to itself
+//!   (`SELECT c AS c`) from resolving against its own definition;
 //! * the parts of a qualified reference other than the one that resolves: the parts before
 //!   the column qualify a relation (by table name or by alias) and the parts after index
 //!   into the column's own value, and the catalog publishes neither. A qualified reference
@@ -96,7 +101,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Expr, Ident, ObjectName, Query, SelectItem, SetExpr, Statement, Visit, Visitor,
+    Expr, ObjectName, Query, SelectItem, SetExpr, Statement, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -256,11 +261,36 @@ fn nesting_depth(statement: &str) -> usize {
 pub struct QueryShape {
     /// Every relation the statement names, in walk order, each once.
     pub tables: Vec<String>,
-    /// Every column reference the statement makes, in walk order, each once.
+    /// Every column reference the statement makes, in walk order: each once per scope it
+    /// was read in, so a reference written in a select list is kept both as that list reads
+    /// it and as the statement at large does.
     columns: Vec<ColumnReference>,
     /// The names the statement itself DEFINES: the alias of a select item, which a later
     /// clause of the same statement may name although no table publishes it.
     defined: BTreeSet<String>,
+    /// The aliases of each SELECT LIST the statement writes, in the order they were read:
+    /// the names that list defines, which its own expressions cannot name because a select
+    /// list defines them for the clauses that come after it. A reference written in one
+    /// carries that list's index.
+    select_lists: Vec<BTreeSet<String>>,
+}
+
+impl QueryShape {
+    /// Is `name` — a name the statement defines — in scope where `reference` stands?
+    ///
+    /// It is everywhere except in the expressions of the select list that defines it.
+    fn defined_name_in_scope(&self, reference: &ColumnReference, name: &str) -> bool {
+        let Some(list) = reference.select_list else {
+            // Anywhere but a select list, every name the statement defines is in scope.
+            return true;
+        };
+        // The index was handed out by the walk that recorded the list, so a missing entry
+        // is unreachable; reading it as a list that defines nothing keeps this total
+        // rather than indexing.
+        self.select_lists
+            .get(list)
+            .is_none_or(|defined| !defined.contains(name))
+    }
 }
 
 /// One column reference a statement makes.
@@ -272,6 +302,11 @@ struct ColumnReference {
     parts: Vec<String>,
     /// The reference as the statement writes it, which is what a refusal names.
     written: String,
+    /// The select list this reference is written in, as an index into
+    /// [`QueryShape::select_lists`], whose aliases are therefore not in scope for it.
+    /// `None` for a reference standing anywhere else, where every name the statement
+    /// defines is in scope.
+    select_list: Option<usize>,
 }
 
 /// The relations and column references of `statement`.
@@ -367,8 +402,85 @@ struct QueryWalk {
     /// The relations already reported, so de-duplicating them costs
     /// O(relations log relations) and not O(relations^2).
     seen_tables: BTreeSet<String>,
-    /// The column references already reported, for the same reason.
-    seen_columns: BTreeSet<String>,
+    /// The column references already reported, for the same reason — each under the select
+    /// list it was read in, so one text read once in a select list's own scope and once in
+    /// the wider scope of the statement is reported under both and neither reading is lost.
+    seen_columns: BTreeSet<(String, Option<usize>)>,
+}
+
+impl QueryWalk {
+    /// Report one column reference, `select_list` being the select list it is written in
+    /// (as an index into [`QueryShape::select_lists`]) and `None` anywhere else.
+    fn record_reference(&mut self, parts: Vec<String>, select_list: Option<usize>) {
+        let reference = ColumnReference {
+            written: parts.join("."),
+            parts,
+            select_list,
+        };
+        let key = (reference.written.clone(), select_list);
+        if self.seen_columns.insert(key) {
+            self.shape.columns.push(reference);
+        }
+    }
+
+    /// Read every SELECT of `body`: the names its select list DEFINES, and the references
+    /// the expressions of that same select list make — which those names are not in scope
+    /// for, because a select list defines them for the clauses that come AFTER it.
+    ///
+    /// Recurses with the set expression's own structure, which [`MAX_QUERY_TOKENS`] bounds
+    /// the depth of, on the stack [`query_shape`] sized for that bound. Each select list is
+    /// read ONCE more than the single walk over the tree, and reports at most one reference
+    /// per identifier it encloses, so the extra work and the references kept stay bounded
+    /// by the statement's own token count times its nesting depth — both capped before the
+    /// parser is entered.
+    fn read_select_lists(&mut self, body: &SetExpr) {
+        match body {
+            SetExpr::Select(select) => {
+                let defined: BTreeSet<String> = select
+                    .projection
+                    .iter()
+                    .filter_map(|item| match item {
+                        SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let list = self.shape.select_lists.len();
+                self.shape.select_lists.push(defined.clone());
+                for item in &select.projection {
+                    let expr = match item {
+                        SelectItem::UnnamedExpr(expr)
+                        | SelectItem::ExprWithAlias { expr, .. } => expr,
+                        // A wildcard names no column, qualified or not.
+                        _ => continue,
+                    };
+                    self.read_select_item(expr, list);
+                }
+                self.shape.defined.extend(defined);
+            }
+            SetExpr::Query(query) => self.read_select_lists(&query.body),
+            SetExpr::SetOperation { left, right, .. } => {
+                self.read_select_lists(left);
+                self.read_select_lists(right);
+            }
+            _ => {}
+        }
+    }
+
+    /// Report the references ONE select item's expression makes, as written in select list
+    /// `list`.
+    fn read_select_item(&mut self, expr: &Expr, list: usize) {
+        // The expression ITSELF, and then everything inside it: whether a walk started at
+        // an expression reports that expression is the visitor's business, and a reference
+        // reported twice in one select list is recorded once.
+        if let Some(parts) = identifier_parts(expr) {
+            self.record_reference(parts, Some(list));
+        }
+        let mut inside = SelectItemReferences::default();
+        let _ = expr.visit(&mut inside);
+        for parts in inside.references {
+            self.record_reference(parts, Some(list));
+        }
+    }
 }
 
 impl Visitor for QueryWalk {
@@ -402,53 +514,61 @@ impl Visitor for QueryWalk {
     /// stands — a select item, a predicate, a join condition, a function argument, a
     /// grouping or an ordering. A function's NAME, a type name, an alias and a relation are
     /// not identifier expressions, so none of them is read here.
+    ///
+    /// Read in the scope of the WHOLE statement, where every name the statement defines is
+    /// in scope; the expressions of a select list are read a second time, in the narrower
+    /// scope of that list, by [`QueryWalk::read_select_lists`].
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-        let parts: Vec<&Ident> = match expr {
-            Expr::Identifier(ident) => vec![ident],
-            Expr::CompoundIdentifier(idents) => idents.iter().collect(),
-            _ => return ControlFlow::Continue(()),
-        };
-        let reference = ColumnReference {
-            parts: parts.iter().map(|ident| ident.value.clone()).collect(),
-            written: parts
-                .iter()
-                .map(|ident| ident.value.as_str())
-                .collect::<Vec<_>>()
-                .join("."),
-        };
-        if self.seen_columns.insert(reference.written.clone()) {
-            self.shape.columns.push(reference);
+        if let Some(parts) = identifier_parts(expr) {
+            self.record_reference(parts, None);
         }
         ControlFlow::Continue(())
     }
 
-    /// The names each query of the statement DEFINES for itself.
+    /// The names each query of the statement DEFINES for itself, and the references its
+    /// select lists make in their own scope.
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
-        collect_defined_names(&query.body, &mut self.shape.defined);
+        self.read_select_lists(&query.body);
         ControlFlow::Continue(())
     }
 }
 
-/// The names `body` defines itself: the alias of each select item, which a later clause of
-/// the same statement may name although no table publishes it.
+/// The identifier parts `expr` is written with, when it is a reference to a name: one part
+/// for a bare identifier, every part of a compound one. `None` for an expression that
+/// names nothing (a literal, a call, an operator).
+fn identifier_parts(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::Identifier(ident) => Some(vec![ident.value.clone()]),
+        Expr::CompoundIdentifier(idents) => {
+            Some(idents.iter().map(|ident| ident.value.clone()).collect())
+        }
+        _ => None,
+    }
+}
+
+/// Collects the references ONE expression of a select list makes, so [`QueryWalk`] can
+/// report them under that select list's own scope.
 ///
-/// Recurses with the set expression's own structure, which [`MAX_QUERY_TOKENS`] bounds the
-/// depth of, on the stack [`query_shape`] sized for that bound.
-fn collect_defined_names(body: &SetExpr, into: &mut BTreeSet<String>) {
-    match body {
-        SetExpr::Select(select) => {
-            for item in &select.projection {
-                if let SelectItem::ExprWithAlias { alias, .. } = item {
-                    into.insert(alias.value.clone());
-                }
-            }
+/// A sub-query written inside the expression is descended into like anything else, which
+/// reports its names in this scope as well; the sub-query's own select list is read in its
+/// own scope when the outer walk reaches that query, so a name it defines for itself never
+/// resolves the expression that defines it.
+#[derive(Debug, Default)]
+struct SelectItemReferences {
+    /// The identifier parts of each reference, in walk order.
+    references: Vec<Vec<String>>,
+}
+
+impl Visitor for SelectItemReferences {
+    /// Nothing stops this walk: it is over one expression, which the statement's own
+    /// bounds already cover.
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let Some(parts) = identifier_parts(expr) {
+            self.references.push(parts);
         }
-        SetExpr::Query(query) => collect_defined_names(&query.body, into),
-        SetExpr::SetOperation { left, right, .. } => {
-            collect_defined_names(left, into);
-            collect_defined_names(right, into);
-        }
-        _ => {}
+        ControlFlow::Continue(())
     }
 }
 
@@ -521,11 +641,16 @@ pub fn resolve_data_query(
         record_configuration(table, properties, &mut effective);
     }
     for reference in &shape.columns {
-        // A reference resolves when one of its parts is a published column or a name the
-        // statement defines: the other parts qualify a relation or index into the column's
-        // value, and the catalog publishes neither.
+        // A reference resolves when one of its parts is a published column, or a name the
+        // statement defines that is IN SCOPE where the reference stands: the other parts
+        // qualify a relation or index into the column's value, and the catalog publishes
+        // neither. A select list's own aliases are out of scope in that list's
+        // expressions, so an unpublished name aliased to itself does not resolve against
+        // its own definition.
         let resolved = reference.parts.iter().any(|part| {
-            published.contains(part.as_str()) || shape.defined.contains(part.as_str())
+            published.contains(part.as_str())
+                || (shape.defined.contains(part.as_str())
+                    && shape.defined_name_in_scope(reference, part))
         });
         if !resolved {
             return Err(invalid_query_column(&reference.written).into());
