@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeProvisionedProduct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeProvisionedProduct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeProvisionedProduct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -148,18 +138,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeProvisionedProduct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeProvisionedProductErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeProvisionedProduct"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: this operation reports the provisioned product
+        // `ProvisionProduct` stored and writes nothing, so a later caller sees exactly
+        // what this one saw. The status it reports is derived from the stored record of
+        // the last operation and the clock, never advanced by being read.
+        let state = state.lock();
+        let now = std::time::SystemTime::now();
+
+        // "You must provide the name or ID, but not both. If you do not provide a name
+        // or ID, or you provide both name and ID, an `InvalidParametersException` will
+        // occur" — the model states both halves of that refusal, for both members.
+        let provisioned = match (
+            input.id.as_deref().filter(|id| !id.is_empty()),
+            input.name.as_deref().filter(|name| !name.is_empty()),
+        ) {
+            (Some(id), None) => state
+                .provisioned_products
+                .get(id)
+                .ok_or_else(|| id.to_string()),
+            (None, Some(name)) => state
+                .provisioned_product_by_name(name)
+                .ok_or_else(|| name.to_string()),
+            (None, None) => {
+                return Err(
+                    DescribeProvisionedProductErrorModeled::InvalidParametersException(
+                        InvalidParametersException {
+                            message: Some(
+                                "Either Id or Name must be provided to identify the provisioned \
+                                 product."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            (Some(_), Some(_)) => {
+                return Err(
+                    DescribeProvisionedProductErrorModeled::InvalidParametersException(
+                        InvalidParametersException {
+                            message: Some(
+                                "Id and Name cannot both be provided: you must provide the name \
+                                 or ID, but not both."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+        let provisioned = match provisioned {
+            Ok(provisioned) => provisioned,
+            Err(identifier) => {
+                return Err(
+                    DescribeProvisionedProductErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "{identifier} does not exist or access was denied"
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        Ok(DescribeProvisionedProductOutput {
+            provisioned_product_detail: Some(
+                state.provisioned_product_detail(provisioned, now),
+            ),
+            // The CloudWatch dashboards of a provisioned product are the dashboards
+            // the resources behind it publish, and no launch has stood any up in this
+            // emulator, so the set is empty rather than absent.
+            cloud_watch_dashboards: Some(Vec::new()),
+        })
     }
 }

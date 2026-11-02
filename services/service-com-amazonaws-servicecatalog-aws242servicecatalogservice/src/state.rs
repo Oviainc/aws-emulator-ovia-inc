@@ -7,9 +7,10 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     ConstraintDetail, ConstraintSummary, PortfolioDetail, ProductViewDetail, ProductViewSummary,
+    ProvisionedProductAttribute, ProvisionedProductDetail,
     ProvisioningArtifact as ModelledProvisioningArtifact, ProvisioningArtifactDetail,
-    ProvisioningArtifactSummary, ResourceDetail, ServiceActionDetail, ServiceActionSummary,
-    SourceConnectionDetail, Tag, TagOptionDetail,
+    ProvisioningArtifactSummary, RecordDetail, RecordTag, ResourceDetail, ServiceActionDetail,
+    ServiceActionSummary, SourceConnectionDetail, Tag, TagOptionDetail,
 };
 
 /// The `ResourceType` naming a portfolio, one of the two kinds a TagOption can be
@@ -393,6 +394,197 @@ impl ProvisioningArtifact {
     }
 }
 
+/// A persisted provisioned product — the resourced instance of a product that
+/// `ProvisionProduct` mints and `DescribeProvisionedProduct` and
+/// `SearchProvisionedProducts` report.
+#[derive(Debug, Clone)]
+pub struct ProvisionedProduct {
+    /// The minted provisioned-product id (`pp-…`), also this record's key in
+    /// [`ComAmazonawsServicecatalogAws242servicecatalogserviceState::provisioned_products`].
+    pub id: String,
+    /// The ARN minted at provision time and read back verbatim afterwards.
+    pub arn: String,
+    /// `ProvisionedProductName`, which the model documents "must be unique for the
+    /// Amazon Web Services account and cannot be updated after the product is
+    /// provisioned" — so it addresses this record as firmly as its id does.
+    pub name: String,
+    /// A `ProvisionedProductType` value, derived from the product's `ProductType`
+    /// by [`provisioned_product_type`] when the provisioning request was served.
+    pub r#type: String,
+    pub product_id: String,
+    pub provisioning_artifact_id: String,
+    /// The launch path this product was provisioned through: the id of the
+    /// portfolio that path is the product's relationship with.
+    pub path_id: String,
+    /// Creation instant, minted once at provision time.
+    pub created_time: SystemTime,
+    /// The `ProvisionToken` the provisioning request carried, reported back as
+    /// `IdempotencyToken`.
+    pub provision_token: String,
+    /// Tag key -> tag value, as the provisioning request asked for them.
+    pub tags: BTreeMap<String, String>,
+    /// The records of the operations performed on this provisioned product, oldest
+    /// first: the one stored history every `Last*RecordId` member is derived from,
+    /// so two responses cannot disagree about which record was last.
+    pub record_ids: Vec<String>,
+}
+
+/// A persisted record — "information about a request operation", which
+/// `ProvisionProduct` answers with and `DescribeRecord` reports.
+#[derive(Debug, Clone)]
+pub struct Record {
+    /// The minted record id (`rec-…`).
+    pub id: String,
+    /// A `RecordType` value: which request this record is the record OF.
+    pub record_type: String,
+    pub provisioned_product_id: String,
+    pub provisioned_product_name: String,
+    pub provisioned_product_type: String,
+    pub product_id: String,
+    pub provisioning_artifact_id: String,
+    pub path_id: String,
+    /// Creation instant, minted once when the request this record describes arrived.
+    pub created_time: SystemTime,
+    /// The instant the operation this record describes stops being in flight.
+    /// The request answers in the non-terminal `CREATED` status, so the transition
+    /// to the terminal one is owed by the CLOCK: it is stored as the instant it
+    /// falls due and never slept for, and every report derives the status from it
+    /// rather than from who asked.
+    pub completed_at: SystemTime,
+    /// Tag key -> tag value, reported as this record's `RecordTags`.
+    pub tags: BTreeMap<String, String>,
+}
+
+/// The `RecordType` of a record `ProvisionProduct` creates
+/// (`smithy_query query="doc" shape="RecordDetail" member="RecordType"`:
+/// `PROVISION_PRODUCT` | `UPDATE_PROVISIONED_PRODUCT` |
+/// `TERMINATE_PROVISIONED_PRODUCT`).
+pub const RECORD_TYPE_PROVISION_PRODUCT: &str = "PROVISION_PRODUCT";
+
+/// The record types `ProvisionedProductDetail$LastProvisioningRecordId` counts as a
+/// provisioning request: its documentation names ProvisionProduct,
+/// UpdateProvisionedProduct, ExecuteProvisionedProductPlan and
+/// TerminateProvisionedProduct, each of which records one of the three `RecordType`
+/// values above.
+pub const PROVISIONING_RECORD_TYPES: &[&str] = &[
+    RECORD_TYPE_PROVISION_PRODUCT,
+    "UPDATE_PROVISIONED_PRODUCT",
+    "TERMINATE_PROVISIONED_PRODUCT",
+];
+
+/// `RecordStatus`'s non-terminal first value, which the model documents as "the
+/// request was created but the operation has not started"
+/// (`smithy_query query="shape" shape="RecordStatus"`: `CREATED` | `IN_PROGRESS` |
+/// `IN_PROGRESS_IN_ERROR` | `SUCCEEDED` | `FAILED`).
+pub const RECORD_STATUS_CREATED: &str = "CREATED";
+
+/// `RecordStatus`'s terminal value for an operation that completed: "the requested
+/// operation has successfully completed".
+pub const RECORD_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// `ProvisionedProductStatus`'s transitive value, which the model documents as
+/// "operations performed might not have valid results. Wait for an AVAILABLE status
+/// before performing operations"
+/// (`smithy_query query="shape" shape="ProvisionedProductStatus"`).
+pub const PROVISIONED_PRODUCT_STATUS_UNDER_CHANGE: &str = "UNDER_CHANGE";
+
+/// `ProvisionedProductStatus`'s stable value: "ready to perform any operation. The
+/// most recent operation succeeded and completed".
+pub const PROVISIONED_PRODUCT_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// How long after the request that starts it a provisioning operation stays in
+/// flight.
+///
+/// A span this emulator CHOOSES (AWS documents none, and a real launch takes as long
+/// as the resources behind it do): long enough that a caller acting straight after
+/// the request still sees the transient record status and the `UNDER_CHANGE`
+/// provisioned product it implies, short enough that nothing waits on it.
+pub const PROVISIONING_COMPLETES_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The `ProvisionedProductType` a product of `product_type` provisions as.
+///
+/// `ProvisionedProductDetail$Type` documents the supported values as `CFN_STACK`,
+/// `CFN_STACKSET`, `TERRAFORM_OPEN_SOURCE`, `TERRAFORM_CLOUD` and `EXTERNAL`, and
+/// `ProductType` (`smithy_query query="shape" shape="ProductType"`) is
+/// `CLOUD_FORMATION_TEMPLATE` | `MARKETPLACE` | `TERRAFORM_OPEN_SOURCE` |
+/// `TERRAFORM_CLOUD` | `EXTERNAL`: the three Terraform/external names are shared, and
+/// the two CloudFormation-backed product types (a template of this account's own, and
+/// a Marketplace product, which is a CloudFormation template too) provision one
+/// stack each.
+pub fn provisioned_product_type(product_type: &str) -> &'static str {
+    match product_type {
+        "TERRAFORM_OPEN_SOURCE" => "TERRAFORM_OPEN_SOURCE",
+        "TERRAFORM_CLOUD" => "TERRAFORM_CLOUD",
+        "EXTERNAL" => "EXTERNAL",
+        _ => "CFN_STACK",
+    }
+}
+
+impl Record {
+    /// This record's `RecordStatus` at `now`: the non-terminal one until the clock
+    /// owes the transition, the terminal one afterwards.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.completed_at {
+            RECORD_STATUS_CREATED
+        } else {
+            RECORD_STATUS_SUCCEEDED
+        }
+    }
+
+    /// Whether this record is the record of a provisioning request — see
+    /// [`PROVISIONING_RECORD_TYPES`].
+    pub fn is_provisioning(&self) -> bool {
+        PROVISIONING_RECORD_TYPES.contains(&self.record_type.as_str())
+    }
+
+    /// "The time when the record was last updated": the instant it was created
+    /// while the operation is still in flight, and the instant the operation
+    /// completed once the clock owes that transition.
+    pub fn updated_time(&self, now: SystemTime) -> SystemTime {
+        if now < self.completed_at {
+            self.created_time
+        } else {
+            self.completed_at
+        }
+    }
+
+    /// This record as the modelled `RecordDetail`: every member comes from stored
+    /// state, so the provisioning request and a later read report the same values.
+    pub fn detail(&self, now: SystemTime) -> RecordDetail {
+        RecordDetail {
+            record_id: Some(self.id.clone()),
+            provisioned_product_name: Some(self.provisioned_product_name.clone()),
+            status: Some(self.status(now).to_string()),
+            created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
+            updated_time: Some(::aws_smithy_types::DateTime::from(self.updated_time(now))),
+            provisioned_product_type: Some(self.provisioned_product_type.clone()),
+            record_type: Some(self.record_type.clone()),
+            provisioned_product_id: Some(self.provisioned_product_id.clone()),
+            product_id: Some(self.product_id.clone()),
+            provisioning_artifact_id: Some(self.provisioning_artifact_id.clone()),
+            path_id: Some(self.path_id.clone()),
+            // "The errors that occurred": the operation this record describes has
+            // not failed, so there are none rather than an unknown set.
+            record_errors: Some(Vec::new()),
+            record_tags: Some(self.tag_list()),
+            // A launch role comes from a LAUNCH constraint's `RoleArn`, and nothing
+            // assumes a role in this emulator, so no record carries one.
+            launch_role_arn: None,
+        }
+    }
+
+    /// The stored tags as the modelled `RecordTags` list, in key order.
+    pub fn tag_list(&self) -> Vec<RecordTag> {
+        self.tags
+            .iter()
+            .map(|(key, value)| RecordTag {
+                key: Some(key.clone()),
+                value: Some(value.clone()),
+            })
+            .collect()
+    }
+}
+
 /// A persisted self-service action.
 #[derive(Debug, Clone)]
 pub struct ServiceAction {
@@ -509,6 +701,17 @@ pub const MAX_CONSTRAINTS: usize = 500;
 /// idempotency entry, so bounding the count bounds all three.
 pub const MAX_PRODUCTS: usize = 500;
 
+/// The most provisioned products this account can hold, which also bounds this
+/// store and the records inside it.
+///
+/// `ProvisionProduct` models no limit error, so a provisioning request past this
+/// bound is refused with the parameter error it does model, naming the account's
+/// provisioned-product quota. As with [`MAX_PRODUCTS`] the figure is the EMULATOR's
+/// bound, not a quoted AWS one, and it is checked before anything is stored: each
+/// provisioned product holds its tags and the records of the operations performed on
+/// it, so bounding the count bounds all three.
+pub const MAX_PROVISIONED_PRODUCTS: usize = 500;
+
 /// The most self-service actions this account can hold, which also bounds this store.
 ///
 /// `CreateServiceAction` models `LimitExceededException` for a create past the account's
@@ -545,6 +748,15 @@ pub struct ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     pub products: BTreeMap<String, Product>,
     /// Every created, not-yet-deleted self-service action, keyed by action id.
     pub service_actions: BTreeMap<String, ServiceAction>,
+    /// Every provisioned, not-yet-terminated provisioned product, keyed by
+    /// provisioned-product id. A `BTreeMap` so every walk over the set has one
+    /// stable order.
+    pub provisioned_products: BTreeMap<String, ProvisionedProduct>,
+    /// The record of every operation performed on a provisioned product, keyed by
+    /// record id. Each provisioned product names its own records in
+    /// [`ProvisionedProduct::record_ids`], so this map is the one place a record is
+    /// stored.
+    pub records: BTreeMap<String, Record>,
     /// Every created, not-yet-deleted TagOption, keyed by TagOption id.
     pub tag_options: BTreeMap<String, TagOption>,
     /// `CreatePortfolio` idempotency: `IdempotencyToken` -> portfolio id, so a
@@ -567,6 +779,11 @@ pub struct ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     /// `CreateConstraint` idempotency: `IdempotencyToken` -> constraint id. Private and
     /// pruned on every write, so it is bounded by [`MAX_CONSTRAINTS`].
     constraint_idempotency: HashMap<String, String>,
+    /// `ProvisionProduct` idempotency: `ProvisionToken` -> record id, so a repeated
+    /// provisioning request replays the record the first one minted instead of
+    /// provisioning a second product. Private and pruned on every write, exactly as
+    /// the maps above, so it is bounded by [`MAX_PROVISIONED_PRODUCTS`].
+    provision_idempotency: HashMap<String, String>,
     /// Counter behind every `next_*_id`. Deterministic, so a fresh
     /// emulator mints the same id sequence every run.
     pub next_id_seed: u64,
@@ -655,6 +872,166 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     pub fn forget_constraint_tokens(&mut self, constraint_id: &str) {
         self.constraint_idempotency
             .retain(|_, id| id != constraint_id);
+    }
+
+    /// The record a provisioning request carrying `token` already made, if that
+    /// record is still stored. `None` for an unseen token, which is no longer a
+    /// replay.
+    pub fn replayed_provision_record(&self, token: &str) -> Option<&Record> {
+        self.records.get(self.provision_idempotency.get(token)?)
+    }
+
+    /// Remember a `ProvisionToken` so a repeat replays `record_id`, bounded exactly
+    /// as [`Self::remember_portfolio_token`] is.
+    pub fn remember_provision_token(&mut self, token: String, record_id: String) {
+        let records = &self.records;
+        self.provision_idempotency
+            .retain(|_, id| records.contains_key(id));
+        self.provision_idempotency.insert(token, record_id);
+    }
+
+    /// The portfolios `product_id` can be launched through — its launch paths.
+    ///
+    /// A launch path is a portfolio the product can be launched through, so the paths
+    /// ARE the product's stored portfolio associations: the same set `DescribeProduct`
+    /// reports as `LaunchPaths`, `ListLaunchPaths` pages over and
+    /// `ProductViewSummary$HasDefaultPath` is derived from. A product no portfolio
+    /// holds resolves no path at all, and neither does a product id nothing stored
+    /// carries.
+    ///
+    /// The principal half of a path ("a path is dependent on a specific product,
+    /// portfolio, and principal") cannot be evaluated here: a request carries only the
+    /// access key id of its signature, and this crate holds no resolution from that to
+    /// the principal ARN an association names. The paths are therefore the
+    /// product-portfolio ones, unfiltered by [`Portfolio::principals`].
+    pub fn launch_path_portfolios(&self, product_id: &str) -> Vec<&Portfolio> {
+        self.products
+            .get(product_id)
+            .into_iter()
+            .flat_map(|product| product.portfolio_ids.iter())
+            .filter_map(|portfolio_id| self.portfolios.get(portfolio_id))
+            .collect()
+    }
+
+    /// The provisioned product `name` addresses, which the model makes unique for the
+    /// account, or `None` when this account holds none by that name.
+    pub fn provisioned_product_by_name(&self, name: &str) -> Option<&ProvisionedProduct> {
+        self.provisioned_products
+            .values()
+            .find(|provisioned| provisioned.name == name)
+    }
+
+    /// The records of the operations performed on `provisioned`, oldest first.
+    fn provisioned_product_records<'a>(
+        &'a self,
+        provisioned: &'a ProvisionedProduct,
+    ) -> impl DoubleEndedIterator<Item = &'a Record> {
+        provisioned
+            .record_ids
+            .iter()
+            .filter_map(|record_id| self.records.get(record_id))
+    }
+
+    /// `provisioned`'s `ProvisionedProductStatus` at `now`: the transitive one while
+    /// the operation its last record describes is still in flight, the stable one once
+    /// the clock owes that record's completion.
+    pub fn provisioned_product_status(
+        &self,
+        provisioned: &ProvisionedProduct,
+        now: SystemTime,
+    ) -> &'static str {
+        match self.provisioned_product_records(provisioned).next_back() {
+            Some(last) if last.status(now) == RECORD_STATUS_CREATED => {
+                PROVISIONED_PRODUCT_STATUS_UNDER_CHANGE
+            }
+            _ => PROVISIONED_PRODUCT_STATUS_AVAILABLE,
+        }
+    }
+
+    /// `provisioned` as the modelled `ProvisionedProductDetail`.
+    ///
+    /// Every `Last*RecordId` member is derived from the one stored history
+    /// [`ProvisionedProduct::record_ids`] holds, so a detail and a search result
+    /// cannot disagree about which record was last.
+    pub fn provisioned_product_detail(
+        &self,
+        provisioned: &ProvisionedProduct,
+        now: SystemTime,
+    ) -> ProvisionedProductDetail {
+        ProvisionedProductDetail {
+            name: Some(provisioned.name.clone()),
+            arn: Some(provisioned.arn.clone()),
+            r#type: Some(provisioned.r#type.clone()),
+            id: Some(provisioned.id.clone()),
+            status: Some(self.provisioned_product_status(provisioned, now).to_string()),
+            // A status message reports what the resources behind the provisioned
+            // product last said, and nothing in this emulator has launched any, so
+            // there is no message rather than an invented one.
+            status_message: None,
+            created_time: Some(::aws_smithy_types::DateTime::from(provisioned.created_time)),
+            idempotency_token: Some(provisioned.provision_token.clone()),
+            last_record_id: provisioned.record_ids.last().cloned(),
+            last_provisioning_record_id: self
+                .provisioned_product_records(provisioned)
+                .rfind(|record| record.is_provisioning())
+                .map(|record| record.id.clone()),
+            last_successful_provisioning_record_id: self
+                .provisioned_product_records(provisioned)
+                .rfind(|record| {
+                    record.is_provisioning() && record.status(now) == RECORD_STATUS_SUCCEEDED
+                })
+                .map(|record| record.id.clone()),
+            product_id: Some(provisioned.product_id.clone()),
+            provisioning_artifact_id: Some(provisioned.provisioning_artifact_id.clone()),
+            // As with a record: no launch role is assumed in this emulator.
+            launch_role_arn: None,
+        }
+    }
+
+    /// `provisioned` as the modelled `ProvisionedProductAttribute` — the shape a
+    /// search over provisioned products reports, which carries the same stored values
+    /// [`Self::provisioned_product_detail`] does plus the product and artifact NAMES,
+    /// read from the product the provisioning resolved.
+    pub fn provisioned_product_attribute(
+        &self,
+        provisioned: &ProvisionedProduct,
+        now: SystemTime,
+    ) -> ProvisionedProductAttribute {
+        let detail = self.provisioned_product_detail(provisioned, now);
+        let product = self.products.get(&provisioned.product_id);
+        ProvisionedProductAttribute {
+            name: detail.name,
+            arn: detail.arn,
+            r#type: detail.r#type,
+            id: detail.id,
+            status: detail.status,
+            status_message: detail.status_message,
+            created_time: detail.created_time,
+            idempotency_token: detail.idempotency_token,
+            last_record_id: detail.last_record_id,
+            last_provisioning_record_id: detail.last_provisioning_record_id,
+            last_successful_provisioning_record_id: detail.last_successful_provisioning_record_id,
+            tags: Some(tag_list(&provisioned.tags)),
+            // "The assigned identifier for the resource, such as an EC2 instance ID
+            // or an S3 bucket name": the resources a launch creates have none here,
+            // because no launch has run.
+            physical_id: None,
+            product_id: detail.product_id,
+            product_name: product.map(|product| product.name.clone()),
+            provisioning_artifact_id: detail.provisioning_artifact_id,
+            provisioning_artifact_name: product
+                .and_then(|product| {
+                    product
+                        .provisioning_artifacts
+                        .get(&provisioned.provisioning_artifact_id)
+                })
+                .and_then(|artifact| artifact.name.clone()),
+            // The ARN of the user that provisioned the product, and of the session it
+            // used: the emulated service verifies no caller identity, so neither is
+            // known rather than fabricated.
+            user_arn: None,
+            user_arn_session: None,
+        }
     }
 
     /// The TagOptions associated with the resource `resource_id` names, or `None`
@@ -820,6 +1197,27 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
         loop {
             let id = self.mint_id("act");
             if !self.service_actions.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Mint an unused provisioned-product id (`pp-…`), the same shape as a portfolio
+    /// id.
+    pub fn next_provisioned_product_id(&mut self) -> String {
+        loop {
+            let id = self.mint_id("pp");
+            if !self.provisioned_products.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Mint an unused record id (`rec-…`).
+    pub fn next_record_id(&mut self) -> String {
+        loop {
+            let id = self.mint_id("rec");
+            if !self.records.contains_key(&id) {
                 return id;
             }
         }

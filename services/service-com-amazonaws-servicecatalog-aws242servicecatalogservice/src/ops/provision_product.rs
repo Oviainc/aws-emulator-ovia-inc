@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ProvisionProduct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ProvisionProduct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ProvisionProduct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -177,18 +167,307 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ProvisionProduct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ProvisionProductErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+        let now = std::time::SystemTime::now();
+
+        // `ProvisionToken` is `@idempotencyToken`: "an idempotency token that uniquely
+        // identifies the provisioning request", so a token already seen REPLAYS the
+        // record its request minted rather than provisioning a second product. The
+        // replay keys on the TOKEN ALONE: this operation models no mismatch error for a
+        // token reused with different members.
+        if let Some(record) = state.replayed_provision_record(&input.provision_token) {
+            return Ok(ProvisionProductOutput {
+                record_detail: Some(record.detail(now)),
+            });
+        }
+
+        // Every resource this request names is resolved BEFORE anything is
+        // provisioned, so a request naming one that does not resolve is refused with
+        // no effect at all: the product, then its launch path, then the product
+        // version to launch.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ProvisionProduct"))
+        // The product is addressed by id or by name — "You must provide the name or
+        // ID, but not both" — and a request that addresses it by neither names no
+        // product to provision.
+        let addressed_product = addressed(
+            input.product_id.as_deref(),
+            input.product_name.as_deref(),
+            "ProductId",
+            "ProductName",
+        )
+        .map_err(invalid_parameters)?
+        .ok_or_else(|| invalid_parameters(either_required("ProductId", "ProductName")))?;
+        let product = match addressed_product {
+            Addressed::Id(id) => state.products.get(id),
+            Addressed::Name(name) => {
+                state.products.values().find(|product| product.name == name)
+            }
+        };
+
+        // Provisioning resolves the product's launch paths first: a path is the
+        // product's relationship with a portfolio it can be launched through, so a
+        // product that sits in no portfolio — and a product id or name nothing stored
+        // carries, which resolves no path either — has no path to launch through, and
+        // the request is refused as a not-found resource naming the product no path
+        // could be resolved for. This is NOT a parameter error about the optional
+        // `PathId`/`PathName`: no path can be named for a product that has none.
+        let paths: Vec<(String, String)> = product
+            .map(|product| {
+                state
+                    .launch_path_portfolios(&product.id)
+                    .into_iter()
+                    .map(|portfolio| (portfolio.id.clone(), portfolio.display_name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let product = match product.filter(|_| !paths.is_empty()) {
+            Some(product) => product,
+            None => return Err(no_launch_paths(addressed_product.identifier())),
+        };
+
+        // The path to launch through: the one the request names, or the product's
+        // default path. `PathId` "is optional if the product has a default path, and
+        // required if the product has more than one path", and a product reachable
+        // through exactly one portfolio needs no disambiguation — the same derivation
+        // `ProductViewSummary$HasDefaultPath` reports.
+        let path_id = match addressed(
+            input.path_id.as_deref(),
+            input.path_name.as_deref(),
+            "PathId",
+            "PathName",
+        )
+        .map_err(invalid_parameters)?
+        {
+            Some(addressed_path) => {
+                let found = paths.iter().find(|(id, name)| match addressed_path {
+                    Addressed::Id(path_id) => id == path_id,
+                    Addressed::Name(path_name) => name == path_name,
+                });
+                match found {
+                    Some((id, _)) => id.clone(),
+                    None => return Err(not_found(addressed_path.identifier())),
+                }
+            }
+            None => match paths.as_slice() {
+                [(id, _)] => id.clone(),
+                _ => {
+                    return Err(invalid_parameters(
+                        "A path is required when the product has more than one path. To list the \
+                         paths for a product, use ListLaunchPaths."
+                            .to_string(),
+                    ))
+                }
+            },
+        };
+
+        // The product version to launch, addressed by id or by name the same way and
+        // resolved among THIS product's provisioning artifacts: an artifact of another
+        // product is no version of this one.
+        let artifact = addressed(
+            input.provisioning_artifact_id.as_deref(),
+            input.provisioning_artifact_name.as_deref(),
+            "ProvisioningArtifactId",
+            "ProvisioningArtifactName",
+        )
+        .map_err(invalid_parameters)?
+        .ok_or_else(|| {
+            invalid_parameters(either_required(
+                "ProvisioningArtifactId",
+                "ProvisioningArtifactName",
+            ))
+        })?;
+        let artifact_id = match artifact {
+            Addressed::Id(id) => product.provisioning_artifacts.get(id),
+            Addressed::Name(name) => product
+                .provisioning_artifacts
+                .values()
+                .find(|artifact| artifact.name.as_deref() == Some(name)),
+        }
+        .ok_or_else(|| not_found(artifact.identifier()))?
+        .id
+        .clone();
+
+        let product_id = product.id.clone();
+        let provisioned_product_type =
+            crate::state::provisioned_product_type(&product.product_type).to_string();
+
+        // `ProvisionedProductName` "must be unique for the Amazon Web Services account
+        // and cannot be updated after the product is provisioned", so a name this
+        // account already holds is a duplicate rather than a second provisioning under
+        // that name.
+        if state
+            .provisioned_product_by_name(&input.provisioned_product_name)
+            .is_some()
+        {
+            return Err(ProvisionProductErrorModeled::DuplicateResourceException(
+                DuplicateResourceException {
+                    message: Some(format!(
+                        "A provisioned product with the name {} already exists.",
+                        input.provisioned_product_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account's provisioned-product quota, refused before anything is stored,
+        // so a caller cannot grow the store past it by repeating the call. This
+        // operation models no limit error, so the refusal is the parameter error it
+        // does model, naming the bound the request broke.
+        if state.provisioned_products.len() >= crate::state::MAX_PROVISIONED_PRODUCTS {
+            return Err(invalid_parameters(format!(
+                "An account cannot hold more than {} provisioned products.",
+                crate::state::MAX_PROVISIONED_PRODUCTS
+            )));
+        }
+
+        // A provisioned product holds each tag key once, so a repeated key in `Tags`
+        // collapses to its last value. The modelled 0..50 bound on the input list is
+        // already enforced by the time this handler runs.
+        let tags: std::collections::BTreeMap<String, String> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let provisioned_product_id = state.next_provisioned_product_id();
+        let record_id = state.next_record_id();
+        // AWS addresses a provisioned product as
+        // `arn:${Partition}:servicecatalog:${Region}:${Account}:stack/${ProvisionedProductName}/${ProvisionedProductId}`
+        // — the stack a launch stands up, named by the provisioned product.
+        let arn = ::emulator_server::emulator_arn(
+            "servicecatalog",
+            &crate::state::request_region(ctx),
+            &format!(
+                "stack/{}/{provisioned_product_id}",
+                input.provisioned_product_name
+            ),
+        );
+        // The provisioning this request starts is not instantaneous: the record is
+        // answered in the non-terminal status and the clock owes its completion, so a
+        // caller acting straight after this call still sees the provisioned product
+        // `UNDER_CHANGE`.
+        let completed_at = now + crate::state::PROVISIONING_COMPLETES_AFTER;
+
+        let record = crate::state::Record {
+            id: record_id.clone(),
+            record_type: crate::state::RECORD_TYPE_PROVISION_PRODUCT.to_string(),
+            provisioned_product_id: provisioned_product_id.clone(),
+            provisioned_product_name: input.provisioned_product_name.clone(),
+            provisioned_product_type: provisioned_product_type.clone(),
+            product_id: product_id.clone(),
+            provisioning_artifact_id: artifact_id.clone(),
+            path_id: path_id.clone(),
+            created_time: now,
+            completed_at,
+            tags: tags.clone(),
+        };
+        let provisioned = crate::state::ProvisionedProduct {
+            id: provisioned_product_id.clone(),
+            arn,
+            name: input.provisioned_product_name,
+            r#type: provisioned_product_type,
+            product_id,
+            provisioning_artifact_id: artifact_id,
+            path_id,
+            created_time: now,
+            provision_token: input.provision_token.clone(),
+            tags,
+            record_ids: vec![record_id.clone()],
+        };
+
+        let record_detail = record.detail(now);
+        state.records.insert(record_id.clone(), record);
+        state
+            .provisioned_products
+            .insert(provisioned_product_id, provisioned);
+        state.remember_provision_token(input.provision_token, record_id);
+
+        Ok(ProvisionProductOutput {
+            record_detail: Some(record_detail),
+        })
     }
+}
+
+/// Which of the two members that address one resource the request gave.
+///
+/// Several of this operation's inputs come in that pair — a product, a launch path and
+/// a provisioning artifact — and every pair carries the same contract: "You must
+/// provide the name or ID, but not both."
+#[derive(Debug, Clone, Copy)]
+enum Addressed<'a> {
+    Id(&'a str),
+    Name(&'a str),
+}
+
+impl Addressed<'_> {
+    /// The value the request addressed the resource by, which a refusal names.
+    fn identifier(&self) -> &str {
+        match self {
+            Addressed::Id(id) => id,
+            Addressed::Name(name) => name,
+        }
+    }
+}
+
+/// How the request addressed one resource: by `id`, by `name`, or by neither
+/// (`None`). `Err` carries the refusal for a request that gave BOTH, which the
+/// members' own documentation forbids.
+///
+/// An empty string addresses nothing: the modelled minimum length of each of these
+/// members is 1, so a member that arrives empty names no resource.
+fn addressed<'a>(
+    id: Option<&'a str>,
+    name: Option<&'a str>,
+    id_member: &str,
+    name_member: &str,
+) -> Result<Option<Addressed<'a>>, String> {
+    match (
+        id.filter(|value| !value.is_empty()),
+        name.filter(|value| !value.is_empty()),
+    ) {
+        (Some(_), Some(_)) => Err(format!(
+            "{id_member} and {name_member} cannot both be provided: you must provide the name or \
+             ID, but not both."
+        )),
+        (Some(id), None) => Ok(Some(Addressed::Id(id))),
+        (None, Some(name)) => Ok(Some(Addressed::Name(name))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The refusal for a request that named a resource it must address by neither of the
+/// two members that address it.
+fn either_required(id_member: &str, name_member: &str) -> String {
+    format!("Either {id_member} or {name_member} must be provided.")
+}
+
+/// This operation's parameter error, carrying `message`.
+fn invalid_parameters(message: String) -> ProvisionProductError {
+    ProvisionProductErrorModeled::InvalidParametersException(InvalidParametersException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's not-found error for a product that resolves no launch path: the
+/// product sits in no portfolio, or nothing stored carries the identifier at all.
+fn no_launch_paths(identifier: &str) -> ProvisionProductError {
+    ProvisionProductErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("No launch paths found for resource: {identifier}")),
+    })
+    .into()
+}
+
+/// This operation's not-found error for an identifier that resolves to nothing this
+/// account holds — the wording every read in this service answers such an identifier
+/// with.
+fn not_found(identifier: &str) -> ProvisionProductError {
+    ProvisionProductErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("{identifier} does not exist or access was denied")),
+    })
+    .into()
 }

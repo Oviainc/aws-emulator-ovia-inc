@@ -161,16 +161,38 @@ pub(crate) async fn create_product(
     name: &str,
     token: &str,
 ) -> String {
+    create_product_of_type(router, name, "CLOUD_FORMATION_TEMPLATE", token).await
+}
+
+/// Create one product of `product_type` and answer the id the service minted.
+///
+/// The accepted values are the model's own
+/// (`smithy_query query="shape" shape="ProductType"`: CLOUD_FORMATION_TEMPLATE,
+/// MARKETPLACE, TERRAFORM_OPEN_SOURCE, TERRAFORM_CLOUD and EXTERNAL), and the first
+/// version's `Type` is the `ProvisioningArtifactType` of that product type
+/// (`smithy_query query="shape" shape="ProvisioningArtifactType"`:
+/// CLOUD_FORMATION_TEMPLATE, MARKETPLACE_AMI, MARKETPLACE_CAR, TERRAFORM_OPEN_SOURCE,
+/// TERRAFORM_CLOUD and EXTERNAL — the two enums share every name but MARKETPLACE's).
+pub(crate) async fn create_product_of_type(
+    router: &MultiServiceRouter,
+    name: &str,
+    product_type: &str,
+    token: &str,
+) -> String {
+    let artifact_type = match product_type {
+        "MARKETPLACE" => "MARKETPLACE_AMI",
+        shared => shared,
+    };
     let (status, created) = call(
         router,
         "CreateProduct",
         &json!({
             "Name": name,
             "Owner": "acme",
-            "ProductType": "CLOUD_FORMATION_TEMPLATE",
+            "ProductType": product_type,
             "ProvisioningArtifactParameters": {
                 "Name": "v1",
-                "Type": "CLOUD_FORMATION_TEMPLATE",
+                "Type": artifact_type,
                 // The accepted `Info` keys are the model's own:
                 // `ProvisioningArtifactProperties$Info` documents
                 // "Keys accepted: [ LoadTemplateFromURL, ImportFromPhysicalId ]".
@@ -187,6 +209,30 @@ pub(crate) async fn create_product(
     created["ProductViewDetail"]["ProductViewSummary"]["ProductId"]
         .as_str()
         .unwrap_or_else(|| panic!("CreateProduct {name:?}: no ProductId in {created}"))
+        .to_string()
+}
+
+/// The id of the one provisioning artifact `create_product_of_type` minted for
+/// `product_id` — the product version a provisioning request names.
+pub(crate) async fn first_provisioning_artifact_id(
+    router: &MultiServiceRouter,
+    product_id: &str,
+) -> String {
+    let (status, described) = call(
+        router,
+        "DescribeProduct",
+        &json!({"Id": product_id}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DescribeProduct {product_id}: expected 200, got {status} with {described}"
+    );
+    described["ProvisioningArtifacts"][0]["Id"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("DescribeProduct {product_id}: no provisioning artifact in {described}")
+        })
         .to_string()
 }
 

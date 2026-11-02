@@ -205,8 +205,8 @@ async fn each_service_sharing_the_servicecatalog_signing_name_serves_its_own_pat
         (
             catalog(
                 "a Service Catalog operation that is still a stub",
-                "ProvisionProduct",
-                r#"{"ProvisionedProductName":"pp","ProvisionToken":"t1"}"#,
+                "GetAWSOrganizationsAccessStatus",
+                r#"{}"#,
             ),
             501,
             Expect::Error("NotImplemented"),

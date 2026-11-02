@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchProvisionedProducts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchProvisionedProducts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchProvisionedProducts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -158,18 +148,335 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchProvisionedProducts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchProvisionedProductsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // "The access level to use to obtain results. The default is Account", and of
+        // its `Value` the model says "The only supported value is `self`". Every
+        // provisioned product this store holds belongs to the one emulated account, and
+        // the `Role` and `User` levels narrow results to the federated role or user that
+        // provisioned them — which cannot be evaluated here, because a request carries
+        // only the access key id of its signature and this crate holds no resolution
+        // from that to a principal (the same reason `ProvisionedProductAttribute$UserArn`
+        // is not reported). So an access level selects this account's set, and only a
+        // `Value` the model does not support is refused.
+        if let Some(value) = input
+            .access_level_filter
+            .as_ref()
+            .and_then(|filter| filter.value.as_deref())
+            .filter(|value| !value.is_empty())
+        {
+            if value != ACCESS_LEVEL_FILTER_SELF {
+                return Err(invalid_parameters(format!(
+                    "Invalid AccessLevelFilter value {value}: the only supported value is \
+                     {ACCESS_LEVEL_FILTER_SELF}."
+                )));
+            }
+        }
+
+        // The search terms. `ProvisionedProductFilters` is keyed by
+        // `ProvisionedProductViewFilterBy`, whose only value is `SearchQuery`
+        // (`smithy_query query="shape" shape="ProvisionedProductViewFilterBy"`), so a
+        // filter under any other key names no search this operation can run.
+        let mut terms: Vec<&str> = Vec::new();
+        for (key, values) in input.filters.iter().flatten() {
+            if key != FILTER_BY_SEARCH_QUERY {
+                return Err(invalid_parameters(format!(
+                    "Invalid Filters key {key}: the only accepted key is {FILTER_BY_SEARCH_QUERY}"
+                )));
+            }
+            terms.extend(values.iter().map(String::as_str));
+        }
+        // Every term is matched against every searchable field of every stored
+        // provisioned product, so the term COUNT is a multiplier on the work one
+        // request asks for. The model constrains the filter's value list by nothing, so
+        // the bound is this service's own, checked before any matching runs.
+        if terms.len() > MAX_SEARCH_QUERY_TERMS {
+            return Err(invalid_parameters(format!(
+                "A search cannot carry more than {MAX_SEARCH_QUERY_TERMS} {FILTER_BY_SEARCH_QUERY} \
+                 terms."
+            )));
+        }
+
+        // "The sort field. If no value is specified, the results are not sorted. The
+        // valid values are arn, id, name, and lastRecordId."
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .filter(|field| !field.is_empty())
+            .map(|field| {
+                SORT_FIELDS.contains(&field).then_some(field).ok_or_else(|| {
+                    invalid_parameters(format!(
+                        "Invalid SortBy {field}: the valid values are {}.",
+                        SORT_FIELDS.join(", ")
+                    ))
+                })
+            })
+            .transpose()?;
+
+        // A page token is this service's own opaque cursor: the position in the
+        // RESULT the next page resumes at, because that result is the caller's own
+        // filter and sort order rather than a range of the store. Anything that is not
+        // one of ours is a bad parameter.
+        let resume_at = match input.page_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => match crate::state::decode_page_cursor(token)
+                .and_then(|cursor| cursor.parse::<usize>().ok())
+            {
+                Some(offset) => offset,
+                None => {
+                    return Err(invalid_parameters(
+                        "PageToken is not a valid page token.".to_string(),
+                    ))
+                }
+            },
+            None => 0,
+        };
+
+        // `PageSize` is modelled `0..100` with a default of 0, and 0 asks for no
+        // caller-imposed bound: the whole remaining result is returned, which the
+        // account's provisioned-product quota already bounds, so one small request
+        // cannot ask for an unbounded response.
+        let page_size = if input.page_size > 0 {
+            input.page_size as usize
+        } else {
+            crate::state::MAX_PROVISIONED_PRODUCTS
+        };
+
+        // Every provisioned product the terms match. A product matches when it matches
+        // EVERY term the filter carries: the filters narrow the result, so a second
+        // term cannot widen what the first one selected.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchProvisionedProducts"))
+        // A pure read: this operation reports the provisioned products
+        // `ProvisionProduct` stored and writes nothing, page tokens included — a token
+        // is derived from the position it resumes at, so handing one back records
+        // nothing. The stored set is read into the modelled shapes under the lock and
+        // the guard is dropped before any matching or sorting runs, so a caller's own
+        // search never holds up another request. The set is bounded by the account's
+        // provisioned-product quota.
+        let mut matched: Vec<ProvisionedProductAttribute> = {
+            let state = state.lock();
+            let now = std::time::SystemTime::now();
+            state
+                .provisioned_products
+                .values()
+                .map(|provisioned| state.provisioned_product_attribute(provisioned, now))
+                .collect()
+        };
+        matched.retain(|attribute| {
+            let searchable = searchable_values(attribute);
+            terms.iter().all(|term| matches_term(&searchable, term))
+        });
+
+        // Sorted by the field the request names, in the order it asks for. With no
+        // sort field "the results are not sorted": they come out in the store's own
+        // order (ascending provisioned-product id), which is stable across calls — what
+        // makes the cursor above resume exactly where the previous page stopped.
+        if let Some(field) = sort_by {
+            matched.sort_by(|left, right| {
+                sort_key(left, field)
+                    .cmp(&sort_key(right, field))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            if input.sort_order.as_deref() == Some(SORT_ORDER_DESCENDING) {
+                matched.reverse();
+            }
+        }
+
+        // "The number of provisioned products found" — the whole result, not this page.
+        let total_results_count = matched.len();
+        let provisioned_products: Vec<ProvisionedProductAttribute> =
+            matched.into_iter().skip(resume_at).take(page_size).collect();
+        // More remain: hand back a cursor that resumes after this page.
+        let next_page_token = (resume_at + provisioned_products.len() < total_results_count)
+            .then(|| {
+                crate::state::encode_page_cursor(
+                    &(resume_at + provisioned_products.len()).to_string(),
+                )
+            });
+
+        Ok(SearchProvisionedProductsOutput {
+            provisioned_products: Some(provisioned_products),
+            total_results_count: total_results_count as i32,
+            next_page_token,
+        })
     }
+}
+
+/// The only `ProvisionedProductViewFilterBy` value, and so the only `Filters` key a
+/// search accepts.
+const FILTER_BY_SEARCH_QUERY: &str = "SearchQuery";
+
+/// The only `AccessLevelFilter$Value` the model supports: "The user to which the
+/// access level applies. The only supported value is `self`."
+const ACCESS_LEVEL_FILTER_SELF: &str = "self";
+
+/// `SortOrder`'s descending value (`smithy_query query="shape" shape="SortOrder"`:
+/// `ASCENDING` | `DESCENDING`).
+const SORT_ORDER_DESCENDING: &str = "DESCENDING";
+
+/// The fields a search may sort by, from `SearchProvisionedProductsInput$SortBy`:
+/// "The valid values are `arn`, `id`, `name`, and `lastRecordId`."
+const SORT_FIELDS: &[&str] = &["arn", "id", "name", "lastRecordId"];
+
+/// The most `SearchQuery` terms one search may carry.
+///
+/// The model constrains `ProvisionedProductFilters` neither in entries nor in values,
+/// and each term is matched against every searchable field of every stored provisioned
+/// product — so this is the EMULATOR's bound on the one factor of that product a
+/// request chooses freely, and it is checked before any matching runs. Finite and
+/// small: more terms than a resource has searchable fields cannot narrow a result
+/// further.
+const MAX_SEARCH_QUERY_TERMS: usize = 20;
+
+/// The fields a `SearchQuery` term may name, from
+/// `SearchProvisionedProductsInput$Filters`: "When the key is `SearchQuery`, the
+/// searchable fields are `arn`, `createdTime`, `id`, `lastRecordId`,
+/// `idempotencyToken`, `name`, `physicalId`, `productId`, `provisioningArtifactId`,
+/// `type`, `status`, `tags`, `userArn`, `userArnSession`,
+/// `lastProvisioningRecordId`, `lastSuccessfulProvisioningRecordId`, `productName`,
+/// and `provisioningArtifactName`." Each one is a member of the
+/// `ProvisionedProductAttribute` the search reports, so a term is matched against
+/// exactly the value the response carries.
+const SEARCHABLE_FIELDS: &[&str] = &[
+    "arn",
+    "createdTime",
+    "id",
+    "lastRecordId",
+    "idempotencyToken",
+    "name",
+    "physicalId",
+    "productId",
+    "provisioningArtifactId",
+    "type",
+    "status",
+    "tags",
+    "userArn",
+    "userArnSession",
+    "lastProvisioningRecordId",
+    "lastSuccessfulProvisioningRecordId",
+    "productName",
+    "provisioningArtifactName",
+];
+
+/// `attribute`'s searchable fields and their values, skipping the members this
+/// service does not report.
+///
+/// One entry per [`SEARCHABLE_FIELDS`] field the attribute carries; a field may
+/// appear more than once, because `tags` carries one entry per tag.
+fn searchable_values(attribute: &ProvisionedProductAttribute) -> Vec<(&'static str, String)> {
+    let mut values: Vec<(&'static str, String)> = [
+        ("arn", attribute.arn.clone()),
+        (
+            "createdTime",
+            attribute.created_time.map(|created| {
+                created
+                    .fmt(::aws_smithy_types::date_time::Format::DateTime)
+                    .unwrap_or_default()
+            }),
+        ),
+        ("id", attribute.id.clone()),
+        ("lastRecordId", attribute.last_record_id.clone()),
+        ("idempotencyToken", attribute.idempotency_token.clone()),
+        ("name", attribute.name.clone()),
+        ("physicalId", attribute.physical_id.clone()),
+        ("productId", attribute.product_id.clone()),
+        (
+            "provisioningArtifactId",
+            attribute.provisioning_artifact_id.clone(),
+        ),
+        ("type", attribute.r#type.clone()),
+        ("status", attribute.status.clone()),
+        ("userArn", attribute.user_arn.clone()),
+        ("userArnSession", attribute.user_arn_session.clone()),
+        (
+            "lastProvisioningRecordId",
+            attribute.last_provisioning_record_id.clone(),
+        ),
+        (
+            "lastSuccessfulProvisioningRecordId",
+            attribute.last_successful_provisioning_record_id.clone(),
+        ),
+        ("productName", attribute.product_name.clone()),
+        (
+            "provisioningArtifactName",
+            attribute.provisioning_artifact_name.clone(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(field, value)| value.map(|value| (field, value)))
+    .collect();
+    // A tag is searchable by either half of the pair, so each one is one searchable
+    // value holding both.
+    values.extend(
+        attribute
+            .tags
+            .iter()
+            .flatten()
+            .map(|tag| ("tags", format!("{}={}", tag.key, tag.value))),
+    );
+    values
+}
+
+/// Whether one search term selects a provisioned product whose searchable fields are
+/// `values`.
+///
+/// A term of the documented `<field>:<value>` form, where the field is one of
+/// [`SEARCHABLE_FIELDS`] (the model's own example is
+/// `"SearchQuery":["status:AVAILABLE"]`), is matched against THAT field — and selects
+/// nothing when this service reports no value for it. Anything else — a bare term, or
+/// one whose prefix names no searchable field — is matched against every searchable
+/// field, which is what makes a term that merely CONTAINS a colon (an ARN, a
+/// timestamp) searchable as itself. A field is matched case-insensitively and by
+/// substring: the searchable fields are the user-facing names and ids of a resource,
+/// and a search over them reports what contains the term.
+fn matches_term(values: &[(&'static str, String)], term: &str) -> bool {
+    if let Some((field, wanted)) = term.split_once(':') {
+        if !wanted.is_empty() && SEARCHABLE_FIELDS.contains(&field) {
+            return values
+                .iter()
+                .filter(|(name, _)| *name == field)
+                .any(|(_, value)| contains_ignoring_case(value, wanted));
+        }
+    }
+    values
+        .iter()
+        .any(|(_, value)| contains_ignoring_case(value, term))
+}
+
+/// Whether `haystack` contains `needle`, ignoring ASCII case.
+///
+/// A byte-window comparison rather than two lowercased copies: a term is matched
+/// against every searchable field of every stored provisioned product, so matching one
+/// allocates nothing and a term longer than the field it is matched against costs
+/// nothing at all.
+fn contains_ignoring_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// `attribute`'s value for the sort field `field`, which [`SORT_FIELDS`] has already
+/// been checked to admit. The empty string for a member this service does not report,
+/// so every result sorts rather than some of them dropping out.
+fn sort_key(attribute: &ProvisionedProductAttribute, field: &str) -> String {
+    let value = match field {
+        "arn" => &attribute.arn,
+        "name" => &attribute.name,
+        "lastRecordId" => &attribute.last_record_id,
+        _ => &attribute.id,
+    };
+    value.clone().unwrap_or_default()
+}
+
+/// This operation's parameter error, carrying `message`.
+fn invalid_parameters(message: String) -> SearchProvisionedProductsError {
+    SearchProvisionedProductsErrorModeled::InvalidParametersException(InvalidParametersException {
+        message: Some(message),
+    })
+    .into()
 }
