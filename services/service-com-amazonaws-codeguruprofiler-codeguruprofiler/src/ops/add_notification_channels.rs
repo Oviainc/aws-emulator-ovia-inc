@@ -173,14 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         // The group is looked up FIRST, so a request naming a group the store does not
-        // hold answers the same 404 the other two notification operations answer,
-        // whatever else the request carries.
+        // hold is refused for that absence alone, whatever else the request carries.
         if !guard.groups.contains_key(&input.profiling_group_name) {
             return Err(
                 AddNotificationChannelsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        // The ONE sentence every group-scoped refusal of this service
-                        // uses, so this operation cannot word it a second way.
+                        // WHICH sentence this operation states for a group that is not
+                        // there is `crate::state`'s rule, not this handler's: see
+                        // [`crate::state::group_not_found_message`], whose doc also says
+                        // which operations word that refusal their own way.
                         message: crate::state::group_not_found_message(
                             &input.profiling_group_name,
                         ),

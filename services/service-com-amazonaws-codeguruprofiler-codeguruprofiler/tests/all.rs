@@ -41,6 +41,8 @@ mod get_profile_latest_profile;
 mod get_profile_window_companion;
 #[path = "all/get_profile_window_length.rs"]
 mod get_profile_window_length;
+#[path = "all/group_not_found_sentence_source.rs"]
+mod group_not_found_sentence_source;
 #[path = "all/input_refusal_is_modelled.rs"]
 mod input_refusal_is_modelled;
 #[path = "all/instant_comparison_resolution.rs"]

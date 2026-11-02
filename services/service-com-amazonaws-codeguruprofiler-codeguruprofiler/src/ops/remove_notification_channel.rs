@@ -157,8 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 RemoveNotificationChannelErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        // The ONE sentence every group-scoped refusal of this service
-                        // uses, so this operation cannot word it a second way.
+                        // WHICH sentence this operation states for a group that is not
+                        // there is `crate::state`'s rule, not this handler's: see
+                        // [`crate::state::group_not_found_message`], whose doc also says
+                        // which operations word that refusal their own way.
                         message: crate::state::group_not_found_message(
                             &input.profiling_group_name,
                         ),

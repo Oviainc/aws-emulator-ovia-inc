@@ -225,8 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::PolicyWrite::UnknownGroup => {
                 Err(PutPermissionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        // The service's own not-found text for an operation ON a group,
-                        // as `crate::state` words it for every group-scoped operation.
+                        // WHICH sentence this operation states for a group that is not
+                        // there is `crate::state`'s rule, not this handler's: see
+                        // [`crate::state::group_not_found_message`], whose doc also says
+                        // which operations word that refusal their own way.
                         message: crate::state::group_not_found_message(
                             &input.profiling_group_name,
                         ),

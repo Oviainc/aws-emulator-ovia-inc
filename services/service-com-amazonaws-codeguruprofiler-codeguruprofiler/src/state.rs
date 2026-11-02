@@ -2112,6 +2112,16 @@ pub fn profiling_group_record_not_found_message(name: &str) -> String {
 /// This is the refusal of an operation ON a group, as distinct from a refusal about the
 /// group RECORD (create's conflict, delete's absence), which names the account too —
 /// see [`profiling_group_record_not_found_message`].
+///
+/// It is the sentence of the operations whose own wording for that case is NOT recorded,
+/// so it is not what EVERY group-scoped refusal states: the operations with a recorded
+/// form of their own state that instead, each documented on its own helper —
+/// [`policy_group_not_found_message`] (`GetPolicy`),
+/// [`notification_group_not_found_message`] (`GetNotificationConfiguration`),
+/// [`update_group_not_found_message`] (`UpdateProfilingGroup`) and
+/// [`agent_group_not_found_message`] (the agent plane). A handler that calls this
+/// function therefore states no rule of its own: this doc is the rule, and which sentence
+/// an operation answers with is decided here.
 pub fn group_not_found_message(name: &str) -> String {
     format!("CodeGuru Profiler can\u{2019}t complete the operation because {name} was not found.")
 }
