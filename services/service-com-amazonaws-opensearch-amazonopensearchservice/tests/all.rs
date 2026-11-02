@@ -191,6 +191,8 @@ mod upgrade_history;
 mod upgrade_progress_convergence;
 #[path = "all/upgrade_status.rs"]
 mod upgrade_status;
+#[path = "all/upgrade_status_envelope.rs"]
+mod upgrade_status_envelope;
 #[path = "all/upgrade_status_reporting.rs"]
 mod upgrade_status_reporting;
 #[path = "all/version_catalog.rs"]

@@ -10,6 +10,10 @@
 //! the same derivation `GetUpgradeHistory` reports every step of that run from, so a
 //! poll and the history cannot disagree about how far the run got.
 //!
+//! The report is answered as [`GetUpgradeStatusReport`], so every member of the modelled
+//! response is on the wire whatever the domain's upgrade state — carrying a null where
+//! this domain has nothing to put there rather than being left out.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -138,7 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetUpgradeStatus<Eng>
 {
     type Input = GetUpgradeStatusInput;
-    type Output = GetUpgradeStatusOutput;
+    type Output = GetUpgradeStatusReport;
     type Error = GetUpgradeStatusError;
 
     const NAME: &'static str = "GetUpgradeStatus";
@@ -172,14 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The most recent status of the last upgrade or upgrade eligibility check
         // performed on" the domain: a domain nothing has ever upgraded or checked has no
-        // such run, and every member of this response is optional — so there is nothing
-        // to report rather than a step some run is on.
+        // such run, so there is no step, no step status and no run to name — each of
+        // which is still REPORTED, as a null, by the envelope this answers with.
         let Some(run) = domain.latest_upgrade() else {
-            return Ok(GetUpgradeStatusOutput {
+            return Ok(GetUpgradeStatusReport(GetUpgradeStatusOutput {
                 upgrade_step: None,
                 step_status: None,
                 upgrade_name: None,
-            });
+            }));
         };
 
         // "One of three steps that an upgrade or upgrade eligibility check goes through"
@@ -187,13 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // performing right now, which for a run whose span has passed is the last step it
         // performed.
         let current = run.current_step(now);
-        Ok(GetUpgradeStatusOutput {
+        Ok(GetUpgradeStatusReport(GetUpgradeStatusOutput {
             upgrade_step: current.map(|(step, _)| step.to_string()),
             step_status: current.map(|(_, status)| status.to_string()),
             // "A string that describes the update": the same description
             // `GetUpgradeHistory` reports this run under, so the two name one run
             // identically.
             upgrade_name: Some(run.upgrade_name()),
-        })
+        }))
     }
 }

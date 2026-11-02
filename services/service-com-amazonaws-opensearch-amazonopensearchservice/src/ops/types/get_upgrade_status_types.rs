@@ -9,6 +9,8 @@
 
 use super::*;
 
+use ::aws_smithy_schema::serde::SerdeError;
+
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-opensearch-amazonopensearchservice.json");
 
 #[smithy_macros::smithy(shape = "com.amazonaws.opensearch#GetUpgradeStatusRequest")]
@@ -17,11 +19,77 @@ pub struct GetUpgradeStatusInput {
     pub domain_name: String,
 }
 
+/// `GetUpgradeStatus`'s output, exactly as the model declares it: the shape
+/// `GET_UPGRADE_STATUS_OUTPUT_SCHEMA` describes, which carries every member's wire name
+/// and target.
+///
+/// The handler answers with [`GetUpgradeStatusReport`] rather than this, for the reason
+/// stated there.
 #[smithy_macros::smithy(shape = "com.amazonaws.opensearch#GetUpgradeStatusResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct GetUpgradeStatusOutput {
     pub upgrade_step: Option<String>,
     pub step_status: Option<String>,
     pub upgrade_name: Option<String>,
+}
+
+/// What `GetUpgradeStatus` ANSWERS with: [`GetUpgradeStatusOutput`]'s members, every one
+/// of them written on every answer — as the value the domain's upgrade record yields, or
+/// as an explicit null where that record leaves it unset.
+///
+/// WHY a wrapper and not the generated output: the generated serializer writes an
+/// optional member only when it holds a value, so a domain with no upgrade and no
+/// upgrade-eligibility check on record was answered a body with NONE of the three
+/// members this report exists to expose. The step an upgrade is on, that step's status
+/// and the run's description are this operation's whole answer, so every one of them is
+/// reported on every answer: a client reading them can then tell "no upgrade on record"
+/// (the member, reported as null) from "the member was not reported at all", and one
+/// that checks the body against the modelled output shape before reading it finds the
+/// shape it expects.
+///
+/// Every member is written through the generated member schemas of
+/// `GET_UPGRADE_STATUS_OUTPUT_SCHEMA`, so each one's wire name is single-homed in the
+/// model-derived schema and this type holds no second copy of it.
+#[derive(Debug, Clone, Default)]
+pub struct GetUpgradeStatusReport(pub GetUpgradeStatusOutput);
+
+impl GetUpgradeStatusReport {
+    /// The member of the generated output schema named `name`.
+    fn member(name: &str) -> Result<&'static ::aws_smithy_schema::Schema, SerdeError> {
+        GET_UPGRADE_STATUS_OUTPUT_SCHEMA
+            .members()
+            .iter()
+            .copied()
+            .find(|member| member.member_name() == Some(name))
+            .ok_or_else(|| {
+                SerdeError::custom(format!(
+                    "GetUpgradeStatusResponse declares no member '{name}'"
+                ))
+            })
+    }
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetUpgradeStatusReport {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), SerdeError> {
+        // Every member the model declares for this response, each one written whatever
+        // the domain's upgrade state: the value when the report has one, a null when it
+        // has none. A member left out would say nothing at all, where a null says the
+        // report has nothing to put there.
+        for (name, value) in [
+            ("UpgradeStep", self.0.upgrade_step.as_deref()),
+            ("StepStatus", self.0.step_status.as_deref()),
+            ("UpgradeName", self.0.upgrade_name.as_deref()),
+        ] {
+            let member = Self::member(name)?;
+            match value {
+                Some(value) => s.write_string(member, value)?,
+                None => s.write_null(member)?,
+            }
+        }
+        Ok(())
+    }
 }
 
