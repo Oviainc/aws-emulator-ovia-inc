@@ -998,6 +998,67 @@ pub fn invalid_next_token() -> ValidationException {
     }
 }
 
+/// What a refusal about the REQUEST'S OWN PARAMETERS opens with, whichever operation
+/// composes it and whatever is wrong with them.
+///
+/// The faults of one request are stated as this fixed prefix followed by one clause
+/// per fault, comma-separated, so a caller reads every fault from the one sentence.
+/// Nothing but the clauses varies: the prefix carries no member name, no value and no
+/// count.
+const PARAMETERS_NOT_VALID_PREFIX: &str = "The following parameter(s) are not valid: ";
+
+/// The clause stating that the request has to carry a parameter and does not.
+///
+/// `path` is the parameter's path from the operation's own input — the nesting written
+/// with `.`, as in a `Details` member — and it is quoted in the sentence, which is the
+/// one variable part of the clause.
+pub fn required_parameter(path: &str) -> String {
+    format!("{path:?} is required")
+}
+
+/// The clause stating that the request carries parameters it may not carry here. It
+/// names none of them: the clause is the whole of what is said about them, so it is
+/// fixed text. Private, so the clause reaches a `Message` only through the one
+/// envelope constructor below.
+const UNSUPPORTED_PARAMETERS: &str = "Unsupported request parameter(s) were found.";
+
+/// The whole `Message` of a refusal about the request's parameters: the fixed
+/// [`PARAMETERS_NOT_VALID_PREFIX`] followed by `clauses`, one per fault, in the order
+/// the faults were found.
+pub fn parameters_not_valid_message(clauses: &[String]) -> String {
+    format!("{PARAMETERS_NOT_VALID_PREFIX}{}", clauses.join(", "))
+}
+
+/// The modelled 400 for a request whose own parameters are at fault; the `Message` is
+/// [`parameters_not_valid_message`].
+pub fn parameters_not_valid(clauses: &[String]) -> ValidationException {
+    invalid_request(parameters_not_valid_message(clauses))
+}
+
+/// The `Message` refusing a request whose set of nested members is not the set the
+/// request's own discriminator (its `Type`, its `Event`, its `Action`) admits:
+/// `missing` is every parameter path the request has to carry and omits, and
+/// `unsupported` says whether it carries a member that is not admitted here.
+///
+/// `None` when nothing is at fault — no path is missing and no member is unsupported —
+/// so one call decides both whether to refuse and what the refusal says.
+pub fn member_set_message(missing: &[&str], unsupported: bool) -> Option<String> {
+    let mut clauses: Vec<String> = missing.iter().copied().map(required_parameter).collect();
+    if unsupported {
+        clauses.push(UNSUPPORTED_PARAMETERS.to_string());
+    }
+    (!clauses.is_empty()).then(|| parameters_not_valid_message(&clauses))
+}
+
+/// The whole `Message` of the refusal of a parameter whose value is outside the set
+/// the model admits for it; see [`parameter_not_in_value_set`].
+pub fn parameter_not_in_value_set_message(parameter: &str, admitted: &[&str]) -> String {
+    parameters_not_valid_message(&[format!(
+        "{parameter:?} must be one of [{}].",
+        admitted.join(", ")
+    )])
+}
+
 /// The modelled 400 for a request parameter whose value is outside the set the model
 /// admits for it: `The following parameter(s) are not valid: "origin" must be one of
 /// [OWNED, ENTITLED].`
@@ -1005,10 +1066,7 @@ pub fn invalid_next_token() -> ValidationException {
 /// `admitted` is the model's own value set, in the model's own order, so the sentence
 /// states the contract rather than a remembered example.
 pub fn parameter_not_in_value_set(parameter: &str, admitted: &[&str]) -> ValidationException {
-    invalid_request(format!(
-        "The following parameter(s) are not valid: {parameter:?} must be one of [{}].",
-        admitted.join(", ")
-    ))
+    invalid_request(parameter_not_in_value_set_message(parameter, admitted))
 }
 
 /// Whether the request carried `name` as a query parameter at all - whatever value
@@ -1297,6 +1355,23 @@ pub fn event_action_limit_exceeded() -> ServiceLimitExceededException {
     }
 }
 
+/// The parameter path of the one member an `Action` names — the action it performs
+/// (`smithy_query(query="shape", shape="Action")`).
+const ACTION_MEMBER_PATH: &str = "Action.ExportRevisionToS3";
+
+/// The parameter path an `Action` has to carry and does not, or `None` when it names
+/// the action it performs.
+///
+/// `Action`'s single member is optional in the model, so the boundary walk admits an
+/// empty one; an operation that carries an `Action` beside other members reports this
+/// fault together with theirs, in one refusal.
+pub fn missing_action_member(action: &Action) -> Option<&'static str> {
+    action
+        .export_revision_to_s3
+        .is_none()
+        .then_some(ACTION_MEMBER_PATH)
+}
+
 /// Refuse an event action's `Action` the store will not hold, and one that describes
 /// nothing to do.
 ///
@@ -1308,9 +1383,9 @@ pub fn event_action_limit_exceeded() -> ServiceLimitExceededException {
 /// — the create and the update — refuses the same values with the same sentence.
 pub fn bound_action(action: &Action) -> Result<(), String> {
     let Some(export) = action.export_revision_to_s3.as_ref() else {
-        return Err(
-            "Action must name the action to perform: ExportRevisionToS3".to_string()
-        );
+        return Err(parameters_not_valid_message(&[required_parameter(
+            ACTION_MEMBER_PATH,
+        )]));
     };
     bound_chars(
         "Action.ExportRevisionToS3.RevisionDestination.Bucket",

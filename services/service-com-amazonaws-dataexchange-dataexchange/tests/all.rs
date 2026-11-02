@@ -17,6 +17,8 @@ mod data_set_notifications;
 mod data_sets;
 #[path = "all/event_actions.rs"]
 mod event_actions;
+#[path = "all/invalid_parameter_message.rs"]
+mod invalid_parameter_message;
 #[path = "all/job_lifecycle.rs"]
 mod job_lifecycle;
 #[path = "all/job_state_conflict_message.rs"]

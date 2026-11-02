@@ -378,15 +378,27 @@ fn present_members(details: &RequestDetails) -> Vec<&'static str> {
     .collect()
 }
 
-/// The refusal for a `Details` that does not carry exactly the member `Type` names.
-fn wrong_details(job_type: &str, expected: &str, present: &[&str]) -> String {
-    let carried = match present {
-        [] => "no member".to_string(),
-        members => members.join(", "),
-    };
-    format!(
-        "Details must carry exactly the {expected} member for a {job_type} job, got {carried}"
-    )
+/// The parameter path of a `Details` member, as a path from this operation's input.
+fn details_path(member: &str) -> String {
+    format!("Details.{member}")
+}
+
+/// Every fault of a `Details` that does not carry exactly the member `Type` names, as
+/// the whole `Message` of the refusal — `None` when it carries exactly that member and
+/// nothing else.
+///
+/// A `Details` can be at fault in two ways at once, and both are reported: the member
+/// the requested `Type` demands is absent, and a member that `Type` does not admit is
+/// present. Which members are present is the only thing read from the request; the
+/// unsupported ones are not named, because that clause states no member.
+fn details_faults(expected: &str, present: &[&str]) -> Option<String> {
+    let path = details_path(expected);
+    let mut missing: Vec<&str> = Vec::new();
+    if !present.contains(&expected) {
+        missing.push(path.as_str());
+    }
+    let unsupported = present.iter().any(|member| *member != expected);
+    crate::state::member_set_message(&missing, unsupported)
 }
 
 /// The endpoint THIS request arrived at, from its `Host` header or its URI's own
@@ -444,13 +456,18 @@ fn plan_job(
     endpoint: Option<&str>,
     created_at: ::aws_smithy_types::DateTime,
 ) -> Result<Plan, String> {
-    let expected = details_member_for(job_type)
-        .ok_or_else(|| format!("Type {job_type} is not a job type this service creates"))?;
+    let expected = details_member_for(job_type).ok_or_else(|| {
+        crate::state::parameter_not_in_value_set_message("Type", TYPE_VALUES)
+    })?;
     let present = present_members(&details);
-    if present.as_slice() != [expected] {
-        return Err(wrong_details(job_type, expected, &present));
+    if let Some(message) = details_faults(expected, &present) {
+        return Err(message);
     }
-    let missing = || wrong_details(job_type, expected, &[]);
+    let missing = || {
+        crate::state::parameters_not_valid_message(&[crate::state::required_parameter(
+            &details_path(expected),
+        )])
+    };
 
     match expected {
         "CreateS3DataAccessFromS3Bucket" => {

@@ -235,8 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `Type` names: a `DEPRECATION` notification carrying data-update details describes
 /// two different events at once, and `DATA_DELAY` has no detail shape at all.
 ///
-/// `Err` carries the message naming the member at fault, so the caller can fix the
-/// request from it alone.
+/// `Err` carries the refusal's whole `Message`: the request's parameter faults, which
+/// `crate::state::member_set_message` composes for every member set this service
+/// cross-checks against its request's own discriminator.
 fn notified_details(
     notification_type: &str,
     details: Option<&NotificationDetails>,
@@ -266,27 +267,30 @@ fn notified_details(
             details.is_some_and(|details| details.schema_change.is_some()),
         ),
     ];
-    for (member, present) in carried {
-        if present && Some(member) != expected {
-            return Err(format!(
-                "Details.{member} does not belong to a {notification_type} notification"
-            ));
-        }
-    }
+    // A detail member other than the one `Type` names is a parameter this request may
+    // not carry: it is reported as such rather than named in the sentence.
+    let unsupported = carried
+        .iter()
+        .any(|(member, present)| *present && Some(*member) != expected);
 
     // A `DEPRECATION` or `SCHEMA_CHANGE` notification IS about the instant its detail
     // carries - `DeprecationAt` and `SchemaChangeAt` are both `@required` - so that
     // detail is required with those types. `DataUpdate`'s only member is optional, so
     // a `DATA_UPDATE` notification without it still says what it is about.
-    if let Some(member) = expected.filter(|member| {
-        matches!(*member, "Deprecation" | "SchemaChange")
-            && !carried
-                .iter()
-                .any(|(name, present)| *name == *member && *present)
-    }) {
-        return Err(format!(
-            "Details.{member} is required for a {notification_type} notification"
-        ));
+    let required = expected
+        .filter(|member| {
+            matches!(*member, "Deprecation" | "SchemaChange")
+                && !carried
+                    .iter()
+                    .any(|(name, present)| *name == *member && *present)
+        })
+        .map(|member| format!("Details.{member}"));
+    let mut missing: Vec<&str> = Vec::new();
+    if let Some(path) = required.as_deref() {
+        missing.push(path);
+    }
+    if let Some(message) = crate::state::member_set_message(&missing, unsupported) {
+        return Err(message);
     }
 
     // The one caller-sized collection a notification carries. The model bounds it in

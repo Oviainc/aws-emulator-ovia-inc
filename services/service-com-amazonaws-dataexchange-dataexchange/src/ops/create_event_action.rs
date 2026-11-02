@@ -125,6 +125,10 @@ impl From<CreateEventActionErrorModeled> for CreateEventActionError {
     }
 }
 
+/// The parameter path of the one member an `Event` names — the event that starts the
+/// action (`smithy_query(query="shape", shape="Event")`).
+const EVENT_MEMBER_PATH: &str = "Event.RevisionPublished";
+
 /// The `CreateEventAction` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -171,14 +175,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Event` and `Action` are modelled structures whose single member is
         // optional, so the boundary walk admits an empty one: an event action that
         // names neither the event that fires it nor what it then does describes no
-        // automation at all.
-        let Some(published) = input.event.revision_published.clone() else {
-            return Err(CreateEventActionErrorModeled::ValidationException(
-                crate::state::invalid_request(
-                    "Event must name the event that starts the action: RevisionPublished",
-                ),
-            )
-            .into());
+        // automation at all. Both are faults of the one request, so one refusal states
+        // both, a clause each.
+        let published = input.event.revision_published.clone();
+        let faults: Vec<String> = [
+            published.is_none().then_some(EVENT_MEMBER_PATH),
+            crate::state::missing_action_member(&input.action),
+        ]
+        .into_iter()
+        .flatten()
+        .map(crate::state::required_parameter)
+        .collect();
+        let published = match published {
+            Some(published) if faults.is_empty() => published,
+            // Every absent member above contributed its own clause, so this refusal
+            // always states at least one fault.
+            _ => {
+                return Err(CreateEventActionErrorModeled::ValidationException(
+                    crate::state::parameters_not_valid(&faults),
+                )
+                .into())
+            }
         };
         if let Err(message) = crate::state::bound_action(&input.action)
             .and_then(|()| crate::state::bound_tags(input.tags.as_ref()))

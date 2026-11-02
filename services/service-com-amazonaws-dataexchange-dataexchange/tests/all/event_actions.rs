@@ -219,7 +219,7 @@ fn message(answer: &Answer) -> String {
 /// `data_set_notifications.rs` writes a data set's Marketplace product. It is also
 /// what proves the handler's answer comes from the stored record rather than from the
 /// request.
-fn entitle_data_set(engine: &Arc<engine::InMemoryEngine>, data_set_id: &str) {
+pub(crate) fn entitle_data_set(engine: &Arc<engine::InMemoryEngine>, data_set_id: &str) {
     let state = dataexchange::state::service_state(&**engine).expect("the dataexchange store");
     let mut store = state.lock();
     let data_set = store
