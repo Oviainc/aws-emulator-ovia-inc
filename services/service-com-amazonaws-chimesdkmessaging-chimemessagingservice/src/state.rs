@@ -73,6 +73,13 @@ pub const MAX_TAGS_PER_RESOURCE: usize = ::service_common::chime_tags::MAX_TAGS_
 pub const UNRESOLVABLE_APP_INSTANCE: &str =
     "An invalid App Instance ARN was supplied for the input parameter.";
 
+/// How many bytes the digest every id this service mints is laid out from carries:
+/// SHA-256's output length. Hex-rendered whole, it is the 64-character id the generated
+/// segment of this service's app-instance-scoped ARNs is, which is also exactly
+/// `ChannelId`'s modelled maximum (`smithy_query(query="shape", shape="ChannelId")`:
+/// `len 1..64`); its first 16 bytes are the ones a `MessageId`'s uuid is laid out from.
+const ID_DIGEST_BYTES: usize = 32;
+
 /// How many channel flows this emulator stores at once.
 ///
 /// `CreateChannelFlow` is the only way to add one and `DeleteChannelFlow` the only way to
@@ -244,7 +251,7 @@ pub struct ComAmazonawsChimesdkmessagingChimemessagingserviceState {
     /// `@idempotencyToken` too — read and written through
     /// [`Self::remembered_channel_flow`] / [`Self::remember_channel_flow`].
     create_channel_flow_idempotency: IdempotencyLedger,
-    /// Draws [`Self::mint_id`], so two ids minted in the same nanosecond differ.
+    /// Draws [`Self::id_digest`], so two ids minted in the same nanosecond differ.
     id_counter: u64,
 }
 
@@ -284,21 +291,54 @@ impl IdempotencyLedger {
 }
 
 impl ComAmazonawsChimesdkmessagingChimemessagingserviceState {
-    /// Mint an id for a resource this service creates: a channel id or a message id.
+    /// Mint the id segment of an ARN this service derives for a resource it creates: a
+    /// channel id or a channel flow id.
     ///
-    /// The value is the first 16 bytes of a SHA-256 over `salt`, a monotonic counter and
-    /// the current instant, hex-encoded — 32 characters that satisfy both `ChannelId`'s
-    /// `^[A-Za-z0-9]([A-Za-z0-9:\-_.@]{0,62}[A-Za-z0-9])?$` and `MessageId`'s
-    /// `^[-_a-zA-Z0-9]*$`. The counter is what makes two ids minted in the same
-    /// nanosecond differ; nothing the caller sent is recoverable from the result.
-    pub fn mint_id(&mut self, salt: &str) -> String {
+    /// Both carry the same id shape, because both are the generated last segment of an
+    /// app-instance-scoped ARN of this service (`…/channel/<id>`,
+    /// `…/channel-flow/<id>`): a FULL lowercase hex digest, 64 characters, which is also
+    /// exactly `ChannelId`'s modelled maximum (`len 1..64`) and inside its
+    /// `^[A-Za-z0-9]([A-Za-z0-9:\-_.@]{0,62}[A-Za-z0-9])?$`.
+    ///
+    /// The digest comes from [`Self::id_digest`], so two ids minted in the same
+    /// nanosecond differ and nothing the caller sent is recoverable from the result.
+    pub fn mint_resource_id(&mut self, salt: &str) -> String {
+        hex::encode(self.id_digest(salt))
+    }
+
+    /// Mint a `MessageId` for a message this service accepts.
+    ///
+    /// A message id carries a different shape from the ARN id segments above: the
+    /// canonical hyphenated lowercase UUID form, which `MessageId`'s `len 1..128`,
+    /// `^[-_a-zA-Z0-9]*$` admits (the hyphens included). The family's one rendering of 16
+    /// opaque bytes in that form is
+    /// [`::service_common::uuid_from_random_bytes`], so the version and variant bits and
+    /// the group boundaries are not restated here.
+    ///
+    /// The bytes handed to it are [`Self::id_digest`]'s, the same source the ARN id
+    /// segments draw, so the uniqueness argument is the one stated there.
+    pub fn mint_message_id(&mut self, salt: &str) -> String {
+        let digest = self.id_digest(salt);
+        let bytes: [u8; 16] = digest[..16]
+            .try_into()
+            .expect("16 of the digest's 32 bytes");
+        ::service_common::uuid_from_random_bytes(bytes)
+    }
+
+    /// The digest every id this service mints is laid out from: a SHA-256 over `salt`, a
+    /// monotonic counter and the current instant.
+    ///
+    /// The counter is what makes two ids minted in the same nanosecond differ, and the
+    /// digest is what keeps `salt` — which carries the caller's own ARNs — unrecoverable
+    /// from the id.
+    fn id_digest(&mut self, salt: &str) -> [u8; ID_DIGEST_BYTES] {
         self.id_counter = self.id_counter.wrapping_add(1);
         let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
         sha2::Digest::update(&mut hasher, salt.as_bytes());
         sha2::Digest::update(&mut hasher, self.id_counter.to_be_bytes());
         sha2::Digest::update(&mut hasher, now_nanos().to_be_bytes());
         let digest = sha2::Digest::finalize(hasher);
-        hex::encode(&digest[..16])
+        digest.into()
     }
 
     /// The `ChannelArn` an earlier `CreateChannel` with this `(AppInstanceArn,
@@ -914,7 +954,7 @@ pub fn now_millis() -> i64 {
     }
 }
 
-/// Now, as epoch nanoseconds, which is what [`ComAmazonawsChimesdkmessagingChimemessagingserviceState::mint_id`]
+/// Now, as epoch nanoseconds, which is what the digest behind every id this service mints
 /// hashes beside its counter.
 fn now_nanos() -> u128 {
     std::time::SystemTime::now()

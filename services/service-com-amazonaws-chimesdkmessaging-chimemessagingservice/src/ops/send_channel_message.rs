@@ -267,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Minted before the channel is borrowed, because the counter it draws lives on
         // the store itself.
-        let minted_id = store.mint_id(&input.channel_arn);
+        let minted_id = store.mint_message_id(&input.channel_arn);
         // A channel ARN this service cannot resolve names a channel scope the caller
         // cannot reach, which is the modelled `ForbiddenException` — the only terminal
         // client error this operation declares for a channel it will not send to.

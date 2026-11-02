@@ -261,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A channel flow is a resource OF the app instance, so its ARN extends that app
         // instance's — exactly as `CreateChannel` derives a `ChannelArn`.
-        let channel_flow_id = store.mint_id(&input.app_instance_arn);
+        let channel_flow_id = store.mint_resource_id(&input.app_instance_arn);
         let arn = format!("{}/channel-flow/{channel_flow_id}", input.app_instance_arn);
         let arn_length = arn.chars().count();
         if arn_length > CHIME_ARN_MAX_LENGTH {

@@ -44,10 +44,14 @@ use crate::channel_membership::INSUFFICIENT_ACCESS;
 
 /// One response, reduced to the two things the wire contract pins: the HTTP status and
 /// the JSON body.
+///
+/// `pub(crate)` for the reason [`encode`] is: the sibling suites in this ONE test binary
+/// address the same restJson1 surface, so they read one reply type rather than a copy
+/// each.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Reply {
@@ -61,12 +65,14 @@ impl Reply {
 }
 
 /// The emulator under test: this one service mounted in the production router.
-struct Emulator {
+///
+/// `pub(crate)` for the reason [`encode`] is.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // ONE shared engine, exactly as `router/src/lib.rs` builds it, so every request
         // in a case observes the same store.
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -79,7 +85,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn call(&self, method: &str, uri: &str, body: Option<&Value>) -> Reply {
+    pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<&Value>) -> Reply {
         let bytes = match body {
             Some(value) => Bytes::from(serde_json::to_vec(value).expect("serialize the request")),
             None => Bytes::new(),
@@ -108,11 +114,11 @@ impl Emulator {
         Reply { status, body }
     }
 
-    async fn create_channel(&self, request: &Value) -> Reply {
+    pub(crate) async fn create_channel(&self, request: &Value) -> Reply {
         self.call("POST", "/channels", Some(request)).await
     }
 
-    async fn describe_channel(&self, channel_arn: &str) -> Reply {
+    pub(crate) async fn describe_channel(&self, channel_arn: &str) -> Reply {
         self.call("GET", &format!("/channels/{}", encode(channel_arn)), None)
             .await
     }
@@ -126,7 +132,7 @@ impl Emulator {
         .await
     }
 
-    async fn send_message(&self, channel_arn: &str, request: &Value) -> Reply {
+    pub(crate) async fn send_message(&self, channel_arn: &str, request: &Value) -> Reply {
         self.call(
             "POST",
             &format!("/channels/{}/messages", encode(channel_arn)),
@@ -135,7 +141,7 @@ impl Emulator {
         .await
     }
 
-    async fn get_message(&self, channel_arn: &str, message_id: &str) -> Reply {
+    pub(crate) async fn get_message(&self, channel_arn: &str, message_id: &str) -> Reply {
         self.call(
             "GET",
             &format!(
@@ -204,7 +210,7 @@ impl Emulator {
     }
 
     /// Create a channel with only the required members and return its ARN.
-    async fn channel(&self, app_instance_arn: &str, name: &str, token: &str) -> String {
+    pub(crate) async fn channel(&self, app_instance_arn: &str, name: &str, token: &str) -> String {
         let reply = self
             .create_channel(&json!({
                 "AppInstanceArn": app_instance_arn,

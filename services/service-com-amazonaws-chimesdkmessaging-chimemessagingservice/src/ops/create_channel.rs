@@ -272,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service mints, exactly as the model documents.
         let channel_id = match input.channel_id {
             Some(channel_id) => channel_id,
-            None => store.mint_id(&input.app_instance_arn),
+            None => store.mint_resource_id(&input.app_instance_arn),
         };
         let arn = format!("{}/channel/{channel_id}", input.app_instance_arn);
         let arn_length = arn.chars().count();

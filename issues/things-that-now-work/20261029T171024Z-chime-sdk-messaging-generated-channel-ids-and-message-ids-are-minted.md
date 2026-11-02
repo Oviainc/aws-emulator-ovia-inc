@@ -47,3 +47,26 @@ Source: `state.rs:287-295` - `hex::encode(&digest[..16])`, documented as the id 
 2. Replay chime-sdk-messaging-channel-ban-create-list-and-delete step task#4 (CreateChannel) and inspect the returned ChannelArn: its channel segment is a 32-character hex string, which fails the fixture's shape assertion for the segment.
 3. Replay chime-sdk-messaging-channel-message-send-update-and-redact step task#4 (SendChannelMessage) and inspect MessageId: a 32-character hex string with no hyphens, which fails the fixture's shape assertion.
 4. By hand: CreateChannel then SendChannelMessage against the emulator and compare the id shapes with any recorded AWS response.
+
+## Resolution
+The id FORM of both generated identifiers was corrected and pinned by tests; the remaining
+divergence - the literal id value - is DECLINED, because it is a per-run, service-generated
+value this emulator must not derive from a recording.
+
+One helper minted every id in this service (`state.rs` `mint_id`) by hex-encoding the first
+16 of SHA-256's 32 digest bytes, so both id classes came out as the same 32-character hex
+string. It is now two mints over one digest: `mint_resource_id` renders the FULL digest, the
+64-character lowercase hex id the generated last segment of this service's
+app-instance-scoped ARNs is (`.../channel/<id>` from `CreateChannel`, `.../channel-flow/<id>`
+from `CreateChannelFlow`), which is also exactly `ChannelId`'s modelled maximum; and
+`mint_message_id` lays the digest bytes out as the canonical hyphenated lowercase UUID a
+`MessageId` is, through the `uuid` crate, which owns that form's version/variant nibbles and
+its rendering. A `ChannelId` the caller supplies is still carried through unchanged.
+
+Both replay keys (`CreateChannel|2xx->2xx|$.ChannelArn`,
+`SendChannelMessage|2xx->2xx|$.MessageId`) still report as failing, byte-identically to
+before the change: they compare the recorded id VALUE, which is per-account and per-run.
+What the service owes instead is asserted end-to-end in `tests/all/generated_id_shapes.rs`:
+every generated ARN id segment is a full lowercase hex digest, every `MessageId` a canonical
+hyphenated uuid, each unique per resource over a table of request forms and a run of sends,
+each the id the resource reads back by, and a caller-supplied `ChannelId` untouched.
