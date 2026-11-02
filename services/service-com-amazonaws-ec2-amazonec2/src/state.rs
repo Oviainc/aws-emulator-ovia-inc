@@ -612,6 +612,13 @@
 //! most one transfer at a time — `EnableAddressTransfer` starts the one offer on it — which
 //! also gives the describe path one stable order to report and page over.
 //!
+//! The status on the record is what the two-step handshake writes:
+//! [`ComAmazonawsEc2Amazonec2State::withdraw_address_transfer`] leaves a withdrawn offer
+//! `disabled` and [`ComAmazonawsEc2Amazonec2State::accept_address_transfer`] leaves a taken
+//! one `accepted` with the instant it was taken on it. An offer is found BY ADDRESS for the
+//! accepting side ([`ComAmazonawsEc2Amazonec2State::address_transfer_on_offer`]), which is
+//! what the accept names the transfer by.
+//!
 //! Unlike a `pending` VPC's move, those instants are DOCUMENTED spans rather than chosen
 //! ones ([`ADDRESS_TRANSFER_OFFER_WINDOW`], [`ADDRESS_TRANSFER_ACCEPTED_VISIBILITY`]), so
 //! they are kept on the wall clock the reported timestamps are on;
@@ -29373,6 +29380,55 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         record.transfer.address_transfer_status =
             Some(ADDRESS_TRANSFER_STATUS_DISABLED.to_string());
+        true
+    }
+
+    /// The allocation id of the stored transfer that has `public_ip` ON OFFER, or `None`
+    /// when no transfer of this store does.
+    ///
+    /// The transfer surface's one lookup by ADDRESS: "The Elastic IP address you are
+    /// accepting for transfer" (`AcceptAddressTransferRequest$Address`) names the address
+    /// rather than the allocation id a record is keyed by. Only a `pending` offer is
+    /// answered — a `disabled` one has been withdrawn and an `accepted` one has already been
+    /// taken, so neither is on offer — which is also what decides there is nothing to
+    /// accept. A scan of the records themselves, like [`Self::allocation_id_for_public_ip`]
+    /// and bounded the same way: a stored address carries at most one transfer.
+    pub fn address_transfer_on_offer(&self, public_ip: &str) -> Option<String> {
+        self.address_transfers
+            .iter()
+            .find(|(_, record)| {
+                record.transfer.public_ip.as_deref() == Some(public_ip)
+                    && record.transfer.address_transfer_status.as_deref()
+                        == Some(ADDRESS_TRANSFER_STATUS_PENDING)
+            })
+            .map(|(allocation_id, _)| allocation_id.clone())
+    }
+
+    /// Take the transfer offer on `allocation_id` as of `at`, answering whether there was a
+    /// `pending` one to take.
+    ///
+    /// "Accepts an Elastic IP address transfer" (`AcceptAddressTransfer`): the record moves
+    /// to `accepted`, `TransferOfferAcceptedTimestamp` names the instant it was taken, and
+    /// the record stays visible for [`ADDRESS_TRANSFER_ACCEPTED_VISIBILITY`] from that
+    /// instant instead of until the offer would have run out — "Accepted transfers are
+    /// visible to the source account for 14 days after the transfers have been accepted"
+    /// (`DescribeAddressTransfers`). Only an offer that is still `pending` can be taken, so
+    /// this answers `false` for every other state and the caller refuses the request with
+    /// [`address_transfer_not_available`], exactly as [`Self::withdraw_address_transfer`]
+    /// does. Storing no caller-chosen bytes, it makes no byte charge.
+    pub fn accept_address_transfer(&mut self, allocation_id: &str, at: SystemTime) -> bool {
+        let Some(record) = self.address_transfers.get_mut(allocation_id) else {
+            return false;
+        };
+        if record.transfer.address_transfer_status.as_deref()
+            != Some(ADDRESS_TRANSFER_STATUS_PENDING)
+        {
+            return false;
+        }
+        record.transfer.address_transfer_status =
+            Some(ADDRESS_TRANSFER_STATUS_ACCEPTED.to_string());
+        record.transfer.transfer_offer_accepted_timestamp = Some(system_time_to_date_time(at));
+        record.visible_until = at + ADDRESS_TRANSFER_ACCEPTED_VISIBILITY;
         true
     }
 

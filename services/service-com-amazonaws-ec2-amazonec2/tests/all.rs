@@ -1276,3 +1276,9 @@ mod describe_reserved_instances;
 // `ClientToken` bounds it to one delete.
 #[path = "all/delete_verified_access_instance.rs"]
 mod delete_verified_access_instance;
+// Appended at the END of this file, for the reason the header gives: the sorted region of this
+// file is where every new ec2 suite inserts its lines. The accepting half of the Elastic IP
+// address transfer handshake: what `AcceptAddressTransfer` takes out of a standing offer, what
+// it refuses for an address nothing has on offer, and where the tags it carries land.
+#[path = "all/accept_address_transfer.rs"]
+mod accept_address_transfer;

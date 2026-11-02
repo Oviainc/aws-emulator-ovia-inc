@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptAddressTransfer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptAddressTransfer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the Elastic IP address transfer the request names, moving the stored
+//! offer on that address out of `pending` into `accepted` and answering with the transfer as
+//! it now stands. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptAddressTransfer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The transfer is named by ADDRESS rather than by allocation id, so the offer is looked up
+//! by the address it puts on offer
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::address_transfer_on_offer`]); an address
+//! no stored transfer has on offer — because none was ever started on it, because the source
+//! account withdrew it, or because it has already been taken — is nothing this account can
+//! accept, and is refused with the one code the transfer surface answers for an address it
+//! cannot resolve ([`crate::state::address_transfer_not_available`]).
+//!
+//! The accepted record stays visible for the documented fourteen days
+//! ([`crate::state::ADDRESS_TRANSFER_ACCEPTED_VISIBILITY`]) and any tags the call assigns go
+//! onto the address itself, which is the one resource this operation tags.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +144,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptAddressTransfer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptAddressTransferErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptAddressTransfer"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            address_transfer_not_available, internal_error, is_ipv4_address, require_service_state,
+            tag_bytes, tags_from_specifications, ADDRESS_TAGGABLE_RESOURCE, MAX_STORED_BYTES,
+            MAX_TAGS_PER_RESOURCE,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — a transfer
+        // is named by the address it is of. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        // "The Elastic IP address you are accepting for transfer"
+        // (`AcceptAddressTransferRequest$Address`): the model types it as a plain `String`
+        // and so does not constrain it, and a value that is not an IPv4 address at all names
+        // no Elastic IP address — refused as the value it is rather than as an address
+        // nothing has on offer, the same reading `AllocateAddress` gives its own `address`
+        // parameter.
+        let address = input.address.clone();
+        if !is_ipv4_address(&address) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{address}' for address. It must be an IPv4 address"
+            )));
+        }
+
+        // The tags this call assigns, from the request's `TagSpecifications`. The Elastic IP
+        // address is the only resource the acceptance takes on, so a specification naming
+        // any other resource type is refused rather than accepted and discarded; the shared
+        // helper also bounds the tag count, each key and value, and the reserved `aws:`
+        // prefix.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            ADDRESS_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+        let updates: Vec<(String, String)> = tags
+            .iter()
+            .filter_map(|tag| Some((tag.key.clone()?, tag.value.clone().unwrap_or_default())))
+            .collect();
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The offer this call would take may already have run out, and that expiry was owed
+        // at its instant whether or not anybody called — so it is applied before this call
+        // reads whether there is anything left to accept.
+        store.materialize_due_transitions();
+
+        // Only an offer that is still standing can be taken. The refusal names the address
+        // from the REQUEST, the way the transfer surface words it, and says nothing about
+        // which of the reasons it is.
+        let Some(allocation_id) = store.address_transfer_on_offer(&address) else {
+            return Err(address_transfer_not_available(&address));
+        };
+
+        // What the address would carry once the tags land, asked of a COPY of its stored
+        // tags so the check itself writes nothing — the same gate `CreateTags` applies, over
+        // the same accessor, so one path cannot store tags the other would refuse.
+        let Some(stored_tags) = store.resource_tags_mut(&allocation_id) else {
+            return Err(internal_error(format!(
+                "the address on offer under '{allocation_id}' carries no record to accept"
+            )));
+        };
+        let current = stored_tags.pairs();
+        let mut merged = current.clone();
+        for (key, value) in &updates {
+            merged.insert(key.clone(), value.clone());
+        }
+        if merged.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "The resource '{allocation_id}' would carry {} tags, \
+                 above the maximum of {MAX_TAGS_PER_RESOURCE}",
+                merged.len()
+            )));
+        }
+        let added_bytes = tag_bytes(&merged).saturating_sub(tag_bytes(&current));
+        if store.would_exceed_stored_bytes(added_bytes) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {added_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The instant the offer was taken is the clock's, never the request's. The check
+        // above already established the offer is standing and nothing can have moved it —
+        // the store is still locked — so this cannot answer `false`; it is read rather than
+        // discarded so no path can accept nothing and report a success.
+        if !store.accept_address_transfer(&allocation_id, ::std::time::SystemTime::now()) {
+            return Err(address_transfer_not_available(&address));
+        }
+        if !updates.is_empty() {
+            if let Some(mut stored_tags) = store.resource_tags_mut(&allocation_id) {
+                stored_tags.set(&updates);
+            }
+            // Charged at the write, so no path can store those bytes uncharged — and the
+            // gate above asked for exactly this many.
+            store.add_stored_bytes(added_bytes);
+        }
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // `DescribeAddressTransfers` will see rather than a record built here.
+        let stored = store.address_transfers.get(&allocation_id).ok_or_else(|| {
+            internal_error(format!(
+                "the transfer just accepted for '{allocation_id}' could not be read back"
+            ))
+        })?;
+        Ok(AcceptAddressTransferOutput {
+            address_transfer: Some(stored.transfer.clone()),
+        })
     }
 }
