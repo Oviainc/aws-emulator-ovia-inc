@@ -10,6 +10,10 @@
 //! minting, the record-to-modelled-shape projections, the pagination cursor codec,
 //! the idempotency fingerprint — are shared by those handlers rather than duplicated
 //! per operation.
+//!
+//! The email verification codes `SendEmailVerificationCode` sends live here too:
+//! one record per `(catalog, address)`, which is where the operations that SPEND a
+//! code find the code this service actually sent.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -81,6 +85,9 @@ pub const REASON_LIMIT_EXCEEDED_OPEN_CONNECTION_INVITATION: &str =
 /// stored connections past [`MAX_CONNECTIONS`].
 pub const REASON_LIMIT_EXCEEDED_ACTIVE_CONNECTION: &str =
     "LIMIT_EXCEEDED_NUMBER_OF_ACTIVE_CONNECTION";
+/// `ServiceQuotaExceededException$Reason` for a send that would take the email
+/// addresses holding a verification code past [`MAX_VERIFICATION_EMAILS`].
+pub const REASON_LIMIT_EXCEEDED_EMAIL: &str = "LIMIT_EXCEEDED_NUMBER_OF_EMAIL";
 /// `FieldValidationError$Code` for a member whose value this service rejects
 /// (`FIELD_VALIDATION_CODE_VALUES`).
 pub const FIELD_CODE_INVALID_VALUE: &str = "INVALID_VALUE";
@@ -100,6 +107,22 @@ pub const PARTNER_PROFILE_ID_PREFIX: &str = "pprofile-";
 
 /// Characters in an `AwsAccountId` (`^[0-9]{12}$`).
 const ACCOUNT_ID_LEN: usize = 12;
+
+/// The digits an `EmailVerificationCode` carries: the shape is `@length(min: 6,
+/// max: 6)` with `@pattern ^[0-9]+$` (`smithy_query(query="shape",
+/// shape="EmailVerificationCode")`), so a code this service sends is exactly six
+/// decimal digits and the operations that take one accept nothing else.
+pub const VERIFICATION_CODE_DIGITS: usize = 6;
+
+/// How long an email verification code stays held after it was sent.
+///
+/// CHOSEN, not cited: the model declares no lifetime for `EmailVerificationCode`
+/// and no response member reports one. 30 minutes is this emulator's code
+/// lifetime — long enough for a client to send a code and spend it in the same
+/// session, while the removal the clock owes once that instant passes is still
+/// materialised by
+/// [`ComAmazonawsPartnercentralaccountPartnercentralaccountState::materialise_due_transitions`].
+pub const EMAIL_VERIFICATION_CODE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// How long a connection invitation stays answerable before it expires.
 ///
@@ -239,6 +262,31 @@ impl ConnectionRecord {
     }
 }
 
+/// The email verification code this service last sent to one address of one
+/// catalog.
+///
+/// `SendEmailVerificationCode` returns nothing, so the code it sent lives only
+/// here: the operations that spend one (`CreatePartner`,
+/// `AssociateAwsTrainingCertificationEmailDomain`) take an `EmailVerificationCode`
+/// and have to check it against the code the service actually sent. Never put
+/// `code` in a response, a message or a log — `EmailVerificationCode` is
+/// `@sensitive`.
+#[derive(Debug, Clone)]
+pub struct EmailVerificationCodeRecord {
+    pub catalog: String,
+    pub email: String,
+    /// The six digits this service sent, from
+    /// [`ComAmazonawsPartnercentralaccountPartnercentralaccountState::mint_verification_code`].
+    pub code: String,
+    pub sent_at: SystemTime,
+    /// When the code falls due for removal ([`EMAIL_VERIFICATION_CODE_TTL`] after
+    /// [`Self::sent_at`]).
+    pub expires_at: SystemTime,
+    /// How many codes have been sent to this address while one was held, so a
+    /// resend is a resend rather than a first send.
+    pub sends: u64,
+}
+
 /// What a completed, idempotency-token-bearing call recorded, so a replay of that
 /// exact call answers with the resource it created rather than creating a second one.
 #[derive(Debug, Clone)]
@@ -324,6 +372,16 @@ impl IdempotencyTokens {
 /// so normal use never meets it, while the store a caller can grow stays bounded.
 pub const MAX_INVITATIONS: usize = 1_000;
 
+/// The most email addresses this emulator holds a verification code for before
+/// `SendEmailVerificationCode` answers its modelled `ServiceQuotaExceededException`
+/// with [`REASON_LIMIT_EXCEEDED_EMAIL`].
+///
+/// The real service's per-account email quota is not in the model, so this ceiling
+/// is CHOSEN, not cited, for the same reason as [`MAX_INVITATIONS`]: it is far above
+/// any plausible client's address count, so normal use never meets it, while the
+/// store a caller can grow by sending codes stays bounded.
+pub const MAX_VERIFICATION_EMAILS: usize = 100;
+
 /// The most connections this emulator stores before `AcceptConnectionInvitation`
 /// answers its modelled `ServiceQuotaExceededException`. CHOSEN for the same reason
 /// as [`MAX_INVITATIONS`], and smaller because a connection outlives the invitation
@@ -365,11 +423,19 @@ pub struct ComAmazonawsPartnercentralaccountPartnercentralaccountState {
     /// duplicating. Bounded by [`MAX_IDEMPOTENCY_TOKENS`], which evicts its oldest
     /// record rather than growing.
     pub idempotency: IdempotencyTokens,
+    /// The verification code last sent to each address, keyed by `(catalog,
+    /// email)` — one record per address, since a newly sent code replaces the one
+    /// it supersedes. Bounded by [`MAX_VERIFICATION_EMAILS`], which
+    /// `SendEmailVerificationCode` checks before it inserts, and shortened by
+    /// [`Self::materialise_due_transitions`] as codes fall due.
+    pub email_verification_codes: BTreeMap<(String, String), EmailVerificationCodeRecord>,
     /// Monotonic counter behind every minted invitation id; never returned to a
     /// caller.
     next_invitation_seq: u64,
     /// Monotonic counter behind every minted connection id.
     next_connection_seq: u64,
+    /// Monotonic counter behind every minted email verification code.
+    next_verification_code_seq: u64,
 }
 
 impl ComAmazonawsPartnercentralaccountPartnercentralaccountState {
@@ -394,11 +460,52 @@ impl ComAmazonawsPartnercentralaccountPartnercentralaccountState {
         )
     }
 
+    /// Mint an `EmailVerificationCode` matching `^[0-9]{6}$`.
+    ///
+    /// The code is the mint counter rendered as [`VERIFICATION_CODE_DIGITS`]
+    /// decimal digits, so a code comes from this service's own state rather than
+    /// from the address it is sent to. The addresses holding a code are bounded by
+    /// [`MAX_VERIFICATION_EMAILS`], far below the codes that many digits spell, so
+    /// stepping the counter past the codes already held terminates and two live
+    /// addresses never hold the same code — including after the counter has wrapped
+    /// that space.
+    pub fn mint_verification_code(&mut self) -> String {
+        let mut code = self.next_verification_code();
+        for _ in 0..MAX_VERIFICATION_EMAILS {
+            if !self.verification_code_is_held(&code) {
+                break;
+            }
+            code = self.next_verification_code();
+        }
+        code
+    }
+
+    /// The next code the mint counter spells.
+    fn next_verification_code(&mut self) -> String {
+        self.next_verification_code_seq = self.next_verification_code_seq.wrapping_add(1);
+        let space = 10u64.pow(VERIFICATION_CODE_DIGITS as u32);
+        format!(
+            "{:0width$}",
+            self.next_verification_code_seq % space,
+            width = VERIFICATION_CODE_DIGITS
+        )
+    }
+
+    /// Whether some address already holds `code`.
+    fn verification_code_is_held(&self, code: &str) -> bool {
+        self.email_verification_codes
+            .values()
+            .any(|record| record.code == code)
+    }
+
     /// Apply every transition the CLOCK has already made due.
     ///
     /// An invitation nobody answered before its `ExpiresAt` is `EXPIRED` from that
     /// instant on, whether or not anyone called; `UpdatedAt` moves to the instant the
-    /// expiry fell due, not to now, because that is when the invitation changed.
+    /// expiry fell due, not to now, because that is when the invitation changed. An
+    /// email verification code whose lifetime has passed is no longer held, for the
+    /// same reason: it stopped being spendable at that instant even if nobody
+    /// called.
     /// Called by the reporting operations as well as the mutating ones: a change that
     /// was owed at this instant anyway is the only write a read may perform.
     pub fn materialise_due_transitions(&mut self, now: SystemTime) {
@@ -408,6 +515,8 @@ impl ComAmazonawsPartnercentralaccountPartnercentralaccountState {
                 invitation.updated_at = invitation.expires_at;
             }
         }
+        self.email_verification_codes
+            .retain(|_, record| now < record.expires_at);
     }
 
     /// What the earlier call carrying `token` on `operation` did, or `None` when this

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/email_verification.rs"]
+mod email_verification;
 #[path = "all/error_response_fidelity.rs"]
 mod error_response_fidelity;
 #[path = "all/state_roundtrip.rs"]
