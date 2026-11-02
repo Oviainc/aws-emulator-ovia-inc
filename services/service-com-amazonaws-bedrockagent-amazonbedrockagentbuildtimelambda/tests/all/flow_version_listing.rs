@@ -8,11 +8,10 @@
 //! calling a handler directly.
 //!
 //! The versions themselves are placed in the store directly, because
-//! `CreateFlowVersion` and `PrepareFlow` are still scaffold stubs in this crate
-//! (`services/.../src/ops/create_flow_version.rs`,
-//! `services/.../src/ops/prepare_flow.rs`), so no implemented operation cuts a
-//! version yet. The listing under test still reads what the store holds, through
-//! the same `crate::state` seam the handler uses.
+//! `CreateFlowVersion` is still a scaffold stub in this crate
+//! (`services/.../src/ops/create_flow_version.rs`), so no implemented operation
+//! cuts a version yet. The listing under test still reads what the store holds,
+//! through the same `crate::state` seam the handler uses.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};

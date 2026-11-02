@@ -242,6 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // status will be NotPrepared" — the DRAFT version no longer carries the
         // latest changes until a `PrepareFlow` packages them.
         record.status = crate::state::FlowStatus::NotPrepared;
+        // A preparation still in flight was of the definition this update just
+        // replaced, so its outcome is no longer owed: the DRAFT version has to be
+        // prepared again before it carries these changes.
+        record.pending_preparation = None;
         // The findings reported in `validations` are the last failed operation's,
         // and this operation succeeded, so the flow carries none.
         record.validations.clear();

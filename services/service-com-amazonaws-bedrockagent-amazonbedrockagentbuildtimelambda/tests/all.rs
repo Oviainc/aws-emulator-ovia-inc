@@ -21,6 +21,8 @@ mod delete_removes_the_resource;
 mod flow_definition_validation;
 #[path = "all/flow_lifecycle.rs"]
 mod flow_lifecycle;
+#[path = "all/flow_preparation.rs"]
+mod flow_preparation;
 #[path = "all/flow_version_listing.rs"]
 mod flow_version_listing;
 #[path = "all/immutable_configuration_members.rs"]

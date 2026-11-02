@@ -2,8 +2,9 @@
 
 //! @op GetFlow
 //!
-//! Reports the flow `CreateFlow` stored, read from [`crate::state`]. A pure
-//! read: it writes nothing.
+//! Reports the flow `CreateFlow` stored, read from [`crate::state`]. A report: the
+//! only write is the outcome of a preparation the CLOCK already made due, which
+//! was owed at this instant whether or not anybody asked for the flow.
 //!
 //! ## Shape of an operation
 //!
@@ -204,9 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A read: the stored flow is reported as it stands, and nothing about it
-        // changes because somebody asked for it.
-        let state = state.lock();
+        // A read: the stored flow is reported as it stands, and the only write is
+        // the one the CLOCK already made due — the outcome of a preparation that
+        // was owed at this instant whether or not anyone had asked for the flow.
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
         let Some(record) = state.flows.get(flow_id) else {
             return Err(GetFlowErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

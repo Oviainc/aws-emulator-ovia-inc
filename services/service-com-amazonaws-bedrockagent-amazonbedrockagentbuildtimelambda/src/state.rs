@@ -9,11 +9,15 @@
 //! ([`AgentRecord::to_agent`], [`AgentRecord::to_summary`]) live here so no two
 //! handlers can project the same record differently.
 //!
-//! The flow lifecycle (`CreateFlow`, `UpdateFlow`, `GetFlow`) is backed by the
+//! The flow lifecycle (`CreateFlow`, `UpdateFlow`, `PrepareFlow`, `GetFlow`) is
+//! backed by the
 //! [`flows`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::flows)
 //! map the same way, with [`FlowRecord::to_create_output`] /
 //! [`FlowRecord::to_update_output`] / [`FlowRecord::to_get_output`] as its single
-//! projections.
+//! projections. A flow a `PrepareFlow` accepted leaves `Preparing` on the CLOCK
+//! alone, through [`PendingPreparation`] and
+//! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::materialise_due_transitions`],
+//! so every reader of the flow observes the same progression.
 //!
 //! A flow's numbered versions (`ListFlowVersions`) are backed by the
 //! [`flow_versions`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::flow_versions)
@@ -274,13 +278,26 @@ pub fn included_data_carries_definition(included_data: Option<&str>) -> bool {
     included_data != Some(INCLUDED_DATA_METADATA_ONLY)
 }
 
+/// How long after `PrepareFlow` a flow leaves [`FlowStatus::Preparing`] for the
+/// outcome that preparation reached.
+///
+/// CHOSEN, not documented: AWS publishes no duration for the preparation of a
+/// flow. It is deliberately non-zero so a caller that reads the flow back
+/// immediately still observes the transient `Preparing` status the modelled
+/// `FlowStatus` declares ("Preparing – The flow is being prepared so that the
+/// DRAFT version contains the latest changes for testing"), and short enough
+/// that a client script polling the flow converges promptly.
+pub const FLOW_PREPARATION_SPAN: Duration = Duration::from_secs(3);
+
 /// The `FlowStatus` values this slice of the service can hold, named as the
 /// model's `FlowStatus` enum names them on the wire.
 ///
 /// `CreateFlow` mints only [`FlowStatus::NotPrepared`] — the operation's own
 /// contract says "When you submit this request, the status will be NotPrepared" —
 /// and a flow leaves it only when a later call (`PrepareFlow`, `UpdateFlow`) moves
-/// it, never because the clock passed or because somebody read it.
+/// it, never because somebody read it. The one status the CLOCK moves a flow to is
+/// the outcome of a preparation already accepted, held in
+/// [`FlowRecord::pending_preparation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowStatus {
     /// Created or updated, but not prepared: `CreateFlow`'s result.
@@ -305,6 +322,26 @@ impl FlowStatus {
     }
 }
 
+/// The outcome of a preparation `PrepareFlow` has already accepted, and the
+/// instant the clock makes it due.
+///
+/// Preparation is asynchronous — the operation answers 202 with the flow in
+/// [`FlowStatus::Preparing`] — so its result is decided when the call is accepted
+/// and reported once the clock reaches `due`. The findings travel with it because
+/// `validations` reports "the last failed operation on the flow": until the
+/// failure is due, nothing has failed.
+#[derive(Debug, Clone)]
+pub struct PendingPreparation {
+    /// When the flow leaves [`FlowStatus::Preparing`] for [`Self::status`].
+    pub due: SystemTime,
+    /// The status preparation reached: [`FlowStatus::Prepared`] when the DRAFT
+    /// definition carries no blocking defect, [`FlowStatus::Failed`] when it does.
+    pub status: FlowStatus,
+    /// The findings the flow reports once the outcome is due; empty for a
+    /// preparation that succeeded.
+    pub validations: Vec<FlowValidation>,
+}
+
 /// One stored flow: the single source of truth for every flow operation.
 #[derive(Debug, Clone)]
 pub struct FlowRecord {
@@ -320,6 +357,10 @@ pub struct FlowRecord {
     /// Validation findings from the last operation on the flow; empty while
     /// nothing has failed.
     pub validations: Vec<FlowValidation>,
+    /// The preparation the CLOCK still owes this flow, if one is in flight. A
+    /// reporting operation may materialise it once its instant has passed; it
+    /// never invents a transition of its own.
+    pub pending_preparation: Option<PendingPreparation>,
     pub tags: HashMap<String, String>,
     pub client_token: Option<String>,
     pub created_at: SystemTime,
@@ -1769,6 +1810,23 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                     agent.pending_status = None;
                 }
             }
+        }
+        // A flow's preparation was decided when `PrepareFlow` accepted it, so
+        // what the clock owes the flow is only the reporting of that outcome and
+        // of the findings it reached.
+        for flow in self.flows.values_mut() {
+            let Some(pending) = flow.pending_preparation.take() else {
+                continue;
+            };
+            if now < pending.due {
+                flow.pending_preparation = Some(pending);
+                continue;
+            }
+            flow.status = pending.status;
+            flow.validations = pending.validations;
+            // The flow changed when the clock made the change due, not when it
+            // was noticed.
+            flow.updated_at = pending.due;
         }
         for knowledge_base in self.knowledge_bases.values_mut() {
             if let Some((due, next)) = knowledge_base.pending_status {

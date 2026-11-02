@@ -342,6 +342,18 @@ pub fn validate_definition(definition: &FlowDefinition) -> Vec<FlowValidation> {
     findings
 }
 
+/// Whether `findings` hold a defect of [`SEVERITY_ERROR`] severity, i.e. one that
+/// stops the flow working at all rather than one it still runs with.
+///
+/// Shared with `PrepareFlow`, which packages the DRAFT definition only when it
+/// carries no such defect, so the two operations cannot disagree about which
+/// finding is fatal.
+pub fn has_error_finding(findings: &[FlowValidation]) -> bool {
+    findings
+        .iter()
+        .any(|finding| finding.severity == SEVERITY_ERROR)
+}
+
 /// The findings a single node carries on its own: whether it is configured for
 /// the type it declares, whether its input expressions address the incoming data,
 /// and the checks its node type adds.

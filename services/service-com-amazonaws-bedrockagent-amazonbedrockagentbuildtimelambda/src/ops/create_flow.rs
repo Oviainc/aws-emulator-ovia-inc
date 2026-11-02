@@ -259,6 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             definition: input.definition,
             // Nothing has failed on a flow this call just created.
             validations: Vec::new(),
+            // No preparation has been asked for, so the clock owes this flow
+            // nothing.
+            pending_preparation: None,
             tags: input.tags.unwrap_or_default(),
             client_token: input.client_token.clone(),
             created_at: now,

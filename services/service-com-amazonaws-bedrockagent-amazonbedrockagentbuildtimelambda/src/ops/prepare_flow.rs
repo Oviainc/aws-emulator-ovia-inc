@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PrepareFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PrepareFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PrepareFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Packages the stored flow's DRAFT version: the call is ACCEPTED (202) with the
+//! flow in `Preparing`, and the clock then carries it to the outcome preparation
+//! reached — `Prepared` when the stored definition carries no fatal defect,
+//! `Failed` with those defects in `validations` when it does. The defects are the
+//! ones `ValidateFlowDefinition` reports, through
+//! [`super::validate_flow_definition::validate_definition`], so preparing a flow
+//! and validating its definition cannot disagree.
+//!
+//! A following `GetFlow` observes `Preparing` and then that outcome.
+//!
+//! The response reports the status the flow is in once the call is ACCEPTED, which
+//! is what the modelled 202 and the `FlowStatus` member's own documentation name:
+//! "Preparing – The flow is being prepared so that the DRAFT version contains the
+//! latest changes for testing". The sentence in this response member's doc about
+//! the status being `NotPrepared` describes the flow as a submitted request finds
+//! it — the state `CreateFlow` and `UpdateFlow` leave behind, and the reason a
+//! flow needs preparing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +169,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PrepareFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PrepareFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PrepareFlowErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The modelled `FlowIdentifier` admits a flow ARN or a bare flow id and
+        // nothing else. The boundary validator lets other values through — the
+        // pattern's top-level alternation leaves the second branch anchored only
+        // at its end — so an identifier of neither form is refused here as the
+        // bad request it is, rather than reported as a missing flow.
+        let Some(flow_id) = crate::state::flow_id_from_identifier(&input.flow_identifier) else {
+            return Err(PrepareFlowErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::flow_identifier_pattern_message(
+                    &input.flow_identifier,
+                )),
+                field_list: None,
+            })
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        let Some(record) = state.flows.get_mut(flow_id) else {
+            return Err(PrepareFlowErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::flow_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        };
+
+        // What is packaged is the DRAFT version's stored definition, so the
+        // outcome follows from that definition alone. A flow carrying no
+        // definition has nothing to package, and the same checks say so: an empty
+        // definition declares neither the starting nor the ending node a flow
+        // needs.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PrepareFlow"))
+        // The walk is bounded by the model, not by the caller: a stored
+        // definition reached the store through `CreateFlow`/`UpdateFlow`, whose
+        // modelled `FlowDefinition` admits at most 40 `nodes` and 20
+        // `connections` (each node at most 20 `inputs` and 5 `outputs`), and the
+        // boundary validator refuses a larger one before any handler runs. So the
+        // work under the state guard is capped by those constants however large a
+        // request is, and the findings it can publish by the modelled `length
+        // ..100` on `validations`.
+        let definition = record.definition.clone().unwrap_or_default();
+        let findings = super::validate_flow_definition::validate_definition(&definition);
+        // `validations` is documented as "validation error messages related to the
+        // last FAILED operation on the flow", so the findings are published only
+        // with the failure they explain; a preparation no fatal defect stopped
+        // leaves the flow carrying none.
+        let (outcome, validations) =
+            if super::validate_flow_definition::has_error_finding(&findings) {
+                (crate::state::FlowStatus::Failed, findings)
+            } else {
+                (crate::state::FlowStatus::Prepared, Vec::new())
+            };
+
+        // Preparation is ACCEPTED now and reported on the clock: the flow reports
+        // `Preparing` until `FLOW_PREPARATION_SPAN` has elapsed, then the outcome
+        // above. The findings travel with that pending outcome rather than being
+        // published while the flow is still being prepared: until the failure is
+        // due, nothing has failed.
+        record.status = crate::state::FlowStatus::Preparing;
+        record.validations.clear();
+        record.pending_preparation = Some(crate::state::PendingPreparation {
+            due: now + crate::state::FLOW_PREPARATION_SPAN,
+            status: outcome,
+            validations,
+        });
+        record.updated_at = now;
+
+        Ok(PrepareFlowOutput {
+            id: record.flow_id.clone(),
+            status: record.status.as_wire().to_string(),
+        })
     }
 }
