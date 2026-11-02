@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tenant) = store.tenants.get(&tenant_name) else {
             return Err(DeleteTenantResourceAssociationErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::requested_tenant_not_found(&tenant_name)),
+                    message: Some(crate::state::tenant_not_found(&tenant_name)),
                 },
             )
             .into());

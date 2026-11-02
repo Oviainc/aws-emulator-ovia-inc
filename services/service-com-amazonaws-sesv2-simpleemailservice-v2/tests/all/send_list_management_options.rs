@@ -519,9 +519,12 @@ async fn the_topic_a_send_names_is_the_one_the_new_contact_is_subscribed_to() {
             contact.body.get("TopicPreferences")
         );
         // The list's own defaults are unchanged by the send: they are the list's, not
-        // the contact's.
+        // the contact's. They are reported for the topics the contact stated nothing
+        // for, so the topic the message named — which the send subscribed it to — is
+        // not among them.
         let defaults: Vec<Value> = topics
             .iter()
+            .filter(|(name, _)| name != topic)
             .map(|(topic, default_status)| {
                 json!({"TopicName": topic, "SubscriptionStatus": default_status})
             })

@@ -180,10 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // at all, rather than an empty list.
             topic_preferences: (!record.topic_preferences.is_empty())
                 .then(|| record.topic_preferences.clone()),
-            // "The default topic preferences applied to the contact" — the list's own
-            // topics and the status each gives a contact that stated none.
-            topic_default_preferences: (!list.topics.is_empty())
-                .then(|| list.topic_default_preferences()),
+            // "The default topic preferences applied to the contact" — the default of
+            // each list topic the contact has stated no preference for, and no member at
+            // all when no default reaches it.
+            topic_default_preferences: list.topic_default_preferences(record),
             unsubscribe_all: record.unsubscribe_all,
             attributes_data: record.attributes_data.clone(),
             created_timestamp: Some(::aws_smithy_types::DateTime::from(record.created_at)),

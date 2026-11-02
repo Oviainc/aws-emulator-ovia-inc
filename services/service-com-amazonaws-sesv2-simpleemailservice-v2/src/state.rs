@@ -958,16 +958,21 @@ pub fn invalid_tenant_name(tenant_name: &str) -> String {
     )
 }
 
-/// How this service words `NotFoundException` for a tenant it does not hold.
+/// How this service words `NotFoundException` for a tenant the account does not hold.
 ///
-/// One wording for the operations that address the tenant itself, or a tenant's
-/// suppression list, by `TenantName` — `GetTenant`, `DeleteTenant`,
-/// `GetSuppressedDestination` and `ListSuppressedDestinations` — so a client sees the
-/// same sentence whichever of them first tells it the tenant is gone. The
-/// tenant-resource association surface words the same condition differently; see
-/// [`requested_tenant_not_found`].
+/// ONE sentence for every operation that names a tenant it cannot resolve — the tenant
+/// itself (`GetTenant`, `DeleteTenant`), a tenant's suppression list
+/// (`GetSuppressedDestination`, `ListSuppressedDestinations`,
+/// `PutTenantSuppressionAttributes`) and the tenant-resource association surface
+/// (`CreateTenantResourceAssociation`, `DeleteTenantResourceAssociation`,
+/// `ListTenantResources`) — so a client sees the same sentence whichever of them first
+/// tells it the tenant is not there, and two views of one deleted tenant cannot
+/// disagree about how it is gone.
+///
+/// The fixed text is `The requested tenant <` + `> does not exist.`; the requested name,
+/// taken from the request, is the only variable part.
 pub fn tenant_not_found(tenant_name: &str) -> String {
-    format!("Tenant {tenant_name} does not exist.")
+    format!("The requested tenant <{tenant_name}> does not exist.")
 }
 
 /// How this service words `AlreadyExistsException` for a tenant name already taken.
@@ -979,14 +984,6 @@ pub fn tenant_not_found(tenant_name: &str) -> String {
 /// from the call's own scope ([`CallerScope`]).
 pub fn tenant_already_exists(tenant_name: &str, account_id: &str) -> String {
     format!("Tenant with name {tenant_name} already exists in account {account_id}")
-}
-
-/// How the tenant-resource association surface words `NotFoundException` for a
-/// tenant the account does not hold: the sentence SES answers a
-/// `CreateTenantResourceAssociation` whose `TenantName` resolves to nothing, with the
-/// requested name as its only variable part.
-pub fn requested_tenant_not_found(tenant_name: &str) -> String {
-    format!("The requested tenant <{tenant_name}> does not exist.")
 }
 
 /// How this service words `AlreadyExistsException` for a resource already associated
@@ -2554,21 +2551,46 @@ impl ContactListRecord {
         }
     }
 
-    /// The default preference the list's own topics give a contact that has stated
-    /// none: one `TopicPreference` per topic, carrying that topic's
-    /// `DefaultSubscriptionStatus`.
+    /// The default preferences in force FOR `contact`, as `Contact$TopicDefaultPreferences`
+    /// reports them — or `None` when none of this list's defaults reaches it.
     ///
-    /// `Contact$TopicDefaultPreferences` is "the default topic preferences applied to
-    /// the contact", which is exactly this projection of the list's topics, so every
-    /// operation that reports it computes it here.
-    pub fn topic_default_preferences(&self) -> Vec<crate::ops::types::TopicPreference> {
-        self.topics
+    /// `Topic$DefaultSubscriptionStatus` is "the default subscription status to be applied
+    /// to a contact if the contact has not noted their preference for subscribing to a
+    /// topic", so a topic the contact HAS stated a preference for contributes no default:
+    /// the contact's own answer is the status in force, and the member reports only what
+    /// `Contact$TopicDefaultPreferences` says it reports, "the default topic preferences
+    /// APPLIED to the contact". A contact that has stated a preference for every topic
+    /// this list publishes — and a list that publishes none — therefore has no default
+    /// applied at all, which is reported as no member rather than as an empty list.
+    ///
+    /// Every operation that reports the member computes it here, so a contact read on its
+    /// own and the same contact in a listing cannot disagree. The entries keep the order
+    /// the list publishes its topics in.
+    pub fn topic_default_preferences(
+        &self,
+        contact: &ContactRecord,
+    ) -> Option<Vec<crate::ops::types::TopicPreference>> {
+        // The contact's own answers are indexed ONCE, the same way `replace_metadata`
+        // above indexes the published topics: the work is then the number of topics PLUS
+        // the number of preferences, never their product. That matters because a listing
+        // projects a whole page of contacts under one lock, and neither collection
+        // carries a modelled bound (`Topics` and `TopicPreferenceList` declare no
+        // `@length`: `smithy_query(query="shape",shape="Topics,TopicPreferenceList")`).
+        let stated: BTreeSet<&str> = contact
+            .topic_preferences
             .iter()
+            .map(|preference| preference.topic_name.as_str())
+            .collect();
+        let applied: Vec<crate::ops::types::TopicPreference> = self
+            .topics
+            .iter()
+            .filter(|topic| !stated.contains(topic.topic_name.as_str()))
             .map(|topic| crate::ops::types::TopicPreference {
                 topic_name: topic.topic_name.clone(),
                 subscription_status: topic.default_subscription_status.clone(),
             })
-            .collect()
+            .collect();
+        (!applied.is_empty()).then_some(applied)
     }
 
     /// The modelled `ContactList` view of this record, as `ListContactLists` reports
@@ -2681,11 +2703,16 @@ impl ContactRecord {
     /// The modelled `Contact` view of this record, as `ListContacts` reports it.
     ///
     /// `list` is the list this contact is on, which supplies the default preferences.
+    /// Both preference members are the ones `GetContact` reports for the same contact —
+    /// a contact that has stated no preference carries no `TopicPreferences` member at
+    /// all rather than an empty list, and the defaults are the ones that apply to it —
+    /// so one contact cannot read differently in a listing than on its own.
     pub fn summary(&self, list: &ContactListRecord) -> crate::ops::types::Contact {
         crate::ops::types::Contact {
             email_address: Some(self.email_address.clone()),
-            topic_preferences: Some(self.topic_preferences.clone()),
-            topic_default_preferences: Some(list.topic_default_preferences()),
+            topic_preferences: (!self.topic_preferences.is_empty())
+                .then(|| self.topic_preferences.clone()),
+            topic_default_preferences: list.topic_default_preferences(self),
             unsubscribe_all: self.unsubscribe_all,
             last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(self.last_updated_at)),
         }
@@ -2977,6 +3004,16 @@ pub fn contact_list_not_found(contact_list_name: &str) -> String {
 /// list's own name, so the sentence is the same whichever list was asked.
 pub fn contact_not_found(email_address: &str) -> String {
     format!("{email_address} doesn't exist in List.")
+}
+
+/// How this service words `AlreadyExistsException` for an address the named list already
+/// holds a contact under.
+///
+/// The counterpart of [`contact_not_found`], and worded the same way: the one variable
+/// part is the address the request supplied, and the resource is named by its KIND rather
+/// than by the list's own name, so one sentence serves whichever list was asked.
+pub fn contact_already_exists(email_address: &str) -> String {
+    format!("{email_address} already exists in List.")
 }
 
 /// Characters of `AttributesData` one contact may carry.
@@ -4166,9 +4203,8 @@ pub fn invalid_message_id() -> String {
 /// reads a message by its id.
 ///
 /// `NotFoundException` is documented only as "the resource you attempted to access
-/// doesn't exist", which names no resource, so the sentence follows this service's
-/// own wording for a resource it does not hold — [`tenant_not_found`]'s form, with
-/// the requested id as its only variable part, taken from the request.
+/// doesn't exist", which names no resource, so the sentence names the resource kind and
+/// the requested id, which is its only variable part, taken from the request.
 pub fn message_not_found(message_id: &str) -> String {
     format!("Message {message_id} does not exist.")
 }

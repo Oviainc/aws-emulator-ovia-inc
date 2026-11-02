@@ -79,6 +79,11 @@ use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse}
 
 pub mod wire;
 
+/// Unit cases for the media type this service announces (see the module header); the
+/// module is test-only, so nothing it holds is part of the served surface.
+#[cfg(test)]
+mod response_media_type;
+
 /// This service's endpoint prefix, as its model gives it
 /// (`smithy_query(query="service_info")`: `awsService.endpointPrefix` `email`) — the name
 /// a host-addressed request resolves to, beside the SigV4 signing name (`ses`) the

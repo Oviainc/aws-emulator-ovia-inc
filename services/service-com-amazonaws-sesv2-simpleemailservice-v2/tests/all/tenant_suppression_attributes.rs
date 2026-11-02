@@ -546,7 +546,7 @@ async fn a_tenant_the_account_cannot_reach_is_refused() {
         );
         assert_eq!(
             refused.message(),
-            format!("Tenant {name} does not exist."),
+            format!("The requested tenant <{name}> does not exist."),
             "case {case:?}: the refusal must name the tenant it did not find, got {:?}",
             refused.message()
         );

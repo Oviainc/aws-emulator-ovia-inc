@@ -59,6 +59,8 @@ mod configuration_set_suppression_options;
 mod configuration_sets;
 #[path = "all/contact_lists.rs"]
 mod contact_lists;
+#[path = "all/contact_plane_wire_fidelity.rs"]
+mod contact_plane_wire_fidelity;
 #[path = "all/contact_updates.rs"]
 mod contact_updates;
 #[path = "all/dedicated_ip_in_pool.rs"]

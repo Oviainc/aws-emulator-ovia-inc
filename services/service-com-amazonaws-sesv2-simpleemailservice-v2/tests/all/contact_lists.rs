@@ -709,8 +709,9 @@ async fn a_contact_round_trips_through_its_own_read() {
         "reader@example.com",
         read.body
     );
-    // `TopicDefaultPreferences` is "the default topic preferences applied to the
-    // contact": one per topic the list publishes, carrying that topic's default.
+    // `TopicDefaultPreferences` is "the default topic preferences APPLIED to the
+    // contact": the default of each topic the list publishes that the contact has stated
+    // no preference for. The contact stated one for `offers`, so only `weekly` applies.
     let defaults = read
         .body
         .get("TopicDefaultPreferences")
@@ -719,8 +720,16 @@ async fn a_contact_round_trips_through_its_own_read() {
         .unwrap_or_default();
     assert_eq!(
         defaults.len(),
-        2,
-        "case {:?}: the read must report one default per topic the list publishes, got {:?}",
+        1,
+        "case {:?}: the read must report a default only for the topic the contact stated \
+         nothing for, got {:?}",
+        "reader@example.com",
+        read.body
+    );
+    assert_eq!(
+        defaults[0].get("TopicName").and_then(Value::as_str),
+        Some("weekly"),
+        "case {:?}: the default must be the one of the unstated topic, got {:?}",
         "reader@example.com",
         read.body
     );
@@ -1194,15 +1203,19 @@ async fn updating_a_contact_list_replaces_its_metadata_completely() {
             "case {:?}: the contact must survive the metadata replacement, got {} {:?}",
             case.case, read_contact.status, read_contact.body
         );
-        // `TopicDefaultPreferences` is computed from the list's topics, so the
-        // replacement shows through on the contact as well.
+        // `TopicDefaultPreferences` is computed from the list's topics the contact has
+        // stated no preference for, so the replacement shows through on the contact as
+        // well — without the topic whose preference the contact stated (`offers`, while
+        // the list still publishes it).
         assert_eq!(
             preference_topics(&read_contact, "TopicDefaultPreferences"),
             expected_topics
                 .iter()
                 .map(|(name, _, _)| name.clone())
+                .filter(|name| name != "offers")
                 .collect::<Vec<String>>(),
-            "case {:?}: a contact's defaults must follow the list's topics, got {:?}",
+            "case {:?}: a contact's defaults must follow the list's topics it stated \
+             nothing for, got {:?}",
             case.case,
             read_contact.body
         );
@@ -1356,8 +1369,9 @@ async fn a_preference_dropped_with_its_topic_does_not_come_back_with_the_topic()
     );
     assert_eq!(
         preference_topics(&after_readd, "TopicDefaultPreferences"),
-        vec!["offers".to_string(), "weekly".to_string()],
-        "case {:?}: the re-added topic must contribute its default, got {:?}",
+        vec!["weekly".to_string()],
+        "case {:?}: the re-added topic must contribute its default, and the topic the \
+         contact stated a preference for must not, got {:?}",
         "weekly re-added",
         after_readd.body
     );

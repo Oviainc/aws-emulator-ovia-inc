@@ -169,10 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if list.contacts.contains_key(&key) {
             return Err(CreateContactErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    message: Some(format!(
-                        "Contact with email address: {address} already exists in list: \
-                         {list_name}."
-                    )),
+                    message: Some(crate::state::contact_already_exists(&address)),
                 },
             )
             .into());

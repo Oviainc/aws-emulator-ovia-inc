@@ -296,7 +296,7 @@ async fn a_tenant_is_deleted_whatever_it_holds_and_only_its_own_views_go() {
         );
         assert_eq!(
             read.message(),
-            state::tenant_not_found(&tenant_name),
+            format!("The requested tenant <{tenant_name}> does not exist."),
             "case {case:?}: expected the refusal to name the tenant it did not find, got {:?}",
             read.message()
         );
@@ -335,7 +335,7 @@ async fn a_tenant_is_deleted_whatever_it_holds_and_only_its_own_views_go() {
             );
             assert_eq!(
                 entry.message(),
-                state::tenant_not_found(&tenant_name),
+                format!("The requested tenant <{tenant_name}> does not exist."),
                 "case {case:?}: expected the suppression read to report the tenant missing, \
                  got {:?}",
                 entry.message()
@@ -619,14 +619,14 @@ fn refusal_cases() -> Vec<RefusalCase> {
             tenant_name: "ghost-tenant".to_string(),
             status: 404,
             error_code: "NotFoundException",
-            message: state::tenant_not_found("ghost-tenant"),
+            message: "The requested tenant <ghost-tenant> does not exist.".to_string(),
         },
         RefusalCase {
             case: "a name differing from a real tenant's only in case",
             tenant_name: "Live-Tenant".to_string(),
             status: 404,
             error_code: "NotFoundException",
-            message: state::tenant_not_found("Live-Tenant"),
+            message: "The requested tenant <Live-Tenant> does not exist.".to_string(),
         },
         RefusalCase {
             case: "a name one character past the documented bound",

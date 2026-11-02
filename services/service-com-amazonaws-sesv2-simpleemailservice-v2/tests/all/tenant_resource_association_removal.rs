@@ -543,7 +543,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             resource_arn: live_set_arn.clone(),
             status: 404,
             error_code: "NotFoundException",
-            message: state::requested_tenant_not_found("ghost-tenant"),
+            message: "The requested tenant <ghost-tenant> does not exist.".to_string(),
         },
         RefusalCase {
             case: "a tenant name differing from a real one only in case",
@@ -551,7 +551,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             resource_arn: live_set_arn.clone(),
             status: 404,
             error_code: "NotFoundException",
-            message: state::requested_tenant_not_found("Live-Tenant"),
+            message: "The requested tenant <Live-Tenant> does not exist.".to_string(),
         },
         RefusalCase {
             case: "a tenant name one character past the documented bound",

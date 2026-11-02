@@ -604,7 +604,7 @@ async fn get_tenant_refuses_a_tenant_the_account_does_not_hold() {
         );
         assert_eq!(
             read.message(),
-            format!("Tenant {name} does not exist."),
+            format!("The requested tenant <{name}> does not exist."),
             "case {case:?}: the refusal must name the tenant it did not find, got {:?}",
             read.message()
         );
