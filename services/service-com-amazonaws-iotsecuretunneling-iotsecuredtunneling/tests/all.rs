@@ -19,6 +19,8 @@ mod clock_read_inside_the_store_lock;
 mod close_tunnel_idempotence;
 #[path = "all/closed_tunnel_shape.rs"]
 mod closed_tunnel_shape;
+#[path = "all/creation_order_agrees_with_created_at.rs"]
+mod creation_order_agrees_with_created_at;
 #[path = "all/destination_service_limit.rs"]
 mod destination_service_limit;
 #[path = "all/limit_refusals.rs"]
