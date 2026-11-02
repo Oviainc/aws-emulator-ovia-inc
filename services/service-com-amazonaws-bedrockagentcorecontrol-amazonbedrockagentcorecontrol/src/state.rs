@@ -205,10 +205,40 @@ pub fn member_not_defined(member_prose: &str) -> ValidationException {
 /// `credentialProviderConfigurations` as [`member_not_defined`] spells it.
 pub const CREDENTIAL_PROVIDER_CONFIGURATIONS_PROSE: &str = "Credential provider configurations";
 
+/// A status enum token as this service's PROSE spells it: every
+/// `_`-separated word capitalised and the words run together (`CREATING` ->
+/// `Creating`, `UPDATE_UNSUCCESSFUL` -> `UpdateUnsuccessful`).
+///
+/// A response member carries a status as the screaming-snake token its enum
+/// declares (`smithy_query shape=GatewayStatus`), while a message that talks
+/// ABOUT the status names it as a word ("... when it is in Creating state"), so
+/// the token is rendered for prose rather than quoted into it.
+pub fn status_in_prose(status: &str) -> String {
+    status
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => {
+                    first.to_uppercase().collect::<String>()
+                        + &characters.as_str().to_lowercase()
+                }
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
 /// The modelled validation error a gateway operation gets while the gateway is
-/// in a status that cannot serve it: the operation and the status it found,
-/// in the form this service's recorded refusals take ("Cannot perform operation
-/// CreateGatewayTarget when gateway is in CREATING status").
+/// in a status that cannot serve it: the operation that was asked for and the
+/// status it found, with the one remedy the caller has ("DeleteGateway operation
+/// can't be performed on gateway when it is in Creating state. Retry the request
+/// when the gateway is in a valid state.").
+///
+/// The sentence is fixed; its variable parts are the asking operation's own name
+/// and the gateway's current status, the latter spelled as prose
+/// ([`status_in_prose`]) rather than as the wire's enum token.
 ///
 /// A gateway reaches `READY` on the clock, so every mutation of it is refused
 /// while it is still `CREATING`, `UPDATING` or on its way out in `DELETING`:
@@ -216,7 +246,11 @@ pub const CREDENTIAL_PROVIDER_CONFIGURATIONS_PROSE: &str = "Credential provider 
 /// [`VALIDATION_REASON_RESOURCE_CONFLICT`] and there is no `fieldList`.
 pub fn gateway_status_conflict(operation: &str, status: &str) -> ValidationException {
     ValidationException {
-        message: format!("Cannot perform operation {operation} when gateway is in {status} status"),
+        message: format!(
+            "{operation} operation can't be performed on {RESOURCE_GATEWAY} when it is in {} \
+             state. Retry the request when the {RESOURCE_GATEWAY} is in a valid state.",
+            status_in_prose(status)
+        ),
         reason: VALIDATION_REASON_RESOURCE_CONFLICT.to_string(),
         field_list: None,
     }
@@ -279,6 +313,38 @@ pub fn memory_not_found(operation: &str, memory_id: &str) -> ResourceNotFoundExc
         message: Some(format!(
             "Resource not found during {operation}: Failed to retrieve memory item for ID: \
              {memory_id}"
+        )),
+    }
+}
+
+/// How [`agent_runtime_not_found`] spells "the request asked for no particular
+/// version": the lookup ran with no version, and the sentence reports the
+/// missing value rather than leaving a gap.
+pub const AGENT_RUNTIME_VERSION_UNSPECIFIED: &str = "null";
+
+/// The modelled not-found error for an agent runtime — or for a VERSION of one —
+/// that this service does not hold: the id the lookup ran for, the account it ran
+/// in, and the version it asked for ("Agent with agentId: <id>, accountId:
+/// <account>, and version: <version> not found!").
+///
+/// This control plane words a missing runtime in terms of the agent it runs. The
+/// sentence around the three values is fixed: `agent_runtime_id` is the id the
+/// request carried, the account is the single one this emulator serves
+/// (`engine::emulator_account_id`), and `version` is the version the request
+/// asked for — a request that named none is reported with
+/// [`AGENT_RUNTIME_VERSION_UNSPECIFIED`].
+///
+/// Shared by the handlers rather than written per operation, so one runtime
+/// cannot be reported missing in two different sentences by two operations.
+pub fn agent_runtime_not_found(
+    agent_runtime_id: &str,
+    version: Option<&str>,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Agent with agentId: {agent_runtime_id}, accountId: {}, and version: {} not found!",
+            ::engine::emulator_account_id(),
+            version.unwrap_or(AGENT_RUNTIME_VERSION_UNSPECIFIED)
         )),
     }
 }

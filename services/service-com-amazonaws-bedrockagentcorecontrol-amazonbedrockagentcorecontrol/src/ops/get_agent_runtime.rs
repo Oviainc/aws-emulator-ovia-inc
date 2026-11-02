@@ -197,13 +197,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let store = state.lock();
 
+        // The lookup that fails is the agent's, so the refusal names the agent,
+        // the account it was looked for in and the version that was asked for.
         let not_found = || {
-            GetAgentRuntimeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "no agent runtime {} in this account",
-                    input.agent_runtime_id
-                )),
-            })
+            GetAgentRuntimeErrorModeled::ResourceNotFoundException(
+                crate::state::agent_runtime_not_found(
+                    &input.agent_runtime_id,
+                    input.agent_runtime_version.as_deref(),
+                ),
+            )
         };
         let record = store
             .agent_runtimes

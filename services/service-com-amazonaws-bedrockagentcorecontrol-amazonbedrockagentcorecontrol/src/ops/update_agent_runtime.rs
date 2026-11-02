@@ -256,13 +256,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .agent_runtimes
             .get_mut(&input.agent_runtime_id)
             .ok_or_else(|| {
+                // The lookup that fails is the agent's, so the refusal names the
+                // agent and the account it was looked for in; an update addresses
+                // the runtime itself rather than one of its versions, so it asked
+                // for no version.
                 UpdateAgentRuntimeErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "no agent runtime {} in this account",
-                            input.agent_runtime_id
-                        )),
-                    },
+                    crate::state::agent_runtime_not_found(&input.agent_runtime_id, None),
                 )
             })?;
 

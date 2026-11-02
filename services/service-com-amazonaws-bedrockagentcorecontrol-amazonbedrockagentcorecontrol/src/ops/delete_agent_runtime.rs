@@ -169,14 +169,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Built before the store is borrowed, so the refusal can be returned from
-        // anywhere below without holding on to the request.
+        // anywhere below without holding on to the request. The lookup that fails
+        // is the agent's, so the refusal names the agent, the account it was
+        // looked for in and the version that was asked for.
         let not_found = || {
-            DeleteAgentRuntimeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "no agent runtime {} in this account",
-                    input.agent_runtime_id
-                )),
-            })
+            DeleteAgentRuntimeErrorModeled::ResourceNotFoundException(
+                crate::state::agent_runtime_not_found(
+                    &input.agent_runtime_id,
+                    input.agent_runtime_version.as_deref(),
+                ),
+            )
         };
         let record = store
             .agent_runtimes

@@ -826,16 +826,17 @@ async fn the_gateway_mutations_refuse_what_the_model_states_they_must() {
 /// service drives, from `smithy_query shape=GatewayStatus`) and along the operation refused.
 #[tokio::test]
 async fn a_gateway_the_clock_still_owes_a_transition_refuses_both_mutations() {
-    // (case, the status to leave the gateway in, the method refused, its operation name)
-    let rows: [(&str, &str, &str, &str); 5] = [
-        ("UpdateGateway while CREATING", "CREATING", "PUT", "UpdateGateway"),
-        ("DeleteGateway while CREATING", "CREATING", "DELETE", "DeleteGateway"),
-        ("UpdateGateway while UPDATING", "UPDATING", "PUT", "UpdateGateway"),
-        ("DeleteGateway while UPDATING", "UPDATING", "DELETE", "DeleteGateway"),
-        ("UpdateGateway while DELETING", "DELETING", "PUT", "UpdateGateway"),
+    // (case, the status to leave the gateway in, that status as the refusal's prose spells
+    // it, the method refused, its operation name)
+    let rows: [(&str, &str, &str, &str, &str); 5] = [
+        ("UpdateGateway while CREATING", "CREATING", "Creating", "PUT", "UpdateGateway"),
+        ("DeleteGateway while CREATING", "CREATING", "Creating", "DELETE", "DeleteGateway"),
+        ("UpdateGateway while UPDATING", "UPDATING", "Updating", "PUT", "UpdateGateway"),
+        ("DeleteGateway while UPDATING", "UPDATING", "Updating", "DELETE", "DeleteGateway"),
+        ("UpdateGateway while DELETING", "DELETING", "Deleting", "PUT", "UpdateGateway"),
     ];
 
-    for (index, (case, status, method, operation)) in rows.into_iter().enumerate() {
+    for (index, (case, status, status_prose, method, operation)) in rows.into_iter().enumerate() {
         let router = router();
         let name = format!("gwg{index}");
         let created = create_gateway(&router, &baseline_body(&name)).await;
@@ -897,9 +898,9 @@ async fn a_gateway_the_clock_still_owes_a_transition_refuses_both_mutations() {
         );
         let message = text(&refused.body, "message");
         assert!(
-            message.contains(operation) && message.contains(status),
-            "case {case:?}: the refusal must name the operation and the status it found, got \
-             {message:?}"
+            message.contains(operation) && message.contains(status_prose),
+            "case {case:?}: the refusal must name the operation and the status it found (as \
+             {status_prose:?}), got {message:?}"
         );
 
         // The refusal wrote nothing: the gateway is still in the status it was in, with the

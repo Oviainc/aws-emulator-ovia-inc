@@ -709,13 +709,14 @@ async fn an_update_of_something_that_is_not_there_is_the_modelled_404() {
 /// the refusal names the status it found.
 #[tokio::test]
 async fn a_gateway_that_cannot_serve_the_change_refuses_the_update() {
-    // (case, the request that moves the gateway out of READY, the status it then reports)
-    let rows: [(&str, &str, &str); 2] = [
-        ("an update in flight on the gateway", "PUT", "UPDATING"),
-        ("a deletion accepted for the gateway", "DELETE", "DELETING"),
+    // (case, the request that moves the gateway out of READY, the status it then reports,
+    // that status as the refusal's prose spells it)
+    let rows: [(&str, &str, &str, &str); 2] = [
+        ("an update in flight on the gateway", "PUT", "UPDATING", "Updating"),
+        ("a deletion accepted for the gateway", "DELETE", "DELETING", "Deleting"),
     ];
 
-    for (case, method, status_name) in rows {
+    for (case, method, status_name, status_prose) in rows {
         let router = router();
         let gateway_id = settled_gateway(&router, "gatewaygate").await;
         let created =
@@ -768,8 +769,8 @@ async fn a_gateway_that_cannot_serve_the_change_refuses_the_update() {
         assert_eq!(
             text(&refused.body, "message"),
             format!(
-                "Cannot perform operation UpdateGatewayTarget when gateway is in {status_name} \
-                 status"
+                "UpdateGatewayTarget operation can't be performed on gateway when it is in \
+                 {status_prose} state. Retry the request when the gateway is in a valid state."
             ),
             "case {case:?}: the refusal names the operation and the status it found, got {}",
             text(&refused.body, "message")

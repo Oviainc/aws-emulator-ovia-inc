@@ -206,7 +206,8 @@ async fn a_gateway_takes_a_target_only_once_it_reports_ready() {
         );
         assert_eq!(
             text(&refused, "message"),
-            "Cannot perform operation CreateGatewayTarget when gateway is in CREATING status",
+            "CreateGatewayTarget operation can't be performed on gateway when it is in Creating \
+             state. Retry the request when the gateway is in a valid state.",
             "case {case:?}: the refusal names the operation and the status to wait out, got {}",
             text(&refused, "message")
         );
@@ -319,7 +320,8 @@ async fn a_gateway_on_its_way_out_takes_no_target() {
         );
         assert_eq!(
             text(&refused, "message"),
-            "Cannot perform operation CreateGatewayTarget when gateway is in DELETING status",
+            "CreateGatewayTarget operation can't be performed on gateway when it is in Deleting \
+             state. Retry the request when the gateway is in a valid state.",
             "case {case:?}: the refusal names the status it found, got {}",
             text(&refused, "message")
         );

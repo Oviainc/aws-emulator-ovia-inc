@@ -61,6 +61,8 @@ mod memory_mutation;
 mod memory_update_and_read_projection;
 #[path = "all/registry_lifecycle.rs"]
 mod registry_lifecycle;
+#[path = "all/resource_error_message_wording.rs"]
+mod resource_error_message_wording;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/signing_name_routing.rs"]
