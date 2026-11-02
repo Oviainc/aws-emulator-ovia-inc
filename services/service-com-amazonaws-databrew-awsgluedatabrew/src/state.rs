@@ -78,6 +78,14 @@ pub const MAX_SCHEDULES: usize = 1_000;
 /// The most recipes this emulator retains, for the reason [`MAX_DATASETS`] gives.
 pub const MAX_RECIPES: usize = 1_000;
 
+/// The most published versions this emulator retains for one recipe.
+///
+/// Every publish freezes another version of the recipe, so it is a growth site a
+/// caller drives: past this ceiling the publish is REFUSED with the modelled
+/// `ServiceQuotaExceededException` (the error AWS answers a quota with) rather than
+/// appending, for the reason [`MAX_DATASETS`] gives.
+pub const MAX_PUBLISHED_RECIPE_VERSIONS: usize = 1_000;
+
 /// The version identifier a recipe carries the moment `CreateRecipe` mints it.
 ///
 /// A recipe version is `X.Y`, major and minor (model: `Recipe$RecipeVersion` —
@@ -244,7 +252,7 @@ pub struct RecipeVersionRecord {
     pub steps: Vec<RecipeStep>,
     /// Set only on a version a publish froze; `None` on a working version, whose
     /// modelled `PublishedBy`/`PublishedDate` report a publish that has not happened
-    /// (`PublishRecipe`, still its own stub issue, is what sets them).
+    /// ([`RecipeRecord::publish`] is what sets them).
     pub published_by: Option<String>,
     pub published_date: Option<SystemTime>,
     pub audit: Audit,
@@ -504,6 +512,63 @@ impl RecipeRecord {
             version => self.published.iter().find(|held| held.version == version),
         }
     }
+
+    /// The number the NEXT publish of this recipe freezes a version at: the major
+    /// after the highest one this recipe holds, at minor 0.
+    ///
+    /// A version number is `X.Y`, major and minor, and `"0.0"` is not a valid one
+    /// (model: `Recipe$RecipeVersion`); a recipe is created at major 0
+    /// ([`INITIAL_RECIPE_VERSION`]), so the first publish of any recipe is `1.0` and
+    /// each later one takes the next whole number.
+    pub fn next_published_version(&self) -> String {
+        let highest = self
+            .published
+            .iter()
+            .chain(::std::iter::once(&self.working))
+            .filter_map(|held| version_major(&held.version))
+            .max()
+            .unwrap_or(0);
+        format!("{}.0", highest.saturating_add(1))
+    }
+
+    /// Freeze this recipe's working version as a new published version, and answer the
+    /// number it was frozen at.
+    ///
+    /// Publishing is ADDITIVE: it copies the definition the working version holds into
+    /// a version of its own, numbered by [`RecipeRecord::next_published_version`] and
+    /// appended to [`RecipeRecord::published`] (oldest first, so it becomes
+    /// `LATEST_PUBLISHED`), while the working version carries on unchanged as the draft
+    /// development continues on. `description` is the description the publish carried
+    /// for this version; a publish that carried none freezes the definition's own
+    /// description with it.
+    pub fn publish(
+        &mut self,
+        description: Option<String>,
+        at: SystemTime,
+        principal: String,
+    ) -> String {
+        let frozen = RecipeVersionRecord {
+            version: self.next_published_version(),
+            description: description.or_else(|| self.working.description.clone()),
+            steps: self.working.steps.clone(),
+            published_by: Some(principal.clone()),
+            published_date: Some(at),
+            // The frozen version is minted by this publish, so its create audit is
+            // the publish itself rather than the draft's.
+            audit: Audit::created(at, principal),
+        };
+        let version = frozen.version.clone();
+        self.published.push(frozen);
+        version
+    }
+}
+
+/// The major half of a numeric `X.Y` version, or `None` when the identifier is not
+/// numeric (an alias, say).
+fn version_major(version: &str) -> Option<u64> {
+    let (major, minor) = version.split_once('.')?;
+    minor.parse::<u64>().ok()?;
+    major.parse().ok()
 }
 
 impl JobRunRecord {

@@ -19,6 +19,8 @@ mod databrew_harness;
 mod dataset_update_lifecycle;
 #[path = "all/recipe_lifecycle.rs"]
 mod recipe_lifecycle;
+#[path = "all/recipe_publishing.rs"]
+mod recipe_publishing;
 #[path = "all/recipe_version_resolution.rs"]
 mod recipe_version_resolution;
 #[path = "all/resource_not_found_message.rs"]

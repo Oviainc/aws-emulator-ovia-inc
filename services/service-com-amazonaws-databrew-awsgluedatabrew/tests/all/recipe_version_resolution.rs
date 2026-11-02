@@ -16,11 +16,11 @@
 //! published (none, one, several), which identifier form addresses them (omitted, each
 //! documented alias, a numeric version), and which half of the pair is missing.
 //!
-//! Versions are frozen into the store directly rather than through `PublishRecipe`,
-//! which is still a scaffold stub with its own issue
-//! (`issues/things-that-do-not-work/20261029T172132Z-databrew-publishrecipe-stub.md`);
-//! the store written here is the one shared engine the handlers serve from, so every
-//! assertion below is still made over the wire.
+//! Versions are frozen into the store directly rather than through `PublishRecipe`, so
+//! the cases can address version numbers no publish mints (`999999.999999`, say)
+//! alongside the ones it does; what `PublishRecipe` itself freezes is covered by
+//! `tests/all/recipe_publishing.rs`. The store written here is the one shared engine the
+//! handlers serve from, so every assertion below is still made over the wire.
 
 use std::time::{Duration, SystemTime};
 
