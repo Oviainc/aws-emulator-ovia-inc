@@ -214,24 +214,28 @@ pub(crate) async fn create_product_of_type(
 
 /// The id of the one provisioning artifact `create_product_of_type` minted for
 /// `product_id` — the product version a provisioning request names.
+///
+/// Read through `ListProvisioningArtifacts`, the ADMIN view of a product's versions: a
+/// product a case has not yet put in a portfolio is outside the end-user view, which
+/// reaches a product only through a launch path.
 pub(crate) async fn first_provisioning_artifact_id(
     router: &MultiServiceRouter,
     product_id: &str,
 ) -> String {
-    let (status, described) = call(
+    let (status, listed) = call(
         router,
-        "DescribeProduct",
-        &json!({"Id": product_id}),
+        "ListProvisioningArtifacts",
+        &json!({"ProductId": product_id}),
     )
     .await;
     assert_eq!(
         status, 200,
-        "DescribeProduct {product_id}: expected 200, got {status} with {described}"
+        "ListProvisioningArtifacts {product_id}: expected 200, got {status} with {listed}"
     );
-    described["ProvisioningArtifacts"][0]["Id"]
+    listed["ProvisioningArtifactDetails"][0]["Id"]
         .as_str()
         .unwrap_or_else(|| {
-            panic!("DescribeProduct {product_id}: no provisioning artifact in {described}")
+            panic!("ListProvisioningArtifacts {product_id}: no provisioning artifact in {listed}")
         })
         .to_string()
 }

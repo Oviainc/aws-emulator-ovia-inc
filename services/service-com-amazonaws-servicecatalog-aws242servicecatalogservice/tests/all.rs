@@ -23,6 +23,8 @@ mod launch_paths;
 mod portfolio_lifecycle;
 #[path = "all/portfolios_for_product.rs"]
 mod portfolios_for_product;
+#[path = "all/product_copies.rs"]
+mod product_copies;
 #[path = "all/provisioned_products.rs"]
 mod provisioned_products;
 #[path = "all/resources_for_tag_option.rs"]

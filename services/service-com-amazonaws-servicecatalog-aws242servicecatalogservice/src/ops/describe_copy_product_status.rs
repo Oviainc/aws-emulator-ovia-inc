@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCopyProductStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCopyProductStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCopyProductStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +132,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCopyProductStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCopyProductStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCopyProductStatus"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read: this operation reports the copy `CopyProduct` started and writes
+        // nothing, so a later caller sees exactly what this one saw.
+        let state = state.lock();
+
+        // "The token for the copy product operation. This token is returned by
+        // CopyProduct" — so a token this service never minted, or one whose copy record
+        // it no longer keeps, names no copy operation to report on.
+        let Some(copy) = state.product_copies.get(&input.copy_product_token) else {
+            return Err(
+                DescribeCopyProductStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "{} does not exist or access was denied",
+                            input.copy_product_token
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeCopyProductStatusOutput {
+            // The status is DERIVED from the due instant the copy stored, so this report
+            // tells a caller what the clock has made true — `IN_PROGRESS` while the
+            // copy's completion is still owed, the terminal `SUCCEEDED` once it fell due
+            // — and writes nothing either way.
+            copy_product_status: Some(copy.status(std::time::SystemTime::now()).to_string()),
+            // "The identifier of the copied product": the product the request named, or
+            // the one the copy created, known from the moment the copy started.
+            target_product_id: Some(copy.target_product_id.clone()),
+            // "The status message", which a copy carries only when it has something to
+            // say beyond its status: nothing inside this emulator can fail a copy, so
+            // every copy it reports on is either running or done.
+            status_detail: None,
+        })
     }
 }

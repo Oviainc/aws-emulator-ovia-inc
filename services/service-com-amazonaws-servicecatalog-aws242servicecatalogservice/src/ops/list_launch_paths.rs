@@ -185,13 +185,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // product no portfolio holds therefore resolves no path at all, and neither
         // does a product id nothing stored carries: that is what this operation's path
         // resolution refuses, rather than answering an empty page.
-        let paths: Vec<&crate::state::Portfolio> = state
-            .products
-            .get(&input.product_id)
-            .into_iter()
-            .flat_map(|product| product.portfolio_ids.iter())
-            .filter_map(|portfolio_id| state.portfolios.get(portfolio_id))
-            .collect();
+        let paths: Vec<&crate::state::Portfolio> =
+            state.launch_path_portfolios(&input.product_id);
         if paths.is_empty() {
             return Err(ListLaunchPathsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

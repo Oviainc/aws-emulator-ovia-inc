@@ -146,15 +146,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both `Id` and `Name` are optional: the product is addressed by its id, or by
         // its name when no id is given. Neither names a product, so there is nothing
         // to look up and the request is refused as invalid rather than as not found.
+        //
+        // This is the END-USER view of a product ("running this operation with
+        // administrator access results in a failure. DescribeProductAsAdmin should be
+        // used instead"), and an end user reaches a product only through a LAUNCH PATH:
+        // a portfolio the product is associated with. A product no portfolio carries is
+        // therefore outside the catalog this operation can see, exactly as a product
+        // nothing stored carries is — and the refusal does not tell the two apart, so a
+        // caller cannot learn from it that a product it has no access to exists. The
+        // admin view, `DescribeProductAsAdmin`, is what reads a product that sits in no
+        // portfolio.
+        let reachable = |product: &&crate::state::Product| {
+            !state.launch_path_portfolios(&product.id).is_empty()
+        };
         let product = match (
             input.id.as_deref().filter(|id| !id.is_empty()),
             input.name.as_deref().filter(|name| !name.is_empty()),
         ) {
-            (Some(id), _) => state.products.get(id).ok_or_else(|| id.to_string()),
+            (Some(id), _) => state
+                .products
+                .get(id)
+                .filter(|product| reachable(product))
+                .ok_or_else(|| id.to_string()),
             (None, Some(name)) => state
                 .products
                 .values()
-                .find(|product| product.name == name)
+                .find(|product| product.name == name && reachable(product))
                 .ok_or_else(|| name.to_string()),
             (None, None) => {
                 return Err(DescribeProductErrorModeled::InvalidParametersException(
@@ -195,16 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (`AssociateBudgetWithResource` is still scaffolded), so that set is
             // empty rather than absent.
             budgets: Some(Vec::new()),
-            // A launch path is a portfolio this product can be launched through, so
-            // the paths ARE the product's portfolio associations: one per associated
-            // portfolio, named by that portfolio. This is the same stored set
-            // `ProductViewSummary$HasDefaultPath` is derived from, so the two members
-            // of one response cannot contradict each other.
+            // The launch paths this product was reached THROUGH: one per associated
+            // portfolio, named by that portfolio, from the same stored set
+            // `ProductViewSummary$HasDefaultPath` is derived from, so the two members of
+            // one response cannot contradict each other.
             launch_paths: Some(
-                product
-                    .portfolio_ids
-                    .iter()
-                    .filter_map(|portfolio_id| state.portfolios.get(portfolio_id))
+                state
+                    .launch_path_portfolios(&product.id)
+                    .into_iter()
                     .map(|portfolio| LaunchPath {
                         id: Some(portfolio.id.clone()),
                         name: Some(portfolio.display_name.clone()),

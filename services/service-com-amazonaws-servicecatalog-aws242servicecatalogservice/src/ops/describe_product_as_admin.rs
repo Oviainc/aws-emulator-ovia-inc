@@ -214,7 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(DescribeProductAsAdminOutput {
-            product_view_detail: Some(product.detail()),
+            // The product's `Status` is DERIVED from the due instant its create or the
+            // copy that is filling it in stored, so this report tells a caller what the
+            // clock has made true and writes nothing either way.
+            product_view_detail: Some(product.detail(std::time::SystemTime::now())),
             provisioning_artifact_summaries: Some(
                 product
                     .provisioning_artifacts

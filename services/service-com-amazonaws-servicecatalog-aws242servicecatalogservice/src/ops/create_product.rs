@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with different members.
         if let Some(product) = state.replayed_product(&input.idempotency_token) {
             return Ok(CreateProductOutput {
-                product_view_detail: Some(product.detail()),
+                product_view_detail: Some(product.detail(std::time::SystemTime::now())),
                 provisioning_artifact_detail: product
                     .provisioning_artifacts
                     .values()
@@ -330,6 +330,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             product_type: input.product_type,
             status: crate::state::PRODUCT_STATUS_CREATED.to_string(),
             created_time,
+            // A created product is ready to use the moment it is stored, so the clock
+            // owes it no transition and it never reads as `CREATING`.
+            available_at: created_time,
             tags,
             // The connection the product is to sync from, reported back as the detail
             // shape: the `Type` and `ConnectionParameters` the request carried, with no
@@ -349,7 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tag_option_ids: std::collections::BTreeSet::new(),
         };
 
-        let product_view_detail = product.detail();
+        let product_view_detail = product.detail(created_time);
         let provisioning_artifact_detail = product
             .provisioning_artifacts
             .values()

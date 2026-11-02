@@ -298,7 +298,9 @@ async fn an_unknown_resource_id_is_resource_not_found() {
         ),
         (
             "product",
-            "DescribeProduct",
+            // The ADMIN read of a product: the seeded product sits in no portfolio, so
+            // it is outside the catalog the end-user `DescribeProduct` reaches.
+            "DescribeProductAsAdmin",
             json!({"Id": seeded.product_id}),
         ),
         (
@@ -368,29 +370,36 @@ async fn a_created_resource_reads_back_through_its_describe() {
         "case \"constraint\": the stored parameters must come back, got {constraint}"
     );
 
-    // The product reads back by id and by name, and both report the same record.
+    // The product reads back by id and by name, and both report the same record. The
+    // seeded product sits in no portfolio, so the read that reaches it is the ADMIN one;
+    // the end-user `DescribeProduct` sees a product only through a launch path, which
+    // the block below gives it.
     for (case, body) in [
         ("product by id", json!({"Id": seeded.product_id})),
         ("product by name", json!({"Name": seeded.product_name})),
     ] {
-        let (status, product) = call(&router, "DescribeProduct", &body).await;
+        let (status, product) = call(&router, "DescribeProductAsAdmin", &body).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected 200, got {status} with {product}"
         );
         assert_eq!(
-            field(case, &product, "/ProductViewSummary/ProductId"),
+            field(
+                case,
+                &product,
+                "/ProductViewDetail/ProductViewSummary/ProductId"
+            ),
             seeded.product_id,
             "case {case:?}: the stored product id must come back, got {product}"
         );
         assert_eq!(
-            field(case, &product, "/ProductViewSummary/Name"),
+            field(case, &product, "/ProductViewDetail/ProductViewSummary/Name"),
             seeded.product_name,
             "case {case:?}: the stored name must come back, got {product}"
         );
         assert_eq!(
             product
-                .pointer("/ProvisioningArtifacts/0/Id")
+                .pointer("/ProvisioningArtifactSummaries/0/Id")
                 .and_then(Value::as_str),
             Some(seeded.provisioning_artifact_id.as_str()),
             "case {case:?}: the stored version must be listed, got {product}"
@@ -580,9 +589,11 @@ async fn create_product_needs_a_readable_template_source() {
             "case {case:?}: a request carrying a template source must be served, got {status} \
              with {created}"
         );
-        // The product is readable afterwards, so the create really stored it.
+        // The product is readable afterwards, so the create really stored it. A created
+        // product sits in no portfolio, so the read that reaches it is the admin one.
         let id = field(case, &created, "/ProductViewDetail/ProductViewSummary/ProductId");
-        let (status, described) = call(&router, "DescribeProduct", &json!({"Id": id})).await;
+        let (status, described) =
+            call(&router, "DescribeProductAsAdmin", &json!({"Id": id})).await;
         assert_eq!(
             status, 200,
             "case {case:?}: the created product must read back, got {status} with {described}"
@@ -1236,7 +1247,7 @@ async fn a_deleted_resource_is_resource_not_found() {
         ),
         (
             "product",
-            "DescribeProduct",
+            "DescribeProductAsAdmin",
             "DeleteProduct",
             &seeded.product_id,
         ),
@@ -1596,7 +1607,7 @@ async fn an_update_is_visible_through_the_describe_beside_it() {
     );
     let (status, described) = call(
         &router,
-        "DescribeProduct",
+        "DescribeProductAsAdmin",
         &json!({"Name": "renamed-product"}),
     )
     .await;
@@ -1606,12 +1617,20 @@ async fn an_update_is_visible_through_the_describe_beside_it() {
          with {described}"
     );
     assert_eq!(
-        field("product", &described, "/ProductViewSummary/ProductId"),
+        field(
+            "product",
+            &described,
+            "/ProductViewDetail/ProductViewSummary/ProductId"
+        ),
         seeded.product_id,
         "case \"product\": it is the same product, got {described}"
     );
     assert_eq!(
-        field("product", &described, "/ProductViewSummary/Owner"),
+        field(
+            "product",
+            &described,
+            "/ProductViewDetail/ProductViewSummary/Owner"
+        ),
         "acme",
         "case \"product\": an unnamed member keeps its stored value, got {described}"
     );

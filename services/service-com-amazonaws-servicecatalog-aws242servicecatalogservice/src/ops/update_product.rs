@@ -233,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The response is the post-update STORED record, so a following
         // DescribeProduct reports the same values.
         Ok(UpdateProductOutput {
-            product_view_detail: Some(product.detail()),
+            product_view_detail: Some(product.detail(std::time::SystemTime::now())),
             tags: Some(product.tag_list()),
         })
     }

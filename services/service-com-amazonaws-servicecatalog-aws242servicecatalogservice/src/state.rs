@@ -231,10 +231,20 @@ pub struct Product {
     pub support_url: Option<String>,
     /// A `ProductType` value, as the request gave it.
     pub product_type: String,
-    /// The product's `Status`, [`PRODUCT_STATUS_CREATED`] from create time on.
+    /// The product's terminal `Status`, [`PRODUCT_STATUS_CREATED`] from create time on.
+    /// Read through [`Product::status`], which answers the non-terminal one while the
+    /// clock still owes this product's transition.
     pub status: String,
     /// Creation instant, minted once at create time.
     pub created_time: SystemTime,
+    /// The instant this product stops being `CREATING` and reads as [`Self::status`].
+    ///
+    /// A product `CreateProduct` minted is ready at once — AWS answers that create with
+    /// a terminal status — so its due instant IS its create instant. A product
+    /// `CopyProduct` is still filling in is the one that reads as `CREATING`: the copy
+    /// is asynchronous, so the transition is owed by the CLOCK, stored as the instant it
+    /// falls due and never slept for.
+    pub available_at: SystemTime,
     /// Tag key -> tag value.
     pub tags: BTreeMap<String, String>,
     /// The connection the product syncs from, when the create request named one.
@@ -257,13 +267,25 @@ pub struct Product {
 /// `CreateProduct` answers a product that is ready to use — the recorded AWS responses
 /// this emulator is graded against carry `CREATED`, and the calls that follow a create
 /// use the new `ProductId` immediately — so the record is stored in that one terminal
-/// status and no clock transition is owed. The modelled `Status` enum
-/// (`smithy_query query="shape" shape="Status"`) additionally admits `AVAILABLE`,
-/// `CREATING` and `FAILED`, which only the provisioning paths this emulator has not
-/// implemented yet can produce.
+/// status and no clock transition is owed. A product a `CopyProduct` is still filling
+/// in reads as [`STATUS_CREATING`] until that copy's due instant and as this value
+/// afterwards. The modelled `Status` enum (`smithy_query query="shape" shape="Status"`)
+/// additionally admits `AVAILABLE` and `FAILED`, which only the provisioning paths this
+/// emulator has not implemented yet can produce.
 pub const PRODUCT_STATUS_CREATED: &str = "CREATED";
 
 impl Product {
+    /// This product's `Status` at `now`: `CREATING` — which the model documents as
+    /// "product creation has started; the product is not ready for use" — until the
+    /// clock owes this product's transition, and the stored terminal status afterwards.
+    pub fn status(&self, now: SystemTime) -> &str {
+        if now < self.available_at {
+            STATUS_CREATING
+        } else {
+            &self.status
+        }
+    }
+
     /// This record as the modelled `ProductViewSummary`.
     pub fn view_summary(&self) -> ProductViewSummary {
         ProductViewSummary {
@@ -288,11 +310,12 @@ impl Product {
     }
 
     /// This record as the modelled `ProductViewDetail`: every member comes from stored
-    /// state, so Create and Describe report the same values.
-    pub fn detail(&self) -> ProductViewDetail {
+    /// state, so Create and Describe report the same values. `now` is what the derived
+    /// [`Self::status`] is read at, so every reporter of one product agrees.
+    pub fn detail(&self, now: SystemTime) -> ProductViewDetail {
         ProductViewDetail {
             product_view_summary: Some(self.view_summary()),
-            status: Some(self.status.clone()),
+            status: Some(self.status(now).to_string()),
             product_arn: Some(self.arn.clone()),
             created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
             source_connection: self.source_connection.clone(),
@@ -390,6 +413,66 @@ impl ProvisioningArtifact {
             description: self.description.clone(),
             created_time: Some(::aws_smithy_types::DateTime::from(self.created_time)),
             guidance: Some(self.guidance.clone()),
+        }
+    }
+}
+
+/// One asynchronous product copy — the record `CopyProduct` mints and
+/// `DescribeCopyProductStatus` reports, addressed by the token the copy answered.
+///
+/// The copy itself is performed where it is asked for, so the target product and the
+/// versions it gained are stored the moment the copy starts and every reader of the
+/// catalog sees the same thing. What the CLOCK still owes is the copy's own
+/// completion: the operation is documented as asynchronous, so it reads as
+/// `IN_PROGRESS` until [`Self::succeeded_at`].
+#[derive(Debug, Clone)]
+pub struct ProductCopy {
+    /// The minted `CopyProductToken` (`copy-product-…`), also this record's key in
+    /// [`ComAmazonawsServicecatalogAws242servicecatalogserviceState::product_copies`].
+    pub token: String,
+    /// The product the versions were copied FROM.
+    pub source_product_id: String,
+    /// The product they were copied INTO — the one the request named, or the one this
+    /// copy created.
+    pub target_product_id: String,
+    /// The instant this copy stops being `IN_PROGRESS` and becomes `SUCCEEDED`, stored
+    /// as the instant it falls due and never slept for.
+    pub succeeded_at: SystemTime,
+}
+
+/// `CopyProductStatus`'s non-terminal value, which the operation answers while the
+/// asynchronous copy it started is still owed
+/// (`smithy_query query="shape" shape="CopyProductStatus"`: `SUCCEEDED` |
+/// `IN_PROGRESS` | `FAILED`).
+pub const COPY_PRODUCT_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// `CopyProductStatus`'s terminal value for a copy that completed.
+pub const COPY_PRODUCT_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// How long after the call that started it a product copy stays `IN_PROGRESS`.
+///
+/// A span this emulator CHOOSES (AWS documents none): never zero, so a caller acting
+/// straight after `CopyProduct` still sees the non-terminal status and the
+/// not-yet-ready product it implies, and short enough that nothing waits on it.
+pub const PRODUCT_COPY_SUCCEEDS_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The most copy records this store keeps, which bounds it.
+///
+/// A copy's record is what `DescribeCopyProductStatus` reads, so it outlives the call
+/// that made it; a caller copying into one target product repeatedly would otherwise
+/// grow this map without bound. As with [`MAX_PRODUCTS`] this is the emulator's own
+/// bound, not a quoted AWS figure: the newest this many copies are the ones whose
+/// token still resolves.
+pub const MAX_PRODUCT_COPIES: usize = 500;
+
+impl ProductCopy {
+    /// This copy's `CopyProductStatus` at `now`: the non-terminal one until the clock
+    /// owes its completion, the terminal one afterwards.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.succeeded_at {
+            COPY_PRODUCT_STATUS_IN_PROGRESS
+        } else {
+            COPY_PRODUCT_STATUS_SUCCEEDED
         }
     }
 }
@@ -701,6 +784,16 @@ pub const MAX_CONSTRAINTS: usize = 500;
 /// idempotency entry, so bounding the count bounds all three.
 pub const MAX_PRODUCTS: usize = 500;
 
+/// The most provisioning artifacts (versions) one product can carry, which bounds every
+/// product record.
+///
+/// `CopyProduct` adds the source's versions to the target product, so without a cap on
+/// the versions one product holds a caller could grow one record without bound by
+/// repeating the copy. As with [`MAX_PRODUCTS`] this is the EMULATOR's bound, not a
+/// quoted AWS figure — set at the scale of the one quota this file does cite (100
+/// portfolios) — and it is checked before any version is stored.
+pub const MAX_PROVISIONING_ARTIFACTS_PER_PRODUCT: usize = 100;
+
 /// The most provisioned products this account can hold, which also bounds this
 /// store and the records inside it.
 ///
@@ -759,6 +852,10 @@ pub struct ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     pub records: BTreeMap<String, Record>,
     /// Every created, not-yet-deleted TagOption, keyed by TagOption id.
     pub tag_options: BTreeMap<String, TagOption>,
+    /// Every remembered product copy, keyed by the `CopyProductToken` `CopyProduct`
+    /// answered. A `BTreeMap` so the walk the eviction in [`Self::remember_product_copy`]
+    /// makes is deterministic. Bounded by [`MAX_PRODUCT_COPIES`].
+    pub product_copies: BTreeMap<String, ProductCopy>,
     /// `CreatePortfolio` idempotency: `IdempotencyToken` -> portfolio id, so a
     /// repeated create replays the first one instead of minting a second portfolio.
     ///
@@ -779,6 +876,11 @@ pub struct ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     /// `CreateConstraint` idempotency: `IdempotencyToken` -> constraint id. Private and
     /// pruned on every write, so it is bounded by [`MAX_CONSTRAINTS`].
     constraint_idempotency: HashMap<String, String>,
+    /// `CopyProduct` idempotency: `IdempotencyToken` -> `CopyProductToken`, so a
+    /// repeated copy answers the token of the copy it already started instead of
+    /// starting a second one. Private and pruned on every write, so it is bounded by
+    /// [`MAX_PRODUCT_COPIES`].
+    product_copy_idempotency: HashMap<String, String>,
     /// `ProvisionProduct` idempotency: `ProvisionToken` -> record id, so a repeated
     /// provisioning request replays the record the first one minted instead of
     /// provisioning a second product. Private and pruned on every write, exactly as
@@ -872,6 +974,46 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     pub fn forget_constraint_tokens(&mut self, constraint_id: &str) {
         self.constraint_idempotency
             .retain(|_, id| id != constraint_id);
+    }
+
+    /// The copy a `CopyProduct` carrying `token` already started, if its record is
+    /// still stored. `None` for an unseen token, or one whose record has since been
+    /// evicted — which is no longer a replay.
+    pub fn replayed_product_copy(&self, token: &str) -> Option<&ProductCopy> {
+        self.product_copies
+            .get(self.product_copy_idempotency.get(token)?)
+    }
+
+    /// Store `copy` and remember the `IdempotencyToken` that started it, so a repeat
+    /// of that request answers the same `CopyProductToken`.
+    ///
+    /// Keeps the map at [`MAX_PRODUCT_COPIES`] by dropping the copy that started
+    /// longest ago, then drops every idempotency entry whose copy is no longer stored
+    /// — so neither map grows without bound however many copies a caller makes.
+    pub fn remember_product_copy(&mut self, idempotency_token: String, copy: ProductCopy) {
+        while self.product_copies.len() >= MAX_PRODUCT_COPIES {
+            let oldest = self
+                .product_copies
+                .values()
+                .min_by(|left, right| {
+                    left.succeeded_at
+                        .cmp(&right.succeeded_at)
+                        .then_with(|| left.token.cmp(&right.token))
+                })
+                .map(|copy| copy.token.clone());
+            match oldest {
+                Some(token) => {
+                    self.product_copies.remove(&token);
+                }
+                None => break,
+            }
+        }
+        self.product_copy_idempotency
+            .insert(idempotency_token, copy.token.clone());
+        self.product_copies.insert(copy.token.clone(), copy);
+        let copies = &self.product_copies;
+        self.product_copy_idempotency
+            .retain(|_, token| copies.contains_key(token));
     }
 
     /// The record a provisioning request carrying `token` already made, if that
@@ -1229,6 +1371,19 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
             let id = self.mint_id("tag");
             if !self.tag_options.contains_key(&id) {
                 return id;
+            }
+        }
+    }
+
+    /// Mint an unused `CopyProductToken` (`copy-product-…`) — the token `CopyProduct`
+    /// answers and `DescribeCopyProductStatus` addresses the operation by. The same form
+    /// as every other minted identifier here, which the modelled `Id` pattern
+    /// `^[a-zA-Z0-9_\-]*$` and its 1..100 length admit.
+    pub fn next_copy_product_token(&mut self) -> String {
+        loop {
+            let token = self.mint_id("copy-product");
+            if !self.product_copies.contains_key(&token) {
+                return token;
             }
         }
     }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyProduct
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyProduct`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyProduct::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +151,333 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyProduct` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyProductErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut state = state.lock();
+
+        // `IdempotencyToken` is `@idempotencyToken`: "If multiple requests differ only
+        // by the idempotency token, the same response is returned for each repeated
+        // request" — so a token already seen answers the token of the copy it already
+        // started, rather than starting a second copy and minting a second product. The
+        // replay keys on the TOKEN ALONE: this operation models no mismatch error, so
+        // there is no faithful way to refuse a token reused with other members.
+        if let Some(copy) = state.replayed_product_copy(&input.idempotency_token) {
+            return Ok(CopyProductOutput {
+                copy_product_token: Some(copy.token.clone()),
+            });
+        }
+
+        // The source is addressed by ARN, so the ARN is what resolves it: a product is
+        // readable here only through the catalog of the account that holds it, and this
+        // emulator holds one account's. An ARN naming any other account's product — one
+        // that would have to be shared into a portfolio first — names nothing this
+        // caller can read, exactly as an ARN whose product was never created or has
+        // since been deleted does.
+        let Some(source) = state
+            .products
+            .values()
+            .find(|product| product.arn == input.source_product_arn)
+            .cloned()
+        else {
+            return Err(product_not_found(&input.source_product_arn));
+        };
+
+        // "The identifiers of the provisioning artifacts (also known as versions) of the
+        // product to copy. By default, all provisioning artifacts are copied" — so the
+        // versions copied are the ones the request names, in the order it names them,
+        // and every version of the source when it names none.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyProduct"))
+        // An entry IDENTIFIES a version, so naming one twice names it once and copies it
+        // once; and a request cannot name more entries than one product can carry
+        // versions. Together those bound the selection by the versions the source holds,
+        // however long the list a request sends is.
+        let selected = match input
+            .source_provisioning_artifact_identifiers
+            .as_deref()
+            .filter(|identifiers| !identifiers.is_empty())
+        {
+            Some(identifiers) => {
+                if identifiers.len() > crate::state::MAX_PROVISIONING_ARTIFACTS_PER_PRODUCT {
+                    return Err(too_many_versions());
+                }
+                let mut selected: Vec<crate::state::ProvisioningArtifact> = Vec::new();
+                let mut named: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+                for identifier in identifiers {
+                    let Some(artifact_id) = identifier
+                        .get(ARTIFACT_IDENTIFIER_ID)
+                        .filter(|id| !id.is_empty())
+                    else {
+                        return Err(CopyProductErrorModeled::InvalidParametersException(
+                            InvalidParametersException {
+                                message: Some(format!(
+                                    "Each entry of SourceProvisioningArtifactIdentifiers must \
+                                     name a source provisioning artifact by its \
+                                     {ARTIFACT_IDENTIFIER_ID}."
+                                )),
+                            },
+                        )
+                        .into());
+                    };
+                    let Some(artifact) = source.provisioning_artifacts.get(artifact_id) else {
+                        return Err(CopyProductErrorModeled::InvalidParametersException(
+                            InvalidParametersException {
+                                message: Some(format!(
+                                    "Provisioning artifact {artifact_id} does not exist for \
+                                     product {}",
+                                    source.id
+                                )),
+                            },
+                        )
+                        .into());
+                    };
+                    if named.insert(artifact_id.as_str()) {
+                        selected.push(artifact.clone());
+                    }
+                }
+                selected
+            }
+            None => source.provisioning_artifacts.values().cloned().collect(),
+        };
+
+        // "The copy options. If the value is CopyTags, the tags from the source product
+        // are copied to the target product" — so without it the target keeps the tags it
+        // has, and a new target is created with none.
+        let copy_tags = input
+            .copy_options
+            .iter()
+            .flatten()
+            .any(|option| option == COPY_OPTION_COPY_TAGS);
+
+        let now = std::time::SystemTime::now();
+        // The copy is documented as asynchronous, so its completion is owed by the
+        // CLOCK: the instant is stored and never slept for.
+        let succeeded_at = now + crate::state::PRODUCT_COPY_SUCCEEDS_AFTER;
+
+        // "The identifier of the target product. By default, a new product is created."
+        let target_product_id = match input
+            .target_product_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            Some(target_id) => {
+                // A copy READS the source and WRITES the target, so one product cannot be
+                // both: copying a product onto itself would add a second copy of each of
+                // its own versions every time it was repeated.
+                if target_id == source.id {
+                    return Err(CopyProductErrorModeled::InvalidParametersException(
+                        InvalidParametersException {
+                            message: Some(format!(
+                                "{} cannot be both the source and the target product of a copy.",
+                                source.id
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                // Each copied version is a version OF THE TARGET, so it gets the
+                // target's own freshly minted artifact id and this copy's create
+                // instant; everything the version IS — its name, description, type,
+                // guidance, whether it can be provisioned, and the template source its
+                // `Info` names — comes from the source version. Minting the ids only
+                // advances this service's id counter, so the refusals below still leave
+                // both products exactly as they were.
+                let copied = copied_artifacts(&mut state, &selected, now);
+                // The target is resolved ONCE, mutably: a `TargetProductId` naming no
+                // product this account holds is refused here, and the checks that follow
+                // all run before the first write.
+                let Some(target) = state.products.get_mut(target_id) else {
+                    return Err(product_not_found(target_id));
+                };
+                // The versions the target would end up holding. Refused BEFORE anything
+                // is stored, so a copy past the bound leaves both products as they were
+                // and repeating it cannot grow the target past it either.
+                if target.provisioning_artifacts.len() + copied.len()
+                    > crate::state::MAX_PROVISIONING_ARTIFACTS_PER_PRODUCT
+                {
+                    return Err(too_many_versions());
+                }
+                // The tag set the copy would leave on the target: the source's values
+                // merged over the target's, since a product holds each key once and the
+                // copy is what carries the source's.
+                let mut tags = target.tags.clone();
+                if copy_tags {
+                    tags.extend(
+                        source
+                            .tags
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone())),
+                    );
+                }
+                if tags.len() > crate::state::MAX_PRODUCT_TAGS {
+                    // This operation models no `LimitExceededException`, so the refusal
+                    // is the bad-parameter one it does model.
+                    return Err(CopyProductErrorModeled::InvalidParametersException(
+                        InvalidParametersException {
+                            message: Some(format!(
+                                "A product cannot carry more than {} tags.",
+                                crate::state::MAX_PRODUCT_TAGS
+                            )),
+                        },
+                    )
+                    .into());
+                }
+
+                target.provisioning_artifacts.extend(copied);
+                target.tags = tags;
+                // A product that already exists is already ready to use, so this copy
+                // owes IT no transition: only the copy's own status is non-terminal.
+                target_id.to_string()
+            }
+            None => {
+                // The same bound on the versions one product can carry, for the product
+                // this copy is about to mint.
+                if selected.len() > crate::state::MAX_PROVISIONING_ARTIFACTS_PER_PRODUCT {
+                    return Err(too_many_versions());
+                }
+                // The account's product quota, refused before anything is stored.
+                if state.products.len() >= crate::state::MAX_PRODUCTS {
+                    return Err(CopyProductErrorModeled::InvalidParametersException(
+                        InvalidParametersException {
+                            message: Some(format!(
+                                "An account cannot hold more than {} products.",
+                                crate::state::MAX_PRODUCTS
+                            )),
+                        },
+                    )
+                    .into());
+                }
+
+                let id = state.next_product_id();
+                let view_id = state.next_product_view_id();
+                // The same `catalog` namespace every product ARN in this service is
+                // minted in, in the region this request was signed for: the copy's
+                // product is a product of THIS account and region, whichever region the
+                // source's ARN names.
+                let arn = ::emulator_server::emulator_arn(
+                    "catalog",
+                    &crate::state::request_region(ctx),
+                    &format!("product/{id}"),
+                );
+                let provisioning_artifacts = copied_artifacts(&mut state, &selected, now);
+                let product = crate::state::Product {
+                    id: id.clone(),
+                    view_id,
+                    arn,
+                    // "A name for the target product. The default is the name of the
+                    // source product"; a name the request leaves empty names nothing, so
+                    // the source's name is what the copy carries.
+                    name: input
+                        .target_product_name
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| source.name.clone()),
+                    // Everything else that describes the product is the source's: a copy
+                    // is the same product in another place.
+                    owner: source.owner.clone(),
+                    short_description: source.short_description.clone(),
+                    distributor: source.distributor.clone(),
+                    support_email: source.support_email.clone(),
+                    support_description: source.support_description.clone(),
+                    support_url: source.support_url.clone(),
+                    product_type: source.product_type.clone(),
+                    status: crate::state::PRODUCT_STATUS_CREATED.to_string(),
+                    created_time: now,
+                    // The copy is asynchronous, so the product it is creating is not
+                    // ready for use until the copy falls due: until then every reader
+                    // derives the non-terminal status from this instant.
+                    available_at: succeeded_at,
+                    tags: if copy_tags {
+                        source.tags.clone()
+                    } else {
+                        std::collections::BTreeMap::new()
+                    },
+                    // A copy carries the source's VERSIONS, not the connection the
+                    // source syncs from: this input names no connection, and the copied
+                    // versions are the ones the request selected rather than whatever a
+                    // sync would next fetch.
+                    source_connection: None,
+                    provisioning_artifacts,
+                    // A copied product lives in no portfolio and carries no TagOption
+                    // until something associates it with one.
+                    portfolio_ids: std::collections::BTreeSet::new(),
+                    tag_option_ids: std::collections::BTreeSet::new(),
+                };
+                state.products.insert(id.clone(), product);
+                id
+            }
+        };
+
+        let token = state.next_copy_product_token();
+        state.remember_product_copy(
+            input.idempotency_token,
+            crate::state::ProductCopy {
+                token: token.clone(),
+                source_product_id: source.id,
+                target_product_id,
+                succeeded_at,
+            },
+        );
+
+        Ok(CopyProductOutput {
+            copy_product_token: Some(token),
+        })
     }
+}
+
+/// The refusal for a product this account cannot read: the one `SourceProductArn`
+/// names, or the one `TargetProductId` does. The message does not tell a product that
+/// does not exist from one the caller has no access to, so a refusal cannot be read as
+/// "this product exists".
+fn product_not_found(identifier: &str) -> CopyProductError {
+    CopyProductErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("{identifier} does not exist or access was denied")),
+    })
+    .into()
+}
+
+/// The refusal for a copy that would leave one product holding more versions than
+/// [`crate::state::MAX_PROVISIONING_ARTIFACTS_PER_PRODUCT`], and for a request naming
+/// more of them than that. This operation models no `LimitExceededException`, so the
+/// refusal is the bad-parameter one it does model.
+fn too_many_versions() -> CopyProductError {
+    CopyProductErrorModeled::InvalidParametersException(InvalidParametersException {
+        message: Some(format!(
+            "A product cannot carry more than {} provisioning artifacts.",
+            crate::state::MAX_PROVISIONING_ARTIFACTS_PER_PRODUCT
+        )),
+    })
+    .into()
+}
+
+/// The one `CopyOption` the model admits
+/// (`smithy_query query="shape" shape="CopyOption"`), documented as "if the value is
+/// `CopyTags`, the tags from the source product are copied to the target product".
+const COPY_OPTION_COPY_TAGS: &str = "CopyTags";
+
+/// The one key an entry of `SourceProvisioningArtifactIdentifiers` carries: its map key
+/// targets `ProvisioningArtifactPropertyName`, whose single value is `Id`
+/// (`smithy_query query="shape" shape="ProvisioningArtifactPropertyName"`), so an entry
+/// names a source version by that id.
+const ARTIFACT_IDENTIFIER_ID: &str = "Id";
+
+/// `selected` as versions of the product being copied into: each one keeps what the
+/// source version IS and gets a freshly minted artifact id of the target's own and
+/// `created_time` the copy's instant, keyed by that new id.
+fn copied_artifacts(
+    state: &mut crate::state::ComAmazonawsServicecatalogAws242servicecatalogserviceState,
+    selected: &[crate::state::ProvisioningArtifact],
+    created_time: std::time::SystemTime,
+) -> std::collections::BTreeMap<String, crate::state::ProvisioningArtifact> {
+    let mut copied = std::collections::BTreeMap::new();
+    for artifact in selected {
+        let id = state.next_provisioning_artifact_id();
+        copied.insert(
+            id.clone(),
+            crate::state::ProvisioningArtifact {
+                id,
+                created_time,
+                ..artifact.clone()
+            },
+        );
+    }
+    copied
 }
