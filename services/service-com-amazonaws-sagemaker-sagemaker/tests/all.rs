@@ -205,6 +205,8 @@ mod trial_component_association;
 mod trial_component_deletion;
 #[path = "all/trial_component_disassociation.rs"]
 mod trial_component_disassociation;
+#[path = "all/trial_component_not_found_refusal.rs"]
+mod trial_component_not_found_refusal;
 #[path = "all/trial_component_tracking.rs"]
 mod trial_component_tracking;
 #[path = "all/trial_deletion.rs"]
