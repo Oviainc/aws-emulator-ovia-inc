@@ -43,7 +43,10 @@ const REGION: &str = "us-west-2";
 
 /// One emulator: the production router with this service mounted on a shared
 /// engine.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` so a sibling suite in this test target drives the SAME harness
+/// rather than a second copy of it.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are the emulator core's business, not this service's; off here
@@ -72,7 +75,7 @@ fn request(region: &str, method: &str, uri: &str, body: &str) -> http::Request<b
 }
 
 /// Dispatch a call signed for `region` and read back its status and JSON body.
-async fn call_in(
+pub(crate) async fn call_in(
     router: &MultiServiceRouter,
     region: &str,
     method: &str,
@@ -108,7 +111,7 @@ async fn call(
 
 /// `__type` as the restJson1 error envelope carries it, with any `shapeId#`
 /// prefix dropped.
-fn error_code(body: &serde_json::Value) -> String {
+pub(crate) fn error_code(body: &serde_json::Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_default()
@@ -119,7 +122,7 @@ fn error_code(body: &serde_json::Value) -> String {
 }
 
 /// Enable Macie in `region`, requiring the documented 200.
-async fn enable_in(router: &MultiServiceRouter, region: &str, body: &str) {
+pub(crate) async fn enable_in(router: &MultiServiceRouter, region: &str, body: &str) {
     let (status, reply) = call_in(router, region, "POST", "/macie", body).await;
     assert_eq!(
         status, 200,
@@ -171,7 +174,7 @@ fn assert_id_grammar(id: &str, case: &str) {
 /// and extended ISO 8601 format" — so the wire form is an RFC 3339 date-time
 /// STRING, never the restJson1 default of an epoch-seconds number. The parsed
 /// instant is handed back so a caller can compare two reports of it.
-fn reported_instant(case: &str, member: &str, body: &serde_json::Value) -> f64 {
+pub(crate) fn reported_instant(case: &str, member: &str, body: &serde_json::Value) -> f64 {
     let value = &body[member];
     let text = value.as_str().unwrap_or_else(|| {
         panic!(
@@ -194,7 +197,7 @@ fn reported_instant(case: &str, member: &str, body: &serde_json::Value) -> f64 {
 }
 
 /// Now, as the epoch seconds a reported instant is compared against.
-fn now_seconds() -> f64 {
+pub(crate) fn now_seconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default()

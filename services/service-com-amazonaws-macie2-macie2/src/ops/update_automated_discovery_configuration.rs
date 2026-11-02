@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAutomatedDiscoveryConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAutomatedDiscoveryConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAutomatedDiscoveryConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: writes this region's automated sensitive data discovery
+//! configuration, which `GetAutomatedDiscoveryConfiguration` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +148,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAutomatedDiscoveryConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAutomatedDiscoveryConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAutomatedDiscoveryConfiguration"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateAutomatedDiscoveryConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Macie session store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Macie, and so its automated sensitive data discovery, is configured
+        // per account and Region; a request names the region it addresses.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        if state.session(&region).is_none() {
+            // Nothing has enabled Macie in this region, so the account has no
+            // automated sensitive data discovery to configure.
+            return Err(
+                UpdateAutomatedDiscoveryConfigurationErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `status` is required and both members are validated against their
+        // enums before this handler runs, so a present value is one the wire
+        // allows. An omitted `autoEnableOrganizationMembers` takes the
+        // documented default rather than keeping what was stored: this call
+        // states the configuration the account is to have, and the member
+        // documents ALL as the value it takes when a request names none.
+        let status = input.status.clone();
+        let enabled = status == crate::state::AUTOMATED_DISCOVERY_ENABLED;
+        let auto_enable_organization_members = input
+            .auto_enable_organization_members
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_AUTO_ENABLE_ORGANIZATION_MEMBERS.to_string());
+
+        if let Some(configuration) = state.automated_discovery.get_mut(&region) {
+            let settings_changed =
+                configuration.auto_enable_organization_members != auto_enable_organization_members;
+            let status_changed = configuration.status != status;
+            if status_changed {
+                configuration.status = status;
+                if enabled {
+                    // `firstEnabledAt` records when automated sensitive data
+                    // discovery was INITIALLY enabled, so a later re-enable
+                    // leaves it alone; `disabledAt` is null while it runs.
+                    configuration.first_enabled_at.get_or_insert(now);
+                    configuration.disabled_at = None;
+                } else {
+                    configuration.disabled_at = Some(now);
+                }
+            }
+            configuration.auto_enable_organization_members = auto_enable_organization_members;
+            // `lastUpdatedAt` records when the settings or the status most
+            // recently CHANGED, so a call asking for the configuration the
+            // account already has does not move it.
+            if status_changed || settings_changed {
+                configuration.last_updated_at = now;
+            }
+        } else {
+            // The first call that configures automated sensitive data
+            // discovery for this region also materialises the classification
+            // scope and the sensitivity inspection template its analyses use,
+            // whose identifiers a read reports.
+            let classification_scope_seed = state.next_id_seed();
+            let sensitivity_inspection_template_seed = state.next_id_seed();
+            let configuration = crate::state::AutomatedDiscoveryConfiguration {
+                status,
+                auto_enable_organization_members,
+                classification_scope_id: crate::state::new_resource_id(
+                    classification_scope_seed,
+                    now,
+                ),
+                sensitivity_inspection_template_id: crate::state::new_resource_id(
+                    sensitivity_inspection_template_seed,
+                    now,
+                ),
+                first_enabled_at: enabled.then_some(now),
+                disabled_at: (!enabled).then_some(now),
+                last_updated_at: now,
+            };
+            state.automated_discovery.insert(region, configuration);
+        }
+
+        // `UpdateAutomatedDiscoveryConfigurationResponse` models no members:
+        // the configuration this call wrote is read back through
+        // `GetAutomatedDiscoveryConfiguration`.
+        Ok(UpdateAutomatedDiscoveryConfigurationOutput {})
     }
 }

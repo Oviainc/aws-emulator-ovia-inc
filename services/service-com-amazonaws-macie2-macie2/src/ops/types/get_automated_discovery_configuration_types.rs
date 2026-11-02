@@ -16,7 +16,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-macie2-macie2.json");
 pub struct GetAutomatedDiscoveryConfigurationInput {
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.macie2#GetAutomatedDiscoveryConfigurationResponse")]
+// `GetAutomatedDiscoveryConfigurationOutput`'s schema and codec are written out
+// by hand rather than derived with `#[smithy_macros::smithy(shape = ...)]`,
+// because `disabledAt`, `firstEnabledAt` and `lastUpdatedAt` target
+// `__timestampIso8601` and the derive drops that shape's
+// `@timestampFormat("date-time")`. See `super::date_time_wire` for the whole
+// reason and for when to delete this block; everything else below mirrors the
+// derive exactly.
 #[derive(Debug, Clone, Default)]
 pub struct GetAutomatedDiscoveryConfigurationOutput {
     pub auto_enable_organization_members: Option<String>,
@@ -28,3 +34,147 @@ pub struct GetAutomatedDiscoveryConfigurationOutput {
     pub status: Option<String>,
 }
 
+impl GetAutomatedDiscoveryConfigurationOutput {
+    /// Targets the `AutoEnableMode` enum, which is string-encoded on the wire —
+    /// the derive classifies an enum member as a string too.
+    pub const M_AUTO_ENABLE_ORGANIZATION_MEMBERS: ::aws_smithy_schema::Schema =
+        super::date_time_wire::member(
+            "com.amazonaws.macie2#GetAutomatedDiscoveryConfigurationResponse$autoEnableOrganizationMembers",
+            "autoEnableOrganizationMembers",
+            ::aws_smithy_schema::ShapeType::String,
+            0,
+        );
+    pub const M_CLASSIFICATION_SCOPE_ID: ::aws_smithy_schema::Schema =
+        super::date_time_wire::member(
+            "com.amazonaws.macie2#GetAutomatedDiscoveryConfigurationResponse$classificationScopeId",
+            "classificationScopeId",
+            ::aws_smithy_schema::ShapeType::String,
+            1,
+        );
+    /// `@timestampFormat("date-time")`, from the `__timestampIso8601` shape it
+    /// targets. THE reason this schema is hand-written.
+    pub const M_DISABLED_AT: ::aws_smithy_schema::Schema =
+        super::date_time_wire::date_time_member(
+            "com.amazonaws.macie2#GetAutomatedDiscoveryConfigurationResponse$disabledAt",
+            "disabledAt",
+            2,
+        );
+    /// `@timestampFormat("date-time")`, as `disabledAt` above.
+    pub const M_FIRST_ENABLED_AT: ::aws_smithy_schema::Schema =
+        super::date_time_wire::date_time_member(
+            "com.amazonaws.macie2#GetAutomatedDiscoveryConfigurationResponse$firstEnabledAt",
+            "firstEnabledAt",
+            3,
+        );
+    /// `@timestampFormat("date-time")`, as `disabledAt` above.
+    pub const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        super::date_time_wire::date_time_member(
+            "com.amazonaws.macie2#GetAutomatedDiscoveryConfigurationResponse$lastUpdatedAt",
+            "lastUpdatedAt",
+            4,
+        );
+    pub const M_SENSITIVITY_INSPECTION_TEMPLATE_ID: ::aws_smithy_schema::Schema =
+        super::date_time_wire::member(
+            "com.amazonaws.macie2#GetAutomatedDiscoveryConfigurationResponse$sensitivityInspectionTemplateId",
+            "sensitivityInspectionTemplateId",
+            ::aws_smithy_schema::ShapeType::String,
+            5,
+        );
+    /// Targets the `AutomatedDiscoveryStatus` enum; string-encoded, as above.
+    pub const M_STATUS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetAutomatedDiscoveryConfigurationResponse$status",
+        "status",
+        ::aws_smithy_schema::ShapeType::String,
+        6,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.macie2#GetAutomatedDiscoveryConfigurationResponse",
+            "com.amazonaws.macie2",
+            "GetAutomatedDiscoveryConfigurationResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_AUTO_ENABLE_ORGANIZATION_MEMBERS,
+            &Self::M_CLASSIFICATION_SCOPE_ID,
+            &Self::M_DISABLED_AT,
+            &Self::M_FIRST_ENABLED_AT,
+            &Self::M_LAST_UPDATED_AT,
+            &Self::M_SENSITIVITY_INSPECTION_TEMPLATE_ID,
+            &Self::M_STATUS,
+        ],
+    );
+}
+
+pub static GET_AUTOMATED_DISCOVERY_CONFIGURATION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetAutomatedDiscoveryConfigurationOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetAutomatedDiscoveryConfigurationOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // Every member is optional, so each is written only when present — the
+        // derive's `is_option` split.
+        if let Some(value) = self.auto_enable_organization_members.as_ref() {
+            s.write_string(&Self::M_AUTO_ENABLE_ORGANIZATION_MEMBERS, value.as_str())?;
+        }
+        if let Some(value) = self.classification_scope_id.as_ref() {
+            s.write_string(&Self::M_CLASSIFICATION_SCOPE_ID, value.as_str())?;
+        }
+        if let Some(value) = self.disabled_at.as_ref() {
+            s.write_timestamp(&Self::M_DISABLED_AT, value)?;
+        }
+        if let Some(value) = self.first_enabled_at.as_ref() {
+            s.write_timestamp(&Self::M_FIRST_ENABLED_AT, value)?;
+        }
+        if let Some(value) = self.last_updated_at.as_ref() {
+            s.write_timestamp(&Self::M_LAST_UPDATED_AT, value)?;
+        }
+        if let Some(value) = self.sensitivity_inspection_template_id.as_ref() {
+            s.write_string(&Self::M_SENSITIVITY_INSPECTION_TEMPLATE_ID, value.as_str())?;
+        }
+        if let Some(value) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, value.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct
+    for GetAutomatedDiscoveryConfigurationOutput
+{
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    out.auto_enable_organization_members =
+                        Some(d.read_string(&Self::M_AUTO_ENABLE_ORGANIZATION_MEMBERS)?);
+                }
+                Some(1) => {
+                    out.classification_scope_id =
+                        Some(d.read_string(&Self::M_CLASSIFICATION_SCOPE_ID)?);
+                }
+                Some(2) => out.disabled_at = Some(d.read_timestamp(&Self::M_DISABLED_AT)?),
+                Some(3) => {
+                    out.first_enabled_at = Some(d.read_timestamp(&Self::M_FIRST_ENABLED_AT)?);
+                }
+                Some(4) => {
+                    out.last_updated_at = Some(d.read_timestamp(&Self::M_LAST_UPDATED_AT)?);
+                }
+                Some(5) => {
+                    out.sensitivity_inspection_template_id =
+                        Some(d.read_string(&Self::M_SENSITIVITY_INSPECTION_TEMPLATE_ID)?);
+                }
+                Some(6) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAutomatedDiscoveryConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAutomatedDiscoveryConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAutomatedDiscoveryConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports this region's stored automated sensitive data
+//! discovery configuration, which `UpdateAutomatedDiscoveryConfiguration`
+//! writes.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +159,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAutomatedDiscoveryConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAutomatedDiscoveryConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAutomatedDiscoveryConfiguration"))
+        // `GetAutomatedDiscoveryConfigurationRequest` models no members: the
+        // configuration a call reports is the one of the region the request
+        // addressed.
+        let _ = &input;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetAutomatedDiscoveryConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Macie session store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        let state = store.lock();
+        if state.session(&region).is_none() {
+            // Nothing has enabled Macie in this region, so the account has no
+            // automated sensitive data discovery to report.
+            return Err(
+                GetAutomatedDiscoveryConfigurationErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Nothing has configured automated sensitive data discovery here yet,
+        // so there is no scope, no template and no instant to report, and none
+        // of its activities are performed. A read mints nothing: the
+        // identifiers appear once a write has materialised them.
+        let Some(configuration) = state.automated_discovery_configuration(&region) else {
+            return Ok(GetAutomatedDiscoveryConfigurationOutput {
+                auto_enable_organization_members: Some(
+                    crate::state::DEFAULT_AUTO_ENABLE_ORGANIZATION_MEMBERS.to_string(),
+                ),
+                classification_scope_id: None,
+                disabled_at: None,
+                first_enabled_at: None,
+                last_updated_at: None,
+                sensitivity_inspection_template_id: None,
+                status: Some(crate::state::DEFAULT_AUTOMATED_DISCOVERY_STATUS.to_string()),
+            });
+        };
+
+        Ok(GetAutomatedDiscoveryConfigurationOutput {
+            auto_enable_organization_members: Some(
+                configuration.auto_enable_organization_members.clone(),
+            ),
+            classification_scope_id: Some(configuration.classification_scope_id.clone()),
+            disabled_at: configuration.disabled_at.map(crate::state::to_date_time),
+            first_enabled_at: configuration
+                .first_enabled_at
+                .map(crate::state::to_date_time),
+            last_updated_at: Some(crate::state::to_date_time(configuration.last_updated_at)),
+            sensitivity_inspection_template_id: Some(
+                configuration.sensitivity_inspection_template_id.clone(),
+            ),
+            status: Some(configuration.status.clone()),
+        })
     }
 }

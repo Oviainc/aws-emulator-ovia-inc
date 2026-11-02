@@ -8,7 +8,10 @@
 //! everything it owns) and the custom-data-identifier registry
 //! (`CreateCustomDataIdentifier` mints an entry, `GetCustomDataIdentifier` and
 //! `ListCustomDataIdentifiers` project it, `DeleteCustomDataIdentifier` soft
-//! deletes it). Nothing a handler answers with is computed from the request
+//! deletes it) — plus the per-region automated sensitive data discovery
+//! configuration (`UpdateAutomatedDiscoveryConfiguration` writes it,
+//! `GetAutomatedDiscoveryConfiguration` projects it). Nothing a handler answers
+//! with is computed from the request
 //! alone: every member of every response is read back out of here.
 
 use std::collections::BTreeMap;
@@ -52,6 +55,30 @@ pub const DEFAULT_MACIE_STATUS: &str = "ENABLED";
 /// [`crate::ops::types::FINDING_PUBLISHING_FREQUENCY_VALUES`], and the
 /// frequency with which Macie publishes policy-finding updates by default.
 pub const DEFAULT_FINDING_PUBLISHING_FREQUENCY: &str = "FIFTEEN_MINUTES";
+
+/// The `AutomatedDiscoveryStatus` under which Macie performs automated
+/// sensitive data discovery activities: the status doc states "ENABLED, use the
+/// specified settings to perform automated sensitive data discovery
+/// activities". An entry of
+/// [`crate::ops::types::AUTOMATED_DISCOVERY_STATUS_VALUES`].
+pub const AUTOMATED_DISCOVERY_ENABLED: &str = "ENABLED";
+
+/// The `AutomatedDiscoveryStatus` under which Macie performs none of those
+/// activities: "DISABLED, don't perform automated sensitive data discovery
+/// activities". An entry of
+/// [`crate::ops::types::AUTOMATED_DISCOVERY_STATUS_VALUES`].
+pub const AUTOMATED_DISCOVERY_DISABLED: &str = "DISABLED";
+
+/// The automated sensitive data discovery `status` a read reports for an
+/// account that has never configured it: nothing has asked for those
+/// activities, so none are performed.
+pub const DEFAULT_AUTOMATED_DISCOVERY_STATUS: &str = AUTOMATED_DISCOVERY_DISABLED;
+
+/// The `autoEnableOrganizationMembers` an automated-discovery configuration
+/// takes when the request names none: the member's doc states "Valid values
+/// are: ALL (default), enable it for all existing accounts and new member
+/// accounts". An entry of [`crate::ops::types::AUTO_ENABLE_MODE_VALUES`].
+pub const DEFAULT_AUTO_ENABLE_ORGANIZATION_MEMBERS: &str = "ALL";
 
 /// How a reporting operation states that this account has no Macie session in
 /// the region the request addressed. Macie has to be enabled before any of its
@@ -157,6 +184,39 @@ pub struct MacieSession {
     pub updated_at: SystemTime,
 }
 
+/// The automated sensitive data discovery configuration of one account in one
+/// region.
+///
+/// Every member of `GetAutomatedDiscoveryConfigurationResponse` is a field here
+/// or projected from one. The record exists once something has configured
+/// automated sensitive data discovery for the region; until then a read reports
+/// the never-configured defaults.
+#[derive(Debug, Clone)]
+pub struct AutomatedDiscoveryConfiguration {
+    /// `AutomatedDiscoveryStatus` as the wire words it: an entry of
+    /// [`crate::ops::types::AUTOMATED_DISCOVERY_STATUS_VALUES`].
+    pub status: String,
+    /// `AutoEnableMode` as the wire words it: an entry of
+    /// [`crate::ops::types::AUTO_ENABLE_MODE_VALUES`].
+    pub auto_enable_organization_members: String,
+    /// The classification scope automated sensitive data discovery uses, which
+    /// Macie materialises together with this configuration.
+    pub classification_scope_id: String,
+    /// The sensitivity inspection template automated sensitive data discovery
+    /// uses, materialised with this configuration too.
+    pub sensitivity_inspection_template_id: String,
+    /// When automated sensitive data discovery was INITIALLY enabled, which is
+    /// `None` until it has been enabled once: its member doc states "This value
+    /// is null if automated sensitive data discovery has never been enabled."
+    pub first_enabled_at: Option<SystemTime>,
+    /// When it was MOST RECENTLY disabled, which is `None` while it is enabled:
+    /// its member doc states "This value is null if automated sensitive data
+    /// discovery is currently enabled."
+    pub disabled_at: Option<SystemTime>,
+    /// When these settings or this status most recently CHANGED.
+    pub last_updated_at: SystemTime,
+}
+
 /// A stored custom data identifier.
 ///
 /// Every member of `GetCustomDataIdentifierResponse` and of
@@ -237,6 +297,11 @@ pub struct ComAmazonawsMacie2Macie2State {
     /// for. Macie is enabled per account and Region, so there is one session
     /// per region rather than one per process.
     pub sessions: BTreeMap<String, MacieSession>,
+    /// The automated sensitive data discovery configuration of each region
+    /// something has configured it for. A key of this map is always a key of
+    /// [`Self::sessions`]: Macie has to be enabled in a region before its
+    /// automated discovery can be configured there.
+    pub automated_discovery: BTreeMap<String, AutomatedDiscoveryConfiguration>,
     /// Custom data identifiers keyed by id, so an id-addressed read is
     /// O(log n) and an enumeration is in a stable total order.
     pub custom_data_identifiers: BTreeMap<String, CustomDataIdentifier>,
@@ -259,6 +324,15 @@ impl ComAmazonawsMacie2Macie2State {
     /// there.
     pub fn session(&self, region: &str) -> Option<&MacieSession> {
         self.sessions.get(region)
+    }
+
+    /// The automated sensitive data discovery configuration of `region`, or
+    /// `None` when nothing has configured it there yet.
+    pub fn automated_discovery_configuration(
+        &self,
+        region: &str,
+    ) -> Option<&AutomatedDiscoveryConfiguration> {
+        self.automated_discovery.get(region)
     }
 
     /// The custom data identifier `id` of `region`, soft deleted or not.
@@ -295,10 +369,12 @@ impl ComAmazonawsMacie2Macie2State {
 
     /// Retire everything Macie holds for `region`: `DisableMacie` "Disables
     /// Amazon Macie and deletes all settings and resources for a Macie
-    /// account", so the session, the region's custom data identifiers and the
-    /// client tokens that minted them all go.
+    /// account", so the session, the region's automated-discovery
+    /// configuration, its custom data identifiers and the client tokens that
+    /// minted them all go.
     pub fn forget_region(&mut self, region: &str) {
         self.sessions.remove(region);
+        self.automated_discovery.remove(region);
         self.custom_data_identifiers
             .retain(|_, identifier| identifier.region != region);
         let prefix = region_key_prefix(region);
