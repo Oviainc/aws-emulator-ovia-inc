@@ -53,6 +53,13 @@ const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 /// with.
 const UNAUTHORIZED_EXCEPTION: &str = "UnauthorizedException";
 
+/// The `Message` AWS Chatbot answers for a custom action this account holds none of, with
+/// the action name taken from the requested ARN and the account id from the caller's
+/// account.
+fn not_found_message(action_name: &str) -> String {
+    format!("sdk action [{action_name}] not found for account [{ACCOUNT}]")
+}
+
 /// A SigV4 credential scope naming this service and `region`; `MultiServiceRouter`
 /// routes on the scope's service name and the handlers read the region from it.
 fn authorization(region: &str) -> String {
@@ -588,11 +595,26 @@ async fn getting_an_arn_the_store_does_not_hold_is_refused_as_its_arn_form_calls
     // Each row is a well-formed `CustomActionArn` this account holds no action under, with
     // the refusal its ARN form calls for: an ARN of the minted (region-less, this-account)
     // form is the modelled 404, while one no create can mint for this account names no target
-    // in its namespace and is the modelled 403.
+    // in its namespace and is the modelled 403. The rows differ in the action name's length
+    // and charset, in whether the ARN carries a region segment, and in the account it names.
     let cases = [
         (
             "a name nothing was created under",
             expected_arn("absent"),
+            404,
+            RESOURCE_NOT_FOUND_EXCEPTION,
+        ),
+        (
+            // `ActionName` is len 1..64 (smithy_query: CustomActionName); these two rows
+            // sit on its published bounds.
+            "the shortest allowed name",
+            expected_arn("a"),
+            404,
+            RESOURCE_NOT_FOUND_EXCEPTION,
+        ),
+        (
+            "the longest allowed name",
+            expected_arn(&"z".repeat(64)),
             404,
             RESOURCE_NOT_FOUND_EXCEPTION,
         ),
@@ -622,6 +644,17 @@ async fn getting_an_arn_the_store_does_not_hold_is_refused_as_its_arn_form_calls
             expected_code,
             "case {label:?} ({arn}): expected {expected_code}, got {body}"
         );
+        if expected_code == RESOURCE_NOT_FOUND_EXCEPTION {
+            // The absent action is named by the ARN the request carried, in the account
+            // the caller speaks for.
+            let action_name = arn.rsplit('/').next().expect("the ARN names an action");
+            assert_eq!(
+                body.get("Message").and_then(Value::as_str),
+                Some(not_found_message(action_name).as_str()),
+                "case {label:?} ({arn}): the not-found Message must name the action and the \
+                 account, got {body}"
+            );
+        }
     }
 
     // The action that IS there is untouched by those failed reads.

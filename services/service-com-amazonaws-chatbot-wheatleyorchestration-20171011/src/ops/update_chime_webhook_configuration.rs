@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChimeWebhookConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChimeWebhookConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: writes the members the request carries through to the Amazon Chime webhook
+//! configuration stored under `ChatConfigurationArn` and answers that stored record,
+//! projected through [`crate::state::ChimeWebhookConfigRecord::view`] — so a later
+//! `DescribeChimeWebhookConfigurations` reports the updated values rather than the ones the
+//! configuration was created with.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChimeWebhookConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A PARTIAL write: every member but the ARN is optional, so a member the request omits
+//! names no new value and leaves the stored one exactly as it was, the way
+//! `UpdateSlackChannelConfiguration` treats its own optional members. The configuration's
+//! name, region and tags are not this operation's to move: the ARN fixes the first two and
+//! only the tagging operations write the third.
+//!
+//! An ARN the store holds no Chime webhook configuration under is refused with the modelled
+//! 404 `ResourceNotFoundException`, carrying the sentence a Chime webhook configuration's
+//! ARN is recorded answering when it holds no configuration
+//! ([`crate::state::resource_not_found_message`]) — observed on this configuration's delete
+//! and applied here, the same resource addressed by the same ARN. A Slack channel
+//! configuration words its own not-found answer differently, so it keeps its own sentence.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +172,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChimeWebhookConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChimeWebhookConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChimeWebhookConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateChimeWebhookConfigurationErrorModeled::UpdateChimeWebhookConfigurationException(
+                UpdateChimeWebhookConfigurationException {
+                    message: Some("the chatbot configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        // An ARN fully qualifies the configuration, its region included (see
+        // `crate::state::chime_webhook_configuration_arn`), so the lookup is by ARN alone
+        // and the signing region does not enter into it.
+        let record = store
+            .chime_webhook_configurations
+            .get_mut(&input.chat_configuration_arn)
+            .ok_or_else(|| {
+                UpdateChimeWebhookConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            &input.chat_configuration_arn,
+                        )),
+                    },
+                )
+            })?;
+
+        // Every member is written only when the request carries it, leaving the stored
+        // value otherwise.
+        if let Some(webhook_description) = input.webhook_description {
+            record.webhook_description = webhook_description;
+        }
+        if let Some(webhook_url) = input.webhook_url {
+            record.webhook_url = webhook_url;
+        }
+        if let Some(sns_topic_arns) = input.sns_topic_arns {
+            record.sns_topic_arns = sns_topic_arns;
+        }
+        if let Some(iam_role_arn) = input.iam_role_arn {
+            record.iam_role_arn = iam_role_arn;
+        }
+        if let Some(logging_level) = input.logging_level {
+            record.logging_level = Some(logging_level);
+        }
+
+        // The answer is the record as it now stands, so the update and a later describe
+        // cannot report two different configurations.
+        Ok(UpdateChimeWebhookConfigurationOutput {
+            webhook_configuration: Some(record.view()),
+        })
     }
 }

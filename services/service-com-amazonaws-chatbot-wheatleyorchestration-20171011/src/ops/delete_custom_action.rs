@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCustomAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCustomAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: removes the custom action stored under `CustomActionArn` from the store,
+//! so every later call addressed to that ARN answers exactly as it does for an action that
+//! was never created — `GetCustomAction` with the modelled 404 `ResourceNotFoundException`
+//! — and the name is free for a new create again. The record owns its tags, so they are
+//! removed with it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCustomAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@idempotent`, answering 200 with an empty result document (the status the recorded
+//! delete responses carry; see `SUCCESS_STATUS` below). An ARN of the form a custom action
+//! of this account is minted under ([`crate::state::is_mintable_custom_action_arn`]) that
+//! holds no action is refused with the modelled 404 `ResourceNotFoundException` — the answer
+//! a chat configuration's delete is recorded giving for an ARN holding no resource — carrying
+//! the sentence AWS Chatbot words for a WRITE addressed to an absent custom action
+//! ([`crate::state::custom_action_does_not_exist_message`]). An ARN of any other form is
+//! refused with the modelled 403 `UnauthorizedException` before the store is consulted, as
+//! the read refuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -134,25 +140,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteCustomAction";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_CUSTOM_ACTION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_CUSTOM_ACTION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 204u16;
+    /// AWS Chatbot answers a successful delete of a custom action with 200 and an empty
+    /// result document, which is what the recorded delete responses carry; the model's
+    /// `@http` code for this operation (204) is stale and the live service does not use
+    /// it.
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCustomAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCustomActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCustomAction"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteCustomActionErrorModeled::InternalServiceError(InternalServiceError {
+                message: Some("the chatbot configuration store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // An ARN outside the form this account's custom actions are minted under names no
+        // action the account can hold at all, so the request is refused as unauthorized
+        // without consulting the store, exactly as the read refuses it — the authorization
+        // decision is made against the ARN.
+        if !crate::state::is_mintable_custom_action_arn(&input.custom_action_arn) {
+            return Err(DeleteCustomActionErrorModeled::UnauthorizedException(
+                UnauthorizedException {
+                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A custom action is account-scoped, so its ARN names it on its own and the
+        // signing region is not part of the lookup. The record owns its tags, so removing
+        // it removes them with it. An ARN of the minted form holding no action is the
+        // modelled 404, worded for a WRITE's error class as `UpdateCustomAction` words it.
+        if store
+            .custom_actions
+            .remove(&input.custom_action_arn)
+            .is_none()
+        {
+            return Err(
+                DeleteCustomActionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::custom_action_does_not_exist_message(
+                            &input.custom_action_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(DeleteCustomActionOutput {})
     }
 }

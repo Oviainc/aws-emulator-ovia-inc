@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCustomAction
-//! Implemented: replaces the mutable state of the custom action named by
-//! `CustomActionArn` with what the request carries, and answers with that ARN. A later
-//! `GetCustomAction` therefore reads back exactly what the update wrote.
+//! Implemented: writes the members the request carries through to the custom action named
+//! by `CustomActionArn`, and answers with that ARN. A later `GetCustomAction` therefore
+//! reads back exactly what the update left in the store.
 //!
-//! The request carries the action's WHOLE mutable state, not a patch: `Definition` is
-//! required on the update even though the stored action already has one, so an optional
-//! member the request leaves out (`AliasName`, `Attachments`) is cleared rather than
-//! kept. What the ARN itself fixes — the action's name — and the tags, which
-//! only the tagging operations write, are untouched.
+//! A PARTIAL write: `Definition` is required, so the command text always moves, while an
+//! optional member the request leaves out (`AliasName`, `Attachments`) names no new value
+//! and leaves the stored one exactly as it was — the way `UpdateSlackChannelConfiguration`
+//! treats its own optional members. What the ARN itself fixes — the action's name — and the
+//! tags, which only the tagging operations write, are untouched.
 //!
 //! An ARN of the form a custom action of this account is minted under
 //! ([`crate::state::is_mintable_custom_action_arn`]) that this account holds no action under
@@ -199,12 +199,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        // The update carries the action's whole mutable state: `Definition` is required,
-        // and the optional members are written as the request carried them, so one the
-        // request left out is cleared rather than kept from the previous definition.
+        // `Definition` is required, so the command text is always written. The optional
+        // members are PARTIAL: one the request leaves out names no new value for it and
+        // leaves the stored one exactly as it was — the recorded read after an update that
+        // carried only a new `Definition` still reports the alias and the attachments the
+        // create supplied — which is how `UpdateSlackChannelConfiguration` treats its own
+        // optional members too.
         record.command_text = input.definition.command_text;
-        record.alias_name = input.alias_name;
-        record.attachments = input.attachments;
+        if let Some(alias_name) = input.alias_name {
+            record.alias_name = Some(alias_name);
+        }
+        if let Some(attachments) = input.attachments {
+            record.attachments = Some(attachments);
+        }
 
         // The ARN names the action, so the update answers the one it was addressed to.
         Ok(UpdateCustomActionOutput {

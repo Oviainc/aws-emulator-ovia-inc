@@ -15,8 +15,14 @@
 mod account_preferences;
 #[path = "all/chime_webhook_configuration.rs"]
 mod chime_webhook_configuration;
+#[path = "all/chime_webhook_configuration_delete.rs"]
+mod chime_webhook_configuration_delete;
+#[path = "all/chime_webhook_configuration_update.rs"]
+mod chime_webhook_configuration_update;
 #[path = "all/custom_action.rs"]
 mod custom_action;
+#[path = "all/custom_action_delete.rs"]
+mod custom_action_delete;
 #[path = "all/custom_action_fail_closed.rs"]
 mod custom_action_fail_closed;
 #[path = "all/custom_action_update.rs"]

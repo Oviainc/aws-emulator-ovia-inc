@@ -4,24 +4,25 @@
 //! (`GetCustomAction`), over the wire (restJson1) through the same `MultiServiceRouter`
 //! the production router serves with.
 //!
-//! The rule every assertion here is about: an update of a custom action carries the
-//! action's WHOLE mutable state rather than a patch — `Definition` is required even though
-//! the stored action already has one — so the stored action's definition, alias and
-//! attachments afterwards are exactly the members the request carried, an omitted optional
-//! member being cleared; what the ARN fixes (the action's name) and the tags, which only
-//! the tagging operations write, are left alone; an ARN of the form this account's actions
-//! are minted under that holds no action is refused with the modelled 404
-//! `ResourceNotFoundException`, and an ARN no create can mint for this account with the
-//! modelled 403 `UnauthorizedException` (the same pair
+//! The rule every assertion here is about: an update WRITES the members the request carries
+//! through to the stored custom action and the read answers that stored record. `Definition`
+//! is required, so the command text always moves; the optional members are partial, so one
+//! the request leaves out (`AliasName`, `Attachments`) names no new value and leaves the
+//! stored one exactly as it was — the recorded read after an update that carried only a new
+//! `Definition` still reports the alias and the attachments the create supplied. What the ARN
+//! fixes (the action's name) and the tags, which only the tagging operations write, are left
+//! alone; an ARN of the form this account's actions are minted under that holds no action is
+//! refused with the modelled 404 `ResourceNotFoundException`, and an ARN no create can mint
+//! for this account with the modelled 403 `UnauthorizedException` (the same pair
 //! `tests/all/custom_action_fail_closed.rs` asserts for the other custom-action-addressed
-//! operations).
+//! operations), and a refused update persists nothing.
 //!
 //! The tables span the class rather than one recorded request: the rows differ in which
 //! optional members the update carries, in how many attachments, criteria and variables
 //! they hold, in the criteria operator, and in the length and charset of the alias and the
 //! command text — including each published bound of those shapes.
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::wire::{Emulator, OTHER_REGION, REGION};
 
@@ -48,8 +49,8 @@ fn custom_action_arn_in_region(region: &str, action_name: &str) -> String {
     format!("arn:aws:chatbot:{region}:{ACCOUNT}:custom-action/{action_name}")
 }
 
-/// The create every update row starts from: it carries EVERY optional member, so a row
-/// that leaves one out shows the update clearing it rather than inheriting it.
+/// The create every update row starts from: it carries EVERY optional member, so a row that
+/// leaves one out shows the update keeping the stored value rather than clearing it.
 fn baseline_create(action_name: &str) -> Value {
     json!({
         "ActionName": action_name,
@@ -95,15 +96,27 @@ async fn get_ok(emulator: &Emulator, arn: &str) -> Value {
     answer.body["CustomAction"].clone()
 }
 
-/// One row of the update table: the members the update carries beside `CustomActionArn`,
-/// and the definition/alias/attachments the stored action must hold afterwards.
+/// The action `stored` becomes once `update`'s members are written through it: the rule
+/// itself, applied to the record the read must report. Every member the update carries
+/// replaces the stored one; every member it omits is left as it was.
+fn merged(stored: &Value, update: &Value) -> Value {
+    let mut expected = stored.clone();
+    let members = update.as_object().cloned().unwrap_or_else(Map::new);
+    for (member, value) in members {
+        if member == "CustomActionArn" {
+            continue;
+        }
+        expected[member] = value;
+    }
+    expected
+}
+
+/// One row of the update table: a label and the members the update carries beside
+/// `CustomActionArn`.
 struct UpdateCase {
     label: &'static str,
     /// The request body members other than `CustomActionArn`.
     update: Value,
-    /// The members of the `CustomAction` the update decides — everything the stored action
-    /// must report besides `CustomActionArn` and `ActionName`.
-    expected: Value,
 }
 
 /// The update cases, each differing from the others along what the update rule generalises
@@ -119,17 +132,12 @@ struct UpdateCase {
 fn update_cases() -> Vec<UpdateCase> {
     vec![
         UpdateCase {
-            label: "only the required Definition: the alias and the attachments are cleared",
+            label: "only the required Definition: the alias and the attachments stand",
             update: json!({"Definition": {"CommandText": "s3 ls"}}),
-            expected: json!({"Definition": {"CommandText": "s3 ls"}}),
         },
         UpdateCase {
-            label: "a new definition and a new alias, no attachments",
+            label: "a new definition and a new alias, no attachments named",
             update: json!({
-                "Definition": {"CommandText": "lambda invoke --function-name $Function"},
-                "AliasName": "run-lambda",
-            }),
-            expected: json!({
                 "Definition": {"CommandText": "lambda invoke --function-name $Function"},
                 "AliasName": "run-lambda",
             }),
@@ -137,17 +145,6 @@ fn update_cases() -> Vec<UpdateCase> {
         UpdateCase {
             label: "attachments but no alias, with one EQUALS criterion",
             update: json!({
-                "Definition": {"CommandText": "cloudwatch describe-alarms"},
-                "Attachments": [{
-                    "NotificationType": "aws-cloudwatch-alarm",
-                    "ButtonText": "Describe alarms",
-                    "Criteria": [
-                        {"Operator": "EQUALS", "VariableName": "State", "Value": "ALARM"},
-                    ],
-                    "Variables": {"State": "$.detail.state.value"},
-                }],
-            }),
-            expected: json!({
                 "Definition": {"CommandText": "cloudwatch describe-alarms"},
                 "Attachments": [{
                     "NotificationType": "aws-cloudwatch-alarm",
@@ -187,40 +184,10 @@ fn update_cases() -> Vec<UpdateCase> {
                     {"ButtonText": "Open event"},
                 ],
             }),
-            expected: json!({
-                "Definition": {"CommandText": "codedeploy stop-deployment --deployment-id $Id"},
-                "AliasName": "stop-deploy",
-                "Attachments": [
-                    {
-                        "NotificationType": "aws-codedeploy-deployment",
-                        "ButtonText": "Stop deployment",
-                        "Criteria": [
-                            {"Operator": "EQUALS", "VariableName": "State", "Value": "FAILED"},
-                            {"Operator": "HAS_VALUE", "VariableName": "Id"},
-                            {"Operator": "EQUALS", "VariableName": "Region", "Value": "us-east-1"},
-                            {"Operator": "HAS_VALUE", "VariableName": "Account"},
-                            {"Operator": "EQUALS", "VariableName": "App", "Value": "checkout"},
-                        ],
-                        "Variables": {
-                            "State": "$.detail.state",
-                            "Id": "$.detail.deploymentId",
-                            "Region": "$.region",
-                            "Account": "$.account",
-                            "App": "$.detail.application",
-                        },
-                    },
-                    {"ButtonText": "Open event"},
-                ],
-            }),
         },
         UpdateCase {
             label: "the longest allowed alias and command text, and an empty attachment list",
             update: json!({
-                "Definition": {"CommandText": "c".repeat(100)},
-                "AliasName": "A-_".repeat(10),
-                "Attachments": [],
-            }),
-            expected: json!({
                 "Definition": {"CommandText": "c".repeat(100)},
                 "AliasName": "A-_".repeat(10),
                 "Attachments": [],
@@ -232,10 +199,6 @@ fn update_cases() -> Vec<UpdateCase> {
                 "Definition": {"CommandText": "s"},
                 "AliasName": "a",
             }),
-            expected: json!({
-                "Definition": {"CommandText": "s"},
-                "AliasName": "a",
-            }),
         },
         UpdateCase {
             label: "the definition the create carried, with another alias",
@@ -243,30 +206,18 @@ fn update_cases() -> Vec<UpdateCase> {
                 "Definition": {"CommandText": "ssm start-session --target $InstanceId"},
                 "AliasName": "session",
             }),
-            expected: json!({
-                "Definition": {"CommandText": "ssm start-session --target $InstanceId"},
-                "AliasName": "session",
-            }),
         },
     ]
 }
 
-/// The whole `CustomAction` the stored action must report after `case` was applied to the
-/// action `arn` named `action_name`.
-fn expected_action(case: &UpdateCase, arn: &str, action_name: &str) -> Value {
-    let mut expected = case.expected.clone();
-    expected["CustomActionArn"] = json!(arn);
-    expected["ActionName"] = json!(action_name);
-    expected
-}
-
 #[tokio::test]
-async fn an_update_replaces_the_actions_mutable_state_with_what_the_request_carries() {
+async fn an_update_writes_the_supplied_members_through_and_leaves_the_others() {
     for case in update_cases() {
         // A fresh store per row, so every row updates the same baseline action.
         let emulator = Emulator::new();
         let action_name = "updated-action";
         let arn = create_baseline(&emulator, action_name).await;
+        let created = get_ok(&emulator, &arn).await;
 
         let mut request = case.update.clone();
         request["CustomActionArn"] = json!(arn);
@@ -288,7 +239,7 @@ async fn an_update_replaces_the_actions_mutable_state_with_what_the_request_carr
         let stored = get_ok(&emulator, &arn).await;
         assert_eq!(
             stored,
-            expected_action(&case, &arn, action_name),
+            merged(&created, &case.update),
             "case {:?}: the stored action differs from the expected one, got {stored}",
             case.label
         );
@@ -314,12 +265,13 @@ async fn an_update_replaces_the_actions_mutable_state_with_what_the_request_carr
 }
 
 #[tokio::test]
-async fn successive_updates_each_replace_the_state_the_previous_one_left() {
-    // One action, every row applied in turn: each read must report that row's state alone,
-    // so nothing carries over from the row before it.
+async fn successive_updates_each_build_on_the_state_the_previous_one_left() {
+    // One action, every row applied in turn: each read must report the stored action with
+    // that row's members written through it and nothing else moved.
     let emulator = Emulator::new();
     let action_name = "serially_updated-1";
     let arn = create_baseline(&emulator, action_name).await;
+    let mut expected = get_ok(&emulator, &arn).await;
 
     for case in update_cases() {
         let mut request = case.update.clone();
@@ -331,11 +283,12 @@ async fn successive_updates_each_replace_the_state_the_previous_one_left() {
             case.label, answer.status, answer.body
         );
 
+        expected = merged(&expected, &case.update);
         let stored = get_ok(&emulator, &arn).await;
         assert_eq!(
-            stored,
-            expected_action(&case, &arn, action_name),
-            "case {:?}: the stored action must be this update's state alone, got {stored}",
+            stored, expected,
+            "case {:?}: the stored action must carry this update over the previous ones, \
+             got {stored}",
             case.label
         );
     }
@@ -394,13 +347,27 @@ async fn an_update_is_addressed_by_arn_alone_whatever_region_it_is_signed_for() 
 
     for (arn, action_name, signing_region) in pairs {
         let stored = get_ok(&emulator, arn).await;
+        // The update carried only the definition, so everything else is what the create
+        // left.
         assert_eq!(
             stored,
-            json!({
-                "CustomActionArn": arn,
-                "ActionName": action_name,
-                "Definition": {"CommandText": format!("s3 ls --region {signing_region}")},
-            }),
+            merged(
+                &json!({
+                    "CustomActionArn": arn,
+                    "ActionName": action_name,
+                    "Definition": {"CommandText": "ssm start-session --target $InstanceId"},
+                    "AliasName": "start-session",
+                    "Attachments": [{
+                        "NotificationType": "aws-cloudwatch-alarm",
+                        "ButtonText": "Start a session",
+                        "Criteria": [{"Operator": "HAS_VALUE", "VariableName": "InstanceId"}],
+                        "Variables": {"InstanceId": "$.detail.instanceId"},
+                    }],
+                }),
+                &json!({
+                    "Definition": {"CommandText": format!("s3 ls --region {signing_region}")},
+                }),
+            ),
             "case {arn}: the update signed for {signing_region} must be the one stored, \
              got {stored}"
         );
