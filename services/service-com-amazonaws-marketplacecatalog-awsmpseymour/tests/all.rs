@@ -61,6 +61,8 @@ mod modelled_answer_bounds;
 mod modelled_member_lengths;
 #[path = "all/page_size_rule.rs"]
 mod page_size_rule;
+#[path = "all/page_token_property.rs"]
+mod page_token_property;
 #[path = "all/page_token_rule.rs"]
 mod page_token_rule;
 #[path = "all/page_token_spelling.rs"]
