@@ -134,15 +134,11 @@ pub const MAX_CLOUD_CONNECTORS: usize = 1_000;
 /// and the kind an idempotency token is scoped to ([`IdempotencyKey`]).
 pub const CLOUD_CONNECTOR_RESOURCE_TYPE: &str = "CloudConnector";
 
-/// The cloud-connector resource as a READ's reason names it — the resource's name in
-/// words, which is what that sentence states instead of the identifier
-/// ([`resource_not_found_message`]).
-pub const CLOUD_CONNECTOR_RESOURCE_NAME: &str = "Cloud Connector";
-
-/// The cloud-connector resource as a MUTATION's reason names it: the same name in SENTENCE
-/// case, because that reason is a sentence about it ([`cannot_be_found_message`]) rather
-/// than a label like the read's — exactly as its sibling of the C2C surface words its own
-/// ([`CONNECTOR_DESTINATION_RESOURCE_SUBJECT`]).
+/// The cloud-connector resource as its own reasons name it: the resource in SENTENCE case,
+/// because both the sentence a read of an absent connector states
+/// ([`subject_not_found_message`]) and the one a mutation states
+/// ([`cannot_be_found_message`]) are sentences ABOUT the resource — exactly as its sibling
+/// of the C2C surface words its own ([`CONNECTOR_DESTINATION_RESOURCE_SUBJECT`]).
 pub const CLOUD_CONNECTOR_RESOURCE_SUBJECT: &str = "Cloud connector";
 
 /// One stored connector destination: the record `CreateConnectorDestination` inserts —
@@ -815,9 +811,11 @@ pub const NO_OAUTH_AUTHORIZATION_URL: &str = "";
 /// the resource kind an [`IdempotencyKey`] of a `CreateAccountAssociation` carries.
 pub const ACCOUNT_ASSOCIATION_RESOURCE_TYPE: &str = "AccountAssociation";
 
-/// The account-association resource as a READ's reason names it: the resource's name in
-/// words, the way [`MANAGED_THING_RESOURCE_NAME`] is for a managed thing.
-pub const ACCOUNT_ASSOCIATION_RESOURCE_NAME: &str = "Account Association";
+/// The account-association resource as its own READ's reason names it: the resource in
+/// SENTENCE case, because that reason is a sentence about it
+/// ([`subject_not_found_message`]), the way [`CLOUD_CONNECTOR_RESOURCE_SUBJECT`] is for a
+/// cloud connector.
+pub const ACCOUNT_ASSOCIATION_RESOURCE_SUBJECT: &str = "Account association";
 
 /// The most `AccountAssociationItem`s one `ListAccountAssociations` page carries, and the
 /// page size an absent `MaxResults` gets, for the same reason and on the same terms as
@@ -2095,6 +2093,33 @@ pub fn cannot_be_found_message(resource_subject: &str) -> String {
     format!("{resource_subject} cannot be found.")
 }
 
+/// How a READ of this service states the same absence WITHOUT naming the identifier, where
+/// the sentence is about the resource rather than a label for it: the resource as the
+/// sentence's subject, that it was not found, and a full stop.
+///
+/// The recorded 404 of a `GetAccountAssociation` for an identifier this region holds no
+/// association under reads `Account association not found.`, and a `GetCloudConnector`'s
+/// reads `Cloud connector not found.` — one sentence, with each resource as its subject. A
+/// resource whose backend words its absence this way states it through here, from EVERY
+/// operation that resolves one and finds none.
+pub fn subject_not_found_message(resource_subject: &str) -> String {
+    format!("{resource_subject} not found.")
+}
+
+/// How this service states that a resource it resolved by NAME is not there, in the present
+/// tense and with no full stop: the resource as the sentence's subject, and that it does not
+/// exist.
+///
+/// Two paths are recorded wording an absence this way: the 404 of an event log
+/// configuration this region holds none of ([`EVENT_LOG_CONFIGURATION_ABSENT_REASON`], the
+/// same sentence for that resource), and the refusal of a `CreateNotificationConfiguration`
+/// whose `DestinationName` names no destination of this region, which reads `Destination
+/// doesn't exist`. No name or identifier is quoted back, so one sentence serves every
+/// request that names an absent one.
+pub fn does_not_exist_message(resource_subject: &str) -> String {
+    format!("{resource_subject} doesn't exist")
+}
+
 /// How a READ of this service states the same thing: the resource's name in words and
 /// that no such resource exists, naming no identifier.
 ///
@@ -2224,11 +2249,12 @@ pub fn bare_resource_not_found() -> ResourceNotFoundException {
 }
 
 /// The modelled `ResourceNotFoundException` a READ answers for a cloud connector the
-/// store does not hold under the identifier a request named, worded by the same read-path
-/// sentence every read of this service uses ([`resource_not_found_message`]).
+/// store does not hold under the identifier a request named: the sentence this resource's
+/// backend words its absence with ([`subject_not_found_message`]) plus the `ResourceId` and
+/// `ResourceType` members the recorded body carries.
 pub fn cloud_connector_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(resource_not_found_message(CLOUD_CONNECTOR_RESOURCE_NAME)),
+        message: Some(subject_not_found_message(CLOUD_CONNECTOR_RESOURCE_SUBJECT)),
         ..resource_not_found(CLOUD_CONNECTOR_RESOURCE_TYPE, identifier)
     }
 }
@@ -2292,6 +2318,27 @@ pub fn connector_destination_not_found_on_mutation(identifier: &str) -> Resource
 pub fn unknown_reference_message(member: &str) -> String {
     format!("The provided {member} does not exist.")
 }
+
+/// How this service refuses a request that supplied no value for a field its backend
+/// REQUIRES: the field as the backend names it, and that it may be neither absent nor
+/// empty.
+///
+/// The text is BUILT FROM THE REQUEST — the field at fault is what names it — so it is part
+/// of the contract and not just an example: the recorded refusal of a
+/// `CreateConnectorDestination` carrying no Secrets Manager ARN reads `SecretsManagerArn
+/// cannot be null or empty`. A field whose own `@required` trait is on a member of an
+/// OPTIONAL structure is unconstrained by the model's walk when that structure is left out,
+/// so the backend's own requirement is stated here, and stated BEFORE any reference the
+/// request names is resolved: a request is judged on what it carries before the store is
+/// asked about anything.
+pub fn cannot_be_null_or_empty_message(field: &str) -> String {
+    format!("{field} cannot be null or empty")
+}
+
+/// The Secrets Manager ARN of a connector destination as the backend names it in that
+/// refusal: the `SecretsManager` member's `arn`, which the service states as one flattened
+/// field name rather than as the path to it.
+pub const SECRETS_MANAGER_ARN_FIELD: &str = "SecretsManagerArn";
 
 /// How a resource whose 404 QUOTES the identifier states it: the resource as the
 /// sentence's subject, that it was not found, and the identifier the request carried.
@@ -2471,13 +2518,13 @@ fn capitalized(word: &str) -> String {
 }
 
 /// The modelled `ResourceNotFoundException` a READ answers for an account association the
-/// store does not hold under the identifier a request named: the read path's reason
-/// ([`resource_not_found_message`]) plus the `ResourceId` and `ResourceType` members,
-/// worded through the same two helpers every other resource of this service uses.
+/// store does not hold under the identifier a request named: the sentence this resource's
+/// backend words its absence with ([`subject_not_found_message`]) plus the `ResourceId` and
+/// `ResourceType` members the recorded body carries.
 pub fn account_association_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(resource_not_found_message(
-            ACCOUNT_ASSOCIATION_RESOURCE_NAME,
+        message: Some(subject_not_found_message(
+            ACCOUNT_ASSOCIATION_RESOURCE_SUBJECT,
         )),
         ..resource_not_found(ACCOUNT_ASSOCIATION_RESOURCE_TYPE, identifier)
     }

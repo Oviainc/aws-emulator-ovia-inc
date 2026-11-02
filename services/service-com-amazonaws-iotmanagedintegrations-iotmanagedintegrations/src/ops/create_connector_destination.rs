@@ -4,9 +4,12 @@
 //!
 //! Inserts the connector destination into `crate::state`'s `connector_destinations` store
 //! under a freshly generated `ConnectorDestinationId`, and answers with that id. The
-//! `CloudConnectorId` the request names is RESOLVED against the signing region's cloud
-//! connectors first: a destination for a connector this account does not have is refused
-//! with the modelled `ValidationException` (HTTP 400) and nothing is stored. A replayed
+//! Secrets Manager ARN the destination keeps its credentials under is REQUIRED by this
+//! service even though the model leaves `SecretsManager` optional, and a request carrying
+//! none is refused with the modelled `ValidationException` (HTTP 400) before any reference
+//! it names is resolved. The `CloudConnectorId` the request names is then RESOLVED against
+//! the signing region's cloud connectors: a destination for a connector this account does
+//! not have is refused the same way and nothing is stored. A replayed
 //! `ClientToken` (`@idempotencyToken`) answers with the destination the first call created
 //! instead of creating a second one.
 //!
@@ -191,6 +194,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "AuthType",
                         crate::state::AUTH_TYPE_VALUES,
                         auth_type,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The connector destination keeps the credentials it connects with in Secrets
+        // Manager, so the ARN of that secret is a value this service REQUIRES: a create
+        // carrying no `SecretsManager`, or one whose `arn` is blank, is refused and stores
+        // nothing. `SecretsManager` is optional on the input shape, so the model's own
+        // constraint walk never asks for the `arn` its `@required` trait marks when the
+        // structure is left out; this states the requirement the backend has, and states it
+        // BEFORE the `CloudConnectorId` below is resolved, so a request missing it is told
+        // about the field it left out rather than about a resource the store was asked for.
+        if input
+            .secrets_manager
+            .as_ref()
+            .is_none_or(|secrets_manager| secrets_manager.arn.trim().is_empty())
+        {
+            return Err(CreateConnectorDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::cannot_be_null_or_empty_message(
+                        crate::state::SECRETS_MANAGER_ARN_FIELD,
                     )),
                 },
             )

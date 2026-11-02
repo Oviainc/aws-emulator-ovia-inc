@@ -182,8 +182,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let association = store
             .account_association_in(&region, &input.account_association_id)
             .ok_or_else(|| {
-                // A read reports WHICH KIND of resource was not found; the identifier the
-                // request carried is reported on `ResourceId`.
+                // The reason is the sentence this resource's backend words its absence
+                // with, naming no identifier; the identifier the request carried is
+                // reported on `ResourceId`.
                 GetAccountAssociationErrorModeled::ResourceNotFoundException(
                     crate::state::account_association_not_found_on_read(
                         &input.account_association_id,

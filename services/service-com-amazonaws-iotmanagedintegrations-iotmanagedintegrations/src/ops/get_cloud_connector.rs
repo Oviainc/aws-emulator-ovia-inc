@@ -166,8 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let connector = store
             .cloud_connector_in(&region, &input.identifier)
             .ok_or_else(|| {
-                // A read reports WHICH KIND of resource was not found; the identifier
-                // the request carried is reported on `ResourceId`.
+                // The reason is the sentence this resource's backend words its absence
+                // with, naming no identifier; the identifier the request carried is
+                // reported on `ResourceId`.
                 GetCloudConnectorErrorModeled::ResourceNotFoundException(
                     crate::state::cloud_connector_not_found_on_read(&input.identifier),
                 )

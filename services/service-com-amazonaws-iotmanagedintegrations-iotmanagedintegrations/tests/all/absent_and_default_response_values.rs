@@ -412,7 +412,8 @@ async fn cloud_connector(router: &MultiServiceRouter, region: &str) -> String {
 }
 
 /// `CreateConnectorDestination` in `region` against `connector`, answering the `Id` it
-/// minted.
+/// minted. The `SecretsManager` configuration is part of every create: the service requires
+/// the ARN of the secret a destination keeps its credentials in.
 async fn create_destination(
     router: &MultiServiceRouter,
     region: &str,
@@ -424,7 +425,20 @@ async fn create_destination(
         region,
         "POST",
         DESTINATIONS,
-        Some(json!({ "CloudConnectorId": connector, "AuthConfig": {} })),
+        Some(json!({
+            "CloudConnectorId": connector,
+            "AuthConfig": {},
+            // Inside the `SecretsManagerArn` `@pattern`
+            // (`^arn:aws:secretsmanager:[0-9a-zA-Z-]{1,32}:\d{12}:secret:[A-Za-z0-9/_+=.@-]{8,520}$`)
+            // and the `SecretsManagerVersionId` `@length` (32..64).
+            "SecretsManager": {
+                "arn": format!(
+                    "arn:aws:secretsmanager:{region}:{}:secret:destination-A1b2C3",
+                    engine::EMULATOR_ACCOUNT_ID
+                ),
+                "versionId": "a".repeat(32),
+            },
+        })),
     )
     .await;
     assert_eq!(

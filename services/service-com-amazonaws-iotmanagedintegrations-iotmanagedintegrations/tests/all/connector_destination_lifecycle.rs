@@ -4,6 +4,9 @@
 //! `GetConnectorDestination`.
 //!
 //! RULE: `CreateConnectorDestination` (POST `/connector-destinations`, success 201)
+//! requires the Secrets Manager ARN the destination keeps its credentials under — so every
+//! row below carries a `SecretsManager`, and a create that carries none is refused before
+//! anything is resolved (that refusal and its wording are `error_message_wording.rs`). It
 //! RESOLVES the `CloudConnectorId` its request names against the cloud connectors the
 //! signing region holds and refuses, with the modelled `ValidationException` (HTTP 400)
 //! and no record stored, any create naming a connector that region does not hold —
@@ -234,8 +237,11 @@ struct Case {
     auth_type: Option<&'static str>,
     /// The `@required` `AuthConfig`, exactly as the row sends it.
     auth_config: Value,
-    /// `SecretsManager`, absent on a row that names none.
-    secrets_manager: Option<Value>,
+    /// The `SecretsManager` configuration the create carries. Every row carries one: the
+    /// service requires the Secrets Manager ARN of a connector destination, so a create
+    /// that names none never reaches the create path at all (see
+    /// `error_message_wording.rs`).
+    secrets_manager: Value,
 }
 
 impl Case {
@@ -256,9 +262,7 @@ impl Case {
         if let Some(auth_type) = self.auth_type {
             body["AuthType"] = json!(auth_type);
         }
-        if let Some(secrets_manager) = &self.secrets_manager {
-            body["SecretsManager"] = secrets_manager.clone();
-        }
+        body["SecretsManager"] = self.secrets_manager.clone();
         body
     }
 
@@ -290,7 +294,7 @@ fn cases() -> Vec<Case> {
             description: None,
             auth_type: None,
             auth_config: json!({}),
-            secrets_manager: None,
+            secrets_manager: secret("minimal-secret", '0'),
         },
         Case {
             label: "oauth-with-every-member",
@@ -308,7 +312,7 @@ fn cases() -> Vec<Case> {
                     "proactiveRefreshTokenRenewal": { "enabled": true, "DaysBeforeRenewal": 30 },
                 },
             }),
-            secrets_manager: Some(secret("partner-oauth", 'a')),
+            secrets_manager: secret("partner-oauth", 'a'),
         },
         Case {
             label: "oauth-required-members-only",
@@ -322,7 +326,7 @@ fn cases() -> Vec<Case> {
                     "tokenEndpointAuthenticationScheme": "REQUEST_BODY_CREDENTIALS",
                 },
             }),
-            secrets_manager: None,
+            secrets_manager: secret("required-only-secret", '1'),
         },
         Case {
             label: "general-authorization-one-material",
@@ -332,7 +336,7 @@ fn cases() -> Vec<Case> {
             auth_config: json!({
                 "GeneralAuthorization": [auth_material("partner-key", 'b')],
             }),
-            secrets_manager: Some(secret("partner-general", 'c')),
+            secrets_manager: secret("partner-general", 'c'),
         },
         Case {
             label: "general-authorization-three-materials",
@@ -347,7 +351,7 @@ fn cases() -> Vec<Case> {
                     auth_material("key/three", 'f'),
                 ],
             }),
-            secrets_manager: None,
+            secrets_manager: secret("three-materials-secret", '2'),
         },
         Case {
             label: "redirect-url-the-output-member-cannot-carry",
@@ -365,7 +369,7 @@ fn cases() -> Vec<Case> {
                     "oAuthCompleteRedirectUrl": "partnerapp://oauth/done",
                 },
             }),
-            secrets_manager: None,
+            secrets_manager: secret("native-redirect-secret", '3'),
         },
     ]
 }
@@ -478,7 +482,7 @@ async fn a_read_reports_what_the_create_stored() {
         );
         assert_eq!(
             read.member("SecretsManager"),
-            case.secrets_manager.as_ref(),
+            Some(&case.secrets_manager),
             "case {:?}: expected SecretsManager {:?}, got {:?}",
             case.label,
             case.secrets_manager,
@@ -614,7 +618,7 @@ async fn a_replayed_client_token_answers_with_the_first_destination() {
         description: None,
         auth_type: None,
         auth_config: json!({}),
-        secrets_manager: None,
+        secrets_manager: secret("duplicate-secret", '4'),
     };
     let first = create(&router, &case, &connector).await;
     let second = create(&router, &case, &connector).await;
@@ -741,7 +745,7 @@ async fn a_destination_no_create_stored_in_this_region_is_not_found() {
             description: None,
             auth_type: None,
             auth_config: json!({}),
-            secrets_manager: None,
+            secrets_manager: secret("regional-secret", '5'),
         },
         &connector,
     )
@@ -1002,7 +1006,7 @@ async fn an_auth_config_update_writes_each_material_under_its_name() {
                 auth_config: json!({
                     "GeneralAuthorization": [auth_material("partner-key", 'b')],
                 }),
-                secrets_manager: None,
+                secrets_manager: secret("one-material-secret", '6'),
             },
             &connector,
         )
@@ -1089,7 +1093,7 @@ async fn an_auth_config_update_writes_each_material_under_its_name() {
             description: None,
             auth_type: None,
             auth_config: json!({}),
-            secrets_manager: None,
+            secrets_manager: secret("no-oauth-secret", '7'),
         },
         &connector,
     )
@@ -1133,7 +1137,7 @@ async fn an_auth_config_update_writes_each_material_under_its_name() {
                     "tokenEndpointAuthenticationScheme": "HTTP_BASIC",
                 },
             }),
-            secrets_manager: None,
+            secrets_manager: secret("oauth-configuration-secret", '8'),
         },
         &connector,
     )
@@ -1271,6 +1275,7 @@ async fn a_create_past_the_maximum_is_refused() {
         Some(json!({
             "CloudConnectorId": connector,
             "AuthConfig": {},
+            "SecretsManager": secret("one-too-many-secret", '9'),
             "Name": "one too many",
         })),
     )

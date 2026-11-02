@@ -39,6 +39,8 @@ mod device_discovery_lifecycle;
 mod enum_value_set_listing;
 #[path = "all/enum_value_set_rendering.rs"]
 mod enum_value_set_rendering;
+#[path = "all/error_message_wording.rs"]
+mod error_message_wording;
 #[path = "all/event_log_configuration_lifecycle.rs"]
 mod event_log_configuration_lifecycle;
 #[path = "all/event_log_configuration_update_isolation.rs"]

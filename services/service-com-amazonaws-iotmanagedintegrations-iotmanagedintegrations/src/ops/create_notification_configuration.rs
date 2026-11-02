@@ -246,9 +246,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // kind that this API itself mints (`CreateDestination`), so the reference is
         // RESOLVED: a name this account has no destination under names nothing to deliver
         // to, and the configuration is not created. The model declares no
-        // `ResourceNotFoundException` here, so the refusal is the modelled client error —
-        // worded through the one formatter every create of this service states an unknown
-        // reference with.
+        // `ResourceNotFoundException` here, so the refusal is the modelled client error,
+        // and its reason is the sentence the DESTINATION's own absence is stated with
+        // (`crate::state::does_not_exist_message`) — it names the resource that is
+        // missing, not the member the name arrived on, and quotes no name back.
         if store
             .destination_in(&region, &input.destination_name)
             .is_none()
@@ -258,7 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateNotificationConfigurationErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(crate::state::unknown_reference_message("DestinationName")),
+                        message: Some(crate::state::does_not_exist_message(
+                            crate::state::DESTINATION_RESOURCE_SUBJECT,
+                        )),
                     },
                 )
                 .into(),

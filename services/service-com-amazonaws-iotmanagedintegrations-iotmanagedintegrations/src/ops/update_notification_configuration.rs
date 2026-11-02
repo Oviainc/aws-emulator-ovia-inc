@@ -222,8 +222,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The destination the notifications are to be delivered to is resolved on the same
-        // terms as on the create: a name the account has no destination under names nothing
-        // to deliver to, and the stored configuration is left as it was.
+        // terms as on the create, and refused in the same words: the sentence is the
+        // DESTINATION's, so every operation that resolves one and finds none states it the
+        // same way.
         if store
             .destination_in(&region, &input.destination_name)
             .is_none()
@@ -233,7 +234,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateNotificationConfigurationErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(crate::state::unknown_reference_message("DestinationName")),
+                        message: Some(crate::state::does_not_exist_message(
+                            crate::state::DESTINATION_RESOURCE_SUBJECT,
+                        )),
                     },
                 )
                 .into(),
