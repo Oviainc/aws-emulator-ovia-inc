@@ -158,9 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !crate::state::DELETABLE_APPLICATION_STATES.contains(&application_state.as_str()) {
             return Err(DeleteApplicationErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
-                        "Application is in {application_state} state; an application has to \
-                         be in CREATED or STOPPED state in order to be deleted"
+                    message: crate::state::application_not_deletable_message(
+                        &input.application_id,
+                        &application_state,
                     ),
                 },
             )

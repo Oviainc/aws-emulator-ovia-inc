@@ -14,7 +14,8 @@
 //! `StartJobRun` / `GetJobRun` / `ListJobRuns` / `CancelJobRun` work on the job runs it
 //! owns. An interactive session lives inside one application the same way a job run
 //! does: `StartSession` mints a [`SessionRecord`] on the application it names,
-//! `GetSession` reports it and `GetSessionEndpoint` hands a client the endpoint of that
+//! `GetSession` reports it, `ListSessions` reports the sessions one application holds a
+//! page at a time, and `GetSessionEndpoint` hands a client the endpoint of that
 //! stored session together with a freshly minted, time-limited authentication token.
 //!
 //! Two things here move with the CLOCK rather than with a call, and both are stored as a
@@ -40,7 +41,8 @@ use crate::ops::types::{
     IdentityCenterConfiguration, IdentityCenterConfigurationInput, ImageConfiguration,
     ImageConfigurationInput, JobRun, JobRunSummary, JobLevelCostAllocationConfiguration,
     ManagedPersistenceMonitoringConfiguration, MonitoringConfiguration,
-    ResourceNotFoundException, Session, WorkerTypeSpecification, WorkerTypeSpecificationInput,
+    ResourceNotFoundException, Session, SessionSummary, WorkerTypeSpecification,
+    WorkerTypeSpecificationInput,
 };
 
 /// This service's ARN namespace, and the `sigv4Name` the model declares
@@ -52,11 +54,12 @@ pub const ARN_NAMESPACE: &str = "emr-serverless";
 /// to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The largest page either list operation serves, and the page size it uses when the
+/// The largest page any list operation serves, and the page size it uses when the
 /// request names no `maxResults`.
 ///
-/// Source: `ListApplicationsRequest$maxResults` and `ListJobRunsRequest$maxResults`
-/// are both modelled `@range(min: 1, max: 50)` with no declared default.
+/// Source: `ListApplicationsRequest$maxResults`, `ListJobRunsRequest$maxResults` and
+/// `ListSessionsRequest$maxResults` are all modelled `@range(min: 1, max: 50)` with no
+/// declared default.
 pub const PAGE_LIMIT: i32 = 50;
 
 /// How many applications the store holds before `CreateApplication` refuses.
@@ -407,6 +410,48 @@ pub fn release_supports_sessions(release_label: &str) -> bool {
 /// or created state in order to be deleted."
 pub const DELETABLE_APPLICATION_STATES: &[&str] = &["CREATED", "STOPPED"];
 
+/// The `ApplicationState` values `StartApplication` admits: an application holds
+/// capacity only from a status that has no capacity yet.
+///
+/// The same pair the delete admits, named separately because the two gates state
+/// different sentences about it.
+pub const STARTABLE_APPLICATION_STATES: &[&str] = &["CREATED", "STOPPED"];
+
+/// How a status gate renders the statuses it admits: the bracketed, comma-separated
+/// list the service's own refusals carry, built from the gate's own set so the sentence
+/// and the check can never disagree.
+fn allowed_status_list(states: &[&str]) -> String {
+    format!("[{}]", states.join(", "))
+}
+
+/// What a `ValidationException` says when `StartApplication` is asked for on an
+/// application whose status does not admit a start.
+///
+/// Recorded behaviour: the sentence states the operation that was refused and the
+/// statuses that would admit it, and names neither the application nor the status it is
+/// in — so it is fixed text plus the allowed-status list.
+pub fn application_not_startable_message() -> String {
+    format!(
+        "Application cannot be STARTED. Applications must be in one of the following statuses: {}",
+        allowed_status_list(STARTABLE_APPLICATION_STATES)
+    )
+}
+
+/// What a `ValidationException` says when `DeleteApplication` is asked for on an
+/// application whose status does not admit a delete.
+///
+/// Recorded behaviour: this sentence DOES name the application — the id the request
+/// carried — and the status it is currently in, beside the allowed-status list. Its
+/// fixed text reads "must be in of the following statuses", which is how the service
+/// words it; it is reproduced as the service says it rather than repaired.
+pub fn application_not_deletable_message(application_id: &str, current_status: &str) -> String {
+    format!(
+        "Application {application_id} must be in of the following statuses {}. Current status: \
+         {current_status}",
+        allowed_status_list(DELETABLE_APPLICATION_STATES)
+    )
+}
+
 /// The `ApplicationState` a deleted application is retained in: the terminal value of
 /// the enum.
 pub const TERMINATED_APPLICATION_STATE: &str = "TERMINATED";
@@ -742,6 +787,25 @@ impl SessionRecord {
             }
         }
         None
+    }
+
+    /// The `SessionSummary` projection `ListSessions` returns: the stored record's own
+    /// members, never request input.
+    pub fn summary(&self) -> SessionSummary {
+        let session = &self.session;
+        SessionSummary {
+            application_id: session.application_id.clone(),
+            session_id: session.session_id.clone(),
+            arn: session.arn.clone(),
+            name: session.name.clone(),
+            state: session.state.clone(),
+            state_details: session.state_details.clone(),
+            release_label: session.release_label.clone(),
+            execution_role_arn: session.execution_role_arn.clone(),
+            created_by: session.created_by.clone(),
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+        }
     }
 
     /// The termination the session's idle timeout owes it, measured from `idle_since`.

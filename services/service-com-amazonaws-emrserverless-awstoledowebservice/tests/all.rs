@@ -29,6 +29,8 @@ mod resource_tags;
 mod session_endpoint;
 #[path = "all/session_lifecycle.rs"]
 mod session_lifecycle;
+#[path = "all/session_listing.rs"]
+mod session_listing;
 #[path = "all/session_refusal_semantics.rs"]
 mod session_refusal_semantics;
 #[path = "all/session_termination.rs"]

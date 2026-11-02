@@ -7,7 +7,7 @@
 //! validator, this service's refusal wording and serialization — the same path an SDK
 //! client takes.
 //!
-//! Four rules are under test, each asserted over a SET of inputs rather than one
+//! Five rules are under test, each asserted over a SET of inputs rather than one
 //! recorded request:
 //!
 //! 1. A refusal states the condition it refuses on; it never echoes the value the
@@ -23,6 +23,9 @@
 //! 4. The auto-start gate states the GATE — the application is not running and will not
 //!    start itself — in the fixed sentence for the work that was submitted, naming
 //!    neither the application's current state nor a remedy call.
+//! 5. An application lifecycle status gate states the statuses that WOULD admit the call:
+//!    a start names only that list, a delete names it beside the application the request
+//!    asked for and the status it is in.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -830,4 +833,142 @@ async fn a_resource_arn_of_another_vendor_is_refused_by_the_vendor_check() {
             answer.message()
         );
     }
+}
+
+/// Rule 5: an application lifecycle STATUS GATE states the statuses that would admit the
+/// call. `StartApplication`'s sentence is fixed text plus the bracketed allowed-status
+/// list and names neither the application nor the status it is in; `DeleteApplication`'s
+/// names the application the request asked for and the status it is currently in beside
+/// that same list.
+///
+/// The rows differ along the status the gate finds the application in, along whether a
+/// transition was still in flight when the call arrived, and along the application — so
+/// an id inside a sentence can only have come from the request that carried it.
+#[tokio::test]
+async fn an_application_status_gate_states_the_statuses_that_would_admit_the_call() {
+    /// The sentence a start refused on its status carries. Written out here rather than
+    /// read from `crate::state`, so a wrong sentence in `src/` cannot make this test
+    /// pass. Source: the recorded refusal of a start on a deleted application.
+    const NOT_STARTABLE: &str = "Application cannot be STARTED. Applications must be in one of \
+                                 the following statuses: [CREATED, STOPPED]";
+
+    /// The same, for a delete refused on its status: the id from the request, the allowed
+    /// statuses, and the status the application is in. Its fixed text is reproduced as
+    /// the service words it.
+    fn not_deletable(application_id: &str, current_status: &str) -> String {
+        format!(
+            "Application {application_id} must be in of the following statuses \
+             [CREATED, STOPPED]. Current status: {current_status}"
+        )
+    }
+
+    /// Create an application and bring it to `reach`, answering its id.
+    async fn application_in(router: &MultiServiceRouter, token: &str, reach: &str) -> String {
+        let created = call(
+            router,
+            "POST",
+            "/applications",
+            Some(json!({ "clientToken": token, "releaseLabel": "emr-7.1.0", "type": "SPARK" })),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {token:?}: CreateApplication expected 200, got {} with {:?}",
+            created.status, created.body
+        );
+        let id = created
+            .at("/applicationId")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        wait_for_transition();
+        match reach {
+            // The start has returned but the clock has not brought the application up
+            // yet, so the gate judges a transition that is still in flight.
+            "STARTING" => {
+                call(router, "POST", &format!("/applications/{id}/start"), None).await;
+            }
+            "STARTED" => {
+                call(router, "POST", &format!("/applications/{id}/start"), None).await;
+                wait_for_transition();
+            }
+            "TERMINATED" => {
+                let deleted = call(router, "DELETE", &format!("/applications/{id}"), None).await;
+                assert_eq!(
+                    deleted.status, 200,
+                    "case {token:?}: DeleteApplication expected 200, got {} with {:?}",
+                    deleted.status, deleted.body
+                );
+            }
+            other => panic!("unhandled starting point {other}"),
+        }
+        id
+    }
+
+    // The delete gate, over the statuses that do not admit a delete.
+    for (case, reach, current_status) in [
+        (
+            "a delete while the start is still in flight",
+            "STARTING",
+            "STARTED",
+        ),
+        ("a delete on a started application", "STARTED", "STARTED"),
+        (
+            "a delete on an application already terminated",
+            "TERMINATED",
+            "TERMINATED",
+        ),
+    ] {
+        let router = emulator();
+        let id = application_in(&router, &format!("tok-gate-delete-{reach}"), reach).await;
+
+        let answer = call(&router, "DELETE", &format!("/applications/{id}"), None).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected 400, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.message(),
+            not_deletable(&id, current_status),
+            "case {case:?}: expected {:?}, got {:?}",
+            not_deletable(&id, current_status),
+            answer.message()
+        );
+    }
+
+    // The start gate: the sentence states the allowed statuses and nothing about this
+    // application.
+    let router = emulator();
+    let id = application_in(&router, "tok-gate-start", "TERMINATED").await;
+    let answer = call(&router, "POST", &format!("/applications/{id}/start"), None).await;
+    assert_eq!(
+        answer.status, 400,
+        "case a start on a terminated application: expected 400, got {} with {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error_code(),
+        "ValidationException",
+        "case a start on a terminated application: expected ValidationException, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        answer.message(),
+        NOT_STARTABLE,
+        "case a start on a terminated application: expected {NOT_STARTABLE:?}, got {:?}",
+        answer.message()
+    );
+    assert!(
+        !answer.body.to_string().contains(&id) && !answer.message().contains("TERMINATED"),
+        "case a start on a terminated application: the sentence names no application and no \
+         current status, got {:?}",
+        answer.body
+    );
 }

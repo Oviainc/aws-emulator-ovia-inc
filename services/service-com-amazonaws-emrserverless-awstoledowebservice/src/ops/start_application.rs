@@ -155,12 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `@idempotent`: an application that is already running, or already on its
             // way there, is left exactly as it is.
             "STARTING" | "STARTED" => {}
-            // A terminated application is gone for good — there is nothing to start.
+            // A terminated application is gone for good — there is nothing to start. The
+            // refusal states the statuses a start WOULD be admitted from, which is what
+            // the service's own sentence tells a caller.
             "TERMINATED" => {
                 return Err(StartApplicationErrorModeled::ValidationException(
                     ValidationException {
-                        message: "Application is in TERMINATED state and cannot be started"
-                            .to_string(),
+                        message: crate::state::application_not_startable_message(),
                     },
                 )
                 .into())

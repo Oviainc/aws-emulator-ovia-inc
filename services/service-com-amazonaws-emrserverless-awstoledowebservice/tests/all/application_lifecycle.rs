@@ -1890,12 +1890,6 @@ async fn the_operations_this_slice_does_not_implement_still_answer_501() {
 
     for (case, method, uri, body) in [
         (
-            "ListSessions",
-            "GET",
-            format!("/applications/{application_id}/sessions"),
-            None,
-        ),
-        (
             "GetResourceDashboard",
             "GET",
             format!("/applications/{application_id}/dashboard"),
@@ -1914,7 +1908,7 @@ async fn the_operations_this_slice_does_not_implement_still_answer_501() {
 /// `Date`'s `httpQuery` binding is an RFC-3339 date-time (restJson1's default
 /// timestamp format outside a JSON body), so a creation-time bound travels in that
 /// form even though the same member comes back as epoch seconds in a response body.
-fn rfc3339(epoch_seconds: f64) -> String {
+pub(crate) fn rfc3339(epoch_seconds: f64) -> String {
     aws_smithy_types::DateTime::from_secs_f64(epoch_seconds)
         .fmt(aws_smithy_types::date_time::Format::DateTime)
         .expect("the instant formats as RFC-3339")
