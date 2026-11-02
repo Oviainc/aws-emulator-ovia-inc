@@ -473,6 +473,18 @@ pub const CERTIFICATE_STATE_REGISTERING: &str = "Registering";
 /// [`TRANSITION_SPAN`] has elapsed: the modelled enum's `Registered` value.
 pub const CERTIFICATE_STATE_REGISTERED: &str = "Registered";
 
+/// The `CertificateState` a certificate carries between `DeregisterCertificate` and
+/// [`TRANSITION_SPAN`]: the `Deregistering` value of the modelled `CertificateState`
+/// enum.
+///
+/// The deregister answers while the certificate is still being taken out of the system,
+/// so the registration leaving the directory is owed by the clock, on the same span a
+/// register's state transition uses. A registration that has left is no longer one
+/// `DescribeCertificate` or `ListCertificates` reports, which is why no record rests on
+/// the enum's `Deregistered` value — the same construction as
+/// [`IP_ROUTE_STATUS_REMOVING`].
+pub const CERTIFICATE_STATE_DEREGISTERING: &str = "Deregistering";
+
 /// The `CertificateType` a certificate that secures LDAP calls performs: the
 /// `ClientLDAPS` value of the modelled `CertificateType` enum
 /// (`smithy_query(query="shape", shape="CertificateType")` answers `["ClientCertAuth",
@@ -1536,6 +1548,20 @@ impl Directory {
         })
     }
 
+    /// Whether this directory's LDAP security rests on the certificates it holds:
+    /// whether LDAP secure calls are active for any `LDAPSType` of it, or on their way
+    /// there under the transition an activation owes.
+    ///
+    /// While they are, the registrations that perform
+    /// [`CERTIFICATE_TYPE_CLIENT_LDAPS`] are what secures them, which is what
+    /// `DeregisterCertificate` refuses to take out from under a live LDAP security
+    /// connection.
+    pub fn ldaps_security_in_force(&self) -> bool {
+        self.ldaps_settings.values().any(|setting| {
+            setting.status == LDAPS_STATUS_ENABLING || setting.status == LDAPS_STATUS_ENABLED
+        })
+    }
+
     /// Whether this directory's domain controllers are this service's to report at all:
     /// whether its type is one of [`DOMAIN_CONTROLLER_DIRECTORY_TYPES`].
     pub fn manages_domain_controllers(&self) -> bool {
@@ -2403,10 +2429,10 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 }
             }
             // The state transition `RegisterCertificate` owes: the transient
-            // `Registering` settles on `Registered`. The mirrored transition out of
-            // `Deregistering` belongs to `DeregisterCertificate`, which is still
-            // scaffolded, so it lands with that handler rather than as a branch nothing
-            // can reach.
+            // `Registering` settles on `Registered`. The teardown
+            // `DeregisterCertificate` owes has no settled state to move to — a
+            // registration the system no longer holds is not one this service reports —
+            // so once it falls due the registration is gone.
             for certificate in directory.certificates.values_mut() {
                 let Some(due) = certificate.state_due_at else {
                     continue;
@@ -2415,7 +2441,13 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                     certificate.state = CERTIFICATE_STATE_REGISTERED.to_string();
                     certificate.state_due_at = None;
                 }
+                // A certificate being deregistered leaves the store below, so its due
+                // instant is left in place for that pass to find.
             }
+            directory.certificates.retain(|_, certificate| {
+                certificate.state != CERTIFICATE_STATE_DEREGISTERING
+                    || certificate.state_due_at.is_some_and(|due| now < due)
+            });
             // The status transition `EnableLDAPS` owes: the transient `Enabling`
             // settles on `Enabled`. A deactivation has no transient status to settle
             // out of — the modelled enum carries no `Disabling` — so `DisableLDAPS`
@@ -2924,6 +2956,7 @@ modeled_failures!(
     AuthenticationFailedException,
     CertificateAlreadyExistsException,
     CertificateDoesNotExistException,
+    CertificateInUseException,
     CertificateLimitExceededException,
     ClientException,
     DirectoryAlreadySharedException,
@@ -3165,6 +3198,19 @@ pub fn no_such_trust(trust_id: &str) -> String {
 /// [`refusal`] appends the request id.
 pub fn no_such_domain_controller(domain_controller_id: &str) -> String {
     format!("DomainController: '{domain_controller_id}' does not exist.")
+}
+
+/// The `CertificateDoesNotExistException` message for an id that names no certificate
+/// registered with the directory the request asked about. Shared so every operation that
+/// resolves a registration (`DescribeCertificate`, `DeregisterCertificate`) says the
+/// same thing about the same failure.
+///
+/// A certificate is registered FOR a directory, so the message names both ids the
+/// request sent — the error shape's own documentation is "The certificate is not present
+/// in the system for describe or deregister activities" — and nothing else.
+/// [`refusal`] appends the request id.
+pub fn no_such_certificate(certificate_id: &str, directory_id: &str) -> String {
+    format!("Certificate {certificate_id} does not exist for directory {directory_id}")
 }
 
 /// The `EntityDoesNotExistException` message for an id that names no stored assessment.
