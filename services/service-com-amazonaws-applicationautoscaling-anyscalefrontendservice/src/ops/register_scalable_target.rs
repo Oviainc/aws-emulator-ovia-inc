@@ -437,6 +437,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .unwrap_or_default()
                         .into_iter()
                         .collect(),
+                    // A target nothing has scaled yet carries no settled scaling decision.
+                    settled_arbitration: None,
                 };
                 state.arn_index.insert(arn.clone(), key.clone());
                 state.targets.insert(key.clone(), record);

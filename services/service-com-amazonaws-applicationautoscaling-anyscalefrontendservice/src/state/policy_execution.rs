@@ -70,6 +70,15 @@
 //! ([`ARBITRATION_WINDOW`]) are compared and the largest resulting capacity is the one the
 //! target is moved to — the others are suppressed, each consumed without a movement and without
 //! an activity of its own.
+//!
+//! That decision is the target's, not one pass's: it is recorded on the target
+//! ([`super::SettledArbitration`]) with the capacity it was taken FROM, and for as long as the
+//! movement that took it is still being waited on, a policy of the same target whose trigger is
+//! read after it is compared against it — its movement computed from the capacity as of the
+//! decision, performed only if it provides MORE capacity than the decision settled on, and
+//! otherwise suppressed. So however far apart the alarms of one target transition, the capacity
+//! it lands on is the largest any of its policies asked for and never the accumulation of two
+//! of them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -112,14 +121,22 @@ const MAX_REMEMBERED_ALARMS_PER_POLICY: usize = 32;
 /// How long the breaches of one scalable target are collected over before the policies they
 /// trigger are arbitrated against each other ([`arbitration_windows`]).
 ///
-/// The window is what makes "triggered at the same time" decidable here. The alarms a client
-/// drives into `ALARM` together transition one after another, so a pass that read the stores
-/// between two of them would perform the first policy before it had seen the second at all, and
-/// the precedence the service gives the largest resulting capacity could never be applied. The
-/// span is this emulator's own — nothing in a stored alarm state says how wide the service's is
-/// — and it is only ever waited out by a target that has more than one policy an alarm can
-/// fire.
-const ARBITRATION_WINDOW: Duration = Duration::from_secs(3);
+/// The window is what makes "triggered at the same time" decidable here. The alarms that
+/// trigger the policies of one target move into `ALARM` one after another — each on its own
+/// evaluation, each read by whichever pass comes next — so a pass that performed the first
+/// policy it found would have moved the capacity before it had seen the second trigger at all,
+/// and the precedence the service gives the largest resulting capacity could never be applied
+/// to it. The span is this emulator's own, since nothing in a stored alarm state says how wide
+/// the service's is: wide enough that the triggers a client drives together through separate
+/// requests, and the evaluations this emulator materialises for them one at a time, are read as
+/// one event, and still far inside the time the real service takes to execute a policy at all.
+///
+/// Nothing waits it out that has nothing left to collect: the window closes as soon as every
+/// policy of the target an alarm can fire has a breach in hand ([`arbitration_windows`]), so it
+/// is only really waited out by a target a strict SUBSET of whose policies is triggered — and
+/// then only for as long as that subset's alarms keep breaching, since the breach a pass holds
+/// is read from the alarm's state rather than remembered.
+const ARBITRATION_WINDOW: Duration = Duration::from_secs(8);
 
 /// How long one scaling-clock wake-up waits before looking for breaches again.
 ///
@@ -602,6 +619,11 @@ fn breaches_above(comparison_operator: &str) -> Option<bool> {
 /// capacity is performed and every other is fully suppressed — its transition is consumed, and
 /// it moves no capacity and records no activity, because one scalable target was moved once, by
 /// one policy.
+///
+/// A breach whose trigger is only read AFTER that decision was taken — the alarms of one target
+/// transition one at a time, and each is read by whichever pass comes next — is decided against
+/// the decision itself rather than against the capacity it left behind
+/// ([`plan_breach`]), so the policies of one target never accumulate their adjustments.
 fn apply_breaches(
     store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
     fired: &[(FiringPolicy, Breach)],
@@ -625,7 +647,7 @@ fn apply_breaches(
         // withheld — by a cooldown, by a suspended direction, by a window that is still open —
         // has asked for nothing yet, so it keeps its transition and the first pass that may
         // perform it still does.
-        let suppressed = matches!(planned_here, Disposition::Move { .. })
+        let suppressed = matches!(planned_here, Disposition::Move(_))
             && winners
                 .get(&policy.key.target)
                 .is_some_and(|winner| *winner != index);
@@ -650,8 +672,8 @@ fn apply_breaches(
                     breach.transitioned_secs,
                 );
             }
-            Disposition::Move { capacity } => {
-                perform_movement(store, policy, breach, capacity, now);
+            Disposition::Move(movement) => {
+                perform_movement(store, policy, breach, movement, now);
             }
         }
     }
@@ -667,8 +689,23 @@ enum Disposition {
     /// Evaluated and done with: there is no capacity movement in it, so the transition is
     /// remembered and no later pass looks at it again.
     Consume,
-    /// Move the target's capacity to this value.
-    Move { capacity: i32 },
+    /// Move the target's capacity, as [`Movement`] states it.
+    Move(Movement),
+}
+
+/// The capacity movement one breach asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Movement {
+    /// The capacity to move the target to.
+    capacity: i32,
+    /// The capacity this movement was computed FROM: the one the target held as of the scaling
+    /// decision this breach belongs to, which is what the movements of that one decision are
+    /// all computed from, so two of them can never accumulate.
+    base: i32,
+    /// How long the decision this movement settles is the one a policy triggered with it is
+    /// compared against — this policy's own wait for a previous scaling activity to take
+    /// effect ([`cooldown_of`]).
+    settled_for: Duration,
 }
 
 /// What this pass would do with one breach, from the store as it stands.
@@ -746,12 +783,28 @@ fn plan_breach(
         .get(&policy.key.target)
         .copied()
         .unwrap_or(target.current_capacity);
+    // The scaling decision this target's policies have already settled, while it is still the
+    // one a policy triggered with them is compared against, and while it was taken by ANOTHER
+    // policy — this policy's own breaches wait for its own cooldown above, which is the span
+    // that decision stands for.
+    let settled = target
+        .settled_arbitration
+        .as_ref()
+        .filter(|settled| now < settled.open_until)
+        .filter(|settled| settled.policy_name != policy.key.policy_name);
+    // What this breach asks a movement OF: the capacity the target held as of the decision its
+    // trigger belongs to. "Application Auto Scaling gives precedence to the policy that
+    // provides the largest capacity" — so a policy whose trigger is read after the decision was
+    // taken still asks for a movement of the capacity that decision was taken from, and the
+    // capacity the winner already moved is part of what it asked for rather than something to
+    // add to.
+    let base = settled.map_or(current, |settled| settled.base_capacity);
 
     // The capacity the policy asks for, as its OWN configuration states it.
     let wanted = match &policy.config {
-        FiringConfig::Step(config) => adjusted_capacity(config, breach, current),
+        FiringConfig::Step(config) => adjusted_capacity(config, breach, base),
         FiringConfig::TargetTracking(config) => {
-            super::target_tracking_capacity(&policy.key, config, breach.measured(), current)
+            super::target_tracking_capacity(&policy.key, config, breach.measured(), base)
         }
     };
     let Some(wanted) = wanted else {
@@ -764,6 +817,13 @@ fn plan_breach(
         // Nothing moved, so there is no capacity movement to record: the policy asked for
         // the capacity the resource already holds, or for one past a bound it already
         // sits at.
+        return Disposition::Consume;
+    }
+    // A policy that does not provide MORE capacity than the decision its target has already
+    // settled is the one precedence is given against: it is fully suppressed, so its
+    // transition is consumed and it moves no capacity and records no activity of its own —
+    // one scalable target was moved once, by the policy that provided the largest capacity.
+    if settled.is_some_and(|settled| capacity <= settled.settled_capacity) {
         return Disposition::Consume;
     }
     // "DynamicScalingInSuspended […] Whether scale in by a target tracking scaling policy
@@ -782,18 +842,28 @@ fn plan_breach(
     if direction_suspended {
         return Disposition::Hold;
     }
-    Disposition::Move { capacity }
+    Disposition::Move(Movement {
+        capacity,
+        base,
+        settled_for: cooldown_of(record, tracked_kind),
+    })
 }
 
 /// Perform one movement: consume the transition, set the capacity, record the activity — which
-/// is what queues the capacity the resource is owed — and start this policy's cooldown.
+/// is what queues the capacity the resource is owed — record the scaling decision it settles for
+/// the target's policies, and start this policy's cooldown.
 fn perform_movement(
     store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
     policy: &FiringPolicy,
     breach: &Breach,
-    capacity: i32,
+    movement: Movement,
     now: SystemTime,
 ) {
+    let Movement {
+        capacity,
+        base,
+        settled_for,
+    } = movement;
     // This transition has now been performed, so no later pass performs it again.
     remember_transition(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
     let cause = format!(
@@ -810,6 +880,18 @@ fn perform_movement(
     store.record_capacity_change(&policy.key.target, capacity, cause, moved_at);
     if let Some(target) = store.targets.get_mut(&policy.key.target) {
         target.current_capacity = capacity;
+        // The scaling decision this target's policies have now settled: recorded AFTER the
+        // movement, which clears the decision an earlier capacity was settled against, and
+        // carrying the capacity that decision was taken FROM — so a policy of this target
+        // whose trigger is read later is compared against this one instead of adding to it.
+        target.settled_arbitration = moved_at
+            .checked_add(settled_for)
+            .map(|open_until| super::SettledArbitration {
+                base_capacity: base,
+                settled_capacity: capacity,
+                policy_name: policy.key.policy_name.clone(),
+                open_until,
+            });
     }
     if let Some(record) = store.policies.get_mut(&policy.key) {
         record.last_executed = Some(moved_at);
@@ -826,14 +908,33 @@ fn perform_movement(
 ///
 /// Only a target with more than one policy an alarm can fire has a window: with a single policy
 /// there is no second movement to give precedence to, so its breach is performed as soon as a
-/// pass finds it.
+/// pass finds it. And a target every one of whose alarm-driven policies this pass holds a breach
+/// of has none either: the movements they ask for are ALL here to be compared, so there is
+/// nothing left for the window to collect and waiting it out would only delay the one movement
+/// they settle on.
 fn arbitration_windows(
     store: &ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
     fired: &[(FiringPolicy, Breach)],
 ) -> BTreeMap<TargetKey, SystemTime> {
+    // Which policies of each target this pass holds a breach of, which is what says how much of
+    // that target's own set of alarm-driven policies has been collected.
+    let mut triggered: BTreeMap<TargetKey, BTreeSet<PolicyKey>> = BTreeMap::new();
+    for (policy, _) in fired {
+        triggered
+            .entry(policy.key.target.clone())
+            .or_default()
+            .insert(policy.key.clone());
+    }
     let mut windows: BTreeMap<TargetKey, SystemTime> = BTreeMap::new();
     for (policy, breach) in fired {
-        if alarm_driven_policies(store, &policy.key.target) < 2 {
+        let alarm_driven = alarm_driven_policies(store, &policy.key.target);
+        if alarm_driven < 2 {
+            continue;
+        }
+        if triggered
+            .get(&policy.key.target)
+            .is_some_and(|keys| keys.len() >= alarm_driven)
+        {
             continue;
         }
         let Some(closes) =
@@ -876,7 +977,7 @@ fn arbitrate(
     let mut best: BTreeMap<TargetKey, (i32, usize)> = BTreeMap::new();
     let mut asking: BTreeMap<TargetKey, BTreeSet<PolicyKey>> = BTreeMap::new();
     for (index, ((policy, _), disposition)) in fired.iter().zip(planned).enumerate() {
-        let Disposition::Move { capacity } = *disposition else {
+        let Disposition::Move(Movement { capacity, .. }) = *disposition else {
             continue;
         };
         asking

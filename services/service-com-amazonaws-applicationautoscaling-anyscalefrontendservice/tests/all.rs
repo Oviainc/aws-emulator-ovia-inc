@@ -61,6 +61,8 @@ mod scheduled_actions;
 mod scheduled_scaling_suspension;
 #[path = "all/service_linked_role.rs"]
 mod service_linked_role;
+#[path = "all/simultaneous_policy_arbitration.rs"]
+mod simultaneous_policy_arbitration;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/step_scaling_execution.rs"]

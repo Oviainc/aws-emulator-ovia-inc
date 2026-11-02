@@ -93,6 +93,47 @@ pub struct ScalableTargetRecord {
     pub creation_time: SystemTime,
     pub suspended_state: Option<SuspendedState>,
     pub tags: BTreeMap<String, String>,
+    /// The scaling decision this target's policies last settled between them, while it is
+    /// still the decision a policy triggered with them is compared against. See
+    /// [`SettledArbitration`].
+    pub settled_arbitration: Option<SettledArbitration>,
+}
+
+/// The ONE scaling decision a scalable target's policies settled for one triggering event:
+/// the capacity the target held when it was taken, the capacity it was moved to, and the
+/// policy that moved it.
+///
+/// "Multiple scaling policies can be in force at the same time for the same scalable target
+/// […] Application Auto Scaling gives precedence to the policy that provides the largest
+/// capacity for both scale out and scale in": a target moves ONCE for the policies triggered
+/// together, to the largest capacity any of them asked for. Which means the capacity each of
+/// them is computed from is the one the target held AS OF that decision — a policy whose
+/// trigger is read after the decision was already taken is still asking for a movement of the
+/// capacity that was in force when the event began, not of the capacity the winner has since
+/// moved it to, so the two adjustments can never accumulate.
+///
+/// The record stands for as long as the movement that took it is still being waited on
+/// ([`SettledArbitration::open_until`]), and any capacity movement of the target that is not a
+/// policy's own ends it ([`ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::record_capacity_change`]):
+/// the capacity as of the decision is only meaningful while that is the capacity the target
+/// was moved from.
+#[derive(Debug, Clone)]
+pub struct SettledArbitration {
+    /// The capacity the target held when this decision was taken, which every policy
+    /// triggered by the same event computes its movement from.
+    pub base_capacity: i32,
+    /// The capacity the decision moved the target to, which another policy of this target
+    /// has to provide MORE than to move it again.
+    pub settled_capacity: i32,
+    /// The `PolicyName` of the policy whose movement settled it; its own later breaches are
+    /// governed by its `Cooldown` rather than by this decision.
+    pub policy_name: String,
+    /// While this instant is still ahead, the decision is the one a policy triggered with it
+    /// is compared against: it is "the amount of time, in seconds, to wait for a previous
+    /// scaling activity to take effect" (`StepScalingPolicyConfiguration$Cooldown`) of the
+    /// policy that took it, so a policy that states no wait at all leaves no decision for a
+    /// later trigger to be compared against.
+    pub open_until: SystemTime,
 }
 
 /// What `PutScheduledAction` persists: the action as `DescribeScheduledActions` reports
@@ -312,6 +353,13 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
         let sequence = self.activities_recorded;
         self.activities_recorded += 1;
         let activity_id = scaling_activity_id(sequence, target);
+        // Whatever this movement is, the capacity it sets is the capacity the target holds
+        // from here on — so a scaling decision its policies settled against an EARLIER
+        // capacity is no longer the decision anything is compared against. The policy
+        // execution that settles one records it again itself, after this call.
+        if let Some(record) = self.targets.get_mut(target) {
+            record.settled_arbitration = None;
+        }
         // This movement is what the target is driven to from here on, so a movement of the
         // same target that had not been fulfilled yet is displaced by it, and this capacity
         // is the one that takes effect instead of the capacity it named.
@@ -3376,6 +3424,7 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
                                 creation_time: now,
                                 suspended_state: None,
                                 tags: BTreeMap::new(),
+                                settled_arbitration: None,
                             },
                         );
                         None
