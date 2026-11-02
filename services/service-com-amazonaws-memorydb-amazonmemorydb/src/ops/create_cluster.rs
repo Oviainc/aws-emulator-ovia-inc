@@ -345,10 +345,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // shard between 0 and `MAX_REPLICAS_PER_SHARD` replicas. The two ceilings make
         // the node total (`shards * (replicas + 1)`) bounded too, so neither factor
         // nor their product can be driven by the request.
-        if number_of_shards < 1 {
+        if number_of_shards < crate::state::MIN_SHARDS_PER_CLUSTER {
             return Err(CreateClusterErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
-                    message: Some("NumShards must be at least 1.".to_string()),
+                    message: Some(crate::state::too_few_shards_message()),
                 },
             )
             .into());
@@ -366,13 +366,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if !(0..=crate::state::MAX_REPLICAS_PER_SHARD).contains(&num_replicas_per_shard) {
+        if !(crate::state::MIN_REPLICAS_PER_SHARD..=crate::state::MAX_REPLICAS_PER_SHARD)
+            .contains(&num_replicas_per_shard)
+        {
             return Err(CreateClusterErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
-                    message: Some(format!(
-                        "NumReplicasPerShard must be between 0 and {}.",
-                        crate::state::MAX_REPLICAS_PER_SHARD
-                    )),
+                    message: Some(crate::state::replica_count_out_of_range_message()),
                 },
             )
             .into());

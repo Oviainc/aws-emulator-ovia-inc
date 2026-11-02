@@ -126,3 +126,23 @@ Smithy evidence cited: SourceType enum = [node, parameter-group, subnet-group, c
 8. Cause 6: replay memorydb-parameter-group-lifecycle step task#5 - DescribeParameterGroups for a group that does not exist; read $.message.
 9. Cause 7: replay memorydb-parameter-group-lifecycle step task#6 - DescribeParameters on a default group; compare each Parameter's Description/AllowedValues/Value against the fixture.
 10. Cause 8: replay memorydb-parameter-update-and-reset-rules step task#18 - DeleteParameterGroup with a syntactically invalid ParameterGroupName; read $.message.
+
+## Resolution note
+
+Causes 1-6 and 8 are closed, and cause 7 is closed for 12 of its 19 recorded paths: the
+catalog now carries the service's own text and value sets for acllog-max-len,
+active-expire-effort, hll-sparse-max-bytes, latency-tracking, lfu-decay-time,
+lfu-log-factor, list-compress-depth, maxmemory-samples, tcp-keepalive and search-enabled
+(yes,no plus its Value), and what a parameter publishes is what an update accepts.
+
+STILL DIVERGING, 7 paths of cause 7, all inside the 200 body of
+memorydb-parameter-group-lifecycle#task#6: `Description` of search-enabled,
+search-query-timeout-ms, slowlog-log-slower-than, slowlog-max-len and
+tracking-table-max-keys, and `AllowedValues` of search-query-timeout-ms and
+slowlog-log-slower-than. This report quotes the required text for every other path but
+not for these, and a replay withholds a recorded 200-body value, so the catalog's exact
+wording and bounds for them could not be established from inside the fix; each is left at
+the engine-grounded value documented beside it in `state::ENGINE_PARAMETERS` rather than
+at another paraphrase, and the suite deliberately pins none of those five descriptions.
+Anyone holding the recorded listing for a default group can close them by correcting those
+seven fields in that one table.

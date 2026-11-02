@@ -11,12 +11,13 @@
 //! The rule under test: an account already holds one default parameter group per
 //! published parameter group family AND the vector-search baseline of every engine line
 //! that has one. The two kinds differ in what they report, which is the whole point of
-//! the table below: a family's own group reports that family, while a search baseline is
-//! named after its line with `.search` and reports the LINE's family — so a default
-//! group's family does not follow from its name — and the search PREVIEW line is a
-//! family of its own. Each group reports a description naming the baseline it is of, an
-//! ARN scoped to the region the call was signed for, and its family's engine defaults:
-//! exactly what a group a caller creates in that family starts from.
+//! the table below: a family's own group reports that family and describes the baseline
+//! it is of, while a search baseline is named after its line with `.search`, reports the
+//! LINE's family — so a default group's family does not follow from its name — and
+//! describes itself as a CUSTOMIZED default group of that family with the vector-search
+//! setting on; and the search PREVIEW line is a family of its own. Each group also
+//! reports an ARN scoped to the region the call was signed for, and its family's engine
+//! defaults: exactly what a group a caller creates in that family starts from.
 //!
 //! The rows differ along what the rule generalises over: the engine (Redis OSS and
 //! Valkey), the major version (6 and 7), and the kind of family (an engine line, a
@@ -38,27 +39,46 @@ const REGION: &str = "us-west-2";
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// Every default parameter group an account holds, in name order, as
-/// `(group name, the family it reports)`.
+/// `(group name, the family it reports, the Description it reports)`.
 ///
 /// Spelled out HERE rather than taken from the crate under test, so the assertions are
 /// independent of the code that materialises the groups.
-const DEFAULT_GROUPS: &[(&str, &str)] = &[
-    ("default.memorydb-redis6", "memorydb_redis6"),
-    ("default.memorydb-redis7", "memorydb_redis7"),
-    // The search baseline of the Redis OSS 7 line: its own name, its line's family. Its
-    // `Description` is asserted below from the service's own template, like every other
-    // row; the recorded wording for the two search baselines follows no documented rule
-    // and the difference is declined (see `crate::state::DefaultParameterGroup`), so do
-    // not read that one assertion as recorded truth.
-    ("default.memorydb-redis7.search", "memorydb_redis7"),
-    // The search PREVIEW line, which is a family in its own right.
+const DEFAULT_GROUPS: &[(&str, &str, &str)] = &[
+    (
+        "default.memorydb-redis6",
+        "memorydb_redis6",
+        "Default parameter group for memorydb_redis6",
+    ),
+    (
+        "default.memorydb-redis7",
+        "memorydb_redis7",
+        "Default parameter group for memorydb_redis7",
+    ),
+    // The search baseline of the Redis OSS 7 line: its own name, its line's family, and
+    // the customized-default description the service gives a search baseline.
+    (
+        "default.memorydb-redis7.search",
+        "memorydb_redis7",
+        "Customized default parameter group for memorydb_redis7 with search-enabled yes",
+    ),
+    // The search PREVIEW line, which is a family in its own right and so takes the
+    // family form of the description.
     (
         "default.memorydb-redis7.search.preview",
         "memorydb_redis7.search.preview",
+        "Default parameter group for memorydb_redis7.search.preview",
     ),
-    ("default.memorydb-valkey7", "memorydb_valkey7"),
-    // The search baseline of the Valkey 7 line, with the same note as the Redis one.
-    ("default.memorydb-valkey7.search", "memorydb_valkey7"),
+    (
+        "default.memorydb-valkey7",
+        "memorydb_valkey7",
+        "Default parameter group for memorydb_valkey7",
+    ),
+    // The search baseline of the Valkey 7 line, described like the Redis one.
+    (
+        "default.memorydb-valkey7.search",
+        "memorydb_valkey7",
+        "Customized default parameter group for memorydb_valkey7 with search-enabled yes",
+    ),
 ];
 
 /// A string member of a reported group, or a panic naming the case.
@@ -116,7 +136,7 @@ async fn an_untouched_account_reports_exactly_the_default_parameter_groups() {
         .collect();
     let want: Vec<(String, String)> = DEFAULT_GROUPS
         .iter()
-        .map(|(name, family)| (name.to_string(), family.to_string()))
+        .map(|(name, family, _)| (name.to_string(), family.to_string()))
         .collect();
     assert_eq!(
         reported, want,
@@ -125,14 +145,14 @@ async fn an_untouched_account_reports_exactly_the_default_parameter_groups() {
 }
 
 /// Each default group answers for ITSELF: read one at a time it reports the same family,
-/// a description naming the baseline it is of and an ARN in the region the call was
-/// signed for — and the parameters it reports are the ones a group a caller creates in
-/// that family starts from.
+/// the description the service gives a baseline of its kind and an ARN in the region the
+/// call was signed for — and the parameters it reports are the ones a group a caller
+/// creates in that family starts from.
 #[tokio::test]
 async fn every_default_group_reports_its_family_and_that_family_s_engine_defaults() {
     let router = router();
 
-    for (index, (name, family)) in DEFAULT_GROUPS.iter().enumerate() {
+    for (index, (name, family, description)) in DEFAULT_GROUPS.iter().enumerate() {
         let case = format!("default group {name}");
         let described = ok(
             &router,
@@ -142,19 +162,10 @@ async fn every_default_group_reports_its_family_and_that_family_s_engine_default
         )
         .await;
         let group = &described["ParameterGroups"][0];
-        // The baseline a group is of is its own name read as a family token: the
-        // `default.` prefix dropped and the family's underscore written back.
-        let baseline = name
-            .strip_prefix("default.")
-            .unwrap_or_else(|| panic!("case {case:?}: a default group is named default.<baseline>"))
-            .replacen("memorydb-", "memorydb_", 1);
         for (reported, expected) in [
             ("Name", json!(name)),
             ("Family", json!(family)),
-            (
-                "Description",
-                json!(format!("Default parameter group for {baseline}")),
-            ),
+            ("Description", json!(description)),
             (
                 "ARN",
                 json!(format!(

@@ -202,7 +202,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The borrow checker needs the group looked up twice (once to read its family,
         // once to write), so the not-found refusal is built HERE and cannot differ
-        // between the two sites.
+        // between the two sites. This is the one parameter-group path the service is
+        // recorded wording with the group it could not resolve.
         let not_found = || {
             UpdateParameterGroupErrorModeled::ParameterGroupNotFoundFault(
                 ParameterGroupNotFoundFault {

@@ -242,6 +242,29 @@ pub const DURATION_WITH_INTERVAL_MESSAGE: &str =
 pub const SOURCE_NAME_WITHOUT_TYPE_MESSAGE: &str =
     "Cannot specify source identifier without source type";
 
+/// What the service answers a `DescribeEvents$SourceType` outside the modelled
+/// `SourceType` value set with.
+///
+/// Fixed text, end to end: the service states the condition and then LISTS the types it
+/// serves, comma-separated with no spaces and in the order it publishes them; the value
+/// the request sent is not echoed. The tokens are exactly the model's `SourceType`
+/// values (the generated `crate::ops::types::SOURCE_TYPE_VALUES` catalog, which the
+/// listing is kept a permutation of), written in the service's own order because that
+/// order is part of the sentence rather than of the enum.
+pub const INVALID_EVENT_SOURCE_TYPE_MESSAGE: &str =
+    "Invalid event source type. Valid types are \
+     node,cluster,parameter-group,subnet-group,user,acl";
+
+/// What the service answers a `DescribeServiceUpdates$Status` entry outside the modelled
+/// `ServiceUpdateStatus` value set with.
+///
+/// The fixed part states which input was not valid; the variable part is the status the
+/// request sent for it, verbatim and once — the service reports the offending token
+/// back, and nothing else about where in the list it sat.
+pub fn invalid_service_update_status_message(status: &str) -> String {
+    format!("The input service update status {status} is not valid.")
+}
+
 /// The most events this store keeps.
 ///
 /// A ceiling THIS EMULATOR chooses, on top of [`EVENT_RETENTION`], so that a caller
@@ -791,10 +814,10 @@ pub struct DefaultParameterGroup {
     /// `ParameterGroup$Family`: the family whose engine defaults the group reports.
     pub family: String,
     /// `ParameterGroup$Description`: the service's own wording for the baseline the
-    /// group is of ([`default_parameter_group_description`]), which the recorded
-    /// per-family and search-preview groups confirm. The two search baselines are
-    /// described by the same template, since no documented rule produces another
-    /// wording for them from the family, the name or the request.
+    /// group is of — [`default_parameter_group_description`] for a family's own
+    /// baseline, [`search_default_parameter_group_description`] for the SEARCH-enabled
+    /// baseline of a line, which the service describes as its line's family with the
+    /// vector-search setting turned on.
     pub description: String,
 }
 
@@ -823,13 +846,13 @@ pub fn default_parameter_groups() -> Vec<DefaultParameterGroup> {
             .any(|(engine, major)| family == line_family(engine, *major));
         if line_has_search_baseline {
             // The baseline this group is of is the line's family WITH the search
-            // suffix, which is what its name and its description are built from; the
-            // family it reports is the line's own.
+            // suffix, which is what its NAME is built from; the family it reports — and
+            // the family its description names — is the line's own.
             let baseline = format!("{family}{SEARCH_DEFAULT_GROUP_SUFFIX}");
             groups.push(DefaultParameterGroup {
                 name: default_parameter_group_name(&baseline),
+                description: search_default_parameter_group_description(&family),
                 family,
-                description: default_parameter_group_description(&baseline),
             });
         }
     }
@@ -856,6 +879,18 @@ pub fn default_parameter_group_name(family: &str) -> String {
 /// every other stored group rather than an absent member.
 pub fn default_parameter_group_description(family: &str) -> String {
     format!("Default parameter group for {family}")
+}
+
+/// `ParameterGroup$Description` of the SEARCH-enabled default group of the engine line
+/// whose family is `family`.
+///
+/// A search baseline is its line's own default group with the vector-search setting
+/// turned on, and the service describes it as exactly that: a CUSTOMIZED default group
+/// of the line's family — the family the group reports, so without the `.search`
+/// qualifier its own name carries — with [`SEARCH_ENABLED_PARAMETER`] at the engine's
+/// on-token. The sentence is fixed text; only the family token comes from the group.
+pub fn search_default_parameter_group_description(family: &str) -> String {
+    format!("Customized default parameter group for {family} with {SEARCH_ENABLED_PARAMETER} {YES}")
 }
 
 /// Why `family` is not a parameter group family this service publishes, or `None` when it
@@ -890,42 +925,45 @@ pub fn immutable_parameter_group_rejection(name: &str, mutation: Mutation) -> Op
         })
 }
 
-/// The message a `ParameterGroupNotFoundFault` carries for the group `name` the request
-/// named.
+/// The message a `ParameterGroupNotFoundFault` carries on the paths that state the
+/// condition WITHOUT naming a group.
 ///
-/// The operations that resolve a parameter group by name and report the name back answer
-/// the absent one through this, so one request's name is reported back in one template
-/// whichever of them it was sent to. Where the service words ONE operation's absent
-/// group differently — the reset's [`PARAMETER_GROUP_NOT_FOUND_FIXED_MESSAGE`], which
-/// names no group — that operation states its own sentence instead, the same way
-/// [`NO_SUCH_CLUSTER_MESSAGE`] does for a cluster.
+/// Fixed text, end to end. The service words this fault per OPERATION: the paths whose
+/// SUBJECT is the group itself — the group describe, the parameter listing, the reset and
+/// the delete — state the condition and report no name, and the paths that report the
+/// name they could not resolve state [`parameter_group_not_found_message`] instead. Both
+/// forms are recorded, so each is held here once and named by the operations that carry
+/// it rather than re-spelled per handler.
+pub const PARAMETER_GROUP_NOT_FOUND_MESSAGE: &str = "Parameter Group not found.";
+
+/// The message a `ParameterGroupNotFoundFault` carries on the paths that REPORT BACK the
+/// group they could not resolve, built from the name the request carried.
+///
+/// The counterpart of [`PARAMETER_GROUP_NOT_FOUND_MESSAGE`]: the group's own update
+/// (`UpdateParameterGroup`) and the cluster writes that POINT a cluster at a group
+/// (`CreateCluster`/`UpdateCluster`'s `ParameterGroupName`) are recorded wording their
+/// unresolved group this way, so they state this sentence.
 pub fn parameter_group_not_found_message(name: &str) -> String {
     format!("ParameterGroup not found: {name}")
 }
 
-/// What `ResetParameterGroup` answers a `ParameterGroupName` this store holds no group
-/// for with.
-///
-/// Fixed text: the condition is stated and the name the request carried is NOT reported
-/// back, unlike [`parameter_group_not_found_message`].
-pub const PARAMETER_GROUP_NOT_FOUND_FIXED_MESSAGE: &str = "Parameter Group not found.";
-
 /// The message the `*NotFoundFault` of `kind` carries for the `name` a request named
 /// the resource by DIRECTLY — in a name member, rather than inside an ARN.
 ///
-/// ONE sentence per kind, built from the name the request carried, so every operation
-/// that resolves a resource of that kind reports an absent one in the same words. The
-/// sentence differs per kind because the service words it per kind, down to its
-/// punctuation; a call that named the resource through an ARN has its own sentence again
-/// ([`ResourceKind::absent_in_arn_message`]). Where the service is RECORDED wording ONE
-/// operation differently — the delete's [`NO_SUCH_CLUSTER_MESSAGE`] — that operation
-/// states its own sentence rather than this one.
+/// ONE sentence per kind, so every operation that resolves a resource of that kind
+/// reports an absent one in the same words. The sentence differs per kind because the
+/// service words it per kind, down to its punctuation and down to whether it names the
+/// resource at all; a call that named the resource through an ARN has its own sentence
+/// again ([`ResourceKind::absent_in_arn_message`]). Where the service is RECORDED
+/// wording ONE operation differently — the delete's [`NO_SUCH_CLUSTER_MESSAGE`], the
+/// update's [`CLUSTER_NOT_FOUND_MESSAGE`] — that operation states its own sentence
+/// rather than this one.
 pub fn not_found_message(kind: ResourceKind, name: &str) -> String {
     match kind {
-        // The ACL sentence carries no full stop, and the parameter group's names the
-        // group after the complaint rather than before it.
+        // The ACL sentence carries no full stop, and the parameter group's names no
+        // group at all.
         ResourceKind::Acl => format!("ACL {name} not found"),
-        ResourceKind::ParameterGroup => parameter_group_not_found_message(name),
+        ResourceKind::ParameterGroup => PARAMETER_GROUP_NOT_FOUND_MESSAGE.to_string(),
         ResourceKind::Cluster
         | ResourceKind::User
         | ResourceKind::Snapshot
@@ -1021,14 +1059,10 @@ pub mod parameter_source {
 /// (`default.memorydb-redis6`, `default.memorydb-redis7`, `default.memorydb-valkey7` —
 /// one per family [`ENGINE_VERSIONS`] publishes), whose settings and defaults are the
 /// Redis OSS / Valkey engine defaults of the corresponding engine line, plus the settings
-/// MemoryDB adds itself. Each `description` is the one-line summary that catalog
-/// publishes for the setting (`Parameter$Description`), which is a phrase rather than a
-/// sentence. `since`/`until` record which engine line a setting belongs to, which is what
-/// makes one family's listing differ from another's.
-///
-/// Every entry is modifiable: MemoryDB's `Parameter` shape models no `IsModifiable`
-/// member, and the settings MemoryDB manages itself (`maxmemory`, `cluster-enabled`,
-/// the append-only settings) are not published as parameters at all.
+/// MemoryDB adds itself. Each `description` and each published value range is SERVICE
+/// data — the same for every account — so it is the catalog's own text and bounds rather
+/// than a paraphrase of them. `since`/`until` record which engine line a setting belongs
+/// to, which is what makes one family's listing differ from another's.
 ///
 /// Every entry is modifiable: MemoryDB's `Parameter` shape models no `IsModifiable`
 /// member, and the settings MemoryDB manages itself (`maxmemory`, `cluster-enabled`,
@@ -1038,7 +1072,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "acllog-max-len",
         default_value: "128",
-        description: "The maximum number of entries in the ACL log",
+        description: "The maximum length of the ACL Log",
         domain: ParameterDomain::Integer { min: 1, max: Some(10_000) },
         since: GENERATION_REDIS6,
         until: None,
@@ -1111,8 +1145,8 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "active-expire-effort",
         default_value: "1",
-        description: "The amount of effort Redis uses to expire items in the active \
-                      expiration job",
+        description: "The amount of effort that redis uses to expire items in the \
+                      active expiration job",
         domain: ParameterDomain::Integer { min: 1, max: Some(10) },
         since: GENERATION_REDIS6,
         until: None,
@@ -1174,10 +1208,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "hll-sparse-max-bytes",
         default_value: "3000",
         description: "HyperLogLog sparse representation bytes limit",
-        // The engine publishes no upper bound for this one: a larger value costs CPU on
-        // every read of a sparse HyperLogLog rather than being rejected, so the
-        // published set is open-ended.
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: 1, max: Some(16_000) },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1218,7 +1249,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "lfu-decay-time",
         default_value: "1",
         description: "The amount of time in minutes to decrement the key counter for \
-                      LFU maxmemory policy",
+                      LFU eviction policyd",
         domain: ParameterDomain::Integer { min: 0, max: None },
         since: GENERATION_REDIS6,
         until: None,
@@ -1226,17 +1257,18 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "lfu-log-factor",
         default_value: "10",
-        description: "The log factor for incrementing key counter for LFU maxmemory \
+        description: "The log factor for incrementing key counter for LFU eviction \
                       policy",
-        domain: ParameterDomain::Integer { min: 0, max: None },
+        domain: ParameterDomain::Integer { min: 1, max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "list-compress-depth",
         default_value: "0",
-        description: "Number of quicklist ziplist nodes from each end of the list to \
-                      exclude from compression",
+        description: "Number of quicklist ziplist nodes from each side of the list to \
+                      exclude from compression. The head and tail of the list are \
+                      always uncompressed for fast push/pop operations",
         domain: ParameterDomain::Integer { min: 0, max: None },
         since: GENERATION_REDIS6,
         until: None,
@@ -1253,7 +1285,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
         name: "maxmemory-samples",
         default_value: "3",
         description: "Max memory samples",
-        domain: ParameterDomain::Integer { min: 1, max: Some(64) },
+        domain: ParameterDomain::Integer { min: 1, max: None },
         since: GENERATION_REDIS6,
         until: None,
     },
@@ -1286,8 +1318,8 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "slowlog-log-slower-than",
         default_value: "10000",
-        description: "The execution time threshold (in microseconds) for logging a \
-                      command in the slow log",
+        description: "The execution time threshold (in microseconds) above which a \
+                      command is logged in the slow log",
         // A command slower than this is logged, and the service caps what a caller may
         // ask for at one second: a threshold above that would log nothing at all.
         domain: ParameterDomain::Integer { min: 0, max: Some(1_000_000) },
@@ -1297,7 +1329,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "slowlog-max-len",
         default_value: "128",
-        description: "The maximum number of entries in the slow log",
+        description: "The maximum length of the slow log",
         domain: ParameterDomain::Integer { min: 0, max: None },
         since: GENERATION_REDIS6,
         until: None,
@@ -1321,8 +1353,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "tcp-keepalive",
         default_value: "300",
-        description: "If non-zero, use SO_KEEPALIVE to send TCP ACKs to clients in \
-                      absence of communication",
+        description: "If non-zero, send ACKs every given number of seconds",
         domain: ParameterDomain::Integer { min: 0, max: None },
         since: GENERATION_REDIS6,
         until: None,
@@ -1342,8 +1373,7 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "tracking-table-max-keys",
         default_value: "1000000",
-        description: "The maximum number of keys in the client-side caching \
-                      invalidation table",
+        description: "The maximum number of keys in the invalidation table",
         domain: ParameterDomain::Integer { min: 1, max: Some(100_000_000) },
         since: GENERATION_REDIS6,
         until: None,
@@ -1432,8 +1462,11 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     },
     EngineParameter {
         name: "latency-tracking",
-        default_value: "no",
-        description: "Specifies whether to track the per-command latencies",
+        default_value: NO,
+        description: "Track the per command latencies and enable exporting the \
+                      percentile distribution via the INFO latencystats command and \
+                      cumulative latency distributions (histograms) via the LATENCY \
+                      command.",
         domain: ParameterDomain::Tokens(YES_NO),
         since: GENERATION_REDIS7,
         until: None,
@@ -1497,20 +1530,23 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     // Valkey-only, so no Redis OSS family publishes these and both are absent from a
     // `memorydb_redis*` listing.
     EngineParameter {
-        name: "search-enabled",
-        default_value: "false",
-        description: "Whether the vector search engine is enabled on the cluster",
-        // Not a Redis OSS setting, and not spelled like one: this is MemoryDB's own,
-        // and the service takes it as a boolean rather than the engine's `yes`/`no`.
-        domain: ParameterDomain::Tokens(TRUE_FALSE),
+        name: SEARCH_ENABLED_PARAMETER,
+        default_value: NO,
+        description: "Enables or disables search",
+        // A boolean engine setting, spelled the way the engine's own configuration
+        // spells its booleans: the service publishes `yes,no` for it and takes those two
+        // tokens, which is also what the search baseline's own group description reports
+        // the setting as ([`search_default_parameter_group_description`]).
+        domain: ParameterDomain::Tokens(YES_NO),
         since: GENERATION_VALKEY,
         until: None,
     },
     EngineParameter {
         name: "search-query-timeout-ms",
         default_value: "10000",
-        description: "The milliseconds a vector search query may run before it is \
-                      cancelled",
+        description: "The timeout in milliseconds for search queries",
+        // A timeout bounds a query, so it is at least one millisecond; the service
+        // publishes no upper bound for it.
         domain: ParameterDomain::Integer { min: 1, max: None },
         since: GENERATION_VALKEY,
         until: None,
@@ -1519,11 +1555,17 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
 
 /// The two tokens every boolean engine parameter takes, in the order MemoryDB
 /// publishes them in `AllowedValues`.
-const YES_NO: &[&str] = &["yes", "no"];
+const YES_NO: &[&str] = &[YES, NO];
 
-/// The two tokens a MemoryDB-own boolean setting takes — the service's own settings are
-/// not spelled the way the engine's configuration spells its booleans.
-const TRUE_FALSE: &[&str] = &["true", "false"];
+/// The token a boolean engine setting takes to turn it ON, and the one that turns it
+/// off, as the engine's own configuration spells them.
+const YES: &str = "yes";
+const NO: &str = "no";
+
+/// MemoryDB's own vector-search switch, named here because the search-enabled default
+/// parameter groups describe themselves by it
+/// ([`search_default_parameter_group_description`]).
+const SEARCH_ENABLED_PARAMETER: &str = "search-enabled";
 
 /// The eviction policies `maxmemory-policy` takes, in the order the engine documents
 /// them.
@@ -2931,6 +2973,50 @@ pub const SUBNET_GROUP_NOT_FOUND_MESSAGE: &str = "Subnet Group not found.";
 /// service's own sentence for the condition, which quotes no value of the request.
 pub const NO_SUCH_CLUSTER_MESSAGE: &str = "Specified cluster does not exist";
 
+/// What a cluster UPDATE answers a `ClusterName` this store does not hold with.
+///
+/// Fixed text, end to end: the condition is stated and the name the request carried is
+/// NOT reported back. The service words this per operation — the delete's sentence is
+/// [`NO_SUCH_CLUSTER_MESSAGE`] and the describe's names the cluster it was asked about
+/// ([`not_found_message`]) — so each one states the sentence recorded for it.
+pub const CLUSTER_NOT_FOUND_MESSAGE: &str = "Cluster not found.";
+
+/// The fewest shards a MemoryDB cluster can be laid out over, and so the lowest value a
+/// shard count a request carries may take.
+pub const MIN_SHARDS_PER_CLUSTER: i32 = 1;
+
+/// The fewest replicas one shard may have: a shard can be laid out with no replica at
+/// all.
+pub const MIN_REPLICAS_PER_SHARD: i32 = 0;
+
+/// What a cluster write answers a replica count outside
+/// [`MIN_REPLICAS_PER_SHARD`]..=[`MAX_REPLICAS_PER_SHARD`] with.
+///
+/// Fixed text: the service states the rule about the NUMBER OF REPLICAS PER SHARD and
+/// the bounds it enforces, naming neither the member the count arrived in
+/// (`CreateCluster$NumReplicasPerShard`, `ReplicaConfigurationRequest$ReplicaCount`) nor
+/// the value the request sent, so both write paths of a cluster's replica count refuse
+/// an out-of-range count in the same words. The bounds in the sentence are the ones the
+/// layout is built against, so the two cannot disagree.
+pub fn replica_count_out_of_range_message() -> String {
+    format!(
+        "The number of replicas per shard must be within {MIN_REPLICAS_PER_SHARD} and \
+         {MAX_REPLICAS_PER_SHARD}."
+    )
+}
+
+/// What a cluster write answers a shard count below [`MIN_SHARDS_PER_CLUSTER`] with.
+///
+/// Fixed text: the service states the rule about the NUMBER OF SHARDS, naming neither
+/// the member the count arrived in (`CreateCluster$NumShards`,
+/// `ShardConfigurationRequest$ShardCount`) nor the value the request sent, so both write
+/// paths of a cluster's shard count refuse a too-small count in the same words. The
+/// bound in the sentence is the one the layout is built against, so the two cannot
+/// disagree.
+pub fn too_few_shards_message() -> String {
+    format!("Number of shards cannot be less than {MIN_SHARDS_PER_CLUSTER}.")
+}
+
 /// What `ResetParameterGroup` answers a request that asks for the whole group to be
 /// reset AND lists individual parameters to reset with.
 ///
@@ -3446,15 +3532,19 @@ impl ResourceKind {
     /// How the service states the identifier rule for a name of this kind that is not a
     /// well-formed identifier — the sentence a caller learns the broken rule from.
     ///
-    /// Both forms end in the same clauses ([`IDENTIFIER_RULE_CLAUSES`]); they differ in
-    /// what they name as the thing refused:
+    /// Every form ends in the same clauses ([`IDENTIFIER_RULE_CLAUSES`]); they differ in
+    /// what they name as the thing refused, and in whether they state the "is not a valid
+    /// identifier" verdict before them, because the service words this refusal per kind:
     ///
     /// * a PARAMETER GROUP's refusal is built from the request: it names the member the
     ///   name arrived in ([`name_member`]) and then states the rule for identifiers
     ///   generally, so a caller — or tooling reading the message — can tell which
     ///   request member was rejected;
-    /// * every other kind states the rule about the service's own label for that
-    ///   identifier ([`name_label`]), which is how this service words those refusals.
+    /// * a CLUSTER's names the service's own label for the identifier it was given
+    ///   ([`name_label`]) and states the same verdict after it;
+    /// * every other kind states the rule about that label alone, which is the form this
+    ///   service's recorded user- and ACL-name refusals carry, and so the one a kind no
+    ///   recorded call covers takes.
     ///
     /// [`name_member`]: ResourceKind::name_member
     /// [`name_label`]: ResourceKind::name_label
@@ -3463,6 +3553,11 @@ impl ResourceKind {
             Self::ParameterGroup | Self::MultiRegionParameterGroup => format!(
                 "The parameter {} is not a valid identifier. Identifiers {}",
                 self.name_member(),
+                IDENTIFIER_RULE_CLAUSES
+            ),
+            Self::Cluster => format!(
+                "{} specified is not a valid identifier. Identifiers {}",
+                self.name_label(),
                 IDENTIFIER_RULE_CLAUSES
             ),
             _ => format!("{} {}", self.name_label(), IDENTIFIER_RULE_CLAUSES),

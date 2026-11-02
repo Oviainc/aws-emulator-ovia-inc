@@ -198,7 +198,9 @@ fn updates_for(family: &str) -> Vec<(&'static str, &'static str)> {
         ("hll-sparse-max-bytes", "3000"),
     ];
     if is_valkey(family) {
-        rows.push(("search-enabled", "true"));
+        // The service's own vector-search switch, which takes the engine's boolean
+        // tokens like every other boolean setting.
+        rows.push(("search-enabled", "yes"));
     }
     rows
 }
@@ -577,11 +579,6 @@ async fn each_family_carries_the_settings_of_its_own_engine_line() {
                     "case {case:?}: expected a {member}, got {parameter}"
                 );
             }
-            assert!(
-                !field(parameter, "Description", &case).ends_with('.'),
-                "case {case:?}: a published description is a phrase, not a sentence, \
-                 got {parameter}"
-            );
             let data_type = field(parameter, "DataType", &case);
             assert!(
                 data_type == "integer" || data_type == "string",

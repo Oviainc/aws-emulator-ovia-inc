@@ -453,8 +453,9 @@ async fn a_token_resumes_the_listing_at_any_served_page_size() {
 
 /// A name that is not a well-formed identifier is refused with the sentence the service
 /// words that kind of refusal in — a parameter group's names the REQUEST MEMBER the name
-/// arrived in, every other kind's the service's own label for that identifier — over
-/// every form of malformed name, and a well-formed name is accepted by the same path.
+/// arrived in, a cluster's its own label for the identifier plus the service's verdict,
+/// the RBAC kinds' that label alone — over every form of malformed name, and a
+/// well-formed name is accepted by the same path.
 #[tokio::test]
 async fn a_malformed_identifier_is_refused_in_the_wording_for_that_kind_of_resource() {
     let router = router();
@@ -482,7 +483,13 @@ async fn a_malformed_identifier_is_refused_in_the_wording_for_that_kind_of_resou
         ),
         ("CreateUser", format!("User id {IDENTIFIER_CLAUSES}")),
         ("CreateACL", format!("ACL name {IDENTIFIER_CLAUSES}")),
-        ("CreateCluster", format!("Cluster name {IDENTIFIER_CLAUSES}")),
+        (
+            "CreateCluster",
+            format!(
+                "Cluster name specified is not a valid identifier. Identifiers \
+                 {IDENTIFIER_CLAUSES}"
+            ),
+        ),
     ];
 
     for (operation, wanted) in creates {

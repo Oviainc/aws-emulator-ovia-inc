@@ -281,12 +281,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `CreateCluster`'s `NumShards`, `ShardCount` arrives as a bare `i32` with
             // no modelled range and sizes the stored shard and node lists, so a value
             // outside 1..=MAX_SHARDS_PER_CLUSTER is refused rather than allocated.
-            if shards.shard_count < 1 {
+            if shards.shard_count < crate::state::MIN_SHARDS_PER_CLUSTER {
                 return Err(UpdateClusterErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(
-                            "ShardConfiguration.ShardCount must be at least 1.".to_string(),
-                        ),
+                        message: Some(crate::state::too_few_shards_message()),
                     },
                 )
                 .into());
@@ -307,13 +305,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         if let Some(replicas) = input.replica_configuration.as_ref() {
-            if !(0..=crate::state::MAX_REPLICAS_PER_SHARD).contains(&replicas.replica_count) {
+            if !(crate::state::MIN_REPLICAS_PER_SHARD..=crate::state::MAX_REPLICAS_PER_SHARD)
+                .contains(&replicas.replica_count)
+            {
                 return Err(UpdateClusterErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(format!(
-                            "ReplicaConfiguration.ReplicaCount must be between 0 and {}.",
-                            crate::state::MAX_REPLICAS_PER_SHARD
-                        )),
+                        message: Some(crate::state::replica_count_out_of_range_message()),
                     },
                 )
                 .into());
@@ -331,10 +328,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.clusters.contains_key(&cluster_name) {
             return Err(UpdateClusterErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
-                    message: Some(crate::state::not_found_message(
-                        crate::state::ResourceKind::Cluster,
-                        &cluster_name,
-                    )),
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

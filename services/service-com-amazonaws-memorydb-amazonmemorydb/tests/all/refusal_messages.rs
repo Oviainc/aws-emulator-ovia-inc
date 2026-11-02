@@ -15,9 +15,10 @@
 //! * a name refusal states the service's ONE rule for that kind of resource: the length
 //!   clause names the identifier the way the service names it (`User id`, `ACL name`, …),
 //!   and the spelling clause names the REQUEST MEMBER for a parameter group ("The
-//!   parameter ParameterGroupName is not a valid identifier. …") and the service's own
-//!   label for the other kinds — and says the same whether the name was caught by the
-//!   model's half of the rule or by the service's tighter half;
+//!   parameter ParameterGroupName is not a valid identifier. …"), the service's own label
+//!   plus that verdict for a cluster, and that label alone for the other kinds — and says
+//!   the same whether the name was caught by the model's half of the rule or by the
+//!   service's tighter half;
 //! * a password refusal states the documented length bound, a password-count refusal
 //!   states the service's maximum, and an `AuthenticationMode` whose type and
 //!   `Passwords` do not go together names the type it refused — for every operation
@@ -57,6 +58,23 @@ const ACCESS: &str = "on ~* +@all";
 
 /// A parameter group family the engine catalog publishes.
 const FAMILY: &str = "memorydb_valkey7";
+
+/// The clauses every spelling refusal of a MemoryDB identifier ends with, whichever
+/// subject the kind of resource states them about.
+const IDENTIFIER_RULE_CLAUSES: &str = "must begin with a letter; must contain only ASCII \
+                                       letters, digits, and hyphens; and must not end \
+                                       with a hyphen or contain two consecutive hyphens.";
+
+/// What a kind of resource's spelling refusal states the identifier rule ABOUT.
+#[derive(Debug, Clone, Copy)]
+enum Subject {
+    /// The service's own label for the identifier, and nothing else.
+    Label,
+    /// That label, followed by the service's "is not a valid identifier" verdict.
+    LabelAndVerdict,
+    /// The request member the name arrived in, followed by that verdict.
+    Member(&'static str),
+}
 
 /// The `Message` of a failure body, under either spelling of the member.
 fn error_message(body: &Value, case: &str) -> String {
@@ -114,10 +132,11 @@ fn create_body(operation: &str, name: &str) -> Value {
 /// A name refusal states the service's ONE name rule for that kind of resource: the
 /// length clause names the published bound, the spelling clause names every part of the
 /// rule, and each names what the SERVICE names when it refuses that kind of identifier —
-/// its own label, or, for a parameter group, the request member the name arrived in —
-/// for every kind of resource that takes a name, and whichever half of the rule the name
-/// broke (the model's `@pattern`, refused at the boundary, or the service's tighter rule,
-/// refused by the handler).
+/// its own label, that label with the "is not a valid identifier" verdict, or, for a
+/// parameter group, the request member the name arrived in — for every kind of resource
+/// that takes a name, and whichever half of the rule the name broke (the model's
+/// `@pattern`, refused at the boundary, or the service's tighter rule, refused by the
+/// handler).
 #[tokio::test]
 async fn a_name_refusal_states_the_services_own_rule_for_that_resource() {
     let router = router();
@@ -143,37 +162,37 @@ async fn a_name_refusal_states_the_services_own_rule_for_that_resource() {
         ("two consecutive hyphens", "double--hyphen".to_string(), false),
     ];
     // One row per name-taking create, with the label the service gives that kind of
-    // resource's identifier and — where its spelling refusal is built from the request
-    // instead — the member the name arrived in.
-    let kinds: &[(&str, &str, Option<&str>)] = &[
-        ("CreateUser", "User id", None),
-        ("CreateACL", "ACL name", None),
+    // resource's identifier and the SUBJECT its spelling refusal states the identifier
+    // rule about: the label alone, the label with the service's verdict after it, or the
+    // request member the name arrived in.
+    let kinds: &[(&str, &str, Subject)] = &[
+        ("CreateUser", "User id", Subject::Label),
+        ("CreateACL", "ACL name", Subject::Label),
         (
             "CreateParameterGroup",
             "Parameter group name",
-            Some("ParameterGroupName"),
+            Subject::Member("ParameterGroupName"),
         ),
-        ("CreateCluster", "Cluster name", None),
+        ("CreateCluster", "Cluster name", Subject::LabelAndVerdict),
     ];
 
-    for (create, label, member) in kinds {
+    for (create, label, subject) in kinds {
         for (name_case, name, breaks_length) in &names {
             let case = format!("{create}/{name_case}");
             let wanted = if *breaks_length {
                 format!("{label} length must be less than {MAX_RESOURCE_NAME_LEN}.")
-            } else if let Some(member) = member {
-                format!(
-                    "The parameter {member} is not a valid identifier. Identifiers must \
-                     begin with a letter; must contain only ASCII letters, digits, and \
-                     hyphens; and must not end with a hyphen or contain two consecutive \
-                     hyphens."
-                )
             } else {
-                format!(
-                    "{label} must begin with a letter; must contain only ASCII letters, \
-                     digits, and hyphens; and must not end with a hyphen or contain two \
-                     consecutive hyphens."
-                )
+                match subject {
+                    Subject::Label => format!("{label} {IDENTIFIER_RULE_CLAUSES}"),
+                    Subject::LabelAndVerdict => format!(
+                        "{label} specified is not a valid identifier. Identifiers \
+                         {IDENTIFIER_RULE_CLAUSES}"
+                    ),
+                    Subject::Member(member) => format!(
+                        "The parameter {member} is not a valid identifier. Identifiers \
+                         {IDENTIFIER_RULE_CLAUSES}"
+                    ),
+                }
             };
             let (status, code, message) =
                 refused(&router, create, &create_body(create, name), &case).await;
@@ -939,7 +958,9 @@ async fn the_other_parameter_update_refusals_use_the_services_templates() {
         );
     }
 
-    // A group that is not in state names the group the request named.
+    // A group that is not in state is answered with the template of the operation that
+    // resolved it: the update reports the name it could not resolve, the read states the
+    // condition alone.
     for group in ["no-such-group", "refusal-shape", "refusal-shapes-2"] {
         let case = format!("absent group {group:?}");
         let (status, answered) = update_parameters(&router, group, &[("timeout", "30")]).await;
@@ -953,7 +974,6 @@ async fn the_other_parameter_update_refusals_use_the_services_templates() {
             format!("ParameterGroup not found: {group}"),
             "case {case:?}: expected the service's not-found template"
         );
-        // The same template whichever operation resolved the group.
         let (status, answered) = call(
             &router,
             "DescribeParameters",
@@ -967,7 +987,7 @@ async fn the_other_parameter_update_refusals_use_the_services_templates() {
         );
         assert_eq!(
             error_message(&answered, &case),
-            format!("ParameterGroup not found: {group}"),
+            "Parameter Group not found.",
             "case {case:?}: expected the service's not-found template on the read"
         );
     }

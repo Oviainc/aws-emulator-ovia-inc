@@ -17,6 +17,8 @@ mod acl_membership;
 mod acl_pending_changes;
 #[path = "all/arn_addressed_refusals.rs"]
 mod arn_addressed_refusals;
+#[path = "all/aws_message_templates.rs"]
+mod aws_message_templates;
 #[path = "all/canonical_access_string.rs"]
 mod canonical_access_string;
 #[path = "all/cluster_lifecycle.rs"]

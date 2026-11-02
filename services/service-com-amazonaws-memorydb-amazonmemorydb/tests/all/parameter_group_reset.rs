@@ -113,7 +113,7 @@ const RESET_CASES: &[ResetCase] = &[
         family: "memorydb_valkey7",
         set: &[
             ("activerehashing", "no"),
-            ("search-enabled", "true"),
+            ("search-enabled", "yes"),
             ("active-expire-effort", "10"),
         ],
         select: Select::Named(&["activerehashing", "search-enabled"]),

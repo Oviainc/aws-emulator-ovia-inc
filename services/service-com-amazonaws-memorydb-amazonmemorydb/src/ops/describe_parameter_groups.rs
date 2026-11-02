@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         DescribeParameterGroupsErrorModeled::ParameterGroupNotFoundFault(
                             ParameterGroupNotFoundFault {
                                 message: Some(
-                                    crate::state::parameter_group_not_found_message(name),
+                                    crate::state::PARAMETER_GROUP_NOT_FOUND_MESSAGE.to_string(),
                                 ),
                             },
                         )

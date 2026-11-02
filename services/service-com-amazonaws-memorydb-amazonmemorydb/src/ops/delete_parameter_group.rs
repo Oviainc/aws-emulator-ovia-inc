@@ -154,36 +154,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let region = crate::state::request_region(ctx);
-        // A parameter-group name is a case-insensitive identifier, so the name this
-        // request deletes is folded exactly as the store is keyed.
-        let parameter_group_name = crate::state::fold_name(&input.parameter_group_name);
-        let mut state = state.lock();
-        state.settle(std::time::Instant::now());
-        // The groups the account ALREADY HAD before any call — the `default.<family>`
-        // ones MemoryDB owns — are materialised on first touch, exactly as
-        // `DescribeParameterGroups` does, so a delete naming one is refused as the
-        // service's own group rather than answered not-found for it.
-        state.ensure_builtins(&region);
-
-        // WHICH GROUP FIRST: a request naming a group state does not hold is answered
-        // not-found whatever else is wrong with it.
-        let Some(group) = state.parameter_groups.get(&parameter_group_name) else {
-            return Err(DeleteParameterGroupErrorModeled::ParameterGroupNotFoundFault(
-                ParameterGroupNotFoundFault {
-                    message: Some(crate::state::parameter_group_not_found_message(
-                        &parameter_group_name,
-                    )),
-                },
-            )
-            .into());
-        };
-        // "You cannot delete the default parameter groups in your account": a group
-        // MemoryDB itself provides carries a family's engine defaults, so it is not the
-        // caller's to remove. The refusal is the one rule every write path over a
-        // parameter group reads.
-        if let Some(message) = crate::state::immutable_parameter_group_rejection(
-            &parameter_group_name,
-            crate::state::Mutation::Delete,
+        // THE IDENTIFIER'S SYNTAX FIRST. `ParameterGroupName` is an unconstrained
+        // `String` in the model, and the service refuses a name that is not a
+        // well-formed identifier before it reads the name as a group at all — so a
+        // malformed name is answered with the rule it broke rather than with whatever
+        // the store happens to hold under it (the `default.<family>` groups MemoryDB
+        // owns are not legal identifiers either, which is why the default-group
+        // protection below is never what a dotted name is refused with). The sentence is
+        // the one rule every name of this kind is refused by.
+        if let Some(message) = crate::state::resource_name_rejection(
+            crate::state::ResourceKind::ParameterGroup,
+            &input.parameter_group_name,
         ) {
             return Err(
                 DeleteParameterGroupErrorModeled::InvalidParameterValueException(
@@ -194,6 +175,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // A parameter-group name is a case-insensitive identifier, so the name this
+        // request deletes is folded exactly as the store is keyed.
+        let parameter_group_name = crate::state::fold_name(&input.parameter_group_name);
+        let mut state = state.lock();
+        state.settle(std::time::Instant::now());
+        // The groups the account ALREADY HAD before any call — the `default.<family>`
+        // ones MemoryDB owns — are materialised on first touch, exactly as
+        // `DescribeParameterGroups` does, so the lookup below answers over the same set
+        // of groups a describe reports.
+        state.ensure_builtins(&region);
+
+        // WHICH GROUP NEXT: a name that IS a well-formed identifier but that state holds
+        // no group for is answered not-found, whatever else is wrong with the request.
+        let Some(group) = state.parameter_groups.get(&parameter_group_name) else {
+            return Err(DeleteParameterGroupErrorModeled::ParameterGroupNotFoundFault(
+                ParameterGroupNotFoundFault {
+                    message: Some(crate::state::PARAMETER_GROUP_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        // A group MemoryDB itself provides is not the caller's to remove ("You cannot
+        // delete the default parameter groups in your account") — and the identifier rule
+        // above is what refuses one: every family's `default.<family>` name carries a
+        // dot, so such a name is not a well-formed identifier and never reaches a lookup
+        // at all. The rule itself stays in
+        // `crate::state::immutable_parameter_group_rejection`, which the parameter-group
+        // MODIFY paths read.
         // "You cannot delete a parameter group if it is associated with any clusters":
         // a cluster's settings come from the group it names, so a group still named by
         // one cannot go away under it. The list is derived from the clusters in state,

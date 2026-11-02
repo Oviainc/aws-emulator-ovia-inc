@@ -121,6 +121,73 @@ fn name_rule_message(violation: &smithy_server_runtime::Violation) -> Option<Str
     crate::state::resource_name_rejection(*kind, value)
 }
 
+/// The members a request carries a LIST in whose over-long value this service words
+/// itself, and the sentence each one takes, with `{max}` standing for the maximum the
+/// model declares.
+///
+/// A violation states its member as the last segment of a dotted path, in lowerCamel, so
+/// the lookup below matches the segment case-insensitively, exactly as [`NAME_MEMBERS`]
+/// does.
+const LIST_LENGTH_MEMBERS: &[(&str, &str)] = &[(
+    "clusterNames",
+    "Too many cluster names provided. Maximum is {max}.",
+)];
+
+/// This service's own wording for a list the MODEL refused as too long, or `None` when
+/// the violation is not about a list this service words itself.
+///
+/// A `@length` maximum on a list a request carries is a SERVICE limit, and the service
+/// states it in its own sentence: what there were too many of, and the maximum. That
+/// maximum comes from the violation — i.e. from the model's own bound — so the sentence
+/// cannot name a limit the validator does not enforce, and the over-long value itself is
+/// not echoed.
+fn list_length_rule_message(violation: &smithy_server_runtime::Violation) -> Option<String> {
+    use smithy_server_runtime::ViolationKind;
+    let ViolationKind::MaxLength(max) = violation.kind else {
+        return None;
+    };
+    let member = violation.path.rsplit('.').next()?;
+    LIST_LENGTH_MEMBERS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(member))
+        .map(|(_, sentence)| sentence.replace("{max}", &max.to_string()))
+}
+
+/// This service's own wording for a value the MODEL refused because it is outside an
+/// enumerated type's value set, or `None` for an enum this service words no sentence of
+/// its own for.
+///
+/// MemoryDB states a rejected enum value in ITS OWN sentence per enumerated type, not in
+/// the generic constraint clause: the sentence is a property of the TYPE the member
+/// targets, so the violation is matched on the value set the model declares for it (the
+/// generated catalogs in `crate::ops::types`) rather than on a member path, and every
+/// member targeting that type is refused in the same words however deep in the request
+/// it sat. An enum with no sentence of this service's own keeps the framework's clause.
+fn enum_rule_message(violation: &smithy_server_runtime::Violation) -> Option<String> {
+    use smithy_server_runtime::ViolationKind;
+    let ViolationKind::EnumValue(allowed) = &violation.kind else {
+        return None;
+    };
+    // The generated catalogs are sorted, the violation lists the model's own order, so
+    // the two are compared as the SETS they are.
+    let targets = |catalog: &[&str]| {
+        let mut declared: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        declared.sort_unstable();
+        declared == catalog
+    };
+    if targets(crate::ops::types::SOURCE_TYPE_VALUES) {
+        return Some(crate::state::INVALID_EVENT_SOURCE_TYPE_MESSAGE.to_string());
+    }
+    if targets(crate::ops::types::SERVICE_UPDATE_STATUS_VALUES) {
+        // This one reports the rejected status back, so it needs the value the request
+        // sent; an enum member is only refused when it HELD one.
+        return Some(crate::state::invalid_service_update_status_message(
+            violation.value.as_deref()?,
+        ));
+    }
+    None
+}
+
 /// The `com-amazonaws-memorydb-amazonmemorydb` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -205,11 +272,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                     // and nothing invented here — except a RESOURCE NAME, which this
                     // service states in its own one-sentence rule (see
                     // [`name_rule_message`]) so that the boundary and the handler
-                    // refuse a name with the same words.
+                    // refuse a name with the same words, and a value outside an
+                    // enumerated type this service words itself (see
+                    // [`enum_rule_message`]).
                     message: value_violations
                         .iter()
                         .map(|violation| {
                             name_rule_message(violation)
+                                .or_else(|| enum_rule_message(violation))
+                                .or_else(|| list_length_rule_message(violation))
                                 .unwrap_or_else(|| violation.message())
                         })
                         .collect::<Vec<_>>()

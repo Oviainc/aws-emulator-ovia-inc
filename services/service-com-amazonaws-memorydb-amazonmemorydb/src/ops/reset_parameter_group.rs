@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ResetParameterGroupErrorModeled::ParameterGroupNotFoundFault(
                 ParameterGroupNotFoundFault {
                     message: Some(
-                        crate::state::PARAMETER_GROUP_NOT_FOUND_FIXED_MESSAGE.to_string(),
+                        crate::state::PARAMETER_GROUP_NOT_FOUND_MESSAGE.to_string(),
                     ),
                 },
             )

@@ -189,13 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // `SourceType` is a modelled enum, and the deserializer carries its value
         // through as a string, so the token is checked against the GENERATED catalog
-        // here — a value no `SourceType` names selects nothing.
+        // here — a value no `SourceType` names selects nothing. The boundary validator
+        // refuses such a value first; both state the service's own sentence for it, so
+        // the two cannot word the one rule differently.
         if let Some(source_type) = input.source_type.as_deref() {
             if !crate::ops::types::SOURCE_TYPE_VALUES.contains(&source_type) {
-                return Err(invalid_value(format!(
-                    "SourceType must be one of {} — got {source_type:?}.",
-                    crate::ops::types::SOURCE_TYPE_VALUES.join(", ")
-                )));
+                return Err(invalid_value(
+                    crate::state::INVALID_EVENT_SOURCE_TYPE_MESSAGE.to_string(),
+                ));
             }
         }
         // A `SourceName` identifies a source WITHIN a kind of source: two kinds can
