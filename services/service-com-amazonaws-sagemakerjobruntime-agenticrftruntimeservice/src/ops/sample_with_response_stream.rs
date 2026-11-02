@@ -170,13 +170,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let request_content_type = ctx
-            .parts()
-            .headers
-            .get(::http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-
         let now = ::std::time::SystemTime::now();
         let job_arn = input.job_arn.clone();
         let trajectory_id = input.trajectory_id.clone();
@@ -184,7 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The SAME state path as `Sample` — the crate's ONE sampling path
         // (`crate::state::serve_sampling_turn`) — so one trajectory can mix turns
         // served by either operation and the two cannot drift; only the framing of
-        // the response body differs.
+        // the response body differs. What the captured turn records about the
+        // REQUEST — the `Content-Type` the caller labelled its payload with — is
+        // read by that shared path out of the headers handed to it here.
         let turn = crate::state::serve_sampling_turn(
             &*self.engine,
             &state,
@@ -192,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 job_arn: &job_arn,
                 trajectory_id: &trajectory_id,
                 request_body: &prompt,
-                request_content_type,
+                headers: &ctx.parts().headers,
                 streamed: true,
                 at: now,
             },

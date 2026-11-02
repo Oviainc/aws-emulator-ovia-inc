@@ -43,6 +43,9 @@ mod refused_sampling_leaves_no_trajectory;
 #[path = "all/rejected_value_echo.rs"]
 mod rejected_value_echo;
 
+#[path = "all/request_content_type_is_read_once.rs"]
+mod request_content_type_is_read_once;
+
 #[path = "all/reward_resolution_precedes_its_own_checks.rs"]
 mod reward_resolution_precedes_its_own_checks;
 

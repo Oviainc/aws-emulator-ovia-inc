@@ -401,7 +401,7 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
         let response_bytes = response_body.len();
         trajectory.turns.push(Turn {
             request_body: request.request_body.to_vec(),
-            request_content_type: request.request_content_type.clone(),
+            request_content_type: request.request_content_type(),
             response_body,
             response_content_type: Some(response_content_type),
             streamed: request.streamed,
@@ -417,8 +417,8 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
 }
 
 /// What one sampling call brings to a trajectory: which trajectory it is for,
-/// the prompt it carries and how it was labelled, which sampling operation
-/// served it, and when.
+/// the prompt it carries and the headers it labelled that prompt with, which
+/// sampling operation served it, and when.
 #[derive(Debug, Clone)]
 pub struct TurnRequest<'a> {
     /// The job the rollout belongs to.
@@ -427,12 +427,32 @@ pub struct TurnRequest<'a> {
     pub trajectory_id: &'a str,
     /// The raw inference request body.
     pub request_body: &'a [u8],
-    /// The `Content-Type` the caller labelled the request body with.
-    pub request_content_type: Option<String>,
+    /// The headers the sampling call arrived with, which is where everything a
+    /// captured turn records about HOW the caller labelled its payload is read
+    /// from ([`TurnRequest::request_content_type`]).
+    pub headers: &'a ::http::HeaderMap,
     /// Whether `SampleWithResponseStream`, rather than `Sample`, serves it.
     pub streamed: bool,
     /// The instant the turn is served at.
     pub at: SystemTime,
+}
+
+impl TurnRequest<'_> {
+    /// The `Content-Type` the caller labelled the request body with, when it
+    /// sent one a header value can be read as text.
+    ///
+    /// Read HERE rather than at either handler: what a captured turn records
+    /// about the request is the same for both sampling operations, so the read
+    /// belongs to the one sampling path they share ([`serve_sampling_turn`]) and
+    /// neither of them can drift from the other on how a turn of one trajectory
+    /// labels its prompt.
+    #[must_use]
+    pub fn request_content_type(&self) -> Option<String> {
+        self.headers
+            .get(::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
 }
 
 /// What one captured turn served its caller: the response body and its
@@ -722,7 +742,10 @@ impl SamplingRefusal {
 /// left to each of them is what genuinely differs: the response body it renders
 /// (`respond`), the `Content-Type` that body carries, the `streamed` flag the
 /// captured turn records, and the modelled error enum it reports a
-/// [`SamplingRefusal`] through.
+/// [`SamplingRefusal`] through. Everything a captured turn records about the
+/// REQUEST — including the `Content-Type` the caller labelled its payload with
+/// ([`TurnRequest::request_content_type`]) — is derived here, from the request
+/// this path is handed.
 ///
 /// In order: a request carrying no inference request payload is refused; then
 /// the `JobArn` is resolved, because it names the job the turn belongs to,
