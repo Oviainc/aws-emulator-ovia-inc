@@ -173,10 +173,11 @@ pub const QUICK_RESPONSE_TYPE_MARKDOWN: &str = "application/x.quickresponse;form
 
 /// The sentence this endpoint answers a request addressed to a quick response a
 /// knowledge base does not hold with — fixed service text, worded as
-/// [`MESSAGE_KNOWLEDGE_BASE_NOT_FOUND`] words the parent resource of the same family.
-/// The requested label travels in `ResourceNotFoundException`'s own `resourceName`
-/// member.
-pub const MESSAGE_QUICK_RESPONSE_NOT_FOUND: &str = "Quick Response does not exist.";
+/// [`MESSAGE_KNOWLEDGE_BASE_NOT_FOUND`] words the parent resource of the same family,
+/// with the resource token spelled as the recorded wire answer of this endpoint spells it:
+/// one word, as the API itself names the resource. The requested label travels in
+/// `ResourceNotFoundException`'s own `resourceName` member.
+pub const MESSAGE_QUICK_RESPONSE_NOT_FOUND: &str = "QuickResponse does not exist.";
 
 /// The sentence a create past [`MAX_QUICK_RESPONSES_PER_KNOWLEDGE_BASE`] is refused
 /// with, stating the RULE — the ceiling and what to do about it — and carrying nothing
@@ -217,6 +218,21 @@ pub fn message_value_in_use(member: &str) -> String {
 /// request member whose value must be unique inside the knowledge base.
 pub const MEMBER_QUICK_RESPONSE_NAME: &str = "name";
 pub const MEMBER_SHORTCUT_KEY: &str = "shortcut key";
+
+/// The sentence an update that both SETS a member and asks for that same member to be
+/// REMOVED is refused with.
+///
+/// `UpdateQuickResponse` pairs three optional members with a `remove…` flag
+/// (`smithy_query(query="operation",operation="UpdateQuickResponse")`:
+/// `description`/`removeDescription`, `shortcutKey`/`removeShortcutKey`,
+/// `groupingConfiguration`/`removeGroupingConfiguration`), and a request carrying both
+/// halves of a pair asks for two incompatible outcomes on one member, so it is refused
+/// with the modelled `ValidationException` rather than silently resolved one way. The
+/// sentence states the rule and names the two members as the model declares them,
+/// carrying no value from the request.
+pub fn message_conflicting_update_members(set_member: &str, remove_member: &str) -> String {
+    format!("Cannot specify both {set_member} and {remove_member}.")
+}
 
 /// The most tags one resource carries.
 ///
@@ -924,6 +940,10 @@ pub struct QuickResponse {
     /// When this record last changed. Equal to [`Self::created_at`] until an update
     /// writes it, so `lastModifiedTime` is never earlier than `createdTime`.
     pub last_modified_at: SystemTime,
+    /// The ARN of the identity that last wrote this record ([`caller_principal`]),
+    /// stamped by the create and re-stamped by every update, so a read reports who
+    /// wrote the values it is reading rather than who is reading them.
+    pub last_modified_by: String,
 }
 
 impl QuickResponse {
@@ -963,11 +983,9 @@ impl QuickResponse {
             description: self.description.clone(),
             grouping_configuration: self.grouping_configuration.clone(),
             shortcut_key: self.shortcut_key.clone(),
-            // `lastModifiedBy` is the ARN of the identity that last wrote the resource.
-            // Nothing in this emulator attributes a write to an identity — a request's
-            // credential scope carries no principal ARN — so the member stays absent
-            // rather than carrying an ARN nothing minted.
-            last_modified_by: None,
+            // `lastModifiedBy` is the ARN of the identity that last wrote the resource,
+            // which this record carries because each write stamped it.
+            last_modified_by: Some(self.last_modified_by.clone()),
             is_active: self.is_active,
             channels: self.channels.clone(),
             language: self.language.clone(),
@@ -992,7 +1010,7 @@ impl QuickResponse {
             created_time: ::aws_smithy_types::DateTime::from(self.created_at),
             last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_at),
             description: self.description.clone(),
-            last_modified_by: None,
+            last_modified_by: Some(self.last_modified_by.clone()),
             is_active: self.is_active,
             channels: self.channels.clone(),
             tags: wire_tags(&self.tags),
@@ -1831,6 +1849,49 @@ impl ComAmazonawsWisdomWisdomserviceState {
         true
     }
 
+    /// The same quick response as [`Self::quick_response`], for a caller that WRITES to
+    /// it: the seam `UpdateQuickResponse` applies its changes through, so an update and
+    /// a read reach one record rather than two copies.
+    pub fn quick_response_mut(
+        &mut self,
+        knowledge_base_label: &str,
+        quick_response_label: &str,
+    ) -> Option<&mut QuickResponse> {
+        let knowledge_base_id = self.resolve_knowledge_base_id(knowledge_base_label)?;
+        let quick_response_id = self.resolve_quick_response_id(quick_response_label)?;
+        self.quick_responses
+            .get_mut(&quick_response_id)
+            .filter(|quick_response| quick_response.knowledge_base_id == knowledge_base_id)
+    }
+
+    /// Drop a quick response and every index entry that named it — including the
+    /// `clientToken` entry that created it, so a create/delete cycle reclaims everything
+    /// it allocated and a replayed token cannot resurrect a deleted record.
+    ///
+    /// The name and the shortcut key go with it, so a later create may take either again:
+    /// both identify a LIVE quick response of the knowledge base, not one that is gone.
+    /// `None` means the label pair named no quick response of that knowledge base, which
+    /// is the caller's not-found.
+    pub fn remove_quick_response(
+        &mut self,
+        knowledge_base_label: &str,
+        quick_response_label: &str,
+    ) -> Option<QuickResponse> {
+        let quick_response_id = self
+            .quick_response(knowledge_base_label, quick_response_label)?
+            .quick_response_id
+            .clone();
+        let quick_response = self.quick_responses.remove(&quick_response_id)?;
+        self.quick_response_arn_index
+            .remove(&quick_response.quick_response_arn);
+        self.idempotency
+            .retain(|_, created| created.resource_id != quick_response_id);
+        // The order queue mirrors the map, so it drops exactly the same entries.
+        self.idempotency_order
+            .retain(|key| self.idempotency.contains_key(key));
+        Some(quick_response)
+    }
+
     /// Drop a knowledge base and every index entry that named it — including the
     /// `clientToken` entry that created it, so a create/delete cycle reclaims
     /// everything it allocated and a replayed token cannot resurrect a deleted record.
@@ -2276,6 +2337,24 @@ pub fn request_region(headers: &::http::HeaderMap) -> String {
     ::emulator_server::sigv4_credential_scope(headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The ARN of the identity a write of this endpoint is attributed to — what
+/// `lastModifiedBy` (a `GenericArn`, "The Amazon Resource Name (ARN) of the user who last
+/// updated the quick response data") carries.
+///
+/// The emulator publishes ONE long-term access key, and on AWS a long-term key belongs to
+/// an IAM user of the account; that user is stated once for the whole tree
+/// (`service_common::caller_principal`) and is the identity `sts:GetCallerIdentity`
+/// answers with, so the principal a resource names as its author is the principal a client
+/// reads as itself. It is a function of the account contract alone, so it is the same on
+/// every call and across restarts, and it satisfies the member's own pattern
+/// (`^arn:[a-z-]+?:[a-z-]+?:[a-z0-9-]*?:([0-9]{12})?:[a-zA-Z0-9-:/]+$`). The Amazon Q in
+/// Connect view of this same endpoint attributes a write to the same identity
+/// (`services/service-com-amazonaws-qconnect-wisdomservice/src/state.rs`), so a client
+/// cannot read a different author depending on which model it addressed.
+pub fn caller_principal() -> String {
+    ::service_common::caller_principal::ambient_user_arn()
 }
 
 /// The ARN of an assistant: `arn:aws:wisdom:<region>:<account>:assistant/<id>`.

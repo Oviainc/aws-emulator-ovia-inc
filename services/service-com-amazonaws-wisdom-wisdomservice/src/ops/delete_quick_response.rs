@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteQuickResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteQuickResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteQuickResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the quick response the route names from the knowledge base that
+//! holds it, releasing its ARN index entry, the `clientToken` entry that created it, and
+//! the `name` and `shortcutKey` it held — so every later read of that id is the modelled
+//! `ResourceNotFoundException`, and the 204 carries no document. A label pair naming no
+//! quick response of that knowledge base is that same not-found.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +139,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteQuickResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteQuickResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteQuickResponse"))
+        // The modelled `UuidOrArn` patterns on both labels are already refused BEFORE
+        // this handler runs, so reaching here means each is a well-formed id or ARN;
+        // whether the pair names a stored record is decided below, out of the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: nothing can be deleted,
+            // and this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteQuickResponse",
+            ));
+        };
+        let mut state = state.lock();
+        // A quick response is reachable only through the knowledge base it was created
+        // under, so the parent is resolved first and a knowledge base this account does
+        // not hold is reported as the resource that is missing.
+        if state
+            .resolve_knowledge_base_id(&input.knowledge_base_id)
+            .is_none()
+        {
+            return Err(DeleteQuickResponseErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.knowledge_base_id.clone()),
+                },
+            )
+            .into());
+        }
+        // The record and every index entry that named it go together, so a later read
+        // cannot answer out of a leftover index. A label pair that crosses one knowledge
+        // base with another's quick response names nothing either.
+        if state
+            .remove_quick_response(&input.knowledge_base_id, &input.quick_response_id)
+            .is_none()
+        {
+            return Err(DeleteQuickResponseErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_QUICK_RESPONSE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.quick_response_id.clone()),
+                },
+            )
+            .into());
+        }
+        Ok(DeleteQuickResponseOutput {})
     }
 }

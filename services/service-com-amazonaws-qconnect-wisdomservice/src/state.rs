@@ -632,8 +632,12 @@ pub const QUICK_RESPONSE_ACTIVE_BY_DEFAULT: bool = true;
 
 /// The message a read or a write of a quick response this knowledge base does not hold
 /// is refused with, worded as this endpoint words the other not-found resources of this
-/// family ([`MESSAGE_KNOWLEDGE_BASE_NOT_FOUND`]).
-pub const MESSAGE_QUICK_RESPONSE_NOT_FOUND: &str = "Quick Response does not exist.";
+/// family ([`MESSAGE_KNOWLEDGE_BASE_NOT_FOUND`]), with the resource token spelled as the
+/// recorded wire answer of this endpoint spells it: one word, as the API itself names the
+/// resource. The Amazon Connect Wisdom view of this same endpoint words it from its own
+/// copy of this text, so a client cannot get a different sentence depending on which model
+/// it addressed.
+pub const MESSAGE_QUICK_RESPONSE_NOT_FOUND: &str = "QuickResponse does not exist.";
 
 /// The sentence a create past [`MAX_QUICK_RESPONSES_PER_KNOWLEDGE_BASE`] is refused
 /// with, stating the RULE — the ceiling and what to do about it — and carrying nothing
@@ -673,6 +677,24 @@ pub fn message_value_in_use(member: &str) -> String {
 /// request member whose value must be unique inside the knowledge base.
 pub const MEMBER_QUICK_RESPONSE_NAME: &str = "name";
 pub const MEMBER_SHORTCUT_KEY: &str = "shortcut key";
+
+/// The sentence an update that both SETS a member and asks for that same member to be
+/// REMOVED is refused with.
+///
+/// `UpdateQuickResponse` pairs three optional members with a `remove…` flag
+/// (`smithy_query(query="operation",operation="UpdateQuickResponse")`:
+/// `description`/`removeDescription`, `shortcutKey`/`removeShortcutKey`,
+/// `groupingConfiguration`/`removeGroupingConfiguration`), and a request carrying both
+/// halves of a pair asks for two incompatible outcomes on one member, so it is refused
+/// with the modelled `ValidationException` rather than silently resolved one way. The
+/// sentence states the rule and names the two members as the model declares them,
+/// carrying no value from the request. The Amazon Connect Wisdom view of this same
+/// endpoint words it from its own copy of this text
+/// (`services/service-com-amazonaws-wisdom-wisdomservice/src/state.rs`), so a client
+/// cannot get a different sentence depending on which model it addressed.
+pub fn message_conflicting_update_members(set_member: &str, remove_member: &str) -> String {
+    format!("Cannot specify both {set_member} and {remove_member}.")
+}
 
 /// The only `KnowledgeBaseType` a content upload may be started against.
 ///
@@ -900,6 +922,24 @@ pub const ARN_NAMESPACE: &str = "wisdom";
 /// The region a request that carries no SigV4 credential scope is attributed to —
 /// `emulator_arn`'s own documented default.
 const DEFAULT_REGION: &str = "us-east-1";
+
+/// The ARN of the identity a write of this endpoint is attributed to — what
+/// `lastModifiedBy` (a `GenericArn`, "The Amazon Resource Name (ARN) of the user who last
+/// updated the quick response data") carries.
+///
+/// The emulator publishes ONE long-term access key, and on AWS a long-term key belongs to
+/// an IAM user of the account; that user is stated once for the whole tree
+/// (`service_common::caller_principal`) and is the identity `sts:GetCallerIdentity`
+/// answers with, so the principal a resource names as its author is the principal a client
+/// reads as itself. It is a function of the account contract alone, so it is the same on
+/// every call and across restarts, and it satisfies the member's own pattern
+/// (`^arn:[a-z-]+?:[a-z-]+?:[a-z0-9-]*?:([0-9]{12})?:[a-zA-Z0-9-:/]+$`). The Amazon Connect
+/// Wisdom view of this same endpoint attributes a write to the same identity
+/// (`services/service-com-amazonaws-wisdom-wisdomservice/src/state.rs`), so a client cannot
+/// read a different author depending on which model it addressed.
+pub fn caller_principal() -> String {
+    ::service_common::caller_principal::ambient_user_arn()
+}
 
 /// The region the caller signed this request for: an ARN names the region the request
 /// was addressed to. Falls back to [`DEFAULT_REGION`] for an unsigned request, and for
@@ -1972,6 +2012,10 @@ pub struct QuickResponse {
     /// When this record last changed. Equal to [`Self::created_at`] until an update
     /// writes it, so `lastModifiedTime` is never earlier than `createdTime`.
     pub last_modified_at: SystemTime,
+    /// The ARN of the identity that last wrote this record ([`caller_principal`]),
+    /// stamped by the create and re-stamped by every update, so a read reports who
+    /// wrote the values it is reading rather than who is reading them.
+    pub last_modified_by: String,
 }
 
 impl QuickResponse {
@@ -2011,11 +2055,9 @@ impl QuickResponse {
             description: self.description.clone(),
             grouping_configuration: self.grouping_configuration.clone(),
             shortcut_key: self.shortcut_key.clone(),
-            // `lastModifiedBy` is the ARN of the identity that last wrote the resource.
-            // Nothing in this emulator attributes a write to an identity — a request's
-            // credential scope carries no principal ARN — so the member stays absent
-            // rather than carrying an ARN nothing minted.
-            last_modified_by: None,
+            // `lastModifiedBy` is the ARN of the identity that last wrote the resource,
+            // which this record carries because each write stamped it.
+            last_modified_by: Some(self.last_modified_by.clone()),
             is_active: self.is_active,
             channels: self.channels.clone(),
             language: self.language.clone(),
@@ -2040,7 +2082,7 @@ impl QuickResponse {
             created_time: ::aws_smithy_types::DateTime::from(self.created_at),
             last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_at),
             description: self.description.clone(),
-            last_modified_by: None,
+            last_modified_by: Some(self.last_modified_by.clone()),
             is_active: self.is_active,
             channels: self.channels.clone(),
             tags: tags_out(&self.tags),
@@ -2075,9 +2117,9 @@ impl QuickResponse {
             description: self.description.clone(),
             grouping_configuration: self.grouping_configuration.clone(),
             shortcut_key: self.shortcut_key.clone(),
-            // See [`Self::to_quick_response_data`]: nothing in this emulator attributes a
-            // write to an identity, so the member stays absent.
-            last_modified_by: None,
+            // See [`Self::to_quick_response_data`]: the identity the stored record was
+            // last written by.
+            last_modified_by: Some(self.last_modified_by.clone()),
             channels: self.channels.clone(),
             language: self.language.clone(),
             // These two report which of the contact attributes a search was given were
@@ -3129,6 +3171,53 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .find(|quick_response| {
                 quick_response.shortcut_key.as_deref() == Some(shortcut_key)
             })
+    }
+
+    /// The same quick response as [`Self::quick_response`], for a caller that WRITES to
+    /// it: the seam `UpdateQuickResponse` applies its changes through, so an update and a
+    /// read reach one record rather than two copies.
+    pub fn quick_response_mut(
+        &mut self,
+        knowledge_base_label: &str,
+        quick_response_label: &str,
+    ) -> Option<&mut QuickResponse> {
+        let knowledge_base_id = self
+            .knowledge_base(knowledge_base_label)?
+            .knowledge_base_id
+            .clone();
+        self.quick_responses
+            .get_mut(resolve_id(quick_response_label))
+            .filter(|quick_response| quick_response.knowledge_base_id == knowledge_base_id)
+    }
+
+    /// Drop a quick response, together with the `clientToken` entry that created it — a
+    /// token whose resource is gone must not resurrect it on a replay, exactly as
+    /// [`Self::remove_knowledge_base`] drops the tokens of what it reclaims.
+    ///
+    /// The name and the shortcut key go with it, so a later create may take either again:
+    /// both identify a LIVE quick response of the knowledge base, not one that is gone.
+    /// `None` means the label pair named no quick response of that knowledge base, which
+    /// is the caller's not-found.
+    pub fn remove_quick_response(
+        &mut self,
+        knowledge_base_label: &str,
+        quick_response_label: &str,
+    ) -> Option<QuickResponse> {
+        let quick_response_id = self
+            .quick_response(knowledge_base_label, quick_response_label)?
+            .quick_response_id
+            .clone();
+        let quick_response = self.quick_responses.remove(&quick_response_id)?;
+        let gone: Vec<String> = self
+            .idempotency
+            .iter()
+            .filter(|(_, created)| created.resource_id == quick_response_id)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in gone {
+            self.idempotency.remove(&token);
+        }
+        Some(quick_response)
     }
 
     /// Store an assistant and index it by name.

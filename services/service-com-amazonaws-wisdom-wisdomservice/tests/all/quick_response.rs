@@ -92,7 +92,7 @@ const CONTENT_MAX: usize = 1024;
 /// out here rather than imported from the implementation: the one naming the quick
 /// response, and the one naming its parent knowledge base. Each travels with the label
 /// the request used in `ResourceNotFoundException`'s own `resourceName` member.
-const MESSAGE_QUICK_RESPONSE_NOT_FOUND: &str = "Quick Response does not exist.";
+const MESSAGE_QUICK_RESPONSE_NOT_FOUND: &str = "QuickResponse does not exist.";
 const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
 
 /// One wire answer, reduced to what a client branches on.

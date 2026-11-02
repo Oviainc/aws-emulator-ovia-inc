@@ -361,6 +361,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has modified the record yet, so it was last written when it was
             // created.
             last_modified_at: now,
+            // …and by whoever made this call.
+            last_modified_by: crate::state::caller_principal(),
         });
         store.remember_create(
             &token_scope,

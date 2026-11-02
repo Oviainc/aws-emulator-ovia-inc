@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateQuickResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateQuickResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateQuickResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: applies the members the request supplies to the STORED quick response —
+//! each `remove…` flag clearing the member it names — and re-stamps `lastModifiedTime`
+//! and `lastModifiedBy`, so the answer and every later read report the updated record.
+//! A rename onto a `name` or a `shortcutKey` another live quick response of the same
+//! knowledge base holds is the conflict `ConflictException` describes.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +104,32 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> UpdateQuickResponseError {
+    UpdateQuickResponseErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ConflictException` (HTTP 409).
+fn conflict(message: &str) -> UpdateQuickResponseError {
+    UpdateQuickResponseErrorModeled::ConflictException(ConflictException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400).
+fn validation(message: String) -> UpdateQuickResponseError {
+    UpdateQuickResponseErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -181,18 +203,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateQuickResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateQuickResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateQuickResponse"))
+        // Modeled constraints (`name`'s and `description`'s length, `contentType`'s
+        // pattern, the content union's length) are already refused BEFORE this handler
+        // runs, so reaching here means the input satisfies every one of them.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("UpdateQuickResponse")
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A quick response is reachable only through the knowledge base it was created
+        // under, so the parent is resolved first and a knowledge base this account does
+        // not hold is reported as the resource that is missing.
+        let Some(knowledge_base_id) = store
+            .knowledge_base(&input.knowledge_base_id)
+            .map(|knowledge_base| knowledge_base.knowledge_base_id.clone())
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+                &input.knowledge_base_id,
+            ));
+        };
+        // A label pair that crosses one knowledge base with another's quick response
+        // names nothing either, and an update of a record that is gone writes nothing.
+        let Some(quick_response_id) = store
+            .quick_response(&knowledge_base_id, &input.quick_response_id)
+            .map(|quick_response| quick_response.quick_response_id.clone())
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_QUICK_RESPONSE_NOT_FOUND,
+                &input.quick_response_id,
+            ));
+        };
+
+        // Each optional member this operation pairs with a `remove…` flag may be SET or
+        // CLEARED by one request, not both: a request carrying both halves of a pair asks
+        // for two incompatible outcomes on one member, so it is refused and the stored
+        // record is left as it was.
+        for (set_member, set, remove_member, remove) in [
+            (
+                "description",
+                input.description.is_some(),
+                "removeDescription",
+                input.remove_description,
+            ),
+            (
+                "shortcutKey",
+                input.shortcut_key.is_some(),
+                "removeShortcutKey",
+                input.remove_shortcut_key,
+            ),
+            (
+                "groupingConfiguration",
+                input.grouping_configuration.is_some(),
+                "removeGroupingConfiguration",
+                input.remove_grouping_configuration,
+            ),
+        ] {
+            if set && remove == Some(true) {
+                return Err(validation(
+                    crate::state::message_conflicting_update_members(set_member, remove_member),
+                ));
+            }
+        }
+
+        // A quick response's `name` and its `shortcutKey` each identify it inside its
+        // knowledge base, so an update claiming either from ANOTHER live quick response of
+        // the same knowledge base is the modelled conflict (HTTP 409) rather than a second
+        // record answering to one value — while a request restating this record's own
+        // value changes nothing and conflicts with nothing.
+        if let Some(name) = input.name.as_deref() {
+            if store
+                .quick_response_with_name(&knowledge_base_id, name)
+                .is_some_and(|held| held.quick_response_id != quick_response_id)
+            {
+                return Err(conflict(&crate::state::message_value_in_use(
+                    crate::state::MEMBER_QUICK_RESPONSE_NAME,
+                )));
+            }
+        }
+        if let Some(shortcut_key) = input.shortcut_key.as_deref() {
+            if store
+                .quick_response_with_shortcut_key(&knowledge_base_id, shortcut_key)
+                .is_some_and(|held| held.quick_response_id != quick_response_id)
+            {
+                return Err(conflict(&crate::state::message_value_in_use(
+                    crate::state::MEMBER_SHORTCUT_KEY,
+                )));
+            }
+        }
+
+        // Nothing is refused past this point, so the record is written once: a member the
+        // request supplied replaces the stored one, a `remove…` flag clears the member it
+        // names, and a member the request carries neither half of keeps the value it had.
+        let Some(quick_response) =
+            store.quick_response_mut(&knowledge_base_id, &input.quick_response_id)
+        else {
+            // Unreachable: the record was resolved above under the same lock.
+            return Err(not_found(
+                crate::state::MESSAGE_QUICK_RESPONSE_NOT_FOUND,
+                &input.quick_response_id,
+            ));
+        };
+        if let Some(name) = input.name {
+            quick_response.name = name;
+        }
+        if let Some(QuickResponseDataProvider::Content(content)) = input.content {
+            quick_response.content = content;
+        }
+        if let Some(content_type) = input.content_type {
+            quick_response.content_type = content_type;
+        }
+        if input.remove_grouping_configuration == Some(true) {
+            quick_response.grouping_configuration = None;
+        } else if let Some(grouping_configuration) = input.grouping_configuration {
+            quick_response.grouping_configuration = Some(grouping_configuration);
+        }
+        if input.remove_description == Some(true) {
+            quick_response.description = None;
+        } else if let Some(description) = input.description {
+            quick_response.description = Some(description);
+        }
+        if input.remove_shortcut_key == Some(true) {
+            quick_response.shortcut_key = None;
+        } else if let Some(shortcut_key) = input.shortcut_key {
+            quick_response.shortcut_key = Some(shortcut_key);
+        }
+        if let Some(is_active) = input.is_active {
+            quick_response.is_active = Some(is_active);
+        }
+        if let Some(channels) = input.channels {
+            quick_response.channels = Some(channels);
+        }
+        if let Some(language) = input.language {
+            quick_response.language = Some(language);
+        }
+        // The write is what `lastModifiedTime` and `lastModifiedBy` report: when this
+        // record last changed, and the identity that changed it.
+        quick_response.last_modified_at = now;
+        quick_response.last_modified_by = crate::state::caller_principal();
+
+        // Answer from what was just persisted, so this response and a later
+        // `GetQuickResponse` cannot disagree. `PreconditionFailedException` is modelled
+        // for a stale `revisionId`, which no member of this request carries, so no
+        // request can reach it.
+        Ok(UpdateQuickResponseOutput {
+            quick_response: Some(quick_response.to_quick_response_data()),
+        })
     }
 }

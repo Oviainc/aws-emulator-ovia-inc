@@ -31,6 +31,8 @@ mod idempotency_contents_and_refusal_fidelity;
 mod knowledge_base_lifecycle;
 #[path = "all/quick_response.rs"]
 mod quick_response;
+#[path = "all/quick_response_mutations.rs"]
+mod quick_response_mutations;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/session_recommendations.rs"]
