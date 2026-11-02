@@ -10691,15 +10691,17 @@ pub fn target_group_type_refusal(
             continue;
         };
         if target_type != required {
-            // The form Amazon ECS words this refusal in, composed from the request and the
-            // resolved record: the target group the entry named, the target type that group
-            // has, the network mode the revision declares, and the target type that mode
-            // registers its tasks as — the actionable half, since the caller has to create
-            // or pick another group to get past it.
+            // The form Amazon ECS words this refusal in: ONE sentence, composed from the
+            // request and the resolved record — the target group the entry named, the
+            // target type that group has, and the network mode the revision declares — and
+            // it ends there. The target type the mode does register its tasks as is used to
+            // DECIDE the refusal, not reported in it: the service names what is wrong, and
+            // appending advice of our own would put a sentence on the wire that Amazon ECS
+            // never emits.
             return Some(format!(
                 "The provided target group {arn} has target type {target_type}, which is \
                  incompatible with the {network_mode} network mode specified in the task \
-                 definition. Use a target group whose target type is {required}."
+                 definition."
             ));
         }
     }

@@ -274,7 +274,10 @@ pub(crate) async fn attach_load_balancer(
 /// Register one revision of `family` in `network_mode` and return its ARN. A revision in
 /// the `none` network mode gets a container with no port mappings, which is what that mode
 /// allows ("If the network mode is set to none, you cannot specify port mappings").
-async fn register_definition(
+///
+/// `pub(crate)`: the sibling suite that pins the WORDING of the pairing refusal needs a
+/// revision in each network mode, which is exactly this.
+pub(crate) async fn register_definition(
     router: &MultiServiceRouter,
     family: &str,
     network_mode: &str,
@@ -299,7 +302,10 @@ async fn register_definition(
 }
 
 /// The `CreateService` request body of a service in `cluster` attached to `target_group`.
-fn create_body(
+///
+/// `pub(crate)` for the reason [`register_definition`] gives: the wording suite drives the
+/// same requests through the same front door.
+pub(crate) fn create_body(
     cluster: &str,
     service_name: &str,
     task_definition: &str,
@@ -324,7 +330,9 @@ fn create_body(
 }
 
 /// One `loadBalancers` entry naming `target_group`.
-fn attachment(target_group: &str) -> Value {
+///
+/// `pub(crate)` for the reason [`register_definition`] gives.
+pub(crate) fn attachment(target_group: &str) -> Value {
     json!([{
         "targetGroupArn": target_group,
         "containerName": "web",
@@ -357,7 +365,10 @@ async fn stored_load_balancers(
 }
 
 /// Whether `DescribeServices` reports the named service at all.
-async fn service_exists(
+///
+/// `pub(crate)` for the reason [`register_definition`] gives: a refused create must leave
+/// nothing behind, which the wording suite checks too.
+pub(crate) async fn service_exists(
     router: &MultiServiceRouter,
     cluster: &str,
     service_name: &str,
