@@ -35,6 +35,12 @@ flate2 = "1"
 # `json_document::minified`: the one minification of a JSON document a service reports
 # back, which the lifecycle policy document goes through.
 service-common = { path = "../common" }
+# Computes the query-string SigV4 signature a published layer download URL carries, and
+# the one the download plane verifies before serving a byte
+# (`state::presigned_layer_download_url`).
+aws-sigv4 = { version = "1", features = ["http1"] }
+# The signing identity `aws-sigv4` takes: this registry's own ephemeral download-plane key.
+aws-credential-types = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

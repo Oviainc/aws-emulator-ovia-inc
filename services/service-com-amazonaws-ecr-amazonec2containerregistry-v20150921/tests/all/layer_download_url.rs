@@ -4,11 +4,13 @@
 //!
 //! One rule is pinned here, over a SET of layers, endpoints and windows rather than any
 //! one of them: **for a layer the named repository holds, `GetDownloadUrlForLayer`
-//! answers a URL naming the endpoint the caller reached this emulator on, and an UNSIGNED
-//! fetch of that URL serves the registered blob's own bytes, byte for byte, while the
-//! grant behind it is unexpired.** A layer the repository holds no blob under has no URL
-//! at all, a URL this registry never handed out serves nothing, and one past its window
-//! is an expired request rather than a missing one.
+//! answers a PRE-SIGNED URL naming the endpoint the caller reached this emulator on, and
+//! a fetch of that URL as it was announced — carrying no credential of the holder's own —
+//! serves the registered blob's own bytes, byte for byte, while the grant behind it is
+//! unexpired.** A layer the repository holds no blob under has no URL at all, a URL this
+//! registry never handed out serves nothing, and one past its window is an expired
+//! request rather than a missing one. What the URL's own signature covers, and what a
+//! rewritten one is refused with, is `layer_download_signature.rs`' rule.
 //!
 //! Every case goes through the router, so each exercises the same path a client takes:
 //! claiming, routing, the handler, the persisted state and serialization. The push itself
@@ -48,25 +50,36 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=abc";
 
 /// What a fetch of a download URL answered: the status, the two headers a download
-/// carries, the raw bytes, and the JSON body when the answer is a refusal.
+/// carries, the raw bytes, and the body as text — the `<Error>` document when the answer
+/// is a refusal.
 struct Fetched {
     status: u16,
     content_type: String,
     content_length: String,
     bytes: Bytes,
-    body: Value,
+    body: String,
 }
 
 impl Fetched {
-    /// The error code a refusal states, or the empty string on a served download.
+    /// The error code the `<Error>` document states, or the empty string on a served
+    /// download.
     fn code(&self) -> &str {
-        self.body["code"].as_str().unwrap_or_default()
+        element(&self.body, "Code")
     }
 
-    /// The message a refusal states, or the empty string on a served download.
+    /// The message it states, or the empty string on a served download.
     fn message(&self) -> &str {
-        self.body["message"].as_str().unwrap_or_default()
+        element(&self.body, "Message")
     }
+}
+
+/// The text of `<name>…</name>` in `document`, or the empty string when it carries none —
+/// enough of an XML reading for the three-element error document this plane answers with.
+fn element<'d>(document: &'d str, name: &str) -> &'d str {
+    document
+        .split_once(&format!("<{name}>"))
+        .and_then(|(_before, rest)| rest.split_once(&format!("</{name}>")))
+        .map_or("", |(text, _after)| text)
 }
 
 /// One emulator over `engine`, with request authentication on or off.
@@ -105,7 +118,7 @@ async fn fetch(
     let content_type = header("content-type");
     let content_length = header("content-length");
     let bytes = response.into_body();
-    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let body = String::from_utf8_lossy(&bytes).to_string();
     Fetched {
         status,
         content_type,
@@ -312,6 +325,20 @@ fn token_of(url: &str, case: &str) -> String {
         .to_string()
 }
 
+/// `target` (a path under the published download prefix) as this registry would announce
+/// it: signed through the service's OWN signing path, at this instant, for the window it
+/// mints with. The signature is then one this registry computed, so a case built on it
+/// exercises what the grant resolves to rather than whether the address was signed.
+fn signed(target: &str) -> String {
+    state::presigned_layer_download_url(
+        SERVICE_ENDPOINT,
+        target,
+        REGION,
+        SystemTime::now(),
+        state::LAYER_DOWNLOAD_URL_TTL,
+    )
+}
+
 /// Ask for the download URL of `digest` in `repository` through `crate::wire`'s endpoint,
 /// and answer the whole response.
 async fn download_url(
@@ -473,20 +500,35 @@ async fn a_download_url_serves_the_exact_layer_bytes() {
         );
 
         // The same fetch in ABSOLUTE request form, which is what an SDK-built request
-        // carries, and from a client that reached the emulator on another endpoint: the
-        // PATH is what identifies a download.
+        // carries: the path and query are what identify a download, and they are the same
+        // two halves the signature covers either way.
         let absolute = fetch(&authenticated, "GET", &url, Some(SERVICE_ENDPOINT)).await;
         assert_eq!(
             absolute.bytes, fetched.bytes,
             "case {case:?}: the URL must resolve in absolute request form too, got {}",
             absolute.status
         );
+        // The endpoint the URL names is one of the headers its signature covers, so
+        // following it through ANOTHER endpoint presents a signature that was not computed
+        // over what was presented — which the object store a pre-signed download is served
+        // from refuses rather than serving the layer.
         let elsewhere = fetch(&authenticated, "GET", &path, Some("127.0.0.1:9297")).await;
         assert_eq!(
-            elsewhere.bytes, fetched.bytes,
-            "case {case:?}: a download URL must resolve however the emulator is \
-             addressed, got {}",
-            elsewhere.status
+            elsewhere.status, 403,
+            "case {case:?}: a URL signed over one endpoint must not resolve on another, \
+             got {} with {:?}",
+            elsewhere.status, elsewhere.body
+        );
+        assert_eq!(
+            elsewhere.code(),
+            "SignatureDoesNotMatch",
+            "case {case:?}: expected SignatureDoesNotMatch, got {:?}",
+            elsewhere.body
+        );
+        assert_ne!(
+            elsewhere.bytes.as_ref(),
+            content.as_slice(),
+            "case {case:?}: a refused fetch serves no layer byte"
         );
 
         // Each call mints its own capability, as each pre-signed URL AWS answers with is
@@ -860,8 +902,11 @@ async fn a_download_url_stops_serving_when_its_window_closes() {
 ///
 /// The rows differ along the ways a path can fail to name a grant: a token this registry
 /// never minted, a token that is not an id at all, a real token under another layer's
-/// digest, and a real token whose repository has since been deleted. A method the plane
-/// does not serve is refused as a method, naming the ones it does.
+/// digest, and a real token whose repository has since been deleted. Each address is
+/// SIGNED by this registry's own signing path, so what every row exercises is the grant
+/// the token resolves to and not whether the address was signed (which
+/// `layer_download_signature.rs` holds to its own rule). A method the plane does not serve
+/// is refused as a method, naming the ones it does.
 #[tokio::test]
 async fn only_a_url_this_registry_handed_out_serves_a_layer() {
     let (router, engine) = emulator_with_engine();
@@ -897,15 +942,18 @@ async fn only_a_url_this_registry_handed_out_serves_a_layer() {
     let cases: Vec<(&str, String)> = vec![
         (
             "a token this registry never handed out",
-            format!("{DOWNLOAD_PATH_PREFIX}/{}/{held}", "a".repeat(64)),
+            signed(&format!(
+                "{DOWNLOAD_PATH_PREFIX}/{}/{held}",
+                "a".repeat(64)
+            )),
         ),
         (
             "a token that is not an id at all",
-            format!("{DOWNLOAD_PATH_PREFIX}/not-a-token/{held}"),
+            signed(&format!("{DOWNLOAD_PATH_PREFIX}/not-a-token/{held}")),
         ),
         (
             "a real token under another layer's digest",
-            format!("{DOWNLOAD_PATH_PREFIX}/{token}/{other_digest}"),
+            signed(&format!("{DOWNLOAD_PATH_PREFIX}/{token}/{other_digest}")),
         ),
         (
             "a real token whose repository was deleted",

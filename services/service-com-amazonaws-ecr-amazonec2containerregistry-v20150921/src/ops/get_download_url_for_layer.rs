@@ -8,6 +8,11 @@
 //! token addresses a grant this registry stored, and the bytes behind it are the ones
 //! `CompleteLayerUpload` registered.
 //!
+//! The URL is PRE-SIGNED, as the member it is answered in says it is: its query carries
+//! the SigV4 signature over that whole address (`crate::state::layer_download_url`), so
+//! the window it states is a window the fetch is judged against rather than a statement
+//! about one.
+//!
 //! Two of the modelled refusals are deliberately unreachable here, and neither is a
 //! layer this registry could serve but declines to. `LayerInaccessibleException` is "the
 //! specified layer is not available because it is not associated with an image.
@@ -227,8 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The URL names the endpoint the CALLER reached this emulator on, because this
         // emulator is what serves the download; read off the request before the store is
-        // locked, since it is request metadata rather than state.
+        // locked, since it is request metadata rather than state. Its signature is scoped
+        // to the Region the call was made against, as every SigV4 credential scope is.
         let host = crate::state::layer_download_url_host(ctx.parts());
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
@@ -302,7 +309,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both members come from the grant this registry stored, so the answer reports
         // what a fetch of the URL will resolve against rather than echoing the request.
         Ok(GetDownloadUrlForLayerOutput {
-            download_url: Some(crate::state::layer_download_url(&host, &token, &grant)),
+            download_url: Some(crate::state::layer_download_url(
+                &host, &region, &token, &grant,
+            )),
             layer_digest: Some(grant.layer_digest.clone()),
         })
     }

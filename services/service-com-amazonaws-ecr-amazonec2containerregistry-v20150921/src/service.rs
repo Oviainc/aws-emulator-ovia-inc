@@ -50,20 +50,28 @@
 //! carry it, the same pair any emulated data plane uses:
 //!
 //! - [`Service::can_handle`] also claims a request to that path space, so a fetch that
-//!   carries neither a credential nor a host naming a service — which is every fetch of
-//!   a URL this service handed out — is not answered `UnknownService`;
+//!   carries no `Authorization` header and no host naming a service — which is how a
+//!   pre-signed URL is followed — is not answered `UnknownService`, whether or not the
+//!   credential scope in its query string was read;
 //! - [`Service::override_routing_error`] serves it. A download names no modelled
 //!   operation by construction, so the router reaches exactly this seam for it, and
-//!   reaches it BEFORE authentication — which is what lets a pre-signed URL be followed
-//!   without a signature, as a pre-signed URL is.
+//!   reaches it BEFORE authentication — which is what lets the URL's OWN signature be
+//!   what authorises the fetch, rather than a credential of the holder's.
 //!
 //! What it serves is the blob the repository HOLDS (`crate::state::LayerBlob::content`),
 //! read at the moment of the fetch: a download is a pure read, so following one URL
-//! twice answers the same bytes and changes nothing a later caller sees. The capability
-//! is the grant the control plane minted (`crate::state::LayerDownloadGrant`), addressed
-//! by the token the URL carries: a path a client assembled itself resolves to no grant,
-//! a grant whose window has closed is refused as an expired request, and a grant whose
-//! layer or repository this registry no longer holds has nothing to serve.
+//! twice answers the same bytes and changes nothing a later caller sees.
+//!
+//! What AUTHORISES the fetch is the URL's own query-string signature
+//! (`crate::state::layer_download_signature`), which is what a pre-signed URL presents
+//! instead of a credential: it is verified BEFORE the store is read, so an address this
+//! registry did not sign — a rewritten signing field, a window extended by hand, another
+//! layer's address, another endpoint host — learns nothing about what the registry holds.
+//! Past the signature, the capability is the grant the control plane minted
+//! (`crate::state::LayerDownloadGrant`), addressed by the token the URL carries: a token
+//! whose grant this registry no longer holds resolves to no download, a grant whose
+//! window has closed is refused as an expired request, and a grant whose layer or
+//! repository this registry no longer holds has nothing to serve.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
@@ -544,12 +552,15 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// the grant names and writes nothing, so following one URL twice answers the same
     /// layer and changes nothing a later caller sees.
     ///
-    /// The grant the URL's token addresses is what decides it, in this order: a token
-    /// this registry never handed out (or one whose grant has since been reclaimed) names
-    /// no download at all; a grant whose window has closed is an expired request, which
-    /// is a different answer from one that never existed; a path whose digest is not the
-    /// one the grant serves names no download either, so a URL cannot be rewritten onto
-    /// another layer; and finally the repository's own record of the blob is read, so a
+    /// The URL's own SIGNATURE decides whether the download is authorised at all, and it
+    /// is checked before the store is read: this plane stands in for the object store a
+    /// real pre-signed download is served from, and that store serves what it signed.
+    ///
+    /// Past it, the grant the URL's token addresses is what decides it, in this order: a
+    /// token whose grant this registry no longer holds names no download at all; a grant
+    /// whose window has closed is an expired request, which is a different answer from one
+    /// that never existed; a path whose digest is not the one the grant serves names no
+    /// download either; and finally the repository's own record of the blob is read, so a
     /// repository or a layer this registry no longer holds has nothing to serve.
     fn serve_layer_download(
         &self,
@@ -558,6 +569,24 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     ) -> RtResponse {
         if !matches!(req.method(), "GET" | "HEAD") {
             return method_not_allowed();
+        }
+        match crate::state::layer_download_signature(
+            request_authority(req),
+            request_target(req.uri()),
+            ::std::time::SystemTime::now(),
+        ) {
+            crate::state::LayerDownloadSignature::Honoured => {}
+            // The wording each condition answers with is the one the object store this
+            // plane stands in for gives for it.
+            crate::state::LayerDownloadSignature::Absent => {
+                return download_error(403, "AccessDenied", DOWNLOAD_UNSIGNED_MESSAGE)
+            }
+            crate::state::LayerDownloadSignature::Expired => {
+                return download_error(403, "AccessDenied", DOWNLOAD_EXPIRED_MESSAGE)
+            }
+            crate::state::LayerDownloadSignature::Invalid => {
+                return download_error(403, "SignatureDoesNotMatch", SIGNATURE_MISMATCH_MESSAGE)
+            }
         }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return download_error(
@@ -596,6 +625,16 @@ const DOWNLOAD_NOT_FOUND_MESSAGE: &str = "The specified key does not exist.";
 
 /// The body of a download refusal whose URL is past its validity window.
 const DOWNLOAD_EXPIRED_MESSAGE: &str = "Request has expired";
+
+/// The body of a download refusal that presented no signature at all: an anonymous request
+/// for content only a pre-signed address reaches.
+const DOWNLOAD_UNSIGNED_MESSAGE: &str = "Access Denied";
+
+/// The body of a download refusal whose URL presents a signature that was not computed
+/// over the address it was presented on — the fixed sentence the object store this plane
+/// stands in for answers a signature mismatch with.
+const SIGNATURE_MISMATCH_MESSAGE: &str = "The request signature we calculated does not \
+     match the signature you provided. Check your key and signing method.";
 
 /// The read methods the layer download plane serves: `GET` carries the bytes and `HEAD`
 /// reports the metadata without them.
@@ -636,22 +675,75 @@ fn layer_response(content: &[u8], with_body: bool) -> RtResponse {
     response
 }
 
-/// One download-plane error response: the status, the code in `x-amzn-errortype`, and a
-/// JSON body carrying the reason.
+/// One download-plane error response: the status, the code in `x-amzn-errortype`, and the
+/// `<Error>` document the object store this plane stands in for answers a refused fetch
+/// with — its `<Code>`, its `<Message>` and the id of the request it refused.
 ///
-/// The download plane is plain HTTPS rather than a modelled operation, so it answers in
-/// its own small envelope instead of this service's awsJson1_1 one. The message is built
-/// from constants, never from the request.
+/// The download plane is a pre-signed object download rather than a modelled operation, so
+/// it answers in that store's own envelope instead of this service's awsJson1_1 one. Every
+/// code and message is a constant of this module, never built from the request, and each
+/// value is still output-encoded on the way into the document, through the one XML escape
+/// this tree's response encoders use.
 fn download_error(status_code: u16, code: &str, message: &str) -> RtResponse {
-    let body = ::serde_json::json!({ "message": message, "code": code }).to_string();
+    let escape = ::aws_smithy_schema_server::xml_escape;
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{}</Code>\
+         <Message>{}</Message><RequestId>{}</RequestId></Error>",
+        escape(code),
+        escape(message),
+        crate::state::mint_hex(DOWNLOAD_REQUEST_ID_BYTES).to_ascii_uppercase()
+    );
     let mut response = RtResponse::new(status(status_code), SdkBody::from(body));
     response
         .headers_mut()
-        .insert("content-type", "application/json");
+        .insert("content-type", "application/xml");
     response
         .headers_mut()
         .insert("x-amzn-errortype", code.to_string());
     response
+}
+
+/// How many bytes of a minted id the `<RequestId>` of a refused fetch carries: eight, the
+/// 16 hex characters an object store's request id is written in.
+const DOWNLOAD_REQUEST_ID_BYTES: usize = 8;
+
+/// The endpoint a request reached this emulator on: its `Host` header, or the authority an
+/// HTTP/2 request carries on the URI instead of one. It is the host a published URL was
+/// signed over, so a URL is verified against the endpoint it is followed through.
+fn request_authority(req: &RtRequest) -> &str {
+    req.headers()
+        .get(::http::header::HOST.as_str())
+        .or_else(|| {
+            req.uri()
+                .split_once("://")
+                .map(|(_scheme, rest)| match rest.find(['/', '?', '#']) {
+                    Some(end) => &rest[..end],
+                    None => rest,
+                })
+        })
+        .unwrap_or_default()
+}
+
+/// The request TARGET of a request URI: its path and its query, with any scheme and
+/// authority removed — the two halves of the address a published URL's signature covers.
+///
+/// `::service_common::request_path` reads the path alone, which is what the routing seams
+/// above need; a signature covers the query too, so this reads both. (The same split, for
+/// the same reason, as
+/// `services/service-com-amazonaws-serverlessapplicationrepository-serverlessapplicationrepository/src/service.rs`'s
+/// own `request_target`; neither service's private helper is reachable from the other, and
+/// the shared home for it, if a third needs one, is `services/common`.)
+fn request_target(uri: &str) -> &str {
+    // The scheme is looked for only BEFORE the query: a query VALUE may carry `://`, which
+    // a scan over the whole URI would mistake for the authority.
+    let query_at = uri.find('?').unwrap_or(uri.len());
+    let path_at = match uri[..query_at].find("://") {
+        Some(scheme_end) => uri[scheme_end + 3..query_at]
+            .find('/')
+            .map_or(query_at, |slash| scheme_end + 3 + slash),
+        None => 0,
+    };
+    &uri[path_at..]
 }
 
 /// A status this plane answers with. Every call site passes a constant of this module, so

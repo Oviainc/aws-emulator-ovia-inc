@@ -39,6 +39,8 @@ mod image_storage_class_transitions;
 mod image_tag_mutability;
 #[path = "all/layer_availability.rs"]
 mod layer_availability;
+#[path = "all/layer_download_signature.rs"]
+mod layer_download_signature;
 #[path = "all/layer_download_url.rs"]
 mod layer_download_url;
 #[path = "all/layer_part_upload.rs"]
