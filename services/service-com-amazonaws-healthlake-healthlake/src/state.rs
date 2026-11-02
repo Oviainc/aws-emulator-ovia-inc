@@ -237,6 +237,29 @@ impl DatastoreAction {
     }
 }
 
+/// Why a data store's own [`DatastoreStatus`] refuses a [`DatastoreAction`] on
+/// it, with the sentence that refusal states.
+///
+/// Which statuses refuse an action, and as WHICH of these two kinds, is decided
+/// once in [`Datastore::gate_action`]; what each operation keeps for itself is
+/// only the modelled error SHAPE it carries the answer on, which the model does
+/// not give every one of them alike (a `ConflictException` where the operation
+/// declares one, the `ValidationException` it does declare where it does not).
+/// So a status this enum grows an arm for, or an operation added to
+/// [`DatastoreAction`], is classified in one place rather than in one `match`
+/// per handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatastoreRefusal {
+    /// The record exists but sits in a lifecycle TRANSITION state, so the
+    /// requested action cannot be performed on it: the sentence is
+    /// [`datastore_in_transition_message`].
+    InTransition(String),
+    /// The record has reached the terminal `DELETED` status. That is no
+    /// transition — the data store is gone — so the refusal is this service's
+    /// not-found answer, [`DATASTORE_NOT_FOUND_MESSAGE`].
+    Gone(String),
+}
+
 /// The sentence `UpdateFHIRDatastore` refuses a data store with when the record
 /// exists but its `DatastoreStatus` is anything other than `ACTIVE`.
 ///
@@ -806,6 +829,41 @@ impl Datastore {
                     latest_restore_point: window.map(|window| window.latest),
                     scheduled_permanent_deletion_time: None,
                 }),
+        }
+    }
+
+    /// Whether `action` may proceed against this record as its lifecycle status
+    /// stands, or the refusal that status earns it.
+    ///
+    /// The ONE status partition behind every data-store action gate in this
+    /// crate: only a settled, usable (`ACTIVE`) record takes an action, a record
+    /// in a lifecycle transition refuses it as a transition conflict worded by
+    /// [`datastore_in_transition_message`], and a record that has reached the
+    /// terminal `DELETED` status refuses it as gone
+    /// ([`DATASTORE_NOT_FOUND_MESSAGE`]). The caller wraps the answer in the
+    /// modelled error shape ITS operation declares — which is all that differs
+    /// between them — so the statuses, the two classifications and the sentences
+    /// cannot drift apart operation by operation.
+    ///
+    /// `UpdateFHIRDatastore` deliberately does NOT come through here: it draws a
+    /// different line (anything other than `ACTIVE` is simply not active, stated
+    /// with [`DATASTORE_NOT_ACTIVE_MESSAGE`]), which is why
+    /// [`DatastoreAction`] has no variant for it.
+    ///
+    /// Reads the status only, and writes nothing: call
+    /// [`ComAmazonawsHealthlakeHealthlakeState::settle_lifecycle`] first, so the
+    /// status this gates on is the one the clock already owes.
+    pub fn gate_action(&self, action: DatastoreAction) -> Result<(), DatastoreRefusal> {
+        match self.status {
+            DatastoreStatus::Active => Ok(()),
+            DatastoreStatus::Creating | DatastoreStatus::Updating | DatastoreStatus::Deleting => {
+                Err(DatastoreRefusal::InTransition(
+                    datastore_in_transition_message(self.status, action),
+                ))
+            }
+            DatastoreStatus::Deleted => Err(DatastoreRefusal::Gone(
+                DATASTORE_NOT_FOUND_MESSAGE.to_string(),
+            )),
         }
     }
 

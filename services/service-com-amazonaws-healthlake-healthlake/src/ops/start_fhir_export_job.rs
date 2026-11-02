@@ -257,37 +257,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            match datastore.status {
-                // Only a settled, usable data store can be exported from.
-                crate::state::DatastoreStatus::Active => {}
-                // A data store in a lifecycle transition cannot serve an
-                // export. This operation models no `ConflictException`, so the
-                // refusal is the `ValidationException` it does model, carrying
-                // the one sentence every operation on this resource states a
-                // transition state with.
-                crate::state::DatastoreStatus::Creating
-                | crate::state::DatastoreStatus::Updating
-                | crate::state::DatastoreStatus::Deleting => {
-                    return Err(StartFHIRExportJobErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(crate::state::datastore_in_transition_message(
-                                datastore.status,
-                                crate::state::DatastoreAction::ExportFrom,
-                            )),
-                        },
-                    )
-                    .into());
+            // The ONE status partition every data-store action gate in this
+            // crate shares, held in `crate::state`; what this operation decides
+            // for itself is only which modelled error shape carries the answer.
+            if let Err(refusal) = datastore.gate_action(crate::state::DatastoreAction::ExportFrom) {
+                return Err(match refusal {
+                    // A data store in a lifecycle transition cannot serve an
+                    // export. This operation models no `ConflictException`, so
+                    // the refusal is the `ValidationException` it does model,
+                    // carrying the one sentence every operation on this resource
+                    // states a transition state with.
+                    crate::state::DatastoreRefusal::InTransition(message) => {
+                        StartFHIRExportJobErrorModeled::ValidationException(ValidationException {
+                            message: Some(message),
+                        })
+                    }
+                    // A deleted data store is not in transition — it is gone,
+                    // and there is nothing left to export from it.
+                    crate::state::DatastoreRefusal::Gone(message) => {
+                        StartFHIRExportJobErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(message),
+                            },
+                        )
+                    }
                 }
-                // A deleted data store is not in transition — it is gone, and
-                // there is nothing left to export from it.
-                crate::state::DatastoreStatus::Deleted => {
-                    return Err(StartFHIRExportJobErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
-                        },
-                    )
-                    .into());
-                }
+                .into());
             }
             datastore.fhir_resources.len()
         };

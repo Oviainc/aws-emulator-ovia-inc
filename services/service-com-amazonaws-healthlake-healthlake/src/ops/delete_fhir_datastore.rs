@@ -177,39 +177,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        match datastore.status {
-            // Only a settled, usable data store can be deleted.
-            crate::state::DatastoreStatus::Active => {}
-            // `ConflictException` is modelled as "the data store is in a
-            // transition state and the user requested action cannot be
-            // performed" — which is exactly `CREATING`, `UPDATING` and
-            // `DELETING`.
-            crate::state::DatastoreStatus::Creating
-            | crate::state::DatastoreStatus::Updating
-            | crate::state::DatastoreStatus::Deleting => {
-                return Err(DeleteFHIRDatastoreErrorModeled::ConflictException(
-                    ConflictException {
-                        // The status is the SERVICE's own state, so the sentence
-                        // states it; the requested id is caller input, which this
-                        // service's error text never quotes back. Stated through
-                        // the one shared helper every mutation here uses.
-                        message: Some(crate::state::datastore_in_transition_message(
-                            datastore.status,
-                            crate::state::DatastoreAction::Delete,
-                        )),
-                    },
-                )
-                .into());
+        // The ONE status partition every data-store action gate in this crate
+        // shares, held in `crate::state`; what this operation decides for itself
+        // is only which modelled error shape carries the answer.
+        if let Err(refusal) = datastore.gate_action(crate::state::DatastoreAction::Delete) {
+            return Err(match refusal {
+                // `ConflictException` is modelled as "the data store is in a
+                // transition state and the user requested action cannot be
+                // performed", which is this refusal exactly. The sentence states
+                // the SERVICE's own state and quotes nothing from the request.
+                crate::state::DatastoreRefusal::InTransition(message) => {
+                    DeleteFHIRDatastoreErrorModeled::ConflictException(ConflictException {
+                        message: Some(message),
+                    })
+                }
+                // A deleted data store is not in transition — it is gone.
+                crate::state::DatastoreRefusal::Gone(message) => {
+                    DeleteFHIRDatastoreErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                        },
+                    )
+                }
             }
-            // A deleted data store is not in transition — it is gone.
-            crate::state::DatastoreStatus::Deleted => {
-                return Err(DeleteFHIRDatastoreErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                )
-                .into());
-            }
+            .into());
         }
 
         datastore.status = crate::state::DatastoreStatus::Deleting;
