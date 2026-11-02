@@ -390,6 +390,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             planned.opening,
             planned.pending,
             task_bytes + map_run_bytes,
+            // The unsuccessful step this continuation stopped at, if it stopped at
+            // one: what a later redrive continues the execution from.
+            planned.stopped_at,
         ) {
             Ok(()) => {
                 // The continuation reached ANOTHER activity task: it is queued for a

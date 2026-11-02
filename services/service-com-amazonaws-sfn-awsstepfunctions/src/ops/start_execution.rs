@@ -488,14 +488,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             redrive_tokens: Vec::new(),
             history: planned.opening,
             pending: planned.pending,
-            // No attempt has stopped at a step of this execution yet.
-            redrive_step: None,
+            // "When you redrive an execution, it continues the failed execution from
+            // the unsuccessful step": the step this attempt stopped at, for a walk
+            // that failed at one of the definition's states.
+            redrive_step: planned.stopped_at,
             // This execution was started by this call, not dispatched by a Map Run,
             // so it belongs to no Map Run and processes no items of one.
             map_run_arn: None,
             item_count: None,
             // Measured and counted by `insert_execution`.
             retained_bytes: 0,
+            // No read of this execution's history has handed a page cursor out yet.
+            issued_page_cursors: Vec::new(),
         };
 
         // Phase 3, under the lock again: admit it. Every check is re-made, because

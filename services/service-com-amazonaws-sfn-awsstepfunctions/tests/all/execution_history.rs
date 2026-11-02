@@ -125,16 +125,18 @@ async fn the_history_is_the_events_the_execution_wrote() {
         ],
         "case {case:?}: expected the events the walk wrote, got {events:?}"
     );
-    // Numbered from 1, each event naming the one before it.
+    // Numbered from 1, each event naming the one before it — and the event written
+    // after the start naming none, because the start is the execution beginning
+    // rather than a step of its walk.
     for (index, event) in events.iter().enumerate() {
         let id = event.get("id").and_then(Value::as_i64);
         let previous = event.get("previousEventId").and_then(Value::as_i64);
         let expected = i64::try_from(index + 1).expect("the index fits");
+        let expected_previous = if expected <= 2 { 0 } else { expected - 1 };
         assert_eq!(
             (id, previous),
-            (Some(expected), Some(expected - 1)),
-            "case {case:?}: expected event {expected} to follow {}, got {event:?}",
-            expected - 1
+            (Some(expected), Some(expected_previous)),
+            "case {case:?}: expected event {expected} to follow {expected_previous}, got {event:?}"
         );
         assert!(
             event.get("timestamp").is_some(),

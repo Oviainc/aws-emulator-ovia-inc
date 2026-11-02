@@ -73,6 +73,8 @@ mod execution_key_state;
 mod execution_redrive;
 #[path = "all/express_run_a_job_refusal.rs"]
 mod express_run_a_job_refusal;
+#[path = "all/history_event_provenance.rs"]
+mod history_event_provenance;
 #[path = "all/integration_member_names.rs"]
 mod integration_member_names;
 #[path = "all/json_parse_diagnostics.rs"]

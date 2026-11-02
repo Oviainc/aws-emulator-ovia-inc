@@ -412,9 +412,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.execution_arn,
             now,
             input.client_token.as_deref(),
-            planned.opening,
-            planned.pending,
-            task_bytes + map_run_bytes,
+            crate::state::RedrivenAttempt {
+                opening: planned.opening,
+                pending: planned.pending,
+                extra_bytes: task_bytes + map_run_bytes,
+                // The unsuccessful step THIS attempt stopped at, which the next
+                // redrive continues from.
+                stopped_at: planned.stopped_at,
+            },
         ) {
             Ok(redrive_date) => {
                 // The re-run reached an activity task: it is queued for a worker to

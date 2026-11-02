@@ -259,12 +259,14 @@ async fn resolve<Eng: Send + Sync + 'static>(
             .pending
             .as_ref()
             .is_some_and(|pending| pending.status == super::EXECUTION_STATUS_FAILED);
+    let walked_stopped_at = planned.stopped_at.clone();
     if store
         .resolve_job_task(
             execution_arn,
             planned.opening,
             planned.pending,
             extra_bytes,
+            walked_stopped_at,
             stopped_at_task,
         )
         .is_err()

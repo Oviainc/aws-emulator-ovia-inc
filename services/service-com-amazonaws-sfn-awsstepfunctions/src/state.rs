@@ -1406,6 +1406,27 @@ pub struct HistoryEvent {
     pub details: EventDetails,
 }
 
+/// The `previousEventId` that means "no previous event".
+///
+/// `EventId` is modelled with a default of `0` and events are "numbered
+/// sequentially, starting at one", so `0` names no event at all.
+pub const NO_PREVIOUS_EVENT: i64 = 0;
+
+/// The `previousEventId` an event written after the event `(previous_id,
+/// previous_type)` reports.
+///
+/// Every event names the event before it, EXCEPT one written after an execution's
+/// own `ExecutionStarted`: the start is the execution beginning rather than a step
+/// of its walk, so the first event written after it has no predecessor and reports
+/// [`NO_PREVIOUS_EVENT`], exactly as the `ExecutionStarted` event itself does.
+pub fn follows_event(previous_id: i64, previous_type: &str) -> i64 {
+    if previous_type == EVENT_EXECUTION_STARTED {
+        NO_PREVIOUS_EVENT
+    } else {
+        previous_id
+    }
+}
+
 /// What one history event carries besides its identity.
 ///
 /// Every member is a value the call that wrote the event already had in hand — the
@@ -1642,11 +1663,12 @@ pub struct Execution {
     pub redrive_tokens: Vec<RedriveToken>,
     pub history: Vec<HistoryEvent>,
     /// The step a `RedriveExecution` would continue this execution from: the state the
-    /// current attempt stopped at and the raw input it was entered with.
+    /// current attempt stopped at and the raw input it was entered with — the state it
+    /// was waiting at, or the state of the definition its walk failed at.
     ///
-    /// `None` for an execution no attempt has stopped at a recorded step of — one that
-    /// is still running, or that failed inside a walk — which a redrive then walks
-    /// from the definition's `StartAt`. Cleared by the redrive that consumes it, which
+    /// `None` for an execution no attempt has stopped at a step of — one that is still
+    /// running, and one that could not be run at all — which a redrive then walks from
+    /// the definition's `StartAt`. Cleared by the redrive that consumes it, which
     /// records the next attempt's own step if that attempt stops at one.
     pub redrive_step: Option<asl::RedriveStep>,
     /// The outcome the interpreter computed, until the clock makes it due.
@@ -1662,12 +1684,111 @@ pub struct Execution {
     /// admission is the only place the store can grow, and the ceiling therefore
     /// bounds what is retained at every instant, not only at admission.
     pub retained_bytes: usize,
+    /// How far a read of this execution's history has HANDED cursors out, one entry
+    /// per read ([`HistoryRead`]) and at most [`MAX_HISTORY_PAGE_CURSORS`] of them.
+    ///
+    /// A `nextToken` is a handle this service MINTS, as an activity task's token is,
+    /// so what it was minted for is remembered rather than guessed at from the
+    /// request: "Make the call again using the returned token to retrieve the next
+    /// page. Keep all other arguments unchanged", which is what makes a cursor
+    /// minted for another execution, the other sort order or another page size this
+    /// read's `InvalidToken` rather than a page of it. The cursor cannot carry that
+    /// binding itself: the recorded responses show it as the position alone.
+    ///
+    /// One entry per read, holding the FURTHEST position that read has handed a
+    /// cursor out for, is all it takes: a read's pages begin at the multiples of its
+    /// own page size, so the cursors at or before that position are exactly the ones
+    /// it issued. Two callers walking the same read therefore share one entry and
+    /// neither can displace the other's cursor, and a cursor stays good for as long
+    /// as the record does.
+    ///
+    /// The bytes of the whole list are RESERVED by [`Execution::measure`] at
+    /// admission, so remembering a cursor never grows what the store accounts for.
+    pub issued_page_cursors: Vec<HistoryPageCursor>,
+}
+
+/// How many distinct READS one execution's history remembers handing cursors out
+/// for.
+///
+/// A paginator keeps "all other arguments unchanged", so one walk is one read
+/// however many pages it takes; this bounds how many different sort-order and
+/// page-size combinations are remembered at once, exactly as
+/// [`MAX_REDRIVE_CLIENT_TOKENS`] bounds the remembered redrive client tokens, so one
+/// execution retains the same bytes however many pages are read from it. The oldest
+/// read is dropped past the bound, and a cursor of a read no longer remembered is
+/// refused like one that has aged out ("each pagination token expires after 24
+/// hours. Using an expired pagination token will return an HTTP 400 InvalidToken
+/// error").
+pub const MAX_HISTORY_PAGE_CURSORS: usize = 32;
+
+/// How far ONE read of a history has handed cursors out.
+///
+/// The members are what decide which events the next page holds: the sort order the
+/// read walks, the size of its pages, and the furthest position in that read's own
+/// order it has handed a cursor out for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryPageCursor {
+    pub reverse_order: bool,
+    pub page: usize,
+    pub offset: usize,
+}
+
+impl HistoryPageCursor {
+    /// Whether this is a cursor of `read`.
+    fn of(&self, read: HistoryRead) -> bool {
+        self.reverse_order == read.reverse_order && self.page == read.page
+    }
+}
+
+/// The READ a page cursor belongs to: the sort order and the page size of the
+/// `GetExecutionHistory` call it would be handed back to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryRead {
+    pub reverse_order: bool,
+    pub page: usize,
+}
+
+impl HistoryRead {
+    /// This read's cursor at `offset`, a position in this read's own order.
+    pub fn at(self, offset: usize) -> HistoryPageCursor {
+        HistoryPageCursor {
+            reverse_order: self.reverse_order,
+            page: self.page,
+            offset,
+        }
+    }
 }
 
 impl Execution {
     /// Whether this execution has reached a terminal status.
     pub fn is_terminal(&self) -> bool {
         self.status != EXECUTION_STATUS_RUNNING
+    }
+
+    /// Remember that a read of this history handed a cursor out at `cursor`'s
+    /// position, so the call that comes back with it is served and a cursor this
+    /// history never handed out is not.
+    ///
+    /// One entry per read, holding the furthest position that read reached; only the
+    /// last [`MAX_HISTORY_PAGE_CURSORS`] reads are remembered, the oldest dropped,
+    /// exactly as the remembered redrive client tokens are.
+    pub fn remember_page_cursor(&mut self, cursor: HistoryPageCursor) {
+        let read = HistoryRead {
+            reverse_order: cursor.reverse_order,
+            page: cursor.page,
+        };
+        if let Some(reached) = self
+            .issued_page_cursors
+            .iter_mut()
+            .find(|remembered| remembered.of(read))
+        {
+            reached.offset = reached.offset.max(cursor.offset);
+            return;
+        }
+        while self.issued_page_cursors.len() >= MAX_HISTORY_PAGE_CURSORS {
+            self.issued_page_cursors.remove(0);
+        }
+        self.issued_page_cursors.push(cursor);
     }
 
     /// Whether this is a CHILD workflow execution a Distributed Map state started,
@@ -1720,6 +1841,11 @@ impl Execution {
             } else {
                 STOP_RESERVE_BYTES
             }
+            // The page cursors a read of this history may hand out are RESERVED here
+            // too, and in full: the list is capped at [`MAX_HISTORY_PAGE_CURSORS`],
+            // so remembering one can never take the store past [`MAX_STORE_BYTES`]
+            // and a read never grows what the store accounts for.
+            + MAX_HISTORY_PAGE_CURSORS * std::mem::size_of::<HistoryPageCursor>()
     }
 
     /// Apply the outcome the clock now owes.
@@ -1768,9 +1894,14 @@ impl Execution {
         if self.history.len() >= MAX_HISTORY_EVENTS {
             return;
         }
-        let previous_event_id = self.history.last().map_or(0, |event| event.id);
+        let previous = self.history.last();
+        let last_id = previous.map_or(0, |event| event.id);
+        let previous_event_id = previous
+            .map_or(NO_PREVIOUS_EVENT, |event| {
+                follows_event(event.id, &event.event_type)
+            });
         self.history.push(HistoryEvent {
-            id: previous_event_id + 1,
+            id: last_id + 1,
             previous_event_id,
             event_type: event_type.to_string(),
             timestamp,
@@ -2456,14 +2587,18 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     ///
     /// The task's record is dropped, giving back the bytes it held: a token answers
     /// ONE task, so a later reply under the same token resolves nothing.
+    /// `stopped_at` is the unsuccessful step the continuation's own walk stopped at,
+    /// when it stopped at one ([`Planned::stopped_at`]), which is the step a later
+    /// `RedriveExecution` continues the execution from.
     pub fn answer_activity_task(
         &mut self,
         token: &str,
         events: Vec<HistoryEvent>,
         pending: Option<PendingOutcome>,
         extra_bytes: usize,
+        stopped_at: Option<asl::RedriveStep>,
     ) -> Result<(), TaskReplyRejection> {
-        self.close_activity_task(token, events, pending, extra_bytes, false)
+        self.close_activity_task(token, events, pending, extra_bytes, stopped_at, false)
     }
 
     /// Record the reply that reports the task `token` names FAILED.
@@ -2478,7 +2613,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         events: Vec<HistoryEvent>,
         pending: Option<PendingOutcome>,
     ) -> Result<(), TaskReplyRejection> {
-        self.close_activity_task(token, events, pending, 0, true)
+        self.close_activity_task(token, events, pending, 0, None, true)
     }
 
     /// Close the task `token` names, recording what the call that closed it computed.
@@ -2491,16 +2626,24 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         events: Vec<HistoryEvent>,
         pending: Option<PendingOutcome>,
         extra_bytes: usize,
+        walked_stopped_at: Option<asl::RedriveStep>,
         stopped_at_task: bool,
     ) -> Result<(), TaskReplyRejection> {
         let Some(task) = self.activity_tasks.get(token) else {
             return Err(TaskReplyRejection::Gone);
         };
         let execution_arn = task.execution_arn.clone();
-        let stopped_at = stopped_at_task.then(|| asl::RedriveStep {
-            state_name: task.state_name.clone(),
-            state_input: task.state_input.clone(),
-        });
+        // The attempt stopped either AT this task's state — the worker reported it
+        // failed and no retrier answered — or at the step the continuation's own walk
+        // failed at, if it failed at one.
+        let stopped_at = if stopped_at_task {
+            Some(asl::RedriveStep {
+                state_name: task.state_name.clone(),
+                state_input: task.state_input.clone(),
+            })
+        } else {
+            walked_stopped_at
+        };
         self.continue_execution(&execution_arn, events, pending, extra_bytes, stopped_at)?;
         self.discard_activity_task(token);
         Ok(())
@@ -2822,23 +2965,29 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// continued from the job's own report, admitted against the store's ceiling
     /// exactly as a worker's reply is. `stopped_at_task` is whether the attempt
     /// STOPPED at the state that started the job — the job ended without doing its
-    /// work and no `Catch` carried the execution on — which is the step a later
-    /// `RedriveExecution` continues from.
+    /// work and no `Catch` carried the execution on — and `walked_stopped_at` the
+    /// unsuccessful step the continuation's own walk stopped at otherwise; either way
+    /// it is the step a later `RedriveExecution` continues from.
     pub fn resolve_job_task(
         &mut self,
         execution_arn: &str,
         events: Vec<HistoryEvent>,
         pending: Option<PendingOutcome>,
         extra_bytes: usize,
+        walked_stopped_at: Option<asl::RedriveStep>,
         stopped_at_task: bool,
     ) -> Result<(), TaskReplyRejection> {
         let Some(task) = self.job_tasks.get(execution_arn) else {
             return Err(TaskReplyRejection::Gone);
         };
-        let stopped_at = stopped_at_task.then(|| asl::RedriveStep {
-            state_name: task.state_name.clone(),
-            state_input: task.state_input.clone(),
-        });
+        let stopped_at = if stopped_at_task {
+            Some(asl::RedriveStep {
+                state_name: task.state_name.clone(),
+                state_input: task.state_input.clone(),
+            })
+        } else {
+            walked_stopped_at
+        };
         self.continue_execution(execution_arn, events, pending, extra_bytes, stopped_at)?;
         self.discard_job_task(execution_arn);
         Ok(())
@@ -4176,7 +4325,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             };
             let terminal = HistoryEvent {
                 id: 2,
-                previous_event_id: 1,
+                // The event after an `ExecutionStarted` has no predecessor — see
+                // [`follows_event`].
+                previous_event_id: follows_event(opened.id, &opened.event_type),
                 event_type: if child.status == EXECUTION_STATUS_SUCCEEDED {
                     EVENT_EXECUTION_SUCCEEDED.to_string()
                 } else {
@@ -4222,6 +4373,8 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 item_count: Some(child.item_count),
                 // Measured and counted below, exactly as `insert_execution` does.
                 retained_bytes: 0,
+                // No read of this child's history has handed a page cursor out yet.
+                issued_page_cursors: Vec::new(),
             };
             recorded.push(record.arn.clone());
             self.insert_child_execution(record);
@@ -4580,10 +4733,14 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         arn: &str,
         now: SystemTime,
         client_token: Option<&str>,
-        opening: Vec<HistoryEvent>,
-        pending: Option<PendingOutcome>,
-        extra_bytes: usize,
+        attempt: RedrivenAttempt,
     ) -> Result<SystemTime, RedriveRejection> {
+        let RedrivenAttempt {
+            opening,
+            pending,
+            extra_bytes,
+            stopped_at,
+        } = attempt;
         let Some(execution) = self.executions.get(arn) else {
             return Err(RedriveRejection::NotFound);
         };
@@ -4594,6 +4751,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let before = execution.retained_bytes;
         let mut candidate = execution.clone();
         candidate.apply_redrive(now, client_token, opening, pending);
+        // The step THIS attempt stopped at, which the next redrive continues from;
+        // `apply_redrive` consumed the one the attempt before it left.
+        candidate.redrive_step = stopped_at;
         let after = candidate.measure();
         if after + extra_bytes > before && !self.has_room_for(after + extra_bytes - before) {
             return Err(RedriveRejection::NoRoom);
@@ -5336,6 +5496,25 @@ pub const TASK_STATE_NOT_REACHED: &str =
 /// one member name as `float` in one structure and `integer` in another would
 /// need the shape/member pair instead, and the test above would not catch it.
 pub const FRACTIONAL_MEMBERS: &[&str] = &["toleratedFailurePercentage"];
+
+/// What one redriven attempt leaves for the store to record.
+///
+/// The members travel together — [`plan_redrive`] produces all of them for the same
+/// attempt and none of them means anything without the rest — so they are one
+/// argument.
+#[derive(Debug)]
+pub struct RedrivenAttempt {
+    /// The `ExecutionRedriven` event the attempt opens with.
+    pub opening: Vec<HistoryEvent>,
+    /// The outcome the re-run computed, owed to the clock.
+    pub pending: Option<PendingOutcome>,
+    /// What the activity task the re-run stopped at and the Map Runs it re-entered
+    /// will retain, so the redrive is admitted against the whole of what it adds.
+    pub extra_bytes: usize,
+    /// The unsuccessful step THIS attempt stopped at, which the next redrive
+    /// continues from.
+    pub stopped_at: Option<asl::RedriveStep>,
+}
 
 /// Why a redrive was not performed; see
 /// [`ComAmazonawsSfnAwsstepfunctionsState::redrive_execution`]. A redrive the
@@ -6424,6 +6603,80 @@ pub fn next_page_token(offset: usize, page: usize, total: usize) -> Option<Strin
     (next < total).then(|| next.to_string())
 }
 
+/// What a HISTORY page token names: the position in this execution's OWN event order
+/// — ascending, zero-based — at which the next page begins.
+///
+/// "The value of nextToken is a unique pagination token for each page. Make the call
+/// again using the returned token to retrieve the next page. Keep all other
+/// arguments unchanged": the token is a cursor into the HISTORY rather than a count
+/// of pages, so the position a read continues from is the event it stopped at,
+/// whichever end of the history that read walks from. That is also what binds a
+/// token to the read that issued it: a backwards read continues from a position no
+/// page of a forwards read ever begins at, so each order's tokens are the other's
+/// `InvalidToken`.
+///
+/// The mapping is its own inverse, so one function turns a position in the READ's
+/// order into the cursor the token carries and back.
+fn history_cursor(position: usize, total: usize, reverse_order: bool) -> usize {
+    if reverse_order {
+        total.saturating_sub(1).saturating_sub(position)
+    } else {
+        position
+    }
+}
+
+/// The offset into this read's own order that the page token `next_token` names, or
+/// `None` when it is not a token this read handed out — which the modelled
+/// `InvalidToken` reports.
+///
+/// A token this read issued names one of ITS page boundaries, inside this
+/// execution's history, never the first page (which is asked for by sending no
+/// token at all), and no further than this read has got — `handed_out` is how far
+/// each read of this history has handed cursors out
+/// ([`Execution::issued_page_cursors`]). So text that is no position, a position no
+/// page of this read begins at, and a cursor minted for another execution, the other
+/// sort order or another page size all resolve to nothing.
+pub fn history_page_offset(
+    next_token: Option<&str>,
+    read: HistoryRead,
+    total: usize,
+    handed_out: &[HistoryPageCursor],
+) -> Option<usize> {
+    let Some(token) = next_token else {
+        return Some(0);
+    };
+    let cursor = token.parse::<usize>().ok()?;
+    if cursor >= total {
+        return None;
+    }
+    let offset = history_cursor(cursor, total, read.reverse_order);
+    let boundary = read.page > 0 && offset.is_multiple_of(read.page);
+    if offset == 0 || offset >= total || !boundary {
+        return None;
+    }
+    let reached = handed_out.iter().find(|remembered| remembered.of(read))?;
+    (offset <= reached.offset).then_some(offset)
+}
+
+/// The cursor that names the next page of a history read, or `None` when the page
+/// was not truncated — the one [`history_page_offset`] resolves back, and the one
+/// the execution remembers handing out.
+pub fn next_history_page_cursor(
+    offset: usize,
+    page: usize,
+    total: usize,
+    read: HistoryRead,
+) -> Option<HistoryPageCursor> {
+    let next = offset.saturating_add(page);
+    (next < total).then(|| read.at(next))
+}
+
+/// The `nextToken` text a cursor into a history of `total` events is carried as: the
+/// position in the EXECUTION's own event order ([`history_cursor`]).
+pub fn history_page_token(cursor: HistoryPageCursor, total: usize) -> String {
+    history_cursor(cursor.offset, total, cursor.reverse_order).to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Time
 // ---------------------------------------------------------------------------
@@ -6606,6 +6859,9 @@ pub struct Planned {
     /// The Map Run every Distributed Map state the walk entered started, with the
     /// offsets the walk reported turned into instants.
     pub map_runs: Vec<PlannedMapRun>,
+    /// The unsuccessful step this attempt stopped at, which a later
+    /// `RedriveExecution` continues the execution from ([`asl::Run::stopped_at`]).
+    pub stopped_at: Option<asl::RedriveStep>,
 }
 
 /// One Map Run a planned run started, ready for the store to record.
@@ -6883,6 +7139,9 @@ pub fn plan_task_failure(
         waiting: None,
         parked: None,
         map_runs: Vec::new(),
+        // The attempt stopped at the state that scheduled the task, which the caller
+        // records from the task itself.
+        stopped_at: None,
     }
 }
 
@@ -6895,12 +7154,13 @@ pub fn plan_task_failure(
 /// worker's reply to the task it was suspended at — opens with none, because the
 /// attempt it continues was already opened.
 fn plan_from_run(
-    run: asl::Run,
+    mut run: asl::Run,
     start: SystemTime,
     settle: Duration,
     opening: Option<&str>,
     previous_event_id: i64,
 ) -> Planned {
+    let stopped_at = run.stopped_at.take();
     let opened: Vec<HistoryEvent> = opening
         .map(|event_type| HistoryEvent {
             id: previous_event_id + 1,
@@ -6913,6 +7173,14 @@ fn plan_from_run(
         .into_iter()
         .collect();
     let first_id = previous_event_id + 1 + i64::try_from(opened.len()).unwrap_or(0);
+    // What the FIRST event of this walk names as its predecessor: the event the walk
+    // opened with, or — for a walk that continues an attempt — the event the history
+    // already ended on. An `ExecutionStarted` is no predecessor, so the event after it
+    // reports the sentinel ([`follows_event`]).
+    let first_previous = match opening {
+        Some(event_type) => follows_event(first_id - 1, event_type),
+        None => first_id - 1,
+    };
     // The offsets below are accumulated from the `Wait` states of a CALLER'S
     // definition, so every instant is computed with checked arithmetic: an
     // offset no instant can represent is held at the furthest instant this clock
@@ -6932,7 +7200,11 @@ fn plan_from_run(
         .zip(first_id..)
         .map(|(step, id)| HistoryEvent {
             id,
-            previous_event_id: id - 1,
+            previous_event_id: if id == first_id {
+                first_previous
+            } else {
+                id - 1
+            },
             event_type: step.event_type.to_string(),
             // Each state was entered and left at its own offset into the run; the
             // terminal event is stamped at the instant the outcome came due.
@@ -7013,7 +7285,7 @@ fn plan_from_run(
         let scheduled = PlannedActivityTask {
             activity_arn: waiting.activity_arn,
             state_name: waiting.state_name,
-            input: waiting.input.to_string(),
+            input: waiting.input,
             state_input: waiting.raw_input.to_string(),
             available_at: after(start, waiting.at),
             timeout_seconds: waiting.timeout_seconds,
@@ -7041,6 +7313,7 @@ fn plan_from_run(
             waiting: Some(scheduled),
             parked: None,
             map_runs,
+            stopped_at,
         };
     }
     // A walk that PARKED at a job computed no outcome either: the job was started at
@@ -7066,6 +7339,7 @@ fn plan_from_run(
                 timeout_seconds: parked.timeout_seconds,
             }),
             map_runs,
+            stopped_at,
         };
     }
     Planned {
@@ -7081,6 +7355,7 @@ fn plan_from_run(
         waiting: None,
         parked: None,
         map_runs,
+        stopped_at,
     }
 }
 

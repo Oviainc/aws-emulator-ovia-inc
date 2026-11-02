@@ -19,6 +19,12 @@
 //! `crate::state::encryption`, which answers the modelled `KmsAccessDeniedException`
 //! for a caller the key's policy does not allow.
 //!
+//! The `nextToken` this operation ANSWERS is a cursor it mints: the position in the
+//! execution's own event order at which the next page begins. The execution remembers
+//! the cursors its history handed out, which is what lets a cursor minted for another
+//! execution, the other sort order or another page size be the modelled
+//! `InvalidToken` instead of a page it does not name.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -210,18 +216,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "If nextToken is returned, there are more results available. The value of
-        // nextToken is a unique pagination token for each page": a token that is not
-        // one this service issued is the modelled `InvalidToken`, worded as the
-        // history API words it — the condition alone, see
-        // `crate::state::invalid_history_token_message`.
-        let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
-            return Err(GetExecutionHistoryErrorModeled::InvalidToken(InvalidToken {
-                message: Some(crate::state::invalid_history_token_message()),
-            })
-            .into());
-        };
-
         let now = crate::state::now();
         // "You can select whether execution data (input or output of a history event)
         // is returned. The default is true."
@@ -292,18 +286,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             execution.history.clone()
         };
         let total = ordered.len();
-        let page = crate::state::page_size(input.max_results);
+        let read = crate::state::HistoryRead {
+            reverse_order: input.reverse_order,
+            page: crate::state::page_size(input.max_results),
+        };
+        // "The value of nextToken is a unique pagination token for each page. Make the
+        // call again using the returned token to retrieve the next page. Keep all
+        // other arguments unchanged": a token belongs to the READ that issued it, so
+        // it is resolved against the cursors THIS execution's history handed out and
+        // against this read's own page boundaries. A cursor this read never handed
+        // out — one minted for another execution, the other sort order or another
+        // page size, or text that is no cursor at all — is the modelled
+        // `InvalidToken`, worded as the history API words it: the condition alone,
+        // see `crate::state::invalid_history_token_message`.
+        let Some(offset) = crate::state::history_page_offset(
+            input.next_token.as_deref(),
+            read,
+            total,
+            &execution.issued_page_cursors,
+        ) else {
+            return Err(GetExecutionHistoryErrorModeled::InvalidToken(InvalidToken {
+                message: Some(crate::state::invalid_history_token_message()),
+            })
+            .into());
+        };
         let events: Vec<HistoryEvent> = ordered
             .into_iter()
             .skip(offset)
-            .take(page)
+            .take(read.page)
             .map(|stored| projected(&stored, execution, with_data))
             .collect();
-        let next_token = crate::state::next_page_token(offset, events.len(), total);
+        let next = crate::state::next_history_page_cursor(offset, events.len(), total, read);
+        // The one other write this report makes: the cursor it MINTS. "If nextToken is
+        // returned, there are more results available ... Make the call again using the
+        // returned token": the execution remembers what it handed out so that call is
+        // served, which changes nothing a later read of this history reports.
+        if let Some(cursor) = next {
+            if let Some(execution) = store.executions.get_mut(&input.execution_arn) {
+                execution.remember_page_cursor(cursor);
+            }
+        }
 
         Ok(GetExecutionHistoryOutput {
             events,
-            next_token,
+            next_token: next.map(|cursor| crate::state::history_page_token(cursor, total)),
         })
     }
 }
@@ -453,7 +479,15 @@ fn projected(
             event.execution_started_event_details = Some(ExecutionStartedEventDetails {
                 input: data(Some(execution.input.clone())),
                 input_details: included.filter(|_| with_data),
-                role_arn: None,
+                // "The Amazon Resource Name (ARN) of the IAM role used for executing
+                // Lambda tasks": the execution role this execution RUNS under, which
+                // the start pinned on the record ("all currently running executions
+                // will continue to use the previous definition and roleArn"), so the
+                // history reports the role the run really assumed however the state
+                // machine has moved since. The member is `@length 1..256`, so a
+                // record carrying no role names none.
+                role_arn: Some(execution.ran.role_arn.clone())
+                    .filter(|role_arn| !role_arn.is_empty()),
                 state_machine_alias_arn: execution.state_machine_alias_arn.clone(),
                 state_machine_version_arn: execution.state_machine_version_arn.clone(),
             });

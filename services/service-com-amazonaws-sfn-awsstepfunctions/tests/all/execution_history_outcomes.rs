@@ -399,14 +399,16 @@ async fn an_earlier_attempts_terminal_event_keeps_its_own_values() {
     );
     for (index, event) in events.iter().enumerate() {
         let expected = i64::try_from(index + 1).expect("the index fits");
+        // The event written after the start names no predecessor: the start is the
+        // execution beginning rather than a step of its walk.
+        let expected_previous = if expected <= 2 { 0 } else { expected - 1 };
         assert_eq!(
             (
                 id_of(event, case),
                 event.get("previousEventId").and_then(Value::as_i64)
             ),
-            (expected, Some(expected - 1)),
-            "case {case:?}: expected event {expected} to follow {}, got {event:?}",
-            expected - 1
+            (expected, Some(expected_previous)),
+            "case {case:?}: expected event {expected} to follow {expected_previous}, got {event:?}"
         );
     }
 }

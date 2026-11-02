@@ -7,11 +7,12 @@
 //! beside their own members: a `__type` key carrying the structure's shape id in
 //! AWS's SWF base-model namespace, [`SWF_BASE_MODEL_NAMESPACE`]. The recordings
 //! of this API show it on `LoggingConfiguration`, `TracingConfiguration`,
-//! `EncryptionConfiguration` and `CloudWatchEventsExecutionDataDetails` — the
-//! four structures of [`DISCRIMINATED_SHAPES`] — and NOT on the service's own
-//! list items (a `ListTagsForResource` tag, a `ListStateMachines` item), so the
-//! discriminator is emitted for exactly those four shapes, wherever in whatever
-//! operation's response body they occur, and for nothing else.
+//! `EncryptionConfiguration`, `CloudWatchEventsExecutionDataDetails` and every
+//! `HistoryEvent` of an execution's history — the shapes of
+//! [`DISCRIMINATED_SHAPES`] — and NOT on the service's own list items (a
+//! `ListTagsForResource` tag, a `ListStateMachines` item), so the discriminator is
+//! emitted for exactly those shapes, wherever in whatever operation's response
+//! body they occur, and for nothing else.
 //!
 //! The framework's own serializer writes a structure member from the MEMBER
 //! schema (the target's schema never reaches it), so the shape a member resolves
@@ -49,11 +50,18 @@ pub const SWF_BASE_MODEL_NAMESPACE: &str = "com.amazonaws.swf.base.model";
 ///
 /// Source: the recordings quoted by
 /// `issues/.../states-describe-responses-omit-the-type-discriminator-on.md` and
-/// the two resolved issues before it, which show `__type` on exactly these four
-/// and on no list item.
+/// the two resolved issues before it, which show `__type` on the four
+/// configuration and data-detail structures and on no list item; and the
+/// recordings quoted by
+/// `issues/.../states-step-functions-execution-history-is-serialized-without-the.md`,
+/// which show it on every element of `GetExecutionHistoryOutput.events`
+/// (`$.events[0].__type: expected 'com.amazonaws.swf.base.model#HistoryEvent'`) —
+/// a history event is a structure of that same SWF base model, which is why it is
+/// discriminated where this service's OWN list items are not.
 pub const DISCRIMINATED_SHAPES: &[&str] = &[
     "CloudWatchEventsExecutionDataDetails",
     "EncryptionConfiguration",
+    "HistoryEvent",
     "LoggingConfiguration",
     "TracingConfiguration",
 ];

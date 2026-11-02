@@ -424,7 +424,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let outcome = match planned.pending {
             Some(outcome) => outcome,
             None => {
-                let previous_event_id = history.last().map_or(0, |event| event.id);
+                let previous = history.last();
+                let previous_event_id = previous
+                    .map_or(crate::state::NO_PREVIOUS_EVENT, |event| {
+                        crate::state::follows_event(event.id, &event.event_type)
+                    });
+                let id = previous.map_or(0, |event| event.id) + 1;
                 crate::state::PendingOutcome {
                     due_at: started,
                     status: crate::state::EXECUTION_STATUS_FAILED.to_string(),
@@ -432,7 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     error: Some(crate::state::asl::RUNTIME_ERROR.to_string()),
                     cause: Some(unwaitable.to_string()),
                     events: vec![crate::state::HistoryEvent {
-                        id: previous_event_id + 1,
+                        id,
                         previous_event_id,
                         event_type: crate::state::EVENT_EXECUTION_FAILED.to_string(),
                         timestamp: started,
@@ -485,6 +490,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             item_count: None,
             // Measured and counted by `insert_execution`.
             retained_bytes: 0,
+            // "This API action is not supported by EXPRESS state machines" either, so
+            // no read of this run's history hands a page cursor out.
+            issued_page_cursors: Vec::new(),
         };
 
         // `inputDetails`/`outputDetails` say whether the data itself is included: it

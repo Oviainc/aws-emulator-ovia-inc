@@ -698,6 +698,17 @@ pub struct Run {
     /// The Map Run each Distributed Map state the walk entered started, in the order
     /// they were entered.
     pub map_runs: Vec<StartedMapRun>,
+    /// The step this walk ended UNSUCCESSFULLY at: the state whose failure ended the
+    /// execution, and the raw input that state was entered with.
+    ///
+    /// It is what a later `RedriveExecution` continues from — "when you redrive an
+    /// execution, it continues the failed execution from the unsuccessful step and
+    /// uses the same input" — so a walk that failed inside a state reports which
+    /// state that was instead of leaving a redrive to walk the whole definition
+    /// again. `None` for a walk that reached no failure of a state's own: one that
+    /// succeeded, one that could not be run at all, and one the definition-level
+    /// `TimeoutSeconds` ended.
+    pub stopped_at: Option<RedriveStep>,
 }
 
 impl Run {
@@ -721,8 +732,10 @@ pub struct ScheduledActivity {
     /// The state that scheduled it, so the reply resumes the execution there.
     pub state_name: String,
     /// "The string that contains the JSON input data for the task": the state's
-    /// effective input, after `InputPath` and the `Parameters` payload template.
-    pub input: Value,
+    /// effective input, after `InputPath` and the `Parameters` payload template, as
+    /// this service REPORTS it — the caller's own bytes where the document is the one
+    /// they supplied ([`Interpreter::echo`]).
+    pub input: String,
     /// The RAW input of the state that scheduled it, before `InputPath` and
     /// `Parameters`: what the state's `ResultPath` combines a worker's reply with, so
     /// the reply can be placed when it arrives rather than guessed at.
@@ -3261,7 +3274,7 @@ pub fn redrive(
     tasks: &dyn Tasks,
 ) -> Run {
     let state_input = serde_json::from_str(&from.state_input).unwrap_or(Value::Null);
-    interpret(
+    let mut run = interpret(
         definition,
         input,
         start,
@@ -3270,7 +3283,20 @@ pub fn redrive(
         Duration::ZERO,
         tasks,
     )
-    .0
+    .0;
+    // "Step Functions preserves the results and execution history of the successful
+    // steps, and doesn't rerun these steps": the step this attempt continues FROM was
+    // already ENTERED in the attempt whose history the redrive preserves, so its
+    // entered event is not recorded a second time. What this attempt records is the
+    // work that step does from there on — the outcome it reaches, and every state
+    // after it.
+    if run.steps.first().is_some_and(|step| {
+        step.state_name.as_deref() == Some(from.state_name.as_str())
+            && step.event_type.ends_with(STATE_ENTERED)
+    }) {
+        run.steps.remove(0);
+    }
+    run
 }
 
 /// Walk `definition` on from the activity task `reply` answers, and report what
@@ -3480,6 +3506,12 @@ fn interpret(
         Entry::At(..) | Entry::Start => (None, None, start_at.to_string(), input_value.clone()),
     };
 
+    // The document the CALLER supplied to this walk, as they wrote it: what every
+    // payload this walk reports is echoed from ([`echoed_payload`]).
+    let supplied = Supplied {
+        value: input_value.clone(),
+        text: input.to_string(),
+    };
     let mut interpreter = Interpreter {
         budget: MAX_STATE_TRANSITIONS,
         depth: 0,
@@ -3506,6 +3538,11 @@ fn interpret(
         region: super::arn_region(&context.state_machine_arn),
         child_counter: 0,
         express: context.express,
+        // Set by the walk, if a state of the definition fails.
+        failed_at: None,
+        // The execution's own input, as the caller wrote it: a state's data that IS
+        // that document is echoed in the caller's bytes rather than re-encoded.
+        supplied: supplied.clone(),
     };
     let branch = interpreter.walk(
         states,
@@ -3629,23 +3666,27 @@ fn interpret(
                 waiting,
                 parked,
                 map_runs,
+                // A run that is WAITING failed at nothing: what happens next is a
+                // worker's reply or the job finishing.
+                stopped_at: None,
             },
             applied,
         );
     }
 
-    let run = match branch.outcome {
-        // A state's input and output is a JSON DOCUMENT: when the document the run
-        // ended with is the one the caller wrote — no state transformed it — the
-        // caller's own BYTES are what the execution reports, rather than a
-        // re-encoding of a parsed copy. A document the definition built is reported
-        // in the encoding the walk produced it in.
-        Ok(value) if value == input_value => {
-            succeeded(steps, end, input.to_string()).with_map_runs(map_runs)
+    let mut run = match branch.outcome {
+        // A state's input and output is a JSON DOCUMENT: the document the run ended
+        // with is reported as [`echoed_payload`] reports every document this module
+        // answers — the caller's own BYTES when no state transformed what they wrote,
+        // and the encoding the walk produced it in when the definition built it.
+        Ok(value) => {
+            succeeded(steps, end, echoed_payload(&value, &supplied)).with_map_runs(map_runs)
         }
-        Ok(value) => succeeded(steps, end, value.to_string()).with_map_runs(map_runs),
         Err(failure) => failed(steps, end, failure).with_map_runs(map_runs),
     };
+    // The unsuccessful step this walk stopped at, for the redrive that continues the
+    // execution from it.
+    run.stopped_at = interpreter.failed_at;
     (run, applied)
 }
 
@@ -3755,6 +3796,8 @@ fn terminal(
         // A run that reached a terminal event is waiting for nothing.
         waiting: None,
         parked: None,
+        // Set by `interpret`, which is where the walk's own frame is in scope.
+        stopped_at: None,
         // Set by `run`, which is where the walk's Map Runs are in scope.
         map_runs: Vec::new(),
     }
@@ -3900,6 +3943,41 @@ struct Interpreter<'tasks> {
     /// Whether this walk runs an EXPRESS workflow, which is what refuses a `Task`
     /// state asking for the run-a-job pattern ([`Context::express`]).
     express: bool,
+    /// The TOP-LEVEL state this walk failed at, with the raw input it was entered
+    /// with: what [`Run::stopped_at`] reports, so a redrive continues from the
+    /// unsuccessful step. A failure inside a `Map` iteration or a `Parallel` branch
+    /// is recorded as the state that encloses it, because that is the step of the
+    /// definition the execution stopped at.
+    failed_at: Option<RedriveStep>,
+    /// The document the CALLER supplied, with the bytes they wrote it as: what
+    /// [`Interpreter::echo`] echoes instead of re-encoding.
+    supplied: Supplied,
+}
+
+/// A document a CALLER supplied, as they wrote it: the parsed value, beside the
+/// exact bytes they sent.
+///
+/// A JSON document has many encodings, so a value this service reports BACK to the
+/// caller is reported in the caller's own bytes rather than in a re-encoding of a
+/// parsed copy.
+#[derive(Clone)]
+struct Supplied {
+    value: Value,
+    text: String,
+}
+
+/// `value` as this service REPORTS it: the caller's own bytes when the document is
+/// the one they supplied — their whitespace and member order included — and the
+/// encoding the walk produced it in otherwise.
+///
+/// The ONE implementation of that rule, so every document this module reports
+/// follows it: a payload a caller hashes, signs or diffs against what it sent comes
+/// back byte for byte, while a document the definition BUILT is reported as built.
+fn echoed_payload(value: &Value, supplied: &Supplied) -> String {
+    if *value == supplied.value {
+        return supplied.text.clone();
+    }
+    value.to_string()
 }
 
 /// Where a walk applied an [`ActivityReply`]: the step its own events begin at, and
@@ -3927,6 +4005,12 @@ struct MapTally {
 }
 
 impl Interpreter<'_> {
+    /// `value` as this service reports it: [`echoed_payload`] against the document
+    /// the caller supplied to THIS walk.
+    fn echo(&self, value: &Value) -> String {
+        echoed_payload(value, &self.supplied)
+    }
+
     /// Whether this interpretation has run out of wall-clock time.
     ///
     /// The ceilings on steps, payloads, paths and nesting bound each factor of the
@@ -4009,9 +4093,24 @@ impl Interpreter<'_> {
                     end: at,
                 };
             };
+            // The raw input of the state about to run, kept for the one use a
+            // FAILURE has for it: the step a redrive continues from is that state
+            // with the data it saw ([`Run::stopped_at`]).
+            let raw = current.clone();
             let step = match self.step(&name, state, current, at, scope) {
                 Ok(step) => step,
                 Err(fault) => {
+                    // "It continues the failed execution from the unsuccessful step
+                    // and uses the same input": the step is the TOP-LEVEL state of
+                    // the definition the execution stopped at, so a failure a nested
+                    // walk reports is recorded as the state that encloses it — the
+                    // frame that is at depth zero.
+                    if self.depth == 0 {
+                        self.failed_at = Some(RedriveStep {
+                            state_name: name.clone(),
+                            state_input: raw.to_string(),
+                        });
+                    }
                     return Branch {
                         outcome: Err(fault.failure),
                         end: fault.at,
@@ -4282,7 +4381,7 @@ impl Interpreter<'_> {
         self.waiting = Some(ScheduledActivity {
             activity_arn: resource.to_string(),
             state_name: name.to_string(),
-            input: input.clone(),
+            input: self.echo(&input),
             raw_input: raw.clone(),
             at,
             timeout_seconds,
@@ -4401,12 +4500,13 @@ impl Interpreter<'_> {
         after: Duration,
         input: &Value,
     ) {
+        let input = self.echo(input);
         self.push_detailed(
             event_type,
             state_name,
             after,
             super::EventDetails {
-                input: Some(input.to_string()),
+                input: Some(input),
                 ..super::EventDetails::default()
             },
         );
@@ -4423,12 +4523,13 @@ impl Interpreter<'_> {
         after: Duration,
         output: &Value,
     ) {
+        let output = self.echo(output);
         self.push_detailed(
             event_type,
             state_name,
             after,
             super::EventDetails {
-                output: Some(output.to_string()),
+                output: Some(output),
                 ..super::EventDetails::default()
             },
         );
@@ -4939,7 +5040,7 @@ impl Interpreter<'_> {
                 super::EventDetails {
                     resource_type: Some(resource_type.clone()),
                     resource: Some(action.clone()),
-                    input: Some(request.to_string()),
+                    input: Some(me.echo(&request)),
                     timeout_seconds: within.map(|within| within.as_secs()),
                     heartbeat_seconds: heartbeat,
                     ..super::EventDetails::default()
@@ -7519,6 +7620,15 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // The state under test belongs to no state machine, so no workflow type
         // refuses it: the context the request supplies says nothing of one.
         express: test.context.express,
+        // `TestState` redrives nothing: the step a redrive would continue from
+        // belongs to an execution.
+        failed_at: None,
+        // The request's own input is the caller's document here, so what the trial
+        // reports of it is the bytes the request carried.
+        supplied: Supplied {
+            value: raw.clone(),
+            text: test.input.to_string(),
+        },
     };
     interpreter.trial(test, &raw, inspection)
 }
@@ -7616,11 +7726,7 @@ impl Interpreter<'_> {
             // next state at all.
             None => state.get("Next").and_then(Value::as_str).map(str::to_string),
         };
-        Trial::succeeded(
-            Some(output_text(&output, raw, test.input)),
-            next_state,
-            inspection,
-        )
+        Trial::succeeded(Some(self.echo(&output)), next_state, inspection)
     }
 
     /// The RAW result the state's own work produced: the document the result-side
@@ -7779,17 +7885,6 @@ fn retry_entries<'a>(state: &'a Map<String, Value>, member: &str) -> &'a [Value]
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
-}
-
-/// A state's output as the response carries it: the caller's OWN bytes when the
-/// document the state put out is the one the caller wrote, and the encoding the walk
-/// produced otherwise — the rule an execution's output follows.
-fn output_text(output: &Value, raw: &Value, input: &str) -> String {
-    if output == raw {
-        input.to_string()
-    } else {
-        output.to_string()
-    }
 }
 
 // ---------------------------------------------------------------------------
