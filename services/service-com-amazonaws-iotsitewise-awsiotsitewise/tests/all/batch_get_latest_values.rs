@@ -51,14 +51,14 @@ fn relative(seconds: i64) -> i64 {
 }
 
 /// The entry of `list` whose `entryId` is `entry_id`, if any.
-fn find_entry<'a>(list: &'a Value, entry_id: &str) -> Option<&'a Value> {
+pub(crate) fn find_entry<'a>(list: &'a Value, entry_id: &str) -> Option<&'a Value> {
     list.as_array()?
         .iter()
         .find(|entry| entry["entryId"] == entry_id)
 }
 
 /// How many elements a response list carries (0 when it is absent).
-fn count(list: &Value) -> usize {
+pub(crate) fn count(list: &Value) -> usize {
     list.as_array().map_or(0, Vec::len)
 }
 

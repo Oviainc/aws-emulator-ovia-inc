@@ -77,16 +77,16 @@ const SAMPLE_OFFSETS: [i64; 2] = [10, 20];
 
 /// One row of the table: a property of the asset under test, and where it is
 /// declared.
-struct Row {
+pub(crate) struct Row {
     /// What the row varies: the case name every assertion carries.
-    case: &'static str,
+    pub(crate) case: &'static str,
     /// The stored `propertyId` the row addresses.
-    property_id: String,
+    pub(crate) property_id: String,
     /// The property's declared `PropertyDataType`, which decides which `Variant`
     /// member a written sample carries.
-    data_type: &'static str,
+    pub(crate) data_type: &'static str,
     /// The two readings this row writes, oldest first.
-    readings: [f64; 2],
+    pub(crate) readings: [f64; 2],
 }
 
 impl Row {
@@ -105,7 +105,7 @@ fn variant(data_type: &str, reading: f64) -> Value {
 }
 
 /// The numeric reading of a `Variant`, whichever member carries it.
-fn numeric(value: &Value) -> Option<f64> {
+pub(crate) fn numeric(value: &Value) -> Option<f64> {
     value
         .get("doubleValue")
         .and_then(Value::as_f64)
@@ -113,7 +113,7 @@ fn numeric(value: &Value) -> Option<f64> {
 }
 
 /// Assert `actual` is within [`EPSILON`] of `expected`.
-fn assert_close(case: &str, what: &str, actual: Option<f64>, expected: f64) {
+pub(crate) fn assert_close(case: &str, what: &str, actual: Option<f64>, expected: f64) {
     assert!(
         actual.is_some_and(|actual| (actual - expected).abs() < EPSILON),
         "case {case:?}: expected {what} {expected}, got {actual:?}"
@@ -132,7 +132,7 @@ async fn composite_id(router: &MultiServiceRouter, model_id: &str, body: Value) 
 
 /// The property ids a composite model of `model_id` contributes, as
 /// `DescribeAssetModelCompositeModel` reports them.
-async fn composite_property(
+pub(crate) async fn composite_property(
     router: &MultiServiceRouter,
     model_id: &str,
     composite: &str,
@@ -156,7 +156,7 @@ async fn composite_property(
 /// `(assetId, rows)` with one row per property under test.
 ///
 /// `label` keeps the names of two fixtures in one test binary apart.
-async fn boiler(router: &MultiServiceRouter, label: &str) -> (String, Vec<Row>) {
+pub(crate) async fn boiler(router: &MultiServiceRouter, label: &str) -> (String, Vec<Row>) {
     // A COMPONENT_MODEL with a property of its own, reused below: a
     // component-model-based composite model stores no properties, and the
     // component model it names provides them.
@@ -317,7 +317,7 @@ async fn boiler(router: &MultiServiceRouter, label: &str) -> (String, Vec<Row>) 
 }
 
 /// Write this row's two samples through `BatchPutAssetPropertyValue`.
-async fn write_samples(router: &MultiServiceRouter, asset_id: &str, row: &Row) {
+pub(crate) async fn write_samples(router: &MultiServiceRouter, asset_id: &str, row: &Row) {
     let values: Vec<Value> = SAMPLE_OFFSETS
         .iter()
         .zip(row.readings)
