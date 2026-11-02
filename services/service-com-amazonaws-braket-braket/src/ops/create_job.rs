@@ -10,6 +10,11 @@
 //! job's ARN carries its NAME, so a second job of the same name in the same account and
 //! region would be the same resource and is refused as a conflict.
 //!
+//! A job RUNS AS the `roleArn` it is created with, so that role is resolved against the
+//! account's IAM records before anything is stored (`service_common::iam_role`): a role
+//! this account does not hold, or one whose trust policy does not admit the Braket
+//! service principal, is refused with the modelled `ValidationException`.
+//!
 //! A job this emulator accepts is returned in the non-terminal `QUEUED` status; the
 //! statuses after it are owed by the clock (`crate::state::JOB_RUNNING_SPAN` /
 //! `JOB_TERMINAL_SPAN`) and materialised by the next call that reads the record.
@@ -270,6 +275,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // A hybrid job RUNS AS the execution role the request names, so that role is
+        // resolved against the account's IAM records BEFORE any record is stored: a value
+        // naming a role this account does not hold, or one whose trust policy does not
+        // admit the Braket service principal, is a job that could never run and is refused
+        // as invalid input. A value IAM was not asked about, because it names no role of
+        // THIS account, grounds no refusal — another account's IAM is not this emulator's
+        // to answer for — and neither does an emulator with no IAM mounted.
+        let region = crate::state::request_region(ctx);
+        if ::service_common::iam_role::role_is_unassumable(
+            ctx,
+            &region,
+            &input.role_arn,
+            crate::state::BRAKET_SERVICE_PRINCIPAL,
+        )
+        .await
+        {
+            return Err(refuse(crate::state::cannot_assume_role(&input.role_arn)));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateJobError::from(CreateJobErrorModeled::InternalServiceException(
                 InternalServiceException {
@@ -327,7 +351,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A hybrid job's ARN carries its NAME, so a second job of the same name in the
         // same account and region would BE the first job: that is the conflict this
         // operation models.
-        let region = crate::state::request_region(ctx);
         let job_arn = ::emulator_server::emulator_arn(
             "braket",
             &region,

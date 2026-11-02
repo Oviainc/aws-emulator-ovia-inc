@@ -373,20 +373,41 @@ const DEVICE_ARN_NOT_FOUND: &str =
     "Device ARN not found. Please use SearchDevices operation to get a list of supported \
      devices.";
 
-/// Each create that takes a device ARN in its BODY refuses one the inventory does not
-/// publish with the service's fixed inventory pointer, and one that is not an ARN at all
+/// Well-formed Braket device ARNs whose category segment names no kind of device Amazon
+/// Braket publishes devices under, so the value resolves to no device at all whatever an
+/// inventory holds. `(case, value)`.
+const UNKNOWN_KIND_DEVICE_ARNS: &[(&str, &str)] = &[
+    (
+        "a category nothing is published under",
+        "arn:aws:braket:us-west-2::device/quantum-annealer/acme/Advantage",
+    ),
+    (
+        "a device ARN carrying no category at all",
+        "arn:aws:braket:::device/sv1",
+    ),
+];
+
+/// Each create that takes a device ARN in its BODY refuses one that resolves to no device
+/// with the service's fixed inventory pointer, and one that is not an ARN at all
 /// by naming the member it read it from — the two are different refusals, and neither
 /// echoes the value AWS does not echo.
+///
+/// What "resolves to no device" means differs with what the create DOES: the two creates
+/// that dispatch work to a device resolve the ARN against the published inventory, while
+/// `CreateSpendingLimit` — a cost control about the device an ARN names — resolves only the
+/// KIND the ARN itself states (`spending_limits.rs` pins that admission).
 #[tokio::test]
 async fn a_create_refuses_an_unresolvable_device_with_the_inventory_pointer() {
     let braket = Braket::new();
 
-    // (case, member the malformed refusal names, the request for one device ARN)
+    // (case, member the malformed refusal names, whether the create resolves the ARN
+    // against the inventory, the request for one device ARN)
     #[allow(clippy::type_complexity)]
-    let creates: Vec<(&str, &str, Box<dyn Fn(usize, &str) -> (&'static str, Value)>)> = vec![
+    let creates: Vec<(&str, &str, bool, Box<dyn Fn(usize, &str) -> (&'static str, Value)>)> = vec![
         (
             "CreateQuantumTask",
             "deviceArn",
+            true,
             Box::new(|index: usize, device_arn: &str| {
                 (
                     "/quantum-task",
@@ -397,6 +418,7 @@ async fn a_create_refuses_an_unresolvable_device_with_the_inventory_pointer() {
         (
             "CreateJob",
             "deviceConfig.device",
+            true,
             Box::new(|index: usize, device_arn: &str| {
                 (
                     "/job",
@@ -411,6 +433,7 @@ async fn a_create_refuses_an_unresolvable_device_with_the_inventory_pointer() {
         (
             "CreateSpendingLimit",
             "deviceArn",
+            false,
             Box::new(|index: usize, device_arn: &str| {
                 (
                     "/spending-limit",
@@ -421,8 +444,13 @@ async fn a_create_refuses_an_unresolvable_device_with_the_inventory_pointer() {
     ];
 
     let mut index = 0;
-    for (operation, member, request) in &creates {
-        for (case, device_arn) in ABSENT_DEVICE_ARNS {
+    for (operation, member, resolves_inventory, request) in &creates {
+        let unresolvable = if *resolves_inventory {
+            ABSENT_DEVICE_ARNS
+        } else {
+            UNKNOWN_KIND_DEVICE_ARNS
+        };
+        for (case, device_arn) in unresolvable {
             index += 1;
             let (path, body) = request(index, device_arn);
             let reply = braket.call("POST", path, Some(body)).await;

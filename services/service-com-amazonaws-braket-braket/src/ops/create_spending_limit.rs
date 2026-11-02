@@ -6,15 +6,19 @@
 //! period and the tags, and returns the ARN. `SearchSpendingLimits` reads that record
 //! back, computing the device's queued and total spend from its quantum tasks.
 //!
-//! The device must be one this emulator publishes: `deviceArn` targets `DeviceArn`, an
-//! `@arnReference` shape with no `@pattern` for the boundary validator to enforce, so
-//! its syntax is checked HERE, before the inventory is consulted. This operation models
-//! no `ResourceNotFoundException`, so a malformed ARN and an unknown device are both
-//! `ValidationException` (400) — each with the reason that applies to it.
+//! A spending limit is a cost control ABOUT a device rather than work dispatched TO one,
+//! so what it is admitted for is decided by the KIND of device the `deviceArn` names, read
+//! from the ARN's own published form (`crate::state::device_type_from_arn`), not by whether
+//! this emulator's inventory happens to publish that device: every quantum processor gets
+//! one. `deviceArn` targets `DeviceArn`, an `@arnReference` shape with no `@pattern` for
+//! the boundary validator to enforce, so its syntax is checked HERE; this operation models
+//! no `ResourceNotFoundException`, so a malformed ARN and an ARN naming no kind of device
+//! Amazon Braket publishes are both `ValidationException` (400) — each with the reason that
+//! applies to it.
 //!
-//! Two device rules follow from the model's own documentation: a RETIRED device is
-//! refused with `DeviceRetiredException` (410), and a SIMULATOR with
-//! `ValidationException`, because "Simulators do not support spending limits".
+//! Two device rules follow from the model's own documentation: a device the inventory
+//! publishes as RETIRED is refused with `DeviceRetiredException` (410), and a SIMULATOR
+//! with `ValidationException`, because "Simulators do not support spending limits".
 //!
 //! `clientToken` is an `@idempotencyToken`: replaying it with the same request returns
 //! the ARN minted the first time and creates no second spending limit.
@@ -128,8 +132,9 @@ fn refuse(message: String) -> CreateSpendingLimitError {
 ///
 /// As on the other creates, this operation models no not-found error, so a value that is
 /// not an ARN at all is invalid input naming the member
-/// (`crate::state::member_is_not_valid`) and a well-formed ARN the inventory does not
-/// publish is the device the service cannot resolve (`crate::state::DEVICE_ARN_NOT_FOUND`).
+/// (`crate::state::member_is_not_valid`) and a well-formed ARN naming no kind of device
+/// Amazon Braket publishes is the device the service cannot resolve
+/// (`crate::state::DEVICE_ARN_NOT_FOUND`).
 const INVALID_ARN_MEMBER: &str = "deviceArn";
 
 /// The digest that decides whether a repeated `clientToken` is a replay of the same
@@ -188,7 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CreateSpendingLimit";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_SPENDING_LIMIT_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_SPENDING_LIMIT_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 201u16;
+    // Amazon Braket answers a created spending limit with 200 on the wire, which is what
+    // a client reads and what this emulator therefore serves; the model's own `@http`
+    // code for this operation (201) is not the status the service sends.
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,
@@ -246,30 +254,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        let Some(device) = guard.devices.get(&input.device_arn).cloned() else {
-            // `CreateSpendingLimit` models no `ResourceNotFoundException`, so an unknown
-            // device is refused as invalid input — in the service's own fixed sentence for
-            // a device ARN it cannot resolve, which points the caller at the operation
-            // that enumerates the inventory.
-            return Err(refuse(crate::state::DEVICE_ARN_NOT_FOUND.to_string()));
-        };
-        if device.device_status == crate::state::DEVICE_RETIRED {
+        // A device this inventory publishes as RETIRED is gone, whatever kind it was, so
+        // nothing can be spent on it: that is the one refusal grounded in the inventory,
+        // and a device the inventory does not publish grounds none.
+        if guard
+            .devices
+            .get(&input.device_arn)
+            .is_some_and(|device| device.device_status == crate::state::DEVICE_RETIRED)
+        {
             return Err(CreateSpendingLimitErrorModeled::DeviceRetiredException(
                 DeviceRetiredException {
-                    message: Some(format!("Device {} has been retired", device.device_arn)),
+                    message: Some(format!("Device {} has been retired", input.device_arn)),
                 },
             )
             .into());
         }
+        // What a limit may be created for turns on the KIND of device the ARN names, which
+        // the published device-ARN form itself states: a quantum processor accepts one, and
         // "Simulators do not support spending limits" — the model's own documentation of
-        // this operation. A simulator is refused whatever its status, because no
-        // spending limit can apply to it at all.
-        if device.device_type == crate::state::DEVICE_TYPE_SIMULATOR {
-            return Err(refuse(format!(
-                "Device {} is a {} and simulators do not support spending limits",
-                device.device_arn,
-                crate::state::DEVICE_TYPE_SIMULATOR
-            )));
+        // this operation — so a simulator is refused whatever its status, because no
+        // spending limit can apply to it at all. A device this emulator's inventory does
+        // not publish is still a device of its ARN's kind, so the admission does not
+        // require it to be in the inventory.
+        match crate::state::device_type_from_arn(&input.device_arn) {
+            Some(kind) if kind == crate::state::DEVICE_TYPE_SIMULATOR => {
+                return Err(refuse(format!(
+                    "Device {} is a {} and simulators do not support spending limits",
+                    input.device_arn,
+                    crate::state::DEVICE_TYPE_SIMULATOR
+                )));
+            }
+            Some(_) => {}
+            // The ARN names no kind of device Amazon Braket publishes. This operation
+            // models no `ResourceNotFoundException`, so that is invalid input — in the
+            // service's own fixed sentence for a device ARN it cannot resolve, which points
+            // the caller at the operation that enumerates the inventory.
+            None => return Err(refuse(crate::state::DEVICE_ARN_NOT_FOUND.to_string())),
         }
         // The store is bounded by count: a spending limit has no terminal state to age
         // out of, so there is nothing to evict to make room.
@@ -301,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
         let limit = crate::state::SpendingLimit {
             spending_limit_arn: spending_limit_arn.clone(),
-            device_arn: device.device_arn.clone(),
+            device_arn: input.device_arn.clone(),
             spending_limit: input.spending_limit.clone(),
             time_period,
             created_at: now,

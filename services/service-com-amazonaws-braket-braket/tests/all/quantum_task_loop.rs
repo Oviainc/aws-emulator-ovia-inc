@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 /// The region the test's SigV4 credential scope names, so a minted ARN must carry it.
 const REGION: &str = "eu-west-1";
@@ -77,6 +77,43 @@ impl Braket {
             Arc::clone(&engine),
         ));
         Self { router, engine }
+    }
+
+    /// This service mounted beside the OWNER of the roles it resolves — IAM, which holds
+    /// the execution role a hybrid job asks Braket to assume — on ONE shared engine, plus
+    /// an IAM SDK client over the router's own in-process callback: the very seam this
+    /// service's own role resolution reaches IAM through.
+    ///
+    /// Nothing in a suite using this reaches into IAM's store: a role exists only because
+    /// IAM answered for it.
+    pub(crate) fn with_iam() -> (Self, ::aws_sdk_iam::Client) {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.register_service(service_com_amazonaws_braket_braket::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        let callback = EmbeddedEmulator::from_router(router.clone());
+        let iam = ::aws_sdk_iam::Client::from_conf(
+            ::aws_sdk_iam::Config::builder()
+                .behavior_version(::aws_sdk_iam::config::BehaviorVersion::latest())
+                .region(::aws_sdk_iam::config::Region::new(REGION.to_string()))
+                .endpoint_url(format!("https://iam.{REGION}.amazonaws.com"))
+                .credentials_provider(callback.aws_credentials_provider())
+                .http_client(callback.http_client())
+                .retry_config(::aws_sdk_iam::config::retry::RetryConfig::disabled())
+                .timeout_config(::aws_sdk_iam::config::timeout::TimeoutConfig::disabled())
+                .identity_cache(::aws_sdk_iam::config::IdentityCache::no_cache())
+                .stalled_stream_protection(
+                    ::aws_sdk_iam::config::StalledStreamProtectionConfig::disabled(),
+                )
+                .build(),
+        );
+        (Self { router, engine }, iam)
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Reply {

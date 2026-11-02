@@ -1452,6 +1452,14 @@ pub const ARN_RESOURCE_QUANTUM_TASK: &str = "quantum-task";
 /// The resource type a device ARN names (`DeviceResource`).
 pub const ARN_RESOURCE_DEVICE: &str = "device";
 
+/// The category segment a published simulator's device ARN carries
+/// (`...:device/quantum-simulator/<provider>/<name>`).
+pub const ARN_DEVICE_CATEGORY_SIMULATOR: &str = "quantum-simulator";
+
+/// The category segment a published quantum processor's device ARN carries
+/// (`...:device/qpu/<provider>/<name>`).
+pub const ARN_DEVICE_CATEGORY_QPU: &str = "qpu";
+
 /// The resource type a hybrid-job ARN names (`JobResource`), and the prefix
 /// `JobArn`'s own `@pattern` spells (`...:[0-9]{12}:job/.*$`).
 pub const ARN_RESOURCE_JOB: &str = "job";
@@ -1490,6 +1498,16 @@ pub const QUEUE_POSITION_NOT_QUEUED: &str = "None";
 /// different question, answered by the store: that is the
 /// `ResourceNotFoundException` case.
 pub fn is_braket_arn(value: &str, resource_type: &str) -> bool {
+    braket_arn_resource_id(value, resource_type).is_some()
+}
+
+/// The resource id a Braket ARN of `resource_type` carries — everything after
+/// `<resource_type>/` — or `None` when `value` is not such an ARN.
+///
+/// The ONE reading of the ARN field grammar this module states, so [`is_braket_arn`] and
+/// the readings of what a resource id holds ([`device_type_from_arn`]) cannot disagree
+/// about where the resource field starts.
+fn braket_arn_resource_id<'v>(value: &'v str, resource_type: &str) -> Option<&'v str> {
     let mut fields = value.splitn(6, ':');
     let (Some("arn"), Some(partition), Some(service), Some(region), Some(account), Some(resource)) = (
         fields.next(),
@@ -1499,7 +1517,7 @@ pub fn is_braket_arn(value: &str, resource_type: &str) -> bool {
         fields.next(),
         fields.next(),
     ) else {
-        return false;
+        return None;
     };
     let partition_is_aws = partition
         .strip_prefix("aws")
@@ -1512,11 +1530,41 @@ pub fn is_braket_arn(value: &str, resource_type: &str) -> bool {
     let resource_id = resource
         .strip_prefix(resource_type)
         .and_then(|rest| rest.strip_prefix('/'));
-    partition_is_aws
-        && service == ARN_SERVICE
-        && region_is_well_formed
-        && account_is_well_formed
-        && resource_id.is_some_and(|id| !id.is_empty())
+    (partition_is_aws && service == ARN_SERVICE && region_is_well_formed && account_is_well_formed)
+        .then_some(resource_id)
+        .flatten()
+        .filter(|id| !id.is_empty())
+}
+
+/// The `DeviceType` a published device ARN itself names, read from the category segment
+/// of its resource (`device/<category>/<provider>/<name>`).
+///
+/// Amazon Braket publishes a device's kind IN its ARN — [`ARN_DEVICE_CATEGORY_QPU`] for a
+/// quantum processor and [`ARN_DEVICE_CATEGORY_SIMULATOR`] for a managed simulator — so an
+/// operation whose rule turns on the KIND of device a value names can answer it from the
+/// ARN alone, without the device having to be one this emulator's own inventory publishes.
+///
+/// `None` when the value is not a Braket device ARN at all, when it does not carry the
+/// whole published form (a category, a provider and a device name), or when its category is
+/// neither of the two Amazon Braket publishes devices under: such a value names no device
+/// of any kind.
+#[must_use]
+pub fn device_type_from_arn(device_arn: &str) -> Option<&'static str> {
+    // The resource id comes from this module's ONE reading of the ARN field grammar, which
+    // also settles that the value is a Braket device ARN at all.
+    let named = braket_arn_resource_id(device_arn, ARN_RESOURCE_DEVICE)?;
+    // A published device ARN names a category, a provider and a device: a value that stops
+    // short of any of them names no device, whatever its category segment reads as.
+    let (category, provider_and_name) = named.split_once('/')?;
+    let (provider, name) = provider_and_name.split_once('/')?;
+    if provider.is_empty() || name.is_empty() {
+        return None;
+    }
+    match category {
+        ARN_DEVICE_CATEGORY_QPU => Some(DEVICE_TYPE_QPU),
+        ARN_DEVICE_CATEGORY_SIMULATOR => Some(DEVICE_TYPE_SIMULATOR),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,6 +1616,19 @@ pub fn member_value_is_not_a_valid_arn(member: &str, value: &str) -> String {
 pub const DEVICE_ARN_NOT_FOUND: &str =
     "Device ARN not found. Please use SearchDevices operation to get a list of supported \
      devices.";
+
+/// The service principal a role Amazon Braket acts under has to trust: Braket assumes the
+/// `roleArn` a hybrid job is created with, so a role whose trust policy does not admit this
+/// principal is one the service cannot use.
+pub const BRAKET_SERVICE_PRINCIPAL: &str = "braket.amazonaws.com";
+
+/// How an operation that resolves a caller-supplied execution role refuses one the service
+/// cannot assume: the fixed sentence, with the `roleArn` the REQUEST carried quoted in it
+/// and nothing else interpolated.
+#[must_use]
+pub fn cannot_assume_role(role_arn: &str) -> String {
+    format!("Braket cannot assume the IAM role: '{role_arn}'")
+}
 
 /// How `GetDevice`, which does model a not-found error, reports an ARN the inventory does
 /// not publish: the ARN the request named and the region the request was signed for, which

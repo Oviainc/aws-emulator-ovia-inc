@@ -4,20 +4,21 @@
 //!
 //! The rules these suites pin:
 //!
-//! * `CreateSpendingLimit` mints a spending-limit ARN for a device the inventory
-//!   publishes and PERSISTS a record, which `SearchSpendingLimits` reads back: the
+//! * `CreateSpendingLimit` mints a spending-limit ARN for a device whose ARN names a
+//!   quantum processor and PERSISTS a record, which `SearchSpendingLimits` reads back: the
 //!   amount, the period and the tags come back exactly as they were written, and a
 //!   request that sends no `timePeriod` gets the default window.
 //! * `clientToken` is an `@idempotencyToken`: the same token with the same request
 //!   returns the first ARN and creates nothing; with a different request it is refused.
-//! * A device decides whether a limit may exist at all: a RETIRED device is
-//!   `DeviceRetiredException` (410), a SIMULATOR is `ValidationException` (400) —
-//!   "Simulators do not support spending limits" — and every other published device is
-//!   accepted, OFFLINE included.
+//! * The device decides whether a limit may exist at all: a device the inventory publishes
+//!   as RETIRED is `DeviceRetiredException` (410), a SIMULATOR is `ValidationException`
+//!   (400) — "Simulators do not support spending limits" — and every other quantum
+//!   processor is accepted, OFFLINE included and whether or not the inventory publishes it.
 //! * `queuedSpend` and `totalSpend` are COMPUTED from the device's quantum tasks over
 //!   the limit's own period, at the per-shot price the device's capability document
 //!   publishes.
-//! * The search is filtered (`deviceArn` only, `EQUAL` only) and paginated.
+//! * The search is filtered (on a limit's own ARN or its device's, `EQUAL` only) and
+//!   paginated.
 //!
 //! Each suite asserts its rule over a TABLE spanning the class rather than one recorded
 //! call: the rows differ along the amount's form, the period's length and presence, the
@@ -39,6 +40,9 @@ const REGION: &str = "eu-west-1";
 
 /// The account id every emulated ARN carries.
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+
+/// The status Amazon Braket answers a created spending limit with.
+const CREATED: u16 = 200;
 
 /// `POST /spending-limit`.
 async fn create_limit(braket: &Braket, body: Value) -> Reply {
@@ -241,8 +245,8 @@ async fn a_created_spending_limit_round_trips_through_the_search() {
         }
         let reply = create_limit(&braket, body).await;
         assert_eq!(
-            reply.status, 201,
-            "case {case:?}: expected 201, got {} {}",
+            reply.status, CREATED,
+            "case {case:?}: expected {CREATED}, got {} {}",
             reply.status, reply.body
         );
         let arn = reply.str_member("spendingLimitArn");
@@ -326,7 +330,8 @@ async fn a_created_spending_limit_round_trips_through_the_search() {
 }
 
 /// Whether a limit may be created at all is decided by the device: every published row
-/// of the inventory, by type and status, plus the two ARNs that name no device.
+/// of the inventory, by type and status, plus the ARNs that name a device the inventory
+/// does not publish and the ARNs that name no device at all.
 #[tokio::test]
 async fn the_device_decides_whether_a_spending_limit_may_be_created() {
     let braket = Braket::new();
@@ -347,7 +352,7 @@ async fn the_device_decides_whether_a_spending_limit_may_be_created() {
         } else {
             // Every other device accepts one — OFFLINE included, because a device being
             // temporarily offline does not stop a limit being set on it.
-            (201, None)
+            (CREATED, None)
         };
         rows.push((
             format!("{device_type} {status} {arn}"),
@@ -356,8 +361,30 @@ async fn the_device_decides_whether_a_spending_limit_may_be_created() {
             expected.1,
         ));
     }
-    // `deviceArn` targets an `@arnReference` shape with no `@pattern`, so these two
-    // reach the handler: neither names a device, and this operation models no
+    // A quantum processor this emulator's inventory does not publish is still a quantum
+    // processor: a cost control is about the device the ARN names, so the admission turns
+    // on the KIND in the ARN rather than on the inventory.
+    rows.push((
+        "a QPU ARN the inventory does not publish".to_string(),
+        "arn:aws:braket:::device/qpu/acme/Nonesuch".to_string(),
+        CREATED,
+        None,
+    ));
+    rows.push((
+        "a QPU ARN of another region and partition".to_string(),
+        "arn:aws-cn:braket:cn-north-1::device/qpu/acme/Other".to_string(),
+        CREATED,
+        None,
+    ));
+    // A simulator ARN is refused on the same reading, published or not.
+    rows.push((
+        "a simulator ARN the inventory does not publish".to_string(),
+        "arn:aws:braket:::device/quantum-simulator/acme/Nonesuch".to_string(),
+        400,
+        Some("ValidationException"),
+    ));
+    // `deviceArn` targets an `@arnReference` shape with no `@pattern`, so these reach
+    // the handler: neither names a device, and this operation models no
     // `ResourceNotFoundException`, so both are invalid input.
     rows.push((
         "not an ARN at all".to_string(),
@@ -366,8 +393,28 @@ async fn the_device_decides_whether_a_spending_limit_may_be_created() {
         Some("ValidationException"),
     ));
     rows.push((
-        "a well-formed device ARN the inventory does not publish".to_string(),
-        "arn:aws:braket:::device/qpu/acme/Nonesuch".to_string(),
+        "a device ARN whose kind Amazon Braket publishes nothing under".to_string(),
+        "arn:aws:braket:::device/quantum-annealer/acme/Nonesuch".to_string(),
+        400,
+        Some("ValidationException"),
+    ));
+    // A value that stops short of the published form names no device either, whatever its
+    // category segment reads as.
+    rows.push((
+        "a device ARN carrying a category but no provider or name".to_string(),
+        "arn:aws:braket:::device/qpu".to_string(),
+        400,
+        Some("ValidationException"),
+    ));
+    rows.push((
+        "a device ARN carrying no device name".to_string(),
+        "arn:aws:braket:us-west-1::device/qpu/acme".to_string(),
+        400,
+        Some("ValidationException"),
+    ));
+    rows.push((
+        "a device ARN whose device name is empty".to_string(),
+        "arn:aws:braket:us-west-1::device/qpu/acme/".to_string(),
         400,
         Some("ValidationException"),
     ));
@@ -390,7 +437,7 @@ async fn the_device_decides_whether_a_spending_limit_may_be_created() {
             reply.error,
             reply.body
         );
-        if *status == 201 {
+        if *status == CREATED {
             let arn = reply.str_member("spendingLimitArn");
             assert_spending_limit_arn(&arn, case);
             let limit = limit_by_arn(&braket, device_arn, &arn).await;
@@ -467,8 +514,8 @@ async fn the_client_token_makes_a_create_idempotent() {
 
     let created = create_limit(&braket, first.clone()).await;
     assert_eq!(
-        created.status, 201,
-        "the first create: expected 201, got {} {}",
+        created.status, CREATED,
+        "the first create: expected {CREATED}, got {} {}",
         created.status, created.body
     );
     let arn = created.str_member("spendingLimitArn");
@@ -477,8 +524,8 @@ async fn the_client_token_makes_a_create_idempotent() {
     for attempt in 1..=3 {
         let replay = create_limit(&braket, first.clone()).await;
         assert_eq!(
-            replay.status, 201,
-            "replay {attempt}: expected 201, got {} {}",
+            replay.status, CREATED,
+            "replay {attempt}: expected {CREATED}, got {} {}",
             replay.status, replay.body
         );
         assert_eq!(
@@ -569,8 +616,8 @@ async fn the_reported_spend_is_computed_from_the_devices_quantum_tasks() {
         };
         let created = create_limit(&braket, body).await;
         assert_eq!(
-            created.status, 201,
-            "case {case:?}: expected 201, got {} {}",
+            created.status, CREATED,
+            "case {case:?}: expected {CREATED}, got {} {}",
             created.status, created.body
         );
         let arn = created.str_member("spendingLimitArn");
@@ -632,8 +679,8 @@ async fn the_search_filters_and_pages_over_the_stored_limits() {
         )
         .await;
         assert_eq!(
-            reply.status, 201,
-            "limit {index}: expected 201, got {} {}",
+            reply.status, CREATED,
+            "limit {index}: expected {CREATED}, got {} {}",
             reply.status, reply.body
         );
         on_first.insert(reply.str_member("spendingLimitArn"));
@@ -644,8 +691,8 @@ async fn the_search_filters_and_pages_over_the_stored_limits() {
     )
     .await;
     assert_eq!(
-        reply.status, 201,
-        "the other device's limit: expected 201, got {} {}",
+        reply.status, CREATED,
+        "the other device's limit: expected {CREATED}, got {} {}",
         reply.status, reply.body
     );
     let on_second = reply.str_member("spendingLimitArn");
@@ -762,14 +809,47 @@ async fn the_search_filters_and_pages_over_the_stored_limits() {
         );
     }
 
-    // (case, filter name) — a member AWS does not filter on: "Currently only supports
-    // deviceArn".
+    // A filter on a limit's OWN ARN narrows to that one limit: the other identifier of a
+    // spending-limit summary, matched the same way.
+    let one = search_limits(
+        &braket,
+        json!({
+            "filters": [{
+                "name": "spendingLimitArn",
+                "operator": "EQUAL",
+                "values": [on_second],
+            }],
+            "maxResults": 100,
+        }),
+    )
+    .await;
+    assert_eq!(
+        one.status, 200,
+        "a spendingLimitArn filter is served, got {} {}",
+        one.status, one.body
+    );
+    let reported: Vec<String> = one
+        .body
+        .get("spendingLimits")
+        .and_then(Value::as_array)
+        .expect("spendingLimits is a required output member")
+        .iter()
+        .map(|limit| member(limit, "spendingLimitArn").to_string())
+        .collect();
+    assert_eq!(
+        reported,
+        vec![on_second.clone()],
+        "a spendingLimitArn filter reports exactly that limit: {}",
+        one.body
+    );
+
+    // (case, filter name) — a member this search does not narrow on.
     for (case, name) in [
-        ("the ARN", "spendingLimitArn"),
         ("the amount", "spendingLimit"),
         ("the creation instant", "createdAt"),
         ("a member of no shape", "nonesuch"),
-        ("the supported name with trailing space", "deviceArn "),
+        ("a supported name with a trailing space", "deviceArn "),
+        ("a supported name in another case", "SpendingLimitArn"),
     ] {
         let reply = search_limits(
             &braket,
@@ -855,8 +935,8 @@ async fn searching_twice_reports_the_same_limits() {
     body["timePeriod"] = period(start, start + 600);
     let created = create_limit(&braket, body).await;
     assert_eq!(
-        created.status, 201,
-        "the create: expected 201, got {} {}",
+        created.status, CREATED,
+        "the create: expected {CREATED}, got {} {}",
         created.status, created.body
     );
     let arn = created.str_member("spendingLimitArn");

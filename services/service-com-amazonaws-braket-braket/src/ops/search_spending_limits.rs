@@ -6,9 +6,17 @@
 //! returns one page of them with an opaque `nextToken` for the rest.
 //!
 //! A `SearchSpendingLimitsFilter` names one member, an operator and the values to
-//! compare against. The model documents exactly one filterable member (`deviceArn`) and
-//! models exactly one operator (`EQUAL`), which holds when the member equals any of the
+//! compare against. The filterable members are a spending limit's two identifiers — its
+//! device's ARN and its own ARN ([`SPENDING_LIMIT_FILTER_NAMES`]) — and the model models
+//! exactly one operator (`EQUAL`), which holds when the member equals any of the
 //! filter's values; several filters hold together (AND).
+//!
+//! `spendingLimitArn` is a filter name the model's documentation of the member does not
+//! list ("Currently only supports `deviceArn`") and the service nevertheless serves: in the
+//! wire corpus `simparity-wire-aws-v1`, fixture `braket-spending-limit-lifecycle` step
+//! `task#2` searches with a single `spendingLimitArn` `EQUAL` filter right after the create
+//! and is answered 200 with the created limit in `spendingLimits`. The recording is the
+//! authority for what the service admits, so this operation narrows on it.
 //!
 //! Each summary's `queuedSpend` and `totalSpend` are COMPUTED from the device's quantum
 //! tasks over the limit's own period — see [`crate::state::ComAmazonawsBraketBraketState::spend_on_device`] —
@@ -100,10 +108,14 @@ impl From<SearchSpendingLimitsErrorModeled> for SearchSpendingLimitsError {
 
 /// The filter names this operation accepts.
 ///
-/// From the model's own documentation of `SearchSpendingLimitsFilter$name`: "The name of
-/// the field to filter on. Currently only supports `deviceArn`"
-/// (`smithy_query(query="doc", shape="SearchSpendingLimitsFilter", member="name")`).
-const SPENDING_LIMIT_FILTER_NAMES: &[&str] = &["deviceArn"];
+/// The model's documentation of `SearchSpendingLimitsFilter$name` names `deviceArn`
+/// ("Currently only supports `deviceArn`",
+/// `smithy_query(query="doc", shape="SearchSpendingLimitsFilter", member="name")`), and
+/// Amazon Braket also narrows on a spending limit's OWN ARN — the identifier the create
+/// minted — as the recorded search this module's header cites shows, so a search for one
+/// limit by `spendingLimitArn` is served rather than refused. Both are identifier members of
+/// `SpendingLimitSummary`; every other member of it is not a name this search takes.
+const SPENDING_LIMIT_FILTER_NAMES: &[&str] = &["deviceArn", "spendingLimitArn"];
 
 /// The only operator `SearchSpendingLimitsFilterOperator` models, and so the only one a
 /// filter may carry (`SEARCH_SPENDING_LIMITS_FILTER_OPERATOR_VALUES`).
@@ -129,6 +141,7 @@ fn refuse(message: String) -> SearchSpendingLimitsError {
 fn limit_member<'l>(limit: &'l crate::state::SpendingLimit, name: &str) -> Option<&'l str> {
     match name {
         "deviceArn" => Some(&limit.device_arn),
+        "spendingLimitArn" => Some(&limit.spending_limit_arn),
         _ => None,
     }
 }
