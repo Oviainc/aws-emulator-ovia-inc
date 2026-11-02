@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachNetworkInterface
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachNetworkInterface`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes down the network interface attachment the request names, which is a
+//! write on the interface the attachment is of. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachNetworkInterface::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Detaches a network interface from an instance": an attachment is a member of the
+//! interface record ([`crate::state::ComAmazonawsEc2Amazonec2State::network_interfaces`])
+//! rather than a record of its own, so the `AttachmentId` is resolved by asking the
+//! interfaces which one carries it
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::network_interface_of_attachment`]). A
+//! detach this operation admits leaves the attachment in the NON-TERMINAL `detaching` state
+//! and the clock owes its completion one [`crate::state::TRANSITION_DELAY`] later, at which
+//! point the interface holds nothing: it is `available` again and the instance that held it
+//! no longer has it — which is what `DescribeNetworkInterfaces` and `DescribeInstances` then
+//! report. The interface itself stays; detaching one does not delete it.
+//!
+//! What it refuses, and in what order:
+//!
+//! * `InvalidNetworkInterfaceAttachmentId.Malformed` (400) — the value is not an attachment
+//!   id this service could have issued, so there is nothing to look up
+//!   ([`crate::state::ComAmazonawsEc2Amazonec2State::network_interface_attachment_id_is_well_formed`]).
+//! * `InvalidAttachmentID.NotFound` (400) — a readable attachment id no interface of the
+//!   account carries, which is what a second detach of one already taken down reads.
+//! * `OperationNotPermitted` (400) — the attachment is the instance's PRIMARY interface
+//!   (device index 0), which goes with the instance rather than being detachable on its own,
+//!   or it is one another Amazon Web Services service made and manages.
+//! * `DryRunOperation` (412) — a request that would have succeeded, with `DryRun` set.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +173,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachNetworkInterface` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachNetworkInterfaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachNetworkInterface"))
+        // `ctx` carries request metadata only; this operation reads none of it — an
+        // attachment is named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        let attachment_id = input.attachment_id.as_str();
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A detach the clock already finished took its attachment away at its own instant,
+        // whether or not anybody called: that is materialised before this request resolves the
+        // id, so the attachment this call acts on is the one a reader is already being shown
+        // and one that is gone cannot be detached a second time.
+        store.materialize_due_transitions();
+
+        // A value this service could not have issued as an attachment id is refused BEFORE
+        // anything is looked up, the way EC2 orders the two: there is nothing to look up, so
+        // "not an id of this kind" is never reported as "no such attachment".
+        if !store.network_interface_attachment_id_is_well_formed(attachment_id) {
+            return Err(state::invalid_network_interface_attachment_id_malformed(
+                attachment_id,
+            ));
+        }
+
+        // "Detaches a network interface from an instance": an id that names no attachment the
+        // account holds is a refusal, not a no-op — a caller that detaches twice has to be
+        // able to tell the detach it performed from one it did not.
+        let Some(network_interface_id) = store
+            .network_interface_of_attachment(attachment_id)
+            .map(str::to_string)
+        else {
+            return Err(state::invalid_attachment_id_not_found(attachment_id));
+        };
+        // The two indexes the primary-interface refusal names, read off the STORED attachment
+        // this id resolved to rather than off the request. The device index is kept as the
+        // OPTION the record carries: every writer seam of this store sets it, and an attachment
+        // that carries none is not the instance's primary one — so absence must not read as the
+        // primary's index 0 and make such a record undetachable.
+        let (device_index, network_card_index) = {
+            let attachment = store
+                .network_interface_attachment(&network_interface_id)
+                .ok_or_else(|| {
+                    state::internal_error(format!(
+                        "the attachment '{attachment_id}' resolved a moment ago could not be \
+                         read back"
+                    ))
+                })?;
+            (
+                attachment.device_index,
+                attachment.network_card_index.unwrap_or_default(),
+            )
+        };
+
+        // "The primary network interface is attached at device index 0": an instance in a VPC
+        // always has one and it goes with the instance, so its attachment is not one a caller
+        // may take down — whatever `Force` says, forcing being about an instance that is not
+        // answering rather than about which attachments exist.
+        if device_index == Some(state::PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX) {
+            return Err(state::primary_network_interface_cannot_be_detached(
+                state::PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX,
+                network_card_index,
+            ));
+        }
+        // "Indicates whether the network interface is being managed by Amazon Web Services"
+        // (`NetworkInterface$RequesterManaged`): an interface another service created for its
+        // own resource is not the account's to take down, whatever state it is in — the same
+        // reading `DetachVolume` takes of an attachment to a managed resource.
+        if store
+            .network_interfaces
+            .get(&network_interface_id)
+            .and_then(|interface| interface.requester_managed)
+            == Some(true)
+        {
+            return Err(state::attachment_is_not_the_accounts_to_manage());
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you have
+        // the required permissions, the error response is DryRunOperation" (`DryRun`). Nothing
+        // has moved yet, and nothing does.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+        // "Use the Force parameter only as a last resort to detach a network interface from a
+        // failed instance" (`Force`): a detach is only ever stuck because the instance holding
+        // the interface is not answering, and this emulator runs no instance that can fail to
+        // answer, so every detach it admits completes on the clock and the flag selects
+        // nothing.
+        let _ = input.force;
+
+        // The write: the attachment reads `detaching` from here, and the clock owes its
+        // completion through the one seam that records that move.
+        if !store.start_network_interface_detachment(&network_interface_id) {
+            return Err(state::internal_error(format!(
+                "the attachment '{attachment_id}' checked a moment ago could not be detached"
+            )));
+        }
+        Ok(DetachNetworkInterfaceOutput)
     }
 }

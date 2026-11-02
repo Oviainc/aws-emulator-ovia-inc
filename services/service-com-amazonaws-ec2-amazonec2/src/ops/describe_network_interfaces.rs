@@ -266,7 +266,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what this flag reveals.
         let include_managed_resources = input.include_managed_resources.unwrap_or(false);
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // A detachment the clock has made due took its attachment away at that instant whether
+        // or not anybody called, so it is applied before the interfaces are read: this report
+        // and `DescribeInstances` cannot then disagree about which interface an instance still
+        // holds. Nothing else is written here — a describe reports the store.
+        store.materialize_due_transitions();
 
         // "The network interface IDs" (`DescribeNetworkInterfacesRequest$NetworkInterfaceIds`):
         // an id that names no interface of the account is an error, not an absent row. Each

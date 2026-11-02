@@ -461,11 +461,21 @@
 //! stored beside the record.
 //!
 //! An interface AWS hands back is ready (`available`, or `in-use` once something holds it),
-//! so the clock owes it no transition and there is nothing to derive on read.
-//! [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] is the writer seam, ahead of
-//! the operation that will call it — `CreateNetworkInterface` is still a scaffold stub with
-//! its own open issue — so the create lands on this one record rather than on a second copy
-//! of an interface beside it.
+//! so a create owes it no transition and there is nothing to derive on read.
+//! [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] is the one writer seam every
+//! path that creates one lands on — `CreateNetworkInterface` and a launch's own primary
+//! interface alike — so an interface is one record rather than a second copy beside it.
+//!
+//! An interface's ATTACHMENT is what does owe the clock a move: `AttachNetworkInterface`
+//! leaves it `attaching` on its way to `attached`, and `DetachNetworkInterface` leaves it
+//! `detaching`, after which the interface holds nothing and is `available` again. Each move
+//! falls due one [`TRANSITION_DELAY`] after the call that started it, as the
+//! [`PendingStateMove`] in
+//! [`ComAmazonawsEc2Amazonec2State::network_interface_attachment_move_at`] beside the record
+//! — the way a `pending` VPC's move is kept — and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it. So a caller that
+//! reads the interface straight after either call still sees the transient state, and nothing
+//! is slept for.
 //!
 //! [`ComAmazonawsEc2Amazonec2State::network_interface_permissions`] holds the permissions the
 //! account has granted over those interfaces, as the modelled [`NetworkInterfacePermission`]
@@ -3606,6 +3616,22 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateNetworkInterface` `ClientToken` and the interface id it minted, so a repeat
     /// of the same request answers with that interface instead of creating a second one.
     pub network_interface_client_tokens: HashMap<String, String>,
+    /// The move the clock owes the ATTACHMENT of a network interface, by
+    /// `NetworkInterfaceId` — the interface counterpart of
+    /// [`Self::network_interface_permission_granted_at`], on the same monotonic clock and the
+    /// same [`TRANSITION_DELAY`], carried as the [`PendingStateMove`] every other owed move of
+    /// this store uses.
+    ///
+    /// `AttachNetworkInterface` answers an attachment in the non-terminal
+    /// [`ATTACHMENT_STATUS_ATTACHING`] and the clock owes it [`ATTACHMENT_STATUS_ATTACHED`];
+    /// `DetachNetworkInterface` leaves it [`ATTACHMENT_STATUS_DETACHING`] and the clock owes it
+    /// [`ATTACHMENT_STATUS_DETACHED`], which is the attachment being GONE rather than a state
+    /// it sits in. Either way the move was owed at its instant whether or not anybody called
+    /// again, and [`Self::materialize_due_transitions`] applies it.
+    ///
+    /// An attachment with nothing owed on it has no entry, so it stays exactly as it was
+    /// stored.
+    pub network_interface_attachment_move_at: BTreeMap<String, PendingStateMove>,
     /// Every permission the account has granted over one of its network interfaces, by
     /// `NetworkInterfacePermissionId`, as the modelled [`NetworkInterfacePermission`] shape
     /// itself — the one `DescribeNetworkInterfacePermissions` reports — so a member a writer
@@ -4765,6 +4791,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             network_interfaces: BTreeMap::new(),
             network_interfaces_by_instance: BTreeMap::new(),
             network_interface_client_tokens: HashMap::new(),
+            // Nothing is owed on an account that holds no interface, let alone on an
+            // attachment of one.
+            network_interface_attachment_move_at: BTreeMap::new(),
             // A fresh account has granted nothing over an interface it does not have yet.
             network_interface_permissions: BTreeMap::new(),
             network_interface_permission_granted_at: BTreeMap::new(),
@@ -8114,6 +8143,10 @@ impl ComAmazonawsEc2Amazonec2State {
         // The two moves an IAM instance profile association owes the clock: `associating` ->
         // `associated`, and the REMOVAL of one whose disassociation has been started.
         self.settle_due_iam_instance_profile_associations(now);
+        // The move the clock owes a network interface's attachment: `attaching` ->
+        // `attached` for an attach, and the attachment being GONE for a detach. Owed at its
+        // own instant whether or not anybody called again.
+        self.settle_due_network_interface_attachment_moves(now);
         let subnets = &mut self.subnets;
         self.subnet_available_at.retain(|subnet_id, due_at| {
             if now < *due_at {
@@ -15051,6 +15084,19 @@ pub fn ebs_attachment_limit(instance_type: &str) -> Option<i32> {
     instance_type_info(instance_type)?
         .ebs_info?
         .maximum_ebs_attachments
+}
+
+/// How many network interfaces an instance of `instance_type` can hold attached, or `None`
+/// for a type this service derives no facts for.
+///
+/// Read off the ONE derivation of an instance type's facts ([`instance_type_info`], whose
+/// `NetworkInfo$MaximumNetworkInterfaces` is what `DescribeInstanceTypes` reports) the way
+/// [`ebs_attachment_limit`] beside it reads the volume limit, so the limit an attach is
+/// refused by and the limit the describe publishes cannot disagree.
+pub fn network_interface_limit(instance_type: &str) -> Option<i32> {
+    instance_type_info(instance_type)?
+        .network_info?
+        .maximum_network_interfaces
 }
 
 /// The volume type `CreateVolume` uses when the request names none: "Default: gp2"
@@ -28664,7 +28710,7 @@ pub fn invalid_network_interface_id_not_found<E>(network_interface_id: &str) -> 
 // `NetworkInterface` and `NetworkInterfacePrivateIpAddress` are in this module's shared
 // import list, beside the store field that holds them; the attachment shape is imported
 // here, beside the statuses and the derivation that read it.
-use crate::ops::types::NetworkInterfaceAttachment;
+use crate::ops::types::{AttachmentEnaSrdSpecification, NetworkInterfaceAttachment};
 
 /// The id prefix EC2 mints a network interface with, as
 /// [`network_interface_id_is_well_formed`] reads one: `eni-`, carried here without the
@@ -28709,6 +28755,19 @@ pub const ATTACHMENT_STATUS_DETACHED: &str = "detached";
 /// completed sits in.
 pub const ATTACHMENT_STATUS_ATTACHED: &str = "attached";
 
+/// The `AttachmentStatus` of an attachment that is being brought up: the `attaching` member
+/// of that enum, which is where `AttachNetworkInterface` leaves one. NON-TERMINAL — the clock
+/// owes it [`ATTACHMENT_STATUS_ATTACHED`] one [`TRANSITION_DELAY`] later
+/// ([`ComAmazonawsEc2Amazonec2State::network_interface_attachment_move_at`]).
+pub const ATTACHMENT_STATUS_ATTACHING: &str = "attaching";
+
+/// The `AttachmentStatus` of an attachment that is being taken away: the `detaching` member
+/// of that enum, which is where `DetachNetworkInterface` leaves one. NON-TERMINAL — the clock
+/// owes the attachment its completion one [`TRANSITION_DELAY`] later
+/// ([`ComAmazonawsEc2Amazonec2State::network_interface_attachment_move_at`]), at which point
+/// the interface holds nothing at all.
+pub const ATTACHMENT_STATUS_DETACHING: &str = "detaching";
+
 /// The device index the PRIMARY network interface of an instance is attached at.
 ///
 /// "The primary network interface is attached at device index 0"
@@ -28737,6 +28796,86 @@ pub fn network_interface_in_use<E>(network_interface_id: &str) -> Scaffolded<E> 
              detached first"
         ),
     )
+}
+
+/// `InvalidNetworkInterfaceAttachmentId.Malformed` (HTTP 400): the request named a value that
+/// is not a network interface attachment id this service could have issued, so there is
+/// nothing to look up.
+pub const INVALID_NETWORK_INTERFACE_ATTACHMENT_ID_MALFORMED: &str =
+    "InvalidNetworkInterfaceAttachmentId.Malformed";
+
+/// `InvalidAttachmentID.NotFound` (HTTP 400): a readable attachment id that names no
+/// attachment the account holds — the not-found half of the pair whose malformed half is
+/// [`INVALID_NETWORK_INTERFACE_ATTACHMENT_ID_MALFORMED`].
+pub const INVALID_ATTACHMENT_ID_NOT_FOUND: &str = "InvalidAttachmentID.NotFound";
+
+/// Refuse a value that is not a network interface attachment id this service could have
+/// issued: HTTP 400 [`INVALID_NETWORK_INTERFACE_ATTACHMENT_ID_MALFORMED`], BEFORE any
+/// attachment is looked up, so "not an id of this kind" is never reported as "no such
+/// attachment".
+///
+/// The message is the resource-agnostic [`invalid_id_message`] template — `Invalid id:
+/// "<value>"` — which is the wording recorded for a refused attachment id, and the one every
+/// id kind of this service that has no sentence of its own carries. The one variable part is
+/// the value the REQUEST sent, bounded by [`echoed_resource_id`].
+pub fn invalid_network_interface_attachment_id_malformed<E>(attachment_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INTERFACE_ATTACHMENT_ID_MALFORMED,
+        400,
+        invalid_id_message(attachment_id),
+    )
+}
+
+/// Refuse a readable attachment id the account holds no attachment for: HTTP 400
+/// [`INVALID_ATTACHMENT_ID_NOT_FOUND`].
+///
+/// Worded the way this family of refusals words one about an id of a NAMED kind — the kind,
+/// the value from the request in single quotes, and that it does not exist — which is the
+/// sentence [`invalid_network_interface_id_not_found`] carries for the interface the
+/// attachment is of.
+pub fn invalid_attachment_id_not_found<E>(attachment_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_ATTACHMENT_ID_NOT_FOUND,
+        400,
+        format!("The attachment ID '{attachment_id}' does not exist"),
+    )
+}
+
+/// Refuse a detach of the PRIMARY network interface of an instance: HTTP 400
+/// `OperationNotPermitted`.
+///
+/// "The primary network interface is attached at device index 0"
+/// ([`PRIMARY_NETWORK_INTERFACE_DEVICE_INDEX`]): an instance in a VPC always has one and it
+/// goes with the instance, so it is not an attachment a caller may take down — whatever
+/// `Force` says, since forcing is about an instance that is not answering rather than about
+/// which attachments exist. The sentence names the two indexes of the attachment the request
+/// selected, both read off the stored attachment rather than off the request.
+pub fn primary_network_interface_cannot_be_detached<E>(
+    device_index: i32,
+    network_card_index: i32,
+) -> Scaffolded<E> {
+    Scaffolded::operation_not_permitted(format!(
+        "The network interface at device index {device_index} and networkcard index \
+         {network_card_index} cannot be detached."
+    ))
+}
+
+/// Refuse a detach of an attachment ANOTHER Amazon Web Services service made and manages:
+/// HTTP 400 `OperationNotPermitted`.
+///
+/// "Indicates whether the network interface is being managed by Amazon Web Services"
+/// (`NetworkInterface$RequesterManaged`): such an interface was created for a service's own
+/// resource — an interface VPC endpoint's, say — so its attachment is not the account's to
+/// take down, and the refusal is about the ATTACHMENT rather than about the interface's state.
+///
+/// The sentence names the KIND of attachment the caller may not manage — the id PREFIX of that
+/// kind, [`NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX`] — which is the form EC2 words this class
+/// of refusal in, rather than the one id the request happened to name: what the caller may not
+/// do is manage attachments of that kind at all, so the text carries no per-request value.
+pub fn attachment_is_not_the_accounts_to_manage<E>() -> Scaffolded<E> {
+    Scaffolded::operation_not_permitted(format!(
+        "You are not allowed to manage '{NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX}' attachments."
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -28773,6 +28912,34 @@ pub fn trunk_interface_not_permitted<E>() -> Scaffolded<E> {
 // What one network interface is created with lives in [`NetworkInterfaceSpec`], beside the
 // writer seam [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] further up, so a
 // create and a seeded fixture ask for an interface the same way.
+
+/// What one attachment of a network interface to an instance is made with, beside everything
+/// the store itself owns (the attachment's id, the owning account, the attach time and the
+/// status it starts in).
+///
+/// The id is NOT here: it is minted by
+/// [`ComAmazonawsEc2Amazonec2State::start_network_interface_attachment`], the way every other
+/// stored id is, so no caller can choose one.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkInterfaceAttachmentSpec {
+    /// "The ID of the instance" (`AttachNetworkInterfaceRequest$InstanceId`) the interface is
+    /// attached to, which `NetworkInterfaceAttachment$InstanceId` reports.
+    pub instance_id: String,
+    /// "The index of the device for the network interface attachment"
+    /// (`AttachNetworkInterfaceRequest$DeviceIndex`).
+    pub device_index: i32,
+    /// "The index of the network card. … The default is network card index 0"
+    /// (`AttachNetworkInterfaceRequest$NetworkCardIndex`).
+    pub network_card_index: i32,
+    /// "Configures ENA Express for the network interface that this action attaches to the
+    /// instance" (`AttachNetworkInterfaceRequest$EnaSrdSpecification`), in the shape the
+    /// attachment reports it (`NetworkInterfaceAttachment$EnaSrdSpecification`). `None` for an
+    /// attach that asked for none, which is what AWS reports for one.
+    pub ena_srd_specification: Option<AttachmentEnaSrdSpecification>,
+    /// "The number of ENA queues to be created with the instance"
+    /// (`AttachNetworkInterfaceRequest$EnaQueueCount`), which the attachment reports back.
+    pub ena_queue_count: Option<i32>,
+}
 
 /// The caller-chosen bytes a stored network interface retains: its tags, its description
 /// and the addresses it holds. The same quantity
@@ -28887,6 +29054,11 @@ impl ComAmazonawsEc2Amazonec2State {
         {
             self.remove_network_interface_permission(&network_interface_permission_id);
         }
+        // And the move the clock owed this interface's attachment, which an interface the
+        // store no longer holds cannot be owed: nothing is left pointing at a record that is
+        // gone.
+        self.network_interface_attachment_move_at
+            .remove(network_interface_id);
         Some(interface)
     }
 
@@ -28906,6 +29078,199 @@ impl ComAmazonawsEc2Amazonec2State {
             .attachment
             .as_ref()
             .filter(|attachment| !attachment_is_detached(attachment))
+    }
+
+    /// Whether `attachment_id` is a network interface attachment id this service could have
+    /// ISSUED, which is what an operation that resolves a `NetworkInterfaceAttachmentId`
+    /// reads one as.
+    ///
+    /// [`Self::id_was_issued`] under this resource's own
+    /// [`NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX`]: AWS was recorded refusing a hand-written
+    /// long-form `eni-attach-…` id — a value inside the generic EC2 id form that it never
+    /// issued — with [`INVALID_NETWORK_INTERFACE_ATTACHMENT_ID_MALFORMED`] BEFORE any
+    /// attachment was looked up, so this id kind is read as the ids the service issues rather
+    /// than as anything that merely looks hexadecimal. An id it DID issue is looked up, and is
+    /// answered [`invalid_attachment_id_not_found`] when the attachment it named is gone.
+    pub fn network_interface_attachment_id_is_well_formed(&self, attachment_id: &str) -> bool {
+        self.id_was_issued(NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX, attachment_id)
+    }
+
+    /// The network interface the attachment `attachment_id` holds, or `None` when no interface
+    /// of the account carries that attachment.
+    ///
+    /// A READ ONLY, and the one way an operation that names an ATTACHMENT finds the interface
+    /// it is of: an attachment is a member of the interface record rather than a record of its
+    /// own, so the id is resolved by asking the interfaces. An attachment that has been taken
+    /// away holds nothing and so names no interface, exactly as
+    /// [`Self::network_interface_attachment`] reads one.
+    pub fn network_interface_of_attachment(&self, attachment_id: &str) -> Option<&str> {
+        self.network_interfaces
+            .iter()
+            .find_map(|(network_interface_id, interface)| {
+                let attachment = interface.attachment.as_ref()?;
+                if attachment_is_detached(attachment) {
+                    return None;
+                }
+                (attachment.attachment_id.as_deref() == Some(attachment_id))
+                    .then_some(network_interface_id.as_str())
+            })
+    }
+
+    /// Start taking down the attachment the interface `network_interface_id` holds, and answer
+    /// whether there was one to take down.
+    ///
+    /// "Detaches a network interface from an instance" (`DetachNetworkInterface`): the
+    /// attachment moves to the NON-TERMINAL [`ATTACHMENT_STATUS_DETACHING`] now, and the clock
+    /// owes its completion one [`TRANSITION_DELAY`] later — the same span, on the same
+    /// monotonic clock, as every other move this store owes — so a caller that reads the
+    /// interface straight afterwards still sees the transient state. The instant is RECORDED
+    /// rather than slept for ([`Self::network_interface_attachment_move_at`]) and
+    /// [`Self::materialize_due_transitions`] applies it.
+    ///
+    /// That instant is owed by the call that STARTED the move: it is written only when the
+    /// attachment is not already on its way down, so a second detach of one already detaching
+    /// does not postpone its completion — overwriting would let a caller that polls with a
+    /// detach push the move out for as long as it kept asking.
+    pub fn start_network_interface_detachment(&mut self, network_interface_id: &str) -> bool {
+        let Some(interface) = self.network_interfaces.get_mut(network_interface_id) else {
+            return false;
+        };
+        let Some(attachment) = interface.attachment.as_mut() else {
+            return false;
+        };
+        if attachment.status.as_deref() == Some(ATTACHMENT_STATUS_DETACHED) {
+            return false;
+        }
+        let already_detaching =
+            attachment.status.as_deref() == Some(ATTACHMENT_STATUS_DETACHING);
+        attachment.status = Some(ATTACHMENT_STATUS_DETACHING.to_string());
+        if !already_detaching {
+            self.network_interface_attachment_move_at.insert(
+                network_interface_id.to_string(),
+                PendingStateMove::starting_now(ATTACHMENT_STATUS_DETACHED),
+            );
+        }
+        true
+    }
+
+    /// Attach the interface `network_interface_id` to an instance, and answer the
+    /// `AttachmentId` the attachment was given — or `None` when the store holds no such
+    /// interface.
+    ///
+    /// "Attaches a network interface to an instance" (`AttachNetworkInterface`): the attachment
+    /// is made in the NON-TERMINAL [`ATTACHMENT_STATUS_ATTACHING`] and the clock owes it
+    /// [`ATTACHMENT_STATUS_ATTACHED`] one [`TRANSITION_DELAY`] later, on the same terms as the
+    /// detach above, so a caller that reads the interface straight afterwards still sees the
+    /// transient state. The interface is `in-use` from this call on: an interface something
+    /// holds can no more claim to be `available` than the one
+    /// [`Self::insert_network_interface`] stores with an attachment can.
+    ///
+    /// The id is minted HERE rather than taken from a caller, the way every other stored id of
+    /// this store is, and the instance's own index of the interfaces it holds
+    /// ([`Self::network_interfaces_by_instance`]) is written with the attachment — so the
+    /// instance report and `DescribeNetworkInterfaces` cannot disagree about which interfaces
+    /// an instance has.
+    pub fn start_network_interface_attachment(
+        &mut self,
+        network_interface_id: &str,
+        spec: NetworkInterfaceAttachmentSpec,
+    ) -> Option<String> {
+        if !self.network_interfaces.contains_key(network_interface_id) {
+            return None;
+        }
+        let attachment_id = self.next_id(NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX);
+        let interface = self.network_interfaces.get_mut(network_interface_id)?;
+        interface.attachment = Some(NetworkInterfaceAttachment {
+            attach_time: Some(system_time_to_date_time(SystemTime::now())),
+            attachment_id: Some(attachment_id.clone()),
+            // "If you attach a network interface to an existing instance, the
+            // DeleteOnTermination attribute is set to false by default" (the EC2 User Guide's
+            // "Elastic network interfaces"): only the primary interface a LAUNCH creates goes
+            // with its instance.
+            delete_on_termination: Some(false),
+            device_index: Some(spec.device_index),
+            network_card_index: Some(spec.network_card_index),
+            instance_id: Some(spec.instance_id.clone()),
+            instance_owner_id: Some(::engine::emulator_account_id().to_string()),
+            status: Some(ATTACHMENT_STATUS_ATTACHING.to_string()),
+            ena_srd_specification: spec.ena_srd_specification,
+            ena_queue_count: spec.ena_queue_count,
+        });
+        interface.status = Some(NETWORK_INTERFACE_STATUS_IN_USE.to_string());
+        self.network_interfaces_by_instance
+            .entry(spec.instance_id)
+            .or_default()
+            .insert(network_interface_id.to_string());
+        self.network_interface_attachment_move_at.insert(
+            network_interface_id.to_string(),
+            PendingStateMove::starting_now(ATTACHMENT_STATUS_ATTACHED),
+        );
+        Some(attachment_id)
+    }
+
+    /// Apply every move the clock owes a network interface's attachment that has come due by
+    /// `now`.
+    ///
+    /// Reached only through [`Self::materialize_due_transitions`], so a reporting operation may
+    /// ask for it: each move was owed at its own instant whether or not anybody called, and
+    /// applying it writes nothing a caller could not already have been shown.
+    fn settle_due_network_interface_attachment_moves(&mut self, now: Instant) {
+        let due: Vec<(String, String)> = self
+            .network_interface_attachment_move_at
+            .iter()
+            .filter_map(|(network_interface_id, pending)| {
+                pending
+                    .due_by(now)
+                    .map(|to| (network_interface_id.clone(), to.to_string()))
+            })
+            .collect();
+        for (network_interface_id, to) in due {
+            self.network_interface_attachment_move_at
+                .remove(&network_interface_id);
+            // A finished DETACHMENT is the attachment being gone rather than a state it sits
+            // in, so it is applied by taking the attachment off the interface; every other
+            // move is the attachment's own status reaching its terminal value.
+            if to == ATTACHMENT_STATUS_DETACHED {
+                self.complete_network_interface_detachment(&network_interface_id);
+                continue;
+            }
+            if let Some(attachment) = self
+                .network_interfaces
+                .get_mut(&network_interface_id)
+                .and_then(|interface| interface.attachment.as_mut())
+            {
+                attachment.status = Some(to);
+            }
+        }
+    }
+
+    /// Take the attachment off the interface `network_interface_id`: the completed half of
+    /// [`Self::start_network_interface_detachment`].
+    ///
+    /// A finished detachment is the attachment being GONE rather than a state it sits in — the
+    /// interface holds nothing, so its status is [`NETWORK_INTERFACE_STATUS_AVAILABLE`] again
+    /// and the instance that held it no longer has it
+    /// ([`Self::network_interfaces_by_instance`], the index
+    /// [`Self::remove_network_interface`] keeps the same way). The interface itself stays:
+    /// detaching an interface does not delete it.
+    fn complete_network_interface_detachment(&mut self, network_interface_id: &str) {
+        let Some(interface) = self.network_interfaces.get_mut(network_interface_id) else {
+            return;
+        };
+        let held_by = interface
+            .attachment
+            .as_ref()
+            .and_then(|attachment| attachment.instance_id.clone());
+        interface.attachment = None;
+        interface.status = Some(NETWORK_INTERFACE_STATUS_AVAILABLE.to_string());
+        if let Some(instance_id) = held_by {
+            if let Some(held) = self.network_interfaces_by_instance.get_mut(&instance_id) {
+                held.remove(network_interface_id);
+                if held.is_empty() {
+                    self.network_interfaces_by_instance.remove(&instance_id);
+                }
+            }
+        }
     }
 }
 
@@ -33362,6 +33727,52 @@ pub fn issued_id_is_well_formed(prefix: &str, id: &str) -> bool {
             .is_some_and(|suffix| {
                 suffix.len() != LONG_RESOURCE_ID_DIGITS || suffix.starts_with('0')
             })
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether `id` is an id of the kind `prefix` names that this service has ISSUED.
+    ///
+    /// The strictest of this module's id readings, for the id kinds AWS answers
+    /// `Invalid<Kind>.Malformed` for a value that is merely IN the printed id form: an EC2 id
+    /// reaches the service encoded rather than as the identifier it stands for — "Unable to
+    /// unobfuscate ID."
+    /// ([`crate::scaffolded::Scaffolded::instance_id_could_not_be_unobfuscated`]) is the
+    /// sentence EC2 words for one it cannot decode — so a value no issue of that kind ever
+    /// produced is refused BEFORE any lookup rather than reported as a resource that does not
+    /// exist. Only an id the service could have handed out is looked up, which is what keeps
+    /// the not-found half of the pair reachable: the resource an issued id named may since
+    /// have gone.
+    ///
+    /// This store hands out ids from one monotonic counter ([`Self::next_id`], which writes
+    /// `<prefix>-{counter:017x}`), so the ids it has issued are exactly the long-form values
+    /// ([`issued_long_id_is_well_formed`]) at or below that counter — a hand-written
+    /// documentation-shaped id sits astronomically above it, while every id this service ever
+    /// answered with is at or below it.
+    ///
+    /// Which kinds read their ids this way is a fact about each kind, recorded with it:
+    /// [`Self::network_interface_attachment_id_is_well_formed`] does, on the recorded refusal
+    /// cited there, while a kind recorded answering `NotFound` for a hand-written long-form id
+    /// reads the wider [`prefixed_id_is_well_formed`] or [`issued_long_id_is_well_formed`]
+    /// instead.
+    ///
+    /// The counter is the store's ONE id counter, shared by every resource kind, so this says
+    /// "a value the mint has reached" rather than "a value reached for THIS kind" — an id at
+    /// or below it is looked up even when the mint spent that value on another kind, which is
+    /// the conservative direction: it reports a value the service may have issued as
+    /// not-found rather than reporting one it issued as unreadable.
+    pub fn id_was_issued(&self, prefix: &str, id: &str) -> bool {
+        issued_long_id_is_well_formed(prefix, id)
+            && id
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix('-'))
+                // A long-form suffix under a leading `0` is 64 bits of hexadecimal, so the
+                // value a well-formed one names always fits the counter's own width. A suffix
+                // the parse REFUSES is one that does not fit 64 bits, which is above every
+                // value the mint can reach rather than unreadable — so failing closed here is
+                // the same answer as the comparison below would give.
+                .and_then(|suffix| u64::from_str_radix(suffix, 16).ok())
+                .is_some_and(|named| named <= self.id_counter)
+    }
 }
 
 /// Whether `id` is a well-formed VPC ENDPOINT id, as opposed to an id of one of the two

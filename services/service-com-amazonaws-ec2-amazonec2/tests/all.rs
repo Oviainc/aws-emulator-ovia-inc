@@ -621,6 +621,13 @@ mod describe_subnets;
 mod describe_vpc_attribute;
 #[path = "all/describe_vpcs.rs"]
 mod describe_vpcs;
+// What `DetachNetworkInterface` takes down and what it refuses: the `detaching` state and the
+// completion the clock owes it, the malformed/not-found split on an `AttachmentId`, and the
+// attachments that cannot be detached at all. Declared HERE, in sorted position inside the
+// long-settled block rather than at the head of the file, where every new ec2 suite inserts
+// its lines and merges contend.
+#[path = "all/detach_network_interface.rs"]
+mod detach_network_interface;
 // What `DetachVolume` refuses and what it writes beyond the detach path in
 // `fpga_image_tasks_and_volume_io`: the `IncorrectState` wording, the owed `detached`
 // instant, and an attachment to an Amazon Web Services-managed resource.

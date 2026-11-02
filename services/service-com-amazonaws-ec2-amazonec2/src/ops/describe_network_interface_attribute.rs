@@ -262,7 +262,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state_handle = state::require_service_state(&*self.engine)?;
-        let store = state_handle.lock();
+        let mut store = state_handle.lock();
+        // A detachment the clock has made due took its attachment away at that instant whether
+        // or not anybody called, so it is applied before the attribute is read: the
+        // `attachment` this reports is the one `DescribeNetworkInterfaces` reports.
+        store.materialize_due_transitions();
         // "Describes a network interface attribute": a well-formed id this account holds
         // no interface for has no attribute to report, so it is a refusal rather than an
         // empty result.

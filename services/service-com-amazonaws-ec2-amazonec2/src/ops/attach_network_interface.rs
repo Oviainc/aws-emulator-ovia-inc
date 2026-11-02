@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachNetworkInterface
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachNetworkInterface`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: attaches the network interface the request names to the instance it names,
+//! which is a write on the interface the attachment is of. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachNetworkInterface::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Attaches a network interface to an instance": the attachment is a member of the interface
+//! record ([`crate::state::ComAmazonawsEc2Amazonec2State::network_interfaces`]) rather than a
+//! record of its own, so the write lands there and the instance's index of the interfaces it
+//! holds is written with it — one record, so `DescribeNetworkInterfaces` and
+//! `DescribeInstances` cannot disagree about one attachment. The attachment is answered in the
+//! NON-TERMINAL `attaching` state and the clock owes it `attached` one
+//! [`crate::state::TRANSITION_DELAY`] later, so a caller that reads the interface straight
+//! afterwards still sees the transient state. The id it answers with is minted by the store,
+//! never taken from the request, and `DetachNetworkInterface` is what takes the attachment
+//! down again.
+//!
+//! Implemented HERE, with `DetachNetworkInterface`, because it is the only way an attachment a
+//! detach can act on comes to exist: every other attachment in this store is the PRIMARY one a
+//! launch creates, which cannot be detached at all. Its own stub issue is
+//! `issues/.../20261025T021255Z-ec2-attachnetworkinterface-stub.md`.
+//!
+//! What it refuses, in the order the handler asks — the shape of the request first, then what
+//! the store says about the resources it names:
+//!
+//! * `InvalidNetworkInterfaceId.Malformed` / `InvalidInstanceID.Malformed` (400) — a value
+//!   that is not an id of that kind at all, so there is nothing to look up.
+//! * `InvalidParameterValue` (400) — a negative `DeviceIndex` or `NetworkCardIndex`: a
+//!   position cannot be below zero, and neither needs the store to be read.
+//! * `InvalidNetworkInterfaceID.NotFound` / `InvalidInstanceID.NotFound` (400) — a well-formed
+//!   id the account holds no such resource for.
+//! * `IncorrectInstanceState` (400) — an instance on its way to, or already in, `terminated`.
+//! * `InvalidNetworkInterface.InUse` (400) — "The specified interface is currently in use and
+//!   cannot be deleted or attached to another instance", so an interface something already
+//!   holds is refused.
+//! * `InvalidParameterValue` (400) — an interface in another Availability Zone than the
+//!   instance.
+//! * `AttachmentLimitExceeded` (400) — the attach would take the instance past the network
+//!   interfaces its instance type can hold, which a device index outside that range does too.
+//! * `InvalidParameterValue` (400) — a device index the instance already has an interface
+//!   attached at, asked after the type's own limit so a request outside that limit is told
+//!   about the limit rather than about which indexes are taken.
+//! * `DryRunOperation` (412) — a request that would have succeeded, with `DryRun` set.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +176,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachNetworkInterface` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachNetworkInterfaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachNetworkInterface"))
+        // `ctx` carries request metadata only; this operation reads none of it — the interface
+        // and the instance are named by id, and each carries its own Availability Zone. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        let network_interface_id = input.network_interface_id.as_str();
+        let instance_id = input.instance_id.as_str();
+
+        // Values that are not ids of their kind at all are refused BEFORE anything is looked
+        // up, the way the service orders the two.
+        if !state::network_interface_id_is_well_formed(network_interface_id) {
+            return Err(state::invalid_network_interface_id_malformed(
+                network_interface_id,
+            ));
+        }
+        if !state::instance_id_is_well_formed(instance_id) {
+            return Err(Scaffolded::invalid_instance_id_malformed(instance_id));
+        }
+        // "The index of the device for the network interface attachment" (`DeviceIndex`) and
+        // "the index of the network card" (`NetworkCardIndex`) are positions, so neither can be
+        // below zero. The model puts no range on either (`smithy_query(query="operation",
+        // operation="AttachNetworkInterface")` reports plain integers), so the boundary
+        // validator admits a negative one and it is refused here.
+        if input.device_index < 0 {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({}) for parameter deviceIndex is invalid. A device index is zero or \
+                 above",
+                input.device_index
+            )));
+        }
+        // "The default is network card index 0" (`NetworkCardIndex`).
+        let network_card_index = input.network_card_index.unwrap_or(0);
+        if network_card_index < 0 {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({network_card_index}) for parameter networkCardIndex is invalid. A \
+                 network card index is zero or above"
+            )));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A move the clock already made due was owed whether or not anybody called, so it is
+        // applied before this request reads the interface: an interface whose detach has
+        // completed is `available` and can be attached again.
+        store.materialize_due_transitions();
+
+        // "The ID of the network interface": an id the account holds no interface for is a
+        // refusal rather than an attachment of nothing.
+        let Some(interface) = store.network_interfaces.get(network_interface_id) else {
+            return Err(state::invalid_network_interface_id_not_found(
+                network_interface_id,
+            ));
+        };
+        let interface_zone = interface.availability_zone.clone().unwrap_or_default();
+        // The instance, resolved through the ONE reading of that refusal pair.
+        let instance = state::require_instance_record(&store, instance_id)?;
+        let instance_zone = instance.placement_az.clone();
+        let instance_type = instance.instance_type.clone();
+        let instance_state = instance.state;
+
+        // An instance on its way to `terminated` is not in a state that admits an attach: it
+        // is giving its interfaces up rather than taking another.
+        if instance_state.is_terminating() {
+            return Err(Scaffolded::incorrect_instance_state(
+                instance_id,
+                instance_state.as_str(),
+                "given a network interface",
+            ));
+        }
+        // "The specified interface is currently in use and cannot be deleted or attached to
+        // another instance" (EC2 API error codes, `InvalidNetworkInterface.InUse`): an
+        // interface something already holds is refused and stays exactly where it was.
+        if store
+            .network_interface_attachment(network_interface_id)
+            .is_some()
+        {
+            return Err(state::network_interface_in_use(network_interface_id));
+        }
+        // "You can attach a network interface to an instance in the same Availability Zone"
+        // (the EC2 User Guide's "Elastic network interfaces"): an interface lives in one
+        // zone's subnet and an instance runs in one zone, so an attach across two is refused
+        // naming both.
+        if interface_zone != instance_zone {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({network_interface_id}) for parameter networkInterfaceId is invalid. \
+                 The network interface is in the Availability Zone {interface_zone} and the \
+                 instance is in {instance_zone}"
+            )));
+        }
+
+        // What the instance's TYPE can hold, read off the one derivation of a type's facts
+        // (`network_interface_limit`), so the limit an attach is refused by is the one
+        // `DescribeInstanceTypes` publishes. A device index is a POSITION, so an attach at
+        // index N gives the instance N+1 interfaces: the index and the interfaces the instance
+        // already holds are two readings of the same count, and the larger decides. Both
+        // readings answer the quota code rather than a parameter one — what is wrong is the
+        // number of interfaces the instance would then hold, which is what the message names;
+        // no recorded refusal of this operation distinguishes the two, so they are not worded
+        // two ways.
+        let held = store.instance_network_interfaces(instance_id);
+        if let Some(limit) = state::network_interface_limit(&instance_type) {
+            let after_this_attach = i32::try_from(held.len())
+                .unwrap_or(i32::MAX)
+                .saturating_add(1)
+                .max(input.device_index.saturating_add(1));
+            if after_this_attach > limit {
+                return Err(state::attachment_limit_exceeded(format!(
+                    "Interface count {after_this_attach} exceeds the limit for {instance_type}"
+                )));
+            }
+        }
+        // "The primary network interface is attached at device index 0" and every other
+        // interface at an index of its own: an index the instance already has an interface at
+        // cannot take a second one.
+        if held.iter().any(|interface| {
+            interface
+                .attachment
+                .as_ref()
+                .and_then(|attachment| attachment.device_index)
+                == Some(input.device_index)
+        }) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({}) for parameter deviceIndex is invalid. Instance '{instance_id}' \
+                 already has an interface attached at device index '{}'",
+                input.device_index, input.device_index
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you have
+        // the required permissions, the error response is DryRunOperation" (`DryRun`). Nothing
+        // has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "Configures ENA Express for the network interface that this action attaches to the
+        // instance" (`EnaSrdSpecification`): the request's shape and the one the attachment
+        // reports carry the same two settings, so what the caller asked for round-trips
+        // through `DescribeNetworkInterfaces` rather than being dropped.
+        let ena_srd_specification = input.ena_srd_specification.as_ref().map(|asked| {
+            AttachmentEnaSrdSpecification {
+                ena_srd_enabled: asked.ena_srd_enabled,
+                ena_srd_udp_specification: asked.ena_srd_udp_specification.as_ref().map(|udp| {
+                    AttachmentEnaSrdUdpSpecification {
+                        ena_srd_udp_enabled: udp.ena_srd_udp_enabled,
+                    }
+                }),
+            }
+        });
+
+        // The write: the attachment is made `attaching` and the clock owes it `attached`,
+        // through the one seam that records that move and mints the id.
+        let attachment_id = store
+            .start_network_interface_attachment(
+                network_interface_id,
+                state::NetworkInterfaceAttachmentSpec {
+                    instance_id: instance_id.to_string(),
+                    device_index: input.device_index,
+                    network_card_index,
+                    ena_srd_specification,
+                    ena_queue_count: input.ena_queue_count,
+                },
+            )
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the network interface '{network_interface_id}' checked a moment ago could \
+                     not be attached"
+                ))
+            })?;
+
+        // Read the answer back OUT of the store, so the caller is told what a later
+        // `DescribeNetworkInterfaces` will report rather than the request object.
+        let attachment = store
+            .network_interface_attachment(network_interface_id)
+            .ok_or_else(|| {
+                state::internal_error(format!(
+                    "the attachment '{attachment_id}' just made could not be read back"
+                ))
+            })?;
+        Ok(AttachNetworkInterfaceOutput {
+            attachment_id: attachment.attachment_id.clone(),
+            network_card_index: attachment.network_card_index,
+        })
     }
 }
