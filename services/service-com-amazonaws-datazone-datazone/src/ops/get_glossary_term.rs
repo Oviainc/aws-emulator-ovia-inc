@@ -182,6 +182,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_clock(now_ms());
 
+        // Authorization comes FIRST: a permission is held on a domain, so a caller
+        // holds none on an identifier this store serves no domain for, and the request
+        // is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(GetGlossaryTermErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
         // A term is addressed by its domain and its own id, so a term of ANOTHER domain
         // is as absent here as one that was never created.
         let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {

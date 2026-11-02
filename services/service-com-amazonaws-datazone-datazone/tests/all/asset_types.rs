@@ -382,9 +382,15 @@ async fn created_asset_types_are_persisted_and_reported_by_get() {
     let orphaned = dz.get_asset_type(&domain, "MinimalType", "").await;
     assert_eq!(
         (orphaned.status, orphaned.error_code.as_str()),
-        (404, "ResourceNotFoundException"),
-        "an asset type must disappear with its domain, got {} {:?}",
+        (403, "AccessDeniedException"),
+        "an asset type must not outlive its domain, got {} {:?}",
         orphaned.status,
+        orphaned.body
+    );
+    assert_eq!(
+        orphaned.s("message"),
+        "User is not permitted to perform operation: GetAssetType",
+        "the denial must name the operation only, got {:?}",
         orphaned.body
     );
 }
@@ -608,29 +614,44 @@ async fn get_asset_type_reports_what_is_not_there_as_not_found() {
         created.status, created.body
     );
 
-    // Each row names something that is not stored; the stored type is the control.
+    // Each row names something that is not stored; the stored type is the control. An
+    // unknown DOMAIN is not an existence answer at all: the read is scoped to a domain
+    // the caller holds nothing on, so authorization decides it first.
     let cases = [
-        ("an unknown domain", "dzd_nosuchdomain", "StoredType", 404),
-        ("an unknown type", domain.as_str(), "NoSuchType", 404),
+        (
+            "an unknown domain",
+            "dzd_nosuchdomain",
+            "StoredType",
+            403,
+            "AccessDeniedException",
+        ),
+        (
+            "an unknown type",
+            domain.as_str(),
+            "NoSuchType",
+            404,
+            "ResourceNotFoundException",
+        ),
         (
             "a type stored under another name",
             domain.as_str(),
             "storedtype",
             404,
+            "ResourceNotFoundException",
         ),
-        ("the stored type", domain.as_str(), "StoredType", 200),
+        ("the stored type", domain.as_str(), "StoredType", 200, ""),
     ];
-    for (label, target_domain, identifier, status) in cases {
+    for (label, target_domain, identifier, status, code) in cases {
         let got = dz.get_asset_type(target_domain, identifier, "").await;
         assert_eq!(
             got.status, status,
             "case {label:?}: expected {status}, got {} {:?}",
             got.status, got.body
         );
-        if status == 404 {
+        if !code.is_empty() {
             assert_eq!(
-                got.error_code, "ResourceNotFoundException",
-                "case {label:?}: expected ResourceNotFoundException, got {:?}",
+                got.error_code, code,
+                "case {label:?}: expected {code}, got {:?}",
                 got.error_code
             );
         }

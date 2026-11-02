@@ -542,27 +542,32 @@ async fn a_domain_unit_needs_a_stored_domain_an_available_domain_and_a_stored_pa
         too_early.error_code
     );
 
-    // Reading a unit that is not stored, and reading a stored unit through a domain
-    // that is not: both are 404s, since GetDomainUnit models ResourceNotFoundException.
-    for (label, uri) in [
+    // Reading a unit a stored domain does not hold is a not-found; reading a stored
+    // unit through a domain this store has no record of is decided by authorization
+    // first, before the unit is looked for at all.
+    for (label, uri, status, code) in [
         (
             "unknown unit in a stored domain",
             format!("/v2/domains/{domain}/domain-units/nosuchunit"),
+            404,
+            "ResourceNotFoundException",
         ),
         (
-            "the root unit of another domain",
+            "a stored unit addressed through an unknown domain",
             format!("/v2/domains/dzd_nosuchdomain000/domain-units/{root}"),
+            403,
+            "AccessDeniedException",
         ),
     ] {
         let answer = dz.call("GET", &uri, None).await;
         assert_eq!(
-            answer.status, 404,
-            "case {label:?}: expected 404, got {} {:?}",
+            answer.status, status,
+            "case {label:?}: expected {status}, got {} {:?}",
             answer.status, answer.body
         );
         assert_eq!(
-            answer.error_code, "ResourceNotFoundException",
-            "case {label:?}: expected ResourceNotFoundException, got {:?}",
+            answer.error_code, code,
+            "case {label:?}: expected {code}, got {:?}",
             answer.error_code
         );
     }

@@ -9,8 +9,12 @@
 //!    only thing that turns a repeat into a replay of the first domain.
 //! 2. A `ResourceNotFoundException` message names the RESOURCE KIND only and never
 //!    echoes the caller-supplied identifier, on every not-found path this service
-//!    serves (GetDomain, DeleteDomain, CreateProject, GetProject, UpdateProject,
-//!    DeleteProject, GetAssetType).
+//!    serves (DeleteDomain, CreateProject, UpdateProject, DeleteProject, GetProject
+//!    and GetAssetType inside a domain the store holds).
+//!
+//! A single-resource READ scoped to a domain the store holds no record of is not a
+//! not-found path at all — authorization decides it before any lookup — so those rows
+//! live in `domain_scoped_read_authorization`, not in the table below.
 //!
 //! Both are asserted over a TABLE of inputs: the names differ in form and length and
 //! the repeat requests differ in their other members, and the not-found table covers
@@ -323,14 +327,6 @@ async fn resource_not_found_messages_name_the_kind_and_never_the_identifier() {
 
     let cases = vec![
         NotFoundCase {
-            label: "GetDomain with an unknown domain",
-            method: "GET",
-            uri: format!("/v2/domains/{MISSING_DOMAIN_ID}"),
-            body: None,
-            expect_kind: "Domain",
-            identifier: MISSING_DOMAIN_ID.to_string(),
-        },
-        NotFoundCase {
             label: "DeleteDomain with an unknown domain",
             method: "DELETE",
             uri: format!("/v2/domains/{MISSING_DOMAIN_ID}"),
@@ -343,14 +339,6 @@ async fn resource_not_found_messages_name_the_kind_and_never_the_identifier() {
             method: "POST",
             uri: format!("/v2/domains/{MISSING_DOMAIN_ID}/projects"),
             body: Some(json!({ "name": "orphan project" })),
-            expect_kind: "Domain",
-            identifier: MISSING_DOMAIN_ID.to_string(),
-        },
-        NotFoundCase {
-            label: "GetProject under an unknown domain",
-            method: "GET",
-            uri: format!("/v2/domains/{MISSING_DOMAIN_ID}/projects/{project_id}"),
-            body: None,
             expect_kind: "Domain",
             identifier: MISSING_DOMAIN_ID.to_string(),
         },
@@ -411,14 +399,6 @@ async fn resource_not_found_messages_name_the_kind_and_never_the_identifier() {
             body: Some(json!({ "description": "no such project" })),
             expect_kind: "Project",
             identifier: MISSING_PROJECT_ID.to_string(),
-        },
-        NotFoundCase {
-            label: "GetAssetType under an unknown domain",
-            method: "GET",
-            uri: format!("/v2/domains/{MISSING_DOMAIN_ID}/asset-types/{asset_type_id}"),
-            body: None,
-            expect_kind: "Domain",
-            identifier: MISSING_DOMAIN_ID.to_string(),
         },
         NotFoundCase {
             label: "GetAssetType with an unknown asset type in a real domain",

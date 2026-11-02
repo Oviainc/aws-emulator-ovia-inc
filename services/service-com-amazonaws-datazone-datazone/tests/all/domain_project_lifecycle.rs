@@ -379,9 +379,10 @@ async fn an_unknown_or_malformed_domain_identifier_is_refused() {
     let dz = Emulator::new();
     // (identifier, expected status, expected wire error code)
     let cases: Vec<(&str, u16, &str)> = vec![
-        // Well-formed but absent: the resource does not exist.
-        ("dzd_doesnotexist", 404, "ResourceNotFoundException"),
-        ("dzd-alsoabsent", 404, "ResourceNotFoundException"),
+        // Well-formed but absent: a permission is held ON a domain, so the caller holds
+        // none here and authorization decides the read before any lookup.
+        ("dzd_doesnotexist", 403, "AccessDeniedException"),
+        ("dzd-alsoabsent", 403, "AccessDeniedException"),
         // Outside `DomainId`'s pattern: the request itself is invalid.
         ("not-a-domain", 400, "ValidationException"),
         ("dzd", 400, "ValidationException"),
@@ -893,8 +894,8 @@ async fn deleting_a_domain_takes_its_projects_with_it() {
     let gone = dz.call("GET", &format!("/v2/domains/{domain}"), None).await;
     assert_eq!(
         (gone.status, gone.error_code.as_str()),
-        (404, "ResourceNotFoundException"),
-        "a deleted domain must be gone, got {} {:?}",
+        (403, "AccessDeniedException"),
+        "a deleted domain must no longer be served to its caller, got {} {:?}",
         gone.status,
         gone.body
     );
@@ -907,9 +908,17 @@ async fn deleting_a_domain_takes_its_projects_with_it() {
         .await;
     assert_eq!(
         (orphan.status, orphan.error_code.as_str()),
-        (404, "ResourceNotFoundException"),
-        "the deleted domain's projects must go with it, got {} {:?}",
+        (403, "AccessDeniedException"),
+        "a read scoped to the deleted domain must be denied, not answered, got {} {:?}",
         orphan.status,
+        orphan.body
+    );
+    // The domain is gone, so what remains is a permissions answer that names the
+    // operation and nothing the caller sent.
+    assert_eq!(
+        orphan.s("message"),
+        "User is not permitted to perform operation: GetProject",
+        "the denial must name the operation only, got {:?}",
         orphan.body
     );
     let listed = dz.call("GET", "/v2/domains", None).await;

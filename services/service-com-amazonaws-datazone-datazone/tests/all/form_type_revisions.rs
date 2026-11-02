@@ -490,8 +490,8 @@ async fn a_form_type_is_scoped_to_its_domain_and_owning_project() {
         .await;
     assert_eq!(
         (orphan.status, orphan.error_code.as_str()),
-        (404, "ResourceNotFoundException"),
-        "the deleted domain's form types must go with it, got {} {:?}",
+        (403, "AccessDeniedException"),
+        "a read scoped to the deleted domain must be denied, got {} {:?}",
         orphan.status,
         orphan.body
     );

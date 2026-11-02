@@ -370,12 +370,21 @@ async fn created_assets_are_persisted_and_reported_by_get_asset() {
     );
     tokio::time::sleep(SETTLED).await;
     let (_, orphan, _) = &created[0];
+    // The domain is gone, so no permission is held on it any more and the read is
+    // decided by authorization before any asset lookup: the asset is no longer served
+    // under that scope, and the answer says "not allowed", not "not there".
     let gone = dz.call("GET", &format!("{assets_uri}/{orphan}"), None).await;
     assert_eq!(
         (gone.status, gone.error_code.as_str()),
-        (404, "ResourceNotFoundException"),
-        "an asset must disappear with its domain, got {} {:?}",
+        (403, "AccessDeniedException"),
+        "an asset must not outlive its domain, got {} {:?}",
         gone.status,
+        gone.body
+    );
+    assert_eq!(
+        gone.s("message"),
+        "User is not permitted to perform operation: GetAsset",
+        "the denial must name the operation only, got {:?}",
         gone.body
     );
 }

@@ -2257,6 +2257,23 @@ impl ComAmazonawsDatazoneDatazoneState {
         self.bound_idempotency();
     }
 
+    /// Whether a request scoped to the domain `domain_identifier` is authorized.
+    ///
+    /// A DataZone permission is held ON a domain, and the service decides a
+    /// domain-scoped request by authorization BEFORE it resolves the domain or any
+    /// resource inside it. So a caller holds nothing on an identifier this store serves
+    /// no domain for, whatever that identifier looks like, and such a request is denied
+    /// rather than answered with an existence report — see [`not_permitted_message`]
+    /// for the refusal every domain-scoped operation builds from this.
+    ///
+    /// The status of a domain the store DOES hold is not part of this question: a
+    /// request scoped to a stored domain is authorized, and what its own resource
+    /// lookups then find (including a domain on its way out, which
+    /// [`Self::live_domain`] excludes) is reported as existence.
+    pub fn authorizes_domain(&self, domain_identifier: &str) -> bool {
+        self.domains.contains_key(domain_identifier)
+    }
+
     /// The domain `id`, when it exists and is not already being deleted.
     pub fn live_domain(&self, id: &str) -> Option<&Domain> {
         self.domains
@@ -2802,6 +2819,29 @@ impl std::fmt::Display for ResourceKind {
         f.write_str(self.as_str())
     }
 }
+
+/// The `AccessDeniedException` message DataZone answers a request it denies INSIDE a
+/// domain — one carrying a `domainIdentifier` and addressing a resource under it.
+///
+/// The fixed text plus the OPERATION NAME of the request — `Operation::NAME`, the name
+/// the model binds, which is why the only argument is that name: nothing from the
+/// request's path, body or state appears in it, so the denial reveals nothing about
+/// what the caller addressed. Every domain-scoped operation that denies a request words
+/// it through this, so the wording cannot drift between them. (An operation whose own
+/// identifier IS the domain uses [`DOMAIN_SCOPE_DENIED_MESSAGE`] instead.)
+pub fn not_permitted_message(operation: &str) -> String {
+    format!("User is not permitted to perform operation: {operation}")
+}
+
+/// The `AccessDeniedException` message DataZone answers when the identifier the request
+/// carries IS the domain it is scoped to, rather than a resource inside one.
+///
+/// Recorded behaviour: that denial's body carries no members at all, so the `message`
+/// the model marks required is EMPTY — the service says nothing about a domain the
+/// caller holds nothing on, not even which operation was refused. Deliberately distinct
+/// from [`not_permitted_message`], which is the recorded wording for a denial inside a
+/// domain, and shared so the domain-level operations cannot drift from one another.
+pub const DOMAIN_SCOPE_DENIED_MESSAGE: &str = "";
 
 /// The `ConflictException` message `CreateDomain` answers when the account already has
 /// a domain with the requested name. The requirement is the 409 refusal and the code;
