@@ -965,13 +965,23 @@ pub struct PrincipalTagAttributeMap {
 }
 
 /// The DEFAULT principal-tag attribute map, which a call asking for the default mappings
-/// configures. `SetPrincipalTagAttributeMap`'s own doc calls them the "default (username
-/// and clientID) attribute mappings", so those are the two tags; each is taken from the
-/// claim an issued OpenID Connect token carries it in — the subject (`sub`), which names
-/// the identity, and the audience (`aud`), which names what the token was issued to (see
-/// [`open_id_token`]). Choosing the defaults is a choice INSTEAD of a custom mapping, so
-/// this map is the provider's whole mapping rather than something merged into one.
-pub const DEFAULT_PRINCIPAL_TAGS: [(&str, &str); 2] = [("clientID", "aud"), ("username", "sub")];
+/// configures: the two tags a provider's users are mapped by when the call names no
+/// attributes of its own — `username` and `client` — each taken from the claim an issued
+/// OpenID Connect token carries it in, the subject (`sub`), which names the identity, and the
+/// audience (`aud`), which names what the token was issued to (see [`open_id_token`]).
+///
+/// Those two tag KEYS are the ones AWS's own documentation of attributes for access control
+/// publishes for the default mappings — a policy references the vended session tags as
+/// `aws:PrincipalTag/username` and `aws:PrincipalTag/client` — and they are what a read of a
+/// default-mapped provider reports. `SetPrincipalTagAttributeMap`'s own doc names the same
+/// pair in prose, as the "default (username and clientID) attribute mappings"
+/// (`smithy_query(query="doc",shape="SetPrincipalTagAttributeMap")`); that sentence describes
+/// the two attributes rather than spelling the tag keys, so the keys are taken from the
+/// published mapping above.
+///
+/// Choosing the defaults is a choice INSTEAD of a custom mapping, so this map is the
+/// provider's whole mapping rather than something merged into one.
+pub const DEFAULT_PRINCIPAL_TAGS: [(&str, &str); 2] = [("client", "aud"), ("username", "sub")];
 
 /// [`DEFAULT_PRINCIPAL_TAGS`] as a stored mapping.
 pub fn default_principal_tags() -> BTreeMap<String, String> {
@@ -1575,6 +1585,16 @@ pub const EXPIRED_LOGIN_TOKEN_MESSAGE: &str = "Invalid login token. Token is exp
 pub const UNVERIFIABLE_LOGIN_TOKEN_MESSAGE: &str =
     "Invalid login token. Couldn't verify signed token.";
 
+/// How AWS words the refusal of a token presented under this service's own provider name
+/// that is a token of ANOTHER identity pool: the token is read against the pool that owns
+/// the identity the call names — each identity belongs to the pool that minted it — and a
+/// token some other pool minted is no Cognito token of this one, whatever it claims.
+///
+/// Fixed text with no request- or state-derived part, as the other refusals of a presented
+/// token are: the caller of a credential exchange holds no credential yet, so the refusal
+/// names neither pool, neither identity, nor the token it was made with.
+pub const NOT_A_COGNITO_TOKEN_MESSAGE: &str = "Invalid login token. Not a Cognito token.";
+
 /// Why a token presented under [`COGNITO_IDENTITY_LOGIN_PROVIDER`] authorizes nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginTokenRefusal {
@@ -1582,10 +1602,12 @@ pub enum LoginTokenRefusal {
     Expired,
     /// This service holds no issuance for the token.
     Unverifiable,
-    /// The issuance names ANOTHER identity than the one the request was made for, so the
-    /// token is no login of that identity — which is also what keeps a token one identity
-    /// pool minted out of another pool's identities, since an identity belongs to the pool
-    /// that minted it.
+    /// The issuance was made by ANOTHER identity pool than the one that owns the identity
+    /// the request was made for, so the token is no token of that pool at all — which is
+    /// what keeps a token one identity pool minted out of another pool's identities.
+    AnotherPool,
+    /// The issuance is one of the SAME pool, naming another of its identities: a token of
+    /// that pool, but no login of the identity the request named.
     AnotherIdentity,
 }
 
@@ -1595,6 +1617,7 @@ impl LoginTokenRefusal {
         match self {
             Self::Expired => EXPIRED_LOGIN_TOKEN_MESSAGE,
             Self::Unverifiable => UNVERIFIABLE_LOGIN_TOKEN_MESSAGE,
+            Self::AnotherPool => NOT_A_COGNITO_TOKEN_MESSAGE,
             Self::AnotherIdentity => UNMATCHED_LOGINS_MESSAGE,
         }
     }
@@ -2007,9 +2030,15 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// The one entry the map can carry under this service's own provider name has to resolve
     /// to an issuance whose window is still open ([`Self::resolve_login_token`]) AND whose
     /// identity is the one the request was made for: such a token was minted FOR one
-    /// identity, so it is a login of that identity alone and of no other — which is what
-    /// keeps a token minted in one identity pool from reaching an identity of another, each
-    /// identity belonging to the pool that minted it.
+    /// identity, so it is a login of that identity alone and of no other.
+    ///
+    /// Which refusal an issuance of ANOTHER identity carries is decided by the POOL that
+    /// minted it, because the token is read against the pool that owns the identity the
+    /// request names — each identity belonging to the pool that minted it. A token of that
+    /// same pool is one of its tokens and simply not a login of the identity named
+    /// ([`LoginTokenRefusal::AnotherIdentity`]); a token ANOTHER pool minted is no token of
+    /// this pool at all ([`LoginTokenRefusal::AnotherPool`]), which is the refusal that keeps
+    /// one pool's tokens out of another pool's identities.
     ///
     /// A map presenting no token of this service's is decided by the providers that issued
     /// its tokens, which this emulator does not reach, so it is not refused here.
@@ -2020,11 +2049,25 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         now: SystemTime,
     ) -> Option<LoginTokenRefusal> {
         let token = logins.get(COGNITO_IDENTITY_LOGIN_PROVIDER)?;
-        match self.resolve_login_token(token, now) {
-            Err(refusal) => Some(refusal),
-            Ok(issued) => (issued.identity_id != identity_id)
-                .then_some(LoginTokenRefusal::AnotherIdentity),
+        let issued = match self.resolve_login_token(token, now) {
+            Err(refusal) => return Some(refusal),
+            Ok(issued) => issued,
+        };
+        if issued.identity_id == identity_id {
+            return None;
         }
+        // The pool the named identity belongs to, which is the pool the token is read
+        // against. An identity this service holds no record of is reported as the missing
+        // resource it is before this is reached, so there is no pool to compare for one and
+        // the token is answered as the login of another identity that it is.
+        let addressed_pool = self
+            .identities
+            .get(identity_id)
+            .map(|identity| identity.identity_pool_id.as_str());
+        if addressed_pool.is_some_and(|pool| pool != issued.identity_pool_id) {
+            return Some(LoginTokenRefusal::AnotherPool);
+        }
+        Some(LoginTokenRefusal::AnotherIdentity)
     }
 
     /// Every identity a presented `Logins` map PROVES, each once, in the provider-name order

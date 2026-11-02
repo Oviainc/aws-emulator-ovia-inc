@@ -49,6 +49,8 @@ mod identity_pool_roles_presence;
 mod list_identity_pools;
 #[path = "all/login_authorized_refusals.rs"]
 mod login_authorized_refusals;
+#[path = "all/login_issuer_precedence.rs"]
+mod login_issuer_precedence;
 #[path = "all/login_token_window.rs"]
 mod login_token_window;
 #[path = "all/lookup_developer_identity.rs"]

@@ -14,6 +14,12 @@
 //! token nothing: presented for the identity it WAS minted for, the same token is still
 //! exchanged.
 //!
+//! WHICH refusal it is, is decided by the pool the token is read against — the pool that owns
+//! the identity the request names. A token of THAT pool, minted for another of its
+//! identities, is one of the pool's tokens and simply not a login of the identity named, so
+//! the refusal is the login mismatch; a token ANOTHER pool minted is no Cognito token of this
+//! pool at all, and the refusal says that instead.
+//!
 //! The rows differ along what the rule generalises over: which identity the presented token
 //! names against which the request names (the same one, another of the same pool, one of
 //! another pool, in both directions), how the token was minted
@@ -49,6 +55,12 @@ const PUBLIC_PROVIDER: &str = "graph.facebook.com";
 /// same reason. Fixed text: it carries no part taken from the request or from stored state.
 const UNMATCHED_LOGINS_MESSAGE: &str = "Logins don't match. Please include at least one \
                                         valid login for this identity or identity pool.";
+
+/// The message the refusal of a token that is no token of the pool the request addresses
+/// carries — one ANOTHER identity pool minted (`crate::state::NOT_A_COGNITO_TOKEN_MESSAGE`).
+/// Pinned here as a literal for the same reason, and fixed text just as well: it names
+/// neither pool, neither identity nor the token.
+const NOT_A_COGNITO_TOKEN_MESSAGE: &str = "Invalid login token. Not a Cognito token.";
 
 /// A pool that can both mint tokens and vend credentials: it names a developer provider, and
 /// its two roles are seeded into the IAM store of the same engine and configured on it —
@@ -162,9 +174,9 @@ fn assert_served(case: &str, identity_id: &str, status: u16, body: &Value) {
     }
 }
 
-/// Assert that the exchange was REFUSED for a login that is none of the identity's, with no
-/// credential in the answer.
-fn assert_refused(case: &str, status: u16, body: &Value) {
+/// Assert that the exchange was REFUSED for a login that is none of the identity's, with the
+/// sentence `message` that refusal is worded with and no credential in the answer.
+fn assert_refused(case: &str, status: u16, body: &Value, message: &str) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected the HTTP 400 of a refused exchange, got {status} with {body}"
@@ -176,8 +188,8 @@ fn assert_refused(case: &str, status: u16, body: &Value) {
     );
     assert_eq!(
         body["message"].as_str(),
-        Some(UNMATCHED_LOGINS_MESSAGE),
-        "case {case:?}: expected the fixed login-mismatch message, got {body}"
+        Some(message),
+        "case {case:?}: expected the fixed sentence {message:?}, got {body}"
     );
     assert!(
         body.get("Credentials").is_none(),
@@ -219,37 +231,45 @@ async fn a_minted_token_is_a_login_of_the_identity_it_was_minted_for_and_of_no_o
             Mint::Developer("backend-user-there"),
         ),
     ];
-    let mut tokens: Vec<(&str, String, String)> = Vec::new();
+    let mut tokens: Vec<(&str, &str, String, String)> = Vec::new();
     for (case, pool_id, how) in &minted {
         let (identity_id, token) =
             mint(&emulator, case, pool_id, developer_provider, how).await;
-        tokens.push((case, identity_id, token));
+        tokens.push((case, pool_id, identity_id, token));
     }
 
     // Its OWN token is exchanged for every identity, whichever way it was minted and
     // whichever pool it belongs to.
-    for (case, identity_id, token) in &tokens {
+    for (case, _, identity_id, token) in &tokens {
         let logins = json!({COGNITO_IDENTITY_PROVIDER: token});
         let (status, body) = exchange(&emulator, identity_id, &logins).await;
         assert_served(case, identity_id, status, &body);
     }
 
     // And ANOTHER identity's token is refused for it — every pair of the table, which spans
-    // two identities of one pool as well as two of different pools.
-    for (identity_case, identity_id, _) in &tokens {
-        for (token_case, token_identity, token) in &tokens {
+    // two identities of one pool as well as two of different pools. Which sentence the
+    // refusal carries follows the pool the token is read against: a token of the addressed
+    // pool is a token of it that does not match the identity, and a token of any other pool
+    // is no token of the addressed pool at all.
+    for (identity_case, identity_pool, identity_id, _) in &tokens {
+        for (token_case, token_pool, token_identity, token) in &tokens {
             if token_identity == identity_id {
                 continue;
             }
             let case = format!("{identity_case:?} presenting the token of {token_case:?}");
+            let expected = if token_pool == identity_pool {
+                UNMATCHED_LOGINS_MESSAGE
+            } else {
+                NOT_A_COGNITO_TOKEN_MESSAGE
+            };
             let logins = json!({COGNITO_IDENTITY_PROVIDER: token});
             let (status, body) = exchange(&emulator, identity_id, &logins).await;
-            assert_refused(&case, status, &body);
+            assert_refused(&case, status, &body, expected);
         }
     }
 
     // The refusals cost the tokens nothing: each is still the login of its own identity.
-    for (case, identity_id, token) in &tokens {
+    for (case, _, identity_id, token) in &tokens {
         let logins = json!({COGNITO_IDENTITY_PROVIDER: token});
         let (status, body) = exchange(&emulator, identity_id, &logins).await;
         assert_served(
@@ -298,12 +318,13 @@ async fn another_identitys_token_is_refused_whatever_else_the_logins_map_carries
     .await;
 
     // The rows differ along which token the map carries under this service's provider name
-    // and what else it carries beside it.
-    let rows: Vec<(&str, Value, bool)> = vec![
+    // and what else it carries beside it; the third field is the refusal owed, and `None` a
+    // served exchange.
+    let rows: Vec<(&str, Value, Option<&str>)> = vec![
         (
             "its own token alone",
             json!({COGNITO_IDENTITY_PROVIDER: &own_token}),
-            true,
+            None,
         ),
         (
             "its own token beside a login of the public provider",
@@ -311,12 +332,12 @@ async fn another_identitys_token_is_refused_whatever_else_the_logins_map_carries
                 COGNITO_IDENTITY_PROVIDER: &own_token,
                 PUBLIC_PROVIDER: "map-user",
             }),
-            true,
+            None,
         ),
         (
             "a sibling identity's token alone",
             json!({COGNITO_IDENTITY_PROVIDER: &sibling_token}),
-            false,
+            Some(UNMATCHED_LOGINS_MESSAGE),
         ),
         (
             "a sibling identity's token beside a login of the public provider",
@@ -324,12 +345,12 @@ async fn another_identitys_token_is_refused_whatever_else_the_logins_map_carries
                 COGNITO_IDENTITY_PROVIDER: &sibling_token,
                 PUBLIC_PROVIDER: "map-user",
             }),
-            false,
+            Some(UNMATCHED_LOGINS_MESSAGE),
         ),
         (
             "another pool's token alone",
             json!({COGNITO_IDENTITY_PROVIDER: &foreign_token}),
-            false,
+            Some(NOT_A_COGNITO_TOKEN_MESSAGE),
         ),
         (
             "another pool's token beside a login of the public provider",
@@ -337,16 +358,15 @@ async fn another_identitys_token_is_refused_whatever_else_the_logins_map_carries
                 COGNITO_IDENTITY_PROVIDER: &foreign_token,
                 PUBLIC_PROVIDER: "map-user",
             }),
-            false,
+            Some(NOT_A_COGNITO_TOKEN_MESSAGE),
         ),
     ];
 
-    for (case, logins, served) in &rows {
+    for (case, logins, refusal) in &rows {
         let (status, body) = exchange(&emulator, &identity_id, logins).await;
-        if *served {
-            assert_served(case, &identity_id, status, &body);
-        } else {
-            assert_refused(case, status, &body);
+        match refusal {
+            None => assert_served(case, &identity_id, status, &body),
+            Some(message) => assert_refused(case, status, &body, message),
         }
     }
 }

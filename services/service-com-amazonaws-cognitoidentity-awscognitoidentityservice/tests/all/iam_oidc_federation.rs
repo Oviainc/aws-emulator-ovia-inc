@@ -50,9 +50,9 @@ const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
 
 /// Three app clients, told apart by nothing but their value — "there is no defined format
 /// for a client ID" (`iam:CreateOpenIDConnectProvider$ClientIDList`).
-const CLIENT_A: &str = "1h57kf5cpq17m0eml12eqpq8m2";
-const CLIENT_B: &str = "4bv7g2kq9n3l1pd8s0a6c5e7f1";
-const CLIENT_C: &str = "7qz0x3m8t2r5y9w1v4n6b8k3j5";
+pub(crate) const CLIENT_A: &str = "1h57kf5cpq17m0eml12eqpq8m2";
+pub(crate) const CLIENT_B: &str = "4bv7g2kq9n3l1pd8s0a6c5e7f1";
+pub(crate) const CLIENT_C: &str = "7qz0x3m8t2r5y9w1v4n6b8k3j5";
 
 /// A 40-character hex thumbprint, the length `iam:CreateOpenIDConnectProvider`'s
 /// `thumbprintType` declares.
@@ -62,20 +62,20 @@ const THUMBPRINT: &str = "0000000000000000000000000000000000000001";
 /// `cognito-idp.<region>.amazonaws.com/<YOUR_USER_POOL_ID>`" (`GetId.Logins` in this
 /// service's model), which is also the `iss` claim of that pool's ID tokens without its
 /// scheme.
-fn user_pool_issuer(user_pool_id: &str) -> String {
+pub(crate) fn user_pool_issuer(user_pool_id: &str) -> String {
     format!("cognito-idp.{REGION}.amazonaws.com/{user_pool_id}")
 }
 
 /// An emulator holding this service beside IAM on ONE shared engine — the OIDC providers a
 /// pool's ARNs resolve against are IAM's own records, so they are written through IAM's own
 /// operations.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Nothing here is really signed: the `Authorization` header carries only the
@@ -95,7 +95,7 @@ impl Emulator {
     }
 
     /// One `awsJson1_1` call to this service, with its status and parsed body.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://cognito-identity.{REGION}.amazonaws.com/"))
@@ -132,7 +132,7 @@ impl Emulator {
     }
 
     /// A call to this service that must succeed, with its output object.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -181,7 +181,7 @@ impl Emulator {
 
     /// Register an IAM OIDC provider for `issuer` accepting `client_ids`, and answer the
     /// ARN IAM keyed it under — the handle an identity pool names it by.
-    async fn oidc_provider(&self, issuer: &str, client_ids: &[&str]) -> String {
+    pub(crate) async fn oidc_provider(&self, issuer: &str, client_ids: &[&str]) -> String {
         let mut params = vec![
             ("Url".to_string(), format!("https://{issuer}")),
             ("ThumbprintList.member.1".to_string(), THUMBPRINT.to_string()),
@@ -203,7 +203,7 @@ impl Emulator {
     /// Create a pool with `configuration` merged over the members every fixture pool
     /// carries, give it an authenticated role that trusts its own users, and answer its
     /// minted `IdentityPoolId`.
-    async fn pool(&self, name: &str, configuration: Value) -> String {
+    pub(crate) async fn pool(&self, name: &str, configuration: Value) -> String {
         let mut request = json!({
             "IdentityPoolName": name,
             "AllowUnauthenticatedIdentities": true,
@@ -244,7 +244,7 @@ impl Emulator {
 const SUBJECT: &str = "7f3a1c2e-0000-4000-8000-0123456789ab";
 
 /// An OpenID Connect ID token of `issuer`, issued for `audience`, naming [`SUBJECT`].
-fn id_token(issuer: &str, audience: Value) -> String {
+pub(crate) fn id_token(issuer: &str, audience: Value) -> String {
     id_token_for(issuer, audience, SUBJECT, "jti-1")
 }
 
@@ -280,13 +280,14 @@ fn id_token_for(issuer: &str, audience: Value, subject: &str, token_id: &str) ->
 }
 
 /// The wire code every refusal of a login this pool does not admit carries.
-const NOT_AUTHORIZED: &str = "NotAuthorizedException";
+pub(crate) const NOT_AUTHORIZED: &str = "NotAuthorizedException";
 
 /// The two sentences AWS words those refusals with, spelled out here so the wire-visible
 /// text is pinned by the test rather than read back out of the crate.
 const UNSUPPORTED_PROVIDER_MESSAGE: &str =
     "Token is not from a supported provider of this identity pool.";
-const INCORRECT_AUDIENCE_MESSAGE: &str = "Invalid login token. Incorrect token audience.";
+pub(crate) const INCORRECT_AUDIENCE_MESSAGE: &str =
+    "Invalid login token. Incorrect token audience.";
 /// The sentence a refusal of a value that is no identity token at all carries, pinned here
 /// for the same reason.
 const NOT_AN_IDENTITY_TOKEN_MESSAGE: &str =
@@ -295,7 +296,12 @@ const NOT_AN_IDENTITY_TOKEN_MESSAGE: &str =
 /// Present `logins` to `GetId` and assert the pool admits it, then exchange the identity it
 /// answers for credentials with the same logins and assert the vend is served. Answers the
 /// `IdentityId`.
-async fn admitted(emulator: &Emulator, case: &str, pool_id: &str, logins: &Value) -> String {
+pub(crate) async fn admitted(
+    emulator: &Emulator,
+    case: &str,
+    pool_id: &str,
+    logins: &Value,
+) -> String {
     let (status, body) = emulator
         .call(
             "GetId",
@@ -350,7 +356,7 @@ async fn admitted(emulator: &Emulator, case: &str, pool_id: &str, logins: &Value
 
 /// Present `logins` to `GetId` and to `GetCredentialsForIdentity` for `identity_id`, and
 /// assert both are refused 400 `NotAuthorizedException` with `message`.
-async fn refused(
+pub(crate) async fn refused(
     emulator: &Emulator,
     case: &str,
     pool_id: &str,
@@ -827,7 +833,11 @@ async fn the_audience_refusal_answers_get_open_id_token_and_unlink_identity_alik
 }
 
 /// The `Logins` list `DescribeIdentity` reports for one identity.
-async fn described_logins(emulator: &Emulator, case: &str, identity_id: &str) -> Vec<String> {
+pub(crate) async fn described_logins(
+    emulator: &Emulator,
+    case: &str,
+    identity_id: &str,
+) -> Vec<String> {
     let described = emulator
         .ok("DescribeIdentity", &json!({"IdentityId": identity_id}))
         .await;

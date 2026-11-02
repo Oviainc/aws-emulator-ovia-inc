@@ -43,12 +43,14 @@ fn set_request(
     Value::Object(request)
 }
 
-/// The DEFAULT mapping a call asking for the defaults configures: the "default (username
-/// and clientID) attribute mappings" `SetPrincipalTagAttributeMap`'s own doc names
-/// (`smithy_query(query="doc",shape="SetPrincipalTagAttributeMap")`), each taken from the
-/// claim an issued OpenID Connect token carries it in — the subject and the audience.
+/// The DEFAULT mapping a call asking for the defaults configures: the two tags a provider's
+/// users are mapped by when the call names no attributes of its own — the pair
+/// `SetPrincipalTagAttributeMap`'s own doc calls the "default (username and clientID)
+/// attribute mappings" (`smithy_query(query="doc",shape="SetPrincipalTagAttributeMap")`) —
+/// each taken from the claim an issued OpenID Connect token carries it in: the subject and
+/// the audience.
 fn default_mapping() -> Value {
-    json!({"clientID": "aud", "username": "sub"})
+    json!({"client": "aud", "username": "sub"})
 }
 
 /// The mapping a pair ends up configured with for one request: the defaults when the call
