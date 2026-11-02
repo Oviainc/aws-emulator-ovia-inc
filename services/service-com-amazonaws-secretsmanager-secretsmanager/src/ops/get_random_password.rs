@@ -169,8 +169,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM authorizes every call to this service against the caller's
+        // identity-based policies BEFORE the operation answers. This action generates a
+        // password rather than addressing a secret, so it is judged against the
+        // resource IAM writes for a request that names none.
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::state::authorization::ANY_RESOURCE,
+        )?;
         // This operation generates a password and persists nothing: it resolves no
         // resource, so it reads no secret, and storing the password it hands back would
         // make it readable by a later caller, which Secrets Manager never does. The

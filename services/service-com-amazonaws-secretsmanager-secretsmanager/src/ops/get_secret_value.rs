@@ -200,6 +200,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM authorizes every call to this service against the caller's
+        // identity-based policies BEFORE the operation reads or writes anything, so a
+        // caller no policy allows is refused rather than served.
+        crate::state::authorization::authorize_secret(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(input.secret_id.as_str()),
+        )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         // What the answer is built from, read under the store's guard and carried
         // out of it: unwrapping the data key this version was sealed under is a

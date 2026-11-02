@@ -181,6 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM authorizes every call to this service against the caller's
+        // identity-based policies BEFORE the operation reads anything. A batched read
+        // selects the secrets it answers for — by a list of ids or by a filter over the
+        // whole account — rather than addressing one, so it is judged against the
+        // resource IAM writes for a request that names none.
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::state::authorization::ANY_RESOURCE,
+        )?;
         // "To choose which secrets to retrieve, you can specify a list of
         // secrets by name or ARN, or you can use filters", and "You must include
         // Filters or SecretIdList, but not both."

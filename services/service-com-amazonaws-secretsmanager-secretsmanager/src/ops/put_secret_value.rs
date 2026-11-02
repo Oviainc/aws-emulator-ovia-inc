@@ -239,6 +239,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM authorizes every call to this service against the caller's
+        // identity-based policies BEFORE the operation reads or writes anything, so a
+        // caller no policy allows is refused rather than served.
+        crate::state::authorization::authorize_secret(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(input.secret_id.as_str()),
+        )?;
         // "Either SecretString or SecretBinary must have a value, but not both."
         if input.secret_string.is_some() && input.secret_binary.is_some() {
             return Err(invalid_parameter(

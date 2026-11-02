@@ -167,8 +167,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM authorizes every call to this service against the caller's
+        // identity-based policies BEFORE the operation reads anything, so a caller no
+        // policy allows is refused rather than served an empty list — which an
+        // unauthorized caller could not tell from an account holding no secret. This
+        // action reports the whole account rather than one secret, so it is judged
+        // against the resource IAM writes for such a request.
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::state::authorization::ANY_RESOURCE,
+        )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let mut store = state.lock();
         // The only writes a read performs, both of them changes the clock has

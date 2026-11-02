@@ -181,8 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM authorizes every call to this service against the caller's
+        // identity-based policies BEFORE the operation reads or writes anything, so a
+        // caller no policy allows is refused rather than served.
+        crate::state::authorization::authorize_secret(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(input.secret_id.as_str()),
+        )?;
         // "You can't use both this parameter and ForceDeleteWithoutRecovery in
         // the same call."
         if input.recovery_window_in_days.is_some() && input.force_delete_without_recovery.is_some()

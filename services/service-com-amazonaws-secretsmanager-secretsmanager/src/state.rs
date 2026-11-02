@@ -33,6 +33,11 @@ use crate::ops::types::{
 /// so every read and every write of one goes through the secret's own key.
 pub mod envelope;
 
+/// Whether IAM lets a request to this service perform the action it asks for: the
+/// one gate every operation of this service consults before it reads or writes
+/// anything.
+pub mod authorization;
+
 /// The staging label on the current value of a secret.
 pub const STAGE_CURRENT: &str = "AWSCURRENT";
 

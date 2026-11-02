@@ -159,6 +159,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM authorizes every call to this service against the caller's
+        // identity-based policies BEFORE the operation reads or writes anything, so a
+        // caller no policy allows is refused rather than served.
+        crate::state::authorization::authorize_secret(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(input.secret_id.as_str()),
+        )?;
         // "You must call this operation from the Region in which you want to
         // promote the replica to a primary secret": the Region the caller signed
         // for is what decides this request.

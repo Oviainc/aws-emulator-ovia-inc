@@ -356,6 +356,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The Region the caller signed for, and the ARN this create allocates for the
+        // secret: the ARN the account already holds a secret of that name under, else the
+        // name plus the six random characters a secret's ARN ends in. Allocated here,
+        // before anything is read or stored, because it is the resource the authorization
+        // decision below is made against — a create addresses the secret it creates.
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::authorization::created_secret_arn(
+            &*self.engine,
+            &region,
+            &input.name,
+        );
+        // IAM authorizes every call to this service against the caller's
+        // identity-based policies BEFORE the operation reads or writes anything, so a
+        // caller no policy allows creates nothing.
+        crate::state::authorization::authorize(&*self.engine, ctx, Self::NAME, &arn)?;
+
         // "Either SecretString or SecretBinary must have a value, but not both."
         if input.secret_string.is_some() && input.secret_binary.is_some() {
             return Err(CreateSecretErrorModeled::InvalidParameterException(
@@ -425,7 +441,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let region = crate::state::request_region(ctx.parts());
         // "A list of Regions and KMS keys to replicate secrets": a replica lives
         // in a Region OTHER than the one the secret is created in, and every
         // requested Region is checked before the secret is stored, so a request
@@ -456,11 +471,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let arn = ::engine::emulator_arn(
-            "secretsmanager",
-            &region,
-            &format!("secret:{}-{}", input.name, crate::state::new_arn_suffix()),
-        );
         // The initial value is stored under the key this secret names, so storing
         // it means encrypting it under that key: a key KMS will not encrypt with is
         // the `EncryptionFailure` this create answers, and no secret is stored.

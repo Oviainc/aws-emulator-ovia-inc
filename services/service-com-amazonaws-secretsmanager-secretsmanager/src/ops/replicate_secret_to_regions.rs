@@ -154,8 +154,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM authorizes every call to this service against the caller's
+        // identity-based policies BEFORE the operation reads or writes anything, so a
+        // caller no policy allows is refused rather than served.
+        crate::state::authorization::authorize_secret(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(input.secret_id.as_str()),
+        )?;
         // Bound the request itself before anything walks or stores it:
         // `AddReplicaRegionListType` declares no maximum length, and no secret
         // may hold more replicas than `REPLICAS_PER_SECRET` anyway, so a longer
