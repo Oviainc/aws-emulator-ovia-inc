@@ -2839,6 +2839,44 @@ pub fn risk_counts_to_map(counts: &BTreeMap<String, i32>) -> HashMap<String, i32
     counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
 }
 
+/// ONE best practice of ONE lens review of ONE workload, as a read of the Trusted Advisor
+/// checks associated to it resolves it
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::best_practice_checks`]).
+///
+/// The workload is borrowed from the store the resolution read, so a caller still reads the
+/// accounts it covers and the account that owns it off the one record the resolution
+/// resolved, rather than looking it up a second time.
+#[derive(Debug)]
+pub struct BestPracticeChecks<'store> {
+    /// The workload the request named, which the checks are reported for.
+    pub workload: &'store WorkloadRecord,
+    /// The `LensArn` the lens under review is reported by, in the Region of the request
+    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_arn_of`]).
+    pub lens_arn: String,
+    /// The checks associated to the best practice, in the catalog's order
+    /// ([`checks_for_best_practice`]) — empty while the workload's Trusted Advisor
+    /// integration is not activated.
+    pub checks: Vec<&'static TrustedAdvisorCheck>,
+}
+
+/// How a read of the Trusted Advisor checks of one best practice is refused: the modelled
+/// exception for the case, for the calling operation to lift into its own error enum.
+///
+/// Shared by every operation that reports those checks — the per-account view and the
+/// summarized one — so both word the same refusal identically
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::best_practice_checks`]).
+#[derive(Debug, Clone)]
+pub enum BestPracticeRefusal {
+    /// No workload is stored under the id the request named, or that workload does not
+    /// review the lens it named — in either case there is no lens review whose best
+    /// practices could be checked: a `ResourceNotFoundException` (HTTP 404).
+    NotFound(ResourceNotFoundException),
+    /// The lens's own content defines no such pillar, asks no such question of that pillar
+    /// or offers no such choice of that question, so the request names no best practice of
+    /// that lens: a `ValidationException` (HTTP 400).
+    Undefined(crate::ops::types::ValidationException),
+}
+
 /// One stored milestone: a workload recorded as it stood at one instant.
 ///
 /// The workload is held by VALUE, not by id: "A milestone records the state of a
@@ -7149,6 +7187,111 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         self.lens_review_questions(lens, version)
             .into_iter()
             .find(|question| question.question_id == question_id)
+    }
+
+    /// Resolve the ONE best practice of ONE lens review of ONE workload a read of its
+    /// Trusted Advisor checks names, and the checks associated to it — or the refusal that
+    /// read answers with ([`BestPracticeRefusal`]).
+    ///
+    /// This is the ONE place that walk lives, so every operation that reports those checks
+    /// — the per-account view and the summarized one — resolves the same request to the
+    /// same best practice and refuses it identically, and a change to the refusal order, to
+    /// the version the lens content is resolved at or to the activation gate reaches both.
+    /// Each sub-rule it composes is single-homed beside it; what lives here is the SEQUENCE:
+    ///
+    /// * the workload the request names ([`workload_not_found`]), then its review of the
+    ///   lens ([`WorkloadRecord::reviews_lens`], [`lens_review_not_found`]) — a check is
+    ///   associated to a lens (`CheckDetail$LensArn` / `CheckSummary$LensArn`) and that
+    ///   association is read through the workload's review of it, so a lens the workload
+    ///   does not carry has no review whose best practices could be checked;
+    /// * then `PillarId`, `QuestionId` and `ChoiceId`, which name one best practice OF THAT
+    ///   LENS and so are judged against the lens's own content as of the version this
+    ///   workload's review of it is pinned at ([`Self::lens_content_at`]), outermost first:
+    ///   the pillar the lens defines ([`undefined_pillar_refusal`]), the question that
+    ///   pillar asks ([`undefined_pillar_question_refusal`]) and the choice that question
+    ///   offers ([`undefined_choice_member_refusal`]). They are values of the request rather
+    ///   than resources of their own — the resources this read resolves are the workload and
+    ///   its lens review — so a value the lens's content does not define is refused as a
+    ///   field validation, the same rule every operation that takes a pillar or a question
+    ///   of a lens review applies. The content comes from the whole lens catalog, so a
+    ///   pillar and a question of a CUSTOM lens are judged against the document that version
+    ///   published exactly as an official lens's are against its catalog row.
+    ///
+    /// A lens this emulator holds no content for asks nothing, so those refusals take the
+    /// request's identifiers as given and there is no question to resolve: such a lens has
+    /// no checked best practice either, so no check is reported. The `ChoiceId` is therefore
+    /// judged on exactly the lenses whose content can judge it, which is the rule the pillar
+    /// and question refusals already apply.
+    ///
+    /// A workload whose Trusted Advisor integration is not activated
+    /// ([`WorkloadRecord::trusted_advisor_integration_enabled`]) has none of the checks
+    /// fetched, so it reports no check at all until a caller activates it.
+    ///
+    /// `region` is the Region the request was signed for, which the `LensArn` the checks are
+    /// reported under is built in ([`Self::lens_arn_of`]). Reads only.
+    pub fn best_practice_checks(
+        &self,
+        workload_id: &str,
+        lens: &str,
+        pillar_id: &str,
+        question_id: &str,
+        choice_id: &str,
+        region: &str,
+    ) -> Result<BestPracticeChecks<'_>, BestPracticeRefusal> {
+        let workload = self
+            .workloads
+            .get(workload_id)
+            .ok_or_else(|| BestPracticeRefusal::NotFound(workload_not_found(workload_id)))?;
+        if !workload.reviews_lens(lens) {
+            return Err(BestPracticeRefusal::NotFound(lens_review_not_found(
+                workload_id,
+                lens,
+            )));
+        }
+
+        let pinned = workload.lens_review_version(lens);
+        let content = self.lens_content_at(lens, pinned);
+        if let Some(exception) = undefined_pillar_refusal(
+            PILLAR_ID_MEMBER,
+            lens,
+            &content,
+            std::iter::once(pillar_id),
+        ) {
+            return Err(BestPracticeRefusal::Undefined(exception));
+        }
+        if let Some(exception) = undefined_pillar_question_refusal(
+            QUESTION_ID_MEMBER,
+            lens,
+            pillar_id,
+            &content,
+            std::iter::once(question_id),
+        ) {
+            return Err(BestPracticeRefusal::Undefined(exception));
+        }
+
+        // The question as the LENS asks it, which is where its choice catalog — the only
+        // place a client discovers the `ChoiceId`s such a request names — comes from.
+        let question = self.lens_review_question(lens, pinned, question_id);
+        if let Some(question) = question.as_ref() {
+            if let Some(exception) = undefined_choice_member_refusal(
+                CHOICE_ID_MEMBER,
+                question,
+                std::iter::once(choice_id),
+            ) {
+                return Err(BestPracticeRefusal::Undefined(exception));
+            }
+        }
+
+        let checks = question
+            .as_ref()
+            .filter(|_| workload.trusted_advisor_integration_enabled())
+            .map(|question| checks_for_best_practice(lens, question, choice_id))
+            .unwrap_or_default();
+        Ok(BestPracticeChecks {
+            workload,
+            lens_arn: self.lens_arn_of(lens, region),
+            checks,
+        })
     }
 
     /// Sync one workload's lens reviews with the integrated service, recording `at`

@@ -513,3 +513,8 @@ mod next_token_spelling;
 // are appended here so a new suite does not collide with another insertion.
 #[path = "all/regional_resource_scope.rs"]
 mod regional_resource_scope;
+
+// Appended at the end of this list for the same reason as the declaration above: the sorted
+// position for a check suite falls beside the two check suites it spans.
+#[path = "all/check_best_practice_agreement.rs"]
+mod check_best_practice_agreement;

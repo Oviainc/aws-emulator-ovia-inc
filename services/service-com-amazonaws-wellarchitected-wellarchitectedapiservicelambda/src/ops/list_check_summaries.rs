@@ -175,85 +175,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        let workload = store.workloads.get(&input.workload_id).ok_or_else(|| {
-            ListCheckSummariesErrorModeled::ResourceNotFoundException(
-                crate::state::workload_not_found(&input.workload_id),
+
+        // Which best practice of which lens review of which workload this request names,
+        // and when it is refused, is the walk every read of these checks shares with the
+        // per-account view — resolved by the one place it lives
+        // (`crate::state::best_practice_checks`), so the two cannot disagree about the same
+        // request. The `checks` it answers are the catalog's rows for that best practice, in
+        // the catalog's order; a summary covers every account the workload relates to in ONE
+        // entry, so — unlike the per-account detail view — the enumeration below is the
+        // checks themselves.
+        let crate::state::BestPracticeChecks {
+            workload,
+            lens_arn,
+            checks,
+        } = store
+            .best_practice_checks(
+                &input.workload_id,
+                &input.lens_arn,
+                &input.pillar_id,
+                &input.question_id,
+                &input.choice_id,
+                &crate::state::request_region(ctx.parts()),
             )
-        })?;
-
-        // A check is associated to a lens (`CheckSummary$LensArn`) and that association is
-        // read through the workload's review of it, so a lens the workload does not carry
-        // has no review whose best practices could be checked.
-        if !workload.reviews_lens(&input.lens_arn) {
-            return Err(ListCheckSummariesErrorModeled::ResourceNotFoundException(
-                crate::state::lens_review_not_found(&input.workload_id, &input.lens_arn),
-            )
-            .into());
-        }
-
-        // `PillarId`, `QuestionId` and `ChoiceId` name ONE best practice OF THAT LENS, so
-        // each is judged against the lens's own content, outermost first: the pillar the
-        // lens defines, the question that pillar asks and the choice that question offers.
-        // They are values of the request rather than resources of their own — the resources
-        // this read resolves are the workload and its lens review above — so a value the
-        // lens's content does not define is refused as a field validation, the same rule
-        // every operation that takes a pillar or a question of a lens review applies.
-        //
-        // The content comes from the whole lens catalog, for the version this workload's
-        // review of the lens is against, so a pillar and a question of a CUSTOM lens are
-        // judged against the document that version published exactly as an official lens's
-        // are against its catalog row.
-        let pinned = workload.lens_review_version(&input.lens_arn);
-        let content = store.lens_content_at(&input.lens_arn, pinned);
-        if let Some(exception) = crate::state::undefined_pillar_refusal(
-            crate::state::PILLAR_ID_MEMBER,
-            &input.lens_arn,
-            &content,
-            std::iter::once(input.pillar_id.as_str()),
-        ) {
-            return Err(ListCheckSummariesErrorModeled::ValidationException(exception).into());
-        }
-        if let Some(exception) = crate::state::undefined_pillar_question_refusal(
-            crate::state::QUESTION_ID_MEMBER,
-            &input.lens_arn,
-            &input.pillar_id,
-            &content,
-            std::iter::once(input.question_id.as_str()),
-        ) {
-            return Err(ListCheckSummariesErrorModeled::ValidationException(exception).into());
-        }
-
-        // The question as the LENS asks it, which is where its choice catalog — the only
-        // place a client discovers the `ChoiceId`s this request names — comes from. A lens
-        // this emulator holds no content for asks nothing, so the two refusals above took
-        // the request's identifiers as given and there is no question to resolve: such a
-        // lens has no checked best practice either, so the answer is an empty page.
-        let question = store.lens_review_question(&input.lens_arn, pinned, &input.question_id);
-        if let Some(question) = question.as_ref() {
-            if let Some(exception) = crate::state::undefined_choice_member_refusal(
-                crate::state::CHOICE_ID_MEMBER,
-                question,
-                std::iter::once(input.choice_id.as_str()),
-            ) {
-                return Err(ListCheckSummariesErrorModeled::ValidationException(exception).into());
-            }
-        }
-
-        // The checks of the best practice, in the catalog's order. A summary covers every
-        // account the workload relates to in ONE entry, so — unlike the per-account detail
-        // view — the enumeration is the checks themselves.
-        //
-        // A workload whose Trusted Advisor integration is not activated has none of them
-        // fetched, so it reports no check at all until a caller activates it.
-        let checks = question
-            .as_ref()
-            .filter(|_| workload.trusted_advisor_integration_enabled())
-            .map(|question| {
-                crate::state::checks_for_best_practice(&input.lens_arn, question, &input.choice_id)
-            })
-            .unwrap_or_default();
-        let lens_arn =
-            store.lens_arn_of(&input.lens_arn, &crate::state::request_region(ctx.parts()));
+            .map_err(|refusal| match refusal {
+                crate::state::BestPracticeRefusal::NotFound(exception) => {
+                    ListCheckSummariesErrorModeled::ResourceNotFoundException(exception)
+                }
+                crate::state::BestPracticeRefusal::Undefined(exception) => {
+                    ListCheckSummariesErrorModeled::ValidationException(exception)
+                }
+            })?;
 
         // What one check reports depends only on which accounts the workload relates to and
         // which of them owns it, so the summary is taken once for the whole page.
