@@ -187,8 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let wanted_state = input.state.as_deref().unwrap_or(ALL_STATES);
 
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
 
         // A query is addressed as a query OF a graph, so the identifier has to name a
         // graph of THIS Region: a listing of the queries of a graph that does not exist

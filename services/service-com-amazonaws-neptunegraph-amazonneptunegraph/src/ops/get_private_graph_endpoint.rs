@@ -154,8 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
 
         // An endpoint is addressed as the endpoint of one graph, so a request naming no
         // stored graph IN THIS REGION is reported as the missing GRAPH rather than as a

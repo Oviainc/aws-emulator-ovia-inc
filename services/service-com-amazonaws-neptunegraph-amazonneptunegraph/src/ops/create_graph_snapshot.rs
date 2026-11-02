@@ -208,8 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
 
         // A snapshot is taken OF a graph, so the graph has to exist IN THE REGION this
         // request was signed for — a graph of another Region is not visible here. The

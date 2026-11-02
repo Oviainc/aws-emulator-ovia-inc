@@ -4136,6 +4136,34 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsNeptunegraphAmazonneptunegraphState>)
 }
 
+/// Take the store, then read the clock — in that order — and answer both, so every
+/// handler decides with the instant it HOLDS the store at.
+///
+/// Every lifecycle decision in this service compares an instant the handler supplies
+/// against a due instant the record holds ([`Graph::settle`],
+/// [`ComAmazonawsNeptunegraphAmazonneptunegraphState::reap_deleted_graphs`],
+/// [`ComAmazonawsNeptunegraphAmazonneptunegraphState::reap_terminated_queries`],
+/// [`ComAmazonawsNeptunegraphAmazonneptunegraphState::materialise_snapshots`],
+/// [`ComAmazonawsNeptunegraphAmazonneptunegraphState::materialise_private_endpoints`],
+/// [`ExportTask::settle`], [`ImportTask::settle`]). A handler that read the clock
+/// BEFORE it contended for the store would settle and reap the world as it stood when
+/// it started waiting: a transition the clock made due during the wait would stay
+/// invisible to it, and it would then answer — and write — from that stale view, so a
+/// stop that has come due would still refuse a start, a freed name would still read as
+/// taken, and a query whose run span is out would still be reported as in flight.
+/// Sampling under the guard makes a handler's instant the instant of the store it is
+/// about to read, however long it waited to get there.
+pub fn locked_store_now(
+    state: &::engine::ServiceState<ComAmazonawsNeptunegraphAmazonneptunegraphState>,
+) -> (
+    ::std::sync::MutexGuard<'_, ComAmazonawsNeptunegraphAmazonneptunegraphState>,
+    Instant,
+) {
+    let store = state.lock();
+    let now = Instant::now();
+    (store, now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

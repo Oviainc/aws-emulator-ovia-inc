@@ -231,8 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
 
         // The names a graph reserves are released when its deletion completes, so the
         // deletions the clock has already made due are materialised before the name is

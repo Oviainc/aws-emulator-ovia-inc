@@ -164,8 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for is part of the lookup: a snapshot of another Region is not deletable
         // through this endpoint.
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
 
         // The lookup materialises what the clock already made due, so a snapshot whose
         // own deletion has already fallen due is gone rather than deletable twice, and

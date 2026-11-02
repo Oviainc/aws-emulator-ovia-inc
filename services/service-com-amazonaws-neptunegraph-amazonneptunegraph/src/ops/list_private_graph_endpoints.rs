@@ -190,8 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = resolve_page_size(input.max_results);
 
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
 
         // An endpoint is addressed as an endpoint of one graph, so the identifier has to
         // name a graph of THIS Region: a listing of the endpoints of a graph that does

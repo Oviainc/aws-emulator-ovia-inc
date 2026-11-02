@@ -146,14 +146,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A taggable resource of this service lives in exactly one Region, so the
         // Region the request was signed for is part of the lookup beside the ARN.
         let region = crate::state::request_region(ctx);
-        let mut store = state.lock();
         // Reporting in the strict sense: the tags answered are the ones stored on the
         // resource — supplied at create time or written later by
         // `TagResource`/`UntagResource`. The one write is the bookkeeping every read of
         // this store makes: a graph or snapshot whose deletion has already fallen due is
         // no longer a resource this service holds, so its record is reclaimed before the
         // ARN is resolved.
-        let now = ::std::time::Instant::now();
+        let (mut store, now) = crate::state::locked_store_now(&state);
         store.reap_deleted_graphs(now);
         store.materialise_snapshots(now);
         let Some(tags) = store.tags_of(&input.resource_arn, &region) else {

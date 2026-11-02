@@ -86,7 +86,7 @@ async fn call(
 /// so the `/` inside an ARN has to arrive encoded or it would split the URI into another
 /// path segment; a tag key goes into the `tagKeys` query string, which is encoded for the
 /// same reason. Only the RFC 3986 unreserved set is left as-is.
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {

@@ -178,8 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is part of the lookup: a graph of another Region is not resettable through
         // this endpoint.
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
         // The lookup settles the transitions the clock has already made due first, so a
         // graph whose provisioning has come due is resettable. The record it finds is
         // taken as a COPY, so the decisions below and the writes they drive never hold a

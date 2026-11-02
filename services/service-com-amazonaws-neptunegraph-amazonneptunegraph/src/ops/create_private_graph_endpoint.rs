@@ -190,8 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let security_group_ids = input.vpc_security_group_ids.unwrap_or_default();
 
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
 
         // A private graph endpoint is the private route INTO a graph, so the graph has
         // to exist IN THE REGION this request was signed for. The lookup settles the

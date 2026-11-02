@@ -178,8 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for is part of the lookup: a graph of another Region is not deletable through
         // this endpoint.
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
         // The record the rest of this handler decides from, taken as a COPY of what the
         // lookup found, so the decisions below and the writes they drive never hold a
         // borrow of one graph across a change to the store.

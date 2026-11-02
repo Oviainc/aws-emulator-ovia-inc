@@ -168,8 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A graph lives in exactly one Region, so the Region this request was signed
         // for is part of the lookup: a graph of another Region is not found here.
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
         // Reporting only: the sole write is materialising the CREATING/UPDATING ->
         // AVAILABLE transition the clock already made due, which was owed at this
         // instant whether or not anybody read the graph.

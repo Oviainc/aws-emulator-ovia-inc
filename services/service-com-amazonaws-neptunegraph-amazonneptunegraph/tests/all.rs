@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/accumulated_constraint_refusals.rs"]
 mod accumulated_constraint_refusals;
+#[path = "all/clock_sampled_under_the_store_lock.rs"]
+mod clock_sampled_under_the_store_lock;
 #[path = "all/constraint_refusal_reason.rs"]
 mod constraint_refusal_reason;
 #[path = "all/create_graph_using_import_task.rs"]

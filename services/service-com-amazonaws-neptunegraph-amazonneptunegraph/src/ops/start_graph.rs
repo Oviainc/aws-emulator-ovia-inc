@@ -174,8 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
         // The lookup settles the transitions the clock has already made due first, so a
         // graph whose stop has come due is startable. A graph lives in exactly one
         // Region, so one of another Region is not found here.

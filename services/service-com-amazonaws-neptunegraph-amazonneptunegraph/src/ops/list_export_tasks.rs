@@ -169,8 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An export task lives in exactly one Region, so this listing reports the tasks
         // of the Region the request was signed for and no others.
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
         // Reporting only (`@readonly`): the sole write is materialising the terminal
         // transitions the clock already made due.
         store.settle_all(now);

@@ -165,12 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A taggable resource of this service lives in exactly one Region, so the
         // Region the request was signed for is part of the lookup beside the ARN.
         let region = crate::state::request_region(ctx);
-        let mut store = state.lock();
         // A graph or snapshot whose deletion has already fallen due is no longer a
         // resource this service holds, so its record is reclaimed before the ARN is
         // resolved: tagging it answers the same 404 as tagging an ARN that never named
         // anything.
-        let now = ::std::time::Instant::now();
+        let (mut store, now) = crate::state::locked_store_now(&state);
         store.reap_deleted_graphs(now);
         store.materialise_snapshots(now);
         let Some(tags) = store.tags_of_mut(&input.resource_arn, &region) else {

@@ -180,8 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for is part of the lookup: a graph of another Region is not reconfigurable
         // through this endpoint.
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
         let Some(graph) = store.settled_graph_mut(&input.graph_identifier, &region, now) else {
             return Err(UpdateGraphErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),

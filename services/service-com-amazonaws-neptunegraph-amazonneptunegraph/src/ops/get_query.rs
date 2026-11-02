@@ -163,8 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
 
         // A query is addressed as a query OF a graph, so the graph is resolved first:
         // an identifier no graph holds names no queries either, and a graph lives in

@@ -177,8 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An export task lives in exactly one Region, so the Region this request was
         // signed for is part of the lookup: a task of another Region is not found here.
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
-        let mut store = state.lock();
+        let (mut store, now) = crate::state::locked_store_now(&state);
 
         // The lookup settles the transitions the clock already made due first, so a task
         // whose export has already stopped is judged on the status it stopped in rather
