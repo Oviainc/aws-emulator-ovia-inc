@@ -189,6 +189,8 @@ mod publish_type_version_in_arn;
 mod published_type_schema;
 #[path = "all/publisher_eligibility.rs"]
 mod publisher_eligibility;
+#[path = "all/publisher_gate_scope.rs"]
+mod publisher_gate_scope;
 #[path = "all/publisher_reads.rs"]
 mod publisher_reads;
 #[path = "all/publisher_registration.rs"]

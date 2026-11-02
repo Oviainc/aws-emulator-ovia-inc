@@ -18,7 +18,10 @@
 //! `HOOK`), a public third-party extension activated here, a public extension of this store,
 //! one of the public extensions Amazon Web Services publishes, a record only another
 //! Region's registry holds, a version no record carries, and an extension nothing registered
-//! anywhere. Every row is driven TWICE — once as an account that is not a publisher, once as
+//! anywhere — and, taken from `publisher_gate_scope.rs` so the two suites share one set of
+//! names, extension names spanning what the modelled `TypeName` admits (both published length
+//! bounds, a name bearing digits, the optional `::MODULE` suffix) under each `RegistryType`.
+//! Every row is driven TWICE — once as an account that is not a publisher, once as
 //! one that is — so the registration is the only difference between the refusal and the
 //! answer the identifier is owed, which is what makes this an ORDERING assertion rather than
 //! a wording one.
@@ -33,9 +36,10 @@ use service_com_amazonaws_cloudformation_cloudformation::state::registry::{
 use service_com_amazonaws_cloudformation_cloudformation::state::template::IMPLEMENTED_RESOURCE_TYPES;
 
 use crate::extension_registry::{router_with_registry, OTHER_REGION};
+use crate::publisher_gate_scope::{unregistered, Unregistered};
 use crate::stack_lifecycle::{xml_text, REGION};
 use crate::type_testing::{
-    assert_not_found, assert_registry_refusal, register_publisher, registry_snapshot,
+    assert_not_found, assert_registry_refusal, borrowed, register_publisher, registry_snapshot,
     resource_arn, test_type, NOT_A_PUBLISHER,
 };
 
@@ -68,6 +72,30 @@ fn not_a_private_extension(arn: &str) -> String {
 }
 
 fn rows() -> Vec<Row> {
+    let mut rows = named_rows();
+    // The name shapes `publisher_gate_scope.rs` spans the modelled `TypeName` constraint
+    // with, driven through the GATED operation here: that suite holds the UNGATED operations
+    // to the modelled 404 on each of these names, so crossing them with the gate keeps both
+    // halves of one rule on one set of names rather than on two tables.
+    rows.extend(unregistered().into_iter().map(
+        |Unregistered {
+             case,
+             type_kind,
+             type_name,
+         }| Row {
+            case,
+            members: vec![
+                ("Type", type_kind.to_string()),
+                ("TypeName", type_name.clone()),
+            ],
+            served: Served::NotFound(type_name),
+        },
+    ));
+    rows
+}
+
+/// The rows written out here, one per record an identifier can resolve to.
+fn named_rows() -> Vec<Row> {
     let resource = resource_arn();
     let module = type_arn(
         REGION,
@@ -194,14 +222,6 @@ fn rows() -> Vec<Row> {
             served: Served::NotFound(format!("{resource}/00000009")),
         },
     ]
-}
-
-/// The members of one row, as the wire helper takes them.
-fn borrowed<'a>(members: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
-    members
-        .iter()
-        .map(|(key, value)| (*key, value.as_str()))
-        .collect()
 }
 
 #[tokio::test]

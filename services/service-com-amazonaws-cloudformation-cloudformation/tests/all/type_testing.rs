@@ -136,6 +136,14 @@ pub(crate) fn registry_snapshot(engine: &Arc<engine::InMemoryEngine>) -> String 
     format!("{:?}", store(engine).lock().extensions)
 }
 
+/// The members of one row, as the wire helpers above take them.
+pub(crate) fn borrowed<'a>(members: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    members
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect()
+}
+
 /// The ARNs of the seeded records, which every case addresses its extension by.
 pub(crate) fn resource_arn() -> String {
     type_arn(REGION, registry_type::RESOURCE, "My::Sample::Resource")
