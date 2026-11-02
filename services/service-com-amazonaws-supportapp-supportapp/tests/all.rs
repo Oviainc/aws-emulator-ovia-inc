@@ -47,3 +47,5 @@ mod slack_workspace_team_name;
 mod state_roundtrip;
 #[path = "all/update_severity_rule_scope.rs"]
 mod update_severity_rule_scope;
+#[path = "all/workspace_registry_presence.rs"]
+mod workspace_registry_presence;

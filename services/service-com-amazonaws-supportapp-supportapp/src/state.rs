@@ -5,7 +5,8 @@
 //! Besides the state struct itself this module holds the few rules the Support App
 //! handlers share — the stored-record-to-modelled-shape conversion, the listing
 //! pagination rule, the documented `notifyOnCaseSeverity` consistency rule, the account
-//! a caller-supplied `channelRoleArn` must name, the Slack workspaces the Support Center
+//! a caller-supplied `channelRoleArn` must name, whether a Slack workspace is registered
+//! to the account, the Slack workspaces the Support Center
 //! console has authorized, the organization membership an
 //! Organizations-scoped call needs, and the wording of the failures
 //! several operations can answer with — so the operation files
@@ -313,6 +314,21 @@ impl Default for ComAmazonawsSupportappSupportappState {
 }
 
 impl ComAmazonawsSupportappSupportappState {
+    /// Whether this account's Slack workspace registry holds the workspace `team_id`
+    /// identifies.
+    ///
+    /// The registry-presence rule itself, owned where the registry is owned: a workspace
+    /// is registered to this account exactly when
+    /// [`Self::slack_workspace_configurations`] holds its `teamId`. Both decisions that
+    /// turn on it read it from here — the create path's
+    /// [`Self::unregistered_workspace_conflict`] and
+    /// `RegisterSlackWorkspaceForOrganization`'s member-account conflict and quota
+    /// accounting — so the two handlers cannot come to disagree about whether a workspace
+    /// is registered.
+    pub fn workspace_is_registered(&self, team_id: &str) -> bool {
+        self.slack_workspace_configurations.contains_key(team_id)
+    }
+
     /// Why a request that ADDS a Slack channel configuration to the workspace `team_id`
     /// names must be refused with the modelled `ConflictException`, or `None` when that
     /// workspace is registered to this account.
@@ -331,8 +347,7 @@ impl ComAmazonawsSupportappSupportappState {
     /// `DeleteSlackWorkspaceConfiguration` takes a workspace's configurations with it —
     /// so this registry has no answer to add once the lookup has missed.
     pub fn unregistered_workspace_conflict(&self, team_id: &str) -> Option<String> {
-        (!self.slack_workspace_configurations.contains_key(team_id))
-            .then(|| workspace_not_registered_message(team_id))
+        (!self.workspace_is_registered(team_id)).then(|| workspace_not_registered_message(team_id))
     }
 
     /// Why a call that AUTHORIZES the Slack workspace `team_id` names must be refused

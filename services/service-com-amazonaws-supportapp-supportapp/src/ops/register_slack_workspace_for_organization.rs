@@ -288,16 +288,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // organization membership, not about a workspace that is already registered.
         // So only a NEW registration counts against the documented quota, which is
         // also what keeps the registry from growing without bound on repeated calls.
-        let already_registered = store
-            .slack_workspace_configurations
-            .contains_key(&input.team_id);
+        let already_registered = store.workspace_is_registered(&input.team_id);
         // The second condition this operation's `ConflictException` enumerates: a call
         // from an account that is a member of its organization, for a workspace the
         // organization's management account has not registered yet. The registry is what
-        // settles that — it holds the workspaces registered for this organization, the same
-        // presence test `CreateSlackChannelConfiguration` makes — and the refusal registers
-        // nothing, so a member account cannot authorize a workspace, nor record the
-        // organization-wide grant, ahead of the management account.
+        // settles that — it holds the workspaces registered for this organization, read
+        // through the state struct's own presence rule
+        // ([`crate::state::ComAmazonawsSupportappSupportappState::workspace_is_registered`]),
+        // the one `CreateSlackChannelConfiguration` decides its conflict by — and the
+        // refusal registers nothing, so a member account cannot authorize a workspace, nor
+        // record the organization-wide grant, ahead of the management account.
         if !registers_for_the_organization && !already_registered {
             return Err(
                 RegisterSlackWorkspaceForOrganizationErrorModeled::ConflictException(
