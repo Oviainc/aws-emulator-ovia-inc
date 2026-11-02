@@ -5,7 +5,9 @@
 //! record in [`crate::state`] (comma-separated stacks resolve to the first name
 //! the catalog has metrics for, the way a client's fallback list is meant to
 //! work); `FontUnicodeRange` names the 256-codepoint range, and the `.pbf`
-//! bytes are the SDF glyphs derived from that record over that range. A range
+//! bytes are the typeface's glyphs for that range, rasterized as signed
+//! distance fields at that record's metrics (see
+//! [`crate::state::glyph_pbf`]). A range
 //! is served as a STORED object of the asset bucket, so it reports the media
 //! type that bucket stores it with — see `crate::service::wire` for the object
 //! headers that carries.

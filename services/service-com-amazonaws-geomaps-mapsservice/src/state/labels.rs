@@ -13,14 +13,14 @@
 //!   which is what the same documentation says happens ("If the specified
 //!   language data isn't available for the map image, the labels will default
 //!   to the regional primary language").
-//! * **How a label is drawn.** The emulator ships no font files — see
-//!   [`super::glyph_pbf`], whose glyph ranges are therefore the "missing glyph"
-//!   box measured with the requested stack's stored metrics. Those boxes ARE
-//!   this service's typeface, so a label on a rendered image is drawn as the
-//!   same per-codepoint boxes [`super::glyph_pbf::glyph_box`] reports to a
-//!   client through `GetGlyphs`: one box per character, at the stack's own
-//!   advances. A label's ink therefore depends on its text, which is what makes
-//!   two languages two images.
+//! * **How a label is drawn.** The emulator ships no licensed map typeface —
+//!   see [`super::glyph_pbf`], whose glyph ranges are rasterized from the
+//!   embedded public-domain 8x8 typeface, with the missing-glyph box standing
+//!   in for a codepoint that typeface does not cover. Those cells ARE this
+//!   service's typeface, so a label on a rendered image is drawn with the same
+//!   per-codepoint glyphs [`super::glyph_pbf::glyph_shape`] reports to a client
+//!   through `GetGlyphs`, at the stack's own advances. A label's ink therefore
+//!   depends on its text, which is what makes two languages two images.
 //!
 //! The text itself is derived, not stored: the emulator has no gazetteer, so a
 //! place's name comes from its position the way its elevation does
@@ -32,7 +32,7 @@
 
 use super::assets::Position;
 use super::canvas::Canvas;
-use super::glyph_pbf::glyph_box;
+use super::glyph_pbf::{glyph_box, glyph_shape, GlyphShape};
 use super::{FontRecord, Rgba};
 
 /// Every language code `GetStaticMapRequest$Language` documents as supported.
@@ -302,11 +302,11 @@ pub fn label_extent(font: &FontRecord, text: &str, size: u32) -> (u32, u32) {
 
 /// Draw `text` on `canvas`, the pen starting on the baseline at `anchor`.
 ///
-/// One missing-glyph box per character — this service's only typeface, the same
-/// shape its glyph ranges carry — measured with `font`'s stored metrics scaled
-/// to `size` pixels. The canvas clips, so a label that runs off the image is
-/// drawn as far as the image goes; leaving such a label out entirely is the
-/// caller's decision (`CropLabels`).
+/// One glyph of this service's typeface per character — the same shapes its
+/// glyph ranges carry — inked at `font`'s stored metrics scaled to `size`
+/// pixels. The canvas clips, so a label that runs off the image is drawn as far
+/// as the image goes; leaving such a label out entirely is the caller's
+/// decision (`CropLabels`).
 pub fn draw_label(
     canvas: &mut Canvas,
     font: &FontRecord,
@@ -318,7 +318,7 @@ pub fn draw_label(
     let mut pen = anchor.0;
     for character in text.chars() {
         let glyph = scaled_box(font, character, size);
-        draw_glyph_box(canvas, pen, anchor.1, glyph.width, glyph.height, color);
+        draw_glyph(canvas, glyph_shape(character as u32), pen, anchor.1, &glyph, color);
         pen = pen.saturating_add(i64::from(glyph.advance));
     }
 }
@@ -328,6 +328,10 @@ struct ScaledBox {
     width: u32,
     height: u32,
     advance: u32,
+    /// The left side bearing: how far right of the pen the ink starts.
+    left: i64,
+    /// How far the ink's top sits above the baseline, in label pixels.
+    above_baseline: i64,
 }
 
 /// Measure one character at label size: the glyph box `GetGlyphs` reports for
@@ -336,21 +340,55 @@ fn scaled_box(font: &FontRecord, character: char, size: u32) -> ScaledBox {
     let metrics = glyph_box(font, character as u32);
     let em = metrics.em.max(1);
     let scale = |value: u32| (value.saturating_mul(size) / em).max(1);
+    let bearing = |value: i32| i64::from(value).saturating_mul(i64::from(size)) / i64::from(em);
     ScaledBox {
         width: scale(metrics.width),
         height: scale(metrics.height),
         advance: scale(metrics.advance),
+        left: bearing(metrics.left),
+        // `top` is negative above the baseline, the way the glyph protobuf
+        // writes it.
+        above_baseline: bearing(metrics.top).saturating_neg(),
     }
 }
 
-/// Draw one missing-glyph box: its outline, sitting on the baseline at `y`.
-fn draw_glyph_box(canvas: &mut Canvas, x: i64, y: i64, width: u32, height: u32, color: Rgba) {
-    let right = x + i64::from(width) - 1;
-    let top = y - i64::from(height) + 1;
-    canvas.hline(top, x, right, color);
-    canvas.hline(y, x, right, color);
-    canvas.vline(x, top, y, color);
-    canvas.vline(right, top, y, color);
+/// Draw one glyph's ink: the cell's coverage, stretched across the rectangle
+/// its metrics report, with the top of that rectangle its own height above the
+/// baseline at `baseline`.
+fn draw_glyph(
+    canvas: &mut Canvas,
+    shape: GlyphShape,
+    x: i64,
+    baseline: i64,
+    glyph: &ScaledBox,
+    color: Rgba,
+) {
+    // The ink starts at the pen plus the glyph's own side bearing, the way the
+    // metrics `GetGlyphs` reports place it.
+    let left = x.saturating_add(glyph.left);
+    let top = baseline.saturating_sub(glyph.above_baseline);
+    // Only the part of the rectangle that lands on the image is walked: the
+    // canvas clips every write anyway, so a glyph set far larger than the image
+    // would otherwise be iterated with nothing to show for it.
+    let columns = on_canvas(left, glyph.width, canvas.width());
+    let rows = on_canvas(top, glyph.height, canvas.height());
+    for row in rows {
+        for column in columns.clone() {
+            if shape.inked_at(column, row, glyph.width, glyph.height) {
+                canvas.put(left + i64::from(column), top + i64::from(row), color);
+            }
+        }
+    }
+}
+
+/// The columns (or rows) of a glyph's rectangle that land inside an image
+/// `limit` pixels across, when the rectangle starts at `start` and is `extent`
+/// pixels wide.
+fn on_canvas(start: i64, extent: u32, limit: u32) -> std::ops::Range<u32> {
+    let extent = i64::from(extent);
+    let first = start.saturating_neg().clamp(0, extent) as u32;
+    let last = i64::from(limit).saturating_sub(start).clamp(0, extent) as u32;
+    first..last.max(first)
 }
 
 /// The seed a place's name is drawn from: its position, quantized to the

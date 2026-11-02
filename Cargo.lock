@@ -9851,6 +9851,7 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
+ "font8x8",
  "hex",
  "http",
  "jpeg-encoder",

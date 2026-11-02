@@ -32,6 +32,10 @@ jpeg-encoder = "0.6"
 # Protobuf codec for the two protobuf formats this service serves: Mapbox
 # Vector Tiles (GetTile) and SDF glyph ranges (GetGlyphs).
 prost = "0.13"
+# The typeface the glyph ranges and the rendered map labels are drawn from: an
+# 8x8 monochrome bitmap font, shipped as data, covering Basic Latin, Latin-1,
+# Greek and Hiragana.
+font8x8 = "0.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
