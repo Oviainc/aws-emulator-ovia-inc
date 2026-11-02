@@ -257,11 +257,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names neither points the endpoint at nothing.
         let Some(model_arn) = input.model_arn.clone() else {
             return Err(match input.flywheel_arn.as_ref() {
-                Some(flywheel_arn) => CreateEndpointErrorModeled::ResourceNotFoundException(
+                // The not-found states only that this service holds no such resource,
+                // in the sentence [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] states
+                // for every operation that resolves one by ARN: the ARN the caller
+                // sent is not echoed back into it.
+                Some(_) => CreateEndpointErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "RESOURCE_NOT_FOUND: Could not find the flywheel {flywheel_arn}."
-                        )),
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     },
                 ),
                 None => {
@@ -281,9 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // persist — is the not-found this operation models.
         let model = store.document_classifiers.get(&model_arn).ok_or_else(|| {
             CreateEndpointErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "RESOURCE_NOT_FOUND: Could not find the model {model_arn}."
-                )),
+                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
             })
         })?;
 

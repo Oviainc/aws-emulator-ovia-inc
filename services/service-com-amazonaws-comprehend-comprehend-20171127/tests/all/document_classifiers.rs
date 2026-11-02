@@ -54,6 +54,13 @@ use crate::comprehend_client::{error_code, error_message, Comprehend, ACCOUNT_ID
 /// believes.
 const RESOURCE_NOT_FOUND_MESSAGE: &str = "RESOURCE_NOT_FOUND: Could not find specified resource.";
 
+/// The sentence the model DELETION refuses an ARN no classifier was created under
+/// with: the same kind of fixed text, worded for the class of resource that
+/// operation deletes — a classifier is a custom model — so the sentence follows the
+/// operation rather than the ARN. `not_found_refusals` is the suite that asserts
+/// that over every operation of the three planes that raise a not-found.
+const MODEL_NOT_FOUND_MESSAGE: &str = "Could not find specified model.";
+
 /// The order a classifier's `ModelStatus` may only move forward along when nobody
 /// stops it.
 ///
@@ -243,10 +250,10 @@ async fn the_reads_refuse_an_arn_no_classifier_was_created_under() {
     )
     .await;
 
-    for operation in [
-        "DescribeDocumentClassifier",
-        "StopTrainingDocumentClassifier",
-        "DeleteDocumentClassifier",
+    for (operation, expected) in [
+        ("DescribeDocumentClassifier", RESOURCE_NOT_FOUND_MESSAGE),
+        ("StopTrainingDocumentClassifier", RESOURCE_NOT_FOUND_MESSAGE),
+        ("DeleteDocumentClassifier", MODEL_NOT_FOUND_MESSAGE),
     ] {
         // Rows that differ along what is wrong with the ARN: an unknown name, a
         // version of a classifier that has none, another region, another account.
@@ -270,14 +277,13 @@ async fn the_reads_refuse_an_arn_no_classifier_was_created_under() {
                 "ResourceNotFoundException",
                 "case {operation} with {arn:?}: expected ResourceNotFoundException, got {body}"
             );
-            // The service's own fixed text for a resource that is not there: it
-            // carries the reason code and NOTHING derived from the request, so the
-            // ARN the caller asked for is never echoed back.
+            // The operation's own fixed text for a resource that is not there: it
+            // carries NOTHING derived from the request, so the ARN the caller asked
+            // for is never echoed back.
             assert_eq!(
                 error_message(&body),
-                RESOURCE_NOT_FOUND_MESSAGE,
-                "case {operation} with {arn:?}: expected the fixed not-found message, got \
-                 {body}"
+                expected,
+                "case {operation} with {arn:?}: expected {expected:?}, got {body}"
             );
             assert!(
                 !error_message(&body).contains(&arn),

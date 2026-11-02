@@ -74,15 +74,10 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::JobFamily;
+use crate::state::{JobFamily, JOB_NOT_FOUND_MESSAGE};
 
 /// The family this operation reports on.
 const FAMILY: JobFamily = JobFamily::DominantLanguageDetection;
-
-/// What AWS answers for a well-formed `JobId` that names no job: a FIXED sentence,
-/// independent of the request, so no client can read the id it asked about back out
-/// of the failure.
-const JOB_NOT_FOUND_MESSAGE: &str = "Could not find specified job.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

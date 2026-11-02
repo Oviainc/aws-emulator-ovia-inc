@@ -261,6 +261,16 @@ pub fn remove_tags(held: &mut Vec<Tag>, tag_keys: &[String]) {
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str =
     "RESOURCE_NOT_FOUND: Could not find specified resource.";
 
+/// The message a `ResourceNotFoundException` carries when the resource the request
+/// named was a custom MODEL and the operation words its refusal for that class of
+/// resource rather than for a resource in general.
+///
+/// Fixed for the same reason as [`RESOURCE_NOT_FOUND_MESSAGE`] — nothing of the
+/// request reaches the sentence — but model-flavoured, because the operations that
+/// use it resolve a trained model by its ARN and say so, which is what lets a client
+/// tell "that model is gone" from a generic resource miss.
+pub const MODEL_NOT_FOUND_MESSAGE: &str = "Could not find specified model.";
+
 /// The actions a custom-model resource policy can grant.
 ///
 /// A model's resource-based policy exists to "authorize an entity in another Amazon

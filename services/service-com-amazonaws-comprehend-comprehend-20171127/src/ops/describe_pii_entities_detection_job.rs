@@ -168,12 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .analysis_jobs
             .get_mut(&(FAMILY, input.job_id.clone()))
             .ok_or_else(|| {
+                // The sentence every job operation of this service words a job id that
+                // names nothing with ([`crate::state::JOB_NOT_FOUND_MESSAGE`]): fixed
+                // text, with the id the caller sent not echoed back into it.
                 DescribePiiEntitiesDetectionJobErrorModeled::JobNotFoundException(
                     JobNotFoundException {
-                        message: Some(format!(
-                            "The PII entities detection job with id '{}' was not found.",
-                            input.job_id
-                        )),
+                        message: Some(crate::state::JOB_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
             })?;

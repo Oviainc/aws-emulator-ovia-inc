@@ -49,6 +49,8 @@ mod scratch_dump;
 mod key_phrases;
 #[path = "all/key_phrases_jobs.rs"]
 mod key_phrases_jobs;
+#[path = "all/not_found_refusals.rs"]
+mod not_found_refusals;
 #[path = "all/noun_phrase_key_phrases.rs"]
 mod noun_phrase_key_phrases;
 #[path = "all/phone_number_forms.rs"]

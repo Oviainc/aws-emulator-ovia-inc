@@ -165,12 +165,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the clock already owed at `now`, which was due whether or not anybody called.
         store.settle_endpoints(now);
 
+        // The refusal states only that this service holds no such resource: its
+        // sentence is the one [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] states for
+        // every operation that resolves a resource by ARN, so the ARN the caller sent
+        // is not echoed back into it.
         let endpoint = store.endpoints.get(&input.endpoint_arn).ok_or_else(|| {
             DescribeEndpointErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "RESOURCE_NOT_FOUND: Could not find the endpoint {}.",
-                    input.endpoint_arn
-                )),
+                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
             })
         })?;
 

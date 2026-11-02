@@ -172,9 +172,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .document_classifiers
             .get_mut(&input.document_classifier_arn)
             .ok_or_else(|| {
+                // A classifier is a custom MODEL, and the deletion of one words its
+                // not-found for that class of resource
+                // ([`crate::state::MODEL_NOT_FOUND_MESSAGE`]) rather than with the
+                // generic resource sentence; nothing of the request is echoed either
+                // way.
                 DeleteDocumentClassifierErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                        message: Some(crate::state::MODEL_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
             })?;
