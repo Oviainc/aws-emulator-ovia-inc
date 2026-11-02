@@ -4857,6 +4857,53 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|key| key.config.caller_reference == caller_reference)
     }
 
+    /// The key group whose STORED configuration lists the public key `public_key_id` names,
+    /// or `None` when no stored group does.
+    ///
+    /// "A key group contains a list of public keys that you can use with CloudFront signed
+    /// URLs and signed cookies", and that list is `KeyGroupConfig$Items` — "A list of the
+    /// identifiers of the public keys in the key group" — so what puts a public key in use is
+    /// a stored group naming it, whichever position of whichever group's list names it. The
+    /// SAME rule
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_cache_policy`]
+    /// states for a policy a cache behaviour attaches. The scan reads the STORED
+    /// configurations rather than a second index beside them, so it cannot drift out of step
+    /// with what a read of those groups reports, and both collections are bounded
+    /// ([`MAX_KEY_GROUPS`] groups, each with a bounded key list).
+    pub fn key_group_using_public_key(&self, public_key_id: &str) -> Option<&StoredKeyGroup> {
+        self.key_groups
+            .values()
+            .find(|group| group.config.items.iter().any(|id| id == public_key_id))
+    }
+
+    /// The field-level encryption profile whose STORED configuration names the public key
+    /// `public_key_id` names in one of its encryption entities, or `None` when no stored
+    /// profile does.
+    ///
+    /// An encryption entity names the key its matching fields are encrypted with through
+    /// `EncryptionEntity$PublicKeyId` — "The public key associated with a set of field-level
+    /// encryption patterns, to be used when encrypting the fields that match the patterns" —
+    /// so what puts a public key in use is a stored profile naming it, which is the same rule
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::key_group_using_public_key`] states
+    /// for the other way a stored record reaches a public key. The entity list is optional on
+    /// the wire, so a profile carrying none names no key at all rather than an unknown one,
+    /// and the scan reads the stored configurations rather than a second index beside them.
+    pub fn field_level_encryption_profile_using_public_key(
+        &self,
+        public_key_id: &str,
+    ) -> Option<&StoredFieldLevelEncryptionProfile> {
+        self.field_level_encryption_profiles.values().find(|stored| {
+            stored
+                .config
+                .encryption_entities
+                .items
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|entity| entity.public_key_id == public_key_id)
+        })
+    }
+
     /// The key group `id` names, or `None` when the store holds none.
     pub fn key_group(&self, id: &str) -> Option<&StoredKeyGroup> {
         self.key_groups.get(id)
@@ -10801,17 +10848,48 @@ pub const MAX_PUBLIC_KEY_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
 
 /// The modelled `NoSuchPublicKey` (HTTP 404) for a public key id the store does not hold.
 ///
-/// The sentence is the one the model states on the shape itself — "The specified public
-/// key doesn't exist." — a property of the store rather than of the request, so nothing
-/// from the request belongs in the text.
+/// The sentence states a property of the store rather than of the request — the id names no
+/// public key — so nothing from the request belongs in the text and every path that raises
+/// this code reads the same.
 pub fn no_such_public_key() -> crate::ops::types::NoSuchPublicKey {
     crate::ops::types::NoSuchPublicKey {
         message: Some(NO_SUCH_PUBLIC_KEY_MESSAGE.to_string()),
     }
 }
 
-/// `NoSuchPublicKey`'s message, as the model documents the shape.
+/// `NoSuchPublicKey`'s message, as CloudFront sends it on the wire — observed in recorded
+/// CloudFront responses to this refusal, which is the source this wording comes from. The
+/// service names the resource "CloudFront public key" and words the condition "does not
+/// exist", as [`NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE`] words the same condition for
+/// another resource of this service, rather than in the model's documentation prose ("The
+/// specified public key doesn't exist."), and the wire wording is what a client reads. Do not
+/// "correct" this constant to the documentation sentence.
 pub const NO_SUCH_PUBLIC_KEY_MESSAGE: &str = "The specified CloudFront public key does not exist.";
+
+/// The modelled `PublicKeyInUse` (HTTP 409) for a delete of a public key a stored record
+/// still references.
+///
+/// The SAME rule [`cache_policy_in_use`] states for a policy a cache behaviour attaches: the
+/// sentence is a property of the CONDITION rather than of the request — the key is still
+/// referenced — so nothing from the request or from the store belongs in it, and every
+/// refusal of this condition reads the same.
+pub fn public_key_in_use() -> crate::ops::types::PublicKeyInUse {
+    crate::ops::types::PublicKeyInUse {
+        message: Some(PUBLIC_KEY_IN_USE_MESSAGE.to_string()),
+    }
+}
+
+/// `PublicKeyInUse`'s message, as CloudFront sends it on the wire — observed in a recorded
+/// CloudFront response to this refusal, which is the source this wording comes from: the key
+/// is associated with either a key group or a field-level encryption profile and the caller is
+/// told to disassociate it before deleting, worded as
+/// [`FIELD_LEVEL_ENCRYPTION_PROFILE_IN_USE_MESSAGE`] and [`CACHE_POLICY_IN_USE_MESSAGE`] word
+/// the same condition for the resources they gate, rather than in the model's documentation
+/// prose ("The specified public key is in use."). Do not "correct" this constant to the
+/// documentation sentence.
+pub const PUBLIC_KEY_IN_USE_MESSAGE: &str =
+    "The Cloudfront public key is currently associated with either Key Group or a field level \
+     encryption profile. Please disassociate the key before deleting.";
 
 /// The longest comment a field-level encryption profile carries.
 ///

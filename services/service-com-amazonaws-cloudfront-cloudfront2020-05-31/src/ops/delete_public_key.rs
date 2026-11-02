@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Remove a public key you previously added to CloudFront." The delete removes the ONE
+//! stored record every read of that key answered from, so afterwards the id names no public
+//! key and the listing stops reporting it, and it is gated twice: on the key's own version
+//! token (`If-Match`) and on nothing else in the store still referencing the key — a key
+//! group's key list or a field-level encryption profile's encryption entity — which is
+//! `PublicKeyInUse`.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +164,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePublicKey"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // The FORM of the `If-Match` header: `InvalidIfMatchVersion` is "the If-Match
+        // version is missing or not valid", a property of the request alone, so it is
+        // decided before the id is resolved — no version of any key could make an absent or
+        // malformed header valid. The same order `UpdatePublicKey` answers in, so the two
+        // mutations of one record cannot disagree about what a header says.
+        let Some(submitted_version) = crate::state::if_match_version(input.if_match.as_deref())
+        else {
+            return Err(DeletePublicKeyErrorModeled::InvalidIfMatchVersion(
+                crate::state::invalid_if_match_version(),
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this call
+        // reads it, as every handler here does: whether anything still references this key
+        // is decided against the store as it stands at this instant. A public key itself has
+        // no transition owed — the model gives it no status.
+        store.settle(::std::time::SystemTime::now());
+
+        // The key being deleted is resolved first: every refusal below is about the record
+        // this id names, and nothing is removed for an id the store does not hold.
+        let Some(stored) = store.public_key(&input.id) else {
+            return Err(DeletePublicKeyErrorModeled::NoSuchPublicKey(
+                crate::state::no_such_public_key(),
+            )
+            .into());
+        };
+
+        // The precondition is checked against the STORED version, the way HTTP evaluates
+        // one: a caller holding a version that is no longer current is told that before
+        // anything about what the key is referenced by.
+        if submitted_version != stored.etag {
+            return Err(DeletePublicKeyErrorModeled::PreconditionFailed(
+                crate::state::precondition_failed(),
+            )
+            .into());
+        }
+
+        // A stored record that names this key still needs it: a key group lists the
+        // identifiers of the public keys in the group, and a field-level encryption
+        // profile's encryption entity names the public key its matching fields are encrypted
+        // with. Either reference makes the key in use, so the delete is refused and the key
+        // stays readable until the referencing record has let go of it.
+        if store.key_group_using_public_key(&input.id).is_some()
+            || store
+                .field_level_encryption_profile_using_public_key(&input.id)
+                .is_some()
+        {
+            return Err(DeletePublicKeyErrorModeled::PublicKeyInUse(
+                crate::state::public_key_in_use(),
+            )
+            .into());
+        }
+
+        // Gone means gone: the record every read answered from is removed, so the id names
+        // no public key, the listing stops reporting it, and the caller reference it held is
+        // free for a later create to claim.
+        store.public_keys.remove(&input.id);
+
+        Ok(DeletePublicKeyOutput)
     }
 }
