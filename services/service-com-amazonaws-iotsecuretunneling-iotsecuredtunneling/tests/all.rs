@@ -45,6 +45,8 @@ mod reserved_tag_keys;
 mod rotate_refusal_error_contract;
 #[path = "all/shared_tag_limit_rule.rs"]
 mod shared_tag_limit_rule;
+#[path = "all/stamp_never_precedes_the_owed_close.rs"]
+mod stamp_never_precedes_the_owed_close;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_key_count.rs"]

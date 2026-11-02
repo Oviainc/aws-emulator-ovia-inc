@@ -22,6 +22,12 @@
 //!
 //! Driven over the wire through the `MultiServiceRouter` exactly as a client
 //! reaches the service (`awsJson1_1`, `POST /` with `X-Amz-Target`).
+//!
+//! This module owns the harness for driving one entry point while the store lock
+//! is held from another thread — the router, the armed expiry and the per-entry
+//! invocation — so the other suite about a call that waited for the store
+//! (`tests/all/stamp_never_precedes_the_owed_close.rs`) drives its own rows
+//! through this code rather than carrying a second copy of it.
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -49,14 +55,14 @@ const MARGIN: Duration = Duration::from_millis(150);
 /// [`MARGIN`], so the instant the holder releases the lock is always past the
 /// armed expiry — whatever the machine's speed, which is why these tests need no
 /// slack of their own.
-const HOLD: Duration = Duration::from_millis(600);
+pub(crate) const HOLD: Duration = Duration::from_millis(600);
 
 /// The tag a row that removes one starts from.
-const TAG_KEY: &str = "stage";
+pub(crate) const TAG_KEY: &str = "stage";
 const TAG_VALUE: &str = "under-lock";
 
 /// A router carrying only this service, over the engine the test also inspects.
-fn mount(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn mount(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(engine)));
@@ -64,7 +70,11 @@ fn mount(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// Call one operation the way an SDK does and return `(status, body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, input: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    input: &Value,
+) -> (u16, Value) {
     let body = serde_json::to_vec(input).expect("serialize the request body");
     let request = http::Request::builder()
         .method("POST")
@@ -91,7 +101,11 @@ async fn call(router: &MultiServiceRouter, operation: &str, input: &Value) -> (u
 }
 
 /// Open one tunnel with `minutes` of lifetime and return `(tunnelId, tunnelArn)`.
-async fn open_tunnel(router: &MultiServiceRouter, case: &str, minutes: i64) -> (String, String) {
+pub(crate) async fn open_tunnel(
+    router: &MultiServiceRouter,
+    case: &str,
+    minutes: i64,
+) -> (String, String) {
     let input = json!({
         "description": case,
         "destinationConfig": {"thingName": "thing-under-lock", "services": ["SSH"]},
@@ -115,7 +129,11 @@ async fn open_tunnel(router: &MultiServiceRouter, case: &str, minutes: i64) -> (
 
 /// The stored record for `tunnel_id`, read straight out of the store so the
 /// observation itself settles nothing.
-fn stored(engine: &Arc<engine::InMemoryEngine>, tunnel_id: &str, case: &str) -> StoredTunnel {
+pub(crate) fn stored(
+    engine: &Arc<engine::InMemoryEngine>,
+    tunnel_id: &str,
+    case: &str,
+) -> StoredTunnel {
     engine
         .state::<TunnelState>()
         .lock()
@@ -126,7 +144,11 @@ fn stored(engine: &Arc<engine::InMemoryEngine>, tunnel_id: &str, case: &str) -> 
 
 /// Move `tunnel_id`'s whole timeline so its lifetime runs out [`MARGIN`] from
 /// now, and answer that expiry: the window the lock is then held across.
-fn arm_expiry(engine: &Arc<engine::InMemoryEngine>, tunnel_id: &str, case: &str) -> SystemTime {
+pub(crate) fn arm_expiry(
+    engine: &Arc<engine::InMemoryEngine>,
+    tunnel_id: &str,
+    case: &str,
+) -> SystemTime {
     let state = engine.state::<TunnelState>();
     let mut store = state.lock();
     let tunnel = store
@@ -191,7 +213,7 @@ fn hold_store_lock(engine: &Arc<engine::InMemoryEngine>, case: &str) -> LockHold
 
 /// The operation a row drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Entry {
+pub(crate) enum Entry {
     /// Addressed by `resourceArn`.
     ListTagsForResource,
     TagResource,
@@ -206,7 +228,7 @@ enum Entry {
 }
 
 /// Drive `entry` once against the tunnel it addresses.
-async fn invoke(
+pub(crate) async fn invoke(
     router: &MultiServiceRouter,
     entry: Entry,
     client_mode: &str,
@@ -262,7 +284,7 @@ async fn invoke(
 }
 
 /// Give `tunnel_arn` the tag a row that removes one starts from.
-async fn tag_fixture(router: &MultiServiceRouter, tunnel_arn: &str, case: &str) {
+pub(crate) async fn tag_fixture(router: &MultiServiceRouter, tunnel_arn: &str, case: &str) {
     let (status, body) = call(
         router,
         "TagResource",
