@@ -179,15 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller drops keys without restating the ones it keeps. A key named by both is
         // therefore removed, with no order to guess at.
         if let Some(properties) = input.properties {
-            context.properties = Some(properties.into_iter().collect());
+            context.properties = properties.into_iter().collect();
         }
         if let Some(to_remove) = input.properties_to_remove {
-            // Removing from an absent map leaves it absent: there is nothing to remove,
-            // and an empty map is a different answer from no map at all.
-            if let Some(properties) = context.properties.as_mut() {
-                for key in to_remove {
-                    properties.remove(&key);
-                }
+            for key in to_remove {
+                context.properties.remove(&key);
             }
         }
         // This call is a mutation, so the context's `LastModifiedTime` moves to now even

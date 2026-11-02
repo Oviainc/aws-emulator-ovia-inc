@@ -345,11 +345,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         last_modified_time: Some(crate::state::timestamp(
                             component.last_modified_time,
                         )),
-                        // The identity recorded at create is reported for both: nothing
-                        // has modified the component since, so its last modifier is its
-                        // creator — the same pairing `DescribeTrialComponent` reports.
+                        // The identity recorded at create, and the one
+                        // `UpdateTrialComponent` records for a component a call has since
+                        // modified — the same pairing `DescribeTrialComponent` reports.
                         created_by: Some(component.created_by.clone()),
-                        last_modified_by: Some(component.created_by.clone()),
+                        last_modified_by: Some(component.last_modified_by.clone()),
                     })
                     .collect(),
             ),

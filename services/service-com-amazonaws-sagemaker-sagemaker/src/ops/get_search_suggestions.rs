@@ -453,13 +453,13 @@ fn stored_property_names(
                 for tag in &component.tags {
                     push("Tags", &tag.key);
                 }
-                for (parameter, _) in component.parameters.iter().flatten() {
+                for parameter in component.parameters.keys() {
                     push("Parameters", parameter);
                 }
-                for (artifact, _) in component.input_artifacts.iter().flatten() {
+                for artifact in component.input_artifacts.keys() {
                     push("InputArtifacts", artifact);
                 }
-                for (artifact, _) in component.output_artifacts.iter().flatten() {
+                for artifact in component.output_artifacts.keys() {
                     push("OutputArtifacts", artifact);
                 }
                 // No `Metrics.<name>` beside them: this service stores no metric series

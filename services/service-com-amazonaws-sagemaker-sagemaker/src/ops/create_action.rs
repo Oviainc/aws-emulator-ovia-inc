@@ -202,11 +202,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 action_type: input.action_type,
                 description: input.description,
                 status: input.status,
-                // An absent map stays absent and an empty one stays empty: the two are
-                // distinguishable on the wire, so the store keeps them distinct.
+                // The map the action holds, which is the empty one when the request named
+                // no properties: the member is how the action reports what it holds, not
+                // what the request mentioned.
                 properties: input
                     .properties
-                    .map(|properties| properties.into_iter().collect()),
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
                 metadata_properties: input.metadata_properties,
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,

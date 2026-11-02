@@ -152,8 +152,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
-        let arn =
-            crate::state::resource_arn(&region, "app-image-config", &input.app_image_config_name);
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::APP_IMAGE_CONFIG_ARN_KIND,
+            &input.app_image_config_name,
+        );
 
         let mut store = state.lock();
         // `AppImageConfigName` is documented "unique to your account", so a name already

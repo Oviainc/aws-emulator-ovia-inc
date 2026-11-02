@@ -149,14 +149,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .notebook_instance_lifecycle_configs
             .get(&input.notebook_instance_lifecycle_config_name)
         else {
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                crate::state::NOTEBOOK_LIFECYCLE_CONFIG_ARN_KIND,
-                &input.notebook_instance_lifecycle_config_name,
-            );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find notebook instance lifecycle configuration \"{arn}\"."
-            )));
+            // The one sentence this service refuses a configuration name nothing is stored
+            // under with, shared with the update that resolves the same name.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::notebook_instance_lifecycle_config_not_found(
+                    &crate::state::request_region(ctx),
+                    &input.notebook_instance_lifecycle_config_name,
+                ),
+            ));
         };
 
         Ok(DescribeNotebookInstanceLifecycleConfigOutput {

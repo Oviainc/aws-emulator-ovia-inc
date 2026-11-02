@@ -40,6 +40,18 @@
 //! already due ([`Endpoint::settle_status`], [`ProcessingJob::settle_status`]), so a read
 //! never changes what a later caller sees and the transient status is observable because
 //! the span is never zero.
+//!
+//! # An entity's own collections are ALWAYS reported, and empty when it holds nothing
+//!
+//! The ML Lineage and experiment-tracking readers report every collection an entity owns
+//! — a lineage entity's properties, a trial component's parameters and artifacts, the
+//! source types of an artifact's source, the metrics and sources nothing has produced for
+//! a component — whatever the creating request carried: an entity created with none of
+//! them reports the EMPTY map or list, not a missing member, because the member is how the
+//! entity reports what it holds rather than what the request mentioned. So the records
+//! below hold those collections directly rather than as an `Option` of one, and the write
+//! path resolves an absent request member to the empty collection ONCE, where the record
+//! is written, instead of leaving each reader to decide again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -1672,6 +1684,9 @@ pub struct Trial {
     /// Stored at creation rather than rebuilt per read, so every later read reports the
     /// identity that actually created the trial.
     pub created_by: UserContext,
+    /// Who last modified the trial: the creating identity until a call modifies it, when
+    /// `UpdateTrial` records the identity behind that call.
+    pub last_modified_by: UserContext,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
 }
@@ -2163,6 +2178,25 @@ pub struct AppImageConfig {
     pub last_modified_time: SystemTime,
 }
 
+/// The `<kind>` component [`resource_arn`] takes for an AppImageConfig, as the modelled
+/// `AppImageConfigArn` pattern spells it
+/// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:app-image-config/`). Named once so
+/// the create, the readers and the update mint and match the same ARN.
+pub const APP_IMAGE_CONFIG_ARN_KIND: &str = "app-image-config";
+
+/// How this service states an `AppImageConfigName` no record is stored under: the
+/// `Could not find <kind> "<arn>".` sentence this family refuses a missing resource with,
+/// over the ARN the requested name resolves to in the Region the request signed for.
+///
+/// Stated once so the reader and the update that resolve the same name word the one fact
+/// the same way.
+pub fn app_image_config_not_found(region: &str, name: &str) -> String {
+    format!(
+        "Could not find AppImageConfig \"{}\".",
+        resource_arn(region, APP_IMAGE_CONFIG_ARN_KIND, name)
+    )
+}
+
 /// A Git repository registered by `CreateCodeRepository`, as `DescribeCodeRepository`
 /// replays it.
 ///
@@ -2300,10 +2334,11 @@ impl App {
 
 /// An artifact created by `CreateArtifact`, as `DescribeArtifact` replays it.
 ///
-/// `properties` keeps the caller's map as given — `None` for an absent member and
-/// `Some(empty)` for an empty one — so a reader cannot tell them apart only because
-/// the store flattened them. It is a `BTreeMap` so the map serialises in one stable
-/// order whatever order the request arrived in.
+/// `properties` is the map the artifact HOLDS, empty while nothing has put an entry in it
+/// (see this module's note on an entity's own collections). It is a `BTreeMap` so the map
+/// serialises in one stable order whatever order the request arrived in. `source` is held
+/// with its `SourceTypes` already resolved to the list the artifact holds, so every reader
+/// of it reports the same thing.
 #[derive(Debug, Clone)]
 pub struct Artifact {
     pub arn: String,
@@ -2313,11 +2348,25 @@ pub struct Artifact {
     pub name: Option<String>,
     pub artifact_type: String,
     pub source: ArtifactSource,
-    pub properties: Option<BTreeMap<String, String>>,
+    pub properties: BTreeMap<String, String>,
     pub metadata_properties: Option<MetadataProperties>,
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
+}
+
+/// An artifact's `Source` as the store holds it: the source the request gave, with its
+/// `SourceTypes` resolved to the list the artifact HOLDS — the empty list when the request
+/// named none (see this module's note on an entity's own collections).
+///
+/// Applied where an artifact is written, so every reader of the stored source — the
+/// describe and the listing's summary — reports the same thing without normalising it
+/// again.
+pub fn stored_artifact_source(source: ArtifactSource) -> ArtifactSource {
+    ArtifactSource {
+        source_uri: source.source_uri,
+        source_types: Some(source.source_types.unwrap_or_default()),
+    }
 }
 
 /// A model package group created by `CreateModelPackageGroup`, as
@@ -2663,6 +2712,21 @@ pub const NOTEBOOK_INSTANCE_LIFECYCLE_CONFIG_QUOTA: usize = 1_000;
 /// configuration, as the AWS ARN reference spells SageMaker's resource type for it.
 /// Named once so the create and the describe mint and expect the same ARN.
 pub const NOTEBOOK_LIFECYCLE_CONFIG_ARN_KIND: &str = "notebook-instance-lifecycle-config";
+
+/// How this service states a notebook instance lifecycle configuration name no record is
+/// stored under: the `Could not find <kind> "<arn>".` sentence this family refuses a
+/// missing resource with, over the ARN the requested name resolves to in the Region the
+/// request signed for.
+///
+/// Stated once so the reader and the update that resolve the same name — neither of which
+/// models a not-found error of its own, so both refuse with a `ValidationException` — word
+/// the one fact the same way.
+pub fn notebook_instance_lifecycle_config_not_found(region: &str, name: &str) -> String {
+    format!(
+        "Could not find notebook instance lifecycle configuration \"{}\".",
+        resource_arn(region, NOTEBOOK_LIFECYCLE_CONFIG_ARN_KIND, name)
+    )
+}
 
 /// A notebook instance lifecycle configuration created by
 /// `CreateNotebookInstanceLifecycleConfig`, as `DescribeNotebookInstanceLifecycleConfig`
@@ -5444,8 +5508,9 @@ pub const ACTION_QUOTA: usize = 1_000;
 ///
 /// Every optional member is held as an `Option` rather than flattened to a default, so
 /// a reader can tell "the caller sent nothing" from "the caller sent an empty value";
-/// `properties` is a `BTreeMap` so the map serialises in one stable order whatever
-/// order the request arrived in.
+/// `properties`, which is not optional but the map the action HOLDS (see this module's
+/// note on an entity's own collections), is a `BTreeMap` so it serialises in one stable
+/// order whatever order the request arrived in.
 #[derive(Debug, Clone)]
 pub struct Action {
     pub name: String,
@@ -5458,7 +5523,7 @@ pub struct Action {
     pub action_type: String,
     pub description: Option<String>,
     pub status: Option<String>,
-    pub properties: Option<BTreeMap<String, String>>,
+    pub properties: BTreeMap<String, String>,
     pub metadata_properties: Option<MetadataProperties>,
     /// What the create carried, so a later `ListTags`/`AddTags` reports it; no
     /// implemented operation surfaces it yet (`DescribeAction` models no `Tags` member).
@@ -5807,12 +5872,12 @@ pub const CONTEXT_QUOTA: usize = 1_000;
 /// A lineage context created by `CreateContext`, as `DescribeContext` replays it and
 /// `UpdateContext` edits it.
 ///
-/// `properties` keeps the caller's map as given — `None` for an absent member and
-/// `Some(empty)` for an empty one — so a reader cannot tell them apart only because the
-/// store flattened them. It is a `BTreeMap` so the map serialises in one stable order
-/// whatever order the request arrived in. `created_by` / `last_modified_by` are stored by
-/// the call that set them rather than rebuilt per read, so every later read reports the
-/// identity that actually created or last edited the context.
+/// `properties` is the map the context HOLDS, empty while nothing has put an entry in it
+/// (see this module's note on an entity's own collections). It is a `BTreeMap` so the map
+/// serialises in one stable order whatever order the request arrived in. `created_by` /
+/// `last_modified_by` are stored by the call that set them rather than rebuilt per read,
+/// so every later read reports the identity that actually created or last edited the
+/// context.
 #[derive(Debug, Clone)]
 pub struct Context {
     pub name: String,
@@ -5824,7 +5889,7 @@ pub struct Context {
     pub source: crate::ops::types::ContextSource,
     pub context_type: String,
     pub description: Option<String>,
-    pub properties: Option<BTreeMap<String, String>>,
+    pub properties: BTreeMap<String, String>,
     pub created_by: UserContext,
     pub last_modified_by: UserContext,
     /// Stored so a later `ListTags` reports what the create carried; `DescribeContext`
@@ -6594,7 +6659,9 @@ pub const TRIAL_COMPONENT_TRIAL_QUOTA: usize = 10_000;
 /// request carried; `creation_time` / `last_modified_time` are the emulator's own clock
 /// readings, so they are `SystemTime` like every other record here. `created_by` is stored
 /// at creation rather than rebuilt per read, so every later read reports the identity that
-/// actually created the component.
+/// actually created the component. `parameters`, `input_artifacts` and `output_artifacts`
+/// are the collections the component HOLDS, empty while nothing has put an entry in them
+/// (see this module's note on an entity's own collections).
 #[derive(Debug, Clone)]
 pub struct TrialComponent {
     pub name: String,
@@ -6610,11 +6677,14 @@ pub struct TrialComponent {
     pub status: Option<crate::ops::types::TrialComponentStatus>,
     pub start_time: Option<::aws_smithy_types::DateTime>,
     pub end_time: Option<::aws_smithy_types::DateTime>,
-    pub parameters: Option<HashMap<String, crate::ops::types::TrialComponentParameterValue>>,
-    pub input_artifacts: Option<HashMap<String, crate::ops::types::TrialComponentArtifact>>,
-    pub output_artifacts: Option<HashMap<String, crate::ops::types::TrialComponentArtifact>>,
+    pub parameters: HashMap<String, crate::ops::types::TrialComponentParameterValue>,
+    pub input_artifacts: HashMap<String, crate::ops::types::TrialComponentArtifact>,
+    pub output_artifacts: HashMap<String, crate::ops::types::TrialComponentArtifact>,
     pub metadata_properties: Option<MetadataProperties>,
     pub created_by: UserContext,
+    /// Who last modified the component: the creating identity until a call modifies it,
+    /// when `UpdateTrialComponent` records the identity behind that call.
+    pub last_modified_by: UserContext,
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
@@ -6816,7 +6886,10 @@ pub const EXPERIMENT_QUOTA: usize = 1_000;
 /// `name` keeps the spelling the creating request used; the store's key is
 /// [`entity_key`] of that name, so a later create or read that differs only in case
 /// resolves to this same record. `created_by` is stored at creation rather than rebuilt
-/// per read, so every later read reports the identity that actually created it.
+/// per read, so every later read reports the identity that actually created it, and
+/// `last_modified_by` starts as that same identity — the creation IS the last
+/// modification until `UpdateExperiment` records the identity behind its own call, the
+/// way the context slice's does.
 #[derive(Debug, Clone)]
 pub struct Experiment {
     pub name: String,
@@ -6827,6 +6900,8 @@ pub struct Experiment {
     pub display_name: String,
     pub description: Option<String>,
     pub created_by: UserContext,
+    /// Who last modified the experiment: the creating identity until a call modifies it.
+    pub last_modified_by: UserContext,
     /// The tags the create carried, which `AddTags`/`DeleteTags`/`ListTags` and `Search`
     /// read once those operations are implemented (they are scaffolded stubs today).
     pub tags: Vec<Tag>,

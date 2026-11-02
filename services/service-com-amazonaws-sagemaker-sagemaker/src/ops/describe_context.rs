@@ -176,15 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source: Some(context.source.clone()),
             context_type: Some(context.context_type.clone()),
             description: context.description.clone(),
-            // Replayed as stored: an absent `Properties` and an empty one came from
-            // different requests, so they read back differently rather than being
-            // flattened into one answer.
-            properties: context.properties.as_ref().map(|properties| {
-                properties
+            // The map the context holds, reported whatever is in it: the empty map for a
+            // context nothing has put a property on.
+            properties: Some(
+                context
+                    .properties
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+                    .collect(),
+            ),
             creation_time: Some(crate::state::timestamp(context.creation_time)),
             last_modified_time: Some(crate::state::timestamp(context.last_modified_time)),
             // `CreatedBy`/`LastModifiedBy` are the identity stored by the call that

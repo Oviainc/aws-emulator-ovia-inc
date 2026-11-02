@@ -174,8 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: Some(crate::state::timestamp(trial.creation_time)),
             created_by: Some(trial.created_by.clone()),
             last_modified_time: Some(crate::state::timestamp(trial.last_modified_time)),
-            // No implemented operation modifies a trial yet, so nothing has.
-            last_modified_by: None,
+            // Who last modified the trial: the creating identity until a call has, and
+            // the identity behind that call once `UpdateTrial` records it.
+            last_modified_by: Some(trial.last_modified_by.clone()),
             metadata_properties: trial.metadata_properties.clone(),
         })
     }

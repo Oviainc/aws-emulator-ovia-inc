@@ -201,11 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 source: input.source,
                 context_type: input.context_type,
                 description: input.description,
-                // Kept as given: an absent `Properties` and an empty one are different
-                // requests, so they are stored differently and read back differently.
+                // The map the context holds, which is the empty one when the request named
+                // no properties: the member is how the context reports what it holds, not
+                // what the request mentioned.
                 properties: input
                     .properties
-                    .map(|properties| properties.into_iter().collect()),
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
                 created_by: created_by.clone(),
                 last_modified_by: created_by,
                 tags: input.tags.unwrap_or_default(),

@@ -188,13 +188,20 @@ async fn describe_context_replays_exactly_what_create_context_stored() {
 
         // Every member the request carried must come back unchanged; `Tags` is stored but
         // is not part of `DescribeContext`'s modelled output, so it is excluded here.
-        for member in ["ContextType", "Source", "Description", "Properties"] {
+        // `Properties` is the map the context HOLDS, so a create that named none reads
+        // back as the empty map rather than as a missing member.
+        for member in ["ContextType", "Source", "Description"] {
             assert_eq!(
                 described.get(member),
                 body.get(member),
                 "case {case}: {member} must round-trip, got {described:?}"
             );
         }
+        assert_eq!(
+            described.get("Properties"),
+            Some(&body.get("Properties").cloned().unwrap_or_else(|| json!({}))),
+            "case {case}: Properties must be the map the context holds, got {described:?}"
+        );
 
         // A context nobody has updated reports one instant for both stamps.
         let created_at = instant(&described, "CreationTime");
@@ -522,10 +529,10 @@ async fn update_context_overwrites_the_properties_and_removes_the_listed_keys() 
             Some("the original description"),
         ),
         (
-            "removing-from-a-context-that-has-no-properties-leaves-none",
+            "removing-from-a-context-that-has-no-properties-leaves-it-empty",
             json!({}),
             json!({ "PropertiesToRemove": ["key0"] }),
-            None,
+            Some(json!({})),
             Some("the original description"),
         ),
         (
@@ -546,7 +553,7 @@ async fn update_context_overwrites_the_properties_and_removes_the_listed_keys() 
             "an-update-carrying-no-edit-changes-no-value",
             json!({}),
             json!({}),
-            None,
+            Some(json!({})),
             Some("the original description"),
         ),
         (
@@ -759,7 +766,7 @@ async fn context_requests_outside_the_modelled_constraints_are_refused() {
             .await;
         assert_eq!(
             survivor.get("Properties"),
-            None,
+            Some(&json!({})),
             "case {case}: the refused request must not edit the stored context, got {survivor:?}"
         );
         assert_eq!(

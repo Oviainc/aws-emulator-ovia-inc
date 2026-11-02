@@ -65,6 +65,8 @@ mod experiment_deletion;
 mod experiment_lifecycle;
 #[path = "all/experiment_not_found_refusal.rs"]
 mod experiment_not_found_refusal;
+#[path = "all/experiment_tracking_updates.rs"]
+mod experiment_tracking_updates;
 #[path = "all/feature_group_deletion.rs"]
 mod feature_group_deletion;
 #[path = "all/feature_group_lifecycle.rs"]
@@ -87,6 +89,8 @@ mod inference_deployment_lifecycle;
 mod inference_recommendations_jobs;
 #[path = "all/lineage_action_lifecycle.rs"]
 mod lineage_action_lifecycle;
+#[path = "all/lineage_and_config_updates.rs"]
+mod lineage_and_config_updates;
 #[path = "all/lineage_associations.rs"]
 mod lineage_associations;
 #[path = "all/lineage_context_lifecycle.rs"]

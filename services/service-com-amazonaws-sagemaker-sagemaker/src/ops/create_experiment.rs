@@ -213,8 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .unwrap_or_else(|| input.experiment_name.clone()),
                 description: input.description,
                 // The identity the request signed with, recorded once at creation so
-                // every later read reports the one that actually created it.
+                // every later read reports the one that actually created it. The creation
+                // IS the last modification until an update records its own caller, so
+                // both identities start out as this one.
                 created_by: crate::state::caller_user_context(ctx),
+                last_modified_by: crate::state::caller_user_context(ctx),
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 // Nothing has modified it yet, so the two instants coincide until an

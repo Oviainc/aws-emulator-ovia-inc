@@ -100,6 +100,21 @@ fn number(body: &Value, member: &str) -> f64 {
         .unwrap_or_else(|| panic!("expected a numeric {member} in {body}"))
 }
 
+/// `Source` as a reader reports it for an artifact created with `body`: the source the
+/// create sent, with `SourceTypes` as the LIST the artifact holds — the empty list when the
+/// create named none, because the member reports what the artifact holds rather than what
+/// the request mentioned.
+fn reported_source(body: &Value) -> Value {
+    let mut source = body
+        .get("Source")
+        .cloned()
+        .expect("every create in this table carries the required Source");
+    if source.get("SourceTypes").is_none() {
+        source["SourceTypes"] = json!([]);
+    }
+    source
+}
+
 /// The `ArtifactArn`s a `ListArtifacts` response lists, in response order.
 fn listed_arns(body: &Value) -> Vec<String> {
     body.get("ArtifactSummaries")
@@ -295,8 +310,8 @@ async fn list_artifacts_honours_every_documented_sort_and_filter() {
 }
 
 /// RULE: every `ArtifactSummary` replays the stored artifact — its minted ARN, its name
-/// where it has one, its source exactly as stored (an absent `SourceTypes` absent and an
-/// empty one empty), its type and the two instants the service recorded — and a listing
+/// where it has one, the source it holds (`SourceTypes` included: the empty list where the
+/// create named none), its type and the two instants the service recorded — and a listing
 /// changes nothing a later caller sees.
 #[tokio::test]
 async fn list_artifacts_summaries_replay_the_stored_artifact() {
@@ -325,16 +340,21 @@ async fn list_artifacts_summaries_replay_the_stored_artifact() {
             entry.arn,
             "case {case}: ArtifactArn in the summary, got {summary:?}"
         );
-        // An absent member stays absent and an empty one stays empty: `ArtifactName` is
-        // present only for an artifact created with one, and `Source` is byte-for-byte
-        // what the create stored.
-        for member in ["ArtifactName", "Source", "ArtifactType"] {
+        // `ArtifactName` is present only for an artifact created with one, and `Source` is
+        // the source the artifact holds — the create's, with `SourceTypes` resolved to the
+        // list it holds.
+        for member in ["ArtifactName", "ArtifactType"] {
             assert_eq!(
                 summary.get(member),
                 entry.body.get(member),
                 "case {case}: {member} must replay what was stored, got {summary:?}"
             );
         }
+        assert_eq!(
+            summary.get("Source"),
+            Some(&reported_source(&entry.body)),
+            "case {case}: Source must replay what the artifact holds, got {summary:?}"
+        );
         assert_eq!(
             summary.get("CreationTime").and_then(Value::as_f64),
             Some(entry.created),

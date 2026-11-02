@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAppImageConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAppImageConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAppImageConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the app configurations the request carries to the AppImageConfig
+//! stored in `crate::state`, moves its `LastModifiedTime`, and refuses an
+//! `AppImageConfigName` nothing is stored under with the modelled `ResourceNotFound`. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +139,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAppImageConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAppImageConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAppImageConfig"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(config) = store.app_image_configs.get_mut(&input.app_image_config_name) else {
+            // An update of a configuration that was never created, or that has been
+            // deleted, is refused and creates nothing as a side effect:
+            // `CreateAppImageConfig` is the only call that mints one. The sentence is the
+            // one the reader of the same name gives.
+            return Err(UpdateAppImageConfigErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::app_image_config_not_found(
+                    &crate::state::request_region(ctx),
+                    &input.app_image_config_name,
+                )),
+            })
+            .into());
+        };
+
+        // Only the app configurations the request CARRIES are applied, and each replaces
+        // the stored one WHOLE: the member is the configuration for one app type ("the new
+        // KernelGateway app to run on the image"), so every member inside it — a file
+        // system's uid and gid, the kernel specifications — is the request's, and an
+        // explicitly sent 0 is a value like any other rather than an absence. A member the
+        // request omits leaves that app type's stored configuration exactly as it was.
+        if let Some(kernel_gateway_image_config) = input.kernel_gateway_image_config {
+            config.kernel_gateway_image_config = Some(kernel_gateway_image_config);
+        }
+        if let Some(jupyter_lab_app_image_config) = input.jupyter_lab_app_image_config {
+            config.jupyter_lab_app_image_config = Some(jupyter_lab_app_image_config);
+        }
+        if let Some(code_editor_app_image_config) = input.code_editor_app_image_config {
+            config.code_editor_app_image_config = Some(code_editor_app_image_config);
+        }
+        // This call is a mutation, so `LastModifiedTime` moves to now even when the request
+        // carried no member that changed a value.
+        config.last_modified_time = ::std::time::SystemTime::now();
+        let arn = config.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(UpdateAppImageConfigOutput {
+            app_image_config_arn: Some(arn),
+        })
     }
 }

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTrialComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTrialComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the members the request carries to the trial component stored in
+//! `crate::state` — the display name, the status, the start and end instants, and the
+//! three keyed collections the request upserts into and prunes — moves its
+//! `LastModifiedTime`/`LastModifiedBy`, and refuses a `TrialComponentName` nothing is
+//! stored under with the modelled `ResourceNotFound`. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTrialComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The modelled `ConflictException` is UNREACHABLE here by design, not by omission: it
+//! reports a conflict in modifying a SageMaker entity, and nothing this emulator stores
+//! makes a component non-modifiable (no job-produced components are minted), while
+//! `DisplayName` is documented not to need to be unique and a key named by both a
+//! collection and its removal list is simply removed — so no request this operation takes
+//! carries a conflict to arbitrate. An operation whose model declares an error it never
+//! raises is correct; the variant stays on the generated enum for when such a component
+//! exists.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +154,74 @@ impl<Eng> UpdateTrialComponent<Eng> {
     }
 }
 
+/// The most entries one of a component's ARTIFACT maps (`InputArtifacts`,
+/// `OutputArtifacts`) holds, and the most its `Parameters` map holds: the maxima the model
+/// puts on the members this operation writes them through
+/// (`smithy_query(query="operation",operation="UpdateTrialComponent")`: `InputArtifacts`
+/// len 0..60, `Parameters` len 0..300).
+///
+/// The modelled bound is checked at the request boundary, which bounds ONE request's map
+/// rather than the stored one — and this operation upserts into the stored map, so without
+/// the same bound on the RESULT a caller updating in a loop could grow one component's
+/// record without end. An update whose result would pass the maximum is refused and
+/// nothing is stored.
+const MAX_ARTIFACTS: usize = 60;
+
+/// See [`MAX_ARTIFACTS`]: the same bound for the `Parameters` map.
+const MAX_PARAMETERS: usize = 300;
+
+/// Apply one of a component's keyed collections: the entries the request supplies are
+/// upserted into the stored map, and the keys its removal list names are then dropped.
+///
+/// `InputArtifacts` is documented to "replace all of the component's input artifacts with
+/// the specified artifacts OR add new input artifacts. Existing input artifacts are
+/// replaced if the trial component is updated with an identical input artifact key"
+/// (`smithy_query(query="doc",shape="UpdateTrialComponentRequest",member="InputArtifacts"`),
+/// and `Parameters` / `OutputArtifacts` word the same rule for their own maps: an entry the
+/// request names replaces the stored one under that key and every other stored entry stays
+/// — which is what the `*ToRemove` lists exist to drop. A key named by both the map and the
+/// removal list ends up removed, so there is no order to guess at.
+///
+/// Shared by the three collections so none of them can drift into different semantics.
+fn apply_entries<V>(
+    stored: &mut ::std::collections::HashMap<String, V>,
+    supplied: Option<::std::collections::HashMap<String, V>>,
+    to_remove: Option<Vec<String>>,
+) {
+    if let Some(supplied) = supplied {
+        stored.extend(supplied);
+    }
+    if let Some(to_remove) = to_remove {
+        for key in to_remove {
+            stored.remove(&key);
+        }
+    }
+}
+
+/// How many entries a stored collection would hold once `supplied` is upserted into it,
+/// i.e. the count [`MAX_ARTIFACTS`] / [`MAX_PARAMETERS`] bounds.
+///
+/// An entry whose key the collection already holds REPLACES that one rather than adding to
+/// it, so it does not count again — a request that rewrites every entry a full collection
+/// holds leaves it exactly as full. The removal list is not counted against the result
+/// either: a request may not use one to make room for entries past the bound, because the
+/// bound is on what the component ends up holding and removal only lowers it.
+fn merged_len<V>(
+    stored: &::std::collections::HashMap<String, V>,
+    supplied: Option<&::std::collections::HashMap<String, V>>,
+) -> usize {
+    match supplied {
+        None => stored.len(),
+        Some(supplied) => {
+            stored.len()
+                + supplied
+                    .keys()
+                    .filter(|key| !stored.contains_key(*key))
+                    .count()
+        }
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for UpdateTrialComponent<Eng>
 {
@@ -165,18 +239,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTrialComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTrialComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTrialComponent"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // The identity behind this call, read before the store is borrowed.
+        let last_modified_by = crate::state::caller_user_context(ctx);
+        // `TrialComponentName` is not case-sensitive, so the record is reached through the
+        // same folded key the create stored it under and every reader resolves it by.
+        let key = crate::state::entity_key(&input.trial_component_name);
+
+        let mut store = state.lock();
+        let Some(component) = store.trial_components.get_mut(&key) else {
+            // An update of a component that was never created, or that has been deleted,
+            // is refused and creates nothing as a side effect: `CreateTrialComponent` is
+            // the only call that mints one. One wording of one fact, as every operation
+            // that cannot resolve a component states it.
+            return Err(UpdateTrialComponentErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::trial_component_does_not_exist(
+                    &crate::state::request_region(ctx),
+                    &input.trial_component_name,
+                )),
+            })
+            .into());
+        };
+
+        // Every collection is bounded BEFORE anything is written, so a request that passes
+        // one bound stores none of its members rather than a part of them.
+        for (member, maximum, resulting) in [
+            (
+                "Parameters",
+                MAX_PARAMETERS,
+                merged_len(&component.parameters, input.parameters.as_ref()),
+            ),
+            (
+                "InputArtifacts",
+                MAX_ARTIFACTS,
+                merged_len(&component.input_artifacts, input.input_artifacts.as_ref()),
+            ),
+            (
+                "OutputArtifacts",
+                MAX_ARTIFACTS,
+                merged_len(&component.output_artifacts, input.output_artifacts.as_ref()),
+            ),
+        ] {
+            if resulting > maximum {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "The trial component cannot hold more than {maximum} {member} entries; \
+                     the update would leave it with {resulting}."
+                )));
+            }
+        }
+
+        // Only the members the request CARRIES are applied: an absent member leaves the
+        // stored value exactly as it was, which is how a caller updates one member without
+        // restating the others.
+        if let Some(display_name) = input.display_name {
+            component.display_name = display_name;
+        }
+        // "The NEW status of the component": a supplied status replaces the stored one
+        // whole, both of its members with it, rather than being merged into it.
+        if let Some(status) = input.status {
+            component.status = Some(status);
+        }
+        if let Some(start_time) = input.start_time {
+            component.start_time = Some(start_time);
+        }
+        if let Some(end_time) = input.end_time {
+            component.end_time = Some(end_time);
+        }
+        apply_entries(
+            &mut component.parameters,
+            input.parameters,
+            input.parameters_to_remove,
+        );
+        apply_entries(
+            &mut component.input_artifacts,
+            input.input_artifacts,
+            input.input_artifacts_to_remove,
+        );
+        apply_entries(
+            &mut component.output_artifacts,
+            input.output_artifacts,
+            input.output_artifacts_to_remove,
+        );
+        // This call is a mutation, so `LastModifiedTime` moves to now and `LastModifiedBy`
+        // becomes the identity behind this call, even when the request carried no member
+        // that changed a value.
+        component.last_modified_time = ::std::time::SystemTime::now();
+        component.last_modified_by = last_modified_by;
+        let arn = component.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(UpdateTrialComponentOutput {
+            trial_component_arn: Some(arn),
+        })
     }
 }

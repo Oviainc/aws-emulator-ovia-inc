@@ -316,12 +316,12 @@ async fn describe_action_replays_exactly_what_create_action_stored() {
         );
 
         // Every member the request carried comes back byte-for-byte; every member it
-        // did not carry is ABSENT, never defaulted.
+        // did not carry is ABSENT, never defaulted — except `Properties`, the map the
+        // action HOLDS, which an action created with none reports as the empty map.
         for member in [
             "ActionType",
             "Description",
             "Status",
-            "Properties",
             "MetadataProperties",
             "Source",
         ] {
@@ -333,6 +333,11 @@ async fn describe_action_replays_exactly_what_create_action_stored() {
                  sent {sent:?}, got {read:?}"
             );
         }
+        assert_eq!(
+            described.get("Properties"),
+            Some(&body.get("Properties").cloned().unwrap_or_else(|| json!({}))),
+            "case {case}: Properties must be the map the action holds, got {described:?}"
+        );
 
         // `Tags` is not a member of `DescribeActionResponse` (smithy_query
         // operation=DescribeAction), so the reader never reports it.

@@ -149,14 +149,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(config) = store.app_image_configs.get(&input.app_image_config_name) else {
             // Never a 200 with empty fields: a caller cannot tell that from a
             // configuration that exists and carries nothing. `ResourceNotFound` is what
-            // this operation models for a name no configuration is stored under.
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                "app-image-config",
-                &input.app_image_config_name,
-            );
+            // this operation models for a name no configuration is stored under, worded by
+            // the one sentence this family refuses a missing configuration with.
             return Err(DescribeAppImageConfigErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Could not find AppImageConfig \"{arn}\".")),
+                message: Some(crate::state::app_image_config_not_found(
+                    &crate::state::request_region(ctx),
+                    &input.app_image_config_name,
+                )),
             })
             .into());
         };

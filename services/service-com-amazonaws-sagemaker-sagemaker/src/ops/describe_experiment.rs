@@ -180,9 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The identity the create was signed with, as it was stored then.
             created_by: Some(experiment.created_by.clone()),
             last_modified_time: Some(crate::state::timestamp(experiment.last_modified_time)),
-            // The creation IS the last modification until something updates the
-            // experiment, so the same identity made both.
-            last_modified_by: Some(experiment.created_by.clone()),
+            // Who last modified the experiment: the creating identity until a call has,
+            // and the identity behind that call once `UpdateExperiment` records it.
+            last_modified_by: Some(experiment.last_modified_by.clone()),
         })
     }
 }

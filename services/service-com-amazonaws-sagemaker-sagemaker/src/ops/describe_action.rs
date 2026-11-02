@@ -185,14 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             action_type: Some(action.action_type.clone()),
             description: action.description.clone(),
             status: action.status.clone(),
-            // Replayed as stored: absent when the create omitted the member, and the
-            // empty map when the create sent one.
-            properties: action.properties.as_ref().map(|properties| {
-                properties
+            // The map the action holds, reported whatever is in it: the empty map for an
+            // action nothing has put a property on.
+            properties: Some(
+                action
+                    .properties
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+                    .collect(),
+            ),
             creation_time: Some(crate::state::timestamp(action.creation_time)),
             last_modified_time: Some(crate::state::timestamp(action.last_modified_time)),
             metadata_properties: action.metadata_properties.clone(),

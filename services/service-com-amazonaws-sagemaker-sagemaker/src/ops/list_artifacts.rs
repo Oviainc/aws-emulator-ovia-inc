@@ -278,8 +278,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|artifact| ArtifactSummary {
                         artifact_arn: Some(artifact.arn.clone()),
                         artifact_name: artifact.name.clone(),
-                        // Replayed as stored, so an absent `SourceTypes` stays absent and
-                        // an empty one stays empty.
+                        // The source as the artifact holds it, `SourceTypes` included: the
+                        // empty list for an artifact whose create named none.
                         source: Some(artifact.source.clone()),
                         artifact_type: Some(artifact.artifact_type.clone()),
                         creation_time: Some(crate::state::timestamp(artifact.creation_time)),

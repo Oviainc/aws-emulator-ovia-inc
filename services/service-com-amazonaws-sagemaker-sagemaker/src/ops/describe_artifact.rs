@@ -170,14 +170,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             artifact_arn: Some(artifact.arn.clone()),
             source: Some(artifact.source.clone()),
             artifact_type: Some(artifact.artifact_type.clone()),
-            // Replayed as stored: absent when the create omitted the member, and the
-            // empty map when the create sent one.
-            properties: artifact.properties.as_ref().map(|properties| {
-                properties
+            // The map the artifact holds, reported whatever is in it: the empty map for an
+            // artifact nothing has put a property on.
+            properties: Some(
+                artifact
+                    .properties
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+                    .collect(),
+            ),
             creation_time: Some(crate::state::timestamp(artifact.creation_time)),
             // The emulator models neither a Studio user profile nor the IAM identity
             // details SageMaker fills in for model packages and projects only, so the

@@ -148,6 +148,21 @@ fn source_uri_of_len(len: usize) -> String {
     format!("{head}{}", "a".repeat(len - head.len()))
 }
 
+/// `Source` as a reader reports it for an artifact created with `body`: the source the
+/// create sent, with `SourceTypes` as the LIST the artifact holds — the empty list when the
+/// create named none, because the member reports what the artifact holds rather than what
+/// the request mentioned.
+fn reported_source(body: &Value) -> Value {
+    let mut source = body
+        .get("Source")
+        .cloned()
+        .expect("every create in this table carries the required Source");
+    if source.get("SourceTypes").is_none() {
+        source["SourceTypes"] = json!([]);
+    }
+    source
+}
+
 /// RULE: an `ArtifactArn` is `arn:aws:sagemaker:<signed region>:<account>:artifact/<id>`,
 /// the form the modelled `ArtifactArn` pattern
 /// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:artifact/`) admits.
@@ -281,7 +296,7 @@ async fn deleting_by_arn_answers_that_arn_and_removes_only_that_artifact() {
             .await;
         assert_eq!(
             described.get("Source"),
-            body.get("Source"),
+            Some(&reported_source(body)),
             "case {case:?}: the created artifact must be readable before the delete, \
              got {described:?}"
         );

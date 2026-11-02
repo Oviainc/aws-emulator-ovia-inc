@@ -136,6 +136,28 @@ fn str_field(body: &Value, member: &str) -> String {
         .to_string()
 }
 
+/// `Source` as a reader reports it for an artifact created with `body`: the source the
+/// create sent, with `SourceTypes` as the LIST the artifact holds — the empty list when
+/// the create named none, because the member reports what the artifact holds rather than
+/// what the request mentioned.
+fn reported_source(body: &Value) -> Value {
+    let mut source = body
+        .get("Source")
+        .cloned()
+        .expect("every create in this table carries the required Source");
+    if source.get("SourceTypes").is_none() {
+        source["SourceTypes"] = json!([]);
+    }
+    source
+}
+
+/// `Properties` as a reader reports it for an artifact created with `body`: the map the
+/// create sent, or the EMPTY map when it sent none — the same rule as
+/// [`reported_source`]'s `SourceTypes`.
+fn reported_properties(body: &Value) -> Value {
+    body.get("Properties").cloned().unwrap_or_else(|| json!({}))
+}
+
 /// RULE: an `ArtifactArn` is `arn:aws:sagemaker:<signed region>:<account>:artifact/<id>`,
 /// where `<id>` is 32 lowercase hex digits the server mints fresh for every create.
 ///
@@ -382,15 +404,26 @@ async fn describe_artifact_replays_exactly_what_create_artifact_stored() {
             "case {case:?}: DescribeArtifact must replay the ARN CreateArtifact minted, \
              got {described:?}"
         );
-        // Every member the output shape carries over from the input, compared as sent:
-        // an absent member stays absent and an empty one stays empty.
-        for member in ["ArtifactName", "Source", "ArtifactType", "Properties"] {
+        // Every member the output shape carries over from the input: the name and the type
+        // as sent, and the two collections the artifact OWNS as the artifact holds them —
+        // the empty one where the create named none.
+        for member in ["ArtifactName", "ArtifactType"] {
             assert_eq!(
                 described.get(member),
                 body.get(member),
                 "case {case:?}: {member} must round-trip exactly, got {described:?}"
             );
         }
+        assert_eq!(
+            described.get("Source"),
+            Some(&reported_source(body)),
+            "case {case:?}: Source, got {described:?}"
+        );
+        assert_eq!(
+            described.get("Properties"),
+            Some(&reported_properties(body)),
+            "case {case:?}: Properties, got {described:?}"
+        );
         assert_eq!(
             described.get("MetadataProperties"),
             body.get("MetadataProperties"),

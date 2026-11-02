@@ -226,13 +226,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status: input.status,
                 start_time: input.start_time,
                 end_time: input.end_time,
-                parameters: input.parameters,
-                input_artifacts: input.input_artifacts,
-                output_artifacts: input.output_artifacts,
+                // The collections the component holds, which are the empty ones when the
+                // request named none: each member is how the component reports what it
+                // holds, not what the request mentioned.
+                parameters: input.parameters.unwrap_or_default(),
+                input_artifacts: input.input_artifacts.unwrap_or_default(),
+                output_artifacts: input.output_artifacts.unwrap_or_default(),
                 metadata_properties: input.metadata_properties,
                 // The identity the request signed with, recorded once here so every later
-                // read reports who actually created the component.
+                // read reports who actually created the component. The creation IS the
+                // last modification until `UpdateTrialComponent` records its own caller,
+                // so both identities start out as this one.
                 created_by: crate::state::caller_user_context(ctx),
+                last_modified_by: crate::state::caller_user_context(ctx),
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 // Nothing has modified the component yet, so it was last modified when

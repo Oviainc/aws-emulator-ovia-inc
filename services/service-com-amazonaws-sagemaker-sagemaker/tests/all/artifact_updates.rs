@@ -178,8 +178,9 @@ struct Applied {
     update: Value,
     /// The name the artifact answers to after the update.
     expected_name: String,
-    /// `Properties` as a read must report it: `None` for the absent member.
-    expected_properties: Option<Value>,
+    /// `Properties` as a read must report it — the map the artifact HOLDS, so the empty
+    /// map where it holds nothing.
+    expected_properties: Value,
 }
 
 #[tokio::test]
@@ -197,77 +198,77 @@ async fn update_artifact_applies_the_members_the_request_carries_and_leaves_the_
             created_properties: Some(json!({ "stage": "raw" })),
             update: json!({ "ArtifactName": "renamed-artifact" }),
             expected_name: "renamed-artifact".to_string(),
-            expected_properties: Some(json!({ "stage": "raw" })),
+            expected_properties: json!({ "stage": "raw" }),
         },
         Applied {
             case: "rename-to-the-published-maximum-length",
             created_properties: None,
             update: json!({ "ArtifactName": long_name.clone() }),
             expected_name: long_name.clone(),
-            expected_properties: None,
+            expected_properties: json!({}),
         },
         Applied {
             case: "properties-overwrite-rather-than-merge",
             created_properties: Some(json!({ "stage": "raw", "keep": "yes" })),
             update: json!({ "Properties": { "stage": "curated" } }),
             expected_name: "properties-overwrite-rather-than-merge".to_string(),
-            expected_properties: Some(json!({ "stage": "curated" })),
+            expected_properties: json!({ "stage": "curated" }),
         },
         Applied {
             case: "properties-to-remove-prunes-a-subset",
             created_properties: Some(json!({ "a": "1", "b": "2", "c": "3" })),
             update: json!({ "PropertiesToRemove": ["b"] }),
             expected_name: "properties-to-remove-prunes-a-subset".to_string(),
-            expected_properties: Some(json!({ "a": "1", "c": "3" })),
+            expected_properties: json!({ "a": "1", "c": "3" }),
         },
         Applied {
             case: "properties-to-remove-applies-to-the-new-map",
             created_properties: Some(json!({ "a": "1" })),
             update: json!({ "Properties": { "x": "9", "y": "8" }, "PropertiesToRemove": ["x"] }),
             expected_name: "properties-to-remove-applies-to-the-new-map".to_string(),
-            expected_properties: Some(json!({ "y": "8" })),
+            expected_properties: json!({ "y": "8" }),
         },
         Applied {
             case: "properties-to-remove-of-a-key-not-present",
             created_properties: Some(json!({ "a": "1" })),
             update: json!({ "PropertiesToRemove": ["absent", "also-absent"] }),
             expected_name: "properties-to-remove-of-a-key-not-present".to_string(),
-            expected_properties: Some(json!({ "a": "1" })),
+            expected_properties: json!({ "a": "1" }),
         },
         Applied {
-            case: "properties-to-remove-against-an-absent-map",
+            case: "properties-to-remove-against-an-artifact-holding-none",
             created_properties: None,
             update: json!({ "PropertiesToRemove": ["a"] }),
-            expected_name: "properties-to-remove-against-an-absent-map".to_string(),
-            expected_properties: None,
+            expected_name: "properties-to-remove-against-an-artifact-holding-none".to_string(),
+            expected_properties: json!({}),
         },
         Applied {
             case: "properties-replaced-by-the-empty-map",
             created_properties: Some(json!({ "a": "1" })),
             update: json!({ "Properties": {} }),
             expected_name: "properties-replaced-by-the-empty-map".to_string(),
-            expected_properties: Some(json!({})),
+            expected_properties: json!({}),
         },
         Applied {
             case: "properties-at-the-modelled-maximum-entry-count",
             created_properties: Some(json!({ "a": "1" })),
             update: json!({ "Properties": properties_of(30) }),
             expected_name: "properties-at-the-modelled-maximum-entry-count".to_string(),
-            expected_properties: Some(properties_of(30)),
+            expected_properties: properties_of(30),
         },
         Applied {
             case: "name-and-properties-together",
             created_properties: Some(json!({ "a": "1" })),
             update: json!({ "ArtifactName": "renamed-and-repropertied", "Properties": { "b": "2" } }),
             expected_name: "renamed-and-repropertied".to_string(),
-            expected_properties: Some(json!({ "b": "2" })),
+            expected_properties: json!({ "b": "2" }),
         },
         Applied {
             case: "no-member-beyond-the-arn",
             created_properties: Some(json!({ "a": "1" })),
             update: json!({}),
             expected_name: "no-member-beyond-the-arn".to_string(),
-            expected_properties: Some(json!({ "a": "1" })),
+            expected_properties: json!({ "a": "1" }),
         },
     ];
 
@@ -315,14 +316,17 @@ async fn update_artifact_applies_the_members_the_request_carries_and_leaves_the_
         );
         assert_eq!(
             described.get("Properties"),
-            row.expected_properties.as_ref(),
+            Some(&row.expected_properties),
             "case {case:?}: Properties after the update, got {described:?}"
         );
-        // Nothing the update did not name moves: the source, the type and the creation
-        // instant are the create's.
+        // Nothing the update did not name moves: the source — with the `SourceTypes` the
+        // artifact holds — the type and the creation instant are the create's.
         assert_eq!(
             described.get("Source"),
-            Some(&json!({ "SourceUri": format!("s3://bucket/{case}.csv") })),
+            Some(&json!({
+                "SourceUri": format!("s3://bucket/{case}.csv"),
+                "SourceTypes": [],
+            })),
             "case {case:?}: Source is the create's, got {described:?}"
         );
         assert_eq!(

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateExperiment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateExperiment`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: applies the members the request carries to the experiment stored in
+//! `crate::state`, moves its `LastModifiedTime`/`LastModifiedBy`, and refuses an
+//! `ExperimentName` nothing is stored under with the modelled `ResourceNotFound`. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateExperiment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The modelled `ConflictException` is UNREACHABLE here by design, not by omission: it
+//! reports a conflict in modifying a SageMaker entity, and nothing this emulator stores
+//! makes an experiment non-modifiable (no managed or service-owned experiments are
+//! minted), while `DisplayName` is documented not to need to be unique — so no request
+//! this operation takes carries a conflict to arbitrate. An operation whose model declares
+//! an error it never raises is correct; the variant stays on the generated enum for when
+//! such an experiment exists.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +150,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateExperiment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateExperimentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateExperiment"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // The identity behind this call, read before the store is borrowed.
+        let last_modified_by = crate::state::caller_user_context(ctx);
+        // `ExperimentName` is not case-sensitive, so the record is reached through the
+        // same folded key the create stored it under and every reader resolves it by.
+        let key = crate::state::entity_key(&input.experiment_name);
+
+        let mut store = state.lock();
+        let Some(experiment) = store.experiments.get_mut(&key) else {
+            // An update of an experiment that was never created, or that has been deleted,
+            // is refused and creates nothing as a side effect: `CreateExperiment` is the
+            // only call that mints one. One wording of one fact, as every operation that
+            // cannot resolve an experiment states it.
+            return Err(UpdateExperimentErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::experiment_does_not_exist(
+                    &crate::state::request_region(ctx),
+                    &input.experiment_name,
+                )),
+            })
+            .into());
+        };
+
+        // Only the members the request CARRIES are applied: an absent member leaves the
+        // stored value exactly as it was, which is how a caller updates one member without
+        // restating the other.
+        if let Some(display_name) = input.display_name {
+            experiment.display_name = display_name;
+        }
+        // `ExperimentDescription` is modelled `len 0..3072`, so the empty string is a value
+        // a caller may set and is stored as sent rather than read as "no description".
+        if let Some(description) = input.description {
+            experiment.description = Some(description);
+        }
+        // This call is a mutation, so `LastModifiedTime` moves to now and `LastModifiedBy`
+        // becomes the identity behind this call, even when the request carried no member
+        // that changed a value.
+        experiment.last_modified_time = ::std::time::SystemTime::now();
+        experiment.last_modified_by = last_modified_by;
+        let arn = experiment.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(UpdateExperimentOutput {
+            experiment_arn: Some(arn),
+        })
     }
 }

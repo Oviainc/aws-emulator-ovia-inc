@@ -219,6 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 metadata_properties: input.metadata_properties,
                 tags: input.tags.unwrap_or_default(),
                 created_by: crate::state::caller_user_context(ctx),
+                // The creation IS the last modification until `UpdateTrial` records its
+                // own caller, so both identities start out as this one.
+                last_modified_by: crate::state::caller_user_context(ctx),
                 creation_time: now,
                 last_modified_time: now,
             },

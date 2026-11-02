@@ -106,15 +106,15 @@ async fn create_trial_component_mints_the_modelled_arn_for_every_name_and_region
 
 /// Every member `DescribeTrialComponent` must replay unchanged from the create request.
 /// `Tags` is stored but is not part of the describe's modelled output, `DisplayName` has
-/// a documented default, and the two timestamps are compared numerically (the JSON
-/// encoder may render `1700000000.0` as an integer), so those are asserted separately.
-const ROUND_TRIPPED: [&str; 5] = [
-    "Status",
-    "Parameters",
-    "InputArtifacts",
-    "OutputArtifacts",
-    "MetadataProperties",
-];
+/// a documented default, the two timestamps are compared numerically (the JSON
+/// encoder may render `1700000000.0` as an integer), and the three collections the
+/// component OWNS are reported whatever the create carried (see [`HELD_COLLECTIONS`]), so
+/// those are asserted separately.
+const ROUND_TRIPPED: [&str; 2] = ["Status", "MetadataProperties"];
+
+/// The collections a trial component HOLDS: reported as the map the component holds, which
+/// is the EMPTY map for a component created without them rather than a missing member.
+const HELD_COLLECTIONS: [&str; 3] = ["Parameters", "InputArtifacts", "OutputArtifacts"];
 
 /// The create requests the round-trip rule is asserted over.
 ///
@@ -319,6 +319,14 @@ async fn describe_trial_component_replays_exactly_what_create_stored() {
                 "case {case}: {member} must round-trip, got {described:?}"
             );
         }
+        for member in HELD_COLLECTIONS {
+            assert_eq!(
+                described.get(member),
+                Some(&body.get(member).cloned().unwrap_or_else(|| json!({}))),
+                "case {case}: {member} must be the map the component holds, \
+                 got {described:?}"
+            );
+        }
 
         // A wire timestamp is a JSON number of epoch seconds, so an instant on a whole
         // second may come back as `1700000000` where the request said `1700000000.0`:
@@ -356,12 +364,19 @@ async fn describe_trial_component_replays_exactly_what_create_stored() {
         );
 
         // Nothing has produced a source job or a metric for a component created through
-        // this API, so the emulator reports none rather than inventing one.
-        for member in ["Source", "Sources", "Metrics"] {
-            assert!(
-                described.get(member).is_none(),
-                "case {case}: {member} must be absent for an API-created component, \
-                 got {described:?}"
+        // this API, so the emulator invents none: the single `Source` is absent, and the
+        // LISTS of sources and metrics are empty — the component holds no entry in either.
+        assert!(
+            described.get("Source").is_none(),
+            "case {case}: Source must be absent for an API-created component, \
+             got {described:?}"
+        );
+        for member in ["Sources", "Metrics"] {
+            assert_eq!(
+                described.get(member),
+                Some(&json!([])),
+                "case {case}: {member} must be the empty list for an API-created \
+                 component, got {described:?}"
             );
         }
 
