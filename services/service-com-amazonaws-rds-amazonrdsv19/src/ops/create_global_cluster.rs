@@ -366,8 +366,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateGlobalClusterErrorModeled::GlobalClusterAlreadyExistsFault(
                     GlobalClusterAlreadyExistsFault {
-                        message: Some(format!(
-                            "Global cluster already exists: {identifier}"
+                        message: Some(crate::state::global_cluster_already_exists_message(
+                            &identifier,
                         )),
                     },
                 )

@@ -459,7 +459,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.db_instances.contains_key(&key) {
             return Err(CreateDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
                 DBInstanceAlreadyExistsFault {
-                    message: Some(format!("DB instance already exists: {identifier}")),
+                    message: Some(
+                        crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

@@ -561,7 +561,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(ModifyDBClusterErrorModeled::DBClusterAlreadyExistsFault(
                     DBClusterAlreadyExistsFault {
-                        message: Some(format!("DB cluster already exists: {renamed}")),
+                        message: Some(
+                            crate::state::DB_CLUSTER_ALREADY_EXISTS_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

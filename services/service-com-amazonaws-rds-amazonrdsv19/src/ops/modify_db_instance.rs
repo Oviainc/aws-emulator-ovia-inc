@@ -478,7 +478,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(ModifyDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
                     DBInstanceAlreadyExistsFault {
-                        message: Some(format!("DB instance already exists: {renamed}")),
+                        message: Some(
+                            crate::state::DB_INSTANCE_ALREADY_EXISTS_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

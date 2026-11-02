@@ -1015,10 +1015,18 @@ async fn delete_option_group_removes_it_and_refuses_the_absent_and_the_in_use() 
         400,
         "InvalidOptionGroupStateFault",
     );
+    // The refusal is worded from the REQUEST alone: it names the group the delete
+    // addressed, single-quoted, and says it is in use — it does not report WHICH instance
+    // holds it.
     let message = text(&body, "Message");
+    assert_eq!(
+        message,
+        "The option group 'emu-used-og' cannot be deleted because it is in use.",
+        "the refusal must carry the in-use sentence for the requested group, got {message:?}"
+    );
     assert!(
-        message.contains("emu-og-user"),
-        "the refusal must name the instance that is using the group, got {message:?}"
+        !message.contains("emu-og-user"),
+        "the refusal must not disclose the instance that is using the group, got {message:?}"
     );
     expect_ok(
         "the instance is deleted",

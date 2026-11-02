@@ -196,9 +196,16 @@ async fn a_group_a_db_instance_is_using_is_refused_with_the_state_fault_then_rel
         400,
         "InvalidOptionGroupStateFault",
     );
+    // The sentence is worded from the REQUEST alone — the group the delete addressed,
+    // single-quoted — and does not report which instance holds it.
+    let message = text(&refused, "Message");
+    assert_eq!(
+        message, "The option group 'emu-del-inuse' cannot be deleted because it is in use.",
+        "expected the in-use sentence for the requested group, got {message:?}"
+    );
     assert!(
-        text(&refused, "Message").contains("emu-del-inuse-instance"),
-        "expected the refusal to name the instance using the group, got {refused}"
+        !message.contains("emu-del-inuse-instance"),
+        "expected the refusal not to name the instance using the group, got {message:?}"
     );
     // The refused delete left the group exactly where it was.
     let described = expect_ok(

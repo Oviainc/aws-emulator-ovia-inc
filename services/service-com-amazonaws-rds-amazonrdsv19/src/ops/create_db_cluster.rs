@@ -900,7 +900,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.db_clusters.contains_key(&key) {
             return Err(CreateDBClusterErrorModeled::DBClusterAlreadyExistsFault(
                 DBClusterAlreadyExistsFault {
-                    message: Some(format!("DB Cluster already exists: {identifier}")),
+                    message: Some(crate::state::DB_CLUSTER_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());

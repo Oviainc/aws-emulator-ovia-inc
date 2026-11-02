@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_attributes.rs"]
 mod account_attributes;
+#[path = "all/already_exists_refusal_sentences.rs"]
+mod already_exists_refusal_sentences;
 #[path = "all/certificate_override.rs"]
 mod certificate_override;
 #[path = "all/cluster_parameter_groups.rs"]

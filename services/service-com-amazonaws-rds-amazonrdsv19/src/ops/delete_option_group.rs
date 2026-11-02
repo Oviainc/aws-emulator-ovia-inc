@@ -186,19 +186,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // "You can't delete an option group that is associated with a DB instance" —
         // the association is the instance record's own `OptionGroupName`, so the guard
-        // reads the store rather than trusting the caller.
-        if let Some(user) = store
+        // reads the store rather than trusting the caller. The instance that holds the
+        // group decides the refusal but is not named in it: the sentence RDS answers
+        // reports only the group the request asked to delete.
+        if store
             .instances_in(&region)
             .into_iter()
-            .find(|instance| instance.option_group_name.as_deref() == Some(name.as_str()))
+            .any(|instance| instance.option_group_name.as_deref() == Some(name.as_str()))
         {
-            let user = user.identifier.clone();
             return Err(DeleteOptionGroupErrorModeled::InvalidOptionGroupStateFault(
                 InvalidOptionGroupStateFault {
-                    message: Some(format!(
-                        "The option group {name} can't be deleted because it is in use by \
-                         DB instance {user}"
-                    )),
+                    message: Some(crate::state::option_group_in_use_message(&name)),
                 },
             )
             .into());

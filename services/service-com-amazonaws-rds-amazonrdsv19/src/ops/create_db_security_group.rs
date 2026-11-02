@@ -163,11 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_identifier("DBSecurityGroupName", &name, MAX_NAME_LEN)
             .map_err(CreateDBSecurityGroupError::invalid_parameter_value)?;
         if name == crate::state::DEFAULT_DB_SECURITY_GROUP {
-            return Err(CreateDBSecurityGroupError::invalid_parameter_value(format!(
-                "DBSecurityGroupName must not be {}: that name is reserved for the account's \
-                 own default DB security group",
-                crate::state::DEFAULT_DB_SECURITY_GROUP
-            )));
+            return Err(CreateDBSecurityGroupError::invalid_parameter_value(
+                crate::state::db_security_group_reserved_name_message(),
+            ));
         }
         // Nothing caller-sized reaches the store unchecked: the description is
         // length-bounded and the tag list is count- and length-bounded (see the
@@ -203,7 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateDBSecurityGroupErrorModeled::DBSecurityGroupAlreadyExistsFault(
                     DBSecurityGroupAlreadyExistsFault {
-                        message: Some(format!("DB Security Group already exists: {name}")),
+                        message: Some(crate::state::db_security_group_already_exists_message(
+                            &name,
+                        )),
                     },
                 )
                 .into(),

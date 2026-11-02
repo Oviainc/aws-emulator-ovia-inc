@@ -256,6 +256,20 @@ pub fn reboot_db_instance_state_message(identifier: &str, status: &str) -> Strin
 pub const MODIFY_DB_INSTANCE_INVALID_STATE_MESSAGE: &str =
     "Database instance is not in available state.";
 
+/// The sentence every `DBInstanceAlreadyExistsFault` of this service carries: the answer to
+/// a request that would put a second DB instance under an identifier the region already
+/// holds — the create that names a stored identifier, and the modification that renames an
+/// instance onto one.
+///
+/// It has NO variable part: Amazon RDS states only that the instance exists and
+/// interpolates neither the identifier the request carried nor the one it holds, so this is
+/// a constant rather than a `format!` over the request, and a caller matching the sentence
+/// reads exactly what the real service sends. It carries no terminal period.
+///
+/// It lives here rather than in one handler because the create and the rename answer the
+/// same one fault, so neither can drift from the other.
+pub const DB_INSTANCE_ALREADY_EXISTS_MESSAGE: &str = "DB instance already exists";
+
 /// The message `StopDBInstance` answers an `InvalidDBInstanceStateFault` with when the
 /// instance is not in the one state a stop is accepted from
 /// ([`DB_INSTANCE_STATUS_AVAILABLE`]).
@@ -3734,6 +3748,18 @@ impl EventSubscriptionRecord {
     }
 }
 
+/// The message the `InvalidOptionGroupStateFault` carries where an option group cannot be
+/// deleted because a DB instance is still associated with it ("You can't delete an option
+/// group that is associated with a DB instance").
+///
+/// Amazon RDS words it from the REQUEST alone: the group name the request asked to delete,
+/// SINGLE-QUOTED, in the one sentence that states the group is in use — not by whom. The
+/// instance holding the group is this service's state and the sentence does not report it,
+/// so nothing but the requested name is interpolated.
+pub fn option_group_in_use_message(name: &str) -> String {
+    format!("The option group '{name}' cannot be deleted because it is in use.")
+}
+
 /// A stored option group: everything `CreateOptionGroup` persists about one, plus the
 /// options `ModifyOptionGroup` has added to it.
 ///
@@ -4329,6 +4355,16 @@ pub fn db_cluster_not_found_colon_message(named: &str) -> String {
 pub const MODIFY_DB_CLUSTER_INVALID_STATE_MESSAGE: &str =
     "This cluster could not be modified. Please try again";
 
+/// The sentence every `DBClusterAlreadyExistsFault` of this service carries: the answer to
+/// a request that would put a second DB cluster under an identifier the region already
+/// holds — the create that names a stored identifier, and the modification that renames a
+/// cluster onto one.
+///
+/// Like its DB instance sibling ([`DB_INSTANCE_ALREADY_EXISTS_MESSAGE`]) it has NO variable
+/// part — Amazon RDS states only that the cluster exists — and it carries no terminal
+/// period. The capitalisation is the service's own.
+pub const DB_CLUSTER_ALREADY_EXISTS_MESSAGE: &str = "DB Cluster already exists";
+
 /// How many DB instances a DB cluster has to hold for a failover to be accepted.
 ///
 /// A failover moves the writer role from one member of the cluster to another, so there has
@@ -4544,6 +4580,16 @@ pub fn db_security_group_not_found_colon_message(name: &str) -> String {
 /// drift from the other.
 pub const DEFAULT_DB_SECURITY_GROUP: &str = "default";
 
+/// The message the `InvalidParameterValue` refusal carries for a create that asks for the
+/// one name the service keeps for itself ([`DEFAULT_DB_SECURITY_GROUP`]).
+///
+/// Amazon RDS words it as a statement to the caller about what cannot be named, naming the
+/// reserved name unquoted and nothing of the request: the request's own spelling folds to
+/// that name, so there is nothing else to report.
+pub fn db_security_group_reserved_name_message() -> String {
+    format!("You cannot name a DB security group {DEFAULT_DB_SECURITY_GROUP}")
+}
+
 /// The message the `InvalidDBSecurityGroupStateFault` carries where a DB security group
 /// cannot be deleted because a DB instance is still a member of it ("The specified DB
 /// security group must not be associated with any DB instances").
@@ -4558,6 +4604,19 @@ pub fn db_security_group_in_use_message(name: &str, holder_identifier: &str) -> 
         "The DB security group {name} can't be deleted because it is in use by DB instance \
          {holder_identifier}"
     )
+}
+
+/// The message the `DBSecurityGroupAlreadyExistsFault` carries for `name`: the fault
+/// reports "A DB security group with the name specified in `DBSecurityGroupName` already
+/// exists".
+///
+/// Amazon RDS words it as a sentence about the group — "A security group named", the
+/// requested name unquoted, then "already exists" with no terminal period — so the name
+/// sits inside the sentence rather than after a colon. The name is the only variable part,
+/// in the folded spelling the group would be stored under, as that member documents
+/// ("stored as a lowercase string").
+pub fn db_security_group_already_exists_message(name: &str) -> String {
+    format!("A security group named {name} already exists")
 }
 
 /// The refusal this API version answers a request that would MODIFY the ingress rules of a
@@ -4645,6 +4704,16 @@ impl DbSecurityGroupRecord {
             db_security_group_arn: Some(self.arn()),
         }
     }
+}
+
+/// The message a `GlobalClusterAlreadyExistsFault` carries for `identifier`.
+///
+/// Amazon RDS words this one as a sentence ABOUT the global cluster the request named: the
+/// resource type, then the requested identifier unquoted, then "already exists" with no
+/// terminal period — so the identifier sits INSIDE the sentence rather than after a colon.
+/// The identifier is the only variable part, and it is the one the request carried.
+pub fn global_cluster_already_exists_message(identifier: &str) -> String {
+    format!("Global cluster {identifier} already exists")
 }
 
 /// A stored Aurora global database cluster: the record `DescribeGlobalClusters` reports.
