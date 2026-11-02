@@ -159,9 +159,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let _ = ctx;
 
+        // "Deregisters the specified task definition by family and revision. ... You must
+        // specify a revision." The revision is what this call ACTS ON, so a
+        // `taskDefinition` that spells no revision at all misses the member's own
+        // constraint: the specified parameter isn't valid, stated in the fixed sentence
+        // that names what is missing. It is decided from the value's SHAPE, ahead of
+        // reading it as a family and a revision, so it is the refusal whatever ELSE is
+        // wrong with the value — a bare family, `family:*`, an ARN carrying no revision
+        // and a value that is no reference at all all miss the same thing. The
+        // family-charset refusal below belongs to the references this service reads a
+        // family out of, which is what the operations resolving "the latest ACTIVE
+        // revision" of one do.
+        if !crate::state::names_task_definition_revision(&input.task_definition) {
+            return Err(
+                DeregisterTaskDefinitionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::TASK_DEFINITION_REVISION_MISSING_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let Some((family, revision)) =
             crate::state::parse_task_definition_reference(&input.task_definition)
         else {
+            // The value DOES spell a revision number, so what is left wrong with it is
+            // the reference: a family part outside the character set a family name is
+            // spelled in, or a number outside the positive range a revision counter
+            // takes. That is the one condition every operation resolving a
+            // `taskDefinition` reference reports with the same fixed sentence.
             return Err(DeregisterTaskDefinitionErrorModeled::ClientException(
                 ClientException {
                     message: Some(crate::state::TASK_DEFINITION_REFERENCE_MESSAGE.to_string()),
@@ -170,23 +199,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "Deregisters the specified task definition by family and revision. ... You
-        // must specify a revision." A reference that names only a family (or `family:*`)
-        // names a whole family, not the ONE revision this call deregisters, so it is
-        // refused for the member constraint it misses rather than resolved to the latest
-        // revision. Like every other refusal of a `taskDefinition` reference this
-        // service cannot turn into one stored revision, it is a `ClientException` — the
-        // error for a request "specifying an identifier that isn't valid" — and the
-        // message names the member and what it has to carry.
+        // A reference that parses to a family and NO revision names a whole family rather
+        // than the one revision this call deregisters — the same thing missing as above,
+        // so the same refusal, reached through the parser instead of the shape.
         let Some(revision) = revision else {
-            return Err(DeregisterTaskDefinitionErrorModeled::ClientException(
-                ClientException {
-                    message: Some(crate::state::task_definition_revision_required_message(
-                        &input.task_definition,
-                    )),
-                },
-            )
-            .into());
+            return Err(
+                DeregisterTaskDefinitionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::TASK_DEFINITION_REVISION_MISSING_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
         };
 
         let mut guard = state.lock();

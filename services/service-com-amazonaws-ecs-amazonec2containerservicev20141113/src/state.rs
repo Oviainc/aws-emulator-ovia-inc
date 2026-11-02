@@ -2129,12 +2129,13 @@ pub fn daemon_task_definition_family_violation(reference: &str) -> Option<&'stat
     }
 }
 
-/// `ClientException$message` for a `taskDefinition` that names a whole FAMILY where the
-/// call needs the ONE revision it acts on — the `DeregisterTaskDefinition` doc: "You must
-/// specify a revision."
-pub fn task_definition_revision_required_message(reference: &str) -> String {
-    revision_required_message("taskDefinition", TASK_DEFINITION_RESOURCE_TYPE, reference)
-}
+/// `InvalidParameterException$message` for a `taskDefinition` that names no revision
+/// where the call acts on ONE revision — the `DeregisterTaskDefinition$taskDefinition`
+/// doc: "You must specify a revision."
+///
+/// FIXED text, carrying nothing of the request: what the value misses is the revision,
+/// whatever it spelled instead.
+pub const TASK_DEFINITION_REVISION_MISSING_MESSAGE: &str = "Revision is missing";
 
 /// `ClientException$message` for a `daemonTaskDefinition` that names a whole FAMILY where
 /// the call needs the ONE revision it acts on — the `DeleteDaemonTaskDefinition$daemonTaskDefinition`
@@ -9199,6 +9200,39 @@ pub fn container_instance_arn_from_reference(
     }
 }
 
+/// The container-instance ARN an instance that is registered in NO cluster is named by:
+/// the id alone under the resource type
+/// (`arn:aws:ecs:<region>:<account>:container-instance/<id>`), with no cluster segment in
+/// the resource part.
+///
+/// The cluster segment of [`container_instance_arn`] names the cluster an instance is
+/// REGISTERED IN, which only a stored instance has, so an answer about an instance this
+/// service holds none of names it by its id alone.
+pub fn unqualified_container_instance_arn(region: &str, instance_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{CONTAINER_INSTANCE_RESOURCE_TYPE}/{instance_id}"),
+    )
+}
+
+/// The `MISSING` `Failure` a container-instance STATE CHANGE reports for an entry that
+/// resolves to no instance it can move: the id the entry named
+/// ([`container_instance_id_from_reference`], whichever of the member's two forms the
+/// entry took) under [`unqualified_container_instance_arn`].
+///
+/// A state change answers about an instance it did not move, so the entry names that
+/// instance alone and never the cluster the request looked for it in — which is also what
+/// lets a caller draining instances in batches correlate the entry back to the id it
+/// submitted however it spelled it. Distinct from [`unresolved_failure`], which is what a
+/// batch READ echoes: there the identifier is reported exactly as the caller sent it.
+pub fn unresolved_container_instance_state_failure(region: &str, reference: &str) -> Failure {
+    missing_failure(&unqualified_container_instance_arn(
+        region,
+        container_instance_id_from_reference(reference),
+    ))
+}
+
 /// The deployment configuration a service stores: what the request supplied, with the
 /// documented defaults materialised for the members a response always carries.
 ///
@@ -10477,6 +10511,21 @@ pub fn parse_task_definition_reference(reference: &str) -> Option<(String, Optio
 /// [`parse_task_definition_reference`] reads, under this resource's own ARN type.
 pub fn parse_daemon_task_definition_reference(reference: &str) -> Option<(String, Option<i32>)> {
     parse_revision_reference(reference, DAEMON_TASK_DEFINITION_RESOURCE_TYPE)
+}
+
+/// Whether a `taskDefinition` reference SPELLS a revision at all: the `family:revision`
+/// form and the ARN of one carry a revision number beside the family, while a value that
+/// names a bare family, or `family:*` ("every revision" of one), or that is no reference
+/// to a task definition at all, carries none.
+///
+/// Answered from the value's SHAPE, before it is read as a family and a revision
+/// ([`parse_task_definition_reference`]), so an operation that acts on one revision sees
+/// a value miss the revision it requires however else that value is malformed.
+pub fn names_task_definition_revision(reference: &str) -> bool {
+    matches!(
+        split_revision_reference(reference, TASK_DEFINITION_RESOURCE_TYPE),
+        Some((_, Some(revision))) if revision.parse::<i32>().is_ok()
+    )
 }
 
 /// The `family` and optional `revision` a reference to a revision of `resource_type`

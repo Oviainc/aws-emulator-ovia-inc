@@ -932,12 +932,12 @@ async fn a_task_definition_identifier_that_names_no_family_is_refused_with_one_f
         "exclaim!",
         &ecs_arn(ACCOUNT, &format!("service/{CLUSTER}/web")),
     ];
-    // Every operation that resolves a `taskDefinition` reference states the same sentence.
-    let operations: [OperationRow; 4] = [
+    // Every operation that READS a family out of a `taskDefinition` reference states the
+    // same sentence. `DeregisterTaskDefinition` is not one of them: it acts on ONE
+    // revision, so a value that spells none misses the revision before its family part is
+    // looked at, which [`crate::task_definition_revision_requirement`] pins.
+    let operations: [OperationRow; 3] = [
         ("DescribeTaskDefinition", |reference| {
-            json!({ "taskDefinition": reference })
-        }),
-        ("DeregisterTaskDefinition", |reference| {
             json!({ "taskDefinition": reference })
         }),
         ("RunTask", |reference| {

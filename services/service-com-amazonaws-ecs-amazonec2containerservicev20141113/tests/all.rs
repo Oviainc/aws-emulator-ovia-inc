@@ -149,6 +149,8 @@ mod task_definition_projection;
 mod task_definition_reference_refusals;
 #[path = "all/task_definition_rendering.rs"]
 mod task_definition_rendering;
+#[path = "all/task_definition_revision_requirement.rs"]
+mod task_definition_revision_requirement;
 #[path = "all/task_lifecycle.rs"]
 mod task_lifecycle;
 #[path = "all/task_provisioning.rs"]
@@ -161,5 +163,7 @@ mod task_set_deletion;
 mod task_sets;
 #[path = "all/task_state_reports.rs"]
 mod task_state_reports;
+#[path = "all/update_container_instances_state_failures.rs"]
+mod update_container_instances_state_failures;
 #[path = "all/update_task_set_refusals.rs"]
 mod update_task_set_refusals;

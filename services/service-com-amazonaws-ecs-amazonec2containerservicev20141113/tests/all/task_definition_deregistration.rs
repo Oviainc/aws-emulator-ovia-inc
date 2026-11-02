@@ -334,15 +334,17 @@ async fn a_reference_that_names_no_single_revision_is_refused_and_persists_nothi
         register_revision(&router, family, slot, case).await;
     }
 
-    // The rows span the ways a `taskDefinition` can fail to name ONE stored revision.
-    // Every one of them is a `ClientException` — the error for a request "specifying an
-    // identifier that isn't valid", which is what every reference this service cannot
-    // turn into one stored revision is — and the rows differ in WHICH way they fail:
-    // `NAMES_NO_REVISION` names a whole family where "you must specify a revision", and
-    // `UNRESOLVABLE` is a reference that resolves to no stored revision at all, which is
-    // the condition `DescribeTaskDefinition` answers too, with the same sentence.
+    // The rows span the ways a `taskDefinition` can fail to name ONE stored revision, and
+    // differ in WHICH way they fail. `NAMES_NO_REVISION` spells no revision where "you
+    // must specify a revision", so the refusal is the `InvalidParameterException` naming
+    // the missing revision, in fixed text; `UNRESOLVABLE` names a revision that resolves
+    // to no stored one, which is the condition `DescribeTaskDefinition` answers too, with
+    // the same `ClientException` and the same sentence.
     const NAMES_NO_REVISION: &str = "names no revision";
     const UNRESOLVABLE: &str = "resolves to no stored revision";
+    /// The fixed sentence a reference that spells no revision earns, from
+    /// [`crate::task_definition_revision_requirement`].
+    const REVISION_MISSING: &str = "Revision is missing";
     let arn_without_revision =
         format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task-definition/{family}");
     let rows: [(&str, String, &str); 8] = [
@@ -376,11 +378,10 @@ async fn a_reference_that_names_no_single_revision_is_refused_and_persists_nothi
         (
             "not a task-definition reference at all",
             "not a reference".to_string(),
-            UNRESOLVABLE,
+            NAMES_NO_REVISION,
         ),
     ];
 
-    let mut no_revision_messages: Vec<(&str, String)> = Vec::new();
     for (case, reference, kind) in rows {
         let (code, message) = refusal(
             &router,
@@ -389,12 +390,12 @@ async fn a_reference_that_names_no_single_revision_is_refused_and_persists_nothi
             case,
         )
         .await;
-        assert_eq!(
-            code, "ClientException",
-            "case {case:?}: expected a ClientException for {reference:?}, got {code} \
-             with {message:?}"
-        );
         if kind == UNRESOLVABLE {
+            assert_eq!(
+                code, "ClientException",
+                "case {case:?}: expected a ClientException for {reference:?}, got {code} \
+                 with {message:?}"
+            );
             // ONE condition, so the reader of a revision and the deregistration of one
             // refuse it with the same sentence.
             let (describe_code, describe_message) = refusal(
@@ -412,26 +413,19 @@ async fn a_reference_that_names_no_single_revision_is_refused_and_persists_nothi
                  {describe_code}/{describe_message:?}"
             );
         } else {
-            // DERIVED from the request: the sentence names the member it is about and
-            // quotes the reference that missed its constraint, so a caller sees which
-            // value was rejected.
-            assert!(
-                message.contains("taskDefinition") && message.contains(&reference),
-                "case {case:?}: expected the refusal to name the member and quote \
-                 {reference:?}, got {message:?}"
+            assert_eq!(
+                code, "InvalidParameterException",
+                "case {case:?}: expected an InvalidParameterException for {reference:?}, \
+                 got {code} with {message:?}"
             );
-            no_revision_messages.push((case, message.replace(&reference, "<reference>")));
+            // FIXED text: what the value misses is the revision, whatever it spelled
+            // instead, so the sentence carries nothing of the request.
+            assert_eq!(
+                message, REVISION_MISSING,
+                "case {case:?}: expected {REVISION_MISSING:?} for {reference:?}, got \
+                 {message:?}"
+            );
         }
-    }
-    // The same condition, however the reference spells it: one sentence, differing only
-    // in the reference it quotes.
-    let (first_case, first_message) = no_revision_messages[0].clone();
-    for (case, message) in &no_revision_messages {
-        assert_eq!(
-            message, &first_message,
-            "case {case:?}: expected the same refusal as {first_case:?} \
-             ({first_message:?}), got {message:?}"
-        );
     }
 
     // A refusal deregisters nothing: both revisions are still ACTIVE.

@@ -320,17 +320,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Only an instance REGISTERED in this cluster is one this call can move: a
             // deregistered one "transitions to an INACTIVE status" and is out of the
             // cluster, so it is no instance of this cluster to update — reported in the
-            // `failures` channel under the identifier the request sent, exactly as an id
-            // naming nothing is.
+            // `failures` channel under the id the entry named, exactly as an id naming
+            // nothing is.
             let resolved = guard
                 .resolve_container_instance(&region, &cluster_name, reference)
                 .filter(|instance| instance.is_registered())
                 .map(|instance| instance.arn.clone());
             let Some(arn) = resolved else {
-                failures.push(crate::state::unresolved_failure(
-                    &region,
-                    crate::state::CONTAINER_INSTANCE_RESOURCE_TYPE,
-                    reference,
+                failures.push(crate::state::unresolved_container_instance_state_failure(
+                    &region, reference,
                 ));
                 continue;
             };
