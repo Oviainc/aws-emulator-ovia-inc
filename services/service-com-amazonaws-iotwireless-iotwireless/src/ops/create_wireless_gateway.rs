@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWirelessGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWirelessGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWirelessGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: provisions a wireless gateway in this service's store, minting its `Id`
+//! and ARN. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +158,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWirelessGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWirelessGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWirelessGateway"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWirelessGatewayError::from(
+                CreateWirelessGatewayErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // `Name`'s model doc excludes a fixed set of special characters, which no
+        // modelled trait carries, so it is checked here.
+        if let Some(name) = input.name.as_deref() {
+            if let Some(rejected) = crate::state::forbidden_name_char(name) {
+                return Err(CreateWirelessGatewayErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "Name must not contain any of {:?}, got {rejected:?} in {name:?}",
+                            crate::state::FORBIDDEN_NAME_CHARS
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let fingerprint = fingerprint(&input);
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is an `@idempotencyToken`: replaying it with the same
+        // parameters completes successfully and returns the id the first call minted;
+        // replaying it with different parameters is an HTTP 409.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(prior) = store.wireless_gateway_token(token) {
+                if prior.fingerprint != fingerprint {
+                    return Err(CreateWirelessGatewayErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(format!(
+                                "ClientRequestToken {token} was already used with different \
+                                 parameters"
+                            )),
+                            resource_id: Some(prior.resource_key.clone()),
+                            resource_type: Some("WirelessGateway".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                if let Some(existing) = store.wireless_gateways.get(&prior.resource_key) {
+                    return Ok(CreateWirelessGatewayOutput {
+                        arn: Some(existing.arn.clone()),
+                        id: Some(existing.id.clone()),
+                    });
+                }
+                // The gateway this token minted has since been deleted, so there is
+                // nothing to replay: fall through and create a new one.
+            }
+        }
+
+        // A `GatewayEui` identifies exactly one gateway on the network, and
+        // `GetWirelessGateway?identifierType=GatewayEui` resolves by it, so a second
+        // gateway claiming one already provisioned is the inconsistent state
+        // `ConflictException` names rather than a silent re-point of the existing
+        // identifier — which is the duplication this operation's doc describes.
+        let gateway_eui = input.lo_ra_wan.gateway_eui.clone();
+        if let Some(gateway_eui) = gateway_eui.as_deref() {
+            if let Some(owner) = store.gateway_eui_index.get(gateway_eui) {
+                return Err(CreateWirelessGatewayErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "GatewayEui {gateway_eui} is already registered to wireless \
+                             gateway {owner}"
+                        )),
+                        resource_id: Some(owner.clone()),
+                        resource_type: Some("WirelessGateway".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The store is bounded, so a create loop cannot grow the emulator's heap without
+        // bound: the gateway map by this ceiling, and the idempotency ledger a successful
+        // create also writes by `MAX_WIRELESS_GATEWAY_TOKENS` with oldest-entry eviction
+        // inside `record_wireless_gateway_token`. This operation models no quota error,
+        // so a full store is a `ValidationException` naming the ceiling it hit.
+        if store.wireless_gateways.len() >= crate::state::MAX_WIRELESS_GATEWAYS {
+            return Err(CreateWirelessGatewayErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "this emulator stores at most {} wireless gateways; delete one \
+                         before creating another",
+                        crate::state::MAX_WIRELESS_GATEWAYS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_wireless_gateway_id();
+        let gateway = crate::state::WirelessGateway {
+            arn: crate::state::wireless_gateway_arn(&region, &id),
+            id: id.clone(),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            lorawan: input.lo_ra_wan.clone(),
+            thing_name: None,
+            thing_arn: None,
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+        let output = CreateWirelessGatewayOutput {
+            arn: Some(gateway.arn.clone()),
+            id: Some(gateway.id.clone()),
+        };
+        store.wireless_gateways.insert(id.clone(), gateway);
+        if let Some(gateway_eui) = gateway_eui {
+            store.gateway_eui_index.insert(gateway_eui, id.clone());
+        }
+        if let Some(token) = input.client_request_token.clone() {
+            store.record_wireless_gateway_token(
+                token,
+                crate::state::IdempotentCreate {
+                    resource_key: id,
+                    fingerprint,
+                },
+            );
+        }
+        Ok(output)
     }
+}
+
+/// The create parameters, the token excluded, as one comparable string — what decides
+/// whether a replayed `ClientRequestToken` carries "the same parameters".
+fn fingerprint(input: &CreateWirelessGatewayInput) -> String {
+    let tags = crate::state::sorted_tag_pairs(input.tags.as_deref().unwrap_or_default());
+    format!(
+        "{:?}|{:?}|{:?}|{tags:?}",
+        input.name, input.description, input.lo_ra_wan,
+    )
 }

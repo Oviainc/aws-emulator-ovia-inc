@@ -87,7 +87,7 @@ fn router() -> MultiServiceRouter {
 /// Dispatch one call signed for `scope_region` — `None` leaves it unsigned, so a minted
 /// ARN falls back to [`DEFAULT_REGION`] — and return its status plus its parsed JSON
 /// body.
-async fn call_signed_for(
+pub(crate) async fn call_signed_for(
     router: &MultiServiceRouter,
     scope_region: Option<&str>,
     method: Method,
@@ -122,7 +122,7 @@ async fn get_group(router: &MultiServiceRouter, id: &str) -> (StatusCode, Value)
 }
 
 /// Every member of `sent` must come back from the reader under `member`, unchanged.
-fn assert_echoes(case: &str, member: &str, sent: &Value, fetched: &Value) {
+pub(crate) fn assert_echoes(case: &str, member: &str, sent: &Value, fetched: &Value) {
     let sent: &Map<String, Value> = sent.as_object().expect("the sent member is an object");
     for (key, value) in sent {
         assert_eq!(

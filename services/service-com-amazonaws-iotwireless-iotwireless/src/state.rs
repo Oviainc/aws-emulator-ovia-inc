@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANMulticast, ResourceNotFoundException,
-    SidewalkDevice, Tag,
+    LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANGateway, LoRaWANMulticast,
+    ResourceNotFoundException, SidewalkDevice, Tag,
 };
 
 /// The ARN service namespace (`arn:aws:iotwireless:...`) and the SigV4 signing name
@@ -50,6 +50,11 @@ pub fn multicast_group_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("MulticastGroup/{id}"))
 }
 
+/// `arn:aws:iotwireless:<region>:<account>:WirelessGateway/<id>`.
+pub fn wireless_gateway_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("WirelessGateway/{id}"))
+}
+
 /// `ExpressionType`'s modelled values, as the model-generated
 /// [`crate::ops::types::EXPRESSION_TYPE_VALUES`] lists them.
 pub use crate::ops::types::EXPRESSION_TYPE_VALUES as EXPRESSION_TYPES;
@@ -61,6 +66,10 @@ pub use crate::ops::types::WIRELESS_DEVICE_TYPE_VALUES as WIRELESS_DEVICE_TYPES;
 /// The identifier kinds `GetWirelessDevice` accepts, as the model-generated
 /// [`crate::ops::types::WIRELESS_DEVICE_ID_TYPE_VALUES`] lists them.
 pub use crate::ops::types::WIRELESS_DEVICE_ID_TYPE_VALUES as WIRELESS_DEVICE_ID_TYPES;
+
+/// The identifier kinds `GetWirelessGateway` accepts, as the model-generated
+/// [`crate::ops::types::WIRELESS_GATEWAY_ID_TYPE_VALUES`] lists them.
+pub use crate::ops::types::WIRELESS_GATEWAY_ID_TYPE_VALUES as WIRELESS_GATEWAY_ID_TYPES;
 
 /// `PositioningConfigStatus`'s modelled values, as the model-generated
 /// [`crate::ops::types::POSITIONING_CONFIG_STATUS_VALUES`] lists them.
@@ -190,6 +199,24 @@ pub struct WirelessDevice {
     pub last_uplink_received_at: Option<String>,
 }
 
+/// A wireless gateway: the LoRaWAN radio configuration of one provisioned gateway.
+#[derive(Debug, Clone)]
+pub struct WirelessGateway {
+    pub id: String,
+    pub arn: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// The gateway configuration the create carried, reported back by the gateway's
+    /// reader. `CreateWirelessGateway` marks `LoRaWAN` required, so every stored gateway
+    /// has one.
+    pub lorawan: LoRaWANGateway,
+    /// Set by `AssociateWirelessGatewayWithThing`, which is still scaffolded, so a
+    /// gateway created today carries none.
+    pub thing_name: Option<String>,
+    pub thing_arn: Option<String>,
+    pub tags: Vec<Tag>,
+}
+
 /// A multicast group: the LoRaWAN downlink settings a set of wireless devices shares.
 ///
 /// The membership itself lives on the devices (`WirelessDevice::multicast_group_id`),
@@ -264,6 +291,13 @@ pub const MAX_DEVICE_PROFILES: usize = 100;
 /// Validation), so a full store refuses with `ValidationException`.
 pub const MAX_MULTICAST_GROUPS: usize = 100;
 
+/// The most wireless gateways this emulator stores. A ceiling, for the same reason as
+/// [`MAX_DESTINATIONS`]; `CreateWirelessGateway` models no quota error either
+/// (`smithy_query(query="operation", operation="CreateWirelessGateway")` lists
+/// AccessDenied / Conflict / InternalServer / Throttling / Validation), so a full store
+/// refuses with `ValidationException`.
+pub const MAX_WIRELESS_GATEWAYS: usize = 100;
+
 /// The most `ClientRequestToken` entries kept for `CreateDestination` idempotency.
 ///
 /// At most one token is recorded per stored destination and a token is dropped with the
@@ -284,6 +318,10 @@ pub const MAX_DEVICE_PROFILE_TOKENS: usize = MAX_DEVICE_PROFILES;
 /// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
 pub const MAX_MULTICAST_GROUP_TOKENS: usize = MAX_MULTICAST_GROUPS;
 
+/// The most `ClientRequestToken` entries kept for `CreateWirelessGateway` idempotency.
+/// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
+pub const MAX_WIRELESS_GATEWAY_TOKENS: usize = MAX_WIRELESS_GATEWAYS;
+
 /// Per-service state for com-amazonaws-iotwireless-iotwireless. A handler reaches it through [`service_state`].
 ///
 /// The resource maps are `BTreeMap`s so every list enumerates in one stable, sorted key
@@ -291,13 +329,17 @@ pub const MAX_MULTICAST_GROUP_TOKENS: usize = MAX_MULTICAST_GROUPS;
 /// resume exactly where the previous page stopped.
 ///
 /// Every store here is BOUNDED: the resource maps by [`MAX_DESTINATIONS`] /
-/// [`MAX_WIRELESS_DEVICES`] / [`MAX_DEVICE_PROFILES`] / [`MAX_MULTICAST_GROUPS`] (the
-/// creates refuse once full), `dev_eui_index` by one entry per stored device, and the
+/// [`MAX_WIRELESS_DEVICES`] / [`MAX_DEVICE_PROFILES`] / [`MAX_MULTICAST_GROUPS`] /
+/// [`MAX_WIRELESS_GATEWAYS`] (the
+/// creates refuse once full), `dev_eui_index` by one entry per stored device,
+/// `gateway_eui_index` by one entry per stored gateway, and the
 /// token maps by [`MAX_DESTINATION_TOKENS`] / [`MAX_WIRELESS_DEVICE_TOKENS`] /
-/// [`MAX_DEVICE_PROFILE_TOKENS`] / [`MAX_MULTICAST_GROUP_TOKENS`] with oldest-entry
+/// [`MAX_DEVICE_PROFILE_TOKENS`] / [`MAX_MULTICAST_GROUP_TOKENS`] /
+/// [`MAX_WIRELESS_GATEWAY_TOKENS`] with oldest-entry
 /// eviction. The token maps are private so every write goes through
 /// [`Self::record_destination_token`] / [`Self::record_wireless_device_token`] /
-/// [`Self::record_device_profile_token`] / [`Self::record_multicast_group_token`] and
+/// [`Self::record_device_profile_token`] / [`Self::record_multicast_group_token`] /
+/// [`Self::record_wireless_gateway_token`] and
 /// cannot bypass the cap.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotwirelessIotwirelessState {
@@ -309,6 +351,12 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     pub device_profiles: BTreeMap<String, DeviceProfile>,
     /// Multicast groups by `Id`. Bounded by [`MAX_MULTICAST_GROUPS`].
     pub multicast_groups: BTreeMap<String, MulticastGroup>,
+    /// Wireless gateways by `Id`. Bounded by [`MAX_WIRELESS_GATEWAYS`].
+    pub wireless_gateways: BTreeMap<String, WirelessGateway>,
+    /// `GatewayEui` -> gateway id, so `GetWirelessGateway?identifierType=GatewayEui`
+    /// resolves without scanning and a duplicate `GatewayEui` is refusable. At most one
+    /// entry per stored gateway.
+    pub gateway_eui_index: BTreeMap<String, String>,
     /// `DevEui` -> device id, so `GetWirelessDevice?identifierType=DevEui` resolves
     /// without scanning and a duplicate `DevEui` is refusable. At most one entry per
     /// stored device, and the entry is released when the device is deleted.
@@ -335,6 +383,11 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     multicast_group_tokens: HashMap<String, IdempotentCreate>,
     /// Write order for [`Self::multicast_group_tokens`].
     multicast_group_token_order: VecDeque<String>,
+    /// `CreateWirelessGateway` client request tokens, bounded by
+    /// [`MAX_WIRELESS_GATEWAY_TOKENS`]. Private, like the destination tokens.
+    wireless_gateway_tokens: HashMap<String, IdempotentCreate>,
+    /// Write order for [`Self::wireless_gateway_tokens`].
+    wireless_gateway_token_order: VecDeque<String>,
 }
 
 /// Record `token` in `tokens`, evicting the oldest recorded token first if that would
@@ -347,7 +400,8 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
 /// last resort rather than a behaviour change: at most one token is recorded per stored
 /// resource, a resource's tokens are dropped with it where its delete is implemented
 /// (`forget_*_tokens_for`, which the destination and wireless-device deletes call —
-/// the device-profile and multicast-group deletes are still scaffolded, so those two
+/// the device-profile, multicast-group and wireless-gateway deletes are still
+/// scaffolded, so those three
 /// maps release a token only when the whole store is dropped), and each
 /// token cap equals its resource ceiling — so the map can only reach `cap` when every
 /// entry in it names a resource the store accepted and the resource store is itself
@@ -415,6 +469,29 @@ impl ComAmazonawsIotwirelessIotwirelessState {
     pub fn mint_multicast_group_id(&mut self) -> String {
         mint_unused_uuid(&self.multicast_groups)
     }
+
+    /// Mint a fresh, unused `WirelessGatewayId`.
+    pub fn mint_wireless_gateway_id(&mut self) -> String {
+        mint_unused_uuid(&self.wireless_gateways)
+    }
+
+    /// What a `CreateWirelessGateway` `ClientRequestToken` already minted, if anything.
+    pub fn wireless_gateway_token(&self, token: &str) -> Option<&IdempotentCreate> {
+        self.wireless_gateway_tokens.get(token)
+    }
+
+    /// Record `token` as having minted the gateway named by `record`, evicting the oldest
+    /// token first if that would push the map past [`MAX_WIRELESS_GATEWAY_TOKENS`].
+    pub fn record_wireless_gateway_token(&mut self, token: String, record: IdempotentCreate) {
+        record_token(
+            &mut self.wireless_gateway_tokens,
+            &mut self.wireless_gateway_token_order,
+            MAX_WIRELESS_GATEWAY_TOKENS,
+            token,
+            record,
+        );
+    }
+
 
     /// How many stored wireless devices belong to multicast group `id`.
     ///
@@ -540,6 +617,30 @@ impl ComAmazonawsIotwirelessIotwirelessState {
                     .and_then(|s| s.sidewalk_manufacturing_sn.as_deref())
                     == Some(identifier)
             }),
+            _ => None,
+        }
+    }
+
+    /// The gateway a `GetWirelessGateway` identifier resolves to, or `None`.
+    ///
+    /// `identifier_type` is the modelled `WirelessGatewayIdType`; an unknown value
+    /// resolves to nothing (the boundary validator already refuses one the enum does
+    /// not list).
+    pub fn find_gateway(
+        &self,
+        identifier_type: &str,
+        identifier: &str,
+    ) -> Option<&WirelessGateway> {
+        match identifier_type {
+            "WirelessGatewayId" => self.wireless_gateways.get(identifier),
+            "GatewayEui" => self
+                .gateway_eui_index
+                .get(identifier)
+                .and_then(|id| self.wireless_gateways.get(id)),
+            "ThingName" => self
+                .wireless_gateways
+                .values()
+                .find(|gateway| gateway.thing_name.as_deref() == Some(identifier)),
             _ => None,
         }
     }
