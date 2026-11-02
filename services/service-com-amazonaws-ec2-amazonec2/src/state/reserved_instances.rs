@@ -11,6 +11,10 @@
 //! `crate::state::insert_reserved_instances` exactly as it reaches the helpers that live in
 //! the parent module.
 //!
+//! The Reserved Instance MARKETPLACE listings of those purchases are the same subject and
+//! live at the end of this file: a listing names the purchase it sells, is created only for
+//! one the account holds in effect, and `CancelReservedInstancesListing` withdraws it.
+//!
 //! The stores themselves are fields of [`ComAmazonawsEc2Amazonec2State`]
 //! (`reserved_instances`, `reserved_instances_modifications` and the client-token map
 //! beside it), because the state struct is one struct; it is only the code that reads and
@@ -32,7 +36,8 @@
 use super::*;
 
 use crate::ops::types::{
-    ReservedInstances, ReservedInstancesConfiguration, ReservedInstancesId,
+    InstanceCount, PriceSchedule, PriceScheduleSpecification, ReservedInstances,
+    ReservedInstancesConfiguration, ReservedInstancesId, ReservedInstancesListing,
     ReservedInstancesModification, ReservedInstancesModificationResult,
 };
 
@@ -1150,5 +1155,458 @@ impl ComAmazonawsEc2Amazonec2State {
     /// minted.
     pub fn mint_reserved_instances_exchange_id(&mut self) -> String {
         self.mint_uuid()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The Marketplace listings those purchases are offered for sale through
+// ---------------------------------------------------------------------------
+
+/// "active" — the status of a listing that is on sale: the `ListingStatus` enum's `active`
+/// member (`smithy_query(query="shape",shape="ListingStatus")`), and the status a listing
+/// starts in, since `CreateReservedInstancesListing` answers the listing it has just put up
+/// for sale rather than one waiting to be put up.
+pub const RESERVED_INSTANCES_LISTING_STATUS_ACTIVE: &str = "active";
+
+/// "cancelled" — the status of a listing the seller has withdrawn: the `ListingStatus`
+/// enum's `cancelled` member, which is where `CancelReservedInstancesListing` leaves one.
+pub const RESERVED_INSTANCES_LISTING_STATUS_CANCELLED: &str = "cancelled";
+
+/// "available" — listed reservations that are still for sale: the `ListingState` enum's
+/// `available` member (`smithy_query(query="shape",shape="ListingState")`), which is the
+/// state every reservation a new listing offers is in.
+pub const RESERVED_INSTANCES_LISTING_STATE_AVAILABLE: &str = "available";
+
+/// "sold" — listed reservations a buyer has bought: the `ListingState` enum's `sold`
+/// member. Nothing in this API buys a listing, so no reservation of this store reaches it;
+/// the count is reported because a listing reports one per member of the catalog.
+pub const RESERVED_INSTANCES_LISTING_STATE_SOLD: &str = "sold";
+
+/// "cancelled" — listed reservations the seller has withdrawn: the `ListingState` enum's
+/// `cancelled` member, where cancelling a listing leaves the ones that were available.
+pub const RESERVED_INSTANCES_LISTING_STATE_CANCELLED: &str = "cancelled";
+
+/// "pending" — listed reservations whose sale is in flight: the `ListingState` enum's
+/// `pending` member. Nothing in this API bids on a listing, so no reservation of this store
+/// reaches it either.
+pub const RESERVED_INSTANCES_LISTING_STATE_PENDING: &str = "pending";
+
+/// How many Marketplace listings this emulator stores before one is refused.
+///
+/// CHOSEN, for the reason [`MAX_STORED_RESERVED_INSTANCES_MODIFICATIONS`] gives: nothing
+/// here reclaims a listing — a cancelled one is still reportable, because `cancelled` is a
+/// member of the modelled `ListingStatus` enum — so without a count ceiling repeated calls
+/// would grow this process's memory without bound.
+pub const MAX_STORED_RESERVED_INSTANCES_LISTINGS: usize = MAX_STORED_RECORDS_PER_STORE;
+
+/// How many price schedules one listing may carry.
+///
+/// CHOSEN: the model declares no `@length` on `PriceScheduleSpecificationList`, and the
+/// record keeps every entry for as long as the listing lives, so the handler is the only
+/// place the size of that list can be bounded. A schedule prices "each month remaining in
+/// the Reserved Instance term" (`CreateReservedInstancesListingRequest$PriceSchedules`) and
+/// the longest term AWS sells is three years, so this is well above the number of months a
+/// listing can usefully price — at the scale of the comparable ceiling
+/// [`MAX_RESERVED_INSTANCES_TARGET_CONFIGURATIONS`] puts on a modification's list.
+pub const MAX_RESERVED_INSTANCES_PRICE_SCHEDULES: usize = 100;
+
+/// The seconds in one of the months a price schedule's `Term` counts: a twelfth of the
+/// 365-day year a one-year Reserved Instance term is `Duration` seconds of
+/// ("the duration of the Reserved Instance, in seconds" — `ReservedInstances$Duration`), so
+/// the months a term is read in and the seconds a term is stored in are the same year.
+///
+/// A month of a term is therefore the same length wherever in the calendar it falls, which
+/// leaves up to a day of slack against a calendar month at a month boundary. That is the
+/// right trade here: the term this is measured against is itself held as a number of seconds
+/// rather than as a count of calendar months.
+const RESERVED_INSTANCES_MONTH_SECONDS: u64 = 365 * 24 * 60 * 60 / 12;
+
+/// The `ReservedInstancesListingId` member, as the Reserved Instance Marketplace's own
+/// validator spells it in a refusal: `listingId`, the name EC2 was recorded answering for a
+/// value it could not resolve to a listing.
+pub const LISTING_ID_MEMBER: &str = "listingId";
+
+/// The `ReservedInstancesId` member of the Marketplace operations, as a refusal names it.
+pub const LISTING_RESERVED_INSTANCES_ID_MEMBER: &str = "reservedInstancesId";
+
+/// The `InstanceCount` member of `CreateReservedInstancesListing`, as a refusal names it.
+pub const LISTING_INSTANCE_COUNT_MEMBER: &str = "instanceCount";
+
+/// Refuse a Marketplace request member whose value this service cannot act on: HTTP 400
+/// [`INVALID_INPUT`], `Invalid value for '<member>'` and nothing after it.
+///
+/// That is the whole sentence EC2 answers when the value names nothing it can act on and
+/// there is no further reason to give — an id that resolves to no listing of this account
+/// has nothing to say about itself beyond being unusable. When the service CAN say what was
+/// wrong with a value it read, [`invalid_marketplace_value_because`] puts that reason after
+/// the same opening.
+pub fn invalid_marketplace_value<E>(member: &str) -> Scaffolded<E> {
+    invalid_input(format!("Invalid value for '{member}'"))
+}
+
+/// Refuse a Marketplace request member the service read but cannot act on: the same HTTP
+/// 400 [`INVALID_INPUT`] opening as [`invalid_marketplace_value`], with the reason after it
+/// — the `. <reason>` half every other [`INVALID_INPUT`] refusal of this module carries
+/// ([`reserved_instances_not_found`]).
+pub fn invalid_marketplace_value_because<E>(member: &str, reason: impl AsRef<str>) -> Scaffolded<E> {
+    invalid_input(format!(
+        "Invalid value for '{member}'. {reason}",
+        reason = reason.as_ref()
+    ))
+}
+
+/// One stored Marketplace listing: the modelled [`ReservedInstancesListing`] every reader
+/// of it reports, beside the one fact that shape carries no member for — when the term of
+/// the Reserved Instance it sells ends, which is what the ACTIVE price schedule is read
+/// against ([`reserved_instances_listing_price_schedules`]).
+///
+/// The view is the modelled shape itself rather than a parallel record, for the reason
+/// [`ReservedInstancesModificationRecord`] keeps its own that way: every member a writer
+/// sets round-trips through a reader without a field-by-field copy that can silently drop
+/// one. Its price schedules carry NO `Active` flag, because which schedule is in effect is
+/// a fact of the clock rather than of the listing: a reader derives it.
+#[derive(Debug, Clone)]
+pub struct ReservedInstancesListingRecord {
+    /// The listing as the model shapes it.
+    pub view: ReservedInstancesListing,
+    /// When the term of the Reserved Instance this listing sells ends
+    /// (`ReservedInstances$End`), held as the instant the months remaining are measured
+    /// back from.
+    pub term_end: SystemTime,
+}
+
+/// What ONE listing is stored with, beyond everything the service derives
+/// ([`ComAmazonawsEc2Amazonec2State::insert_reserved_instances_listing`] mints the id,
+/// stamps the dates, sets the status and lays out the instance counts).
+#[derive(Debug, Clone)]
+pub struct ReservedInstancesListingSpec {
+    /// "The ID of the active Standard Reserved Instance"
+    /// (`CreateReservedInstancesListingRequest$ReservedInstancesId`), already resolved
+    /// against the store by the caller.
+    pub reserved_instances_id: String,
+    /// "The number of instances that are a part of a Reserved Instance account to be listed
+    /// in the Reserved Instance Marketplace"
+    /// (`CreateReservedInstancesListingRequest$InstanceCount`).
+    pub instance_count: i32,
+    /// "A list specifying the price of the Standard Reserved Instance for each month
+    /// remaining in the Reserved Instance term"
+    /// (`CreateReservedInstancesListingRequest$PriceSchedules`), as the request gave them.
+    pub price_schedules: Vec<PriceScheduleSpecification>,
+    /// "A unique, case-sensitive key supplied by the client to ensure that the request is
+    /// idempotent" (`CreateReservedInstancesListingRequest$ClientToken`), which this
+    /// operation requires.
+    pub client_token: String,
+    /// When the term of the Reserved Instance being listed ends.
+    pub term_end: SystemTime,
+    /// When the listing was created: its create and update dates.
+    pub created_at: SystemTime,
+}
+
+/// The bytes one stored listing will hold: the `ClientToken`, the Reserved Instances id and
+/// the currency each price schedule is stored with — the one the request named or the default
+/// the store fills in, since the record keeps that text either way — on top of the fixed
+/// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs. The id, the dates, the status
+/// and the instance counts are derived, and a schedule's term and price are fixed-size
+/// numbers whose COUNT is bounded by [`MAX_RESERVED_INSTANCES_PRICE_SCHEDULES`], so the
+/// stored TEXT is what is charged here.
+///
+/// The ONE definition of that charge, the way
+/// [`reserved_instances_modification_payload_bytes`] is for a modification: the handler asks
+/// it before the write and
+/// [`ComAmazonawsEc2Amazonec2State::insert_reserved_instances_listing`] charges exactly it.
+pub fn reserved_instances_listing_payload_bytes(spec: &ReservedInstancesListingSpec) -> usize {
+    spec.price_schedules
+        .iter()
+        .map(|schedule| {
+            schedule
+                .currency_code
+                .as_deref()
+                .unwrap_or(RESERVED_INSTANCE_CURRENCY_CODE)
+                .len()
+        })
+        .fold(STORED_RECORD_OVERHEAD_BYTES, usize::saturating_add)
+        .saturating_add(spec.client_token.len())
+        .saturating_add(spec.reserved_instances_id.len())
+}
+
+/// The `InstanceCounts` of a listing: one entry per member of the modelled `ListingState`
+/// catalog, in the order that enum declares them, so two reports of one listing cannot
+/// disagree about which states it accounts for.
+///
+/// "The number of instances in this state" (`ReservedInstancesListing$InstanceCounts`), so
+/// every member of the catalog carries a number — a state none of the listing's
+/// reservations are in carries zero rather than being left out.
+pub fn reserved_instances_listing_counts(
+    available: i32,
+    sold: i32,
+    cancelled: i32,
+    pending: i32,
+) -> Vec<InstanceCount> {
+    [
+        (RESERVED_INSTANCES_LISTING_STATE_AVAILABLE, available),
+        (RESERVED_INSTANCES_LISTING_STATE_SOLD, sold),
+        (RESERVED_INSTANCES_LISTING_STATE_CANCELLED, cancelled),
+        (RESERVED_INSTANCES_LISTING_STATE_PENDING, pending),
+    ]
+    .into_iter()
+    .map(|(state, instance_count)| InstanceCount {
+        instance_count: Some(instance_count),
+        state: Some(state.to_string()),
+    })
+    .collect()
+}
+
+/// How many of a listing's reservations are in `state`: the entry of its `InstanceCounts`
+/// for that member of the `ListingState` catalog, and zero when it holds none.
+pub fn reserved_instances_listing_count(counts: &[InstanceCount], state: &str) -> i32 {
+    counts
+        .iter()
+        .find(|entry| entry.state.as_deref() == Some(state))
+        .and_then(|entry| entry.instance_count)
+        .unwrap_or(0)
+}
+
+/// How many reservations a listing LISTED, whatever state they are in now: the sum of its
+/// `InstanceCounts`.
+///
+/// Withdrawing a listing moves reservations between states without changing that total, so
+/// this is the `InstanceCount` the listing was created with, read back off the record rather
+/// than stored a second time beside it.
+pub fn reserved_instances_listing_listed_count(counts: &[InstanceCount]) -> i32 {
+    counts
+        .iter()
+        .filter_map(|entry| entry.instance_count)
+        .fold(0, i32::saturating_add)
+}
+
+/// How many months of a term that ends at `term_end` are left at `now`.
+///
+/// A price schedule's `Term` is "the number of months remaining in the reservation"
+/// (`PriceSchedule$Term`), counted in whole months, so a part month still counts as one and
+/// the answer is never below one: "a specific price schedule is always in effect"
+/// (`PriceSchedule$Active`), which a remainder of zero months would leave nothing to be in
+/// effect for.
+fn months_remaining_in_term(term_end: SystemTime, now: SystemTime) -> i64 {
+    let remaining = term_end.duration_since(now).unwrap_or_default().as_secs();
+    i64::try_from(remaining.div_ceil(RESERVED_INSTANCES_MONTH_SECONDS))
+        .unwrap_or(i64::MAX)
+        .max(1)
+}
+
+/// Which `Term` of `terms` is in effect with `months_remaining` months left; `None` when the
+/// listing prices no term at all.
+///
+/// "The current price schedule, as determined by the term remaining for the Reserved
+/// Instance in the listing. A specific price schedule is always in effect, but only one
+/// price schedule can be active at any time. Take, for example, a Reserved Instance listing
+/// that has five months remaining in its term. When you specify price schedules for five
+/// months and two months, this means that schedule 1, covering the first three months of the
+/// remaining term, will be active during months 5, 4, and 3. Then schedule 2, covering the
+/// last two months of the term, will be active for months 2 and 1" (`PriceSchedule$Active`).
+///
+/// So the schedule in effect is the one with the SMALLEST term that still covers what is
+/// left — the five-month schedule covers months 5, 4 and 3 because the two-month one does
+/// not reach them — and, when no schedule reaches that far, the one with the largest term,
+/// since one is always in effect.
+fn active_price_schedule_term(terms: &[i64], months_remaining: i64) -> Option<i64> {
+    terms
+        .iter()
+        .copied()
+        .filter(|term| *term >= months_remaining)
+        .min()
+        .or_else(|| terms.iter().copied().max())
+}
+
+/// The price schedules of `record` as a report of it carries them: the terms and prices the
+/// listing was created with, with `Active` set on the one the term remaining puts in effect
+/// ([`active_price_schedule_term`]) and cleared on every other.
+///
+/// Derived on every read rather than stored, because which schedule is in effect changes
+/// with the CLOCK and not with the listing: two reads a month apart report the same listing
+/// with a different schedule active, and neither read writes anything.
+pub fn reserved_instances_listing_price_schedules(
+    record: &ReservedInstancesListingRecord,
+    now: SystemTime,
+) -> Vec<PriceSchedule> {
+    let stored: &[PriceSchedule] = record.view.price_schedules.as_deref().unwrap_or_default();
+    let terms: Vec<i64> = stored.iter().filter_map(|schedule| schedule.term).collect();
+    let active = active_price_schedule_term(&terms, months_remaining_in_term(record.term_end, now));
+    stored
+        .iter()
+        .map(|schedule| PriceSchedule {
+            active: Some(schedule.term.is_some() && schedule.term == active),
+            ..schedule.clone()
+        })
+        .collect()
+}
+
+/// One stored listing as every reader of it reports it: what the record holds, with the
+/// price schedule the term remaining puts in effect marked active.
+pub fn reserved_instances_listing_view(
+    record: &ReservedInstancesListingRecord,
+    now: SystemTime,
+) -> ReservedInstancesListing {
+    ReservedInstancesListing {
+        price_schedules: Some(reserved_instances_listing_price_schedules(record, now)),
+        ..record.view.clone()
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another listing fits inside the store's ceiling
+    /// ([`MAX_STORED_RESERVED_INSTANCES_LISTINGS`]).
+    ///
+    /// The same contract as [`Self::has_reserved_instances_modification_capacity`]: the
+    /// handler asks this BEFORE storing anything and refuses instead of growing the store
+    /// past its ceiling.
+    pub fn has_reserved_instances_listing_capacity(&self) -> bool {
+        self.reserved_instances_listings.len() < MAX_STORED_RESERVED_INSTANCES_LISTINGS
+    }
+
+    /// A fresh, unused `ReservedInstancesListingId`.
+    ///
+    /// A UUID, the form AWS's own listing ids read in, laid out by the same counter and
+    /// layout as every other id of the Reserved Instances domain
+    /// ([`Self::mint_reserved_instances_id`]), so it is unique within a run, the same across
+    /// runs, and never taken from the request. The model pins no pattern on
+    /// `ReservedInstancesListingId` (a plain `String`), so the form is decided here, in the
+    /// one place one is minted.
+    pub fn mint_reserved_instances_listing_id(&mut self) -> String {
+        self.mint_uuid()
+    }
+
+    /// The listing id a `ClientToken` has already minted, if it has: "a unique,
+    /// case-sensitive key supplied by the client to ensure that the request is idempotent.
+    /// … This helps avoid duplicate listings"
+    /// (`CreateReservedInstancesListingRequest$ClientToken`), so the repeat of a request
+    /// answers with the listing the first one created instead of creating a second.
+    pub fn reserved_instances_listing_for_token(&self, client_token: &str) -> Option<&str> {
+        self.reserved_instances_listing_client_tokens
+            .get(client_token)
+            .map(String::as_str)
+    }
+
+    /// The id of the listing currently offering `reserved_instances_id` for sale, if one is.
+    ///
+    /// "You can submit one Standard Reserved Instance listing at a time"
+    /// (`CreateReservedInstancesListing`), so a purchase that is already on sale cannot be
+    /// listed a second time while that listing is active — a withdrawn or sold-out listing
+    /// leaves it free to be listed again.
+    pub fn active_reserved_instances_listing_of(&self, reserved_instances_id: &str) -> Option<&str> {
+        self.reserved_instances_listings
+            .values()
+            .find(|record| {
+                record.view.reserved_instances_id.as_deref() == Some(reserved_instances_id)
+                    && record.view.status.as_deref()
+                        == Some(RESERVED_INSTANCES_LISTING_STATUS_ACTIVE)
+            })
+            .and_then(|record| record.view.reserved_instances_listing_id.as_deref())
+    }
+
+    /// Put a Reserved Instance up for sale, and answer the `ReservedInstancesListingId` the
+    /// listing was given, or `None` when the store is already at its ceiling
+    /// ([`Self::has_reserved_instances_listing_capacity`]).
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the caller —
+    /// the id, the create and update dates, the status a new listing starts in
+    /// ([`RESERVED_INSTANCES_LISTING_STATUS_ACTIVE`]), the reason it reports for that status,
+    /// and the instance counts, which start with every listed reservation available and none
+    /// sold, cancelled or pending — so two readers cannot report one listing differently. The
+    /// caller-chosen bytes the record retains
+    /// ([`reserved_instances_listing_payload_bytes`]) are charged against the store's byte
+    /// budget here, so a writer cannot store them uncharged.
+    pub fn insert_reserved_instances_listing(
+        &mut self,
+        spec: ReservedInstancesListingSpec,
+    ) -> Option<String> {
+        if !self.has_reserved_instances_listing_capacity() {
+            return None;
+        }
+        let payload_bytes = reserved_instances_listing_payload_bytes(&spec);
+        let listing_id = self.mint_reserved_instances_listing_id();
+        let created_at = system_time_to_date_time(spec.created_at);
+        let view = ReservedInstancesListing {
+            client_token: Some(spec.client_token.clone()),
+            create_date: Some(created_at),
+            instance_counts: Some(reserved_instances_listing_counts(spec.instance_count, 0, 0, 0)),
+            price_schedules: Some(
+                spec.price_schedules
+                    .iter()
+                    .map(|schedule| PriceSchedule {
+                        // Which schedule is in effect is derived on every report
+                        // ([`reserved_instances_listing_price_schedules`]), so the record
+                        // keeps no answer of its own that a later read could contradict.
+                        active: None,
+                        currency_code: Some(
+                            schedule
+                                .currency_code
+                                .clone()
+                                .unwrap_or_else(|| RESERVED_INSTANCE_CURRENCY_CODE.to_string()),
+                        ),
+                        price: schedule.price,
+                        term: schedule.term,
+                    })
+                    .collect(),
+            ),
+            reserved_instances_id: Some(spec.reserved_instances_id),
+            reserved_instances_listing_id: Some(listing_id.clone()),
+            status: Some(RESERVED_INSTANCES_LISTING_STATUS_ACTIVE.to_string()),
+            // "The reason for the current status of the Reserved Instance listing"
+            // (`ReservedInstancesListing$StatusMessage`): a listing that is simply on sale
+            // reports that status as its own reason, the way AWS's own listing examples do.
+            status_message: Some(RESERVED_INSTANCES_LISTING_STATUS_ACTIVE.to_string()),
+            tags: Some(Vec::new()),
+            update_date: Some(created_at),
+        };
+        self.add_stored_bytes(payload_bytes);
+        self.reserved_instances_listing_client_tokens
+            .insert(spec.client_token, listing_id.clone());
+        self.reserved_instances_listings.insert(
+            listing_id.clone(),
+            ReservedInstancesListingRecord {
+                view,
+                term_end: spec.term_end,
+            },
+        );
+        Some(listing_id)
+    }
+
+    /// Withdraw a listing from the Reserved Instance Marketplace at `at`, and answer it as a
+    /// report of it carries it; `None` when the account holds no listing under `listing_id`.
+    ///
+    /// The reservations that were still for sale become
+    /// [`RESERVED_INSTANCES_LISTING_STATE_CANCELLED`] and the listing's own status follows
+    /// them to [`RESERVED_INSTANCES_LISTING_STATUS_CANCELLED`]: cancelling a listing
+    /// withdraws what is still on offer, so the reservations a buyer has already taken are
+    /// left where they are rather than un-sold. The record is kept rather than dropped —
+    /// `cancelled` is a member of the modelled `ListingStatus` enum, so a describe still
+    /// reports the withdrawn listing.
+    pub fn cancel_reserved_instances_listing(
+        &mut self,
+        listing_id: &str,
+        at: SystemTime,
+    ) -> Option<ReservedInstancesListing> {
+        let record = self.reserved_instances_listings.get_mut(listing_id)?;
+        let counts: &[InstanceCount] = record.view.instance_counts.as_deref().unwrap_or_default();
+        let available =
+            reserved_instances_listing_count(counts, RESERVED_INSTANCES_LISTING_STATE_AVAILABLE);
+        let sold = reserved_instances_listing_count(counts, RESERVED_INSTANCES_LISTING_STATE_SOLD);
+        let cancelled =
+            reserved_instances_listing_count(counts, RESERVED_INSTANCES_LISTING_STATE_CANCELLED);
+        let pending =
+            reserved_instances_listing_count(counts, RESERVED_INSTANCES_LISTING_STATE_PENDING);
+        record.view.instance_counts = Some(reserved_instances_listing_counts(
+            0,
+            sold,
+            cancelled.saturating_add(available),
+            pending,
+        ));
+        record.view.status = Some(RESERVED_INSTANCES_LISTING_STATUS_CANCELLED.to_string());
+        record.view.status_message =
+            Some(RESERVED_INSTANCES_LISTING_STATUS_CANCELLED.to_string());
+        // "The last modified timestamp of the listing"
+        // (`ReservedInstancesListing$UpdateDate`): the instant this withdrawal was made.
+        record.view.update_date = Some(system_time_to_date_time(at));
+        Some(reserved_instances_listing_view(record, at))
     }
 }

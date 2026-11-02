@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservedInstancesListings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservedInstancesListings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReservedInstancesListings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports this account's Reserved Instance Marketplace listings out of
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::reserved_instances_listings`], narrowed by
+//! the ids and the documented filters the request carries. This is the ONLY file to touch
+//! for this operation.
+//!
+//! A pure READ: nothing about a listing is written here, and the one member a report derives
+//! rather than stores — which price schedule the term remaining puts in effect
+//! ([`crate::state::reserved_instances_listing_view`]) — is computed per call, so two reads
+//! of one listing differ only where the clock has moved on.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +85,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::borrow::Cow;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES, MAX_FILTERS,
+    MatchBudget,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -151,18 +159,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservedInstancesListings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservedInstancesListingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — a listing is
+        // named by an id that is unique across this store, and every member of the report
+        // comes from the stored listing itself.
+        let _ = ctx;
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // Matching cost is filters x values x held values x stored listings, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so every
+        // request-controlled factor is capped HERE, before any work proportional to it is done
+        // and before the store is locked — and their PRODUCT is charged to one [`MatchBudget`]
+        // below. The same ceilings every sibling describe of this crate applies.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied} filters, above the maximum of {MAX_FILTERS}",
+                supplied = filters.len(),
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // listing would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here, rather than recompiled
+        // per candidate.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {supplied} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    supplied = values.len(),
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is bounded
+            // too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {supplied} bytes, above the maximum \
+                     of {MAX_FILTER_VALUE_BYTES}",
+                    supplied = oversize.len(),
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this read is allowed to apply — the same call every sibling
+        // describe makes: they were owed at the instant they fell due whether or not anybody
+        // called, so applying them here changes nothing a later caller would not have seen.
+        store.materialize_due_transitions();
+
+        // "One or more Reserved Instance listing IDs" (`$ReservedInstancesListingId`) and
+        // "one or more Reserved Instance IDs" (`$ReservedInstancesId`) each narrow the report
+        // to the listings carrying that value, exactly as the filters of the same names do
+        // (`reserved-instances-listing-id` and `reserved-instances-id` are both documented
+        // filters of this request), and a value nothing carries selects nothing rather than
+        // failing: these members are SELECTORS, not resources to resolve. Every filter must
+        // then hold as well ("If you specify multiple filters, the filters are joined with an
+        // AND" — `Filter`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservedInstancesListings"))
+        // Every comparison is charged to ONE budget — one step per candidate even when no
+        // filter was given, so an unfiltered scan is counted too — which bounds the PRODUCT
+        // of stored listings, filters, values, held values and value length however the caller
+        // combines them, and with it how long this holds the store's lock. The store is keyed
+        // by `ReservedInstancesListingId`, so the report comes back in id order; this
+        // operation models no pagination at all — its request carries neither `MaxResults`
+        // nor `NextToken` — so every selected listing is reported.
+        let now = ::std::time::SystemTime::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut reported: Vec<ReservedInstancesListing> = Vec::new();
+        for record in store.reserved_instances_listings.values() {
+            if budget.exhausted() {
+                break;
+            }
+            let listing = state::reserved_instances_listing_view(record, now);
+            if !selects(
+                input.reserved_instances_listing_id.as_deref(),
+                listing.reserved_instances_listing_id.as_deref(),
+            ) || !selects(
+                input.reserved_instances_id.as_deref(),
+                listing.reserved_instances_id.as_deref(),
+            ) {
+                continue;
+            }
+            if state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(&listing, name)
+            }) {
+                reported.push(listing);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated report.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them"
+            )));
+        }
+
+        Ok(DescribeReservedInstancesListingsOutput {
+            reserved_instances_listings: Some(reported),
+        })
+    }
+}
+
+/// The filter names this operation documents, from
+/// `DescribeReservedInstancesListingsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeReservedInstancesListingsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// Every entry must be answered by [`filter_values`]. The request documents no `tag:` filter,
+/// so a tag name is as undocumented here as any other misspelling even though a listing
+/// carries tags.
+const RESERVED_INSTANCES_LISTING_FILTERS: [&str; 4] = [
+    "reserved-instances-id",
+    "reserved-instances-listing-id",
+    "status",
+    "status-message",
+];
+
+/// Is `name` a filter this operation documents? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact.
+fn is_documented_filter(name: &str) -> bool {
+    RESERVED_INSTANCES_LISTING_FILTERS.contains(&name)
+}
+
+/// Does a request member that names ONE value select a listing carrying `held`?
+///
+/// A member the request omits selects every listing, which is what makes the two narrowing
+/// members of this request independent of each other; a listing that carries no value for a
+/// member the request did name is not one of the listings that member asked for.
+fn selects(asked: Option<&str>, held: Option<&str>) -> bool {
+    asked.is_none_or(|asked| held == Some(asked))
+}
+
+/// The values the EC2 filter `name` compares against this listing.
+///
+/// A filter naming an attribute the listing does not carry compares against NO values, so it
+/// selects nothing — the answer any absent member gives for its own filter.
+fn filter_values<'a>(listing: &'a ReservedInstancesListing, name: &str) -> Vec<Cow<'a, str>> {
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "reserved-instances-id" => text(listing.reserved_instances_id.as_deref()),
+        "reserved-instances-listing-id" => text(listing.reserved_instances_listing_id.as_deref()),
+        "status" => text(listing.status.as_deref()),
+        "status-message" => text(listing.status_message.as_deref()),
+        // Unreachable: [`is_documented_filter`] has already refused every other name. An
+        // attribute nothing is stored for compares against nothing, so it could never widen a
+        // result even if that check were bypassed.
+        _ => Vec::new(),
     }
 }

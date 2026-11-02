@@ -323,6 +323,13 @@ mod security_group_rule_quota_refusal;
 // gives: the sorted neighbourhood is where every new ec2 suite inserts its two lines.
 #[path = "all/reserved_instances_modifications.rs"]
 mod reserved_instances_modifications;
+// The Reserved Instance Marketplace listings of those purchases: what
+// `CreateReservedInstancesListing` puts up for sale, what `CancelReservedInstancesListing`
+// withdraws, what `DescribeReservedInstancesListings` reports back and narrows by, and what
+// each refuses. Declared beside the modifications suite it shares a subject with, rather
+// than in sorted position, for the reason this file's header note gives.
+#[path = "all/reserved_instances_listings.rs"]
+mod reserved_instances_listings;
 // Where a paged describe bounds its page size and where it does not: a `MaxResults` the
 // model leaves unbounded above is served, not refused. Declared beside the suites above
 // rather than in sorted position, for the reason this file's header note gives.

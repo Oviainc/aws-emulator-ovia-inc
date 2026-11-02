@@ -3310,6 +3310,25 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// ensure idempotency of your modification request"
     /// (`ModifyReservedInstancesRequest$ClientToken`).
     pub reserved_instances_modification_client_tokens: HashMap<String, String>,
+    /// Every Reserved Instance Marketplace listing the account has created, by
+    /// `ReservedInstancesListingId`, as a [`ReservedInstancesListingRecord`]: the modelled
+    /// [`crate::ops::types::ReservedInstancesListing`] shape beside the one fact it carries
+    /// no member for — when the term of the Reserved Instance it sells ends, which is what
+    /// the active price schedule is read against. Ordered by id, the order a describe
+    /// reports in.
+    ///
+    /// `CreateReservedInstancesListing` is its writer and
+    /// `CancelReservedInstancesListing` withdraws a listing in place, which keeps the record
+    /// rather than dropping it — `cancelled` is a member of the modelled `ListingStatus`
+    /// enum, so a describe still reports a withdrawn listing. See [`reserved_instances`].
+    pub reserved_instances_listings: BTreeMap<String, ReservedInstancesListingRecord>,
+    /// A `CreateReservedInstancesListing` `ClientToken` and the
+    /// `ReservedInstancesListingId` that request created, so a repeat of the same request
+    /// answers with that listing instead of creating a second one — "a unique,
+    /// case-sensitive key supplied by the client to ensure that the request is idempotent.
+    /// … This helps avoid duplicate listings"
+    /// (`CreateReservedInstancesListingRequest$ClientToken`).
+    pub reserved_instances_listing_client_tokens: HashMap<String, String>,
     /// Every block of Scheduled Instance capacity the account's Regions have set aside, by
     /// [`scheduled_instance_capacity_key`] — the zone, platform and instance type that
     /// identify a block — as a [`ScheduledInstanceCapacityRecord`]: what a search cannot
@@ -4768,6 +4787,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             reserved_instances: BTreeMap::new(),
             reserved_instances_modifications: BTreeMap::new(),
             reserved_instances_modification_client_tokens: HashMap::new(),
+            // A fresh account has put nothing up for sale in the Reserved Instance
+            // Marketplace, so it holds no listing either.
+            reserved_instances_listings: BTreeMap::new(),
+            reserved_instances_listing_client_tokens: HashMap::new(),
             // A fresh account's Regions have no Scheduled Instance capacity set aside for
             // them, so a schedule search is answered with nothing to report.
             scheduled_instance_capacity: BTreeMap::new(),

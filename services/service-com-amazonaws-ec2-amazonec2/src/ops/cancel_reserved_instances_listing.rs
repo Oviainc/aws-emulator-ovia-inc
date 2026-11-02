@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelReservedInstancesListing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelReservedInstancesListing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelReservedInstancesListing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: withdraws one of this account's Reserved Instance Marketplace listings and
+//! answers the listing as it now stands. This is the ONLY file to touch for this operation.
+//!
+//! Cancelling moves the reservations that were still for sale to `cancelled` and the
+//! listing's own status with them, at
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::cancel_reserved_instances_listing`] — the
+//! listings store and everything else the Marketplace operations share live in
+//! [`crate::state::reserved_instances`].
+//!
+//! What this file holds is this operation's own validation: a `reservedInstancesListingId`
+//! must name a listing this account holds that is still on sale. There is no other state a
+//! listing can be withdrawn from, so every other value of that member is one this operation
+//! cannot act on and is refused as such.
 //!
 //! ## Shape of an operation
 //!
@@ -133,18 +138,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelReservedInstancesListing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelReservedInstancesListingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelReservedInstancesListing"))
+        // `ctx` carries request metadata only; this operation reads none of it — a listing
+        // is named by an id that is unique across this store, and every member of the answer
+        // comes from the stored listing itself.
+        let _ = ctx;
+        use crate::state::{
+            LISTING_ID_MEMBER, RESERVED_INSTANCES_LISTING_STATUS_ACTIVE,
+            invalid_marketplace_value, require_service_state,
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Every move the clock already owed is applied before anything is read or written,
+        // the same call every sibling mutation of this crate makes.
+        store.materialize_due_transitions();
+
+        let listing_id = input.reserved_instances_listing_id.as_str();
+        // Only a listing that is still on sale has anything to withdraw. An id that names no
+        // listing of this account, and one naming a listing that is already withdrawn, are
+        // the same thing to this operation — a `listingId` it cannot act on — so both are
+        // refused with the one sentence EC2 words that refusal with, and nothing is written.
+        let on_sale = store
+            .reserved_instances_listings
+            .get(listing_id)
+            .is_some_and(|record| {
+                record.view.status.as_deref() == Some(RESERVED_INSTANCES_LISTING_STATUS_ACTIVE)
+            });
+        if !on_sale {
+            return Err(invalid_marketplace_value(LISTING_ID_MEMBER));
+        }
+
+        let withdrawn = store
+            .cancel_reserved_instances_listing(listing_id, ::std::time::SystemTime::now())
+            .ok_or_else(|| invalid_marketplace_value(LISTING_ID_MEMBER))?;
+        // "The Reserved Instance listing" (`$ReservedInstancesListings`): the one this call
+        // withdrew, as it now stands.
+        Ok(CancelReservedInstancesListingOutput {
+            reserved_instances_listings: Some(vec![withdrawn]),
+        })
     }
 }

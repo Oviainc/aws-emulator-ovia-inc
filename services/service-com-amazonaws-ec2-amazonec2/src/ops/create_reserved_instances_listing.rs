@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReservedInstancesListing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReservedInstancesListing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReservedInstancesListing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: puts some or all of the reservations of one Standard Reserved Instance up
+//! for sale in the Reserved Instance Marketplace and answers the listing it created. This
+//! is the ONLY file to touch for this operation.
+//!
+//! A listing is stored in
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::reserved_instances_listings`] with every
+//! listed reservation `available`, on sale from the instant the call returns — AWS answers
+//! the listing `active` rather than waiting — so there is no move for the clock to owe it.
+//! The store, the listing's id, the price schedule the term remaining puts in effect and
+//! the refusals the Marketplace operations share live in
+//! [`crate::state::reserved_instances`].
+//!
+//! What this file holds is this operation's own validation: the `reservedInstancesId` must
+//! name a Reserved Instance this account holds, in effect, of the `standard` offering class
+//! ("Only Standard Reserved Instances can be sold in the Reserved Instance Marketplace.
+//! Convertible Reserved Instances cannot be sold") and not already on sale ("You can submit
+//! one Standard Reserved Instance listing at a time"); the `instanceCount` must be at least
+//! one and at most the reservations that purchase holds; and each price schedule must price
+//! one month of the term remaining, at a price and in a currency the service can take.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +100,59 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    LISTING_INSTANCE_COUNT_MEMBER, LISTING_RESERVED_INSTANCES_ID_MEMBER, MAX_CLIENT_TOKEN_CHARS,
+    MAX_RESERVED_INSTANCES_PRICE_SCHEDULES, MAX_STORED_BYTES,
+    MAX_STORED_RESERVED_INSTANCES_LISTINGS, RESERVED_INSTANCE_CURRENCY_CODE,
+    RESERVED_INSTANCE_OFFERING_CLASS_CONVERTIBLE, RESERVED_INSTANCE_STATE_ACTIVE,
+    ReservedInstancesListingSpec, date_time_to_system_time, echoed_resource_id,
+    idempotent_parameter_mismatch, invalid_marketplace_value, invalid_marketplace_value_because,
+    invalid_parameter_value, missing_parameter, reserved_instances_limit_exceeded,
+    reserved_instances_listing_payload_bytes,
+};
+
+/// One price schedule as a value two schedules can be COMPARED by, so a replayed
+/// `ClientToken` can be told from a different request carrying the same token.
+///
+/// The modelled `PriceSchedule` and `PriceScheduleSpecification` derive no equality, and
+/// comparing them member by member at the one call site would be the only place their member
+/// lists are restated: these two functions are those lists, and the tuple is what they
+/// answer. The currency is compared as the service STORED it, so a request that left it out
+/// and one that named the only supported currency are the same request.
+type PriceScheduleKey = (Option<i64>, Option<f64>, String);
+
+/// Every member of `schedule`, as a value a stored schedule can be compared by.
+fn asked_schedule_key(schedule: &PriceScheduleSpecification) -> PriceScheduleKey {
+    (
+        schedule.term,
+        schedule.price,
+        schedule
+            .currency_code
+            .clone()
+            .unwrap_or_else(|| RESERVED_INSTANCE_CURRENCY_CODE.to_string()),
+    )
+}
+
+/// Every member of a STORED `schedule`, as the same value. `Active` is left out: it is
+/// derived from the clock on every report rather than asked for by a request.
+fn stored_schedule_key(schedule: &PriceSchedule) -> PriceScheduleKey {
+    (
+        schedule.term,
+        schedule.price,
+        schedule.currency_code.clone().unwrap_or_default(),
+    )
+}
+
+/// Whether `asked` is the price schedule list the stored listing was created with: the same
+/// schedules, in the same order.
+fn same_price_schedules(stored: &[PriceSchedule], asked: &[PriceScheduleSpecification]) -> bool {
+    stored.len() == asked.len()
+        && stored
+            .iter()
+            .zip(asked)
+            .all(|(held, asked)| stored_schedule_key(held) == asked_schedule_key(asked))
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -156,18 +220,262 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReservedInstancesListing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReservedInstancesListingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // Reserved Instance being listed is named by an id that is unique across this store,
+        // and everything the listing reports comes from that purchase and from this request.
+        let _ = ctx;
+        use ::std::collections::BTreeSet;
+
+        use crate::state::{
+            require_service_state, reserved_instances_listing_listed_count,
+            reserved_instances_listing_view,
+        };
+
+        // Every value the request carries is read BEFORE the store is locked, so a request
+        // this operation cannot act on does no work proportional to it under the lock.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReservedInstancesListing"))
+        // "The number of instances that are a part of a Reserved Instance account to be
+        // listed in the Reserved Instance Marketplace" (`$InstanceCount`): a listing offers
+        // reservations for sale, so it must offer at least one.
+        //
+        // `InvalidParameterValue` rather than the `InvalidInput` the two store-resolved
+        // refusals below answer: a count below one is not a number of reservations at all,
+        // which is a fact of the VALUE and is refused before anything is looked up, while a
+        // count above the reservations the named purchase holds is a value this service read
+        // and could not act on for that purchase.
+        if input.instance_count < 1 {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{count}' for instanceCount. It must be at least 1",
+                count = input.instance_count
+            )));
+        }
+        if input.client_token.chars().count() > MAX_CLIENT_TOKEN_CHARS {
+            return Err(invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+        // "A list specifying the price of the Standard Reserved Instance for each month
+        // remaining in the Reserved Instance term" (`$PriceSchedules`): a list that prices
+        // no month at all prices nothing, so the required member is as good as absent. The
+        // model bounds the list at nothing and the record keeps every entry, so its size is
+        // bounded here.
+        if input.price_schedules.is_empty() {
+            return Err(missing_parameter(
+                "The request must contain the parameter priceSchedules",
+            ));
+        }
+        if input.price_schedules.len() > MAX_RESERVED_INSTANCES_PRICE_SCHEDULES {
+            return Err(invalid_parameter_value(format!(
+                "PriceSchedules carries {supplied} schedules, above the maximum of \
+                 {MAX_RESERVED_INSTANCES_PRICE_SCHEDULES}",
+                supplied = input.price_schedules.len()
+            )));
+        }
+        let mut priced_terms: BTreeSet<i64> = BTreeSet::new();
+        for schedule in &input.price_schedules {
+            // "The number of months remaining in the reservation" (`PriceSchedule$Term`): a
+            // schedule that names no month prices none, a month before the first is no month
+            // of any term, and only one schedule can be in effect for a given month
+            // (`PriceSchedule$Active`), so one month cannot carry two prices.
+            let Some(term) = schedule.term else {
+                return Err(missing_parameter(
+                    "The request must contain the parameter term",
+                ));
+            };
+            if term < 1 {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value '{term}' for term. It must be at least 1"
+                )));
+            }
+            if !priced_terms.insert(term) {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value '{term}' for term. The request prices that month more than \
+                     once"
+                )));
+            }
+            // "The fixed price for the term" (`PriceSchedule$Price`): an amount of the one
+            // supported currency, so a schedule must carry one and it must BE an amount — a
+            // negative price, or a value that is not a number at all, is not one.
+            let Some(price) = schedule.price else {
+                return Err(missing_parameter(
+                    "The request must contain the parameter price",
+                ));
+            };
+            if !price.is_finite() || price < 0.0 {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value '{price}' for price. It must be an amount that is not \
+                     negative"
+                )));
+            }
+            // `CurrencyCode` targets the modelled `CurrencyCodeValues` enum, so the boundary
+            // validator has already refused every value outside it: reaching here means the
+            // schedule names the one supported currency ([`RESERVED_INSTANCE_CURRENCY_CODE`])
+            // or names none, which the store fills in.
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Every move the clock already owed is applied before anything is read or written,
+        // so a purchase a fulfilled modification retired is seen as retired here rather than
+        // listed for sale.
+        store.materialize_due_transitions();
+
+        let created_at = ::std::time::SystemTime::now();
+
+        // "Unique, case-sensitive identifier you provide to ensure idempotency of your
+        // listings. This helps avoid duplicate listings" (`$ClientToken`): the repeat of a
+        // request answers with the listing the first one created, and the SAME token
+        // carrying a different request is the mismatch EC2 refuses rather than a second
+        // listing of the same reservations.
+        if let Some(recorded) = store
+            .reserved_instances_listing_for_token(&input.client_token)
+            .map(str::to_string)
+        {
+            let Some(record) = store.reserved_instances_listings.get(&recorded) else {
+                return Err(idempotent_parameter_mismatch());
+            };
+            let replayed = record.view.reserved_instances_id.as_deref()
+                == Some(input.reserved_instances_id.as_str())
+                && reserved_instances_listing_listed_count(
+                    record.view.instance_counts.as_deref().unwrap_or_default(),
+                ) == input.instance_count
+                && same_price_schedules(
+                    record.view.price_schedules.as_deref().unwrap_or_default(),
+                    &input.price_schedules,
+                );
+            if !replayed {
+                return Err(idempotent_parameter_mismatch());
+            }
+            return Ok(CreateReservedInstancesListingOutput {
+                reserved_instances_listings: Some(vec![reserved_instances_listing_view(
+                    record, created_at,
+                )]),
+            });
+        }
+
+        // "The ID of the active Standard Reserved Instance" (`$ReservedInstancesId`), which
+        // is three requirements of the purchase it names: the account holds it, it is in
+        // effect — a queued purchase has not been made yet and a retired one is over, so
+        // neither has reservations to resell — and it is Standard, since "Only Standard
+        // Reserved Instances can be sold in the Reserved Instance Marketplace. Convertible
+        // Reserved Instances cannot be sold".
+        let Some(purchase) = store
+            .reserved_instances
+            .get(input.reserved_instances_id.as_str())
+        else {
+            return Err(invalid_marketplace_value(
+                LISTING_RESERVED_INSTANCES_ID_MEMBER,
+            ));
+        };
+        let held_state = purchase.state.as_deref().unwrap_or_default();
+        if held_state != RESERVED_INSTANCE_STATE_ACTIVE {
+            return Err(invalid_marketplace_value_because(
+                LISTING_RESERVED_INSTANCES_ID_MEMBER,
+                format!(
+                    "Reserved Instance {id} is in the '{held_state}' state.",
+                    id = echoed_resource_id(&input.reserved_instances_id)
+                ),
+            ));
+        }
+        if purchase.offering_class.as_deref() == Some(RESERVED_INSTANCE_OFFERING_CLASS_CONVERTIBLE)
+        {
+            return Err(invalid_marketplace_value_because(
+                LISTING_RESERVED_INSTANCES_ID_MEMBER,
+                format!(
+                    "Reserved Instance {id} is Convertible, and only Standard Reserved \
+                     Instances can be sold in the Reserved Instance Marketplace.",
+                    id = echoed_resource_id(&input.reserved_instances_id)
+                ),
+            ));
+        }
+        // "This number should be less than or equal to the instance count associated with
+        // the Reserved Instance ID specified in this call" (`$InstanceCount`): an account
+        // cannot sell reservations it does not hold.
+        let held_count = purchase.instance_count.unwrap_or_default();
+        if input.instance_count > held_count {
+            return Err(invalid_marketplace_value_because(
+                LISTING_INSTANCE_COUNT_MEMBER,
+                format!(
+                    "Reserved Instance {id} holds {held_count} reservations.",
+                    id = echoed_resource_id(&input.reserved_instances_id)
+                ),
+            ));
+        }
+        // "The date and time the Reserved Instance ends" (`ReservedInstances$End`) is where
+        // the months remaining in the term — and so which price schedule is in effect — are
+        // measured back from.
+        let term_end = purchase
+            .end
+            .map(date_time_to_system_time)
+            .unwrap_or(created_at);
+
+        // "You can submit one Standard Reserved Instance listing at a time": a purchase that
+        // is already on sale cannot be listed a second time while that listing is active,
+        // which would offer the same reservations twice. Withdrawing the listing frees it.
+        if let Some(on_sale) = store
+            .active_reserved_instances_listing_of(input.reserved_instances_id.as_str())
+            .map(str::to_string)
+        {
+            return Err(invalid_marketplace_value_because(
+                LISTING_RESERVED_INSTANCES_ID_MEMBER,
+                format!(
+                    "Reserved Instance {id} is already listed in the Reserved Instance \
+                     Marketplace as {on_sale}.",
+                    id = echoed_resource_id(&input.reserved_instances_id)
+                ),
+            ));
+        }
+
+        let spec = ReservedInstancesListingSpec {
+            reserved_instances_id: input.reserved_instances_id,
+            instance_count: input.instance_count,
+            price_schedules: input.price_schedules,
+            client_token: input.client_token,
+            term_end,
+            created_at,
+        };
+        let payload_bytes = reserved_instances_listing_payload_bytes(&spec);
+
+        // Both ceilings are asked BEFORE anything is written: without them a client could
+        // grow this process's memory without bound, because nothing reclaims a listing — a
+        // withdrawn one is still reportable.
+        if !store.has_reserved_instances_listing_capacity() {
+            return Err(reserved_instances_limit_exceeded(format!(
+                "This emulator holds {MAX_STORED_RESERVED_INSTANCES_LISTINGS} Reserved \
+                 Instances listings, which is as many as it stores"
+            )));
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(reserved_instances_limit_exceeded(format!(
+                "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+            )));
+        }
+
+        let listing_id = store
+            .insert_reserved_instances_listing(spec)
+            .ok_or_else(|| {
+                reserved_instances_limit_exceeded(format!(
+                    "This emulator holds {MAX_STORED_RESERVED_INSTANCES_LISTINGS} Reserved \
+                     Instances listings, which is as many as it stores"
+                ))
+            })?;
+        // "Information about the Standard Reserved Instance listing"
+        // (`$ReservedInstancesListings`): the listing this call created, read back out of the
+        // store it was written to, so the answer and every later describe report it
+        // identically.
+        let created = store
+            .reserved_instances_listings
+            .get(&listing_id)
+            .map(|record| reserved_instances_listing_view(record, created_at))
+            .ok_or_else(|| {
+                crate::state::internal_error(
+                    "the listing this call stored could not be read back",
+                )
+            })?;
+        Ok(CreateReservedInstancesListingOutput {
+            reserved_instances_listings: Some(vec![created]),
+        })
     }
 }
