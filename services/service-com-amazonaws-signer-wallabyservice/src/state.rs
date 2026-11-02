@@ -1591,14 +1591,24 @@ pub fn job_not_found_message(job_id: &str) -> String {
     )
 }
 
-/// The refusal prose for a `profileVersion` the named profile has never had.
+/// The refusal prose for a VERSION of a signing profile this endpoint cannot
+/// resolve.
 ///
-/// Names the profile that WAS resolved and the version that was not, so the
-/// caller can tell which half of the request the endpoint could not reach. Shared
-/// by every operation that resolves a version of a profile, so the one condition
-/// reads the same whichever one refused it.
+/// One sentence for both halves of the addressed resource: a request that
+/// addresses a version names a profile AND a version, and either half can be the
+/// one that did not resolve — the profile may be unknown, or the profile may
+/// never have had the version — so the clause states both, and a caller reading
+/// it can decide whether to re-create the profile or re-read its versions.
+///
+/// Shared by every operation that resolves a version of a profile, so the one
+/// condition reads the same whichever one refused it. Both values come from the
+/// request (`profileName` is the path label, `profileVersion` the member), and
+/// both are bounded by the model (`@length 2..64` and `@length 10..10`), so the
+/// clause is already request-independent in size and needs no further ceiling.
 pub fn profile_version_not_found_message(profile_name: &str, profile_version: &str) -> String {
-    format!("profile with name {profile_name} has no version {profile_version}")
+    format!(
+        "Signing Profile with name {profile_name} and version {profile_version} does not exist."
+    )
 }
 
 /// The character class a `platformId` carried by `GET /revocations` is published

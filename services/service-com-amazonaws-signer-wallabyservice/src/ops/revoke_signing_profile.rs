@@ -165,11 +165,20 @@ impl From<RevokeSigningProfileErrorModeled> for RevokeSigningProfileError {
 
 /// The modelled 404 for a profile name this account holds no profile for.
 ///
-/// `code` names the condition a client branches on — there is no profile of that
-/// name — which is the only machine-readable discriminator a 404 body has.
-fn profile_not_found(profile_name: &str) -> RevokeSigningProfileError {
+/// This operation's `profileVersion` is `@required`, so the resource the request
+/// addressed is one VERSION of a profile: the clause names both halves of it
+/// ([`crate::state::profile_version_not_found_message`]), the same sentence the
+/// unknown-version condition below carries, because a caller cannot tell which
+/// half failed to resolve from a 404 that states only one of them.
+///
+/// `code` is what keeps the two conditions apart for a client branching on it:
+/// here no profile of that name exists at all.
+fn profile_not_found(profile_name: &str, profile_version: &str) -> RevokeSigningProfileError {
     RevokeSigningProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("profile with name {profile_name} does not exists")),
+        message: Some(crate::state::profile_version_not_found_message(
+            profile_name,
+            profile_version,
+        )),
         code: Some(crate::state::ERROR_CODE_PROFILE_NOT_FOUND.to_string()),
     })
     .into()
@@ -194,7 +203,9 @@ fn revocation_unsupported(platform_id: &str) -> RevokeSigningProfileError {
 /// The profile itself was resolved, so what the request failed to name is a
 /// SUB-RESOURCE of it: the refusal carries [`crate::state::ERROR_CODE_NOT_FOUND`]
 /// and not the profile-not-found code, so a client branching on `code` is not
-/// told a profile that is present is absent.
+/// told a profile that is present is absent. The MESSAGE is the one sentence
+/// this service states for a version it cannot resolve, so the prose does not
+/// depend on which half of the addressed resource was missing.
 fn profile_version_not_found(
     profile_name: &str,
     profile_version: &str,
@@ -270,7 +281,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(profile) = store.profile_mut(&region, &input.profile_name) else {
-            return Err(profile_not_found(&input.profile_name));
+            return Err(profile_not_found(
+                &input.profile_name,
+                &input.profile_version,
+            ));
         };
         // `profileVersion` names WHICH version of the profile is revoked, so a
         // version this profile has never had names no revocable resource.

@@ -92,6 +92,9 @@ mod revocation_status;
 #[path = "all/revocation_survives_a_reput.rs"]
 mod revocation_survives_a_reput;
 
+#[path = "all/revocation_writer_not_found_wording.rs"]
+mod revocation_writer_not_found_wording;
+
 #[path = "all/signature_revocation.rs"]
 mod signature_revocation;
 
