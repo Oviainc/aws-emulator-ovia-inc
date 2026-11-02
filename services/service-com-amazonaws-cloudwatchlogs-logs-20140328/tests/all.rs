@@ -21,6 +21,8 @@ mod account_policy_removal;
 mod account_policy_selection_criteria;
 #[path = "all/anomaly_suppression.rs"]
 mod anomaly_suppression;
+#[path = "all/cmk_group_delivery_byte_fidelity.rs"]
+mod cmk_group_delivery_byte_fidelity;
 #[path = "all/cmk_group_fan_out_isolation.rs"]
 mod cmk_group_fan_out_isolation;
 #[path = "all/configuration_templates.rs"]

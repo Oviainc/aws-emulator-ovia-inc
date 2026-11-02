@@ -209,6 +209,20 @@ impl Emulator {
     /// Everything the one-shard stream `stream` holds, from its oldest retained record:
     /// each record's partition key and the envelope its gzip-framed data decodes to.
     pub(crate) async fn delivered(&self, case: &str, stream: &str) -> Vec<(String, Value)> {
+        self.delivered_frames(case, stream)
+            .await
+            .into_iter()
+            .map(|(key, framed)| (key, gunzip_json(case, &framed)))
+            .collect()
+    }
+
+    /// The same records, as the BYTES each one's `Data` carries — what a consumer reads
+    /// before it decompresses anything, which is where the framing itself is observable.
+    pub(crate) async fn delivered_frames(
+        &self,
+        case: &str,
+        stream: &str,
+    ) -> Vec<(String, Vec<u8>)> {
         let iterator = self
             .kinesis(
                 case,
@@ -248,7 +262,7 @@ impl Emulator {
                         panic!("case {case}: a record carries a PartitionKey, got {record}")
                     })
                     .to_string();
-                (key, gunzip_json(case, &framed))
+                (key, framed)
             })
             .collect()
     }
@@ -315,15 +329,23 @@ impl Emulator {
     }
 }
 
-/// The JSON a delivered record's gzip frame carries. A frame that is not gzip, or does not
-/// hold JSON, fails the case here rather than later: the framing IS part of the rule.
-fn gunzip_json(case: &str, framed: &[u8]) -> Value {
-    let mut body = String::new();
+/// The BYTES a delivered record's gzip frame carries. A frame that is not gzip fails the
+/// case here rather than later: the framing IS part of the rule.
+pub(crate) fn gunzip(case: &str, framed: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
     ::flate2::read::GzDecoder::new(framed)
-        .read_to_string(&mut body)
+        .read_to_end(&mut body)
         .unwrap_or_else(|error| {
             panic!("case {case}: a delivered record is a gzip frame, got {error}")
         });
+    body
+}
+
+/// The JSON a delivered record's gzip frame carries. A frame that does not hold JSON fails
+/// the case here rather than later, for the same reason.
+fn gunzip_json(case: &str, framed: &[u8]) -> Value {
+    let body = String::from_utf8(gunzip(case, framed))
+        .unwrap_or_else(|error| panic!("case {case}: the frame holds UTF-8, got {error}"));
     serde_json::from_str(&body)
         .unwrap_or_else(|error| panic!("case {case}: the frame holds JSON, got {error} for {body}"))
 }
