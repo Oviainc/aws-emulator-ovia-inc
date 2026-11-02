@@ -345,6 +345,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // A rollback puts back a configuration this stack already deployed,
                         // so there is nothing for CloudFormation to refuse about it.
                         None,
+                        // What this rollback does with the `DeletionPolicy` of a resource
+                        // the failed update had created, which the revert removes again.
+                        policies,
                     ),
                 )
                 .await;

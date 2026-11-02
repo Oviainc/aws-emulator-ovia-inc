@@ -715,6 +715,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 deployment.declared,
                 &deployment.previous,
                 deployment.refused,
+                // What the new values no longer declare is a resource CloudFormation stops
+                // managing, so its own `DeletionPolicy` decides what becomes of it.
+                crate::state::provisioning::Policies::Honoured,
             )
             .await;
             let mut store = state.lock();

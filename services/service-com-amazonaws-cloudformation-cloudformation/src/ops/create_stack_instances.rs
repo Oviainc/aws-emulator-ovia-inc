@@ -690,6 +690,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 deployment.declared,
                 &[],
                 deployment.refused,
+                // A stack instance's create removes nothing of its own.
+                crate::state::provisioning::Policies::Honoured,
             )
             .await;
             let mut store = state.lock();

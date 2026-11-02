@@ -4891,6 +4891,9 @@ impl ComAmazonawsCloudformationCloudformationState {
                     // The role the rollback's own calls are made under, which is the one in
                     // force on the stack ([`service_role`]).
                     role_arn: stack.role_arn.clone(),
+                    // What this rollback does with the `DeletionPolicy` of a resource the
+                    // failed operation had created ([`provisioning::Policies`]).
+                    policies: stack.rolled_back_resource_policies(),
                     rollback,
                 })
             })
@@ -7474,6 +7477,10 @@ pub struct DueRollback {
     /// The service role in force on the stack, whose permissions decide the calls this
     /// rollback makes in the services that own its resources ([`service_role`]).
     pub role_arn: Option<String>,
+    /// What this rollback does with the `DeletionPolicy` of a resource the failed operation
+    /// had created, which the revert removes again
+    /// ([`StoredStack::rolled_back_resource_policies`]).
+    pub policies: provisioning::Policies,
     pub rollback: OwedRollback,
 }
 
@@ -7527,6 +7534,7 @@ pub async fn settle_due_rollbacks<Eng: Send + Sync + 'static>(
                 // A rollback puts back a configuration this stack already deployed, so
                 // there is nothing for CloudFormation to refuse about it.
                 None,
+                owed.policies,
             ),
         )
         .await;

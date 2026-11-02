@@ -1039,6 +1039,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 declared,
                 &previous_resources,
                 refused_deployment,
+                // An update is where CloudFormation stops managing a resource the template
+                // no longer declares, so that resource's own `DeletionPolicy` decides what
+                // becomes of it.
+                crate::state::provisioning::Policies::Honoured,
             ),
         )
         .await;

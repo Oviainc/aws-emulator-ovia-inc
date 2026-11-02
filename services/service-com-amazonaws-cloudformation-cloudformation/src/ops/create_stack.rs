@@ -813,6 +813,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 declared,
                 &[],
                 refused_deployment,
+                // A create removes nothing of its own; where it does take a resource down —
+                // its own rollback — that walk is the one below, under the policies the
+                // request asked for.
+                crate::state::provisioning::Policies::Honoured,
             ),
         )
         .await;

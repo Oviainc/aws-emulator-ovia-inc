@@ -229,6 +229,8 @@ mod resource_signals;
 mod rollback_trigger_types;
 #[path = "all/rolled_back_resource_records.rs"]
 mod rolled_back_resource_records;
+#[path = "all/rolled_back_resource_retention.rs"]
+mod rolled_back_resource_retention;
 #[path = "all/rolled_back_stack_configuration.rs"]
 mod rolled_back_stack_configuration;
 #[path = "all/s3vectors_resource_types.rs"]

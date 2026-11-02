@@ -743,6 +743,15 @@ pub async fn advance_stabilisations(
 /// the owning service's own refusal. A resource the deployment leaves exactly as it found it
 /// transitions through nothing and is recorded nowhere, and neither is one the walk never
 /// reached.
+///
+/// `removal_policies` is what this walk does with the `DeletionPolicy` of a resource it
+/// REMOVES — one the stack has and this deployment no longer declares ([`Policies`]). An
+/// ordinary deployment reads the attribute, which is where CloudFormation stops managing the
+/// resource; a deployment that is a stack's ROLLBACK passes what the operation being rolled
+/// back was asked for ([`super::StoredStack::rolled_back_resource_policies`]), since
+/// `RetainExceptOnCreate` is documented to override that attribute for a resource the
+/// operation itself created. The OLD physical resource of a replacement is governed by
+/// `UpdateReplacePolicy` instead, so that walk reads no deletion policy either way.
 pub async fn reconcile(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -750,6 +759,7 @@ pub async fn reconcile(
     declared: Vec<StoredResource>,
     previous: &[StoredResource],
     refused: Option<String>,
+    removal_policies: Policies,
 ) -> Materialised {
     let mut outcome = Materialised {
         // A deployment CLOUDFORMATION itself refused before this walk: nothing is asked of
@@ -1238,7 +1248,7 @@ pub async fn reconcile(
             &held,
             &mut opened,
             OnRefusal::Stop,
-            Policies::Honoured,
+            removal_policies,
         )
         .await;
         deleted.resources.append(&mut removed.resources);

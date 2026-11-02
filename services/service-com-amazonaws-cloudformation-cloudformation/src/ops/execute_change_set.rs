@@ -595,6 +595,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 declared,
                 &previous_resources,
                 refused_deployment,
+                // Executing a change set deploys a template, so a resource it no longer
+                // declares is one CloudFormation stops managing: its own `DeletionPolicy`
+                // decides what becomes of it.
+                crate::state::provisioning::Policies::Honoured,
             ),
         )
         .await;

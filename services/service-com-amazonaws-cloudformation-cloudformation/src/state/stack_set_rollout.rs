@@ -190,6 +190,10 @@ pub async fn apply(
             rollout.declared,
             &rollout.previous,
             rollout.refused,
+            // A revision the rollout no longer declares a resource in is a resource
+            // CloudFormation stops managing, so its own `DeletionPolicy` decides what
+            // becomes of it.
+            super::provisioning::Policies::Honoured,
         )
         .await;
         let mut store = state.lock();
