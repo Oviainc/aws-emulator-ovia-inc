@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_personalizeevents_amazonpersonalizeevents::state::{
-    service_state as ingestion_state, MetadataKind,
+    service_state as ingestion_state, MetadataKind, ACTION_INTERACTIONS_NOT_SUPPORTED_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -499,10 +499,23 @@ async fn the_data_plane_ingests_into_the_targets_the_control_plane_minted_and_re
         }),
     )
     .await;
+    // A tracking id the data plane can ingest no action-interaction stream through is the
+    // same input fault as an unresolvable `datasetArn`, worded the way that put words it.
     assert_eq!(
-        interactions.status, 404,
-        "case \"the tracking id of a deleted dataset\": expected the tracker to stop resolving, \
-         got {} with body {}",
-        interactions.status, interactions.body
+        (
+            interactions.status,
+            interactions.error_code().as_str(),
+            interactions.message()
+        ),
+        (
+            400,
+            "InvalidInputException",
+            ACTION_INTERACTIONS_NOT_SUPPORTED_MESSAGE
+        ),
+        "case \"the tracking id of a deleted dataset\": expected the tracker to stop resolving \
+         and the put to be refused as an input fault, got {} {:?} with body {}",
+        interactions.status,
+        interactions.error_code(),
+        interactions.body
     );
 }

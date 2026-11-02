@@ -23,8 +23,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_personalizeevents_amazonpersonalizeevents::state::{
     ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState as PersonalizeEventsState, Dataset,
     DatasetType, MetadataKind, Record, StoredActionInteraction, StoredEvent,
-    INVALID_DATASET_ARN_MESSAGE, MAX_ACTION_INTERACTIONS_PER_TRACKER, MAX_EVENTS_PER_TRACKER,
-    MAX_EVENT_TRACKERS, MAX_RECORDS_PER_DATASET_COLLECTION, RESERVED_PROPERTY_KEYS,
+    ACTION_INTERACTIONS_NOT_SUPPORTED_MESSAGE, INVALID_DATASET_ARN_MESSAGE,
+    MAX_ACTION_INTERACTIONS_PER_TRACKER, MAX_EVENTS_PER_TRACKER, MAX_EVENT_TRACKERS,
+    MAX_RECORDS_PER_DATASET_COLLECTION, RESERVED_PROPERTY_KEYS,
 };
 use service_com_amazonaws_personalizeevents_amazonpersonalizeevents::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -517,6 +518,8 @@ async fn an_unregistered_target_is_refused_by_every_operation() {
         }
     }
 
+    // A `trackingId` this service can ingest no action-interaction stream through is an
+    // INPUT fault too, stated without echoing the submitted id.
     for tracking_id in ["unknown-tracker", "1234567890", "a"] {
         let case = format!("/action-interactions trackingId={tracking_id}");
         let reply = emulator
@@ -528,7 +531,13 @@ async fn an_unregistered_target_is_refused_by_every_operation() {
                 ),
             )
             .await;
-        assert_refused(&case, &reply, 404, "ResourceNotFoundException");
+        assert_refused(&case, &reply, 400, "InvalidInputException");
+        assert!(
+            reply.body.contains(ACTION_INTERACTIONS_NOT_SUPPORTED_MESSAGE),
+            "case {case:?}: expected the message \
+             {ACTION_INTERACTIONS_NOT_SUPPORTED_MESSAGE:?}, got {:?}",
+            reply.body
+        );
         assert!(
             emulator.stored_interactions(tracking_id).is_empty(),
             "case {case:?}: a refused call must persist nothing, got {:?}",
@@ -572,8 +581,8 @@ async fn an_unregistered_target_is_refused_by_every_operation() {
                     "properties": r#"{"sessionId":"x"}"#,
                 }],
             }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "InvalidInputException",
         ),
     ] {
         let reply = emulator.post(route, &body).await;

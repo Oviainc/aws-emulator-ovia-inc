@@ -9,10 +9,16 @@
 //! Same two documented rules as `PutEvents` — an omitted `eventId` is generated and an
 //! id the tracker has already seen is ingested once (`ActionInteraction$eventId`), and
 //! `properties` is a JSON string map that may not use one of the six reserved key names
-//! (case insensitive) — both refused with `InvalidInputException` (400). Unlike
-//! `PutEvents` this operation DOES model `ResourceNotFoundException`, so a `trackingId`
-//! that names no known tracker is refused with it (404) instead of being created, and a
-//! tracker marked in use answers the modelled `ResourceInUseException` (409).
+//! (case insensitive) — both refused with `InvalidInputException` (400).
+//!
+//! A `trackingId` whose action-interaction stream this service cannot ingest into is
+//! refused with `InvalidInputException` (400) and
+//! [`crate::state::ACTION_INTERACTIONS_NOT_SUPPORTED_MESSAGE`], not with the
+//! `ResourceNotFoundException` (404) the model also declares: whether action
+//! interactions can be ingested through a tracking id at all is a property of the input,
+//! and Amazon Personalize answers that before (and instead of) reporting a missing
+//! resource — so no path of this operation answers the modelled 404. A tracker marked in
+//! use answers the modelled `ResourceInUseException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -188,16 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The target is resolved FIRST, as it is for the metadata puts: a request wrong
         // about both its tracker and an interaction answers for the tracker, the
-        // stronger and more specific fault.
+        // stronger and more specific fault. A tracking id this store can ingest no
+        // action-interaction stream through is an INPUT fault, so the refusal is the
+        // modelled 400 and its wording states the capability without echoing the id.
         let tracker = event_trackers.get_mut(&input.tracking_id).ok_or_else(|| {
-            PutActionInteractionsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "No event tracker with the tracking ID {} exists.",
-                        input.tracking_id
-                    )),
-                },
-            )
+            invalid_input(crate::state::ACTION_INTERACTIONS_NOT_SUPPORTED_MESSAGE)
         })?;
         if tracker.in_use {
             return Err(PutActionInteractionsErrorModeled::ResourceInUseException(

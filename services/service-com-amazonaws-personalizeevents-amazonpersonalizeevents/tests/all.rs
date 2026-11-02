@@ -17,3 +17,5 @@ mod constraint_refusal_messages;
 mod ingestion;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tracking_id_refusals.rs"]
+mod tracking_id_refusals;

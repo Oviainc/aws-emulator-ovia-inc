@@ -32,6 +32,13 @@
 //! dataset is refused with [`INVALID_DATASET_ARN_MESSAGE`], one resolving to a dataset of
 //! another type with [`not_a_valid_dataset_message`].
 //!
+//! An ingestion put asks the same of its `trackingId`, and a tracking id this service
+//! cannot ingest the requested stream through is an INPUT fault too — never a not-found,
+//! whatever each operation's modelled error set also allows: `PutEvents` refuses it with
+//! [`invalid_tracking_id_message`] and `PutActionInteractions` with
+//! [`ACTION_INTERACTIONS_NOT_SUPPORTED_MESSAGE`]. Like the two dataset refusals, neither
+//! echoes the value the caller submitted.
+//!
 //! ## What this store retains
 //!
 //! Ingestion never stops, so every place this store can grow is bounded and the bound
@@ -271,6 +278,33 @@ impl EventTracker {
         self.action_interactions.push_back(interaction);
     }
 }
+
+/// What an ingestion put answers for a `trackingId` whose item-interaction stream this
+/// service cannot ingest into — the tracking id resolves to no usable event tracker.
+///
+/// Amazon Personalize words this refusal against the ACCOUNT the call is authenticated to
+/// rather than against the value submitted: the fixed text is `Invalid trackingId in
+/// account ` and the single variable part is that account's 12-digit id, which for this
+/// emulator is the one account it serves ([`::engine::emulator_account_id`]). Like
+/// [`INVALID_DATASET_ARN_MESSAGE`] it names the member that could not be resolved and
+/// never the id itself, so the refusal reveals nothing about which ids exist.
+pub fn invalid_tracking_id_message() -> String {
+    format!(
+        "Invalid trackingId in account {}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// What `PutActionInteractions` answers for a `trackingId` whose action-interaction
+/// stream this service cannot ingest into.
+///
+/// Ingesting action interactions is a capability of what the tracking id names — a
+/// tracking id serves them only where an Action interactions dataset stands behind it —
+/// so a tracking id this service cannot ingest that stream through is reported as the
+/// capability fault it is (`InvalidInputException`, 400) rather than as a missing
+/// resource. The whole sentence is fixed: nothing from the request or from state is
+/// interpolated into it, so it carries no tracking id and no account.
+pub const ACTION_INTERACTIONS_NOT_SUPPORTED_MESSAGE: &str = "ActionInteractions is not supported.";
 
 /// One stored metadata record — an item, a user or an action — of a dataset.
 #[derive(Debug, Clone)]

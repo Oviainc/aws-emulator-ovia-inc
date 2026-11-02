@@ -20,10 +20,12 @@
 //!
 //! Like its four siblings this operation serves only a tracker this emulator knows: a
 //! `trackingId` is minted by `CreateEventTracker` in the Personalize control plane, so
-//! one that names no registered tracker is refused rather than created. This operation
-//! models NO `ResourceNotFoundException`, so the refusal is its one modelled error,
-//! `InvalidInputException` (400) — see `crate::state` for the registry a test or a
-//! sibling Personalize emulator seeds.
+//! one that names no registered tracker is refused rather than created — an INPUT fault,
+//! answered with this operation's one modelled error, `InvalidInputException` (400), and
+//! worded against the account the call is authenticated to
+//! ([`crate::state::invalid_tracking_id_message`]) rather than by echoing the submitted
+//! id. See `crate::state` for the registry a test or a sibling Personalize emulator
+//! seeds.
 //!
 //! A tracker marked in use still ingests here: this operation models no
 //! `ResourceInUseException`, and answering a client-fault 400 for a busy resource would
@@ -201,13 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The target is resolved FIRST, as it is for this service's other four
         // operations: a request wrong about both its tracker and an event answers for
-        // the tracker.
-        let tracker = event_trackers.get_mut(&input.tracking_id).ok_or_else(|| {
-            invalid_input(format!(
-                "No event tracker with the tracking ID {} exists.",
-                input.tracking_id
-            ))
-        })?;
+        // the tracker. A tracking id that resolves to no usable tracker is an INPUT
+        // fault, stated against the account the call is authenticated to and without
+        // echoing the id.
+        let tracker = event_trackers
+            .get_mut(&input.tracking_id)
+            .ok_or_else(|| invalid_input(crate::state::invalid_tracking_id_message()))?;
 
         // Validate every event BEFORE storing any of it: the call has one status, so a
         // batch carrying one unusable event ingests none of the batch.
