@@ -309,6 +309,18 @@ const MAX_CONTRIBUTION_KEYS: usize = 4;
 /// evaluates (Contributor Insights rule syntax).
 const MAX_CONTRIBUTION_FILTERS: usize = 4;
 
+/// How this service words a refusal of a rule body it cannot read as a Contributor Insights
+/// rule definition.
+///
+/// A Contributor Insights refusal message is a reason code and a sentence: the code names
+/// what the service found wrong with the request, and the sentence is fixed text for that
+/// class, echoing neither the rule name nor the body that was rejected (which the model lets
+/// run to 8192 characters). A body that is not a rule definition is ONE class whatever part
+/// of the syntax it gets wrong, so every such refusal reads the same — a client branches on
+/// the reason code to tell an unreadable body from a rejected rule name or an over-limit
+/// rule.
+const UNPARSEABLE_RULE_BODY: &str = "INVALID_RULE_BODY: The RuleBody could not be parsed.";
+
 /// Refuse a `RuleDefinition` that is not a Contributor Insights rule.
 ///
 /// "The definition of the rule, as a JSON object. The definition contains the keywords used
@@ -320,30 +332,38 @@ const MAX_CONTRIBUTION_FILTERS: usize = 4;
 /// syntax does not define are left alone, so a definition carrying more than the rule needs
 /// is still a rule.
 fn validate_definition(definition: &str) -> Result<(), PutInsightRuleError> {
-    let parsed: ::serde_json::Value = ::serde_json::from_str(definition)
-        .map_err(|_| invalid_parameter_value(definition_error("it is not a JSON object")))?;
-    let rule = parsed
-        .as_object()
-        .ok_or_else(|| invalid_parameter_value(definition_error("it is not a JSON object")))?;
+    if reads_as_a_rule(definition) {
+        Ok(())
+    } else {
+        Err(invalid_parameter_value(UNPARSEABLE_RULE_BODY.to_string()))
+    }
+}
+
+/// Whether the rule body reads as a Contributor Insights rule definition: a JSON object
+/// carrying the schema, the log groups, the log format, the contribution and the aggregation
+/// the rule syntax defines.
+fn reads_as_a_rule(definition: &str) -> bool {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(definition) else {
+        return false;
+    };
+    let Some(rule) = parsed.as_object() else {
+        return false;
+    };
 
     // "For rules that you create, this is always {"Name": "CloudWatchLogRule", "Version": 1}"
     // (`InsightRule$Schema`) — so both members are required to be exactly that, which is what
     // lets the stored rule report that schema back.
-    let schema = rule
+    let names_the_schema = rule
         .get("Schema")
         .and_then(::serde_json::Value::as_object)
-        .filter(|schema| {
+        .is_some_and(|schema| {
             schema.get("Name").and_then(::serde_json::Value::as_str)
                 == Some(crate::state::INSIGHT_RULE_SCHEMA_NAME)
                 && schema.get("Version").and_then(::serde_json::Value::as_u64)
                     == Some(crate::state::INSIGHT_RULE_SCHEMA_VERSION)
         });
-    if schema.is_none() {
-        return Err(invalid_parameter_value(definition_error(&format!(
-            "its Schema is not the {} schema, version {}",
-            crate::state::INSIGHT_RULE_SCHEMA_NAME,
-            crate::state::INSIGHT_RULE_SCHEMA_VERSION
-        ))));
+    if !names_the_schema {
+        return false;
     }
 
     // The log groups the rule evaluates, named either by name or by ARN. A rule that selects
@@ -358,9 +378,7 @@ fn validate_definition(definition: &str) -> Result<(), PutInsightRuleError> {
                 })
         });
     if !selects_log_groups {
-        return Err(invalid_parameter_value(definition_error(
-            "it names no log group in LogGroupNames or LogGroupARNArray",
-        )));
+        return false;
     }
 
     let log_format = rule
@@ -368,14 +386,13 @@ fn validate_definition(definition: &str) -> Result<(), PutInsightRuleError> {
         .and_then(::serde_json::Value::as_str)
         .unwrap_or_default();
     if !LOG_FORMATS.contains(&log_format) {
-        return Err(invalid_parameter_value(definition_error(&format!(
-            "its LogFormat is not one of {}",
-            LOG_FORMATS.join(" or ")
-        ))));
+        return false;
     }
 
     let contribution = rule.get("Contribution");
-    validate_contribution(contribution)?;
+    if !contribution_classifies_a_contributor(contribution) {
+        return false;
+    }
 
     // Whether the rule aggregates contributor data by count of occurrences or by the sum of
     // the field `ValueOf` names. Omitted, the rule counts; summing is what makes that field
@@ -383,10 +400,7 @@ fn validate_definition(definition: &str) -> Result<(), PutInsightRuleError> {
     if let Some(aggregate_on) = rule.get("AggregateOn") {
         let named = aggregate_on.as_str().unwrap_or_default();
         if !AGGREGATE_ON.contains(&named) {
-            return Err(invalid_parameter_value(definition_error(&format!(
-                "its AggregateOn is not one of {}",
-                AGGREGATE_ON.join(" or ")
-            ))));
+            return false;
         }
         let sums = named == AGGREGATE_ON_SUM;
         let names_a_value = contribution
@@ -395,24 +409,19 @@ fn validate_definition(definition: &str) -> Result<(), PutInsightRuleError> {
             .and_then(::serde_json::Value::as_str)
             .is_some_and(|value_of| !value_of.is_empty());
         if sums && !names_a_value {
-            return Err(invalid_parameter_value(definition_error(
-                "it aggregates on Sum without naming the field to sum in its Contribution's \
-                 ValueOf",
-            )));
+            return false;
         }
     }
 
-    Ok(())
+    true
 }
 
-/// Refuse a `Contribution` that classifies no contributor.
+/// Whether a `Contribution` classifies a contributor.
 ///
 /// A contribution carries the `Keys` a contributor is identified by, the field `ValueOf`
 /// names, and the `Filters` that narrow the log events, so a contribution without a key
 /// identifies nothing to attribute a contribution to.
-fn validate_contribution(
-    contribution: Option<&::serde_json::Value>,
-) -> Result<(), PutInsightRuleError> {
+fn contribution_classifies_a_contributor(contribution: Option<&::serde_json::Value>) -> bool {
     let contribution = contribution.and_then(::serde_json::Value::as_object);
     let keys = contribution
         .and_then(|object| object.get("Keys"))
@@ -420,34 +429,16 @@ fn validate_contribution(
     let Some(keys) =
         keys.filter(|keys| !keys.is_empty() && keys.iter().all(::serde_json::Value::is_string))
     else {
-        return Err(invalid_parameter_value(definition_error(
-            "its Contribution names no Keys",
-        )));
+        return false;
     };
     if keys.len() > MAX_CONTRIBUTION_KEYS {
-        return Err(invalid_parameter_value(definition_error(&format!(
-            "its Contribution names more than {MAX_CONTRIBUTION_KEYS} Keys"
-        ))));
+        return false;
     }
 
-    if let Some(filters) = contribution.and_then(|object| object.get("Filters")) {
-        let Some(filters) = filters.as_array() else {
-            return Err(invalid_parameter_value(definition_error(
-                "its Contribution's Filters is not an array",
-            )));
-        };
-        if filters.len() > MAX_CONTRIBUTION_FILTERS {
-            return Err(invalid_parameter_value(definition_error(&format!(
-                "its Contribution names more than {MAX_CONTRIBUTION_FILTERS} Filters"
-            ))));
-        }
+    match contribution.and_then(|object| object.get("Filters")) {
+        None => true,
+        Some(filters) => filters
+            .as_array()
+            .is_some_and(|filters| filters.len() <= MAX_CONTRIBUTION_FILTERS),
     }
-
-    Ok(())
-}
-
-/// How a refusal of the rule definition reads: which part of the syntax is wrong. The
-/// definition itself is not echoed — it can be 8192 characters long.
-fn definition_error(because: &str) -> String {
-    format!("The value for parameter RuleDefinition is not valid: {because}")
 }

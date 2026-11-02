@@ -24,6 +24,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// (`ScheduledQueryConfiguration$ScheduledQueryRoleARN`).
 const QUERY_ROLE: &str = "arn:aws:iam::000000000000:role/cwl-scheduled-query";
 
+/// The sentence a `DeleteAlarms` call naming more than one composite alarm is refused with:
+/// the service's own wording for the constraint "this total can include no more than one
+/// composite alarm" (`DeleteAlarms`), fixed text carrying nothing of the request.
+const MULTIPLE_COMPOSITE_ALARMS: &str = "Only one composite alarm delete is allowed per API call";
+
 /// The smallest `PutMetricAlarm` request: every required member and nothing else.
 fn metric_alarm(name: &str) -> Value {
     json!({
@@ -361,9 +366,10 @@ async fn one_call_deletes_no_more_than_one_composite_alarm() {
             "case {case:?}: expected HTTP 400 ValidationException, got {status} with {body}"
         );
         let message = error_message(&body);
-        assert!(
-            message.contains("only one composite alarm delete is allowed"),
-            "case {case:?}: the refusal must name the constraint it enforced, got {message:?}"
+        assert_eq!(
+            message, MULTIPLE_COMPOSITE_ALARMS,
+            "case {case:?}: the refusal must name the constraint it enforced in CloudWatch's \
+             own words, got {message:?}"
         );
         let remaining = remaining_alarm_names(&router).await;
         assert_eq!(
