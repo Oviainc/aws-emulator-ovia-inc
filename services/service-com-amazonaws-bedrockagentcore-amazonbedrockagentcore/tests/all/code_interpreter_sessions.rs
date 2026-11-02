@@ -25,6 +25,8 @@ use std::time::Duration;
 use aws_smithy_types::date_time::{DateTime, Format};
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as agentcore;
 
+use super::harness::label;
+
 /// The system code interpreter AWS ships; `codeInterpreterIdentifier` is modelled as a
 /// plain string, so any identifier a caller names addresses its own session set.
 const SYSTEM_INTERPRETER: &str = "aws.codeinterpreter.v1";
@@ -161,22 +163,6 @@ fn member<'a>(body: &'a Value, name: &str) -> &'a Value {
 
 fn text<'a>(body: &'a Value, name: &str) -> &'a str {
     member(body, name).as_str().unwrap_or("")
-}
-
-/// Percent-encode one `@httpLabel` / `@httpQuery` value, the way an AWS SDK does:
-/// everything outside RFC 3986's unreserved set is escaped, so an identifier's `.`
-/// and any other punctuation reach the server as part of the value rather than as URI
-/// syntax.
-fn label(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 /// One certificate, as `Certificate$location` models it: the `secretsManager` member of

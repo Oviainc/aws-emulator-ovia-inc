@@ -6823,6 +6823,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "percent-encoding",
  "rquickjs",
  "serde_json",
  "service-common",

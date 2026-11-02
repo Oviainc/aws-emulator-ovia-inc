@@ -842,7 +842,10 @@ fn resolve_evaluator(evaluator_id: &str) -> Result<ResolvedEvaluator, EvaluateEr
     if !(evaluator_id.starts_with(BUILTIN_PREFIX) || evaluator_id.starts_with(THIRD_PARTY_PREFIX)) {
         return Err(EvaluateErrorModeled::ResourceNotFoundException(
             ResourceNotFoundException {
-                message: Some(format!("evaluator {evaluator_id} not found")),
+                message: Some(crate::state::resource_not_found_message(
+                    crate::state::NotFoundResource::Evaluator,
+                    evaluator_id,
+                )),
             },
         )
         .into());

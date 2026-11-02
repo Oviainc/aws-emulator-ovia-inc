@@ -3,7 +3,9 @@
 //! @op DeleteEvent
 //! Removes one stored event from its session in [`crate::state`] and reports the id it
 //! removed. An event that is not there — including one already deleted — is a
-//! `ResourceNotFoundException` (404).
+//! `ResourceNotFoundException` (404). The path is resolved outside-in, so the refusal
+//! names the outermost step that does not exist (the memory container, then the
+//! session, then the event).
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +130,15 @@ impl From<DeleteEventErrorModeled> for DeleteEventError {
     }
 }
 
+/// A lookup that missed, as the modelled 404 with the service's own message wording
+/// (built by [`crate::state::resource_not_found_message`]).
+fn not_found(message: String) -> DeleteEventError {
+    DeleteEventErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `DeleteEvent` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -173,53 +184,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let memory_id = crate::state::normalize_memory_id(&input.memory_id);
         let mut store = state.lock();
-        let Some(memory) = store.memories.get_mut(&memory_id) else {
-            return Err(DeleteEventErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("memory {memory_id} not found")),
-                },
+        // The store resolves the path outside-in (memory, then session, then event) and
+        // words every refusal, so the resource reported missing is the outermost step of
+        // the path that does not exist, and the bookkeeping of the removal is the store's.
+        let event = store
+            .remove_event(
+                &input.memory_id,
+                &input.actor_id,
+                &input.session_id,
+                &input.event_id,
             )
-            .into());
-        };
-        let removed = memory
-            .actors
-            .get_mut(&input.actor_id)
-            .and_then(|actor| actor.sessions.get_mut(&input.session_id))
-            .and_then(|session| {
-                let at = session
-                    .events
-                    .iter()
-                    .position(|event| event.event_id == input.event_id)?;
-                session.events.remove(at)
-            });
+            .map_err(not_found)?;
 
-        match removed {
-            Some(event) => {
-                // The `clientToken` that created this event has nothing left to replay,
-                // so its record goes with the event rather than accumulating for the
-                // life of the process.
-                memory
-                    .idempotency
-                    .retain(|_, at| at.event_id != event.event_id);
-                // And the whole-store ring drops its key here rather than carrying a
-                // stale one: reaching the front later would prune the session this
-                // delete deliberately left in place.
-                store.order.retain(|key| key.event_id != event.event_id);
-                Ok(DeleteEventOutput {
-                    event_id: event.event_id,
-                })
-            }
-            None => Err(DeleteEventErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "event {} not found for actor {} in session {} of memory {}",
-                        input.event_id, input.actor_id, input.session_id, memory_id
-                    )),
-                },
-            )
-            .into()),
-        }
+        Ok(DeleteEventOutput {
+            event_id: event.event_id,
+        })
     }
 }

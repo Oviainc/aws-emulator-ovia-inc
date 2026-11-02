@@ -22,6 +22,8 @@ use std::sync::Arc;
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as agentcore;
 use agentcore::ops::types::{Content, IngestPayloadType, MetadataValue};
 
+use super::harness::label;
+
 /// A memory id matching `MemoryId`'s pattern
 /// `^(arn:...:memory/)?[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`.
 const MEMORY: &str = "ingest-memory-0123456789";
@@ -119,21 +121,6 @@ async fn create_event(router: &MultiServiceRouter, memory: &str, body: Value) ->
         Some(body),
     )
     .await
-}
-
-/// Percent-encode one `@httpLabel` value, the way an AWS SDK does: everything outside
-/// RFC 3986's unreserved set is escaped, so a memory ARN's `/` and `:` reach the
-/// server as part of the label rather than as URI syntax.
-fn label(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 /// `SessionId`'s modelled pattern, `^[a-zA-Z0-9][a-zA-Z0-9-_]*$`, with its 1..100 length.

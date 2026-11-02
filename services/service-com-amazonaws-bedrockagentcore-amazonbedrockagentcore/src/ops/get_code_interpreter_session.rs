@@ -195,9 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetCodeInterpreterSessionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "session {} not found for code interpreter {}",
-                            input.session_id, input.code_interpreter_identifier
+                        // The session is the resource addressed and the only one named:
+                        // the code interpreter it was looked for on is not part of this
+                        // message.
+                        message: Some(crate::state::resource_not_found_message(
+                            crate::state::NotFoundResource::Session,
+                            &input.session_id,
                         )),
                     },
                 )

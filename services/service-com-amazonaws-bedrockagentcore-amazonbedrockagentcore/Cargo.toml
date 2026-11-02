@@ -49,6 +49,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Percent-encodes an `@httpLabel` / `@httpQuery` value the way an AWS SDK does, so the
+# test harness never hand-rolls RFC 3986 escaping.
+percent-encoding = "2.3"
 # Decodes one `application/vnd.amazon.eventstream` frame, so a test reads
 # `InvokeCodeInterpreter`'s response the way an SDK's event-stream decoder does.
 aws-smithy-eventstream = "0.60"

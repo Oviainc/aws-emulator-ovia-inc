@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
+use super::harness::label;
+
 /// A memory id matching `MemoryId`'s pattern
 /// `^(arn:...:memory/)?[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`.
 const MEMORY: &str = "demo-memory-0123456789";
@@ -176,26 +178,6 @@ fn conversational(role: &str, text: &str) -> Value {
 
 fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
-}
-
-/// Percent-encode one `@httpLabel` value, the way an AWS SDK does: everything outside
-/// RFC 3986's unreserved set is escaped, so an `eventId`'s `#` and a memory ARN's `/`
-/// reach the server as part of the label rather than as URI syntax.
-///
-/// Written here rather than taken from `percent-encoding`: that crate is not in the
-/// root `[workspace.dependencies]` (which a fix may not edit), and a crate-local
-/// dependency edge for eight lines of test-harness encoding is not worth the
-/// `Cargo.lock` churn.
-fn label(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 /// A created event is reported from what was stored, for every payload shape the

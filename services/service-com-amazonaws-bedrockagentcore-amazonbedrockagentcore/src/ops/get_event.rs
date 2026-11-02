@@ -4,7 +4,9 @@
 //! Reports the event stored by `CreateEvent` at (memory, actor, session, event), from
 //! [`crate::state`]. Reporting only: it writes nothing.
 //!
-//! Any step of that path that does not exist is a `ResourceNotFoundException` (404).
+//! Any step of that path that does not exist is a `ResourceNotFoundException` (404),
+//! raised on the OUTERMOST missing step: a path under a memory container that does not
+//! exist reports the memory, not the event.
 //!
 //! ## Shape of an operation
 //!
@@ -171,21 +173,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let memory_id = crate::state::normalize_memory_id(&input.memory_id);
         let store = state.lock();
         let event = store
-            .find_event(
-                &memory_id,
+            .resolve_event(
+                &input.memory_id,
                 &input.actor_id,
                 &input.session_id,
                 &input.event_id,
             )
-            .ok_or_else(|| {
+            .map_err(|message| {
                 GetEventErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "event {} not found for actor {} in session {} of memory {}",
-                        input.event_id, input.actor_id, input.session_id, memory_id
-                    )),
+                    message: Some(message),
                 })
             })?;
 

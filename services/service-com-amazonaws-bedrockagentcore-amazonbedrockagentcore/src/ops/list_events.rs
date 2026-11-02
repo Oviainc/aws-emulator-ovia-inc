@@ -346,16 +346,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         }
 
-        let memory_id = crate::state::normalize_memory_id(&input.memory_id);
         let store = state.lock();
         let session = store
-            .session(&memory_id, &input.actor_id, &input.session_id)
-            .ok_or_else(|| {
+            .resolve_session(&input.memory_id, &input.actor_id, &input.session_id)
+            .map_err(|message| {
                 ListEventsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "session {} not found for actor {} in memory {}",
-                        input.session_id, input.actor_id, memory_id
-                    )),
+                    message: Some(message),
                 })
             })?;
 

@@ -216,11 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|filter| filter.event_filter.as_deref())
             == Some("HAS_EVENTS");
 
-        let memory_id = crate::state::normalize_memory_id(&input.memory_id);
         let store = state.lock();
-        let memory = store.memories.get(&memory_id).ok_or_else(|| {
+        let memory = store.resolve_memory(&input.memory_id).map_err(|message| {
             ListSessionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("memory {memory_id} not found")),
+                message: Some(message),
             })
         })?;
 
