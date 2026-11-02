@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCalculatedAttributeDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCalculatedAttributeDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Defines a calculated attribute under its domain: it persists the definition the
+//! request carries and answers from the record it stored, so a later
+//! `GetCalculatedAttributeDefinition` / `ListCalculatedAttributeDefinitions` reports the
+//! same definition.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCalculatedAttributeDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `CalculatedAttributeName` is the definition's identity within the domain (it is the
+//! operation's `@httpLabel`), so this is a CREATE and not a replace: the name is looked
+//! up and inserted under ONE hold of the store lock, so of any number of concurrent
+//! creates of one name exactly one is admitted and every other is refused
+//! `BadRequestException` (400) without touching what the winner stored.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +196,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCalculatedAttributeDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCalculatedAttributeDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCalculatedAttributeDefinition"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let domain = store
+            .domains
+            .get_mut(&input.domain_name)
+            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+
+        // The name identifies the definition within the domain, so a name the domain
+        // already holds is a conflict and never an overwrite. The lookup and the insert
+        // below happen under this one hold of the store lock, which is what makes the
+        // check-and-insert atomic: a concurrent create of the same name either finds
+        // nothing and wins, or finds the winner's record and is refused here.
+        if domain.calculated_attributes.contains_key(&input.calculated_attribute_name) {
+            return Err(bad_request(calculated_attribute_exists(
+                &input.calculated_attribute_name,
+            )));
+        }
+        if domain.calculated_attributes.len()
+            >= crate::state::MAX_CALCULATED_ATTRIBUTES_PER_DOMAIN
+        {
+            return Err(bad_request(format!(
+                "The maximum number of calculated attributes for domain {} has been reached: {}",
+                input.domain_name,
+                crate::state::MAX_CALCULATED_ATTRIBUTES_PER_DOMAIN
+            )));
+        }
+
+        let stored = crate::state::StoredCalculatedAttribute::from_request(input, now);
+
+        // The response is the record that was just stored, so it is the same definition
+        // the readers serve.
+        let output = CreateCalculatedAttributeDefinitionOutput {
+            calculated_attribute_name: Some(stored.name.clone()),
+            display_name: stored.display_name.clone(),
+            description: stored.description.clone(),
+            attribute_details: Some(stored.attribute_details.clone()),
+            conditions: stored.conditions.clone(),
+            filter: stored.filter.clone(),
+            statistic: Some(stored.statistic.clone()),
+            created_at: Some(crate::state::to_date_time(stored.created_at)),
+            last_updated_at: Some(crate::state::to_date_time(stored.last_updated_at)),
+            use_historical_data: stored.use_historical_data,
+            status: Some(stored.status(now)),
+            readiness: Some(stored.readiness(now)),
+            tags: stored.tags.clone(),
+        };
+
+        domain
+            .calculated_attributes
+            .insert(stored.name.clone(), stored);
+        Ok(output)
     }
+}
+
+/// The `BadRequestException` message for a calculated attribute name the domain already
+/// holds: the service's fixed sentence for an already-existing definition, with the name
+/// the request's `{CalculatedAttributeName}` label carried as its only variable part.
+fn calculated_attribute_exists(calculated_attribute_name: &str) -> String {
+    format!(
+        "Calculated attribute definition with name {calculated_attribute_name} already exists"
+    )
+}
+
+/// The request is invalid — HTTP 400, the error code a client branches on to learn that
+/// someone else already created this name.
+fn bad_request(message: String) -> CreateCalculatedAttributeDefinitionError {
+    CreateCalculatedAttributeDefinitionErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A domain the request names is not stored.
+fn not_found(message: String) -> CreateCalculatedAttributeDefinitionError {
+    CreateCalculatedAttributeDefinitionErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> CreateCalculatedAttributeDefinitionError {
+    CreateCalculatedAttributeDefinitionErrorModeled::InternalServerException(
+        crate::state::store_unavailable(),
+    )
+    .into()
 }

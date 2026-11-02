@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCalculatedAttributeDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCalculatedAttributeDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCalculatedAttributeDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the calculated attribute definitions stored under one domain, in name order, a
+//! page at a time, and changes nothing a later caller sees. A domain this emulator does
+//! not hold is `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +146,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCalculatedAttributeDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCalculatedAttributeDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCalculatedAttributeDefinitions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        // Definitions are stored in name order, so one page's cursor resumes the next.
+        // The store lock is released at the end of this block, before the response is
+        // built.
+        let (items, next_token) = {
+            let store = state.lock();
+            let domain = store
+                .domains
+                .get(&input.domain_name)
+                .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+            let listed = domain.calculated_attributes.iter().map(|(name, stored)| {
+                (
+                    name.clone(),
+                    ListCalculatedAttributeDefinitionItem {
+                        calculated_attribute_name: Some(stored.name.clone()),
+                        display_name: stored.display_name.clone(),
+                        description: stored.description.clone(),
+                        created_at: Some(crate::state::to_date_time(stored.created_at)),
+                        last_updated_at: Some(crate::state::to_date_time(stored.last_updated_at)),
+                        use_historical_data: stored.use_historical_data,
+                        status: Some(stored.status(now)),
+                        tags: stored.tags.clone(),
+                    },
+                )
+            });
+            crate::state::paginate(listed, input.next_token.as_deref(), input.max_results)
+        };
+
+        Ok(ListCalculatedAttributeDefinitionsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
+}
+
+/// A domain the request names is not stored.
+fn not_found(message: String) -> ListCalculatedAttributeDefinitionsError {
+    ListCalculatedAttributeDefinitionsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> ListCalculatedAttributeDefinitionsError {
+    ListCalculatedAttributeDefinitionsErrorModeled::InternalServerException(
+        crate::state::store_unavailable(),
+    )
+    .into()
 }

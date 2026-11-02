@@ -220,15 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A template supplies the members named below, so naming a template AND any of
         // them is two definitions of the same thing. Refused HERE, before the write:
-        // the object type must not exist afterwards.
-        if input.template_id.is_some() {
-            let conflicting = template_supplied_members(&input);
-            if !conflicting.is_empty() {
-                return Err(bad_request(format!(
-                    "The following attributes cannot be present when TemplateId is specified: {}",
-                    conflicting.join(", ")
-                )));
-            }
+        // the object type must not exist afterwards. The refusal is the service's one
+        // fixed sentence for this conflict class, which names no member of the request.
+        if input.template_id.is_some() && states_template_supplied_members(&input) {
+            return Err(bad_request(TEMPLATE_CONFLICT_MESSAGE.to_string()));
         }
 
         // The definition either replaces one the domain already holds — keeping the
@@ -293,29 +288,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The members `PutProfileObjectTypeRequest$TemplateId`'s own documentation names as the
-/// ones a template supplies — "AllowProfileCreation, SourceLastUpdatedTimestampFormat,
-/// Fields, and Keys" — that THIS request also carries, in that order.
+/// The refusal for a request that states its configuration twice: one sentence for the
+/// whole conflict class, carrying no part of the request — the service does not name
+/// which member collided.
+const TEMPLATE_CONFLICT_MESSAGE: &str = "Can't specify fields or keys together with a templateId";
+
+/// Whether THIS request carries any of the members
+/// `PutProfileObjectTypeRequest$TemplateId`'s own documentation names as the ones a
+/// template supplies — "AllowProfileCreation, SourceLastUpdatedTimestampFormat, Fields,
+/// and Keys".
 ///
 /// `AllowProfileCreation` is modelled with a default of `false`, so a request that
 /// leaves it out is indistinguishable on the wire from one that sends `false`: only the
 /// `true` the documentation's own example gives ("if AllowProfileCreation is set to true
 /// when TemplateId is set, the service may return a BadRequestException") is a value the
 /// request can be said to carry.
-fn template_supplied_members(input: &PutProfileObjectTypeInput) -> Vec<&'static str> {
-    let carried = [
-        ("AllowProfileCreation", input.allow_profile_creation),
-        (
-            "SourceLastUpdatedTimestampFormat",
-            input.source_last_updated_timestamp_format.is_some(),
-        ),
-        ("Fields", input.fields.is_some()),
-        ("Keys", input.keys.is_some()),
-    ];
-    carried
-        .into_iter()
-        .filter_map(|(member, present)| present.then_some(member))
-        .collect()
+fn states_template_supplied_members(input: &PutProfileObjectTypeInput) -> bool {
+    input.allow_profile_creation
+        || input.source_last_updated_timestamp_format.is_some()
+        || input.fields.is_some()
+        || input.keys.is_some()
 }
 
 /// The request is invalid — HTTP 400, the error code a client branches on.

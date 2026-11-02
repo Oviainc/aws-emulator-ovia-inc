@@ -29,6 +29,10 @@ const TEMPLATE_SUPPLIED_MEMBERS: [&str; 4] = [
     "Keys",
 ];
 
+/// The sentence the service refuses a request that states its configuration twice with:
+/// one fixed text for the whole conflict class, naming no member of the request.
+const TEMPLATE_CONFLICT_MESSAGE: &str = "Can't specify fields or keys together with a templateId";
+
 /// A `Fields` map: `ObjectTypeField`'s three members, with a `ContentType` out of the
 /// modelled `FieldContentType` enum (STRING | NUMBER | PHONE_NUMBER | EMAIL_ADDRESS |
 /// NAME).
@@ -71,7 +75,7 @@ async fn get(emulator: &Emulator, domain: &str, name: &str) -> (u16, Value) {
 }
 
 /// The `Message` an error body carries, whichever casing the protocol rendered it in.
-fn error_message(body: &Value) -> &str {
+pub(crate) fn error_message(body: &Value) -> &str {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)
@@ -163,21 +167,18 @@ async fn a_put_that_names_a_template_and_what_the_template_supplies_is_refused()
             "BadRequestException",
             "case {case:?}: expected BadRequestException, got {response:?}"
         );
+        // The sentence is fixed for the class: whichever of the members collided, the
+        // refusal reads the same and names none of them.
         let message = error_message(&response);
-        for member in &conflicting {
-            assert!(
-                message.contains(member),
-                "case {case:?}: the refusal must name the conflicting {member}, got {message:?}"
-            );
-        }
-        for member in TEMPLATE_SUPPLIED_MEMBERS
-            .iter()
-            .filter(|member| !conflicting.contains(member))
-        {
+        assert_eq!(
+            message, TEMPLATE_CONFLICT_MESSAGE,
+            "case {case:?} (conflicting {conflicting:?}): expected the fixed conflict \
+             sentence, got {message:?}"
+        );
+        for member in TEMPLATE_SUPPLIED_MEMBERS {
             assert!(
                 !message.contains(member),
-                "case {case:?}: the refusal must not name {member}, which the request did \
-                 not carry, got {message:?}"
+                "case {case:?}: the refusal must name no request member, got {message:?}"
             );
         }
 

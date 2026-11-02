@@ -17,8 +17,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    DataStoreResponse, MatchingResponse, ObjectTypeField, ObjectTypeKey, Profile, Readiness,
-    ResultsSummary, RuleBasedMatchingResponse,
+    AttributeDetails, Conditions, CreateCalculatedAttributeDefinitionInput, DataStoreResponse,
+    Filter, MatchingResponse, ObjectTypeField, ObjectTypeKey, Profile, Readiness, ResultsSummary,
+    RuleBasedMatchingResponse,
 };
 
 /// How long after `CreateDomain` the asynchronous work a new domain kicks off is treated
@@ -79,6 +80,28 @@ pub const MAX_OBJECT_TYPES_PER_DOMAIN: usize = 1_000;
 /// for one domain. Set well above any realistic emulator workload, and checked before
 /// the insert so repeated `CreateUploadJob` calls cannot grow the store without bound.
 pub const MAX_UPLOAD_JOBS_PER_DOMAIN: usize = 1_000;
+
+/// Emulator resource guard, NOT an AWS quota: the most calculated attribute definitions
+/// this emulator stores for one domain. Set well above any realistic emulator workload,
+/// and checked before the insert so repeated `CreateCalculatedAttributeDefinition` calls
+/// cannot grow the store without bound.
+pub const MAX_CALCULATED_ATTRIBUTES_PER_DOMAIN: usize = 1_000;
+
+/// How long after `CreateCalculatedAttributeDefinition` the indexing of the historical
+/// data the definition asked for is treated as finished.
+///
+/// AWS documents no duration for it, so this is a CHOSEN span. It is deliberately
+/// non-zero: a caller that reads the definition back immediately must still observe the
+/// transient status the create call reported.
+pub const HISTORICAL_DATA_INDEXING_SPAN: Duration = Duration::from_secs(3);
+
+/// `ReadinessStatus` while the historical data a calculated attribute asked for is still
+/// being indexed — the first of the modelled statuses.
+pub const READINESS_PREPARING: &str = "PREPARING";
+
+/// `ReadinessStatus` once every object the calculated attribute covers is indexed, so the
+/// attribute is ready for use.
+pub const READINESS_COMPLETED: &str = "COMPLETED";
 
 /// The `DataExpiry` an upload job gets when the request carries none.
 /// `CreateUploadJobRequest$DataExpiry` documents it: "The expiry duration for the
@@ -161,6 +184,11 @@ pub struct Domain {
     /// is the job's identity (`@httpLabel` on every upload-job operation). A `BTreeMap`,
     /// so a listing walks them in one stable order.
     pub upload_jobs: BTreeMap<String, StoredUploadJob>,
+    /// The domain's calculated attribute definitions, keyed by `CalculatedAttributeName`
+    /// — the name is the definition's identity (`@httpLabel` on every
+    /// calculated-attribute operation), so the (domain, name) pair identifies exactly
+    /// one definition. A `BTreeMap`, so a listing walks them in one stable order.
+    pub calculated_attributes: BTreeMap<String, StoredCalculatedAttribute>,
     /// `KeyName` -> `Value` -> the ids of the profiles indexed under that pair. This is
     /// what `SearchProfiles` reads; [`Domain::put_profile`] fills it and
     /// [`Domain::remove_profile`] empties it. Nested rather than keyed by a
@@ -286,6 +314,110 @@ impl StoredUploadJob {
     }
 }
 
+/// One stored calculated attribute definition: the configuration
+/// `CreateCalculatedAttributeDefinition` persisted and the timestamps the service keeps
+/// for it.
+///
+/// `Status` and `Readiness` are NOT stored: they report how far the indexing of the
+/// definition's historical data has got, which is a function of the clock, so both are
+/// computed on every read from [`StoredCalculatedAttribute::indexed_at`].
+#[derive(Debug, Clone)]
+pub struct StoredCalculatedAttribute {
+    /// `CalculatedAttributeName`, as stored (also this record's key in
+    /// [`Domain::calculated_attributes`]).
+    pub name: String,
+    /// `DisplayName`, as stored.
+    pub display_name: Option<String>,
+    /// `Description`, as stored.
+    pub description: Option<String>,
+    /// `AttributeDetails`, as stored: the expression and the attributes it names.
+    pub attribute_details: AttributeDetails,
+    /// `Conditions`, as stored.
+    pub conditions: Option<Conditions>,
+    /// `Filter`, as stored.
+    pub filter: Option<Filter>,
+    /// `Statistic`, one of the modelled `Statistic` values.
+    pub statistic: String,
+    /// `UseHistoricalData`, as stored: whether data ingested before the definition was
+    /// created is included, which is what gives the definition anything to index.
+    pub use_historical_data: Option<bool>,
+    /// `Tags`, as stored.
+    pub tags: Option<HashMap<String, String>>,
+    /// `CreatedAt`: generated once, when the definition was created, and never
+    /// recomputed.
+    pub created_at: SystemTime,
+    /// `LastUpdatedAt`: the last time the definition was written.
+    pub last_updated_at: SystemTime,
+    /// When the indexing [`HISTORICAL_DATA_INDEXING_SPAN`] covers falls due. Stored as an
+    /// instant so no handler ever sleeps for it, and equal to `created_at` for a
+    /// definition that asked for no historical data: there is nothing to index, so it is
+    /// ready at once.
+    pub indexed_at: SystemTime,
+}
+
+impl StoredCalculatedAttribute {
+    /// A freshly created definition: the configuration the request carried, taken from the
+    /// already-validated request itself so no member can be transposed on the way in, with
+    /// the instant its historical-data indexing falls due. A definition that did not ask
+    /// for historical data has nothing to index, so that instant is `now`.
+    pub fn from_request(input: CreateCalculatedAttributeDefinitionInput, now: SystemTime) -> Self {
+        let indexed_at = if input.use_historical_data == Some(true) {
+            now + HISTORICAL_DATA_INDEXING_SPAN
+        } else {
+            now
+        };
+        Self {
+            name: input.calculated_attribute_name,
+            display_name: input.display_name,
+            description: input.description,
+            attribute_details: input.attribute_details,
+            conditions: input.conditions,
+            filter: input.filter,
+            statistic: input.statistic,
+            use_historical_data: input.use_historical_data,
+            tags: input.tags,
+            created_at: now,
+            last_updated_at: now,
+            indexed_at,
+        }
+    }
+
+    /// Whether every object this definition covers is indexed as of `now`.
+    pub fn is_indexed(&self, now: SystemTime) -> bool {
+        now >= self.indexed_at
+    }
+
+    /// `Status` as the wire reports it: the indexing is either still under way or done.
+    pub fn status(&self, now: SystemTime) -> String {
+        if self.is_indexed(now) {
+            READINESS_COMPLETED.to_string()
+        } else {
+            READINESS_PREPARING.to_string()
+        }
+    }
+
+    /// `Readiness` as the wire reports it: how far the indexing has got, as a percentage
+    /// in 0..=100 (the range `Readiness$ProgressPercentage` declares), and a sentence
+    /// saying whether the attribute can be used yet.
+    ///
+    /// `Readiness$Message` is documented only as "Any customer messaging", so the two
+    /// sentences below are CHOSEN wording, in the same form as the one
+    /// [`Domain::data_store_response`] reports for a data store.
+    pub fn readiness(&self, now: SystemTime) -> Readiness {
+        Readiness {
+            progress_percentage: Some(progress_percentage(self.created_at, self.indexed_at, now)),
+            message: Some(
+                if self.is_indexed(now) {
+                    "All historical data has been processed."
+                } else {
+                    "Historical data is being processed."
+                }
+                .to_string(),
+            ),
+        }
+    }
+}
+
 /// One stored profile: the modelled shape plus the timestamps the service keeps for it.
 #[derive(Debug, Clone)]
 pub struct StoredProfile {
@@ -320,6 +452,7 @@ impl Domain {
             profiles: BTreeMap::new(),
             object_types: BTreeMap::new(),
             upload_jobs: BTreeMap::new(),
+            calculated_attributes: BTreeMap::new(),
             key_index: HashMap::new(),
         }
     }
@@ -332,12 +465,7 @@ impl Domain {
     /// How far through [`ASYNC_WORK_SPAN`] this domain is, as a percentage in 0..=100
     /// (the range `Readiness$ProgressPercentage` declares).
     pub fn progress_percentage(&self, now: SystemTime) -> i32 {
-        let span = ASYNC_WORK_SPAN.as_secs_f64();
-        let elapsed = now
-            .duration_since(self.created_at)
-            .unwrap_or_default()
-            .as_secs_f64();
-        ((elapsed / span) * 100.0).clamp(0.0, 100.0).round() as i32
+        progress_percentage(self.created_at, self.ready_at, now)
     }
 
     /// `Matching` as the wire reports it.
@@ -518,6 +646,27 @@ pub fn paginate<T>(
     (page, token)
 }
 
+/// How far through a span that started at `started_at` and falls due at `due_at` the
+/// clock has got as of `now`, as a percentage in 0..=100 — the range every
+/// `Readiness$ProgressPercentage` on this service's wire declares. One definition of the
+/// clamp and the rounding, so two resources reporting progress cannot drift apart.
+///
+/// A span of no length is complete: there is nothing left to wait for.
+pub fn progress_percentage(started_at: SystemTime, due_at: SystemTime, now: SystemTime) -> i32 {
+    let span = due_at
+        .duration_since(started_at)
+        .unwrap_or_default()
+        .as_secs_f64();
+    if span <= 0.0 {
+        return 100;
+    }
+    let elapsed = now
+        .duration_since(started_at)
+        .unwrap_or_default()
+        .as_secs_f64();
+    ((elapsed / span) * 100.0).clamp(0.0, 100.0).round() as i32
+}
+
 /// A stored instant as the modelled `timestamp` the wire carries.
 pub fn to_date_time(instant: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = instant
@@ -540,6 +689,13 @@ pub fn store_unavailable() -> crate::ops::types::InternalServerException {
 /// the same absent name reads the same whichever of them was called.
 pub fn object_type_not_found(object_type_name: &str) -> String {
     format!("ObjectType {object_type_name} not found")
+}
+
+/// The `ResourceNotFoundException` message for a domain this emulator does not hold, as
+/// every domain-scoped operation words that refusal: the resource kind and the name the
+/// request carried.
+pub fn domain_not_found(domain_name: &str) -> String {
+    format!("The domain {domain_name} does not exist")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
