@@ -263,15 +263,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not hold is a placement EC2 itself refuses, and THIS operation reports the code
         // EC2 answered as its message — the recorded refusal of a create naming such a
         // subnet carries exactly that code, which is why the code is surfaced here while
-        // the other two operations that resolve the same lookup state the sentence their
-        // own error shape is documented with. Nothing is held across that call: the store
+        // the two operations that resolve the same lookup state the sentence EC2 worded
+        // its refusal with. Nothing is held across that call: the store
         // is locked only once the answer is in.
         let placement = match crate::state::resolve_subnet_placement(ctx, &region, &subnets).await {
             Ok(placement) => placement,
-            Err(code) => {
+            Err(refusal) => {
                 return Err(CreateLoadBalancerErrorModeled::SubnetNotFoundException(
                     SubnetNotFoundException {
-                        message: Some(code),
+                        message: Some(refusal.code),
                     },
                 )
                 .into());
@@ -280,22 +280,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A security group is EC2's resource too, and the same rule holds for it: one the
         // account does not hold cannot govern this load balancer's traffic, and what EC2
         // reports for the ones it does hold is what the load balancer reports as its
-        // source security group. The refusal states the sentence the model itself gives
-        // `InvalidSecurityGroupException` — "One or more of the specified security groups
-        // do not exist."
+        // source security group. The refusal reports what EC2 answered, worded the way
+        // this operation's recorded subnet refusal is: the code, rather than the
+        // documentation summary of the error class.
         let source_security_group =
             match crate::state::resolve_source_security_group(ctx, &region, &security_groups).await
             {
                 Ok(resolved) => resolved,
-                Err(_) => {
+                Err(refusal) => {
                     return Err(
                         CreateLoadBalancerErrorModeled::InvalidSecurityGroupException(
                             InvalidSecurityGroupException {
-                                message: Some(
-                                    "One or more of the specified security groups do not \
-                                     exist."
-                                        .to_string(),
-                                ),
+                                message: Some(refusal.code),
                             },
                         )
                         .into(),

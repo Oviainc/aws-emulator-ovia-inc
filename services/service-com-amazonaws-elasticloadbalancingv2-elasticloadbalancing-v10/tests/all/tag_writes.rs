@@ -484,17 +484,32 @@ async fn a_tag_key_named_twice_in_one_call_is_refused() {
     );
 
     // Rows differ in where the repeat sits and whether the two values agree: either way
-    // the request does not say what the key takes.
+    // the request does not say what the key takes — and the refusal names the key that was
+    // repeated, whichever position it sat in.
     let cases = [
-        ("the same key twice with different values", vec![("env", "dev"), ("env", "test")]),
-        ("the same key twice with the same value", vec![("env", "dev"), ("env", "dev")]),
+        (
+            "the same key twice with different values",
+            vec![("env", "dev"), ("env", "test")],
+            "env",
+        ),
+        (
+            "the same key twice with the same value",
+            vec![("env", "dev"), ("env", "dev")],
+            "env",
+        ),
         (
             "a repeat after an unrelated key",
             vec![("tier", "web"), ("env", "dev"), ("env", "test")],
+            "env",
+        ),
+        (
+            "a repeat of a key whose name is the longer of two",
+            vec![("env", "dev"), ("environment", "dev"), ("environment", "test")],
+            "environment",
         ),
     ];
 
-    for (case, pairs) in cases {
+    for (case, pairs, repeated) in cases {
         let refused = add_tags_to(&router, &tg, &owned(&pairs)).await;
         assert_eq!(
             (refused.status, refused.error_code().as_str()),
@@ -503,10 +518,13 @@ async fn a_tag_key_named_twice_in_one_call_is_refused() {
             refused.status,
             refused.body
         );
-        assert!(
-            !message(&refused).is_empty(),
-            "case {case:?}: expected a non-empty message, got {}",
-            refused.body
+        let expected = format!(
+            "Tag key '{repeated}' has two values, but tag keys must have exactly one value"
+        );
+        let stated = unescaped(&message(&refused));
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected the message {expected:?}, got {stated:?}"
         );
         assert_eq!(
             stored(&router, &tg).await,

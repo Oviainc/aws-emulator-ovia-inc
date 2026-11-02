@@ -148,17 +148,58 @@ fn subnet_facts(subnet: &::aws_sdk_ec2::types::Subnet) -> SubnetFacts {
     }
 }
 
+/// The EC2 refusal a read of the account's network ran into.
+///
+/// Elastic Load Balancing reports the refusal EC2 answered rather than restating it, so a
+/// caller that refuses its own request states one of these: the error CODE EC2 answered,
+/// and — when EC2 worded a sentence of its own — that sentence, which names the id EC2
+/// refused the read for and so tells the caller WHICH of the values it sent was rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkRefusal {
+    /// The error code EC2 answered.
+    pub code: String,
+    /// The sentence EC2 worded the refusal with, or `None` when it answered none.
+    pub message: Option<String>,
+}
+
+impl NetworkRefusal {
+    /// A refusal EC2 answered no sentence of its own for: a read that resolved without
+    /// reporting one of the ids says what the code says, and nothing more.
+    pub fn new(code: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: None,
+        }
+    }
+
+    /// The refusal EC2 answered, with the sentence it worded (when it worded one).
+    pub fn worded(code: impl Into<String>, message: Option<String>) -> Self {
+        Self {
+            code: code.into(),
+            message,
+        }
+    }
+
+    /// What a caller states as the MESSAGE of its own refusal: EC2's sentence when EC2
+    /// worded one, because it names the id at fault, and the code it answered otherwise.
+    pub fn reported_message(&self) -> String {
+        self.message
+            .clone()
+            .unwrap_or_else(|| self.code.clone())
+    }
+}
+
 /// What EC2 says about the subnets a request named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubnetLookup {
     /// EC2 reported the subnets, in the order it answered.
     Resolved(Vec<SubnetFacts>),
     /// EC2 reports that the account holds no subnet for one of the ids the request named,
-    /// carrying the error CODE it answered (`InvalidSubnetID.NotFound` for an id that
+    /// carrying the refusal it answered (`InvalidSubnetID.NotFound` for an id that
     /// names no subnet, `InvalidSubnetID.Malformed` for a value that is not a subnet id at
     /// all) — which is what a caller states when it refuses the request, because Elastic
     /// Load Balancing reports the EC2 refusal it ran into rather than restating it.
-    Absent(String),
+    Absent(NetworkRefusal),
     /// Nothing is known: there is no EC2 to ask, or it answered something else.
     Unknown,
 }
@@ -194,19 +235,24 @@ pub async fn resolve_subnets(
                 .iter()
                 .any(|id| !reported.iter().any(|subnet| &subnet.subnet_id == id))
             {
-                return SubnetLookup::Absent(SUBNET_ID_NOT_FOUND.to_string());
+                return SubnetLookup::Absent(NetworkRefusal::new(SUBNET_ID_NOT_FOUND));
             }
             return SubnetLookup::Resolved(reported);
         }
         Err(error) => error,
     };
-    let code = error
-        .as_service_error()
+    let refused = error.as_service_error();
+    let code = refused
         .and_then(ProvideErrorMetadata::code)
         .unwrap_or_default()
         .to_string();
     if code.starts_with(SUBNET_ID_REFUSAL_PREFIX) {
-        return SubnetLookup::Absent(code);
+        // EC2 worded this refusal around the subnet id it would not resolve, so the
+        // sentence is carried along with the code: it is what names that id to the caller.
+        let message = refused
+            .and_then(ProvideErrorMetadata::message)
+            .map(str::to_string);
+        return SubnetLookup::Absent(NetworkRefusal::worded(code, message));
     }
     ::tracing::debug!(
         error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
@@ -389,10 +435,10 @@ pub enum SecurityGroupLookup {
     /// EC2 reported every group the request named, in the order it answered.
     Resolved(Vec<SecurityGroupFacts>),
     /// EC2 reports that the account holds no security group for one of the ids the request
-    /// named, carrying the error CODE it answered — which is what a caller states when it
+    /// named, carrying the refusal it answered — which is what a caller states when it
     /// refuses the request, because Elastic Load Balancing reports the EC2 refusal it ran
     /// into rather than restating it.
-    Absent(String),
+    Absent(NetworkRefusal),
     /// Nothing is known: there is no EC2 to ask, or it answered something else.
     Unknown,
 }
@@ -458,19 +504,24 @@ pub async fn resolve_security_groups(
                 .map(|group| group.group_id.as_str())
                 .collect();
             if group_ids.iter().any(|id| !index.contains(id.as_str())) {
-                return SecurityGroupLookup::Absent(GROUP_NOT_FOUND.to_string());
+                return SecurityGroupLookup::Absent(NetworkRefusal::new(GROUP_NOT_FOUND));
             }
             return SecurityGroupLookup::Resolved(reported);
         }
         Err(error) => error,
     };
-    let code = error
-        .as_service_error()
+    let refused = error.as_service_error();
+    let code = refused
         .and_then(ProvideErrorMetadata::code)
         .unwrap_or_default()
         .to_string();
     if GROUP_REFUSAL_CODES.contains(&code.as_str()) {
-        return SecurityGroupLookup::Absent(code);
+        // EC2 worded this refusal around the group id it would not resolve, so the
+        // sentence is carried along with the code: it is what names that id to the caller.
+        let message = refused
+            .and_then(ProvideErrorMetadata::message)
+            .map(str::to_string);
+        return SecurityGroupLookup::Absent(NetworkRefusal::worded(code, message));
     }
     ::tracing::debug!(
         error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),

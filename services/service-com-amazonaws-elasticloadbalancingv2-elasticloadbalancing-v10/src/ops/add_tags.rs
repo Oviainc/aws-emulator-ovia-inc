@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !keys.insert(tag.key.as_str()) {
                 return Err(AddTagsErrorModeled::DuplicateTagKeysException(
                     DuplicateTagKeysException {
-                        message: Some(format!("The tag key '{}' was specified twice", tag.key)),
+                        message: Some(crate::state::duplicate_tag_key_message(&tag.key)),
                     },
                 )
                 .into());

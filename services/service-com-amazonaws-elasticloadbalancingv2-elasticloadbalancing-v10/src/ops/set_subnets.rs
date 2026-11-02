@@ -301,10 +301,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // modelled `SubnetNotFound` carries the code EC2 answered — the same
                 // reading `CreateLoadBalancer` applies to the subnets a load balancer
                 // STARTS in.
-                crate::state::network::SubnetLookup::Absent(code) => {
+                crate::state::network::SubnetLookup::Absent(refusal) => {
                     return Err(SetSubnetsErrorModeled::SubnetNotFoundException(
                         SubnetNotFoundException {
-                            message: Some(code),
+                            message: Some(refusal.code),
                         },
                     )
                     .into())

@@ -22,6 +22,10 @@
 //!   `DuplicateLoadBalancerName`, whose message names the load balancer as the request
 //!   spelled it and states the rule that produced the refusal: the name is held by a load
 //!   balancer configured with different parameters.
+//! * `DetachLoadBalancerFromSubnets` refuses a detach that would leave a load balancer
+//!   attached to no subnet with `InvalidConfigurationRequest`, whose message names the load
+//!   balancer from the request and states THAT rule — one of the many rules that one error
+//!   code answers, which is why the message is what tells them apart.
 //!
 //! Every refusal is asserted on what a LATER read reports too, so a refusal that changed
 //! the record would fail here.
@@ -53,6 +57,15 @@ type ListenerConflictRow = (&'static str, Vec<(String, String)>, Option<i32>);
 /// One row of the duplicate-name table: the case, the load balancer name, and the form
 /// fields the SECOND create carries.
 type DuplicateNameRow = (&'static str, &'static str, Vec<(String, String)>);
+
+/// One row of the zero-subnet table: the case, the load balancer name, the subnets it is
+/// created in, and the subnets the detach names.
+type ZeroSubnetRow = (
+    &'static str,
+    &'static str,
+    Vec<&'static str>,
+    Vec<&'static str>,
+);
 
 /// Create `name` with one HTTP 80 -> `instance_port` listener in one Availability Zone.
 async fn create(
@@ -660,5 +673,169 @@ async fn the_duplicate_name_refusal_states_the_differing_parameters_rule() {
             "case {case:?}: the refused create must leave the held record as it was, got {}",
             described.body
         );
+    }
+}
+
+/// Create `name` placed in `subnets` (and nothing else), with one HTTP 80 listener.
+async fn create_in_subnets(
+    router: &MultiServiceRouter,
+    name: &str,
+    subnets: &[&str],
+) -> Wire {
+    let mut params = vec![
+        param("LoadBalancerName", name),
+        param("Listeners.member.1.Protocol", "HTTP"),
+        param("Listeners.member.1.LoadBalancerPort", "80"),
+        param("Listeners.member.1.InstancePort", "80"),
+    ];
+    for (slot, subnet) in subnets.iter().enumerate() {
+        params.push(param(&format!("Subnets.member.{}", slot + 1), subnet));
+    }
+    call(router, REGION, "CreateLoadBalancer", &params).await
+}
+
+/// Ask `name` to detach `subnets`.
+async fn detach(router: &MultiServiceRouter, name: &str, subnets: &[&str]) -> Wire {
+    let mut params = vec![param("LoadBalancerName", name)];
+    for (slot, subnet) in subnets.iter().enumerate() {
+        params.push(param(&format!("Subnets.member.{}", slot + 1), subnet));
+    }
+    call(router, REGION, "DetachLoadBalancerFromSubnets", &params).await
+}
+
+/// The subnets `DescribeLoadBalancers` reports for `name`.
+async fn reported_subnets(router: &MultiServiceRouter, name: &str) -> Vec<String> {
+    let described = call(
+        router,
+        REGION,
+        "DescribeLoadBalancers",
+        &[param("LoadBalancerNames.member.1", name)],
+    )
+    .await;
+    let doc = parse(&described.body);
+    let description = find(described.result(&doc), "LoadBalancerDescriptions")
+        .and_then(|list| list.children().next())
+        .unwrap_or_else(|| panic!("no description in {}", described.body));
+    member_texts(description, "Subnets")
+}
+
+/// `DetachLoadBalancerFromSubnets` is documented "the load balancer balances the traffic
+/// among the remaining routable subnets", so there has to BE a remaining one: a detach that
+/// would leave the load balancer attached to no subnet is refused with
+/// `InvalidConfigurationRequestException` (awsQuery `InvalidConfigurationRequest`, HTTP
+/// 409) and detaches nothing.
+///
+/// That one error code answers EVERY configuration rule this operation has, so the MESSAGE
+/// is what tells them apart: it names the load balancer the request asked about and states
+/// the rule the change would have broken. The rows differ along the name's own form, along
+/// how many subnets the load balancer is attached to, and along the shape of the detach
+/// that would empty it — because the message is built from the request, not from one
+/// recorded call.
+#[tokio::test]
+async fn the_zero_subnet_detach_refusal_names_the_load_balancer_and_its_rule() {
+    let router = emulator();
+
+    // (case, the load balancer name, the subnets it is created in, the subnets the detach
+    // names)
+    let rows: [ZeroSubnetRow; 5] = [
+        (
+            "the only subnet of a one-subnet load balancer",
+            "zero-subnet-elb",
+            vec!["subnet-0123456789abcdef0"],
+            vec!["subnet-0123456789abcdef0"],
+        ),
+        (
+            "both subnets of a two-subnet load balancer",
+            "z",
+            vec!["subnet-0123456789abcdef0", "subnet-1a2b3c4d"],
+            vec!["subnet-0123456789abcdef0", "subnet-1a2b3c4d"],
+        ),
+        (
+            "all three subnets, named in another order",
+            "Mixed-Case-Detach-ELB",
+            vec![
+                "subnet-0123456789abcdef0",
+                "subnet-0123456789abcdef1",
+                "subnet-1a2b3c4d",
+            ],
+            vec![
+                "subnet-1a2b3c4d",
+                "subnet-0123456789abcdef1",
+                "subnet-0123456789abcdef0",
+            ],
+        ),
+        (
+            "the attached set with one id named twice",
+            "a-long-hyphenated-detach-elb-name",
+            vec!["subnet-0123456789abcdef0", "subnet-1a2b3c4d"],
+            vec![
+                "subnet-0123456789abcdef0",
+                "subnet-1a2b3c4d",
+                "subnet-0123456789abcdef0",
+            ],
+        ),
+        (
+            "the attached set beside a subnet it was never attached to",
+            "detach-superset-elb",
+            vec!["subnet-0123456789abcdef0"],
+            vec!["subnet-0123456789abcdef0", "subnet-00000000"],
+        ),
+    ];
+
+    for (case, name, attached, detached) in rows {
+        let created = create_in_subnets(&router, name, &attached).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: the fixture must be created, got {}",
+            created.body
+        );
+
+        let refused = detach(&router, name, &detached).await;
+        assert_eq!(
+            (refused.status, refused.error_code().as_str()),
+            (409, "InvalidConfigurationRequest"),
+            "case {case:?}: expected 409 InvalidConfigurationRequest, got {} with {}",
+            refused.status,
+            refused.body
+        );
+        let expected = format!(
+            "Requested configuration change for LoadBalancer \"{name}\" is invalid because \
+             you attempted to detach all the subnets for this LoadBalancer and a \
+             LoadBalancer cannot be attached to zero subnets in VPC."
+        );
+        let stated = error_message(&refused);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected the message {expected:?}, got {stated:?}"
+        );
+
+        // The refused detach detached nothing: every subnet the create placed it in is
+        // still attached, in the order the record holds them.
+        let after = reported_subnets(&router, name).await;
+        let placed: Vec<String> = attached.iter().map(|id| (*id).to_string()).collect();
+        assert_eq!(
+            after, placed,
+            "case {case:?}: the refused detach must leave the placement as it was"
+        );
+
+        // The other side of the same rule: a detach that leaves ONE subnet behind is
+        // applied, so the refusal is about reaching zero rather than about detaching.
+        if let Some((last, rest)) = placed.split_last() {
+            if !rest.is_empty() {
+                let leaving_one: Vec<&str> = rest.iter().map(String::as_str).collect();
+                let accepted = detach(&router, name, &leaving_one).await;
+                assert_eq!(
+                    accepted.status, 200,
+                    "case {case:?}: a detach leaving one subnet must be accepted, got {}",
+                    accepted.body
+                );
+                let after = reported_subnets(&router, name).await;
+                assert_eq!(
+                    after,
+                    vec![last.clone()],
+                    "case {case:?}: the accepted detach must leave the last subnet attached"
+                );
+            }
+        }
     }
 }

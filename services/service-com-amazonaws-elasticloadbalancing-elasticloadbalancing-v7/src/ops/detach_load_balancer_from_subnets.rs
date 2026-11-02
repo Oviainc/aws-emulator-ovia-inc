@@ -198,7 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DetachLoadBalancerFromSubnetsErrorModeled::InvalidConfigurationRequestException(
                     InvalidConfigurationRequestException {
-                        message: Some(crate::state::detached_every_subnet_message()),
+                        message: Some(crate::state::detached_every_subnet_message(
+                            &input.load_balancer_name,
+                        )),
                     },
                 )
                 .into(),

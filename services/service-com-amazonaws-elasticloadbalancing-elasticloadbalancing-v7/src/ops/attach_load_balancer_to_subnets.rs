@@ -197,23 +197,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which Availability Zone — and which VPC — a subnet is in is EC2's to say, and so is
         // whether it exists at all, so the subnets are resolved against EC2 before the store
         // is locked; nothing is held across that call. A subnet the account does not hold is
-        // an attachment EC2 itself refuses, so the modelled `SubnetNotFound` carries the code
-        // EC2 answered rather than a sentence restating it — the same refusal
-        // `CreateLoadBalancer` answers for a placement naming such a subnet.
+        // an attachment EC2 itself refuses, so the modelled `SubnetNotFound` reports the
+        // refusal EC2 answered for the id this request named.
         let placement =
             match crate::state::resolve_subnet_placement(ctx, &region, &input.subnets).await {
                 Ok(placement) => placement,
-                Err(_) => {
-                    // The sentence the model itself gives `SubnetNotFoundException`:
-                    // "One or more of the specified subnets do not exist."
-                    // (`smithy_query(query="shape", shape="SubnetNotFoundException")`).
+                Err(refusal) => {
+                    // `SubnetNotFound` is raised for every subnet of every request this
+                    // operation cannot resolve, so the message is what tells them apart: it
+                    // is the refusal EC2 answered, which names the id at fault — not the
+                    // error shape's documentation summary, which describes the class.
                     return Err(
                         AttachLoadBalancerToSubnetsErrorModeled::SubnetNotFoundException(
                             SubnetNotFoundException {
-                                message: Some(
-                                    "One or more of the specified subnets do not exist."
-                                        .to_string(),
-                                ),
+                                message: Some(refusal.reported_message()),
                             },
                         )
                         .into(),

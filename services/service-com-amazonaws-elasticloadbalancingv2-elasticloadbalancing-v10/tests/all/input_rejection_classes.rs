@@ -37,7 +37,7 @@ use crate::provisioning_loop::{
 use crate::target_group_attributes_and_modification::{create_target_group, unescaped};
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::{
     check_security_groups, check_subnet_ipv6_cidrs,
-    network::{SecurityGroupFacts, SecurityGroupLookup, SubnetFacts},
+    network::{NetworkRefusal, SecurityGroupFacts, SecurityGroupLookup, SubnetFacts},
     Refusal, SecurityGroupRefusal, INVALID_SECURITY_GROUPS, IPV6_CIDR_REQUIRED,
     SECURITY_GROUP_NOT_FOUND, SUBNETS_IN_TWO_ZONES_REQUIRED,
 };
@@ -551,14 +551,14 @@ async fn which_refusal_a_security_group_earns_follows_its_form_the_account_and_t
             "an id the account holds no group for",
             Some("vpc-1"),
             ids(&["sg-33333333"]),
-            SecurityGroupLookup::Absent("InvalidGroup.NotFound".to_string()),
+            SecurityGroupLookup::Absent(NetworkRefusal::new("InvalidGroup.NotFound")),
             Err(SecurityGroupRefusal::Invalid),
         ),
         (
             "an id the account holds no group for, with no VPC known either",
             None,
             ids(&["sg-0123456789abcdef1"]),
-            SecurityGroupLookup::Absent("InvalidGroup.NotFound".to_string()),
+            SecurityGroupLookup::Absent(NetworkRefusal::new("InvalidGroup.NotFound")),
             Err(SecurityGroupRefusal::Invalid),
         ),
         (

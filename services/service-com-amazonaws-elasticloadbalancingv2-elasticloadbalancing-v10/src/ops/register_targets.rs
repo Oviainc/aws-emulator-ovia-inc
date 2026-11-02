@@ -253,7 +253,9 @@ fn group_not_found(arn: &str) -> RegisterTargetsError {
 /// Refuse the WHOLE request when the registrations it asks for would take `group` past
 /// its quota, so nothing is stored and no further work is owed:
 /// `TooManyTargetsException`, the number of targets a group of this kind holds
-/// ([`crate::state::targets_per_target_group`]).
+/// ([`crate::state::targets_per_target_group`]), stated the way Elastic Load Balancing
+/// states it: the refusal names the target group the registration was asked of — a quota is
+/// per target group, so the group is what the caller has to act on.
 ///
 /// Re-registering a target the group already holds REPLACES that registration, so it does
 /// not count — and neither does one key asked for twice in the same request, which is the
@@ -271,15 +273,14 @@ fn check_quota(
         .collect();
     added.sort();
     added.dedup();
-    let held = group.targets.len() + added.len();
-    if held <= quota {
+    if group.targets.len() + added.len() <= quota {
         return Ok(());
     }
     Err(
         RegisterTargetsErrorModeled::TooManyTargetsException(TooManyTargetsException {
             message: Some(format!(
-                "A target group of this kind holds at most {quota} targets, and this \
-                 request would take it to {held}"
+                "The maximum number of targets on target group '{}' has been reached",
+                group.arn
             )),
         })
         .into(),

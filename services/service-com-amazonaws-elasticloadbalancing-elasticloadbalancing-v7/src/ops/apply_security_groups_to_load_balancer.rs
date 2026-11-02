@@ -193,9 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A security group is EC2's resource, so whether one exists is EC2's to say: the
         // groups are resolved against EC2 while the store's lock is released, and a group the
         // account does not hold is an association EC2 itself refuses, so the modelled
-        // `InvalidSecurityGroup` carries the code EC2 answered rather than a sentence
-        // restating it — the same refusal `CreateLoadBalancer` answers for a load balancer
-        // started with such a group. What EC2 reports for the groups it does hold is also
+        // `InvalidSecurityGroup` reports the refusal EC2 answered for the id this request
+        // named. What EC2 reports for the groups it does hold is also
         // what the load balancer reports as its source security group.
         let source_security_group = match crate::state::resolve_source_security_group(
             ctx,
@@ -205,17 +204,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await
         {
             Ok(resolved) => resolved,
-            Err(_) => {
-                // The sentence the model itself gives `InvalidSecurityGroupException`:
-                // "One or more of the specified security groups do not exist."
-                // (`smithy_query(query="shape", shape="InvalidSecurityGroupException")`).
+            Err(refusal) => {
+                // `InvalidSecurityGroup` is raised for every group of every request this
+                // operation cannot resolve, so the message is what tells them apart: it is
+                // the refusal EC2 answered, which names the id at fault — not the error
+                // shape's documentation summary, which describes the class.
                 return Err(
                     ApplySecurityGroupsToLoadBalancerErrorModeled::InvalidSecurityGroupException(
                         InvalidSecurityGroupException {
-                            message: Some(
-                                "One or more of the specified security groups do not exist."
-                                    .to_string(),
-                            ),
+                            message: Some(refusal.reported_message()),
                         },
                     )
                     .into(),

@@ -34,6 +34,7 @@
 //! owns; nothing here restates it.
 
 use crate::provisioning_loop::{action, call, emulator, first_text, members, p, Reply};
+use crate::tag_writes::message;
 use crate::target_group_attributes_and_modification::unescaped;
 use crate::target_group_health_check_port::describe;
 use smithy_server_runtime::MultiServiceRouter;
@@ -654,6 +655,16 @@ async fn a_target_group_holds_the_published_number_of_targets_for_its_family() {
             "case {case:?}: one target past the quota must be refused, got {} body {}",
             past.status,
             past.body
+        );
+        // A targets quota is per target group, so the refusal names the group the
+        // registration was asked of — read back from the ARN this row created rather than
+        // from a name the suite fixed.
+        let expected =
+            format!("The maximum number of targets on target group '{arn}' has been reached");
+        let stated = unescaped(&message(&past));
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected the message {expected:?}, got {stated:?}"
         );
         assert_eq!(
             registered_count(&router, &arn).await,

@@ -277,7 +277,11 @@ async fn every_refusal_answers_its_modeled_awsquery_envelope() {
             ],
             status: 409,
             code: "InvalidConfigurationRequest",
-            message: "The requested configuration change is not valid.".to_string(),
+            message: "Requested configuration change for LoadBalancer \
+                      \"refusal-subnet-elb\" is invalid because you attempted to detach all \
+                      the subnets for this LoadBalancer and a LoadBalancer cannot be \
+                      attached to zero subnets in VPC."
+                .to_string(),
         },
         Refusal {
             case: "an apply naming a load balancer the region does not hold",

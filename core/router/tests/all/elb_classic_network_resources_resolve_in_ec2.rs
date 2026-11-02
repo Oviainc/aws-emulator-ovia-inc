@@ -7,7 +7,9 @@
 //! balancer request names is resolved against EC2: a value EC2 holds no such resource for
 //! is refused with the error this operation models for it — `SubnetNotFound` for a subnet
 //! and `InvalidSecurityGroup` for a security group, both HTTP 400 `text/xml` awsQuery
-//! `ErrorResponse` envelopes — and the request changes nothing, while what EC2 reports for
+//! `ErrorResponse` envelopes, whose MESSAGE is the refusal EC2 answered for the id the
+//! request named rather than the documentation summary of the error shape — and the request
+//! changes nothing, while what EC2 reports for
 //! the resources it DOES hold is what the load balancer reports back: the zone of each
 //! attached subnet, the VPC they belong to, and the name and owner of its source security
 //! group.
@@ -281,6 +283,12 @@ fn code(answer: &Answer) -> String {
     opt_element(&answer.body, "Code").unwrap_or_default()
 }
 
+/// The `<Message>` of a refusal envelope — EC2's or Elastic Load Balancing's, which carry
+/// the same element — or an empty string.
+fn message(answer: &Answer) -> String {
+    opt_element(&answer.body, "Message").unwrap_or_default()
+}
+
 /// A load balancer reports what EC2 says about the network it is placed in, and every
 /// request naming a resource EC2 does not hold is refused with the modelled error and
 /// changes nothing.
@@ -540,4 +548,231 @@ async fn classic_load_balancer_network_resources_resolve_against_ec2() {
         ),
         "the refused detach must leave the last subnet attached"
     );
+}
+
+/// One case of the message table: the Classic request that is refused, the code it is
+/// refused under, the EC2 read of the SAME ids, the value EC2 holds no resource for, and
+/// the documentation summary of the modelled error shape.
+struct MessageCase {
+    case: String,
+    action: &'static str,
+    params: Vec<(String, String)>,
+    expected_code: &'static str,
+    ec2_action: &'static str,
+    ec2_params: Vec<(String, String)>,
+    unknown_id: String,
+    shape_summary: &'static str,
+    /// Whether this operation states the EC2 error CODE rather than the sentence EC2 worded
+    /// its refusal with: `CreateLoadBalancer`'s own recorded network refusal carries that
+    /// code, so a recording pins its wording, while the two operations whose recordings do
+    /// not assert the message state the sentence that names the id.
+    states_ec2_code: bool,
+}
+
+/// `SubnetNotFoundException`'s own documentation
+/// (`smithy_query(query="shape", shape="SubnetNotFoundException")`): the summary of the
+/// error CLASS, which says nothing about the request and is therefore not a message.
+const SUBNET_SHAPE_SUMMARY: &str = "One or more of the specified subnets do not exist.";
+
+/// `InvalidSecurityGroupException`'s own documentation, read the same way and not a message
+/// for the same reason.
+const GROUP_SHAPE_SUMMARY: &str = "One or more of the specified security groups do not exist.";
+
+/// `SubnetId.N` / `GroupId.N` form fields, as ec2Query flattens a list of ids.
+fn indexed(prefix: &str, values: &[&str]) -> Vec<(String, String)> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (format!("{prefix}.{}", index + 1), (*value).to_string()))
+        .collect()
+}
+
+/// One error code answers every subnet a request names that EC2 cannot resolve — and one
+/// answers every security group — so the MESSAGE is what tells the caller WHICH of the
+/// values it sent was rejected: it is the refusal EC2 answered for that very id, which
+/// names it, rather than the documentation summary of the error shape, which describes the
+/// class and carries nothing from the request.
+///
+/// Each row asserts the Classic message against what EC2 ITSELF answers for the same read,
+/// through the same router — the sentence EC2 worded, or the error code it answered where
+/// the operation's own recorded refusal carries that code — so what is pinned is that the
+/// EC2 refusal is reported rather than a sentence this suite memorised. The rows differ
+/// along the FORM of the value EC2 holds no resource for (its 17-hex and 8-hex id forms, and
+/// a value that is no id at all), along the operation that names it, and along how many
+/// resources the request names beside it.
+#[tokio::test]
+async fn a_network_refusal_reports_the_ec2_refusal_for_the_id_the_request_named() {
+    let router = emulator();
+    let network = ec2_network(&router).await;
+    let created = elb(
+        &router,
+        "CreateLoadBalancer",
+        &[
+            param("LoadBalancerName", LOAD_BALANCER),
+            param("Listeners.member.1.Protocol", "HTTP"),
+            param("Listeners.member.1.LoadBalancerPort", "80"),
+            param("Listeners.member.1.InstancePort", "80"),
+            param("Subnets.member.1", &network.subnets[0]),
+            param("SecurityGroups.member.1", &network.security_groups[0]),
+        ],
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "the fixture must be created, got {} with {}",
+        created.status, created.body
+    );
+
+    let mut cases: Vec<MessageCase> = Vec::new();
+    for (form, id) in unknown_subnet_ids() {
+        cases.push(MessageCase {
+            case: format!("an attach naming only a subnet EC2 does not hold, in {form}"),
+            action: "AttachLoadBalancerToSubnets",
+            params: vec![
+                param("LoadBalancerName", LOAD_BALANCER),
+                param("Subnets.member.1", &id),
+            ],
+            expected_code: "SubnetNotFound",
+            ec2_action: "DescribeSubnets",
+            ec2_params: indexed("SubnetId", &[&id]),
+            unknown_id: id.clone(),
+            shape_summary: SUBNET_SHAPE_SUMMARY,
+            states_ec2_code: false,
+        });
+        cases.push(MessageCase {
+            case: format!("an attach naming a held subnet beside one EC2 does not hold, in {form}"),
+            action: "AttachLoadBalancerToSubnets",
+            params: vec![
+                param("LoadBalancerName", LOAD_BALANCER),
+                param("Subnets.member.1", &network.subnets[1]),
+                param("Subnets.member.2", &id),
+            ],
+            expected_code: "SubnetNotFound",
+            ec2_action: "DescribeSubnets",
+            ec2_params: indexed("SubnetId", &[&network.subnets[1], &id]),
+            unknown_id: id.clone(),
+            shape_summary: SUBNET_SHAPE_SUMMARY,
+            states_ec2_code: false,
+        });
+        cases.push(MessageCase {
+            case: format!("a create placed in a subnet EC2 does not hold, in {form}"),
+            action: "CreateLoadBalancer",
+            params: vec![
+                param("LoadBalancerName", "unknown-subnet-elb"),
+                param("Listeners.member.1.Protocol", "HTTP"),
+                param("Listeners.member.1.LoadBalancerPort", "80"),
+                param("Listeners.member.1.InstancePort", "80"),
+                param("Subnets.member.1", &id),
+            ],
+            expected_code: "SubnetNotFound",
+            ec2_action: "DescribeSubnets",
+            ec2_params: indexed("SubnetId", &[&id]),
+            unknown_id: id,
+            shape_summary: SUBNET_SHAPE_SUMMARY,
+            states_ec2_code: true,
+        });
+    }
+    for (form, id) in unknown_group_ids() {
+        cases.push(MessageCase {
+            case: format!("an apply naming only a group EC2 does not hold, in {form}"),
+            action: "ApplySecurityGroupsToLoadBalancer",
+            params: vec![
+                param("LoadBalancerName", LOAD_BALANCER),
+                param("SecurityGroups.member.1", &id),
+            ],
+            expected_code: "InvalidSecurityGroup",
+            ec2_action: "DescribeSecurityGroups",
+            ec2_params: indexed("GroupId", &[&id]),
+            unknown_id: id.clone(),
+            shape_summary: GROUP_SHAPE_SUMMARY,
+            states_ec2_code: false,
+        });
+        cases.push(MessageCase {
+            case: format!("an apply naming a held group beside one EC2 does not hold, in {form}"),
+            action: "ApplySecurityGroupsToLoadBalancer",
+            params: vec![
+                param("LoadBalancerName", LOAD_BALANCER),
+                param("SecurityGroups.member.1", &network.security_groups[1]),
+                param("SecurityGroups.member.2", &id),
+            ],
+            expected_code: "InvalidSecurityGroup",
+            ec2_action: "DescribeSecurityGroups",
+            ec2_params: indexed("GroupId", &[&network.security_groups[1], &id]),
+            unknown_id: id.clone(),
+            shape_summary: GROUP_SHAPE_SUMMARY,
+            states_ec2_code: false,
+        });
+        cases.push(MessageCase {
+            case: format!("a create naming a group EC2 does not hold, in {form}"),
+            action: "CreateLoadBalancer",
+            params: vec![
+                param("LoadBalancerName", "unknown-group-elb"),
+                param("Listeners.member.1.Protocol", "HTTP"),
+                param("Listeners.member.1.LoadBalancerPort", "80"),
+                param("Listeners.member.1.InstancePort", "80"),
+                param("Subnets.member.1", &network.subnets[0]),
+                param("SecurityGroups.member.1", &id),
+            ],
+            expected_code: "InvalidSecurityGroup",
+            ec2_action: "DescribeSecurityGroups",
+            ec2_params: indexed("GroupId", &[&id]),
+            unknown_id: id,
+            shape_summary: GROUP_SHAPE_SUMMARY,
+            states_ec2_code: true,
+        });
+    }
+
+    for case in cases {
+        // What EC2 itself answers for the very read Elastic Load Balancing makes.
+        let from_ec2 = query(
+            &router,
+            "ec2",
+            EC2_API_VERSION,
+            case.ec2_action,
+            &case.ec2_params,
+        )
+        .await;
+        assert_eq!(
+            from_ec2.status, 400,
+            "case {:?}: EC2 must refuse the read of {}, got {} with {}",
+            case.case, case.unknown_id, from_ec2.status, from_ec2.body
+        );
+        let ec2_message = message(&from_ec2);
+        assert!(
+            ec2_message.contains(&case.unknown_id),
+            "case {:?}: EC2's own refusal must name {}, got {ec2_message:?}",
+            case.case,
+            case.unknown_id
+        );
+
+        let refused = elb(&router, case.action, &case.params).await;
+        assert_eq!(
+            (refused.status, code(&refused).as_str()),
+            (400, case.expected_code),
+            "case {:?}: expected 400 {} from {}, got {} with {}",
+            case.case,
+            case.expected_code,
+            case.action,
+            refused.status,
+            refused.body
+        );
+        // Either way the message is the refusal EC2 answered for that id: the sentence it
+        // worded, or — where the operation's own recording pins it — the code it answered.
+        let expected = if case.states_ec2_code {
+            code(&from_ec2)
+        } else {
+            ec2_message.clone()
+        };
+        let stated = message(&refused);
+        assert_eq!(
+            stated, expected,
+            "case {:?}: expected the refusal EC2 answered, {expected:?}, got {stated:?}",
+            case.case
+        );
+        assert_ne!(
+            stated, case.shape_summary,
+            "case {:?}: the message must state the request, not the error shape's summary",
+            case.case
+        );
+    }
 }

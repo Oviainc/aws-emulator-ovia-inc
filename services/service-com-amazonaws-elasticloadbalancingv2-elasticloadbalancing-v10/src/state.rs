@@ -147,6 +147,17 @@ pub fn targets_per_target_group(group: &TargetGroupRecord) -> usize {
 /// is bounded by this times the resource quotas above.
 pub const TAGS_PER_RESOURCE: usize = 50;
 
+/// The message a tag write that names one key twice is refused with, stated once for every
+/// operation that takes a `Tags` list.
+///
+/// `DuplicateTagKeysException` is documented "A tag key was specified more than once", and a
+/// list that names a key twice does not say which value that key takes — so the refusal
+/// names the key FROM THE REQUEST and states the rule it broke: a tag key carries exactly
+/// one value.
+pub fn duplicate_tag_key_message(key: &str) -> String {
+    format!("Tag key '{key}' has two values, but tag keys must have exactly one value")
+}
+
 /// The ARN/endpoint namespace for this service (`sigv4Name` / `arnNamespace` in the
 /// model's `aws.api#service` trait).
 pub const SERVICE_NAMESPACE: &str = "elasticloadbalancing";

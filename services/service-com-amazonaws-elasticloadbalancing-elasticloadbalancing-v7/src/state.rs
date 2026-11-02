@@ -20,6 +20,11 @@ use std::time::SystemTime;
 /// than a second time here.
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as elbv2;
 
+/// The EC2 refusal a request's subnets or security groups ran into, as the ELBv2 crate's
+/// one network lookup reports it: re-exported here so a handler of THIS model names it
+/// without reaching across to the other crate's module path.
+pub use elbv2::state::network::NetworkRefusal;
+
 /// The scheme a load balancer gets when the request names none.
 ///
 /// From `CreateLoadBalancer`'s own documentation: "By default, Elastic Load Balancing
@@ -847,13 +852,16 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// The message a detach that would leave a load balancer attached to no subnet at all is
 /// refused with.
 ///
-/// The sentence is the one the model itself gives
-/// `InvalidConfigurationRequestException` — "The requested configuration change is not
-/// valid." (`smithy_query(query="shape", shape="InvalidConfigurationRequestException")`) —
-/// so this refusal states the error class in Elastic Load Balancing's own words rather than
-/// in a sentence this emulator wrote for it.
-pub fn detached_every_subnet_message() -> String {
-    "The requested configuration change is not valid.".to_string()
+/// `InvalidConfigurationRequest` is the refusal of every configuration rule a load balancer
+/// has, so the message is what tells the rules apart: it names the load balancer the
+/// request asked about and states the rule the change would have broken — a load balancer
+/// in a VPC serves traffic from its subnets, so it cannot be left attached to none.
+pub fn detached_every_subnet_message(load_balancer_name: &str) -> String {
+    format!(
+        "Requested configuration change for LoadBalancer \"{load_balancer_name}\" is invalid \
+         because you attempted to detach all the subnets for this LoadBalancer and a \
+         LoadBalancer cannot be attached to zero subnets in VPC."
+    )
 }
 
 /// The message `CreateLoadBalancer` answers a `DuplicateLoadBalancerName` with.
@@ -916,8 +924,9 @@ pub struct SubnetPlacement {
 ///
 /// A subnet is not this service's resource: whether it exists at all, which zone it is in
 /// and which VPC it belongs to are EC2's to say, so they are read from EC2 through the
-/// in-process callback. `Err` carries the error CODE EC2 answered for an id the account
-/// holds no subnet for, which the caller states in the refusal ITS model declares. An
+/// in-process callback. `Err` carries the REFUSAL EC2 answered for an id the account
+/// holds no subnet for — its code and the sentence EC2 worded it with, which names that id
+/// — and the caller states it in the refusal ITS model declares. An
 /// emulator with no EC2 mounted says NOTHING: the placement comes back empty and the
 /// members it would have filled are left unreported rather than invented — and nothing is
 /// refused on that silence, because this service never learned anything to refuse it on.
@@ -925,10 +934,10 @@ pub async fn resolve_subnet_placement(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     subnet_ids: &[String],
-) -> Result<SubnetPlacement, String> {
+) -> Result<SubnetPlacement, NetworkRefusal> {
     let resolved = match elbv2::state::network::resolve_subnets(ctx, region, subnet_ids).await {
         elbv2::state::network::SubnetLookup::Resolved(resolved) => resolved,
-        elbv2::state::network::SubnetLookup::Absent(code) => return Err(code),
+        elbv2::state::network::SubnetLookup::Absent(refusal) => return Err(refusal),
         elbv2::state::network::SubnetLookup::Unknown => return Ok(SubnetPlacement::default()),
     };
     let zones = resolved
@@ -952,8 +961,9 @@ pub async fn resolve_subnet_placement(
 /// or the EC2 refusal they ran into.
 ///
 /// A security group is EC2's resource, so whether one exists is EC2's to say: `Err` carries
-/// the error CODE EC2 answered for an id the account holds no group for, which the caller
-/// states in the refusal its model declares. `Ok(None)` is silence — a request that
+/// the REFUSAL EC2 answered for an id the account holds no group for — its code and the
+/// sentence EC2 worded it with, which names that id — and the caller
+/// states it in the refusal its model declares. `Ok(None)` is silence — a request that
 /// associates no group, or an emulator with no EC2 to ask — on which nothing is refused and
 /// nothing is reported.
 ///
@@ -964,11 +974,11 @@ pub async fn resolve_source_security_group(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     security_groups: &[String],
-) -> Result<Option<SourceSecurityGroup>, String> {
+) -> Result<Option<SourceSecurityGroup>, NetworkRefusal> {
     let resolved =
         match elbv2::state::network::resolve_security_groups(ctx, region, security_groups).await {
             elbv2::state::network::SecurityGroupLookup::Resolved(resolved) => resolved,
-            elbv2::state::network::SecurityGroupLookup::Absent(code) => return Err(code),
+            elbv2::state::network::SecurityGroupLookup::Absent(refusal) => return Err(refusal),
             elbv2::state::network::SecurityGroupLookup::Unknown => return Ok(None),
         };
     let Some(first) = security_groups.first() else {

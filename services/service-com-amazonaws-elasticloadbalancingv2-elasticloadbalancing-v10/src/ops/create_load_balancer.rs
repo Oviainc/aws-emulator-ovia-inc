@@ -333,10 +333,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The subnets are EC2's resources: one the account does not hold is a
             // placement EC2 itself refuses, so the modelled `SubnetNotFound` carries the
             // code EC2 answered rather than a sentence restating it.
-            crate::state::network::SubnetLookup::Absent(code) => {
+            crate::state::network::SubnetLookup::Absent(refusal) => {
                 return Err(CreateLoadBalancerErrorModeled::SubnetNotFoundException(
                     SubnetNotFoundException {
-                        message: Some(code),
+                        message: Some(refusal.code),
                     },
                 )
                 .into())
@@ -549,7 +549,7 @@ fn tag_map(
         {
             return Err(CreateLoadBalancerErrorModeled::DuplicateTagKeysException(
                 DuplicateTagKeysException {
-                    message: Some(format!("The tag key '{}' was specified twice", tag.key)),
+                    message: Some(crate::state::duplicate_tag_key_message(&tag.key)),
                 },
             )
             .into());
