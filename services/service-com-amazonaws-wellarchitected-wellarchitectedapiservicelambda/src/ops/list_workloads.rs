@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkloads
-//! IMPLEMENTED: pages over the stored workloads, projected to `WorkloadSummary`.
+//! IMPLEMENTED: pages over the workloads stored in the Region this request was signed
+//! for, projected to `WorkloadSummary`.
 //! Reporting only — the `NextToken` it emits carries the whole cursor, so listing never
 //! writes to state.
 //!
@@ -19,7 +20,7 @@
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
 //! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
+//!     let state = crate::state::service_state(&*self.engine, ctx.parts())
 //!         .ok_or(/* a modelled server error */)?;
 //!     state.lock().your_field = /* ... */;
 //! ```
@@ -142,8 +143,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(|| {
             ListWorkloadsErrorModeled::InternalServerException(InternalServerException {
                 message: "the Well-Architected Tool workload store is unavailable".to_string(),
             })
@@ -175,6 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
+        // `state` resolves the store of the Region this request was signed for, so the
+        // enumeration below is that Region's workloads and no other's: a workload belongs
+        // to the Region whose endpoint created it.
         let order = store.workload_order();
         // The cursor is start-EXCLUSIVE: the page resumes just past the id already served,
         // so every workload is enumerated exactly once across the pages, and a workload

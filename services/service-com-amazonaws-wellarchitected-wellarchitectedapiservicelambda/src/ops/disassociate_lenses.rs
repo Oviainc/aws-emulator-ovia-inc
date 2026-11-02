@@ -155,9 +155,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(|| {
             DisassociateLensesErrorModeled::InternalServerException(InternalServerException {
                 message: "the Well-Architected Tool workload store is unavailable".to_string(),
             })

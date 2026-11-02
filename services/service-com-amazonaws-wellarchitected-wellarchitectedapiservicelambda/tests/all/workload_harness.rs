@@ -52,25 +52,27 @@ impl Client {
         Self { router, engine }
     }
 
-    /// This emulator's service state, for a test that has to reach a ceiling the HTTP
-    /// boundary would take tens of thousands of requests to reach. The boundary itself is
-    /// still crossed over HTTP for everything the test asserts about behaviour.
-    pub(crate) fn store(
-        &self,
-    ) -> engine::ServiceState<
-        service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState,
-    > {
-        self.engine
-            .state::<service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>()
+    /// This emulator's service state for the Region this harness signs its requests in
+    /// ([`SIGNED_REGION`]) — the store the handlers resolve for those requests — for a test
+    /// that has to reach a ceiling the HTTP boundary would take tens of thousands of
+    /// requests to reach. The boundary itself is still crossed over HTTP for everything
+    /// the test asserts about behaviour.
+    pub(crate) fn store(&self) -> state::RegionalServiceState {
+        self.store_in(SIGNED_REGION)
+    }
+
+    /// One named Region's store, for a fixture that has to seed a Region other than the
+    /// one [`SIGNED_REGION`] names.
+    pub(crate) fn store_in(&self, region: &str) -> state::RegionalServiceState {
+        state::region_state(&*self.engine, region)
+            .expect("the shared engine must hand out this service's store")
     }
 
     /// Fill the store straight through the state the handlers share, so a test can reach
     /// the workload quota without issuing ten thousand HTTP requests. The boundary itself
     /// is still crossed over HTTP.
     pub(crate) fn seed_workloads(&self, count: usize) {
-        let state = self
-            .engine
-            .state::<service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>();
+        let state = self.store();
         let mut store = state.lock();
         for index in 0..count {
             let workload_id = store.mint_workload_id();
@@ -128,9 +130,7 @@ impl Client {
         question_id: &str,
         answer: service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord,
     ) {
-        let state = self
-            .engine
-            .state::<service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>();
+        let state = self.store();
         let mut store = state.lock();
         let workload = store
             .workloads
@@ -160,9 +160,7 @@ impl Client {
         question_id: &str,
         answer: service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state::AnswerRecord,
     ) {
-        let state = self
-            .engine
-            .state::<service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>();
+        let state = self.store();
         let mut store = state.lock();
         let template = store
             .review_templates
@@ -181,6 +179,18 @@ impl Client {
     }
 
     pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+        self.send_in(SIGNED_REGION, method, uri, body).await
+    }
+
+    /// The same request, signed for `region` instead of [`SIGNED_REGION`] — for a suite
+    /// about what one Region's endpoint reports of another Region's resources.
+    pub(crate) async fn send_in(
+        &self,
+        region: &str,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> Answer {
         let payload = body
             .map(|value| bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")))
             .unwrap_or_default();
@@ -192,8 +202,10 @@ impl Client {
             // the handler learns the request's Region.
             .header(
                 "authorization",
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/us-west-2/wellarchitected/aws4_request, \
-                 SignedHeaders=host, Signature=deadbeef",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/wellarchitected/\
+                     aws4_request, SignedHeaders=host, Signature=deadbeef"
+                ),
             )
             .body(payload)
             .expect("build request");
@@ -500,9 +512,7 @@ impl Client {
     /// and sits in the same Region as a profile minted over the wire; only the account
     /// segment differs, because the profile belongs to another account.
     pub(crate) fn seed_foreign_profile(&self, name: &str, owner: &str, resource_id: &str) -> String {
-        let state = self
-            .engine
-            .state::<service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>();
+        let state = self.store();
         let mut store = state.lock();
         let profile_arn = format!(
             "arn:aws:{}:{SIGNED_REGION}:{owner}:profile/{resource_id}",
@@ -626,9 +636,7 @@ impl Client {
         permission_type: &str,
         status: &str,
     ) -> (String, String) {
-        let state = self
-            .engine
-            .state::<service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>();
+        let state = self.store();
         let mut store = state.lock();
         let shared_by = store
             .workloads

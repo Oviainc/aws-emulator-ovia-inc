@@ -508,3 +508,8 @@ mod bare_lens_name_resolution;
 // are appended here so a new suite does not collide with another insertion.
 #[path = "all/next_token_spelling.rs"]
 mod next_token_spelling;
+
+// Appended at the end of this list for the same reason as the declaration above: modules
+// are appended here so a new suite does not collide with another insertion.
+#[path = "all/regional_resource_scope.rs"]
+mod regional_resource_scope;

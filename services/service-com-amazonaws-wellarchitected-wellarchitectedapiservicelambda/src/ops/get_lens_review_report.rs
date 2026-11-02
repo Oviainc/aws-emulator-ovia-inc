@@ -25,7 +25,7 @@
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
 //! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
+//!     let state = crate::state::service_state(&*self.engine, ctx.parts())
 //!         .ok_or(/* a modelled server error */)?;
 //!     state.lock().your_field = /* ... */;
 //! ```

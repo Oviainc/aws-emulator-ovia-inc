@@ -26,8 +26,9 @@ async fn state_written_by_one_request_is_visible_to_the_next() {
     // the same state.
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
 
-    // A handler does exactly this, via the engine held on `self` (`self.engine`):
-    //     let Some(state) = crate::state::service_state(&*self.engine) else { return Err(..) };
+    // A handler does exactly this, via the engine held on `self` (`self.engine`), with
+    // the Region its request was signed for:
+    //     let Some(state) = crate::state::service_state(&*self.engine, ctx.parts()) else { return Err(..) };
     engine.state::<Probe>().lock().writes += 1;
 
     // A later request sees the write. This is the whole point.

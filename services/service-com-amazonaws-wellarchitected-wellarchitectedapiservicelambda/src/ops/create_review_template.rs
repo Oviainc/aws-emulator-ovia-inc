@@ -20,7 +20,7 @@
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
 //! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
+//!     let state = crate::state::service_state(&*self.engine, ctx.parts())
 //!         .ok_or(/* a modelled server error */)?;
 //!     state.lock().your_field = /* ... */;
 //! ```
@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(|| {
             CreateReviewTemplateErrorModeled::InternalServerException(InternalServerException {
                 message: "the Well-Architected Tool review template store is unavailable"
                     .to_string(),
@@ -320,9 +320,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Review templates are metered, and this operation models
         // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
-        // the store bounded: the create tokens are 1:1 with a live template. The ceiling
-        // is store-wide, which for this single-account emulator also bounds every
-        // account-and-Region pair in it.
+        // the store bounded: the create tokens are 1:1 with a live template. The store is
+        // this request's Region's, so the ceiling is per account and Region, which is how
+        // the service meters one.
         if store.review_templates.len() >= crate::state::MAX_REVIEW_TEMPLATES {
             return Err(CreateReviewTemplateErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {

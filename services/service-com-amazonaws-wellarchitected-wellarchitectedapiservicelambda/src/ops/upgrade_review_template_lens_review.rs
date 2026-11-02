@@ -28,7 +28,7 @@
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
 //! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
+//!     let state = crate::state::service_state(&*self.engine, ctx.parts())
 //!         .ok_or(/* a modelled server error */)?;
 //!     state.lock().your_field = /* ... */;
 //! ```
@@ -187,8 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(|| {
             UpgradeReviewTemplateLensReviewErrorModeled::InternalServerException(
                 InternalServerException {
                     message: "the Well-Architected Tool review template store is unavailable"

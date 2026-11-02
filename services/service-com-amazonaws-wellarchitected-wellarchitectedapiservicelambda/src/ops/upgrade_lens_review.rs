@@ -34,7 +34,7 @@
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
 //! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
+//!     let state = crate::state::service_state(&*self.engine, ctx.parts())
 //!         .ok_or(/* a modelled server error */)?;
 //!     state.lock().your_field = /* ... */;
 //! ```
@@ -196,10 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing here is minted or Region-scoped — the workload and the lens are named by
-        // the request's own labels — so no request metadata is read.
-        let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        // Nothing here is minted — the workload and the lens are named by the request's
+        // own labels — so the only request metadata read is the Region whose store serves
+        // it.
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(|| {
             UpgradeLensReviewErrorModeled::InternalServerException(InternalServerException {
                 message: "the Well-Architected Tool workload store is unavailable".to_string(),
             })

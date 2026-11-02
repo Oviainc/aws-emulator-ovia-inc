@@ -26,7 +26,7 @@
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
 //! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
+//!     let state = crate::state::service_state(&*self.engine, ctx.parts())
 //!         .ok_or(/* a modelled server error */)?;
 //!     state.lock().your_field = /* ... */;
 //! ```
@@ -145,10 +145,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The context is named by the path the request carries, this operation binds no
-        // idempotency token and nothing here is minted, so no request metadata is read.
-        let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        // The context is named by the path the request carries and this operation binds
+        // no idempotency token, so the only request metadata read is the Region whose
+        // store serves it.
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(|| {
             DeleteAgentContextErrorModeled::InternalServerException(InternalServerException {
                 message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
             })

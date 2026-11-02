@@ -174,10 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing here is minted or Region-scoped (the workload is named by the id the
-        // request carries), so no request metadata is read.
-        let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        // Nothing here is minted (the workload is named by the id the request carries),
+        // so the only request metadata read is the Region whose store serves it.
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(|| {
             UpdateIntegrationErrorModeled::InternalServerException(InternalServerException {
                 message: "the Well-Architected Tool workload store is unavailable".to_string(),
             })

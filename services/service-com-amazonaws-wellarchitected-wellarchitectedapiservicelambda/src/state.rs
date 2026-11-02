@@ -96,6 +96,13 @@
 //! here for the same reason: every operation that resolves an identifier or enforces a
 //! uniqueness rule must word the failure identically, so there is ONE place each
 //! message is built.
+//!
+//! Every map below holds the resources of ONE Region. The Well-Architected Tool is a
+//! regional service, so the engine holds one store per Region ([`RegionalStores`]) and a
+//! handler resolves the store of the Region its request was signed for
+//! ([`service_state`]): a resource is created, listed, resolved, counted and deleted in
+//! its own Region, carries that Region in its ARN, and does not exist in any other. The
+//! partitioning, and what bounds it, live in [`regions`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -105,7 +112,25 @@ use sha2::{Digest, Sha256};
 pub mod official_lenses;
 pub mod profile_template;
 pub mod recommendation_catalog;
+/// The Amazon Web Services Regions this API names — a Region as a VALUE.
+pub mod regions;
+/// How this service's state is PARTITIONED by Region, and what bounds that
+/// partitioning. Re-exported below, so a handler names `crate::state::service_state`
+/// for its Region's store exactly as it does for a record type.
+///
+/// It is what the engine holds this state AS rather than another kind of record in it, so
+/// its file sits beside this one; the `#[path]` is what keeps it a module OF this one,
+/// which is what lets it reach the store's own fields.
+#[path = "account_regions.rs"]
+pub mod account_regions;
 pub mod trusted_advisor_checks;
+
+pub use regions::{AWS_REGIONS, DEFAULT_REGION};
+
+pub use account_regions::{
+    partition_region, region_state, request_region, service_state, RegionalServiceState,
+    RegionalStateGuard, RegionalStores, MAX_REGIONS,
+};
 
 pub use profile_template::{
     profile_template, profile_template_published_at, profile_template_question,
@@ -1107,10 +1132,6 @@ pub fn question_priority_of(question_type: &str) -> &'static str {
 /// The ARN service namespace (`OPERATIONS.md`: "ARN namespace: `wellarchitected`").
 pub const ARN_NAMESPACE: &str = "wellarchitected";
 
-/// The region an unsigned request is attributed to, when no SigV4 credential scope
-/// names one.
-pub const DEFAULT_REGION: &str = "us-east-1";
-
 /// The Region an ARN names, or [`DEFAULT_REGION`] when the text carries no Region field.
 ///
 /// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, so the Region is
@@ -1144,9 +1165,9 @@ pub const MAX_WORKLOADS_PER_ACCOUNT_REGION: usize = 10_000;
 /// adjustable through Service Quotas, so this is this emulator's own ceiling rather than
 /// a value read off a doc page — the same reasoning as
 /// [`MAX_WORKLOADS_PER_ACCOUNT_REGION`], and what bounds the template map and the create
-/// tokens keyed to it. The count is store-wide rather than per Region: the emulator
-/// serves ONE account, so a store-wide ceiling also holds for every account-and-Region
-/// pair inside it, and no scan of the stored ARNs is needed to enforce it.
+/// tokens keyed to it. The count is per Region, because the store it bounds is one
+/// Region's ([`RegionalStores`]), and the emulator serves ONE account — so it is a
+/// ceiling per account and Region, enforced without scanning the stored ARNs.
 pub const MAX_REVIEW_TEMPLATES: usize = 10_000;
 
 /// The most lenses one review template carries — a quota this emulator sets.
@@ -1628,8 +1649,9 @@ pub const LENS_JSON_MEMBER: &str = "JSONString";
 /// quota") for the case; the real quota is adjustable through Service Quotas, so — as
 /// with [`MAX_WORKLOADS_PER_ACCOUNT_REGION`] — the number here is this emulator's own
 /// ceiling rather than a value read off a doc page. This emulator serves one account
-/// ([`::engine::emulator_account_id`]), so the store-wide lens count IS that account's
-/// count, and this ceiling is what bounds the lens map's growth. It sits far above any
+/// ([`::engine::emulator_account_id`]) and holds one store per Region
+/// ([`RegionalStores`]), so the lens count of a store IS that account's count in that
+/// Region, and this ceiling is what bounds the lens map's growth. It sits far above any
 /// realistic client workflow.
 pub const MAX_CUSTOM_LENSES_PER_ACCOUNT_REGION: usize = 1_000;
 
@@ -6156,7 +6178,10 @@ impl GlobalSettingsRecord {
     }
 }
 
-/// Per-service state for com-amazonaws-wellarchitected-wellarchitectedapiservicelambda. A handler reaches it through [`service_state`].
+/// ONE Region's store of this service's resources — every resource the Well-Architected
+/// Tool holds for the account in a single Region. A handler reaches the store of the
+/// Region its request was signed for through [`service_state`], and
+/// [`RegionalStores`] is what holds one of these per Region.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// Every stored workload, keyed by its 32-lowercase-hex `WorkloadId`.
@@ -10131,63 +10156,6 @@ pub fn either_regions_exception() -> crate::ops::types::ValidationException {
     ])
 }
 
-/// Every Amazon Web Services Region id a workload may name in `AwsRegions`.
-///
-/// This model types `AwsRegion` as a plain string ("An Amazon Web Services Region, for
-/// example, `us-west-2` or `ap-northeast-1`" — `smithy_query(query="shape",
-/// shape="AwsRegion")`), so the value set is not in the model: it is the published
-/// Region list from the AWS General Reference ("Regions, Availability Zones, and Local
-/// Zones"), which other AWS Smithy models enumerate verbatim as an `AwsRegion` enum.
-/// Sorted, so a reader can see at a glance what is and is not here.
-pub const AWS_REGIONS: &[&str] = &[
-    "af-south-1",
-    "ap-east-1",
-    "ap-east-2",
-    "ap-northeast-1",
-    "ap-northeast-2",
-    "ap-northeast-3",
-    "ap-south-1",
-    "ap-south-2",
-    "ap-southeast-1",
-    "ap-southeast-2",
-    "ap-southeast-3",
-    "ap-southeast-4",
-    "ap-southeast-5",
-    "ap-southeast-6",
-    "ap-southeast-7",
-    "ca-central-1",
-    "ca-west-1",
-    "cn-north-1",
-    "cn-northwest-1",
-    "eu-central-1",
-    "eu-central-2",
-    "eu-isoe-west-1",
-    "eu-north-1",
-    "eu-south-1",
-    "eu-south-2",
-    "eu-west-1",
-    "eu-west-2",
-    "eu-west-3",
-    "eusc-de-east-1",
-    "il-central-1",
-    "me-central-1",
-    "me-south-1",
-    "mx-central-1",
-    "sa-east-1",
-    "us-east-1",
-    "us-east-2",
-    "us-gov-east-1",
-    "us-gov-west-1",
-    "us-iso-east-1",
-    "us-iso-west-1",
-    "us-isob-east-1",
-    "us-isob-west-1",
-    "us-isof-east-1",
-    "us-isof-south-1",
-    "us-west-1",
-    "us-west-2",
-];
-
 /// The refusal for an `AwsRegions` entry that is not a Region, or `None` when every
 /// entry is one. A workload records the Regions it runs in, so a value no Region
 /// carries can never be true of the resource and is refused before any state is
@@ -10280,23 +10248,3 @@ const AWS_REGIONS_MEMBER: &str = "AwsRegions";
 /// The modelled member that satisfies the cross-member Regions rule in place of
 /// `AwsRegions` (`CreateWorkloadInput$NonAwsRegions`).
 const NON_AWS_REGIONS_MEMBER: &str = "NonAwsRegions";
-
-/// The region this request was signed for, from its SigV4 credential scope; an
-/// unsigned request is attributed to [`DEFAULT_REGION`].
-pub fn request_region(parts: &::http::request::Parts) -> String {
-    ::emulator_server::sigv4_credential_scope(&parts.headers)
-        .map(|scope| scope.region)
-        .filter(|region| !region.is_empty())
-        .unwrap_or_else(|| DEFAULT_REGION.to_string())
-}
-
-/// This service's store in the shared engine: call it with a handler's `&*self.engine`.
-///
-/// Answer `None` with a modelled server error, never with a fresh engine.
-pub fn service_state<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-) -> Option<::engine::ServiceState<ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>> {
-    (engine as &dyn ::std::any::Any)
-        .downcast_ref::<::engine::InMemoryEngine>()
-        .map(::engine::InMemoryEngine::state::<ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState>)
-}

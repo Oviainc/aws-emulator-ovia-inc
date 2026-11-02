@@ -136,11 +136,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The input is `smithy.api#Unit`, so there is nothing to read from it, and `ctx`
-        // carries only request metadata this read does not need.
-        let _ = (&input, ctx);
+        // The input is `smithy.api#Unit`, so there is nothing to read from it; `ctx`
+        // carries the Region whose settings this read reports.
+        let _ = &input;
 
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(|| {
             GetGlobalSettingsErrorModeled::InternalServerException(InternalServerException {
                 message: "the Well-Architected Tool global settings store is unavailable"
                     .to_string(),

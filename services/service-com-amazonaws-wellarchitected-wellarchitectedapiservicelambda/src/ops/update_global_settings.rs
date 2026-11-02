@@ -163,12 +163,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata this write does not need: the settings are the
-        // account's, and every request this emulator serves is attributed to its one
+        // `ctx` carries the request's Region, which is the store these settings belong
+        // to: the settings are the account's IN one Region, as every resource of this
+        // service is, and every request this emulator serves is attributed to its one
         // account.
-        let _ = ctx;
 
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(|| {
             UpdateGlobalSettingsErrorModeled::InternalServerException(InternalServerException {
                 message: "the Well-Architected Tool global settings store is unavailable"
                     .to_string(),
