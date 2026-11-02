@@ -1013,6 +1013,9 @@ async fn an_inadmissible_update_is_refused_and_changes_nothing() {
             answer.error_code()
         );
         if matches!(row.bad, Bad::UnprovenDomain) {
+            // Every tenant this suite updates was created with a managed certificate request,
+            // so it HOLDS a certificate: the refusal is about the domain that certificate
+            // validates nothing for, not about a certificate the account does not have.
             let message = answer.root().find_text("Message").unwrap_or_default();
             assert_eq!(
                 message, INVALID_DOMAIN_NAME_MESSAGE,

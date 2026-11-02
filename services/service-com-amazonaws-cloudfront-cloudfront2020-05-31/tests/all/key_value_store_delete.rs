@@ -52,10 +52,12 @@ use crate::key_value_store_lifecycle::{
 /// the crate cannot make these assertions pass.
 const KEY_VALUE_STORE_NOT_FOUND_MESSAGE: &str = "The specified KeyValueStore does not exist.";
 
-/// The sentence the model documents on `CannotDeleteEntityWhileInUse`
-/// (`smithy_query(query="doc", shape="CannotDeleteEntityWhileInUse")`), spelled out here for
-/// the same reason.
-const ENTITY_IN_USE_MESSAGE: &str = "The entity cannot be deleted while it is in use.";
+/// The sentence CloudFront serves a delete of a key value store a function still associates
+/// with: its fixed text, carrying the store the REQUEST addressed as its one variable part.
+/// Spelled out here for the same reason.
+fn key_value_store_in_use_message(name: &str) -> String {
+    format!("Cannot delete KeyValueStore {name} because it is associated with a function")
+}
 
 /// A version token that is well formed — `E` + 13 characters of the shape this service mints
 /// — but that no store in a fresh emulator holds, so a precondition carrying it is STALE
@@ -481,9 +483,10 @@ async fn a_store_a_function_associates_cannot_be_deleted() {
             answer.raw
         );
         let message = answer.root().find_text("Message").unwrap_or_default();
+        let expected = key_value_store_in_use_message(&store.name);
         assert_eq!(
-            message, ENTITY_IN_USE_MESSAGE,
-            "case {case}: expected the in-use sentence, got {message:?}"
+            message, expected,
+            "case {case}: expected the in-use sentence {expected:?}, got {message:?}"
         );
         assert_present(&router, &store.name, etag, case).await;
     }

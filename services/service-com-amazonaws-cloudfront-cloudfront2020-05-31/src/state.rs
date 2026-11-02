@@ -8013,10 +8013,15 @@ pub fn immutable_public_key_change(
     .find_map(|(member, held, asked)| (held != asked).then_some(member))
 }
 
-/// `CannotChangeImmutablePublicKeyFields`'s message: the sentence the model states on the
-/// shape itself, which carries nothing from the request.
+/// `CannotChangeImmutablePublicKeyFields`'s message, on the wire: the sentence names the
+/// members that are fixed for a key's life — which is what the refusal is about, and what
+/// tells a caller that `Comment` is updatable while `Name` and `EncodedKey` are not.
+///
+/// The WIRE text, which differs from the sentence the MODEL's documentation of the shape uses
+/// ("You can't change the value of a public key."); do not "correct" this constant to the
+/// documentation sentence. It carries nothing from the request either way.
 pub const CANNOT_CHANGE_IMMUTABLE_PUBLIC_KEY_FIELDS_MESSAGE: &str =
-    "You can't change the value of a public key.";
+    "You cannot modify encoded material and name of a public key once created.";
 
 /// The modelled `CannotChangeImmutablePublicKeyFields` (HTTP 400) for an update that would
 /// move a member fixed for the key's life ([`immutable_public_key_change`]).
@@ -8702,6 +8707,24 @@ pub fn names_custom_certificate(certificate: Option<&ViewerCertificate>) -> bool
     acm || iam
 }
 
+/// Whether anything a distribution-tenant call has to hand provides a TLS certificate for the
+/// domains that tenant claims: a certificate its `Customizations` name, or a custom
+/// certificate on the multi-tenant distribution it sits under.
+///
+/// This is the question the sentence for a domain nothing proves ENUMERATES
+/// ([`MISSING_CERTIFICATE_FOR_DOMAIN_MESSAGE`] — "at least one certificate in the distribution
+/// tenant or distribution, or … a managed certificate request"), so it is what decides WHICH
+/// of the two refusals that condition carries: with none of the three present the caller is
+/// told the requirement it has not met, and with one of them present the refusal is about the
+/// DOMAIN, which the certificate it holds validates nothing for.
+pub fn names_a_certificate(
+    customizations: Option<&Customizations>,
+    distribution_certificate: Option<&ViewerCertificate>,
+) -> bool {
+    customizations.is_some_and(|customizations| customizations.certificate.is_some())
+        || names_custom_certificate(distribution_certificate)
+}
+
 /// A count in a submitted configuration that exceeds what this service stores, and the
 /// message that says so. Each variant names the modelled error the handler answers with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9100,13 +9123,25 @@ pub fn field_level_encryption_config_quantity_mismatch(
         .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
 }
 
+/// The sentence CloudFront refuses a cache configuration whose three TTLs are not ordered
+/// with: it states the ORDERING RULE over all three members — which is what attributes the
+/// refusal, since `InvalidArgument` is this service's catch-all — and nothing from the
+/// request, so a `DefaultTTL` that breaks the chain is attributable from the same sentence a
+/// `MaxTTL` below `MinTTL` is.
+///
+/// The rule in the words the service states it in: "less than or equal to" rather than a
+/// symbol, and the three members named in the order they are written.
+pub const TTL_ORDER_MESSAGE: &str =
+    "MinTTL, MaxTTL and DefaultTTL should follow order MinTTL less than or equal to \
+     DefaultTTL less than or equal to MaxTTL";
+
 /// Why a cache policy configuration is unusable, as the sentence the modelled
 /// `InvalidArgument` carries — or `None` when every member is within what the model and
 /// the documentation allow.
 ///
-/// Two rules, each one the documentation states and each sentence BUILT FROM THE REQUEST:
-/// it names the member and the constraint it broke, which is the one thing the caller
-/// cannot work out for itself.
+/// Two rules, each one the documentation states. The TTL ordering is reported as the RULE it
+/// broke ([`TTL_ORDER_MESSAGE`], fixed text); the remaining sentences name the member and the
+/// constraint it broke, which is the one thing the caller cannot work out for itself.
 ///
 /// * The three TTLs are ORDERED: each is "The {minimum,default,maximum} amount of time, in
 ///   seconds, that objects stay in the CloudFront cache", so the minimum cannot exceed the
@@ -9115,7 +9150,8 @@ pub fn field_level_encryption_config_quantity_mismatch(
 ///   CloudFront's own documented default for it (86400 or `MinTTL`, whichever is larger,
 ///   for `DefaultTTL`; 31536000 or `DefaultTTL`, whichever is larger, for `MaxTTL`), and
 ///   refusing a configuration whose only disorder comes from that default would refuse
-///   what the service accepts.
+///   what the service accepts. Every break of the chain is the one ordering sentence
+///   ([`TTL_ORDER_MESSAGE`]), which states the rule rather than the pair that exposed it.
 /// * A TTL is an amount of time in seconds, so a negative one names no duration. The model
 ///   puts no `@range` on `long`, so nothing refuses it before a handler runs.
 ///
@@ -9145,22 +9181,20 @@ pub fn cache_policy_config_invalid(config: &CachePolicyConfig) -> Option<String>
     }
 
     // The pairs the ordering rule constrains, each compared only where the request
-    // supplies both members of it.
-    let pairs: [(&str, Option<i64>, &str, Option<i64>); 3] = [
-        ("MinTTL", Some(config.min_ttl), "DefaultTTL", config.default_ttl),
-        ("MinTTL", Some(config.min_ttl), "MaxTTL", config.max_ttl),
-        ("DefaultTTL", config.default_ttl, "MaxTTL", config.max_ttl),
+    // supplies both members of it. Every break of the chain is the ONE ordering sentence
+    // ([`TTL_ORDER_MESSAGE`]): the rule is over all three members, so which pair exposed
+    // the break is no part of what the refusal states.
+    let pairs: [(Option<i64>, Option<i64>); 3] = [
+        (Some(config.min_ttl), config.default_ttl),
+        (Some(config.min_ttl), config.max_ttl),
+        (config.default_ttl, config.max_ttl),
     ];
-    for (lower_label, lower, upper_label, upper) in pairs {
+    for (lower, upper) in pairs {
         let (Some(lower), Some(upper)) = (lower, upper) else {
             continue;
         };
         if lower > upper {
-            return Some(format!(
-                "An argument is invalid: {upper_label} must be greater than or equal to \
-                 {lower_label}, but the request submits {lower_label} {lower} and {upper_label} \
-                 {upper}"
-            ));
+            return Some(TTL_ORDER_MESSAGE.to_string());
         }
     }
 
@@ -9412,6 +9446,40 @@ pub const NO_SUCH_DISTRIBUTION_MESSAGE: &str = "The specified distribution does 
 /// "The specified invalidation does not exist."
 pub const NO_SUCH_INVALIDATION_MESSAGE: &str = "The specified invalidation does not exist.";
 
+/// The modelled `EntityNotFound` (HTTP 404) for an invalidation id that is not in the scope
+/// of the distribution tenant the request named.
+///
+/// The CODE is the tenant surface's own — the family every tenant-scoped read resolves its
+/// tenant under — while the SENTENCE is the one this condition carries whichever code reports
+/// it ([`NO_SUCH_INVALIDATION_MESSAGE`], which the distribution-scoped read answers with):
+/// what it states is that the store holds no such invalidation, which is a property of the
+/// store rather than of the operation asking.
+pub fn invalidation_not_found() -> EntityNotFound {
+    EntityNotFound {
+        message: Some(NO_SUCH_INVALIDATION_MESSAGE.to_string()),
+    }
+}
+
+/// `BatchTooLarge`'s message: the sentence the model states on the shape itself,
+/// "Invalidation batch specified is too large."
+///
+/// A property of the batch the request carried rather than of its contents, so the paths it
+/// named and the bound it broke are no part of the text.
+pub const BATCH_TOO_LARGE_MESSAGE: &str = "Invalidation batch specified is too large.";
+
+/// The modelled `BatchTooLarge` (HTTP 413) for an invalidation batch naming more objects than
+/// one request may — the per-batch bound ([`MAX_INVALIDATION_PATHS`]).
+///
+/// The DISTRIBUTION-scoped create answers this code for that condition; the tenant-scoped one
+/// answers the invalidation quota's own code for it
+/// ([`too_many_invalidations_in_progress`]), which is what each surface's recorded behaviour
+/// carries. Do not unify them.
+pub fn batch_too_large() -> crate::ops::types::BatchTooLarge {
+    crate::ops::types::BatchTooLarge {
+        message: Some(BATCH_TOO_LARGE_MESSAGE.to_string()),
+    }
+}
+
 /// `TooManyInvalidationsInProgress`'s message, as CloudFront sends it: "Processing your
 /// request will cause you to exceed the maximum number of in-progress invalidations."
 ///
@@ -9433,28 +9501,56 @@ pub fn too_many_invalidations_in_progress() -> crate::ops::types::TooManyInvalid
     }
 }
 
-/// `PreconditionFailed`'s message, as CloudFront sends it: "The request failed because it
-/// didn't meet the preconditions in one or more request-header fields."
+/// `PreconditionFailed`'s message, as CloudFront sends it on the resource-DOCUMENT surface:
+/// "The request failed because it didn't meet the preconditions in one or more
+/// request-header fields."
 ///
 /// The model's doc text for the shape states the condition ("The precondition in one or
 /// more of the request fields evaluated to `false`."); this is the sentence the service
 /// puts on the wire. Either way it is fixed service text that names no request value: a
 /// caller learns WHICH precondition failed from the `If-Match` it sent, not from a
 /// version token echoed back to it.
+///
+/// The family this one serves is the resource DOCUMENT a caller conditionally rewrites: a
+/// distribution, an origin access identity, a function, a field-level encryption
+/// configuration or profile, a public key, a key value store, an Anycast IP list, a
+/// continuous deployment policy. The two siblings below word the same condition for the
+/// other two families.
 pub const PRECONDITION_FAILED_MESSAGE: &str =
     "The request failed because it didn't meet the preconditions in one or more \
      request-header fields.";
 
-/// `PreconditionFailed`'s message on the key group surface, as CloudFront sends it: "The
+/// `PreconditionFailed`'s message on the key group surface: see
+/// [`PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE`], which the key group surface shares
+/// with the policy surface.
+/// `PreconditionFailed`'s message on the POLICY surface, as CloudFront sends it: "The
 /// request failed because it didn't meet the preconditions for this operation."
 ///
 /// CloudFront words this one refusal per API FAMILY, and the sentence is fixed text that
-/// names no request value either way. The distribution and origin access identity surfaces
-/// — whose `ETag` is the version of a resource DOCUMENT a caller conditionally rewrites —
-/// report it of the request's header fields ([`PRECONDITION_FAILED_MESSAGE`]); the key
-/// group surface reports it of the OPERATION, which is the sentence below.
+/// names no request value either way. The reusable configuration objects a distribution
+/// references by id — the cache policies, the origin request policies and the key groups —
+/// report the precondition of the OPERATION, which is the sentence below; the resource
+/// DOCUMENTS a caller conditionally rewrites (a distribution, an identity, a function, a
+/// field-level encryption configuration, a key value store) report it of the request's header
+/// fields ([`PRECONDITION_FAILED_MESSAGE`]), and the distribution-tenant surface reports the
+/// request as missing a requirement
+/// ([`PRECONDITION_FAILED_MISSING_REQUIREMENTS_MESSAGE`]). Recorded behaviour decides which
+/// family an operation belongs to: do not move one between them.
 pub const PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE: &str =
     "The request failed because it didn't meet the preconditions for this operation.";
+
+/// `PreconditionFailed`'s message on the DISTRIBUTION-TENANT surface — the tenants, the
+/// connection groups and connection functions that route them, and the web-ACL associations
+/// of both — as CloudFront sends it: "Your request is missing requirements for this
+/// operation. Update your request and try again."
+///
+/// The THIRD wording of the one condition, because CloudFront words this refusal per API
+/// FAMILY: this family reports the request as missing a requirement rather than reporting the
+/// precondition at all. Fixed text that names no request value either way, for the reason
+/// [`PRECONDITION_FAILED_MESSAGE`] names none.
+pub const PRECONDITION_FAILED_MISSING_REQUIREMENTS_MESSAGE: &str =
+    "Your request is missing requirements for this operation. Update your request and try \
+     again.";
 
 /// `InvalidIfMatchVersion`'s message, as CloudFront sends it: "The If-Match version is
 /// missing or not valid for the resource."
@@ -9511,11 +9607,20 @@ pub fn precondition_failed() -> crate::ops::types::PreconditionFailed {
 }
 
 /// The modelled `PreconditionFailed` for an `If-Match` that is a well-formed version token
-/// but not the current one, worded as the key group surface words it
+/// but not the current one, worded as the POLICY surface words it
 /// ([`PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE`]).
 pub fn precondition_failed_for_this_operation() -> crate::ops::types::PreconditionFailed {
     crate::ops::types::PreconditionFailed {
         message: Some(PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled `PreconditionFailed` for an `If-Match` that is a well-formed version token
+/// but not the current one, worded as the DISTRIBUTION-TENANT surface words it
+/// ([`PRECONDITION_FAILED_MISSING_REQUIREMENTS_MESSAGE`]).
+pub fn precondition_failed_missing_requirements() -> crate::ops::types::PreconditionFailed {
+    crate::ops::types::PreconditionFailed {
+        message: Some(PRECONDITION_FAILED_MISSING_REQUIREMENTS_MESSAGE.to_string()),
     }
 }
 
@@ -9647,11 +9752,28 @@ pub fn entity_in_use() -> crate::ops::types::CannotDeleteEntityWhileInUse {
 pub const ENTITY_IN_USE_MESSAGE: &str = "The entity cannot be deleted while it is in use.";
 
 /// The modelled `EntityAlreadyExists` (HTTP 409) for a key value store name that is
-/// already taken — "The entity already exists. You must provide a unique entity."
-pub fn key_value_store_already_exists(name: &str) -> EntityAlreadyExists {
-    EntityAlreadyExists {
+/// already taken.
+///
+/// Carries NO message: the recorded service answers this conflict with the code and the
+/// status alone, so there is no sentence to put on the wire and none is invented. The model
+/// documents the shape ("The entity already exists. You must provide a unique entity."); that
+/// prose states the condition and is not served.
+pub fn key_value_store_already_exists() -> EntityAlreadyExists {
+    EntityAlreadyExists { message: None }
+}
+
+/// The modelled `CannotDeleteEntityWhileInUse` (HTTP 409) for a delete of a key value store
+/// a function still associates.
+///
+/// The sentence CloudFront serves for THIS resource kind names the store the request
+/// addressed — its one variable part, taken from the request — and nothing else: no function
+/// and no ARN, so a caller learns no identifier the request did not already carry. The
+/// neighbouring kinds whose conflict is the same code serve the fixed [`ENTITY_IN_USE_MESSAGE`]
+/// instead.
+pub fn key_value_store_in_use(name: &str) -> crate::ops::types::CannotDeleteEntityWhileInUse {
+    crate::ops::types::CannotDeleteEntityWhileInUse {
         message: Some(format!(
-            "A key value store with the name {name} already exists in this account"
+            "Cannot delete KeyValueStore {name} because it is associated with a function"
         )),
     }
 }
@@ -9744,16 +9866,33 @@ pub fn domain_ownership_unverified() -> crate::ops::types::InvalidArgument {
     }
 }
 
-/// The sentence CloudFront refuses a domain whose control by this account it has no proof
-/// of with: the condition is that nothing proves the domain, which is a property of what
-/// the account has validated rather than of any value the caller sent, so the sentence
-/// names none of them — no domain, no certificate ARN and no tenant name appears in it.
-/// Recorded behaviour.
+/// The sentence CloudFront refuses a domain no certificate of this account covers with: what
+/// the refusal states is the REQUIREMENT the caller has to satisfy — a certificate on the
+/// tenant or on the distribution, or a managed certificate request to mint one — rather than
+/// anything about the domain string submitted, so the sentence names no domain, no
+/// certificate ARN and no tenant.
+///
+/// The one sentence for that condition wherever the tenant surface reaches it: a tenant
+/// create or update claiming a domain nothing proves, and a domain-conflict listing whose
+/// domain control validation resource carries no covering certificate.
+pub const MISSING_CERTIFICATE_FOR_DOMAIN_MESSAGE: &str =
+    "There must be at least one certificate in the distribution tenant or distribution, or \
+     there must be a managed certificate request";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a domain no certificate of this account
+/// covers ([`MISSING_CERTIFICATE_FOR_DOMAIN_MESSAGE`]).
+pub fn missing_certificate_for_domain() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(MISSING_CERTIFICATE_FOR_DOMAIN_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence CloudFront refuses a value that is no domain name at all with: the condition
+/// is a property of the value submitted rather than of the account's certificates, so the
+/// sentence states that and names the value nowhere. Recorded behaviour.
 pub const INVALID_DOMAIN_NAME_MESSAGE: &str = "The request contains an invalid domain name.";
 
-/// The modelled `InvalidArgument` (HTTP 400) for a domain the account has not proven its
-/// control of to CloudFront
-/// ([`ComAmazonawsCloudfrontCloudfront20200531State::unproven_domain`]).
+/// The modelled `InvalidArgument` (HTTP 400) for a value that is no domain name at all.
 pub fn invalid_domain_name() -> crate::ops::types::InvalidArgument {
     crate::ops::types::InvalidArgument {
         message: Some(INVALID_DOMAIN_NAME_MESSAGE.to_string()),
@@ -10672,7 +10811,7 @@ pub fn no_such_public_key() -> crate::ops::types::NoSuchPublicKey {
 }
 
 /// `NoSuchPublicKey`'s message, as the model documents the shape.
-pub const NO_SUCH_PUBLIC_KEY_MESSAGE: &str = "The specified public key doesn't exist.";
+pub const NO_SUCH_PUBLIC_KEY_MESSAGE: &str = "The specified CloudFront public key does not exist.";
 
 /// The longest comment a field-level encryption profile carries.
 ///
@@ -10736,8 +10875,8 @@ pub const FIELD_LEVEL_ENCRYPTION_PROFILE_IN_USE_MESSAGE: &str =
 /// for field-level encryption already exists." — up to the profile the caller reference is
 /// already associated with, which it names at the end: the one piece of store-derived detail
 /// in it, and the one a caller cannot work out for itself. The same shape
-/// [`public_key_already_exists_message`] takes, for the same rule applied to the other
-/// resource.
+/// [`origin_access_identity_already_exists_message`] takes, for the same rule applied to the
+/// other resource.
 pub fn field_level_encryption_profile_already_exists_message(existing_id: &str) -> String {
     format!(
         "The specified profile for field-level encryption already exists: {existing_id}"
@@ -10988,15 +11127,20 @@ pub fn too_many_public_keys() -> crate::ops::types::TooManyPublicKeys {
     }
 }
 
-/// The sentence `PublicKeyAlreadyExists` carries — "The specified public key already
-/// exists." — up to the key the caller reference is already associated with, which it
-/// names at the end: the one piece of store-derived detail in it, and the one a caller
-/// cannot work out for itself. The same shape
-/// [`origin_access_identity_already_exists_message`] takes, for the same rule applied to
-/// the other resource.
-pub fn public_key_already_exists_message(existing_id: &str) -> String {
-    format!("The specified public key already exists: {existing_id}")
-}
+/// The sentence `PublicKeyAlreadyExists` carries, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this emulator
+/// therefore serves. It differs from the sentence the MODEL's documentation of the shape uses
+/// ("The specified public key already exists."): that one documents the condition, this one
+/// states what the condition IS — the caller reference the request carried already names a
+/// key of this account. Do not "correct" this constant to the documentation sentence.
+///
+/// The WHOLE sentence is fixed: the conflict is over the reference the REQUEST submitted, so
+/// the caller already holds it, and the identifier of the key that holds it is no part of the
+/// text.
+pub const PUBLIC_KEY_ALREADY_EXISTS_MESSAGE: &str =
+    "The caller reference that you are using to create a CloudFront public key is associated \
+     with another public key in your account.";
 
 /// The longest comment a key group carries.
 ///

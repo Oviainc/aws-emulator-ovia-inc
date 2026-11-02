@@ -426,7 +426,7 @@ fn inadmissible(admitted: &str) -> Vec<(String, String)> {
 
 /// Assert one refusal is the one this service answers a request whose schema it cannot read,
 /// and that its sentence still states the member and the value set that member broke.
-fn assert_malformed_xml(case: &str, value: &str, answer: &Answer, member: &str, values: &str) {
+fn assert_enum_value_refused(case: &str, value: &str, answer: &Answer, member: &str, values: &str) {
     assert_eq!(
         answer.status, 400,
         "case {case} ({value:?}): expected HTTP 400, got {} ({})",
@@ -467,7 +467,7 @@ async fn a_value_outside_a_modelled_enum_is_a_request_that_cannot_be_read() {
         // list, under a version token that IS the list's current one, so nothing but the
         // enum can be what the request is refused over.
         let answer = update_anycast_ip_list(&router, &list_id, &etag, &value).await;
-        assert_malformed_xml(
+        assert_enum_value_refused(
             &format!("UpdateAnycastIpList/{case}"),
             &value,
             &answer,
@@ -489,7 +489,7 @@ async fn a_value_outside_a_modelled_enum_is_a_request_that_cannot_be_read() {
             &format!("<IpAddressType>{value}</IpAddressType></CreateAnycastIpListRequest>"),
         );
         let answer = create_anycast_ip_list(&router, &body).await;
-        assert_malformed_xml(
+        assert_enum_value_refused(
             &format!("CreateAnycastIpList/{case}"),
             &value,
             &answer,
@@ -505,7 +505,7 @@ async fn a_value_outside_a_modelled_enum_is_a_request_that_cannot_be_read() {
     for (case, value) in inadmissible("sigv4") {
         let answer =
             create_origin_access_control(&router, "refusal-contract-oac", &value, "s3").await;
-        assert_malformed_xml(
+        assert_enum_value_refused(
             &format!("CreateOriginAccessControl/SigningProtocol/{case}"),
             &value,
             &answer,
@@ -516,7 +516,7 @@ async fn a_value_outside_a_modelled_enum_is_a_request_that_cannot_be_read() {
     for (case, value) in inadmissible("s3") {
         let answer =
             create_origin_access_control(&router, "refusal-contract-oac", "sigv4", &value).await;
-        assert_malformed_xml(
+        assert_enum_value_refused(
             &format!("CreateOriginAccessControl/OriginType/{case}"),
             &value,
             &answer,
@@ -525,9 +525,9 @@ async fn a_value_outside_a_modelled_enum_is_a_request_that_cannot_be_read() {
         );
     }
 
-    // The OTHER binding: a value outside the same kind of value set, carried by a query
-    // parameter instead of a document, is the same refusal — the binding does not change
-    // which schema the request broke.
+    // The OTHER binding: the same kind of value set, carried by a query parameter instead of
+    // a document, is the same refusal — the binding does not change which schema the request
+    // broke.
     let refused_query = list_cache_policies_by_type(&router, "not-a-policy-type").await;
     assert_eq!(
         refused_query.error_code(),
@@ -536,6 +536,11 @@ async fn a_value_outside_a_modelled_enum_is_a_request_that_cannot_be_read() {
          same way, got {:?} ({})",
         refused_query.error_code(),
         refused_query.raw
+    );
+    assert!(
+        message(&refused_query).contains("Member must satisfy enum value set:"),
+        "case ListCachePolicies/Type: expected the value-set sentence, got {:?}",
+        message(&refused_query)
     );
 
     // The control for the rule itself: a value the enum DOES admit is served rather than

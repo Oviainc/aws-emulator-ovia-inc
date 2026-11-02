@@ -655,9 +655,11 @@ async fn a_page_size_or_marker_that_names_no_resume_point_is_refused() {
     );
 }
 
-/// A value a query parameter's enum does not admit describes a request this API cannot
-/// read: `MalformedXML` (400), under the sentence that names the parameter and the values it
-/// admits — listed in the order this API publishes that enum's values.
+/// A value a query parameter's enum does not admit describes a request this API cannot read
+/// — the URI is no document, so there is no document the value could have been read from:
+/// `MalformedXML` (400), under the sentence that names the parameter and the values it
+/// admits — listed in the order this API publishes that enum's values, which for
+/// `CachePolicyType` is the caller-owned kind first.
 ///
 /// The rows span the operations whose listing binds such a parameter (cache policies, origin
 /// request policies and response headers policies all filter on a `Type` the model
@@ -700,7 +702,7 @@ async fn a_type_the_enum_does_not_admit_is_refused_as_a_request_that_cannot_be_r
             );
             assert!(
                 message.contains(&format!(
-                    "[{CACHE_POLICY_TYPE_MANAGED}, {CACHE_POLICY_TYPE_CUSTOM}]"
+                    "[{CACHE_POLICY_TYPE_CUSTOM}, {CACHE_POLICY_TYPE_MANAGED}]"
                 )),
                 "case {case} on {path}: expected the admitted values listed as the API \
                  publishes them, got {message:?}"

@@ -267,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             IfMatch::Stale => {
                 return Err(UpdateOriginRequestPolicyErrorModeled::PreconditionFailed(
-                    crate::state::precondition_failed(),
+                    crate::state::precondition_failed_for_this_operation(),
                 )
                 .into());
             }

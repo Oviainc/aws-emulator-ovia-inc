@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             crate::state::IfMatch::Stale => {
                 return Err(DeleteOriginRequestPolicyErrorModeled::PreconditionFailed(
-                    crate::state::precondition_failed(),
+                    crate::state::precondition_failed_for_this_operation(),
                 )
                 .into());
             }

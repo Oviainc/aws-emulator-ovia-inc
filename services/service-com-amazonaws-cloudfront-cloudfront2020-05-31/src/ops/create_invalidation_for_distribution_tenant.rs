@@ -206,8 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You have exceeded the maximum number of allowable InProgress invalidation batch
         // requests, or invalidation objects": the objects ONE batch names count against
         // that quota, so a batch naming more paths than the service admits is refused
-        // under it. The batch is stored whole, so the bound is checked before anything is
-        // stored.
+        // under it — recorded behaviour for this operation, which answers the per-batch
+        // object quota under the SAME code as the in-flight one. The batch is stored whole,
+        // so the bound is checked before anything is stored.
         let path_count = crate::state::batch_path_count(&input.invalidation_batch);
         if path_count > crate::state::MAX_INVALIDATION_PATHS {
             return Err(

@@ -36,7 +36,7 @@
 //! [`crate::managed_certificate_domain_ownership`]'s.
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    DISTRIBUTION_TENANT_ID_PREFIX, INVALID_DOMAIN_NAME_MESSAGE, MAX_DOMAINS_PER_TENANT,
+    DISTRIBUTION_TENANT_ID_PREFIX, MAX_DOMAINS_PER_TENANT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -49,6 +49,19 @@ use crate::managed_certificate_domain_ownership::{
     await_certificate_issuance, distribution_domain_name, resolvable_domains,
 };
 use crate::response_headers_policy_lifecycle::text;
+
+/// The sentence a tenant create claiming a domain no certificate of the account covers is
+/// refused with: the REQUIREMENT the caller has to satisfy. Spelled out here as a literal
+/// rather than read back off the crate's constant, so the WORDING is what these rows are
+/// held to.
+const MISSING_CERTIFICATE_SENTENCE: &str =
+    "There must be at least one certificate in the distribution tenant or distribution, or \
+     there must be a managed certificate request";
+
+/// The sentence the same create is refused with when a certificate IS attached — one named by
+/// ARN, which validates no domain this service can see — so what the refusal is about is the
+/// domain rather than the certificate. A literal here for the same reason.
+const INVALID_DOMAIN_SENTENCE: &str = "The request contains an invalid domain name.";
 
 // ---------------------------------------------------------------------------
 // Calling the reads that say what the create persisted
@@ -373,8 +386,10 @@ async fn a_tenant_is_bound_only_to_a_domain_the_account_has_proven() {
             continue;
         }
 
-        // The refusal: the modelled 400, worded with the one sentence this condition
-        // carries, which interpolates nothing from the request.
+        // The refusal: the modelled 400, worded with the sentence this condition carries for
+        // what the request had to hand — the REQUIREMENT it did not meet where nothing names
+        // a certificate at all, and the DOMAIN where a certificate is attached that validates
+        // nothing for it. Neither interpolates anything from the request.
         assert_eq!(
             answer.status, 400,
             "case {case}: expected HTTP 400, got {} with {}",
@@ -386,10 +401,15 @@ async fn a_tenant_is_bound_only_to_a_domain_the_account_has_proven() {
             "case {case}: expected InvalidArgument, got {}",
             answer.raw
         );
+        let expected = if row.certificate_arn.is_some() {
+            INVALID_DOMAIN_SENTENCE
+        } else {
+            MISSING_CERTIFICATE_SENTENCE
+        };
         let message = answer.root().find_text("Message").unwrap_or_default();
         assert_eq!(
-            message, INVALID_DOMAIN_NAME_MESSAGE,
-            "case {case}: expected the invalid-domain sentence, got {message:?}"
+            message, expected,
+            "case {case}: expected the sentence {expected:?}, got {message:?}"
         );
 
         // Nothing was persisted: no tenant under the name, and no claim on any domain the

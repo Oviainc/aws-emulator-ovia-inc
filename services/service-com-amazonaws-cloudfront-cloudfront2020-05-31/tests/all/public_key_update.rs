@@ -14,8 +14,8 @@
 //!   instant the create recorded, which no update moves;
 //! * a request that submits a different value for any one of `CallerReference`, `Name` or
 //!   `EncodedKey` is refused with `CannotChangeImmutablePublicKeyFields` (HTTP 400, "You
-//!   can't change the value of a public key.") and leaves the stored record and its version
-//!   token exactly as they were;
+//!   cannot modify encoded material and name of a public key once created.") and leaves the
+//!   stored record and its version token exactly as they were;
 //! * the version token the last mutation handed back is the only one an `If-Match` against
 //!   that key satisfies: an absent or malformed header is `InvalidIfMatchVersion` (HTTP
 //!   400), which is a property of the REQUEST and so is answered for an id no key holds
@@ -38,14 +38,20 @@
 use std::collections::BTreeSet;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    CANNOT_CHANGE_IMMUTABLE_PUBLIC_KEY_FIELDS_MESSAGE, MAX_PUBLIC_KEY_COMMENT,
-    NO_SUCH_PUBLIC_KEY_MESSAGE,
+    MAX_PUBLIC_KEY_COMMENT, NO_SUCH_PUBLIC_KEY_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{call, emulator, is_version_token, Answer, API_VERSION};
 use crate::public_key_lifecycle::{create_key, get_key, pem, Key};
 use crate::response_headers_policy_lifecycle::text;
+
+/// The sentence `CannotChangeImmutablePublicKeyFields` carries: it names the members that are
+/// fixed for a key's life, which is what tells a caller that `Comment` is updatable while
+/// `Name` and `EncodedKey` are not. Spelled out here as a literal rather than read back off
+/// the crate's constant, so the WORDING is what these rows are held to.
+const IMMUTABLE_FIELDS_MESSAGE: &str =
+    "You cannot modify encoded material and name of a public key once created.";
 
 // ---------------------------------------------------------------------------
 // Calling the update
@@ -373,8 +379,9 @@ async fn an_update_that_moves_an_immutable_member_is_refused() {
             );
             assert_eq!(
                 answer.root().find_text("Message").unwrap_or_default(),
-                CANNOT_CHANGE_IMMUTABLE_PUBLIC_KEY_FIELDS_MESSAGE,
-                "case {case}: expected the modelled immutability sentence, got {}",
+                IMMUTABLE_FIELDS_MESSAGE,
+                "case {case}: expected the immutability sentence {IMMUTABLE_FIELDS_MESSAGE:?}, \
+                 got {}",
                 answer.raw
             );
             assert_stored(&router, &id, &key, &etag, &created_time, &case).await;

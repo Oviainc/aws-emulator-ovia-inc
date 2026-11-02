@@ -275,6 +275,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let held_domains = tenant.domains.clone();
         let current_distribution_id = tenant.distribution_id.clone();
         let current_parameters = tenant.parameters.clone();
+        // Whether the tenant ALREADY holds a certificate, which an update that states no
+        // customizations of its own leaves in place.
+        let held_certificate = tenant.customization_certificate_arn().is_some()
+            || tenant.managed_certificate.is_some();
 
         // "The value of the ETag header that you received when retrieving the distribution
         // tenant to update": the version the update runs under. A value that is no version
@@ -292,7 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             IfMatch::Stale => {
                 return Err(UpdateDistributionTenantErrorModeled::PreconditionFailed(
-                    crate::state::precondition_failed(),
+                    crate::state::precondition_failed_missing_requirements(),
                 )
                 .into());
             }
@@ -317,7 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // marked as required in the multi-tenant distribution" is checked against the
         // definitions that distribution really carries, so the rule follows the stored
         // record rather than the request.
-        let parameters_refusal = {
+        // The parameter refusal, and — read while the distribution record is in hand —
+        // whether that distribution carries a custom certificate, which is one of the three
+        // places a certificate for this tenant's domains can come from.
+        let (parameters_refusal, distribution_certificate) = {
             let Some(distribution) = store.distribution(&effective_distribution_id) else {
                 return Err(UpdateDistributionTenantErrorModeled::EntityNotFound(
                     crate::state::distribution_not_found(),
@@ -341,7 +348,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(|config| config.parameter_definitions.as_deref())
                 .unwrap_or_default();
-            crate::state::parameter_refusal(definitions, &effective_parameters)
+            (
+                crate::state::parameter_refusal(definitions, &effective_parameters),
+                crate::state::names_custom_certificate(
+                    distribution.config.viewer_certificate.as_ref(),
+                ),
+            )
         };
         if let Some(reason) = parameters_refusal {
             return Err(invalid_argument(reason));
@@ -394,10 +406,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unproven_domain(newly_bound.iter().copied())
                 .is_some()
         {
-            return Err(UpdateDistributionTenantErrorModeled::InvalidArgument(
-                crate::state::invalid_domain_name(),
-            )
-            .into());
+            // The same split the create makes: with no certificate anywhere the caller is
+            // told the REQUIREMENT it has not met, and with one attached the refusal is about
+            // the DOMAIN that certificate validates nothing for. An update stating no
+            // customizations of its own leaves the tenant's certificate as it stands.
+            let names_certificate = match input.customizations.as_ref() {
+                Some(customizations) => customizations.certificate.is_some(),
+                None => held_certificate,
+            } || distribution_certificate;
+            let refusal = if names_certificate {
+                crate::state::invalid_domain_name()
+            } else {
+                crate::state::missing_certificate_for_domain()
+            };
+            return Err(UpdateDistributionTenantErrorModeled::InvalidArgument(refusal).into());
         }
 
         // "An object that contains the CloudFront managed ACM certificate request": a

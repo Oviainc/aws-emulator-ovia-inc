@@ -45,8 +45,8 @@ use std::time::Duration;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::VALIDATION_TOKEN_HOST_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     CERTIFICATE_STATUS_PENDING_VALIDATION, CERTIFICATE_VALIDATION_DELAY,
-    DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE, INVALID_DOMAIN_NAME_MESSAGE, MAX_DOMAINS_PER_TENANT,
-    VALIDATION_TOKEN_HOST_CLOUDFRONT,
+    DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE, MAX_DOMAINS_PER_TENANT,
+    MISSING_CERTIFICATE_FOR_DOMAIN_MESSAGE, VALIDATION_TOKEN_HOST_CLOUDFRONT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -238,11 +238,11 @@ impl Case {
     /// The sentence this row's refusal carries: a create that asks CloudFront to serve the
     /// validation token names the condition that the domain does not point at a CloudFront
     /// resource, while a create that asks CloudFront to validate NOTHING names the
-    /// condition that nothing proves the domain at all.
+    /// REQUIREMENT it did not satisfy — a certificate covering the domain.
     fn refusal_message(&self) -> &'static str {
         match self.validation_token_host {
             Some(_) => DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE,
-            None => INVALID_DOMAIN_NAME_MESSAGE,
+            None => MISSING_CERTIFICATE_FOR_DOMAIN_MESSAGE,
         }
     }
 }

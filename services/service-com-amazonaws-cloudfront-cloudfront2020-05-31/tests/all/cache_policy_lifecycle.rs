@@ -682,6 +682,14 @@ async fn create_persists_the_policy_the_reads_then_report() {
 /// the member out of the document) and whether the configuration must be refused.
 type TtlRow = (&'static str, i64, Option<i64>, Option<i64>, bool);
 
+/// The sentence CloudFront refuses a TTL chain that is not ordered with: fixed text stating
+/// the RULE over all three members — which is what attributes the refusal, `InvalidArgument`
+/// being this service's catch-all — and carrying none of the values submitted. Spelled out
+/// here as a literal rather than read back off the crate's constant, so the WORDING is what
+/// these rows are held to.
+const TTL_ORDER_MESSAGE: &str = "MinTTL, MaxTTL and DefaultTTL should follow order MinTTL \
+                                less than or equal to DefaultTTL less than or equal to MaxTTL";
+
 /// The TTL rule: the values a request supplies are ordered `MinTTL` <= `DefaultTTL` <=
 /// `MaxTTL`, and a TTL is an amount of time in seconds so none of them is negative. A
 /// configuration that breaks the rule is refused with `InvalidArgument` (HTTP 400) and
@@ -800,6 +808,19 @@ async fn ttls_out_of_order_or_negative_are_refused() {
             "case {case}: expected InvalidArgument, got {}",
             answer.raw
         );
+        // WHICH rule the row breaks decides the sentence: a negative TTL names no duration at
+        // all, while every break of the ordering chain — whichever pair exposed it — is the
+        // one sentence that states the chain.
+        let negative = min_ttl < 0
+            || default_ttl.is_some_and(|value| value < 0)
+            || max_ttl.is_some_and(|value| value < 0);
+        if !negative {
+            let message = answer.root().find_text("Message").unwrap_or_default();
+            assert_eq!(
+                message, TTL_ORDER_MESSAGE,
+                "case {case}: expected the ordering rule {TTL_ORDER_MESSAGE:?}, got {message:?}"
+            );
+        }
 
         // Nothing was stored: the name the refused create named is still free, so a
         // well-formed create under it succeeds.

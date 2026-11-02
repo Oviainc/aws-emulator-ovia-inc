@@ -281,6 +281,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Whether anything this call has to hand carries a certificate for the domains the
+        // tenant claims, which is what decides WHICH refusal an unproven domain is answered
+        // with below. Read while the distribution record is in hand.
+        let names_a_certificate = crate::state::names_a_certificate(
+            input.customizations.as_ref(),
+            distribution.config.viewer_certificate.as_ref(),
+        );
 
         // "A valid parameter value must exist for any parameter that is marked as required
         // in the multi-tenant distribution" — checked against the definitions the
@@ -348,17 +355,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds. A certificate named in `Customizations` is no proof: an ARN says nothing
         // about whether the certificate's domains were ever validated. Unproven, the domain
         // is no domain this tenant can be reached at, which is what `InvalidArgument` ("An
-        // argument is invalid") answers, worded with the sentence CloudFront states the
-        // condition in.
+        // argument is invalid") answers.
+        //
+        // WHICH sentence it answers with is decided by what the call has to hand: with no
+        // certificate anywhere — none on the tenant, none on its distribution and none
+        // requested — the caller is told the REQUIREMENT it has not met
+        // ([`crate::state::MISSING_CERTIFICATE_FOR_DOMAIN_MESSAGE`], which enumerates those
+        // three sources); with a certificate attached, that certificate validates nothing for
+        // this domain, so the refusal is about the DOMAIN.
         if input.managed_certificate_request.is_none()
             && store
                 .unproven_domain(domains.iter().map(String::as_str))
                 .is_some()
         {
-            return Err(CreateDistributionTenantErrorModeled::InvalidArgument(
-                crate::state::invalid_domain_name(),
-            )
-            .into());
+            let refusal = if names_a_certificate {
+                crate::state::invalid_domain_name()
+            } else {
+                crate::state::missing_certificate_for_domain()
+            };
+            return Err(CreateDistributionTenantErrorModeled::InvalidArgument(refusal).into());
         }
 
         // "The configuration for the CloudFront managed ACM certificate request": a request

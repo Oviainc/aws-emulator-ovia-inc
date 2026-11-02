@@ -19,16 +19,21 @@
 //! * and the refusal changes nothing: the resource that holds the name is readable
 //!   afterwards with the identity its own create minted.
 //!
-//! The rows span what the rule generalises over: the resource KIND (eight of them, four
-//! error codes between them), and for each kind the names a caller may choose — the ends of
+//! The rows span what the rule generalises over: the resource KIND (eleven of them, seven
+//! error codes between them), and for each kind the values a caller may choose — the ends of
 //! what the name members admit (the shortest form every kind takes and the 64-character
 //! bound the strictest of them publishes) and the character classes they admit (hyphens,
-//! digits, mixed case). Each row's repeat carries a configuration that DIFFERS from the
-//! stored one, so a kind that replaced the resource rather than refusing the name would
-//! show up in the read-back beside the assertion.
+//! underscores, digits, mixed case). Each row's repeat carries a configuration that DIFFERS
+//! from the stored one, so a kind that replaced the resource rather than refusing the value
+//! would show up in the read-back beside the assertion.
 //!
-//! The expected sentences are LITERALS in the table below rather than the crate's own
-//! constants, so a wrong constant cannot make this suite pass.
+//! The second suite below covers the kinds the first one's harness cannot drive: the two
+//! addressed by NAME rather than by a minted `Id`, and the one whose conflict is over the
+//! `CallerReference` rather than the name.
+//!
+//! The expected sentences are LITERALS in the tables below rather than the crate's own
+//! constants, so a wrong constant cannot make this suite pass — including the two conflicts
+//! the service answers with NO message at all.
 //!
 //! The harness (the router, the request helpers and each kind's configuration table) is the
 //! one the per-resource suites use, reused rather than copied; only the two request
@@ -51,12 +56,20 @@ use crate::distribution_lifecycle::{call, emulator, Answer, API_VERSION};
 use crate::distribution_tenant_lifecycle::{
     create_distribution_tenant, escape, managed_certificate_request, multi_tenant_distribution,
 };
+use crate::function_lifecycle::{
+    create_function, create_key_value_store as function_key_value_store,
+    create_table as function_create_table, describe_function,
+};
 use crate::key_group_lifecycle::{create_group, mint_public_keys, Group};
+use crate::key_value_store_lifecycle::{
+    create_key_value_store, create_table as key_value_store_table, describe_key_value_store,
+};
 use crate::origin_access_control_lifecycle::{create_control, table as control_table};
 use crate::origin_request_policy_lifecycle::{
     create_policy as create_origin_request_policy, policy_table as origin_request_policy_table,
     Policy as OriginRequestPolicy,
 };
+use crate::public_key_lifecycle::{create_key, get_key, pem, Key as PublicKey};
 use crate::response_headers_policy_lifecycle::{
     create_policy as create_response_headers_policy,
     policy_table as response_headers_policy_table, Policy as ResponseHeadersPolicy,
@@ -635,5 +648,169 @@ async fn an_update_onto_a_taken_name_carries_the_same_sentence() {
                 reread.status, reread.raw
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The kinds the harness above cannot drive
+// ---------------------------------------------------------------------------
+
+/// The remaining kinds whose create refuses a value the account already holds: the two
+/// addressed by NAME rather than by a minted `Id` (a function and a key value store, which
+/// the harness above cannot read back by id) and the one whose conflict is over the
+/// `CallerReference` rather than the name (a public key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NamedKind {
+    Function,
+    KeyValueStore,
+    PublicKey,
+}
+
+/// Each of them, with the error code the model binds for its conflict and the message the
+/// service states for that code — `""` where the service sends none at all.
+const NAMED_KINDS: &[(NamedKind, &str, &str)] = &[
+    (NamedKind::Function, "FunctionAlreadyExists", ""),
+    (NamedKind::KeyValueStore, "EntityAlreadyExists", ""),
+    (
+        NamedKind::PublicKey,
+        "PublicKeyAlreadyExists",
+        "The caller reference that you are using to create a CloudFront public key is \
+         associated with another public key in your account.",
+    ),
+];
+
+/// The values these kinds are driven over: `FunctionName` and `KeyValueStoreName` are
+/// `^[a-zA-Z0-9-_]{1,64}$` (`smithy_query(query="operation",operation="CreateFunction,CreateKeyValueStore")`),
+/// and a `CallerReference` carries no modelled constraint, so these rows sit inside what all
+/// three admit: the shortest form, the 64-character bound, and the character classes they
+/// share.
+fn named_values() -> Vec<(&'static str, String)> {
+    vec![
+        ("the shortest value every kind admits", "dup5".to_string()),
+        ("a value at the 64-character bound", "n".repeat(64)),
+        ("underscores and digits", "orders_by_region_7".to_string()),
+        ("mixed case and digits", "DupName43".to_string()),
+    ]
+}
+
+/// A create of `kind` under `value`, carrying the configuration `variant` selects so a
+/// repeat differs from the stored record in everything but the value under test.
+async fn create_under_value(
+    router: &MultiServiceRouter,
+    kind: NamedKind,
+    value: &str,
+    variant: usize,
+    store_arn: &str,
+) -> Answer {
+    match kind {
+        NamedKind::Function => {
+            let rows = function_create_table(store_arn);
+            let count = rows.len();
+            let chosen = rows
+                .into_iter()
+                .nth(variant % count)
+                .expect("the function table has the row chosen");
+            let body = crate::function_lifecycle::Create {
+                name: value.to_string(),
+                ..chosen
+            }
+            .xml();
+            create_function(router, &body).await
+        }
+        NamedKind::KeyValueStore => {
+            let rows = key_value_store_table();
+            let count = rows.len();
+            let chosen = rows
+                .into_iter()
+                .nth(variant % count)
+                .expect("the key value store table has the row chosen");
+            let body = crate::key_value_store_lifecycle::Create {
+                name: value.to_string(),
+                ..chosen
+            }
+            .xml();
+            create_key_value_store(router, &body).await
+        }
+        // The conflict is over the CALLER REFERENCE, so the reference is what repeats and
+        // everything else — the name and the encoded material — differs with the variant.
+        NamedKind::PublicKey => {
+            let body = PublicKey {
+                case: value.to_string(),
+                caller_reference: value.to_string(),
+                name: format!("{value}-{variant}"),
+                encoded_key: pem(1 + variant % 3, 'K'),
+                comment: Some(format!("the public key of configuration {variant}")),
+            }
+            .xml();
+            create_key(router, &body).await
+        }
+    }
+}
+
+/// Read the resource `value` names back, through the reader the model binds for that kind.
+async fn read_named_back(
+    router: &MultiServiceRouter,
+    kind: NamedKind,
+    value: &str,
+    holder_id: &str,
+) -> Answer {
+    match kind {
+        NamedKind::Function => describe_function(router, value, None).await,
+        NamedKind::KeyValueStore => describe_key_value_store(router, value).await,
+        NamedKind::PublicKey => get_key(router, holder_id).await,
+    }
+}
+
+/// The same rule over those kinds: the conflict is HTTP 409 under the code the model binds,
+/// its message is the FIXED text the service states for that code — and where the service
+/// states none, the refusal carries no message at all — and the resource holding the value
+/// survives the refusal.
+#[tokio::test]
+async fn a_create_under_a_taken_name_or_reference_carries_the_services_fixed_sentence() {
+    let router = emulator();
+    // The key value store a function's configuration associates, so every function row names
+    // a store this service really holds.
+    let store_arn = function_key_value_store(&router, "dup_named_conflict_store").await;
+
+    for (kind, code, expected) in NAMED_KINDS {
+        let mut sentences: Vec<String> = Vec::new();
+        for (row, (value_case, value)) in named_values().iter().enumerate() {
+            let case = format!("{kind:?} under {value_case}");
+            let first = create_under_value(&router, *kind, value, row, &store_arn).await;
+            assert_eq!(
+                first.status, 201,
+                "case {case}: expected HTTP 201 from the first create, got {} with {}",
+                first.status, first.raw
+            );
+            let holder_id = minted_id(&first);
+            let holder_etag = first.header("etag").to_string();
+
+            let repeat = create_under_value(&router, *kind, value, row + 1, &store_arn).await;
+            assert_conflict(&case, &repeat, code, expected, value, &holder_id);
+            sentences.push(message(&repeat).to_string());
+
+            // The refused create stored nothing: the resource that holds the value still
+            // answers at the version token its OWN create minted.
+            let reread = read_named_back(&router, *kind, value, &holder_id).await;
+            assert_eq!(
+                reread.status, 200,
+                "case {case}: expected the resource holding the value to survive the refusal, \
+                 got {} with {}",
+                reread.status, reread.raw
+            );
+            assert_eq!(
+                reread.header("etag"),
+                holder_etag,
+                "case {case}: expected the version token {holder_etag:?} the create minted, got \
+                 {:?}",
+                reread.header("etag")
+            );
+        }
+
+        // Nothing of the value chosen reaches the sentence, so every row read the same one.
+        assert!(
+            sentences.windows(2).all(|pair| pair[0] == pair[1]),
+            "case {kind:?}: expected one sentence for every value, got {sentences:?}"
+        );
     }
 }

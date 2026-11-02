@@ -160,12 +160,12 @@ const ONE_VALIDATION_RESOURCE_MESSAGE: &str =
 ///
 /// `DomainControlValidationResource` is "the standard distribution or distribution tenant
 /// that has a valid certificate, which covers the domain that you specify", so a resource
-/// whose attached certificate is not valid for that domain validates no control of it.
-/// CloudFront's own wording for that condition, recorded behaviour: it states what the
-/// resource has to carry and echoes no value from the request.
+/// whose attached certificate is not valid for that domain validates no control of it. The
+/// ONE sentence this service states that condition with, shared with the tenant create and
+/// update that reach it ([`crate::state::MISSING_CERTIFICATE_FOR_DOMAIN_MESSAGE`]): it states
+/// what the account has to carry and echoes no value from the request.
 const CERTIFICATE_DOES_NOT_COVER_MESSAGE: &str =
-    "There must be at least one certificate in the distribution tenant or distribution, or \
-     there must be a managed certificate request";
+    crate::state::MISSING_CERTIFICATE_FOR_DOMAIN_MESSAGE;
 
 /// The sentence this operation refuses a `Marker` that is no resume point it handed out
 /// with: the CONSTRAINT on the parameter, which carries nothing from the request, as every
@@ -257,9 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The domain to check for conflicts": the member is a plain string, so the shape
         // of a DNS name is checked here — a value that is no domain name names no
-        // association any CloudFront resource could hold. A wildcard alternate domain name
-        // is one of the inputs this operation documents ("if you provide *.example.com as
-        // input"), and it is a domain name of the same shape.
+        // association any CloudFront resource could hold, which is decided before the store
+        // is consulted at all. A wildcard alternate domain name is one of the inputs this
+        // operation documents ("if you provide *.example.com as input"), and it is a domain
+        // name of the same shape.
         if crate::state::domain_name_refusal(&input.domain).is_some() {
             return Err(ListDomainConflictsErrorModeled::InvalidArgument(
                 crate::state::invalid_domain_name(),

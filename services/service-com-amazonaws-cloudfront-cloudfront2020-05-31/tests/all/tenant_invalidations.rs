@@ -17,8 +17,8 @@
 //!   invalidation its `Marker` names — so walking the pages at ANY admissible page size
 //!   enumerates every invalidation of the tenant exactly once, in that order;
 //! * a page size that names no page, a `Marker` that is no resume point this service handed
-//!   out, and a tenant that does not exist are refused with the errors the operations model
-//!   (`InvalidArgument` 400, `EntityNotFound` 404, `NoSuchInvalidation` 404);
+//!   out, and a tenant or an invalidation that does not exist are refused with the errors the
+//!   operations model (`InvalidArgument` 400, `EntityNotFound` 404);
 //! * a batch over the published per-request object quota is refused with
 //!   `TooManyInvalidationsInProgress` (400) and persists nothing, so the listing after it
 //!   is the listing before it;
@@ -578,8 +578,8 @@ async fn a_list_is_scoped_to_one_tenant() {
         );
         assert_eq!(
             read.error_code(),
-            "NoSuchInvalidation",
-            "case {case}: expected NoSuchInvalidation, got {:?}",
+            "EntityNotFound",
+            "case {case}: expected EntityNotFound, got {:?}",
             read.error_code()
         );
     }
@@ -675,7 +675,9 @@ async fn unusable_arguments_and_unknown_tenants_are_refused() {
 }
 
 /// The published per-request object quota: a batch AT the bound is accepted, one PAST it is
-/// refused with `TooManyInvalidationsInProgress` (400) and persists nothing.
+/// refused with `TooManyInvalidationsInProgress` (400) and persists nothing — the code this
+/// surface answers the per-batch object quota under, where the distribution-scoped create
+/// answers `BatchTooLarge`.
 #[tokio::test]
 async fn a_batch_past_the_object_quota_is_refused_and_persists_nothing() {
     let router = emulator();

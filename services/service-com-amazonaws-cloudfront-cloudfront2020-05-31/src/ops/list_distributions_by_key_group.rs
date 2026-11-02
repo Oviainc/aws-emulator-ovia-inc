@@ -191,10 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The listing is about ONE key group, so an id the store holds no group for is the
         // modelled 404 rather than a page of nothing: an empty page would claim the group
-        // exists and is referenced by no distribution.
+        // exists and is referenced by no distribution. The sentence is the key-group
+        // surface's own, not the one an arbitrary ARN is answered with.
         if store.key_group(&input.key_group_id).is_none() {
             return Err(ListDistributionsByKeyGroupErrorModeled::NoSuchResource(
-                crate::state::no_such_resource(),
+                crate::state::no_such_key_group(),
             )
             .into());
         }

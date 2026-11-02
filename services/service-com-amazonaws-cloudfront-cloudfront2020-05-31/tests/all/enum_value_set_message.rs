@@ -11,13 +11,14 @@
 //!
 //! The rows span what the rule generalises over:
 //!
-//! * the ENUM, which is what the order belongs to: `FunctionStage`, whose published order is
-//!   not the order the schema declares, and `CachePolicyType`, `IpAddressType` and
+//! * the ENUM, which is what the order belongs to: `FunctionStage` and `CachePolicyType`,
+//!   whose published orders are not the orders the schema declares, and `IpAddressType` and
 //!   `OriginAccessControlSigningProtocols`, which this API publishes in the order it
 //!   declares them;
 //! * the OPERATION and the BINDING the value travelled in — a member of a request document,
-//!   a query parameter, a member nested inside a payload — which say nothing about the
-//!   value set, so the same enum is listed alike in each;
+//!   a member nested inside a payload, a query parameter on a collection route and one
+//!   beside a path label — which say nothing about the value set, so the same enum is listed
+//!   alike in each and all of them answer the one code;
 //! * the value set's SIZE (two, three and four values);
 //! * the form the inadmissible value takes (another word, an admitted value in the wrong
 //!   case, an admitted value with trailing text, the empty value), which the sentence
@@ -28,17 +29,18 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::distribution_lifecycle::{call, emulator, Answer, API_VERSION};
 
 /// The code this service answers a request whose published schema it cannot read with; a
-/// value outside an enum's value set is one of those.
+/// value outside an enum's value set is one of those, in whatever binding it travelled.
 const MALFORMED_XML: &str = "MalformedXML";
 
-/// How the one enum this service publishes in an order of its own is listed: `FunctionStage`
+/// How the enums this service publishes in an order of their own are listed. `FunctionStage`
 /// admits DEVELOPMENT and LIVE (`smithy_query(query="shape",shape="FunctionStage")`) and is
 /// listed with the published stage first.
 const FUNCTION_STAGE_SET: &str = "LIVE, DEVELOPMENT";
 
 /// `CachePolicyType` admits managed and custom, in that order
-/// (`smithy_query(query="shape",shape="CachePolicyType")`).
-const CACHE_POLICY_TYPE_SET: &str = "managed, custom";
+/// (`smithy_query(query="shape",shape="CachePolicyType")`), and is listed with the
+/// caller-owned kind first.
+const CACHE_POLICY_TYPE_SET: &str = "custom, managed";
 
 /// `IpAddressType` admits ipv4, ipv6 and dualstack, in that order
 /// (`smithy_query(query="shape",shape="IpAddressType")`).

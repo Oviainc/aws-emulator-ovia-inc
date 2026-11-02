@@ -174,11 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The ID of the invalidation to retrieve": one of the invalidations created
         // under THIS tenant, so an id another tenant's create handed out is no
-        // invalidation of this one.
+        // invalidation of this one. The tenant-scoped reads report it under the ENTITY
+        // error family they resolve the tenant with — `NoSuchInvalidation` belongs to the
+        // distribution-scoped `GetInvalidation` — and the sentence is the one that
+        // condition carries whichever code reports it
+        // ([`crate::state::NO_SUCH_INVALIDATION_MESSAGE`]).
         let Some(invalidation) = tenant.invalidations.get(&input.id) else {
             return Err(
-                GetInvalidationForDistributionTenantErrorModeled::NoSuchInvalidation(
-                    crate::state::no_such_invalidation(),
+                GetInvalidationForDistributionTenantErrorModeled::EntityNotFound(
+                    crate::state::invalidation_not_found(),
                 )
                 .into(),
             );

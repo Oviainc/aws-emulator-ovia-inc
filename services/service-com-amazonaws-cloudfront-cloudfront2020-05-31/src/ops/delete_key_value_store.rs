@@ -215,10 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A store a function still associates is in use, so the delete is refused and the
         // store stays readable: the association names the store by the ARN its own create
         // minted, so the question is answered against the stored function configurations.
+        // The sentence this kind is refused with names the store the REQUEST addressed and
+        // nothing else.
         if store.key_value_store_is_associated(&arn) {
             return Err(
                 DeleteKeyValueStoreErrorModeled::CannotDeleteEntityWhileInUse(
-                    crate::state::entity_in_use(),
+                    crate::state::key_value_store_in_use(&input.name),
                 )
                 .into(),
             );

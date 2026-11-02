@@ -435,9 +435,9 @@ async fn an_unusable_page_size_or_marker_is_refused() {
 
 /// A `ConnectionMode` outside the model's enum is refused rather than served: the listing
 /// never answers with a page for a mode no distribution can have, and the refusal carries
-/// the code this service answers a request whose published schema it cannot read — the
-/// value set an enum declares being part of that schema, whichever binding carried the
-/// value (here a path segment).
+/// the code this service answers a request whose published schema it cannot read — the value
+/// here travelled in the URI (a path segment), and a request that carries no document has no
+/// document the value could have been read from.
 #[tokio::test]
 async fn a_mode_outside_the_modelled_enum_is_not_served() {
     let router = emulator();

@@ -222,10 +222,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "A function with the same name already exists in this Amazon Web Services
         // account. To create a function, you must provide a unique name": a name
         // identifies ONE function for its whole life, so a name the store already holds
-        // cannot name a second one.
+        // cannot name a second one. The refusal carries the code and the status alone
+        // ([`crate::state::function_already_exists`]).
         if store.functions.contains_key(&input.name) {
             return Err(CreateFunctionErrorModeled::FunctionAlreadyExists(
-                crate::state::function_already_exists(&input.name),
+                crate::state::function_already_exists(),
             )
             .into());
         }

@@ -180,15 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Invalidation batch specified is too large." The batch is stored whole, so the
-        // number of paths one request may name is bounded before anything is stored.
+        // number of paths one request may name is bounded before anything is stored, and
+        // the sentence states the condition rather than the count submitted.
         let path_count = crate::state::batch_path_count(&input.invalidation_batch);
         if path_count > crate::state::MAX_INVALIDATION_PATHS {
-            return Err(CreateInvalidationErrorModeled::BatchTooLarge(BatchTooLarge {
-                message: Some(format!(
-                    "An invalidation batch names at most {} paths; this one names {path_count}",
-                    crate::state::MAX_INVALIDATION_PATHS
-                )),
-            })
+            return Err(CreateInvalidationErrorModeled::BatchTooLarge(
+                crate::state::batch_too_large(),
+            )
             .into());
         }
 

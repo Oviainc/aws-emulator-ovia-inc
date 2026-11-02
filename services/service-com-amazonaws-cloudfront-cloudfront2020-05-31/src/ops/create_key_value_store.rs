@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // second one. Checked BEFORE anything is minted.
         if store.key_value_stores.contains_key(&input.name) {
             return Err(CreateKeyValueStoreErrorModeled::EntityAlreadyExists(
-                crate::state::key_value_store_already_exists(&input.name),
+                crate::state::key_value_store_already_exists(),
             )
             .into());
         }

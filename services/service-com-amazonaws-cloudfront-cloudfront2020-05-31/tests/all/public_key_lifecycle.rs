@@ -24,7 +24,8 @@
 //!   sure that the request can't be replayed": the same request again reports the key the
 //!   first create stored, and a different configuration under a reference already taken is
 //!   refused (`PublicKeyAlreadyExists`, 409);
-//! * an id no public key holds is `NoSuchPublicKey` (404);
+//! * an id no public key holds is `NoSuchPublicKey` (404) under the fixed sentence this
+//!   service states for that code, from BOTH readers of the one record;
 //! * `PublicKeyConfig$Comment`: "The comment cannot be longer than 128 characters", so a
 //!   longer comment is refused before anything is stored;
 //! * the number of public keys the account holds is BOUNDED, and a create past the bound
@@ -45,6 +46,11 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     INVALID_PUBLIC_KEY_MARKER_MESSAGE, MAX_ITEMS, MAX_PUBLIC_KEYS, MAX_PUBLIC_KEY_COMMENT,
 };
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The sentence `NoSuchPublicKey` carries: a property of the store rather than of the
+/// request, so it names no id. Spelled out here as a literal rather than read back off the
+/// crate's constant, so the WORDING is what these rows are held to.
+const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
 
 use crate::distribution_lifecycle::{
     call, emulator, is_distribution_id, Answer, Node, API_VERSION, HOST,
@@ -79,6 +85,18 @@ pub(crate) async fn get_key(router: &MultiServiceRouter, id: &str) -> Answer {
         router,
         "GET",
         &format!("/{API_VERSION}/public-key/{id}"),
+        None,
+        None,
+    )
+    .await
+}
+
+/// `GET /2020-05-31/public-key/{Id}/config`, the other reader of the one stored record.
+async fn get_key_config(router: &MultiServiceRouter, id: &str) -> Answer {
+    call(
+        router,
+        "GET",
+        &format!("/{API_VERSION}/public-key/{id}/config"),
         None,
         None,
     )
@@ -439,20 +457,38 @@ async fn create_persists_the_configuration_every_read_then_reports() {
     }
 
     // An id no public key holds exists in no namespace: neither a well-shaped one nor an
-    // arbitrary string.
+    // arbitrary string. BOTH readers of the one record answer the same way, under the fixed
+    // sentence this service states for that code — which names no part of the request, so the
+    // id asked about is no part of it.
     for id in ["K1AAAAAAAAAAAA", "E1AAAAAAAAAAAA", "not-an-id", "0"] {
-        let missing = get_key(&router, id).await;
-        assert_eq!(
-            missing.status, 404,
-            "case {id}: expected HTTP 404 for an id no public key holds, got {} with {}",
-            missing.status, missing.raw
-        );
-        assert_eq!(
-            missing.error_code(),
-            "NoSuchPublicKey",
-            "case {id}: expected NoSuchPublicKey, got {}",
-            missing.raw
-        );
+        for (reader, missing) in [
+            ("GetPublicKey", get_key(&router, id).await),
+            ("GetPublicKeyConfig", get_key_config(&router, id).await),
+        ] {
+            assert_eq!(
+                missing.status, 404,
+                "case {reader}/{id}: expected HTTP 404 for an id no public key holds, got {} \
+                 with {}",
+                missing.status, missing.raw
+            );
+            assert_eq!(
+                missing.error_code(),
+                "NoSuchPublicKey",
+                "case {reader}/{id}: expected NoSuchPublicKey, got {}",
+                missing.raw
+            );
+            let message = missing.root().find_text("Message").unwrap_or_default();
+            assert_eq!(
+                message, NO_SUCH_PUBLIC_KEY,
+                "case {reader}/{id}: expected the sentence {NO_SUCH_PUBLIC_KEY:?}, got \
+                 {message:?}"
+            );
+            assert!(
+                !message.contains(id),
+                "case {reader}/{id}: the refusal must not carry the id asked about, got \
+                 {message:?}"
+            );
+        }
     }
 }
 

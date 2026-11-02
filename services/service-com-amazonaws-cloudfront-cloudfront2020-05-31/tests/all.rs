@@ -213,6 +213,8 @@ mod origin_request_policy_list;
 mod origin_request_policy_update;
 #[path = "all/path_identifier_shape.rs"]
 mod path_identifier_shape;
+#[path = "all/precondition_family_wording.rs"]
+mod precondition_family_wording;
 #[path = "all/public_key_lifecycle.rs"]
 mod public_key_lifecycle;
 #[path = "all/public_key_update.rs"]

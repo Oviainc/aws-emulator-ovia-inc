@@ -549,7 +549,7 @@ async fn the_precheck_still_serves_the_resource_that_exists() {
         if *op == Op::GetInvalidationForDistributionTenant {
             assert_eq!(
                 answer.error_code(),
-                "NoSuchInvalidation",
+                "EntityNotFound",
                 "case {op:?}: expected the refusal to be about the invalidation, got {:?} with {}",
                 answer.error_code(),
                 answer.raw

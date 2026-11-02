@@ -49,9 +49,11 @@ use crate::web_acl_association::{associate_web_acl, create, read_back, Stated, W
 const INVALID_IF_MATCH_VERSION: &str =
     "The If-Match version is missing or not valid for the resource.";
 
-/// `PreconditionFailed`, as the recorded responses carry it.
-const PRECONDITION_FAILED: &str = "The request failed because it didn't meet the \
-     preconditions in one or more request-header fields.";
+/// `PreconditionFailed`, as the recorded responses carry it on the web-ACL association
+/// surface: this family reports the request as missing a requirement rather than reporting
+/// the precondition of the request's header fields.
+const PRECONDITION_FAILED: &str = "Your request is missing requirements for this \
+     operation. Update your request and try again.";
 
 /// One `DisassociateDistributionWebACL` call: the distribution in the path and the version
 /// (when the row states one) in the `If-Match` header. The operation carries no body.

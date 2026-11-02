@@ -241,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             crate::state::IfMatch::Stale => {
                 return Err(DeleteDistributionTenantErrorModeled::PreconditionFailed(
-                    crate::state::precondition_failed(),
+                    crate::state::precondition_failed_missing_requirements(),
                 )
                 .into());
             }

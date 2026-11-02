@@ -33,10 +33,12 @@ use crate::distribution_lifecycle::{
     list_distributions, update_distribution, Answer, Node, API_VERSION,
 };
 use crate::key_group_lifecycle::{create_group, get_group, mint_public_keys};
-// The sentence `NoSuchResource` carries, written out as a literal by the suite that first
-// asserted it rather than read back from the crate, so the WORDING is what this refusal is
-// held to.
-use crate::untag_resource::NO_SUCH_RESOURCE_MESSAGE;
+
+/// The sentence a listing scoped to ONE key group answers for a group this account does not
+/// hold, as a literal rather than read back from the crate, so the WORDING is what this
+/// refusal is held to: the key-group surface's own sentence, not the one an arbitrary ARN is
+/// answered with.
+const NO_SUCH_KEY_GROUP_MESSAGE: &str = "The specified key group does not exist.";
 
 /// One distribution under test: which of the created key groups its default cache behaviour
 /// trusts, which ones each of its ordered cache behaviours trusts, and whether the
@@ -553,8 +555,8 @@ async fn an_id_no_key_group_holds_is_refused() {
         );
         let message = answer.root().find_text("Message").unwrap_or_default();
         assert_eq!(
-            message, NO_SUCH_RESOURCE_MESSAGE,
-            "case {case}: expected the modelled message, got {message:?}"
+            message, NO_SUCH_KEY_GROUP_MESSAGE,
+            "case {case}: expected the absent-key-group sentence, got {message:?}"
         );
         let read = get_group(&router, &candidate).await;
         assert_eq!(

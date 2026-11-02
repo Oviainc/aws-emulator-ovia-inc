@@ -5,7 +5,9 @@
 //! its stages, its code, its configuration, its version tokens and its tags — once the
 //! version the caller read is still current and no stored cache behaviour attaches it, so
 //! every later read of that name reports a function that does not exist and the name is
-//! free for a later create. This is the ONLY file to touch for this operation.
+//! free for a later create. An `If-Match` that is not this function's current version is
+//! `InvalidIfMatchVersion` (400) here, whether it is no version token at all or a
+//! superseded one. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -200,20 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The precondition is checked first, the way HTTP evaluates one: a caller holding a
         // version that is no longer current is told that before anything about what the
-        // function is attached to. A token that is not a version token at all is "missing or
-        // not valid"; a well-formed token that is not the current one is a failed
-        // precondition.
+        // function is attached to. This operation reads "missing or not valid" as "not valid
+        // FOR THIS FUNCTION", so a token that is no version token at all and a well-formed
+        // token that is not the function's current one are the one `InvalidIfMatchVersion` —
+        // the classification `DeleteContinuousDeploymentPolicy` makes for the same split, and
+        // not the `PreconditionFailed` the policy and entity surfaces answer with.
         match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
             IfMatch::Current => {}
-            IfMatch::Invalid => {
+            IfMatch::Invalid | IfMatch::Stale => {
                 return Err(DeleteFunctionErrorModeled::InvalidIfMatchVersion(
                     crate::state::invalid_if_match_version(),
-                )
-                .into());
-            }
-            IfMatch::Stale => {
-                return Err(DeleteFunctionErrorModeled::PreconditionFailed(
-                    crate::state::precondition_failed(),
                 )
                 .into());
             }

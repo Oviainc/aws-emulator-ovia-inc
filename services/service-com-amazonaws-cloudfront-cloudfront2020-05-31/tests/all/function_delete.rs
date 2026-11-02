@@ -12,9 +12,9 @@
 //!   name is free for a later create to claim, while every other function stands;
 //! * the removal only happens at the version its caller read: `IfMatch` is "The current
 //!   version (ETag value) of the function that you are deleting, which you can get using
-//!   DescribeFunction", so a header that carries no version token at all is missing or not
-//!   valid (`InvalidIfMatchVersion`, HTTP 400), one that carries a well-formed token that is
-//!   not the current one is a failed precondition (`PreconditionFailed`, HTTP 412), and a
+//!   DescribeFunction", so a header that does not carry THIS function's current version —
+//!   one that is no version token at all, and one that is a well-formed but superseded or
+//!   foreign token alike — is missing or not valid (`InvalidIfMatchVersion`, HTTP 400), and a
 //!   refused delete removes NOTHING;
 //! * a name no function holds is "The specified function does not exist."
 //!   (`NoSuchFunctionExists`, HTTP 404), whatever the `If-Match` carries, and removes
@@ -291,7 +291,7 @@ struct Precondition {
 /// The removal only happens at the version its caller read. A header carrying the current
 /// version token — bare, quoted as an HTTP entity tag, or quoted as a weak one — deletes;
 /// anything that is no version token at all is refused as missing or not valid; a well-formed
-/// token that belongs to another version is a failed precondition. A refused delete removes
+/// token that belongs to another version is refused too. A refused delete removes
 /// nothing: the function is still readable at the version it stood at, serving the code it
 /// stored.
 #[tokio::test]
@@ -342,12 +342,12 @@ async fn a_delete_needs_the_current_version_of_the_function() {
         Precondition {
             case: "a well-formed token no function holds",
             token: Token::Literal(UNHELD_VERSION_TOKEN.to_string()),
-            refusal: Some((412, "PreconditionFailed")),
+            refusal: Some((400, "InvalidIfMatchVersion")),
         },
         Precondition {
             case: "the version token of another function",
             token: Token::Literal(foreign.clone()),
-            refusal: Some((412, "PreconditionFailed")),
+            refusal: Some((400, "InvalidIfMatchVersion")),
         },
     ];
 
@@ -410,7 +410,7 @@ async fn a_delete_needs_the_current_version_of_the_function() {
 }
 
 /// The version an update SUPERSEDED is a well-formed token that is no longer the current one,
-/// so a delete holding it is a failed precondition that removes nothing — and the delete that
+/// so a delete holding it is refused and removes nothing — and the delete that
 /// carries the version the update handed back removes the function.
 #[tokio::test]
 async fn the_version_an_update_superseded_no_longer_deletes() {
@@ -438,14 +438,14 @@ async fn the_version_an_update_superseded_no_longer_deletes() {
 
         let refused = delete_function(&router, &create.name, &stale).await;
         assert_eq!(
-            refused.status, 412,
-            "case {case}: expected HTTP 412 deleting the superseded version, got {} with {}",
+            refused.status, 400,
+            "case {case}: expected HTTP 400 deleting the superseded version, got {} with {}",
             refused.status, refused.raw
         );
         assert_eq!(
             refused.error_code(),
-            "PreconditionFailed",
-            "case {case}: expected PreconditionFailed, got {}",
+            "InvalidIfMatchVersion",
+            "case {case}: expected InvalidIfMatchVersion, got {}",
             refused.raw
         );
         let still = describe_function(&router, &create.name, None).await;

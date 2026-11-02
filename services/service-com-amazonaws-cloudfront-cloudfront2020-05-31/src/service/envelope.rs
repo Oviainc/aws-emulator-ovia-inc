@@ -328,6 +328,10 @@ const STATED_VALUE_ORDERS: &[&[&str]] = &[
     // order the schema declares (`smithy_query(query="shape",shape="FunctionStage")` ->
     // DEVELOPMENT, LIVE).
     &["LIVE", "DEVELOPMENT"],
+    // `CachePolicyType`, the kind a cache policy listing filters on: the service lists the
+    // caller-owned kind first, which is not the order the schema declares
+    // (`smithy_query(query="shape",shape="CachePolicyType")` -> managed, custom).
+    &["custom", "managed"],
 ];
 
 /// `refusal` with the enum's admitted values listed in the order this service publishes that
@@ -639,9 +643,9 @@ mod tests {
                 "[LIVE, DEVELOPMENT]",
             ),
             (
-                "a two-value set with no order of its own",
+                "the policy-kind set as the schema declares it",
                 "[managed, custom]",
-                "[managed, custom]",
+                "[custom, managed]",
             ),
             (
                 "a three-value set with no order of its own",

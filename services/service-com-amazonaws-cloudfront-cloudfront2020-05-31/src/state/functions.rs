@@ -451,17 +451,16 @@ pub fn function_path(name: &str) -> String {
 }
 
 /// The modelled `FunctionAlreadyExists` (HTTP 409) for a function name that is already
-/// taken, worded as the model documents the shape: "A function with the same name already
-/// exists in this Amazon Web Services account. To create a function, you must provide a
-/// unique name. To update an existing function, use `UpdateFunction`."
-pub fn function_already_exists(name: &str) -> crate::ops::types::FunctionAlreadyExists {
-    crate::ops::types::FunctionAlreadyExists {
-        message: Some(format!(
-            "A function with the name {name} already exists in this Amazon Web Services \
-             account. To create a function, you must provide a unique name. To update an \
-             existing function, use UpdateFunction."
-        )),
-    }
+/// taken.
+///
+/// Carries NO message: the recorded service answers this conflict with the code and the
+/// status alone, so there is no sentence to put on the wire and none is invented. The model
+/// DOCUMENTS the shape ("A function with the same name already exists in this Amazon Web
+/// Services account. To create a function, you must provide a unique name. To update an
+/// existing function, use `UpdateFunction`."); that prose states the condition and tells the
+/// caller what to do instead, and it is not served.
+pub fn function_already_exists() -> crate::ops::types::FunctionAlreadyExists {
+    crate::ops::types::FunctionAlreadyExists { message: None }
 }
 
 /// The modelled `FunctionInUse` (HTTP 409) for a delete of a function a cache behaviour
