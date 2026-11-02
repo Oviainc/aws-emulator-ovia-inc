@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2.delete-bot-locale-cascades-to-intents
+Issue-Trace-Ids: lexv2-models.delete-bot-locale-cascades-to-intents
 Issue-Shape-Id: com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2
 Issue-Key: lex-models-v2|DeleteBotLocale|NotImplemented
 Issue-Commit: 30fa5e7e24c2e7ff08a1ee60d32c6c6e65abb481

@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: serverlessapplicationrepository.application-policy-replace-semantics
+Issue-Trace-Ids: serverlessrepo.application-policy-replace-semantics
 Issue-Shape-Id: com.amazonaws.serverlessapplicationrepository#ServerlessApplicationRepository
 Issue-Key: serverlessapplicationrepository|GetApplicationPolicy|NotImplemented
 Issue-Commit: 00577afa9aa0eead33f7dafc8adac2dd3659e1fc

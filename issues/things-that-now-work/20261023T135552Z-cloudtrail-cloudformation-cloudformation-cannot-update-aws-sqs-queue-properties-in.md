@@ -1,9 +1,9 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudtrail__cloudformation.obs-cloudformation-1-stack-lifecycle-is-audited-as-the-caller-and-provisioning-as-the-service cloudtrail__cloudformation.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited
-Issue-Key: cloudtrail__cloudformation.obs-cloudformation-1-stack-lifecycle-is-audited-as-the-caller-and-provisioning-as-the-service|_wait_stack#43|AssertionError|raise AssertionError(
-Issue-Key: cloudtrail__cloudformation.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited|run#40|AssertionError|assert msg == "The specified queue does not exist.", (
+Issue-Trace-Ids: cloudformation__cloudtrail.obs-cloudformation-1-stack-lifecycle-is-audited-as-the-caller-and-provisioning-as-the-service cloudformation__cloudtrail.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited
+Issue-Key: cloudformation__cloudtrail.obs-cloudformation-1-stack-lifecycle-is-audited-as-the-caller-and-provisioning-as-the-service|_wait_stack#43|AssertionError|raise AssertionError(
+Issue-Key: cloudformation__cloudtrail.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited|run#40|AssertionError|assert msg == "The specified queue does not exist.", (
 Issue-Commit: a59989a9f63c403b66485a4e93f54ab6df22c2a6
 
 # CloudFormation cannot update AWS::SQS::Queue properties in place (stack reaches UPDATE_FAILED) and SQS QueueDoesNotExist uses a non-AWS message

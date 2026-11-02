@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__lambda__sfn__sqs.sfn-task-lambda-fails-without-invoke-permission
+Issue-Trace-Ids: events__lambda__sqs__stepfunctions.sfn-task-lambda-fails-without-invoke-permission
 Issue-Key: sfn|GetExecutionHistory|NotImplemented
 Issue-Commit: 048778663a26e363156c6db724999c4fb229af36
 

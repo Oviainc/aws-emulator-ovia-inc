@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2__lex-runtime-v2.recognize-text-elicits-then-resolves-slot-synonym lex-models-v2__lex-runtime-v2.recognize-text-fills-slot-from-utterance lex-models-v2__lex-runtime-v2.recognize-text-rejects-out-of-vocabulary-slot-value lex-models-v2__lex-runtime-v2.unbuilt-bot-locale-recognize-text-is-rejected
+Issue-Trace-Ids: lexv2-models__lexv2-runtime.recognize-text-elicits-then-resolves-slot-synonym lexv2-models__lexv2-runtime.recognize-text-fills-slot-from-utterance lexv2-models__lexv2-runtime.recognize-text-rejects-out-of-vocabulary-slot-value lexv2-models__lexv2-runtime.unbuilt-bot-locale-recognize-text-is-rejected
 Issue-Key: lex-models-v2|ListBotAliases|NotImplemented
 Issue-Commit: 88dedb85e694d97545027b37e695bddb9d3861f2
 

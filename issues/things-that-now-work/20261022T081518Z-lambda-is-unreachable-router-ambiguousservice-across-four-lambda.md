@@ -1,9 +1,9 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lambda__resource-groups-tagging-api.blueprint-tag-applied-after-create-surfaces-in-the-tag-query lambda__resource-groups-tagging-api.blueprint-tag-untag-removes-the-function-from-the-tag-query lambda__resource-groups-tagging-api.blueprint-tag-e2e-find-tagged-functions-lifecycle
-Issue-Key: lambda__resource-groups-tagging-api|CreateFunction|AmbiguousService
-Issue-Key: lambda__resource-groups-tagging-api.blueprint-tag-e2e-find-tagged-functions-lifecycle|phase#6|AssertionError|raise AssertionError(f"[phase {i}/{len(self.phases)} {name}] {exc}") from exc
+Issue-Trace-Ids: lambda__resourcegroupstaggingapi.blueprint-tag-applied-after-create-surfaces-in-the-tag-query lambda__resourcegroupstaggingapi.blueprint-tag-untag-removes-the-function-from-the-tag-query lambda__resourcegroupstaggingapi.blueprint-tag-e2e-find-tagged-functions-lifecycle
+Issue-Key: lambda__resourcegroupstaggingapi|CreateFunction|AmbiguousService
+Issue-Key: lambda__resourcegroupstaggingapi.blueprint-tag-e2e-find-tagged-functions-lifecycle|phase#6|AssertionError|raise AssertionError(f"[phase {i}/{len(self.phases)} {name}] {exc}") from exc
 Issue-Commit: 5ef273b5ec187d9b55db2ccfdad00816d8c5c39a
 
 # Lambda is unreachable (router AmbiguousService across four 'lambda'-signing services), and a CloudFormation-deployed Lambda stack exposes no Outputs (2 causes)

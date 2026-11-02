@@ -1,9 +1,9 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-runtime-v2.deleted-session-state-is-gone-and-get-session-rejected lex-runtime-v2.put-session-rejects-an-intent-the-locale-does-not-define lex-runtime-v2.put-session-seeds-dialog-state-for-the-next-turn lex-runtime-v2.recognize-text-elicits-missing-required-slot lex-runtime-v2.recognize-text-fills-slot-and-fulfills-intent lex-runtime-v2.recognize-text-rejects-an-unbuilt-locale lex-runtime-v2.recognize-text-rejects-an-unknown-bot-alias lex-runtime-v2.recognize-utterance-text-stream-agrees-with-recognize-text lex-runtime-v2.session-state-persists-across-turns lex-runtime-v2.unmatched-utterance-returns-fallback-intent
+Issue-Trace-Ids: lexv2-runtime.deleted-session-state-is-gone-and-get-session-rejected lexv2-runtime.put-session-rejects-an-intent-the-locale-does-not-define lexv2-runtime.put-session-seeds-dialog-state-for-the-next-turn lexv2-runtime.recognize-text-elicits-missing-required-slot lexv2-runtime.recognize-text-fills-slot-and-fulfills-intent lexv2-runtime.recognize-text-rejects-an-unbuilt-locale lexv2-runtime.recognize-text-rejects-an-unknown-bot-alias lexv2-runtime.recognize-utterance-text-stream-agrees-with-recognize-text lexv2-runtime.session-state-persists-across-turns lexv2-runtime.unmatched-utterance-returns-fallback-intent
 Issue-Shape-Id: com.amazonaws.lexruntimev2#AWSDeepSenseRunTimeServiceApi2_0
-Issue-Key: lex-runtime-v2|CreateBot|AmbiguousService
+Issue-Key: lexv2-runtime|CreateBot|AmbiguousService
 Issue-Commit: 6f82ed95aacdd57d8c8c0220ec6b50c75b2537e1
 
 # Lex Runtime V2 is unreachable: router answers AmbiguousService for every 'lex'-signed request, so no runtime dialog check runs

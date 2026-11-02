@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: kinesis-analytics-v2.add-application-input-on-flink-application-rejected
+Issue-Trace-Ids: kinesisanalyticsv2.add-application-input-on-flink-application-rejected
 Issue-Shape-Id: com.amazonaws.kinesisanalyticsv2#KinesisAnalytics_20180523
 Issue-Key: kinesis-analytics-v2|ListApplicationVersions|NotImplemented
 Issue-Commit: 5bcb167feafadea8e22c35fa67ec2d8f1025761e

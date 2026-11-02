@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: application-auto-scaling.deleted-scheduled-action-never-fires application-auto-scaling.scheduled-action-lifecycle
+Issue-Trace-Ids: application-autoscaling.deleted-scheduled-action-never-fires application-autoscaling.scheduled-action-lifecycle
 Issue-Shape-Id: com.amazonaws.applicationautoscaling#AnyScaleFrontendService
 Issue-Key: application-auto-scaling|DeleteScheduledAction|NotImplemented
 Issue-Commit: 242e2a822ca6eb3fec2aad3ba89160f0a6f40669

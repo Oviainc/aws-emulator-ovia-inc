@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lambda__s3__sfn.sfn-express-workflow-lambda-sync-positive lambda__sfn__sqs.deploy-cdk-synth-express-workflow-lambda-sqs-stack
+Issue-Trace-Ids: lambda__s3__stepfunctions.sfn-express-workflow-lambda-sync-positive lambda__sqs__stepfunctions.deploy-cdk-synth-express-workflow-lambda-sqs-stack
 Issue-Key: sfn|StartSyncExecution|NotImplemented
 Issue-Commit: 048778663a26e363156c6db724999c4fb229af36
 

@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudtrail__cloudformation.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited
-Issue-Key: cloudtrail__cloudformation.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited|run#33|AssertionError|raise AssertionError(
+Issue-Trace-Ids: cloudformation__cloudtrail.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited
+Issue-Key: cloudformation__cloudtrail.create-stack-with-a-role-cloudformation-cannot-assume-is-rejected-and-audited|run#33|AssertionError|raise AssertionError(
 Issue-Commit: c50178ef0adb9f41de3fed65acf95f496e080c81
 
 # CreateStack accepts a RoleARN CloudFormation cannot assume and returns a StackId instead of refusing it with ValidationError

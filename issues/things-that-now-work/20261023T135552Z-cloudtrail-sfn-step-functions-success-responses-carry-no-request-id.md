@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudtrail__sfn.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added
-Issue-Key: cloudtrail__sfn.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added|_marker#23|KeyError|return sfn.describe_state_machine(stateMachineArn=subject_arn)["ResponseMetadata"][
+Issue-Trace-Ids: cloudtrail__stepfunctions.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added
+Issue-Key: cloudtrail__stepfunctions.obs-sfn-2-data-selector-logs-start-sync-execution-to-the-trail-prefix-only-after-it-is-added|_marker#23|KeyError|return sfn.describe_state_machine(stateMachineArn=subject_arn)["ResponseMetadata"][
 Issue-Commit: a59989a9f63c403b66485a4e93f54ab6df22c2a6
 
 # Step Functions success responses carry no request id, so ResponseMetadata has no RequestId

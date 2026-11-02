@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudfront__logs.xsvc-cloudfront-3-standard-logging-v2-access-log-reaches-log-group logs__cloudfront.obs-cloudfront-3-vended-access-logs-match-requests-and-stop-after-delete-delivery
+Issue-Trace-Ids: cloudfront__logs.xsvc-cloudfront-3-standard-logging-v2-access-log-reaches-log-group cloudfront__logs.obs-cloudfront-3-vended-access-logs-match-requests-and-stop-after-delete-delivery
 Issue-Key: cloudfront|CreateOriginAccessControl|NotImplemented
 Issue-Commit: 048778663a26e363156c6db724999c4fb229af36
 

@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__apigatewayv2.obs-apigatewayv2-3-http-api-5xx-alarm-notifies-sqs-via-sns
-Issue-Key: cloudwatch__apigatewayv2|CreateStage|NotImplemented
+Issue-Trace-Ids: apigatewayv2__cloudwatch.obs-apigatewayv2-3-http-api-5xx-alarm-notifies-sqs-via-sns
+Issue-Key: apigatewayv2__cloudwatch|CreateStage|NotImplemented
 Issue-Commit: e2dfe022d58b39493003b3d90859f84840a12f00
 
 # cloudwatch__apigatewayv2: the HTTP-API 5xx alarm-to-SNS-to-SQS check aborts because apigatewayv2 CreateStage answers NotImplemented (1 cause)

@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2.bot-version-snapshots-draft-intent
+Issue-Trace-Ids: lexv2-models.bot-version-snapshots-draft-intent
 Issue-Shape-Id: com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2
-Issue-Key: lex-models-v2|CreateBotVersion|NotImplemented
+Issue-Key: lexv2-models|CreateBotVersion|NotImplemented
 Issue-Commit: 88dedb85e694d97545027b37e695bddb9d3861f2
 
 # Implement lex-models-v2 CreateBotVersion: unimplemented scaffold stub

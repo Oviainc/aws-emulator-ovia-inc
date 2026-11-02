@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: resource-groups-tagging-api__sfn.state-machine-tags-visible-through-get-resources
-Issue-Key: resource-groups-tagging-api__sfn|TagResource|NotImplemented
+Issue-Trace-Ids: resourcegroupstaggingapi__stepfunctions.state-machine-tags-visible-through-get-resources
+Issue-Key: resourcegroupstaggingapi__stepfunctions|TagResource|NotImplemented
 Issue-Commit: 5ef273b5ec187d9b55db2ccfdad00816d8c5c39a
 
 # Implement sfn TagResource: the operation answers NotImplemented, so no state machine can be tagged natively

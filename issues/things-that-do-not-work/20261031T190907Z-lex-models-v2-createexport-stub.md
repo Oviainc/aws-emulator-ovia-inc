@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2.bot-locale-export-download-serves-created-content
+Issue-Trace-Ids: lexv2-models.bot-locale-export-download-serves-created-content
 Issue-Shape-Id: com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2
-Issue-Key: lex-models-v2|CreateExport|NotImplemented
+Issue-Key: lexv2-models|CreateExport|NotImplemented
 Issue-Commit: 30fa5e7e24c2e7ff08a1ee60d32c6c6e65abb481
 
 # Implement lex-models-v2 CreateExport: unimplemented scaffold stub

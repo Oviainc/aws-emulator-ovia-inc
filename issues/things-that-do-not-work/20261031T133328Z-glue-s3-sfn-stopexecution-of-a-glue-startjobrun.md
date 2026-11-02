@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: glue__s3__sfn.xsvc-sfn-1-glue-sync-stop-execution-stops-the-running-job-run
-Issue-Key: glue__s3__sfn.xsvc-sfn-1-glue-sync-stop-execution-stops-the-running-job-run|_wait_run_state#12|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: glue__s3__stepfunctions.xsvc-sfn-1-glue-sync-stop-execution-stops-the-running-job-run
+Issue-Key: glue__s3__stepfunctions.xsvc-sfn-1-glue-sync-stop-execution-stops-the-running-job-run|_wait_run_state#12|Timeout|time.sleep(interval_s)
 Issue-Commit: c1b34f592c646ed434adfb831b97b313d8f8d1bc
 
 # glue__s3__sfn: StopExecution of a glue:startJobRun.sync Task never stops the downstream Glue job run — the Task is never dispatched and the check hangs to the harness timeout (1 cause)

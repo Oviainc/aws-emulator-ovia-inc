@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: application-auto-scaling.custom-resource-registration-floor-patches-the-endpoint application-auto-scaling.custom-resource-scheduled-action-patches-the-endpoint-when-it-fires application-auto-scaling.custom-resource-stage-the-api-never-deployed-rejected application-auto-scaling.custom-resource-step-policy-alarm-patches-the-endpoint-up-to-the-ceiling application-auto-scaling.custom-resource-target-tracking-with-scale-in-disabled-still-scales-out
+Issue-Trace-Ids: application-autoscaling.custom-resource-registration-floor-patches-the-endpoint application-autoscaling.custom-resource-scheduled-action-patches-the-endpoint-when-it-fires application-autoscaling.custom-resource-stage-the-api-never-deployed-rejected application-autoscaling.custom-resource-step-policy-alarm-patches-the-endpoint-up-to-the-ceiling application-autoscaling.custom-resource-target-tracking-with-scale-in-disabled-still-scales-out
 Issue-Shape-Id: com.amazonaws.applicationautoscaling#AnyScaleFrontendService
-Issue-Key: application-auto-scaling|PutIntegration|NotImplemented
+Issue-Key: application-autoscaling|PutIntegration|NotImplemented
 Issue-Commit: 242e2a822ca6eb3fec2aad3ba89160f0a6f40669
 
 # custom-resource Application Auto Scaling checks are blocked: API Gateway PutIntegration answers NotImplemented

@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2.build-rejects-required-slot-without-priority
+Issue-Trace-Ids: lexv2-models.build-rejects-required-slot-without-priority
 Issue-Shape-Id: com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2
-Issue-Key: lex-models-v2.build-rejects-required-slot-without-priority|run#11|AssertionError|assert failed["botLocaleStatus"] == "Failed", (
+Issue-Key: lexv2-models.build-rejects-required-slot-without-priority|run#11|AssertionError|assert failed["botLocaleStatus"] == "Failed", (
 Issue-Commit: 88dedb85e694d97545027b37e695bddb9d3861f2
 
 # lex-models-v2: BuildBotLocale never validates the intent graph — a required slot with no slotPriorities entry builds to 'Built' instead of settling at 'Failed' with the slot-priority failureReason

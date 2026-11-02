@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: global-accelerator.endpoint-group-rejects-duplicate-region global-accelerator.health-check-interval-rejects-unsupported-value global-accelerator.listener-delete-rejects-associated-endpoint-group
+Issue-Trace-Ids: globalaccelerator.endpoint-group-rejects-duplicate-region globalaccelerator.health-check-interval-rejects-unsupported-value globalaccelerator.listener-delete-rejects-associated-endpoint-group
 Issue-Shape-Id: com.amazonaws.globalaccelerator#GlobalAccelerator_V20180706
 Issue-Key: global-accelerator|CreateEndpointGroup|NotImplemented
 Issue-Commit: 7b5968e5380062291ec1b05b736535203332753c

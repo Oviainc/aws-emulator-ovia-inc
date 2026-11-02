@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: serverlessapplicationrepository.rejects-unshareable-policy-statement
+Issue-Trace-Ids: serverlessrepo.rejects-unshareable-policy-statement
 Issue-Shape-Id: com.amazonaws.serverlessapplicationrepository#ServerlessApplicationRepository
 Issue-Key: serverlessapplicationrepository|PutApplicationPolicy|NotImplemented
 Issue-Commit: 00577afa9aa0eead33f7dafc8adac2dd3659e1fc

@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudformation__service-catalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action
-Issue-Key: cloudformation__service-catalog-appregistry|ListTagsForResource|NotImplemented
+Issue-Trace-Ids: cloudformation__servicecatalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action
+Issue-Key: cloudformation__servicecatalog-appregistry|ListTagsForResource|NotImplemented
 Issue-Commit: 9979b14c0e509985792db6dac0171a1eff5d6a10
 
 # SNS ListTagsForResource is an unimplemented scaffold stub: returns NotImplemented instead of the resource's tag list, blocking all cross-service tag-propagation verification

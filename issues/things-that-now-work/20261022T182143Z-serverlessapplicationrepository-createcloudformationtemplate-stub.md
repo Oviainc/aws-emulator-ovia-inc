@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: serverlessapplicationrepository.cloudformation-template-expiry-window serverlessapplicationrepository.sar-prepared-template-serves-the-published-body
+Issue-Trace-Ids: serverlessrepo.cloudformation-template-expiry-window serverlessrepo.sar-prepared-template-serves-the-published-body
 Issue-Shape-Id: com.amazonaws.serverlessapplicationrepository#ServerlessApplicationRepository
 Issue-Key: serverlessapplicationrepository|CreateCloudFormationTemplate|NotImplemented
 Issue-Commit: 00577afa9aa0eead33f7dafc8adac2dd3659e1fc

@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.describe-state-machine-for-execution-matches-started
+Issue-Trace-Ids: stepfunctions.describe-state-machine-for-execution-matches-started
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: sfn|DescribeStateMachineForExecution|NotImplemented
 Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529

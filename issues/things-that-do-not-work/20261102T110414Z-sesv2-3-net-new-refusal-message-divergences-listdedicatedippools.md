@@ -1,7 +1,7 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ses.list-dedicated-ip-pools-forged-next-token-rejected sesv2.a-resource-belongs-to-at-most-one-tenant-and-both-views-agree sesv2.concurrent-contact-creation-exactly-one-succeeds
+Issue-Trace-Ids: sesv2.list-dedicated-ip-pools-forged-next-token-rejected sesv2.a-resource-belongs-to-at-most-one-tenant-and-both-views-agree sesv2.concurrent-contact-creation-exactly-one-succeeds
 Issue-Shape-Id: com.amazonaws.sesv2#SimpleEmailService_v2
 Issue-Key: sesv2|ListDedicatedIpPools|BadRequestException
 Issue-Key: sesv2.a-resource-belongs-to-at-most-one-tenant-and-both-views-agree|run#23|AssertionError|assert get_error == gone, (

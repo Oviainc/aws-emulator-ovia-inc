@@ -1,8 +1,8 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2__lex-runtime-v2.recognize-text-elicits-then-resolves-slot-synonym lex-models-v2__lex-runtime-v2.recognize-text-fills-slot-from-utterance lex-models-v2__lex-runtime-v2.recognize-text-rejects-out-of-vocabulary-slot-value lex-models-v2__lex-runtime-v2.unbuilt-bot-locale-recognize-text-is-rejected
-Issue-Key: lex-models-v2__lex-runtime-v2|CreateBot|AmbiguousService
+Issue-Trace-Ids: lexv2-models__lexv2-runtime.recognize-text-elicits-then-resolves-slot-synonym lexv2-models__lexv2-runtime.recognize-text-fills-slot-from-utterance lexv2-models__lexv2-runtime.recognize-text-rejects-out-of-vocabulary-slot-value lexv2-models__lexv2-runtime.unbuilt-bot-locale-recognize-text-is-rejected
+Issue-Key: lexv2-models__lexv2-runtime|CreateBot|AmbiguousService
 Issue-Commit: 6f82ed95aacdd57d8c8c0220ec6b50c75b2537e1
 
 # Cross-service Lex Models V2 + Lex Runtime V2 checks never run: router refuses every 'lex'-signed request with AmbiguousService

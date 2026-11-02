@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.concurrent-publish-version-same-revision sfn.error-validation-exception-list-versions-bad-arn
+Issue-Trace-Ids: stepfunctions.concurrent-publish-version-same-revision stepfunctions.error-validation-exception-list-versions-bad-arn
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
 Issue-Key: sfn|ListStateMachineVersions|NotImplemented
 Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529

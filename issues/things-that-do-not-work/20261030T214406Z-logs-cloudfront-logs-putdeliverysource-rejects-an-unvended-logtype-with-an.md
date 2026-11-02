@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: logs__cloudfront.obs-cloudfront-3-delivery-source-unsupported-log-type-rejected
-Issue-Key: logs__cloudfront.obs-cloudfront-3-delivery-source-unsupported-log-type-rejected|run#11|AssertionError|assert message == "This service is not allowed for this LogSource.", (
+Issue-Trace-Ids: cloudfront__logs.obs-cloudfront-3-delivery-source-unsupported-log-type-rejected
+Issue-Key: cloudfront__logs.obs-cloudfront-3-delivery-source-unsupported-log-type-rejected|run#11|AssertionError|assert message == "This service is not allowed for this LogSource.", (
 Issue-Commit: 7e40a03527fe455980798ee437e03ca50107a3c6
 
 # logs PutDeliverySource rejects an unvended logType with an emulator-authored ValidationException message instead of AWS's "This service is not allowed for this LogSource."

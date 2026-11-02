@@ -1,10 +1,10 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: kinesis-video.list-fragments-reflects-ingestion-transition-from-empty kinesis-video.putmedia-fragments-round-trip-through-get-media
+Issue-Trace-Ids: kinesisvideo.list-fragments-reflects-ingestion-transition-from-empty kinesisvideo.putmedia-fragments-round-trip-through-get-media
 Issue-Shape-Id: com.amazonaws.kinesisvideo#KinesisVideo_20170930
-Issue-Key: kinesis-video.list-fragments-reflects-ingestion-transition-from-empty|_persisted_fragment_numbers#6|AssertionError|assert status == 200, ("PutMedia answered HTTP %s (x-amzn-ErrorType %r): %r"
-Issue-Key: kinesis-video.putmedia-fragments-round-trip-through-get-media|run#12|AssertionError|assert status == 200, f"PutMedia expected HTTP 200, got {status!r} (tail {tail[:200]!r})"
+Issue-Key: kinesisvideo.list-fragments-reflects-ingestion-transition-from-empty|_persisted_fragment_numbers#6|AssertionError|assert status == 200, ("PutMedia answered HTTP %s (x-amzn-ErrorType %r): %r"
+Issue-Key: kinesisvideo.putmedia-fragments-round-trip-through-get-media|run#12|AssertionError|assert status == 200, f"PutMedia expected HTTP 200, got {status!r} (tail {tail[:200]!r})"
 Issue-Commit: 7846fec8a86647e77da10e6415de80579a2805a4
 
 # PutMedia ingest plane still unserved: POST /putMedia answers 404 (x-amzn-ErrorType UnknownService / empty body) instead of a 200 acknowledgement stream, so no media can be produced and GetMedia/ListFragments can never see a fragment

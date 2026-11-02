@@ -1,9 +1,9 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lex-models-v2.bot-locale-build-transitions-to-built lex-models-v2.bot-version-snapshots-draft-intent lex-models-v2.build-rejects-locale-with-no-utterances lex-models-v2.build-rejects-required-slot-without-priority lex-models-v2.create-slot-rejects-unknown-slot-type lex-models-v2.create-slot-type-rejects-duplicate-name lex-models-v2.delete-bot-locale-cascades-to-intents
+Issue-Trace-Ids: lexv2-models.bot-locale-build-transitions-to-built lexv2-models.bot-version-snapshots-draft-intent lexv2-models.build-rejects-locale-with-no-utterances lexv2-models.build-rejects-required-slot-without-priority lexv2-models.create-slot-rejects-unknown-slot-type lexv2-models.create-slot-type-rejects-duplicate-name lexv2-models.delete-bot-locale-cascades-to-intents
 Issue-Shape-Id: com.amazonaws.lexmodelsv2#LexModelBuildingServiceV2
-Issue-Key: lex-models-v2|CreateBot|AmbiguousService
+Issue-Key: lexv2-models|CreateBot|AmbiguousService
 Issue-Commit: 0c5145d1821481e15376cbd37da6da62f6188e28
 
 # Lex Models V2 is unreachable: router answers AmbiguousService for every 'lex'-signed request, so no build/version/validation check runs

@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudformation__serverlessapplicationrepository__sqs.rejects-changeset-missing-required-capability cloudformation__serverlessapplicationrepository__sqs.deploy-sar-changeset-for-unpublished-version-rejected
-Issue-Key: cloudformation__serverlessapplicationrepository__sqs.rejects-changeset-missing-required-capability|run#8|AssertionError|assert named["RequiredCapabilities"] == ["CAPABILITY_NAMED_IAM"], (
-Issue-Key: cloudformation__serverlessapplicationrepository__sqs.deploy-sar-changeset-for-unpublished-version-rejected|run#10|AssertionError|assert code == "NotFoundException", f"rejection code is {code!r}, expected NotFoundException"
+Issue-Trace-Ids: cloudformation__serverlessrepo__sqs.rejects-changeset-missing-required-capability cloudformation__serverlessrepo__sqs.deploy-sar-changeset-for-unpublished-version-rejected
+Issue-Key: cloudformation__serverlessrepo__sqs.rejects-changeset-missing-required-capability|run#8|AssertionError|assert named["RequiredCapabilities"] == ["CAPABILITY_NAMED_IAM"], (
+Issue-Key: cloudformation__serverlessrepo__sqs.deploy-sar-changeset-for-unpublished-version-rejected|run#10|AssertionError|assert code == "NotFoundException", f"rejection code is {code!r}, expected NotFoundException"
 Issue-Commit: 00577afa9aa0eead33f7dafc8adac2dd3659e1fc
 
 # SAR deploy path: RequiredCapabilities is always empty (never derived per version) and CreateCloudFormationChangeSet answers NotImplemented instead of SAR's accept/refuse semantics

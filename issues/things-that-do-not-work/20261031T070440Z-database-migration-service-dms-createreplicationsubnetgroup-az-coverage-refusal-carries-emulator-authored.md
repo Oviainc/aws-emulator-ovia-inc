@@ -1,9 +1,9 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: database-migration-service.subnet-group-requires-two-azs
+Issue-Trace-Ids: dms.subnet-group-requires-two-azs
 Issue-Shape-Id: com.amazonaws.databasemigrationservice#AmazonDMSv20160101
-Issue-Key: database-migration-service.subnet-group-requires-two-azs|run#17|AssertionError|assert message == (
+Issue-Key: dms.subnet-group-requires-two-azs|run#17|AssertionError|assert message == (
 Issue-Commit: 7846fec8a86647e77da10e6415de80579a2805a4
 
 # DMS CreateReplicationSubnetGroup AZ-coverage refusal carries emulator-authored wording instead of DMS's ReplicationSubnetGroupDoesNotCoverEnoughAZs message

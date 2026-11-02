@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: elastic-load-balancing.stickiness-policy-deletion-while-attached-to-listener-rejected
+Issue-Trace-Ids: elb.stickiness-policy-deletion-while-attached-to-listener-rejected
 Issue-Shape-Id: com.amazonaws.elasticloadbalancing#ElasticLoadBalancing_v7
 Issue-Key: elastic-load-balancing|CreateLBCookieStickinessPolicy|NotImplemented
 Issue-Commit: 1b15cfcf83a9fafcaa69f938ed17066b612a8ba0

@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: auto-scaling-plans.asp-absent-plan-reads-are-empty-but-writes-are-rejected
+Issue-Trace-Ids: autoscaling-plans.asp-absent-plan-reads-are-empty-but-writes-are-rejected
 Issue-Shape-Id: com.amazonaws.autoscalingplans#AnyScaleScalingPlannerFrontendService
 Issue-Key: auto-scaling-plans|DescribeScalingPlanResources|ValidationException
 Issue-Commit: 46f0b06b741958855bcde96340f933e8bc769db3

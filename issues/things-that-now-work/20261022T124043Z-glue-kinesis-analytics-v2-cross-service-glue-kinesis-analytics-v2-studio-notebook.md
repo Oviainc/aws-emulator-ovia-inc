@@ -1,8 +1,8 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: glue__kinesis-analytics-v2.dropping-the-catalog-database-strands-the-notebook-until-it-is-recreated glue__kinesis-analytics-v2.studio-notebook-naming-a-catalog-database-that-does-not-exist-rejected
-Issue-Key: glue__kinesis-analytics-v2|CreateApplication|AmbiguousService
+Issue-Trace-Ids: glue__kinesisanalyticsv2.dropping-the-catalog-database-strands-the-notebook-until-it-is-recreated glue__kinesisanalyticsv2.studio-notebook-naming-a-catalog-database-that-does-not-exist-rejected
+Issue-Key: glue__kinesisanalyticsv2|CreateApplication|AmbiguousService
 Issue-Commit: 9979b14c0e509985792db6dac0171a1eff5d6a10
 
 # Cross-service Glue + Kinesis Analytics V2 Studio-notebook checks never run: router refuses every 'kinesisanalytics'-signed request with AmbiguousService

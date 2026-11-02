@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: serverlessapplicationrepository.application-version-publish-lifecycle serverlessapplicationrepository.rejects-template-without-transform
+Issue-Trace-Ids: serverlessrepo.application-version-publish-lifecycle serverlessrepo.rejects-template-without-transform
 Issue-Shape-Id: com.amazonaws.serverlessapplicationrepository#ServerlessApplicationRepository
-Issue-Key: serverlessapplicationrepository.application-version-publish-lifecycle|run#12|AssertionError|assert first["ParameterDefinitions"] == [
-Issue-Key: serverlessapplicationrepository.rejects-template-without-transform|_error#6|AssertionError|raise AssertionError("the call succeeded; real AWS refuses it")
+Issue-Key: serverlessrepo.application-version-publish-lifecycle|run#12|AssertionError|assert first["ParameterDefinitions"] == [
+Issue-Key: serverlessrepo.rejects-template-without-transform|_error#6|AssertionError|raise AssertionError("the call succeeded; real AWS refuses it")
 Issue-Commit: 00577afa9aa0eead33f7dafc8adac2dd3659e1fc
 
 # serverlessrepo template handling is JSON-only: a YAML SAM template yields no ParameterDefinitions and its missing Transform is never refused

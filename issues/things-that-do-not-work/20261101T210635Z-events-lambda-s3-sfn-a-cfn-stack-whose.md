@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__lambda__s3__sfn.cfn-deploy-lambda-role-missing-events-permission-negative
-Issue-Key: events__lambda__s3__sfn.cfn-deploy-lambda-role-missing-events-permission-negative|_poll_until#17|Timeout|last = probe()
+Issue-Trace-Ids: events__lambda__s3__stepfunctions.cfn-deploy-lambda-role-missing-events-permission-negative
+Issue-Key: events__lambda__s3__stepfunctions.cfn-deploy-lambda-role-missing-events-permission-negative|_poll_until#17|Timeout|last = probe()
 Issue-Commit: 62e4c5cd3531cb5ea16934ee4e8b2e43c8dd65a3
 
 # events__lambda__s3__sfn: a CFN stack whose Lambda role lacks events:PutEvents never reaches a verdict, so the negative deploy check hangs to the harness budget

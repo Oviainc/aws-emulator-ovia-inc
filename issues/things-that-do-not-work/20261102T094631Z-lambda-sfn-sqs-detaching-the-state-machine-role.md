@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lambda__sfn__sqs.cli-detach-lambda-invoke-policy-breaks-sfn-task-negative
-Issue-Key: lambda__sfn__sqs.cli-detach-lambda-invoke-policy-breaks-sfn-task-negative|_poll_until#37|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: lambda__sqs__stepfunctions.cli-detach-lambda-invoke-policy-breaks-sfn-task-negative
+Issue-Key: lambda__sqs__stepfunctions.cli-detach-lambda-invoke-policy-breaks-sfn-task-negative|_poll_until#37|Timeout|time.sleep(interval_s)
 Issue-Commit: 977af42ea79b884a07e35b887b5e587a14d941a9
 
 # lambda__sfn__sqs: detaching the state machine role's lambda:InvokeFunction grant produces no observable task failure — the check never gets a control execution to grade

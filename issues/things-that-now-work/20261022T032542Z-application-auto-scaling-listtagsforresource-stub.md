@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: application-auto-scaling.register-upsert-carrying-tags-rejected-and-bounds-kept
+Issue-Trace-Ids: application-autoscaling.register-upsert-carrying-tags-rejected-and-bounds-kept
 Issue-Shape-Id: com.amazonaws.applicationautoscaling#AnyScaleFrontendService
 Issue-Key: application-auto-scaling|ListTagsForResource|NotImplemented
 Issue-Commit: 5598afbcdd0af564c379fb305d1563cf7235aea7

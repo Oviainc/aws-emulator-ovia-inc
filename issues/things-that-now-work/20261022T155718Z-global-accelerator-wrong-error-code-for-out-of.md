@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: global-accelerator.traffic-dial-rejects-percentage-above-hundred global-accelerator.accelerator-delete-rejects-enabled-accelerator
+Issue-Trace-Ids: globalaccelerator.traffic-dial-rejects-percentage-above-hundred globalaccelerator.accelerator-delete-rejects-enabled-accelerator
 Issue-Shape-Id: com.amazonaws.globalaccelerator#GlobalAccelerator_V20180706
-Issue-Key: global-accelerator.traffic-dial-rejects-percentage-above-hundred|run#7|AssertionError|assert code == "InvalidArgumentException", (
-Issue-Key: global-accelerator.accelerator-delete-rejects-enabled-accelerator|run#9|AssertionError|assert message == expected, (
+Issue-Key: globalaccelerator.traffic-dial-rejects-percentage-above-hundred|run#7|AssertionError|assert code == "InvalidArgumentException", (
+Issue-Key: globalaccelerator.accelerator-delete-rejects-enabled-accelerator|run#9|AssertionError|assert message == expected, (
 Issue-Commit: 7b5968e5380062291ec1b05b736535203332753c
 
 # Global Accelerator: wrong error code for out-of-range TrafficDialPercentage, and AcceleratorNotDisabledException message does not name the accelerator

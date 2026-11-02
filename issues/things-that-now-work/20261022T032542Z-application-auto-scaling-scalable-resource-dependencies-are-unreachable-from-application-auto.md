@@ -1,13 +1,13 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: application-auto-scaling.deregister-in-one-region-keeps-the-same-named-target-in-another application-auto-scaling.scheduled-action-in-a-second-region-scales-only-that-regions-table application-auto-scaling.deregister-index-target-leaves-the-table-policy-and-alarms application-auto-scaling.gsi-scalable-target-moves-the-index-not-the-table application-auto-scaling.register-scalable-target-capacity-clamped-on-max-decrease application-auto-scaling.dynamodb-predefined-metric-on-a-keyspaces-dimension-rejected application-auto-scaling.keyspaces-missing-table-in-an-existing-keyspace-rejected application-auto-scaling.keyspaces-on-demand-table-register-rejected application-auto-scaling.keyspaces-registration-floor-raises-the-table-write-capacity application-auto-scaling.keyspaces-scheduled-action-moves-the-table-read-capacity application-auto-scaling.keyspaces-table-auto-scaling-specification-registers-the-targets-and-policies application-auto-scaling.keyspaces-target-tracking-alarms-watch-the-table-metrics application-auto-scaling.ecs-registration-floor-sets-the-desired-count-with-no-capacity-to-run-it
+Issue-Trace-Ids: application-autoscaling.deregister-in-one-region-keeps-the-same-named-target-in-another application-autoscaling.scheduled-action-in-a-second-region-scales-only-that-regions-table application-autoscaling.deregister-index-target-leaves-the-table-policy-and-alarms application-autoscaling.gsi-scalable-target-moves-the-index-not-the-table application-autoscaling.register-scalable-target-capacity-clamped-on-max-decrease application-autoscaling.dynamodb-predefined-metric-on-a-keyspaces-dimension-rejected application-autoscaling.keyspaces-missing-table-in-an-existing-keyspace-rejected application-autoscaling.keyspaces-on-demand-table-register-rejected application-autoscaling.keyspaces-registration-floor-raises-the-table-write-capacity application-autoscaling.keyspaces-scheduled-action-moves-the-table-read-capacity application-autoscaling.keyspaces-table-auto-scaling-specification-registers-the-targets-and-policies application-autoscaling.keyspaces-target-tracking-alarms-watch-the-table-metrics application-autoscaling.ecs-registration-floor-sets-the-desired-count-with-no-capacity-to-run-it
 Issue-Shape-Id: com.amazonaws.applicationautoscaling#AnyScaleFrontendService
-Issue-Key: application-auto-scaling|CreateTable|ResourceInUseException
-Issue-Key: application-auto-scaling|CreateTable|NotImplemented
-Issue-Key: application-auto-scaling|UpdateTable|NotImplemented
+Issue-Key: application-autoscaling|CreateTable|ResourceInUseException
+Issue-Key: application-autoscaling|CreateTable|NotImplemented
+Issue-Key: application-autoscaling|UpdateTable|NotImplemented
 Issue-Key: keyspaces|CreateKeyspace|AmbiguousService
-Issue-Key: application-auto-scaling|CreateService|NotImplemented
+Issue-Key: application-autoscaling|CreateService|NotImplemented
 Issue-Commit: 5598afbcdd0af564c379fb305d1563cf7235aea7
 
 # Scalable-resource dependencies are unreachable from Application Auto Scaling checks: DynamoDB state is not region-partitioned, CreateTable+GSI and UpdateTable are stubs, two services both claim 'cassandra', and ECS CreateService is a stub

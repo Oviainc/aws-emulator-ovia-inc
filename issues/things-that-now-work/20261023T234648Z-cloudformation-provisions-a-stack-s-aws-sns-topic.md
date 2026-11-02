@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudformation__service-catalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action
-Issue-Key: cloudformation__service-catalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action|run#10|AssertionError|assert topic_tags.get(_MANAGED_TAG_KEY) == "true", topic_tags
+Issue-Trace-Ids: cloudformation__servicecatalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action
+Issue-Key: cloudformation__servicecatalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action|run#10|AssertionError|assert topic_tags.get(_MANAGED_TAG_KEY) == "true", topic_tags
 Issue-Commit: 41a5a58882085f034e9d1217c58dbee38ea55080
 
 # CloudFormation provisions a stack's AWS::SNS::Topic but applies neither the stack's own Tags nor the aws:cloudformation:* tags to it (empty tag set)

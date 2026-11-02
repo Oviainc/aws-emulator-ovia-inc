@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: service-catalog.provisioned-product-creates-cloudformation-stack service-catalog.terminate-provisioned-product-deletes-cloudformation-stack
+Issue-Trace-Ids: servicecatalog.provisioned-product-creates-cloudformation-stack servicecatalog.terminate-provisioned-product-deletes-cloudformation-stack
 Issue-Shape-Id: com.amazonaws.servicecatalog#AWS242ServiceCatalogService
 Issue-Key: service-catalog|ProvisionProduct|NotImplemented
 Issue-Commit: d5912a3a34a2e2faa23a606635408f9fea83c969

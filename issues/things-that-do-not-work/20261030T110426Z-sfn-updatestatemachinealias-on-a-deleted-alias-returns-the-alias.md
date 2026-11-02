@@ -1,11 +1,11 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: sfn.alias-create-describe-update-delete-lifecycle sfn.alias-delete-then-describe-not-found sfn.sm-alias-create-describe-delete
+Issue-Trace-Ids: stepfunctions.alias-create-describe-update-delete-lifecycle stepfunctions.alias-delete-then-describe-not-found stepfunctions.sm-alias-create-describe-delete
 Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
-Issue-Key: sfn.alias-create-describe-update-delete-lifecycle|run#31|AssertionError|assert mutate_err["Message"] == expected_message, f'expected the message {expected_message!r}, got {mutate_err["Message"]!r}'
-Issue-Key: sfn.alias-delete-then-describe-not-found|run#23|AssertionError|assert update_err == expected, (
-Issue-Key: sfn.sm-alias-create-describe-delete|run#18|AssertionError|assert update_error.get("Message") == expected_update, (
+Issue-Key: stepfunctions.alias-create-describe-update-delete-lifecycle|run#31|AssertionError|assert mutate_err["Message"] == expected_message, f'expected the message {expected_message!r}, got {mutate_err["Message"]!r}'
+Issue-Key: stepfunctions.alias-delete-then-describe-not-found|run#23|AssertionError|assert update_err == expected, (
+Issue-Key: stepfunctions.sm-alias-create-describe-delete|run#18|AssertionError|assert update_error.get("Message") == expected_update, (
 Issue-Commit: a28b00726e6917844828701198c7c2f9a84a8d63
 
 # UpdateStateMachineAlias on a deleted alias returns the alias-read ResourceNotFound message instead of AWS's "Request references a resource that does not exist."

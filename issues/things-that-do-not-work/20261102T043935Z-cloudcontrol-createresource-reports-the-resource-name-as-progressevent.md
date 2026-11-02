@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudcontrol__iam__sfn.cloudcontrol-iam-managed-policy-lifecycle-identifier-is-arn cloudcontrol__iam__sfn.cloudcontrol-state-machine-definition-object-round-trip
-Issue-Key: cloudcontrol__iam__sfn.cloudcontrol-iam-managed-policy-lifecycle-identifier-is-arn|run#10|AssertionError|assert identifier == expected_arn, (
-Issue-Key: cloudcontrol__iam__sfn.cloudcontrol-state-machine-definition-object-round-trip|run#11|AssertionError|assert identifier == expected_arn, (
+Issue-Trace-Ids: cloudcontrol__iam__stepfunctions.cloudcontrol-iam-managed-policy-lifecycle-identifier-is-arn cloudcontrol__iam__stepfunctions.cloudcontrol-state-machine-definition-object-round-trip
+Issue-Key: cloudcontrol__iam__stepfunctions.cloudcontrol-iam-managed-policy-lifecycle-identifier-is-arn|run#10|AssertionError|assert identifier == expected_arn, (
+Issue-Key: cloudcontrol__iam__stepfunctions.cloudcontrol-state-machine-definition-object-round-trip|run#11|AssertionError|assert identifier == expected_arn, (
 Issue-Commit: 723aa94a65a7375dec1c2b71e7ed3185ecc54583
 
 # cloudcontrol CreateResource reports the resource NAME as ProgressEvent.Identifier for types whose primary identifier is an ARN (AWS::IAM::ManagedPolicy, AWS::StepFunctions::StateMachine)

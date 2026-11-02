@@ -1,8 +1,8 @@
 Issue-Severity: MEDIUM
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: resource-groups-tagging-api__sfn.state-machine-tags-visible-through-get-resources
-Issue-Key: resource-groups-tagging-api__sfn.state-machine-tags-visible-through-get-resources|_poll_until#13|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: resourcegroupstaggingapi__stepfunctions.state-machine-tags-visible-through-get-resources
+Issue-Key: resourcegroupstaggingapi__stepfunctions.state-machine-tags-visible-through-get-resources|_poll_until#13|Timeout|time.sleep(interval_s)
 Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529
 
 # resource-groups-tagging-api GetResources never answers for a tagged Step Functions state machine

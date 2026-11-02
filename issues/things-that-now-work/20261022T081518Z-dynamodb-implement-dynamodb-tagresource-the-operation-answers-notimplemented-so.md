@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: dynamodb__resource-groups-tagging-api.table-native-tags-visible-through-get-resources
-Issue-Key: dynamodb__resource-groups-tagging-api|TagResource|NotImplemented
+Issue-Trace-Ids: dynamodb__resourcegroupstaggingapi.table-native-tags-visible-through-get-resources
+Issue-Key: dynamodb__resourcegroupstaggingapi|TagResource|NotImplemented
 Issue-Commit: 5ef273b5ec187d9b55db2ccfdad00816d8c5c39a
 
 # Implement dynamodb TagResource: the operation answers NotImplemented, so no table can be tagged natively

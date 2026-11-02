@@ -1,8 +1,8 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudformation__service-catalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action
-Issue-Key: cloudformation__service-catalog-appregistry|ListTagsForResource|ResourceNotFound
+Issue-Trace-Ids: cloudformation__servicecatalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action
+Issue-Key: cloudformation__servicecatalog-appregistry|ListTagsForResource|ResourceNotFound
 Issue-Commit: 3dc196f76d19116b5d570e1dc438e2b93d0e0d47
 
 # CloudFormation never provisions AWS::SNS::Topic into SNS: a CREATE_COMPLETE stack's Ref'd topic ARN is unknown to SNS and carries no stack tags

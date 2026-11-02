@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: auto-scaling-plans.asp-absent-plan-reads-are-empty-but-writes-are-rejected auto-scaling-plans.asp-forecast-window-is-rejected-before-plan-lookup
+Issue-Trace-Ids: autoscaling-plans.asp-absent-plan-reads-are-empty-but-writes-are-rejected autoscaling-plans.asp-forecast-window-is-rejected-before-plan-lookup
 Issue-Shape-Id: com.amazonaws.autoscalingplans#AnyScaleScalingPlannerFrontendService
 Issue-Key: auto-scaling-plans|GetScalingPlanResourceForecastData|NotImplemented
 Issue-Commit: 242e2a822ca6eb3fec2aad3ba89160f0a6f40669

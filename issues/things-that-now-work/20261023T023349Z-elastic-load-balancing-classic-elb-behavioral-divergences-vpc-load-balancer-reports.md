@@ -1,12 +1,12 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: elastic-load-balancing.enable-availability-zones-on-a-vpc-load-balancer-rejected elastic-load-balancing.health-check-timeout-not-below-interval-rejected elastic-load-balancing.duplicate-listener-port-with-different-backend-rejected elastic-load-balancing.duplicate-load-balancer-name-rejected
+Issue-Trace-Ids: elb.enable-availability-zones-on-a-vpc-load-balancer-rejected elb.health-check-timeout-not-below-interval-rejected elb.duplicate-listener-port-with-different-backend-rejected elb.duplicate-load-balancer-name-rejected
 Issue-Shape-Id: com.amazonaws.elasticloadbalancing#ElasticLoadBalancing_v7
-Issue-Key: elastic-load-balancing.enable-availability-zones-on-a-vpc-load-balancer-rejected|run#6|AssertionError|assert before_azs == [azs[0]] and before_subnets == [subnet_ids[0]], (
-Issue-Key: elastic-load-balancing.health-check-timeout-not-below-interval-rejected|run#10|AssertionError|assert equal_code == "ValidationError", (
-Issue-Key: elastic-load-balancing.duplicate-listener-port-with-different-backend-rejected|run#14|AssertionError|assert message == expected_message, (
-Issue-Key: elastic-load-balancing.duplicate-load-balancer-name-rejected|run#11|AssertionError|assert message == expected, (
+Issue-Key: elb.enable-availability-zones-on-a-vpc-load-balancer-rejected|run#6|AssertionError|assert before_azs == [azs[0]] and before_subnets == [subnet_ids[0]], (
+Issue-Key: elb.health-check-timeout-not-below-interval-rejected|run#10|AssertionError|assert equal_code == "ValidationError", (
+Issue-Key: elb.duplicate-listener-port-with-different-backend-rejected|run#14|AssertionError|assert message == expected_message, (
+Issue-Key: elb.duplicate-load-balancer-name-rejected|run#11|AssertionError|assert message == expected, (
 Issue-Commit: 1b15cfcf83a9fafcaa69f938ed17066b612a8ba0
 
 # Classic ELB behavioral divergences: VPC load balancer reports no AvailabilityZones, cross-field health-check refusal uses ValidationException, and two conflict messages use non-AWS templates (4 causes)

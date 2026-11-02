@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudfront__dynamodb__lambda__s3__sfn.cftenant-distribution-naming-a-deleted-origin-access-control-rejected
+Issue-Trace-Ids: cloudfront__dynamodb__lambda__s3__stepfunctions.cftenant-distribution-naming-a-deleted-origin-access-control-rejected
 Issue-Key: cloudfront|DeleteOriginAccessControl|NotImplemented
 Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529
 

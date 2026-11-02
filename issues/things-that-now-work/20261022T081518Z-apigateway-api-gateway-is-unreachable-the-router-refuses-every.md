@@ -1,8 +1,8 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: apigateway__lambda__logs__resource-groups-tagging-api__sqs.api-key-discovered-tagged-and-removed-from-index-on-delete apigateway__lambda__logs__resource-groups-tagging-api__sqs.tag-resources-nonexistent-api-key-arn-rejected-per-resource
-Issue-Key: apigateway__lambda__logs__resource-groups-tagging-api__sqs|CreateApiKey|AmbiguousService
+Issue-Trace-Ids: apigateway__lambda__logs__resourcegroupstaggingapi__sqs.api-key-discovered-tagged-and-removed-from-index-on-delete apigateway__lambda__logs__resourcegroupstaggingapi__sqs.tag-resources-nonexistent-api-key-arn-rejected-per-resource
+Issue-Key: apigateway__lambda__logs__resourcegroupstaggingapi__sqs|CreateApiKey|AmbiguousService
 Issue-Commit: 5ef273b5ec187d9b55db2ccfdad00816d8c5c39a
 
 # API Gateway is unreachable: the router refuses every apigateway-signed request with AmbiguousService because two emulated services claim the 'apigateway' signing name

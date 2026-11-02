@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudformation__service-catalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action
-Issue-Key: cloudformation__service-catalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action|run#8|KeyError|topic_arn = _outputs(deployed)["TopicArn"]
+Issue-Trace-Ids: cloudformation__servicecatalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action
+Issue-Key: cloudformation__servicecatalog-appregistry.appregistry-sync-unassociated-cfn-stack-is-no-action|run#8|KeyError|topic_arn = _outputs(deployed)["TopicArn"]
 Issue-Commit: 2d8e5ac28e0b90b67e06be860948cea48d2b4817
 
 # CloudFormation stack Outputs are never produced: a CREATE_COMPLETE stack declaring Outputs for an AWS::SNS::Topic returns a Stack with no Outputs, blocking the AppRegistry/CFN association probe

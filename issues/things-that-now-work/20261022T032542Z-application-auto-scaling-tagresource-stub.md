@@ -1,11 +1,11 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: application-auto-scaling.put-scaling-policy-idempotent-upsert-updates-config application-auto-scaling.tag-resource-and-untag-roundtrip application-auto-scaling.tag-resource-nonexistent-resource-rejected application-auto-scaling.tag-resource-too-many-tags-rejected
+Issue-Trace-Ids: application-autoscaling.put-scaling-policy-idempotent-upsert-updates-config application-autoscaling.tag-resource-and-untag-roundtrip application-autoscaling.tag-resource-nonexistent-resource-rejected application-autoscaling.tag-resource-too-many-tags-rejected
 Issue-Shape-Id: com.amazonaws.applicationautoscaling#AnyScaleFrontendService
 Issue-Key: application-auto-scaling|TagResource|NotImplemented
-Issue-Key: application-auto-scaling.tag-resource-nonexistent-resource-rejected|run#4|AssertionError|assert error.get("Code") == "ValidationException", error
-Issue-Key: application-auto-scaling.tag-resource-too-many-tags-rejected|run#9|AssertionError|assert error.get("Code") == "ValidationException", error
+Issue-Key: application-autoscaling.tag-resource-nonexistent-resource-rejected|run#4|AssertionError|assert error.get("Code") == "ValidationException", error
+Issue-Key: application-autoscaling.tag-resource-too-many-tags-rejected|run#9|AssertionError|assert error.get("Code") == "ValidationException", error
 Issue-Commit: 5598afbcdd0af564c379fb305d1563cf7235aea7
 
 # Implement application-auto-scaling TagResource: unimplemented scaffold stub

@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__dynamodb__lambda.deploy-ddb-stream-lambda-cloudwatch-dashboard cloudwatch__dynamodb__lambda.deploy-ddb-table-stream-esm-cfn-lambda-trigger cloudwatch__dynamodb__lambda.deploy-lambda-execution-role-missing-cloudwatch-permission-negative cloudwatch__lambda__sqs.obs-lambda-2-sqs-esm-kafka-only-metrics-rejected lambda__sfn__sqs.deploy-sfn-lambda-sqs-dlq-redrive-policy-stack
+Issue-Trace-Ids: cloudwatch__dynamodb__lambda.deploy-ddb-stream-lambda-cloudwatch-dashboard cloudwatch__dynamodb__lambda.deploy-ddb-table-stream-esm-cfn-lambda-trigger cloudwatch__dynamodb__lambda.deploy-lambda-execution-role-missing-cloudwatch-permission-negative cloudwatch__lambda__sqs.obs-lambda-2-sqs-esm-kafka-only-metrics-rejected lambda__sqs__stepfunctions.deploy-sfn-lambda-sqs-dlq-redrive-policy-stack
 Issue-Key: lambda|ListEventSourceMappings|NotImplemented
 Issue-Commit: 048778663a26e363156c6db724999c4fb229af36
 

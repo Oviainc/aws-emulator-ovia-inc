@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__sfn__sqs.xsvc-sfn-2-waittoken-producer
-Issue-Key: events__sfn__sqs.xsvc-sfn-2-waittoken-producer|run#20|Timeout|d = sfn.describe_execution(executionArn=exec_arn)
+Issue-Trace-Ids: events__sqs__stepfunctions.xsvc-sfn-2-waittoken-producer
+Issue-Key: events__sqs__stepfunctions.xsvc-sfn-2-waittoken-producer|run#20|Timeout|d = sfn.describe_execution(executionArn=exec_arn)
 Issue-Commit: 82a9e97b43fb811c245308aabae5044dc3bd73ae
 
 # events__sfn__sqs: the `events:putEvents.waitForTaskToken` producer round trip never completes — no execution of the waitForTaskToken state machine reaches SUCCEEDED (1 cause)

@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudtrail__cloudformation.obs-cloudformation-1-stack-lifecycle-is-audited-as-the-caller-and-provisioning-as-the-service
+Issue-Trace-Ids: cloudformation__cloudtrail.obs-cloudformation-1-stack-lifecycle-is-audited-as-the-caller-and-provisioning-as-the-service
 Issue-Key: cloudformation|DescribeStackResource|NotImplemented
 Issue-Commit: c50178ef0adb9f41de3fed65acf95f496e080c81
 

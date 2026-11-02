@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudwatch__sfn.obs-sfn-1-alias-split-executions-attribute-to-alias-and-routed-version sfn.alias-repoint-to-foreign-state-machine-version-rejected
+Issue-Trace-Ids: cloudwatch__stepfunctions.obs-sfn-1-alias-split-executions-attribute-to-alias-and-routed-version stepfunctions.alias-repoint-to-foreign-state-machine-version-rejected
 Issue-Key: sfn|CreateStateMachineAlias|NotImplemented
 Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529
 

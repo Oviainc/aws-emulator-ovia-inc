@@ -1,11 +1,11 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: serverlessapplicationrepository.sar-prepared-template-serves-the-published-body serverlessapplicationrepository.cloudformation-template-expiry-window serverlessapplicationrepository.rejects-unshareable-policy-statement
+Issue-Trace-Ids: serverlessrepo.sar-prepared-template-serves-the-published-body serverlessrepo.cloudformation-template-expiry-window serverlessrepo.rejects-unshareable-policy-statement
 Issue-Shape-Id: com.amazonaws.serverlessapplicationrepository#ServerlessApplicationRepository
-Issue-Key: serverlessapplicationrepository.sar-prepared-template-serves-the-published-body|_fetch#16|HTTPError|with urllib.request.urlopen(urllib.request.Request(target_url, headers=route_headers), timeout=_FETCH_TIMEOUT_S) as response: # noqa: S310
-Issue-Key: serverlessapplicationrepository.cloudformation-template-expiry-window|run#18|AssertionError|assert window == datetime.timedelta(hours=6), (
-Issue-Key: serverlessapplicationrepository.rejects-unshareable-policy-statement|_error#13|AssertionError|raise AssertionError("PutApplicationPolicy succeeded; real AWS refuses this statement")
+Issue-Key: serverlessrepo.sar-prepared-template-serves-the-published-body|_fetch#16|HTTPError|with urllib.request.urlopen(urllib.request.Request(target_url, headers=route_headers), timeout=_FETCH_TIMEOUT_S) as response: # noqa: S310
+Issue-Key: serverlessrepo.cloudformation-template-expiry-window|run#18|AssertionError|assert window == datetime.timedelta(hours=6), (
+Issue-Key: serverlessrepo.rejects-unshareable-policy-statement|_error#13|AssertionError|raise AssertionError("PutApplicationPolicy succeeded; real AWS refuses this statement")
 Issue-Commit: 1b15cfcf83a9fafcaa69f938ed17066b612a8ba0
 
 # serverlessrepo prepared templates: TemplateUrl serves nothing, expiry window is 1h not 6h, and PutApplicationPolicy accepts an owner principal

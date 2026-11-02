@@ -1,9 +1,9 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudformation__serverlessapplicationrepository__sqs.deploy-sar-published-version-changeset-into-a-working-queue cloudformation__serverlessapplicationrepository__sqs.rejects-changeset-for-versionless-application cloudformation__serverlessapplicationrepository__sqs.sar-change-set-deploys-functioning-queue serverlessapplicationrepository.sar-deploy-denied-for-role-scoped-to-another-application
+Issue-Trace-Ids: cloudformation__serverlessrepo__sqs.deploy-sar-published-version-changeset-into-a-working-queue cloudformation__serverlessrepo__sqs.rejects-changeset-for-versionless-application cloudformation__serverlessrepo__sqs.sar-change-set-deploys-functioning-queue serverlessrepo.sar-deploy-denied-for-role-scoped-to-another-application
 Issue-Key: serverlessapplicationrepository|CreateCloudFormationChangeSet|NotImplemented
-Issue-Key: cloudformation__serverlessapplicationrepository__sqs.rejects-changeset-for-versionless-application|run#10|AssertionError|assert (code, message) == ("BadRequestException", _NO_VERSION_CHANGE_SET), (
+Issue-Key: cloudformation__serverlessrepo__sqs.rejects-changeset-for-versionless-application|run#10|AssertionError|assert (code, message) == ("BadRequestException", _NO_VERSION_CHANGE_SET), (
 Issue-Commit: 00577afa9aa0eead33f7dafc8adac2dd3659e1fc
 
 # Implement serverlessapplicationrepository CreateCloudFormationChangeSet: unimplemented scaffold stub

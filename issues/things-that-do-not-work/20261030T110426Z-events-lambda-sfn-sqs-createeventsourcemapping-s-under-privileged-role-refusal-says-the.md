@@ -1,8 +1,8 @@
 Issue-Severity: LOW
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__lambda__sfn__sqs.sqs-to-lambda-esm-rejects-role-without-receive
-Issue-Key: events__lambda__sfn__sqs.sqs-to-lambda-esm-rejects-role-without-receive|run#7|AssertionError|assert message == expected_message, (
+Issue-Trace-Ids: events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-rejects-role-without-receive
+Issue-Key: events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-rejects-role-without-receive|run#7|AssertionError|assert message == expected_message, (
 Issue-Commit: a28b00726e6917844828701198c7c2f9a84a8d63
 
 # CreateEventSourceMapping's under-privileged-role refusal says "The provided execution role" instead of AWS's "The function execution role does not have permissions to call ReceiveMessage on SQS"

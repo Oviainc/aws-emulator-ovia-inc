@@ -1,10 +1,10 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: database-migration-service.endpoint-rejects-unusable-role database-migration-service.subnet-group-requires-two-azs
+Issue-Trace-Ids: dms.endpoint-rejects-unusable-role dms.subnet-group-requires-two-azs
 Issue-Shape-Id: com.amazonaws.databasemigrationservice#AmazonDMSv20160101
-Issue-Key: database-migration-service.endpoint-rejects-unusable-role|_error#15|AssertionError|raise AssertionError("expected the call to be rejected, but it succeeded")
-Issue-Key: database-migration-service.subnet-group-requires-two-azs|run#16|AssertionError|assert code == 'ReplicationSubnetGroupDoesNotCoverEnoughAZs', (
+Issue-Key: dms.endpoint-rejects-unusable-role|_error#15|AssertionError|raise AssertionError("expected the call to be rejected, but it succeeded")
+Issue-Key: dms.subnet-group-requires-two-azs|run#16|AssertionError|assert code == 'ReplicationSubnetGroupDoesNotCoverEnoughAZs', (
 Issue-Commit: a59989a9f63c403b66485a4e93f54ab6df22c2a6
 
 # DMS: CreateEndpoint skips ServiceAccessRoleArn validation and CreateReplicationSubnetGroup is an unimplemented 501 stub (2 causes)

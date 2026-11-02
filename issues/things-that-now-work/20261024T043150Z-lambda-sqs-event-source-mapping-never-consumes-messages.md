@@ -1,8 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lambda__sfn__sqs.sqs-esm-visibility-timeout-extended-during-processing
-Issue-Key: lambda__sfn__sqs.sqs-esm-visibility-timeout-extended-during-processing|_poll_until#12|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: lambda__sqs__stepfunctions.sqs-esm-visibility-timeout-extended-during-processing
+Issue-Key: lambda__sqs__stepfunctions.sqs-esm-visibility-timeout-extended-during-processing|_poll_until#12|Timeout|time.sleep(interval_s)
 Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529
 
 # Lambda SQS event source mapping never consumes messages, so no invocation and no visibility-timeout extension is observable

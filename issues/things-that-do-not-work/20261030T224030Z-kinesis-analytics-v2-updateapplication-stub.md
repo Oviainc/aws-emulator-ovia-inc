@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: kinesis-analytics-v2.update-with-stale-version-id-rejected
+Issue-Trace-Ids: kinesisanalyticsv2.update-with-stale-version-id-rejected
 Issue-Shape-Id: com.amazonaws.kinesisanalyticsv2#KinesisAnalytics_20180523
 Issue-Key: kinesis-analytics-v2|UpdateApplication|NotImplemented
 Issue-Commit: 5bcb167feafadea8e22c35fa67ec2d8f1025761e

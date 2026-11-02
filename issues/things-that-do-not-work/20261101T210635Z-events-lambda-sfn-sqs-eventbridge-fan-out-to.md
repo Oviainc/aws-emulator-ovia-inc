@@ -1,12 +1,12 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events__lambda__sfn__sqs.eventbridge-fanout-lambda-sqs-sfn events__lambda__sfn__sqs.eventbridge-to-lambda-blocked-without-resource-policy events__lambda__sfn__sqs.eventbridge-to-lambda-invokes-with-resource-policy events__lambda__sfn__sqs.sqs-to-lambda-esm-handler-error-returns-message events__lambda__sfn__sqs.sqs-to-lambda-esm-preserves-attributes
-Issue-Key: events__lambda__sfn__sqs.eventbridge-fanout-lambda-sqs-sfn|_receive_raw#22|Timeout|resp = ctx.client("sqs").receive_message(
-Issue-Key: events__lambda__sfn__sqs.eventbridge-to-lambda-blocked-without-resource-policy|_receive_and_drain#13|Timeout|resp = sqs.receive_message(
-Issue-Key: events__lambda__sfn__sqs.eventbridge-to-lambda-invokes-with-resource-policy|_receive_raw#8|Timeout|resp = ctx.client("sqs").receive_message(
-Issue-Key: events__lambda__sfn__sqs.sqs-to-lambda-esm-handler-error-returns-message|_wait_for_messages#9|AssertionError|raise AssertionError(
-Issue-Key: events__lambda__sfn__sqs.sqs-to-lambda-esm-preserves-attributes|_wait_for_messages#8|Timeout|resp = sqs.receive_message(
+Issue-Trace-Ids: events__lambda__sqs__stepfunctions.eventbridge-fanout-lambda-sqs-sfn events__lambda__sqs__stepfunctions.eventbridge-to-lambda-blocked-without-resource-policy events__lambda__sqs__stepfunctions.eventbridge-to-lambda-invokes-with-resource-policy events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-handler-error-returns-message events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-preserves-attributes
+Issue-Key: events__lambda__sqs__stepfunctions.eventbridge-fanout-lambda-sqs-sfn|_receive_raw#22|Timeout|resp = ctx.client("sqs").receive_message(
+Issue-Key: events__lambda__sqs__stepfunctions.eventbridge-to-lambda-blocked-without-resource-policy|_receive_and_drain#13|Timeout|resp = sqs.receive_message(
+Issue-Key: events__lambda__sqs__stepfunctions.eventbridge-to-lambda-invokes-with-resource-policy|_receive_raw#8|Timeout|resp = ctx.client("sqs").receive_message(
+Issue-Key: events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-handler-error-returns-message|_wait_for_messages#9|AssertionError|raise AssertionError(
+Issue-Key: events__lambda__sqs__stepfunctions.sqs-to-lambda-esm-preserves-attributes|_wait_for_messages#8|Timeout|resp = sqs.receive_message(
 Issue-Commit: 62e4c5cd3531cb5ea16934ee4e8b2e43c8dd65a3
 
 # events__lambda__sfn__sqs: EventBridge fan-out to Lambda and the SQS event-source mapping are both inert — 5 net-new causes never reach a verdict
