@@ -58,6 +58,37 @@ pub(crate) fn b2bi_router() -> MultiServiceRouter {
     router
 }
 
+/// Send one path-style request to the emulator's S3 front door SIGNED FOR `region`,
+/// returning the HTTP status and body.
+///
+/// S3 places a bucket in the Region of the endpoint the create reached, so a test that
+/// needs a bucket in some other Region signs for that Region.
+pub(crate) async fn s3_signed_for(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let request = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/s3/\
+                 aws4_request, SignedHeaders=host, Signature=deadbeef"
+            ),
+        )
+        .body(bytes::Bytes::copy_from_slice(body))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    (
+        response.status().as_u16(),
+        response.body().as_ref().to_vec(),
+    )
+}
+
 /// Send one path-style request to the emulator's S3 front door, returning the HTTP status.
 ///
 /// S3 is a REST service: the bucket and key live in the URI and the body is the object's
@@ -69,23 +100,7 @@ pub(crate) async fn s3(
     path: &str,
     body: &[u8],
 ) -> (u16, Vec<u8>) {
-    let request = http::Request::builder()
-        .method(method)
-        .uri(path)
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{SIGNING_REGION}/s3/\
-                 aws4_request, SignedHeaders=host, Signature=deadbeef"
-            ),
-        )
-        .body(bytes::Bytes::copy_from_slice(body))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    (
-        response.status().as_u16(),
-        response.body().as_ref().to_vec(),
-    )
+    s3_signed_for(router, SIGNING_REGION, method, path, body).await
 }
 
 /// Invoke one operation and return `(status, body)`.
@@ -861,6 +876,10 @@ async fn an_unissued_next_token_is_refused_as_a_validation_error() {
 /// RULE: the optional `profileId` filter narrows `ListPartnerships` to the partnerships
 /// created under that profile, and nothing else. Rows span two profiles holding
 /// different counts, the unfiltered enumeration, and a profile with no partnerships.
+///
+/// Every row names a profile that RESOLVES: a filter naming no profile at all is not a
+/// page but the modelled `ResourceNotFoundException`, which
+/// `profile_filter_and_job_locations` states over its own rows.
 #[tokio::test]
 async fn list_partnerships_reports_only_the_named_profiles_partnerships() {
     let router = b2bi_router();
@@ -888,7 +907,6 @@ async fn list_partnerships_reports_only_the_named_profiles_partnerships() {
         ("busy profile", Some(busy.as_str()), &expected_busy),
         ("quiet profile", Some(quiet.as_str()), &expected_quiet),
         ("profile with none", Some(empty.as_str()), &Vec::new()),
-        ("unknown profile", Some("p-ffffffffffffffffe"), &Vec::new()),
         ("no filter", None, &everything),
     ];
 

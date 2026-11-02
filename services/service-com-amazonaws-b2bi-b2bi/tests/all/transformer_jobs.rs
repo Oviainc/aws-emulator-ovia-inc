@@ -50,7 +50,7 @@ async fn given_transformer_with(
 }
 
 /// Move `transformer_id` to `status`, answering the reported status.
-async fn set_status(
+pub(crate) async fn set_status(
     router: &smithy_server_runtime::MultiServiceRouter,
     transformer_id: &str,
     status: &str,
@@ -99,7 +99,7 @@ fn inbound(mapping: Option<Value>) -> Value {
 /// A job reports the non-terminal `running` status for a span after the call that started
 /// it, exactly as AWS answers that call with a job that has not finished, so a caller
 /// reads it twice: this is what a client's own poll loop does.
-async fn await_job(
+pub(crate) async fn await_job(
     router: &smithy_server_runtime::MultiServiceRouter,
     transformer_id: &str,
     job_id: &str,
@@ -177,7 +177,9 @@ async fn a_job_on_an_inactive_transformer_is_refused() {
             "ValidationException",
             "case {case:?}: expected a ValidationException, got {response}"
         );
-        let message = response["message"].as_str().unwrap_or_default();
+        // The modelled `ValidationException`'s message member is `Message`
+        // (`smithy_query(query="shape",shape="ValidationException")`).
+        let message = response["Message"].as_str().unwrap_or_default();
         assert!(
             message.contains(&transformer_id) && message.contains("active"),
             "case {case:?}: the refusal must name the transformer and the status it needs, \

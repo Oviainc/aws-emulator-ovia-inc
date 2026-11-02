@@ -23,6 +23,8 @@ mod generate_mapping;
 mod not_found_status;
 #[path = "all/onboarding_loop.rs"]
 mod onboarding_loop;
+#[path = "all/profile_filter_and_job_locations.rs"]
+mod profile_filter_and_job_locations;
 #[path = "all/references_logging_and_quota.rs"]
 mod references_logging_and_quota;
 #[path = "all/starter_mapping_template.rs"]

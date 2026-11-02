@@ -2,7 +2,9 @@
 
 //! @op ListPartnerships
 //! Pages the partnership store in creation order, narrowed to one profile when the
-//! caller names a `profileId`. `@readonly`: it writes nothing.
+//! caller names a `profileId` — which is resolved first, so a `profileId` no profile
+//! holds is the modelled `ResourceNotFoundException` rather than an empty page.
+//! `@readonly`: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -172,7 +174,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = store.lock();
 
-        // The optional `profileId` narrows the enumeration BEFORE paging, so a page is
+        // The optional `profileId` is a REFERENCE to a profile, and it is RESOLVED before
+        // anything is enumerated: a filter naming a profile this account's store does not
+        // hold selects nothing because the profile is not there, which is the modelled
+        // `ResourceNotFoundException` this operation declares — never an empty page, which
+        // would tell the caller its stale id names a profile that simply has no
+        // partnerships.
+        if let Some(profile_id) = input.profile_id.as_deref() {
+            if !state.profiles.contains_key(profile_id) {
+                return Err(ListPartnershipsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::profile_reference_not_found(profile_id),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The resolved `profileId` narrows the enumeration BEFORE paging, so a page is
         // `maxResults` matching partnerships rather than `maxResults` of everything.
         let enumerated: Vec<String> = match input.profile_id.as_deref() {
             None => state.partnership_order.clone(),

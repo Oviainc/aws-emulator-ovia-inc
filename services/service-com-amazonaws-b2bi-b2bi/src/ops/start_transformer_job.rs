@@ -6,11 +6,14 @@
 //! transformer is configured for and writes the output file back — then answers with the
 //! job's id, which `GetTransformerJob` reports the run under.
 //!
-//! Two preconditions are the caller's, and are refused before anything is read or written:
-//! a `transformerId` this service does not hold is the modelled
-//! `ResourceNotFoundException` (404), and a transformer that is not ACTIVE is the modelled
+//! Three preconditions are the caller's, and are refused before anything is read or
+//! written: a `transformerId` this service does not hold is the modelled
+//! `ResourceNotFoundException` (404); a transformer that is not ACTIVE is the modelled
 //! `ValidationException` (400) — "for the transformer to be used in a capability, its
-//! status must active" (`CreateTransformerResponse$status`), and a job is such a use.
+//! status must active" (`CreateTransformerResponse$status`), and a job is such a use; and
+//! a location whose Amazon S3 bucket is not in the Region the call is signed for is the
+//! modelled `ValidationException` too, because a job reads and writes through S3 in the
+//! Region of the endpoint the call reached and a bucket lives in exactly one Region.
 //!
 //! The run itself is performed by THIS call (nothing is deferred to a task that could
 //! outlive the request), and its outcome is revealed to `GetTransformerJob` once the job
@@ -237,6 +240,48 @@ fn plan(transformer: &crate::state::Transformer) -> JobPlan {
              evaluates, so no output file was written."
         )),
     }
+}
+
+/// How a refusal names the location of the file a job READS (`inputFile`) and the one it
+/// WRITES (`outputLocation`).
+const LOCATION_ROLE_INPUT: &str = "Input";
+const LOCATION_ROLE_OUTPUT: &str = "Output";
+
+/// Refuse this request as invalid, through the MODELLED `ValidationException` rather than
+/// the framework's synthetic one.
+///
+/// The service declares its own shape, and the model spells its message member `Message`
+/// (`smithy_query(query="shape",shape="ValidationException")`), which is the member a
+/// client of this operation reads a refusal out of.
+fn validation(message: impl Into<String>) -> StartTransformerJobError {
+    StartTransformerJobErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// The `Message` of the refusal for a location whose bucket is not in the Region this call
+/// is signed for: `role` is how the refusal names the location
+/// ([`LOCATION_ROLE_INPUT`] / [`LOCATION_ROLE_OUTPUT`]).
+fn bucket_not_in_region(role: &str, bucket: &str, region: &str) -> String {
+    format!("{role} Bucket {bucket} is not in current region {region}")
+}
+
+/// Whether the bucket `location` names is in `region` — the Region this call is signed
+/// for, and so the Region of the Amazon S3 endpoint the job's reads and writes go to.
+///
+/// A bucket is in exactly one Region ([`crate::state::bucket_region`]), so a bucket held
+/// in another one, and a bucket name that locates nothing at this caller's endpoint, both
+/// answer `false`: in neither case is the named bucket in the current Region.
+async fn location_is_in_region(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    location: &S3Location,
+) -> bool {
+    let bucket = location.bucket_name.as_deref().unwrap_or_default();
+    crate::state::bucket_region(ctx, region, bucket)
+        .await
+        .is_some_and(|held_in| held_in == region)
 }
 
 /// The modelled refusal for a repeat of a `clientToken` that asks for something else — the
@@ -523,13 +568,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .is_empty()
             {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(validation(format!(
                     "{member} must name an Amazon S3 bucketName"
                 )));
             }
         }
         if input.input_file.key.as_deref().unwrap_or_default().is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(validation(
                 "inputFile must name the Amazon S3 key of the EDI file to transform",
             ));
         }
@@ -599,7 +644,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
             if transformer.status != crate::state::TRANSFORMER_STATUS_ACTIVE {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(validation(format!(
                     "Transformer {} must be active",
                     input.transformer_id
                 )));
@@ -618,7 +663,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (transformer, job_id)
         };
 
-        // PHASE 2, with no lock held: the run. It reads the input file, performs the
+        // PHASE 2, with no lock held: both of the job's locations have to be in the Region
+        // this call is signed for, which is the Region of the Amazon S3 endpoint its reads
+        // and writes go to. A bucket elsewhere is the caller's mistake and is refused
+        // before a byte is read or written, so no job is recorded and nothing is observable
+        // under the requested output prefix.
+        for (location, role) in [
+            (&input.input_file, LOCATION_ROLE_INPUT),
+            (&input.output_location, LOCATION_ROLE_OUTPUT),
+        ] {
+            if location_is_in_region(ctx, &region, location).await {
+                continue;
+            }
+            // The reservation the token made above is released: no job exists under it, so
+            // a corrected retry carrying the same `clientToken` is served rather than
+            // answered with the id of a job that was never started.
+            store.lock().forget_idempotency_for(&job_id);
+            return Err(validation(bucket_not_in_region(
+                role,
+                location.bucket_name.as_deref().unwrap_or_default(),
+                &region,
+            )));
+        }
+
+        // PHASE 3, with no lock held: the run. It reads the input file, performs the
         // transformation the transformer is configured for and writes the output file, all
         // through the emulator's own S3 service.
         let outcome = run_job(
@@ -631,7 +699,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await;
 
-        // PHASE 3, under the lock again: persist what the run reported. The job reports
+        // PHASE 4, under the lock again: persist what the run reported. The job reports
         // `running` until its outcome is due, which is the status AWS answers the start
         // call with, and the terminal status afterwards.
         store.lock().record_transformer_job(crate::state::TransformerJob {

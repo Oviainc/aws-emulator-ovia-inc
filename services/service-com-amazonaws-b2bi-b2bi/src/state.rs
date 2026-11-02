@@ -609,6 +609,17 @@ pub fn profile_not_found(profile_id: &str) -> String {
     format!("Profile ID {profile_id} not found.")
 }
 
+/// The `ResourceNotFoundException` message for a `profileId` an operation resolves as a
+/// REFERENCE — the profile a listing is narrowed to, rather than the operation's own
+/// identifier.
+///
+/// The recorded form for that path names the member the id arrived in, so it is a
+/// different template from [`profile_not_found`] — the same split a transformer's two
+/// paths carry ([`transformer_not_found`] and [`transformer_reference_not_found`]).
+pub fn profile_reference_not_found(profile_id: &str) -> String {
+    format!("Profile with profileId {profile_id} not found.")
+}
+
 /// The `ResourceNotFoundException` message for an unknown `capabilityId`.
 pub fn capability_not_found(capability_id: &str) -> String {
     format!("Capability ID {capability_id} not found.")
@@ -963,6 +974,38 @@ pub fn s3_client(
         )
         .build();
     ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// The Region an Amazon S3 bucket is in when its location carries no constraint:
+/// "Buckets in Region us-east-1 have a LocationConstraint of null"
+/// (`GetBucketLocationOutput$LocationConstraint`), so an absent constraint names that one
+/// Region rather than "anywhere".
+pub const UNCONSTRAINED_BUCKET_REGION: &str = "us-east-1";
+
+/// The Region the bucket `bucket` is in, as Amazon S3 reports it to a caller signing for
+/// `region` — or `None` when no bucket of that name is reachable there.
+///
+/// A bucket lives in exactly ONE Region, and `GetBucketLocation` is where S3 states which
+/// (an absent `LocationConstraint` being [`UNCONSTRAINED_BUCKET_REGION`]). `None` covers
+/// every answer that is not a Region — a bucket this account does not hold, or one S3 will
+/// not locate for this caller — because none of those put the bucket in the caller's own
+/// Region either.
+pub async fn bucket_region(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+) -> Option<String> {
+    let located = s3_client(ctx, region)
+        .get_bucket_location()
+        .bucket(bucket)
+        .send()
+        .await
+        .ok()?;
+    let constraint = located
+        .location_constraint()
+        .map(|constraint| constraint.as_str().to_string())
+        .filter(|constraint| !constraint.is_empty());
+    Some(constraint.unwrap_or_else(|| UNCONSTRAINED_BUCKET_REGION.to_string()))
 }
 
 /// Why an `S3Location` could not be read, split the way the modelled errors are: a
