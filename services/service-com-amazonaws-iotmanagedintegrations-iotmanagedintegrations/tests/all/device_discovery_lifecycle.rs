@@ -284,6 +284,61 @@ async fn thing(router: &MultiServiceRouter, case: &str, meta_data: Value) -> Str
     thing_in(router, REGION, case, meta_data, json!({})).await
 }
 
+/// Create a connector destination in [`REGION`] through the wire and answer the
+/// `ConnectorDestinationId` it minted.
+///
+/// `CreateAccountAssociation` resolves its `ConnectorDestinationId` against this service's
+/// own connector-destination store, so every association below is created against a
+/// destination a client really created; a connector destination in turn names a C2C
+/// connector (`CloudConnectorId` is `@required`), so the connector comes first.
+async fn connector_destination(router: &MultiServiceRouter, case: &str) -> String {
+    let connector = call_in(
+        router,
+        REGION,
+        "POST",
+        "/cloud-connectors",
+        Some(json!({
+            "Name": "partner cloud connector",
+            "EndpointConfig": {"lambda": {"arn": "connector-handler"}},
+        })),
+    )
+    .await;
+    assert_eq!(
+        connector.status, 201,
+        "case {case:?}: seeding a cloud connector expected HTTP 201, got {} with body {:?}",
+        connector.status, connector.body
+    );
+    let connector_id = connector.string("Id").unwrap_or_default().to_string();
+    let destination = call_in(
+        router,
+        REGION,
+        "POST",
+        "/connector-destinations",
+        Some(json!({
+            "CloudConnectorId": connector_id,
+            "AuthConfig": {},
+            // The service requires the ARN of the secret a destination keeps its
+            // credentials in. Inside the `SecretsManagerArn` `@pattern`
+            // (`^arn:aws:secretsmanager:[0-9a-zA-Z-]{1,32}:\d{12}:secret:[A-Za-z0-9/_+=.@-]{8,520}$`)
+            // and the `SecretsManagerVersionId` `@length` (32..64).
+            "SecretsManager": {
+                "arn": format!(
+                    "arn:aws:secretsmanager:{REGION}:{ACCOUNT}:secret:destination-A1b2C3"
+                ),
+                "versionId": "a".repeat(32),
+            },
+        })),
+    )
+    .await;
+    assert_eq!(
+        destination.status, 201,
+        "case {case:?}: seeding a connector destination expected HTTP 201, got {} with \
+         body {:?}",
+        destination.status, destination.body
+    );
+    destination.string("Id").unwrap_or_default().to_string()
+}
+
 /// Create an account association against `destination_id` and answer its generated id.
 async fn account_association(
     router: &MultiServiceRouter,
@@ -388,7 +443,8 @@ fn surface(discovery_type: &str, controller: &str, association: &str) -> Value {
 async fn a_started_job_is_running_until_the_clock_finishes_it() {
     let router = emulator();
     let controller = thing(&router, "controller", json!({"ParentControllerId": "none"})).await;
-    let association = account_association(&router, "association", "destinationOne").await;
+    let destination = connector_destination(&router, "association").await;
+    let association = account_association(&router, "association", &destination).await;
 
     // Every row starts a job of one discovery type; the jobs are then read together, so the
     // whole table observes one run of the clock.
@@ -760,25 +816,27 @@ async fn a_hub_discovery_reports_the_devices_attached_to_the_controller_it_names
 async fn a_cloud_discovery_reports_the_devices_of_the_account_association_it_names() {
     let router = emulator();
 
-    let association = account_association(&router, "association", "destinationOne").await;
-    let other = account_association(&router, "other association", "destinationTwo").await;
+    let one = connector_destination(&router, "association").await;
+    let two = connector_destination(&router, "other association").await;
+    let association = account_association(&router, "association", &one).await;
+    let other = account_association(&router, "other association", &two).await;
 
     let first = thing(
         &router,
         "first cloud device",
-        json!({"ConnectorDestinationId": "destinationOne", "ConnectorDeviceId": "cloud.1"}),
+        json!({"ConnectorDestinationId": one, "ConnectorDeviceId": "cloud.1"}),
     )
     .await;
     let second = thing(
         &router,
         "second cloud device",
-        json!({"ConnectorDestinationId": "destinationOne", "ConnectorDeviceId": "cloud.2"}),
+        json!({"ConnectorDestinationId": one, "ConnectorDeviceId": "cloud.2"}),
     )
     .await;
     let elsewhere = thing(
         &router,
         "another destination's device",
-        json!({"ConnectorDestinationId": "destinationTwo"}),
+        json!({"ConnectorDestinationId": two}),
     )
     .await;
 

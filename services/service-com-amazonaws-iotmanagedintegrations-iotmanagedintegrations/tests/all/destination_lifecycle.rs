@@ -145,15 +145,21 @@ async fn call_in(
     }
 }
 
+/// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`), which
+/// is the account whose resources these ARNs name.
+const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+
 /// A `DeliveryDestinationArn` of `region`, inside the modelled pattern
 /// (`^arn:aws:[0-9a-zA-Z]+:[0-9a-zA-Z-]+:[0-9]+:[0-9a-zA-Z]+/[0-9a-zA-Z._-]+$`).
 fn stream_arn(region: &str, stream: &str) -> String {
-    format!("arn:aws:kinesis:{region}:123456789012:stream/{stream}")
+    format!("arn:aws:kinesis:{region}:{ACCOUNT}:stream/{stream}")
 }
 
-/// A `DeliveryDestinationRoleArn` the delivery is performed under.
+/// A `DeliveryDestinationRoleArn` the delivery is performed under: an IAM role of THIS
+/// account, which is what a destination call resolves its `RoleArn` as (a value naming no
+/// role of this account is refused — `tests/all/referenced_resource_validation.rs`).
 fn role_arn(role: &str) -> String {
-    format!("arn:aws:iam::123456789012:role/{role}")
+    format!("arn:aws:iam::{ACCOUNT}:role/{role}")
 }
 
 /// The create body of a destination called `name` delivering into `region`, carrying the

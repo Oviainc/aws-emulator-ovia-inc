@@ -2,6 +2,8 @@
 
 //! Engine state for the com-amazonaws-iotmanagedintegrations-iotmanagedintegrations service.
 
+pub mod references;
+
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2317,6 +2319,23 @@ pub fn connector_destination_not_found_on_mutation(identifier: &str) -> Resource
 /// `@sensitive` is never published in an error body.
 pub fn unknown_reference_message(member: &str) -> String {
     format!("The provided {member} does not exist.")
+}
+
+/// How a create states that a resource of ANOTHER KIND its request REFERS TO is one this
+/// account does not have, where the sentence names that resource's CLASS rather than the
+/// member the identifier arrived on.
+///
+/// The text is BUILT FROM THE RESOURCE — its name in words is what the sentence is about —
+/// so it is part of the contract and not just an example: the recorded refusal of a
+/// `CreateAccountAssociation` whose `ConnectorDestinationId` named no connector destination
+/// of the account reads `Connector Destination in the request does not exist.`
+///
+/// The two phrasings are the two the service is recorded stating: this one for a reference
+/// whose resource class the member's own name already spells out, and
+/// [`unknown_reference_message`] for one stated by member. Neither quotes a value back, so
+/// an identifier the model marks `@sensitive` is never published in an error body.
+pub fn absent_reference_message(resource_name: &str) -> String {
+    format!("{resource_name} in the request does not exist.")
 }
 
 /// How this service refuses a request that supplied no value for a field its backend

@@ -226,9 +226,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The delivery is performed AS the `RoleArn` the request names, so a value that
+        // names no IAM role, or a role IAM answers cannot be assumed by this service, is a
+        // destination no notification could ever be delivered through: it is refused and
+        // nothing is stored — the same rule `UpdateDestination` applies to the member
+        // (`crate::state::references::delivery_role_is_unusable`).
+        if crate::state::references::delivery_role_is_unusable(ctx, &region, &input.role_arn).await
+        {
+            audit(&akid, &region, "refused");
+            return Err(CreateDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        crate::state::references::DELIVERY_ROLE_UNUSABLE_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         let created_at = ::std::time::SystemTime::now();
         let mut store = state.lock();
-
         // Retire the idempotency records the clock already made due, before anything reads
         // them: a token past its TTL neither replays nor occupies the map.
         store.retire_expired_idempotency_tokens(created_at);

@@ -8,6 +8,12 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The shared ARN requirement and IAM reading a destination's `RoleArn` is resolved
+# through (src/state/references.rs).
+service-common = { path = "../common" }
+# Resolves a cloud connector endpoint's Lambda function against the emulator's own
+# Lambda, through the in-process callback (src/state/references.rs).
+aws-sdk-lambda = { version = "1", default-features = false }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -31,6 +37,14 @@ hex = { workspace = true }
 # `tokio::time::sleep` in tests/all/managed_thing_lifecycle.rs separates a create
 # from the update whose `UpdatedAt` bump it asserts.
 tokio = { workspace = true, features = ["time"] }
+# Mounted beside this service in tests/all/referenced_resource_validation.rs, so the
+# Lambda function a connector endpoint resolves and the IAM role a destination
+# delivers as are records the emulator really holds.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# Encodes the deployment package of the Lambda function that suite creates, which
+# restJson1 carries base64-encoded.
+base64 = "0.22"
 
 [lints]
 workspace = true

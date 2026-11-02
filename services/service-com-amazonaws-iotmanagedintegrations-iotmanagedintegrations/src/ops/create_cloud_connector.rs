@@ -3,7 +3,9 @@
 //! @op CreateCloudConnector
 //!
 //! Inserts the C2C connector into `crate::state`'s `cloud_connectors` store under a
-//! freshly generated `CloudConnectorId`, and answers with that id. A replayed
+//! freshly generated `CloudConnectorId`, and answers with that id. The `EndpointConfig`
+//! has to name a Lambda function the emulator's own Lambda holds, or the create is
+//! refused. A replayed
 //! `ClientToken` (`@idempotencyToken`) answers with the connector the first call created
 //! instead of creating a second one.
 //!
@@ -182,6 +184,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+
+        // `EndpointConfig` is how a C2C connector REACHES the cloud it connects to: a
+        // `LAMBDA` endpoint invokes the function its `arn` names, so the function is
+        // resolved before the connector is written and a create naming one that is not
+        // there is refused and stores nothing. The question is put to the emulator's own
+        // Lambda over the in-process callback, and only what Lambda ANSWERED refuses the
+        // call (`crate::state::references::lambda_endpoint_is_absent`).
+        if crate::state::references::lambda_endpoint_is_absent(ctx, &region, &input.endpoint_config)
+            .await
+        {
+            return Err(CreateCloudConnectorErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    crate::state::references::LAMBDA_ENDPOINT_ABSENT_MESSAGE.to_string(),
+                ),
+            })
+            .into());
+        }
+
         let mut store = state.lock();
         let created_at = ::std::time::SystemTime::now();
 

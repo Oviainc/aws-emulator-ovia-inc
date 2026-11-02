@@ -240,6 +240,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let updated_at = ::std::time::SystemTime::now();
+
+        // The delivery is performed AS the `RoleArn` the record holds, exactly as on the
+        // create path, so a replacement that names no IAM role — or a role IAM answers
+        // cannot be assumed by this service — is refused rather than written over a role
+        // that works.
+        if let Some(role_arn) = input.role_arn.as_deref() {
+            if crate::state::references::delivery_role_is_unusable(ctx, &region, role_arn).await {
+                audit(&akid, &region, "refused");
+                return Err(UpdateDestinationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::references::DELIVERY_ROLE_UNUSABLE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
         let mut store = state.lock();
         // A destination is regional, as every resource of this service is: only the region
         // that created it resolves — and updates — it.

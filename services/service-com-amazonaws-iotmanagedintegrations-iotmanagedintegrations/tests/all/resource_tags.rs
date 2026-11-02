@@ -213,6 +213,61 @@ async fn untag_in(
     .await
 }
 
+/// Create a connector destination in `region` through the wire and answer the
+/// `ConnectorDestinationId` it minted.
+///
+/// `CreateAccountAssociation` resolves its `ConnectorDestinationId` against this service's
+/// own connector-destination store, so an association is created against a destination a
+/// client really created; a connector destination in turn names a C2C connector
+/// (`CloudConnectorId` is `@required`), so the connector comes first.
+async fn connector_destination(router: &MultiServiceRouter, region: &str, case: &str) -> String {
+    let connector = call_in(
+        router,
+        region,
+        "POST",
+        "/cloud-connectors",
+        Some(json!({
+            "Name": "partner cloud connector",
+            "EndpointConfig": {"lambda": {"arn": "connector-handler"}},
+        })),
+    )
+    .await;
+    assert_eq!(
+        connector.status, 201,
+        "case {case:?}: seeding a cloud connector expected HTTP 201, got {} with body {:?}",
+        connector.status, connector.body
+    );
+    let connector_id = connector.string("Id").unwrap_or_default().to_string();
+    let destination = call_in(
+        router,
+        region,
+        "POST",
+        "/connector-destinations",
+        Some(json!({
+            "CloudConnectorId": connector_id,
+            "AuthConfig": {},
+            // The service requires the ARN of the secret a destination keeps its
+            // credentials in. Inside the `SecretsManagerArn` `@pattern`
+            // (`^arn:aws:secretsmanager:[0-9a-zA-Z-]{1,32}:\d{12}:secret:[A-Za-z0-9/_+=.@-]{8,520}$`)
+            // and the `SecretsManagerVersionId` `@length` (32..64).
+            "SecretsManager": {
+                "arn": format!(
+                    "arn:aws:secretsmanager:{region}:{ACCOUNT}:secret:destination-A1b2C3"
+                ),
+                "versionId": "a".repeat(32),
+            },
+        })),
+    )
+    .await;
+    assert_eq!(
+        destination.status, 201,
+        "case {case:?}: seeding a connector destination expected HTTP 201, got {} with \
+         body {:?}",
+        destination.status, destination.body
+    );
+    destination.string("Id").unwrap_or_default().to_string()
+}
+
 /// The resource kinds this service STORES, which are the kinds an ARN-addressed tagging
 /// call can really resolve. The `IoTManagedIntegrationsResourceARN` pattern admits three
 /// more (`provisioning-profile`, `ota-task`, `credential-locker`), none of which any
@@ -245,14 +300,18 @@ impl Kind {
 
     /// A create request for this kind, carrying only its required members plus `tags` when
     /// a case wants the create to store some.
-    fn create_body(self, tags: Option<&BTreeMap<String, String>>) -> Value {
+    ///
+    /// `reference` is the resource of this service the create REFERS TO, for a kind whose
+    /// create resolves one: an account association names the connector destination it is
+    /// created against, which has to be one this account holds.
+    fn create_body(self, reference: &str, tags: Option<&BTreeMap<String, String>>) -> Value {
         let mut body = match self {
             Self::ManagedThing => json!({
                 "Role": "DEVICE",
                 "AuthenticationMaterialType": "ZWAVE_QR_BAR_CODE",
                 "AuthenticationMaterial": "zwave:qr:0123456789",
             }),
-            Self::AccountAssociation => json!({"ConnectorDestinationId": "destination1"}),
+            Self::AccountAssociation => json!({"ConnectorDestinationId": reference}),
         };
         if let Some(tags) = tags {
             body["Tags"] = json!(tags);
@@ -277,12 +336,19 @@ impl Kind {
         case: &str,
         tags: Option<&BTreeMap<String, String>>,
     ) -> (String, String) {
+        // A kind whose create resolves a reference gets one this account really holds: the
+        // account association is created against a connector destination seeded through
+        // the API in the same region.
+        let reference = match self {
+            Self::ManagedThing => String::new(),
+            Self::AccountAssociation => connector_destination(router, region, case).await,
+        };
         let reply = call_in(
             router,
             region,
             "POST",
             self.collection(),
-            Some(self.create_body(tags)),
+            Some(self.create_body(&reference, tags)),
         )
         .await;
         assert_eq!(

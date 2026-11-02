@@ -2,8 +2,10 @@
 
 //! @op CreateAccountAssociation
 //!
-//! Mints an account association against the `ConnectorDestinationId` the request names
-//! and stores it in `crate::state`'s `account_associations`, so `GetAccountAssociation`
+//! Mints an account association against the `ConnectorDestinationId` the request names —
+//! which has to name a connector destination the signing region holds, or the create is
+//! refused — and stores it in `crate::state`'s `account_associations`, so
+//! `GetAccountAssociation`
 //! and `ListAccountAssociations` report what this call was given. The record starts in
 //! `crate::state::INITIAL_ASSOCIATION_STATE` — leaving it needs the end user to
 //! authenticate at the third-party platform, which no clock in this emulator performs —
@@ -184,16 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every modelled constraint on this request (`@required`, the `@length` and
         // `@pattern` of each member, the `TagsMap` size) is refused at the boundary, so
-        // reaching here means there is nothing left to check. The
-        // `ConnectorDestinationId` is NOT resolved against a stored connector
-        // destination, even though `CreateConnectorDestination` now keeps a registry of
-        // them: the recorded account-association units name destination ids that no call
-        // in the unit created (none of them calls `CreateConnectorDestination` — this
-        // operation's stub blocked no account-association unit), so a destination this
-        // store does not hold is not evidence that the account does not have one, and
-        // refusing it would refuse a request AWS accepted. Only a create whose referenced
-        // resource this API itself mints in the same account — `CreateConnectorDestination`'s
-        // `CloudConnectorId` — resolves that reference.
+        // reaching here means only this service's own state is left to consult.
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let created_at = ::std::time::SystemTime::now();
@@ -215,6 +208,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 association_state: created.association_state.clone(),
                 o_auth_authorization_url: created.o_auth_authorization_url.clone(),
             });
+        }
+
+        // An account association is created "via the destination id": it associates an end
+        // user's third-party account WITH a connector destination, so the
+        // `ConnectorDestinationId` has to name a destination this account has. A create
+        // naming one the signing region's store does not hold — never created, or deleted
+        // since — is refused and stores nothing, rather than minting an association that
+        // points at no destination. The same reference rule `CreateConnectorDestination`
+        // applies to its own `CloudConnectorId`; the sentence is the one this service is
+        // recorded stating for an absent connector destination, naming the resource class
+        // and quoting no value back (`crate::state::absent_reference_message`).
+        if store
+            .connector_destination_in(&region, &input.connector_destination_id)
+            .is_none()
+        {
+            return Err(CreateAccountAssociationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::absent_reference_message(
+                        crate::state::CONNECTOR_DESTINATION_RESOURCE_NAME,
+                    )),
+                },
+            )
+            .into());
         }
 
         // The store is bounded: past its maximum a create is refused rather than grown

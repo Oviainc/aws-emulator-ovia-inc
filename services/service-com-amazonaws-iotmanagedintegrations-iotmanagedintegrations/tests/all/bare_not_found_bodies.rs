@@ -212,14 +212,17 @@ fn notification_configuration_operations(event_type: &str, destination: &str) ->
 }
 
 /// The create body of a destination called `name` delivering into `region`. A destination
-/// delivers to a target of the SAME region as the call, which is what its create requires.
+/// delivers to a target of the SAME region as the call, which is what its create requires,
+/// AS an IAM role of this account (`engine::EMULATOR_ACCOUNT_ID`), which is what its
+/// `RoleArn` has to name.
 fn destination_request(region: &str, name: &str) -> Value {
     json!({
         "Name": name,
         "DeliveryDestinationArn":
             format!("arn:aws:kinesis:{region}:123456789012:stream/bare-not-found"),
         "DeliveryDestinationType": DELIVERY_DESTINATION_TYPE_VALUES[0],
-        "RoleArn": "arn:aws:iam::123456789012:role/managed-integrations",
+        "RoleArn":
+            format!("arn:aws:iam::{}:role/managed-integrations", engine::EMULATOR_ACCOUNT_ID),
     })
 }
 

@@ -46,6 +46,12 @@ const REGION: &str = "us-east-1";
 /// `/account-associations`).
 const COLLECTION: &str = "/account-associations";
 
+/// The collection routes a connector destination and its C2C connector are created on
+/// (`smithy_query(query="operation",operation="CreateConnectorDestination")` -> POST
+/// `/connector-destinations`, `CreateCloudConnector` -> POST `/cloud-connectors`).
+const CONNECTOR_DESTINATIONS: &str = "/connector-destinations";
+const CLOUD_CONNECTORS: &str = "/cloud-connectors";
+
 /// The wire error codes the model's `@httpError` shapes are rendered under.
 const VALIDATION: &str = "ValidationException";
 const NOT_FOUND: &str = "ResourceNotFoundException";
@@ -205,6 +211,68 @@ async fn list(router: &MultiServiceRouter, query: &str) -> Reply {
     list_in(router, REGION, query).await
 }
 
+/// Create a connector destination in `region` through the wire and answer the
+/// `ConnectorDestinationId` it minted.
+///
+/// `CreateAccountAssociation` resolves its `ConnectorDestinationId` against this service's
+/// own connector-destination store, so every association below is created against a
+/// destination a client really created rather than against an invented id; a connector
+/// destination in turn names a C2C connector (`CloudConnectorId` is `@required`), so the
+/// connector comes first. The id is MINTED by the service, which is why no case picks one.
+async fn connector_destination_in(router: &MultiServiceRouter, region: &str) -> String {
+    let connector = call_in(
+        router,
+        region,
+        "POST",
+        CLOUD_CONNECTORS,
+        Some(json!({
+            "Name": "partner cloud connector",
+            "EndpointConfig": {"lambda": {"arn": "connector-handler"}},
+        })),
+    )
+    .await;
+    assert_eq!(
+        connector.status, 201,
+        "seeding a cloud connector in {region:?}: expected HTTP 201, got {} with body {:?}",
+        connector.status, connector.body
+    );
+    let connector_id = connector.string("Id").unwrap_or_default().to_string();
+    let destination = call_in(
+        router,
+        region,
+        "POST",
+        CONNECTOR_DESTINATIONS,
+        Some(json!({
+            "CloudConnectorId": connector_id,
+            "AuthConfig": {},
+            // The service requires the ARN of the secret a destination keeps its
+            // credentials in. Inside the `SecretsManagerArn` `@pattern`
+            // (`^arn:aws:secretsmanager:[0-9a-zA-Z-]{1,32}:\d{12}:secret:[A-Za-z0-9/_+=.@-]{8,520}$`)
+            // and the `SecretsManagerVersionId` `@length` (32..64).
+            "SecretsManager": {
+                "arn": format!(
+                    "arn:aws:secretsmanager:{region}:{}:secret:destination-A1b2C3",
+                    engine::EMULATOR_ACCOUNT_ID
+                ),
+                "versionId": "a".repeat(32),
+            },
+        })),
+    )
+    .await;
+    assert_eq!(
+        destination.status, 201,
+        "seeding a connector destination in {region:?}: expected HTTP 201, got {} with \
+         body {:?}",
+        destination.status, destination.body
+    );
+    destination.string("Id").unwrap_or_default().to_string()
+}
+
+/// [`connector_destination_in`] in [`REGION`].
+async fn connector_destination(router: &MultiServiceRouter) -> String {
+    connector_destination_in(router, REGION).await
+}
+
 /// The minimal create request body: only the `@required` `ConnectorDestinationId`.
 fn minimal(connector_destination_id: &str) -> Value {
     json!({"ConnectorDestinationId": connector_destination_id})
@@ -309,39 +377,23 @@ async fn a_create_stores_the_record_and_the_reads_project_it() {
     // The rows differ along which optional members the create carries and along the form
     // and length of each one: only the required destination id, a named association, one
     // with a description, tags, general authorization, and every member at once. The
-    // destination ids differ in form and length (the `ConnectorDestinationId` pattern is
-    // `^[A-Za-z0-9-_]+$`, length 1..64).
-    let cases: Vec<(&str, Value)> = vec![
-        ("required only", minimal("d")),
-        (
-            "name only",
-            json!({"ConnectorDestinationId": "dest-1", "Name": "My Association"}),
-        ),
+    // destination each row is created against is seeded through the API and its id is the
+    // service's to mint, so the rows carry no destination id of their own.
+    let members: Vec<(&str, Value)> = vec![
+        ("required only", json!({})),
+        ("name only", json!({"Name": "My Association"})),
         (
             "description only",
-            json!({
-                "ConnectorDestinationId": "DEST_2",
-                "Description": "an account association for the second destination",
-            }),
+            json!({"Description": "an account association for the second destination"}),
         ),
-        (
-            "tags only",
-            json!({
-                "ConnectorDestinationId": "dest-3",
-                "Tags": {"env": "test", "owner": "fixer"},
-            }),
-        ),
+        ("tags only", json!({"Tags": {"env": "test", "owner": "fixer"}})),
         (
             "general authorization only",
-            json!({
-                "ConnectorDestinationId": "dest-4",
-                "GeneralAuthorization": {"AuthMaterialName": "material-1"},
-            }),
+            json!({"GeneralAuthorization": {"AuthMaterialName": "material-1"}}),
         ),
         (
-            "every member, destination id at the modelled maximum",
+            "every member",
             json!({
-                "ConnectorDestinationId": "d".repeat(64),
                 "Name": "N",
                 "Description": "D",
                 "Tags": {"only": "one"},
@@ -349,6 +401,14 @@ async fn a_create_stores_the_record_and_the_reads_project_it() {
             }),
         ),
     ];
+
+    // Each row associates with its OWN connector destination, so the records differ along
+    // the destination they point at as well as along their members.
+    let mut cases: Vec<(&str, Value)> = Vec::new();
+    for (case, mut body) in members {
+        body["ConnectorDestinationId"] = json!(connector_destination(&router).await);
+        cases.push((case, body));
+    }
 
     let mut minted: BTreeSet<String> = BTreeSet::new();
     let mut created: Vec<(String, String, Value)> = Vec::new();
@@ -454,10 +514,16 @@ async fn a_list_pages_over_the_store_in_insertion_order() {
         empty.member("NextToken")
     );
 
-    // Seven records, so the page sizes below divide the store evenly and unevenly.
+    // Seven records, so the page sizes below divide the store evenly and unevenly. They
+    // are spread over two connector destinations, so insertion order is not the order of
+    // the destinations they point at.
+    let destinations = [
+        connector_destination(&router).await,
+        connector_destination(&router).await,
+    ];
     let mut inserted: Vec<String> = Vec::new();
-    for n in 0..7u32 {
-        let reply = create(&router, minimal(&format!("dest-{n}"))).await;
+    for n in 0..7usize {
+        let reply = create(&router, minimal(&destinations[n % destinations.len()])).await;
         inserted.push(accepted_id(&format!("seed-{n}"), &reply));
     }
 
@@ -534,18 +600,38 @@ async fn a_list_pages_over_the_store_in_insertion_order() {
 async fn a_list_filters_by_connector_destination_id() {
     let router = emulator();
 
-    // The rows differ along how many records share a destination and along the form of the
-    // destination id: one record, several, a destination with none, and ids that differ only
-    // in case or by a prefix — so an equality test cannot be mistaken for a prefix match.
-    let destinations = ["dest-a", "dest-a", "dest-a", "dest-b", "DEST-A", "dest-ab"];
+    // Three destinations seeded through the API, with the records spread over them: one
+    // destination holding several records, one holding a single record, and one holding
+    // none at all.
+    let seeded = [
+        connector_destination(&router).await,
+        connector_destination(&router).await,
+        connector_destination(&router).await,
+    ];
+    let against = [0usize, 0, 0, 1];
     let mut per_destination: Vec<(String, String)> = Vec::new();
-    for (n, destination) in destinations.iter().enumerate() {
-        let reply = create(&router, minimal(destination)).await;
+    for (n, which) in against.iter().enumerate() {
+        let destination = seeded[*which].clone();
+        let reply = create(&router, minimal(&destination)).await;
         let id = accepted_id(&format!("seed-{n} for {destination}"), &reply);
-        per_destination.push(((*destination).to_string(), id));
+        per_destination.push((destination, id));
     }
 
-    for destination in ["dest-a", "dest-b", "DEST-A", "dest-ab", "dest-c", "d"] {
+    // Every seeded destination, a destination holding no record, and values that are a
+    // PREFIX and an EXTENSION of a live destination id plus one in the other case — so an
+    // equality test cannot be mistaken for a prefix, a suffix or a case-insensitive match.
+    let filters: Vec<String> = seeded
+        .iter()
+        .cloned()
+        .chain([
+            seeded[0][..12].to_string(),
+            format!("{}0", seeded[0]),
+            seeded[0].to_uppercase(),
+            "d".to_string(),
+        ])
+        .collect();
+    for destination in filters {
+        let destination = destination.as_str();
         let expected: Vec<String> = per_destination
             .iter()
             .filter(|(stored, _)| stored == destination)
@@ -606,8 +692,9 @@ async fn a_list_filters_by_connector_destination_id() {
 #[tokio::test]
 async fn a_max_results_outside_the_modelled_range_is_refused() {
     let router = emulator();
+    let destination = connector_destination(&router).await;
     for n in 0..3u32 {
-        let reply = create(&router, minimal(&format!("dest-{n}"))).await;
+        let reply = create(&router, minimal(&destination)).await;
         accepted_id(&format!("seed-{n}"), &reply);
     }
 
@@ -655,8 +742,9 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 #[tokio::test]
 async fn a_next_token_this_service_never_issued_is_refused() {
     let router = emulator();
+    let destination = connector_destination(&router).await;
     for n in 0..3u32 {
-        let reply = create(&router, minimal(&format!("dest-{n}"))).await;
+        let reply = create(&router, minimal(&destination)).await;
         accepted_id(&format!("seed-{n}"), &reply);
     }
 
@@ -697,11 +785,14 @@ async fn a_next_token_this_service_never_issued_is_refused() {
 async fn an_association_is_only_visible_in_the_region_that_created_it() {
     let router = emulator();
 
-    // The rows differ along the region the create was signed for.
+    // The rows differ along the region the create was signed for. A connector destination
+    // is regional too, so each region's association is created against the destination of
+    // its OWN region.
     let regions = ["us-east-1", "eu-central-1", "ap-southeast-2"];
     let mut per_region: Vec<(&str, String)> = Vec::new();
     for region in regions {
-        let reply = create_in(&router, region, minimal("dest-1")).await;
+        let destination = connector_destination_in(&router, region).await;
+        let reply = create_in(&router, region, minimal(&destination)).await;
         let id = accepted_id(&format!("create in {region}"), &reply);
         assert!(
             reply.string("Arn").unwrap_or_default().contains(region),
@@ -763,26 +854,23 @@ async fn an_association_is_only_visible_in_the_region_that_created_it() {
 #[tokio::test]
 async fn a_replayed_client_token_answers_with_the_first_association() {
     // The rows differ along the token's form (the `ClientToken` pattern is
-    // `^[a-zA-Z0-9=_-]+$`, length 1..64) and along the body it created.
+    // `^[a-zA-Z0-9=_-]+$`, length 1..64) and along the body it created. Each row's
+    // `ConnectorDestinationId` is filled in below from the destination its own emulator
+    // mints, since the id is the service's to generate.
     let cases: Vec<(&str, Value)> = vec![
-        ("t", minimal("dest-1")),
-        (
-            "token-1",
-            json!({"ConnectorDestinationId": "dest-2", "Name": "Second"}),
-        ),
-        (
-            "TOKEN_2=",
-            json!({"ConnectorDestinationId": "dest-3", "Description": "third"}),
-        ),
+        ("t", json!({})),
+        ("token-1", json!({"Name": "Second"})),
+        ("TOKEN_2=", json!({"Description": "third"})),
         (
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            minimal("dest-4"),
+            json!({}),
         ),
     ];
 
     for (token, body) in cases {
         let router = emulator();
         let mut request = body.clone();
+        request["ConnectorDestinationId"] = json!(connector_destination(&router).await);
         request["ClientToken"] = json!(token);
 
         let first = create(&router, request.clone()).await;

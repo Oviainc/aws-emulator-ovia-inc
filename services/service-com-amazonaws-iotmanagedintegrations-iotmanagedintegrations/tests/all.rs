@@ -63,6 +63,8 @@ mod ota_task_configuration_delete_isolation;
 mod ota_task_configuration_lifecycle;
 #[path = "all/ota_task_configuration_not_found_messages.rs"]
 mod ota_task_configuration_not_found_messages;
+#[path = "all/referenced_resource_validation.rs"]
+mod referenced_resource_validation;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/runtime_log_configuration_cycle.rs"]

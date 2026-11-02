@@ -154,6 +154,14 @@ fn destination_request(name: &str) -> Value {
     destination_request_in(REGION, name)
 }
 
+/// A `DeliveryDestinationRoleArn` naming the IAM role `role` of THIS account
+/// (`engine::EMULATOR_ACCOUNT_ID`): a destination call resolves its `RoleArn` as a role of
+/// the account the call is made for, so a value naming no role of it is refused
+/// (`tests/all/referenced_resource_validation.rs`).
+fn role_arn(role: &str) -> String {
+    format!("arn:aws:iam::{}:role/{role}", engine::EMULATOR_ACCOUNT_ID)
+}
+
 /// [`destination_request`] whose delivery target lives in `region`, so a destination can
 /// be created through another region's endpoint.
 fn destination_request_in(region: &str, name: &str) -> Value {
@@ -162,7 +170,7 @@ fn destination_request_in(region: &str, name: &str) -> Value {
         "DeliveryDestinationArn":
             format!("arn:aws:kinesis:{region}:123456789012:stream/notifications"),
         "DeliveryDestinationType": DELIVERY_DESTINATION_TYPE_VALUES[0],
-        "RoleArn": "arn:aws:iam::123456789012:role/managed-integrations",
+        "RoleArn": role_arn("managed-integrations"),
     })
 }
 
@@ -651,7 +659,7 @@ async fn a_destination_round_trips_and_its_name_identifies_it() {
                 "DeliveryDestinationArn":
                     "arn:aws:kinesis:us-east-1:123456789012:stream/other_notifications",
                 "DeliveryDestinationType": DELIVERY_DESTINATION_TYPE_VALUES[0],
-                "RoleArn": "arn:aws:iam::123456789012:role/other-role",
+                "RoleArn": role_arn("other-role"),
                 // `DestinationDescription` is modelled pattern `^[0-9A-Za-z_\- ]+$`.
                 "Description": "events for the test",
             }),
@@ -663,7 +671,7 @@ async fn a_destination_round_trips_and_its_name_identifies_it() {
                 "DeliveryDestinationArn":
                     "arn:aws:kinesis:us-east-1:123456789012:stream/tagged",
                 "DeliveryDestinationType": DELIVERY_DESTINATION_TYPE_VALUES[0],
-                "RoleArn": "arn:aws:iam::123456789012:role/tagged-role",
+                "RoleArn": role_arn("tagged-role"),
                 "Tags": {"env": "test"},
             }),
         ),
