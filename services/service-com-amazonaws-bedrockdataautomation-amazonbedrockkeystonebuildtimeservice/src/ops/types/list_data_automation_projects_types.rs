@@ -43,7 +43,15 @@ pub struct ListDataAutomationProjectsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockdataautomation#DataAutomationProjectSummary")]
+/// `DataAutomationProjectSummary`, the list item `ListDataAutomationProjects` serves. Its schema
+/// and codec come from [`bda_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `creationTime` targets `DateTimestamp`, which
+/// carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="DataAutomationProjectSummary")`) — a trait the derive
+/// does not put on a member schema; see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire names,
+/// same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct DataAutomationProjectSummary {
     pub project_arn: String,
@@ -52,4 +60,24 @@ pub struct DataAutomationProjectSummary {
     pub project_name: Option<String>,
     pub creation_time: ::aws_smithy_types::DateTime,
 }
+
+bda_schema_and_codec!(
+    DataAutomationProjectSummary,
+    DATA_AUTOMATION_PROJECT_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrockdataautomation#DataAutomationProjectSummary",
+    "com.amazonaws.bedrockdataautomation",
+    "DataAutomationProjectSummary",
+    (M_PROJECT_ARN, project_arn, "projectArn", 0, req, string),
+    (M_PROJECT_STAGE, project_stage, "projectStage", 1, opt, string),
+    (M_PROJECT_TYPE, project_type, "projectType", 2, opt, string),
+    (M_PROJECT_NAME, project_name, "projectName", 3, opt, string),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        4,
+        req,
+        date_time
+    ),
+);
 

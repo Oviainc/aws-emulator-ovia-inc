@@ -29,7 +29,15 @@ pub struct ListBlueprintsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockdataautomation#BlueprintSummary")]
+/// `BlueprintSummary`, the list item `ListBlueprints` serves. Its schema and codec come from
+/// [`bda_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]` because
+/// `creationTime` and `lastModifiedTime` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape", shape="BlueprintSummary")`
+/// reports it on both) — a trait the derive does not put on a member schema; see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire names,
+/// same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct BlueprintSummary {
     pub blueprint_arn: String,
@@ -39,4 +47,53 @@ pub struct BlueprintSummary {
     pub creation_time: ::aws_smithy_types::DateTime,
     pub last_modified_time: Option<::aws_smithy_types::DateTime>,
 }
+
+bda_schema_and_codec!(
+    BlueprintSummary,
+    BLUEPRINT_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrockdataautomation#BlueprintSummary",
+    "com.amazonaws.bedrockdataautomation",
+    "BlueprintSummary",
+    (M_BLUEPRINT_ARN, blueprint_arn, "blueprintArn", 0, req, string),
+    (
+        M_BLUEPRINT_VERSION,
+        blueprint_version,
+        "blueprintVersion",
+        1,
+        opt,
+        string
+    ),
+    (
+        M_BLUEPRINT_STAGE,
+        blueprint_stage,
+        "blueprintStage",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_BLUEPRINT_NAME,
+        blueprint_name,
+        "blueprintName",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        4,
+        req,
+        date_time
+    ),
+    (
+        M_LAST_MODIFIED_TIME,
+        last_modified_time,
+        "lastModifiedTime",
+        5,
+        opt,
+        date_time
+    ),
+);
 

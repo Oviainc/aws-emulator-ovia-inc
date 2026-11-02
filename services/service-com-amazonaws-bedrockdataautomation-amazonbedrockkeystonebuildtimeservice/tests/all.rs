@@ -27,3 +27,5 @@ mod refusal_wording;
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/timestamp_wire_form.rs"]
+mod timestamp_wire_form;

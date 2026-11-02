@@ -24,7 +24,16 @@ pub struct GetDataAutomationProjectOutput {
     pub project: DataAutomationProject,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockdataautomation#DataAutomationProject")]
+/// `DataAutomationProject`, the projection the project doors serve
+/// (`CreateDataAutomationProject`, `GetDataAutomationProject`, `UpdateDataAutomationProject`).
+/// Its schema and codec come from [`bda_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `creationTime` and `lastModifiedTime` target
+/// `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="DataAutomationProject")` reports it on both) — a trait
+/// the derive does not put on a member schema; see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire names,
+/// same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct DataAutomationProject {
     pub project_arn: String,
@@ -42,4 +51,82 @@ pub struct DataAutomationProject {
     pub kms_key_id: Option<String>,
     pub kms_encryption_context: Option<std::collections::HashMap<String, String>>,
 }
+
+bda_schema_and_codec!(
+    DataAutomationProject,
+    DATA_AUTOMATION_PROJECT_SCHEMA,
+    "com.amazonaws.bedrockdataautomation#DataAutomationProject",
+    "com.amazonaws.bedrockdataautomation",
+    "DataAutomationProject",
+    (M_PROJECT_ARN, project_arn, "projectArn", 0, req, string),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        1,
+        req,
+        date_time
+    ),
+    (
+        M_LAST_MODIFIED_TIME,
+        last_modified_time,
+        "lastModifiedTime",
+        2,
+        req,
+        date_time
+    ),
+    (M_PROJECT_NAME, project_name, "projectName", 3, req, string),
+    (M_PROJECT_STAGE, project_stage, "projectStage", 4, opt, string),
+    (M_PROJECT_TYPE, project_type, "projectType", 5, opt, string),
+    (
+        M_PROJECT_DESCRIPTION,
+        project_description,
+        "projectDescription",
+        6,
+        opt,
+        string
+    ),
+    (
+        M_STANDARD_OUTPUT_CONFIGURATION,
+        standard_output_configuration,
+        "standardOutputConfiguration",
+        7,
+        opt,
+        struct_of(StandardOutputConfiguration)
+    ),
+    (
+        M_CUSTOM_OUTPUT_CONFIGURATION,
+        custom_output_configuration,
+        "customOutputConfiguration",
+        8,
+        opt,
+        struct_of(CustomOutputConfiguration)
+    ),
+    (
+        M_OVERRIDE_CONFIGURATION,
+        override_configuration,
+        "overrideConfiguration",
+        9,
+        opt,
+        struct_of(OverrideConfiguration)
+    ),
+    (
+        M_DATA_AUTOMATION_LIBRARY_CONFIGURATION,
+        data_automation_library_configuration,
+        "dataAutomationLibraryConfiguration",
+        10,
+        opt,
+        struct_of(DataAutomationLibraryConfiguration)
+    ),
+    (M_STATUS, status, "status", 11, req, string),
+    (M_KMS_KEY_ID, kms_key_id, "kmsKeyId", 12, opt, string),
+    (
+        M_KMS_ENCRYPTION_CONTEXT,
+        kms_encryption_context,
+        "kmsEncryptionContext",
+        13,
+        opt,
+        map_of_string
+    ),
+);
 

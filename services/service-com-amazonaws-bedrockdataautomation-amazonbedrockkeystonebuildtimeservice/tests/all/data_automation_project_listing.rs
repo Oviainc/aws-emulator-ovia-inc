@@ -567,7 +567,9 @@ async fn the_blueprint_filter_selects_the_projects_that_reference_that_blueprint
             "customOutputConfiguration": {"blueprints": [{
                 "blueprintArn": first,
                 "blueprintVersion": "1",
-                "blueprintStage": "DEVELOPMENT",
+                // The stage the blueprint created above actually holds: a create that
+                // names none settles at LIVE (`state::DEFAULT_BLUEPRINT_STAGE`).
+                "blueprintStage": "LIVE",
             }]},
         }),
     )
@@ -621,8 +623,11 @@ async fn the_blueprint_filter_selects_the_projects_that_reference_that_blueprint
             vec![&direct],
         ),
         (
+            // `create_blueprint` above names no `blueprintStage`, so the blueprint it
+            // created is at the stage a create settles at when the request names none:
+            // LIVE (`state::DEFAULT_BLUEPRINT_STAGE`).
             "agreeing-stage",
-            json!({"blueprintFilter": {"blueprintArn": first, "blueprintStage": "DEVELOPMENT"}}),
+            json!({"blueprintFilter": {"blueprintArn": first, "blueprintStage": "LIVE"}}),
             vec![&direct, &versioned],
         ),
     ];
@@ -659,7 +664,7 @@ async fn the_blueprint_filter_selects_the_projects_that_reference_that_blueprint
         ),
         (
             "stage-the-blueprint-is-not-in",
-            json!({"blueprintFilter": {"blueprintArn": first, "blueprintStage": "LIVE"}}),
+            json!({"blueprintFilter": {"blueprintArn": first, "blueprintStage": "DEVELOPMENT"}}),
         ),
     ];
 

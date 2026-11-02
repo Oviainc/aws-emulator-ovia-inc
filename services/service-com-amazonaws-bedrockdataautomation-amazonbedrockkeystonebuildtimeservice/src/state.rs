@@ -27,10 +27,13 @@ use crate::ops::types::{
 
 /// The `blueprintStage` a blueprint takes when `CreateBlueprint` names none.
 ///
-/// Source: `smithy_query(shape="BlueprintStage")` -> `["DEVELOPMENT", "LIVE"]`;
-/// a newly created blueprint is a development-stage blueprint until it is
-/// promoted (`CopyBlueprintStage`).
-pub const DEFAULT_BLUEPRINT_STAGE: &str = "DEVELOPMENT";
+/// `CreateBlueprintRequest$blueprintStage` is OPTIONAL and targets the enum
+/// `BlueprintStage` (`smithy_query(shape="BlueprintStage")` -> `["DEVELOPMENT",
+/// "LIVE"]`), so the service picks the stage when the request does not: a create
+/// that names no stage comes back reporting `LIVE`, and every later read of that
+/// blueprint reports the same stage. A blueprint is only at `DEVELOPMENT` when its
+/// create (or a later `UpdateBlueprint`) asked for that stage by name.
+pub const DEFAULT_BLUEPRINT_STAGE: &str = "LIVE";
 
 /// The region an ARN carries when the request names none (unsigned/local calls).
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -518,16 +521,25 @@ impl BlueprintRecord {
         })
     }
 
-    /// Project the record onto the modeled `BlueprintSummary` shape that
-    /// `ListBlueprints` returns.
+    /// Project the record onto the NARROW `BlueprintSummary` item `ListBlueprints`
+    /// serves: a listing identifies each blueprint and says when it was created, and
+    /// nothing else.
+    ///
+    /// `BlueprintSummary` models six optional-or-required members, but a listing fills
+    /// only `blueprintArn` (the identity), `blueprintVersion` (which snapshot of it the
+    /// item names) and `creationTime` (@required); `blueprintStage`, `lastModifiedTime`
+    /// and the `@sensitive` `blueprintName`
+    /// (`smithy_query(query="shape", shape="BlueprintSummary")` marks it so) belong to
+    /// the full `Blueprint` a read serves, not to an enumeration. A caller that needs
+    /// any of them reads the blueprint by ARN with `GetBlueprint`.
     pub fn to_summary(&self) -> BlueprintSummary {
         BlueprintSummary {
             blueprint_arn: self.blueprint_arn.clone(),
             blueprint_version: self.latest_version().map(|v| v.to_string()),
-            blueprint_stage: Some(self.blueprint_stage.clone()),
-            blueprint_name: Some(self.blueprint_name.clone()),
+            blueprint_stage: None,
+            blueprint_name: None,
             creation_time: self.creation_time,
-            last_modified_time: Some(self.last_modified_time),
+            last_modified_time: None,
         }
     }
 }

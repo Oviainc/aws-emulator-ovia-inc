@@ -49,7 +49,17 @@ pub struct ValidationExceptionField {
     pub message: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockdataautomation#Blueprint")]
+/// `Blueprint`, the projection every blueprint door serves (`CreateBlueprint`, `GetBlueprint`,
+/// `UpdateBlueprint`, `CreateBlueprintVersion`). Its schema and codec come from
+/// [`bda_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]` because
+/// `creationTime`, `lastModifiedTime` and `optimizationTime` all target `DateTimestamp`, which
+/// carries `@timestampFormat("date-time")` (`smithy_query(query="shape", shape="Blueprint")`
+/// reports it on each of the three) — a trait the derive does not put on a member schema, so the
+/// restJson1 codec rendered each of them as an epoch NUMBER. See `types/date_time_wire.rs` for
+/// that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire names,
+/// same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct Blueprint {
     pub blueprint_arn: String,
@@ -65,6 +75,82 @@ pub struct Blueprint {
     pub optimization_samples: Option<Vec<BlueprintOptimizationSample>>,
     pub optimization_time: Option<::aws_smithy_types::DateTime>,
 }
+
+bda_schema_and_codec!(
+    Blueprint,
+    BLUEPRINT_SCHEMA,
+    "com.amazonaws.bedrockdataautomation#Blueprint",
+    "com.amazonaws.bedrockdataautomation",
+    "Blueprint",
+    (M_BLUEPRINT_ARN, blueprint_arn, "blueprintArn", 0, req, string),
+    (M_SCHEMA, schema, "schema", 1, req, string),
+    (M_TYPE, r#type, "type", 2, req, string),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        3,
+        req,
+        date_time
+    ),
+    (
+        M_LAST_MODIFIED_TIME,
+        last_modified_time,
+        "lastModifiedTime",
+        4,
+        req,
+        date_time
+    ),
+    (
+        M_BLUEPRINT_NAME,
+        blueprint_name,
+        "blueprintName",
+        5,
+        req,
+        string
+    ),
+    (
+        M_BLUEPRINT_VERSION,
+        blueprint_version,
+        "blueprintVersion",
+        6,
+        opt,
+        string
+    ),
+    (
+        M_BLUEPRINT_STAGE,
+        blueprint_stage,
+        "blueprintStage",
+        7,
+        opt,
+        string
+    ),
+    (M_KMS_KEY_ID, kms_key_id, "kmsKeyId", 8, opt, string),
+    (
+        M_KMS_ENCRYPTION_CONTEXT,
+        kms_encryption_context,
+        "kmsEncryptionContext",
+        9,
+        opt,
+        map_of_string
+    ),
+    (
+        M_OPTIMIZATION_SAMPLES,
+        optimization_samples,
+        "optimizationSamples",
+        10,
+        opt,
+        list_of_struct(BlueprintOptimizationSample)
+    ),
+    (
+        M_OPTIMIZATION_TIME,
+        optimization_time,
+        "optimizationTime",
+        11,
+        opt,
+        date_time
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockdataautomation#BlueprintOptimizationSample")]
 #[derive(Debug, Clone, Default)]

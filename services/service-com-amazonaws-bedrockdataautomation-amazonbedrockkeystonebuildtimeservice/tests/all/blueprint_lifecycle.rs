@@ -189,10 +189,10 @@ async fn create_blueprint_persists_the_record_get_blueprint_reads_back() {
             *schema,
             "case {case:?}: CreateBlueprint returned the wrong schema: {created:?}"
         );
-        // An absent `blueprintStage` defaults to DEVELOPMENT.
+        // An absent `blueprintStage` settles at LIVE (`state::DEFAULT_BLUEPRINT_STAGE`).
         assert_eq!(
             string_at(&created, "blueprintStage", case),
-            stage.unwrap_or("DEVELOPMENT"),
+            stage.unwrap_or("LIVE"),
             "case {case:?}: CreateBlueprint returned the wrong blueprintStage: {created:?}"
         );
         let created_at = timestamp_at(&created, "creationTime", case);
@@ -467,7 +467,9 @@ async fn update_blueprint_mutates_the_record_and_bumps_last_modified_time() {
         );
         assert_eq!(
             string_at(fetched, "blueprintStage", case),
-            new_stage.unwrap_or("DEVELOPMENT"),
+            // An update that names no stage leaves the stored one alone, and the create
+            // above named none either, so that is the create's default: LIVE.
+            new_stage.unwrap_or("LIVE"),
             "case {case:?}: GetBlueprint must report the updated stage: {fetched:?}"
         );
         assert_eq!(
@@ -603,20 +605,19 @@ async fn list_blueprints_pages_over_a_stable_order() {
                 );
             }
             for summary in &page {
-                // Each summary is built from the stored record, so every member
-                // the model marks required is there.
+                // A list item carries the narrow projection a listing serves — the
+                // identity, the version it names and the creation instant — and not the
+                // members a `GetBlueprint` read serves.
                 assert!(
                     summary.get("creationTime").is_some(),
                     "case {case:?}: summary without creationTime: {summary:?}"
                 );
-                assert_eq!(
-                    summary
-                        .get("blueprintStage")
-                        .and_then(Value::as_str)
-                        .unwrap_or("<missing>"),
-                    "DEVELOPMENT",
-                    "case {case:?}: summary stage: {summary:?}"
-                );
+                for wider in ["blueprintStage", "blueprintName", "lastModifiedTime"] {
+                    assert!(
+                        summary.get(wider).is_none(),
+                        "case {case:?}: a list item must not carry {wider:?}: {summary:?}"
+                    );
+                }
                 seen.push(string_at(summary, "blueprintArn", &case));
             }
             pages += 1;
@@ -721,13 +722,21 @@ async fn list_blueprints_honours_its_filters() {
             page.len()
         );
         if let Some(expected_stage) = filter.filter(|f| *f != "ALL") {
-            for summary in page {
-                assert_eq!(
-                    summary.get("blueprintStage").and_then(Value::as_str),
-                    Some(expected_stage),
-                    "case {case:?}: a summary outside the filtered stage: {summary:?}"
-                );
-            }
+            // The list item does not carry the stage, so what the filter selected is
+            // checked against the ARNs created at that stage.
+            let selected: std::collections::BTreeSet<String> = page
+                .iter()
+                .map(|summary| string_at(summary, "blueprintArn", &case))
+                .collect();
+            let of_stage: std::collections::BTreeSet<String> = by_stage
+                .iter()
+                .filter(|(stage, _)| stage == expected_stage)
+                .map(|(_, arn)| arn.clone())
+                .collect();
+            assert_eq!(
+                selected, of_stage,
+                "case {case:?}: the stage filter selected the wrong blueprints: {payload:?}"
+            );
         }
     }
 
