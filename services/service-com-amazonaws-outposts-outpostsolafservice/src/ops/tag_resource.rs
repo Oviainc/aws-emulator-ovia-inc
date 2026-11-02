@@ -5,8 +5,9 @@
 //! `ResourceArn` names — adding a key the resource does not carry, replacing the value
 //! of one it does, and leaving every other key alone — so every later read of that
 //! resource (`ListTagsForResource`, `GetSite`, `GetOutpost`, the lists) answers the tags
-//! as they now stand. An ARN naming a resource this store does not hold is
-//! `NotFoundException` (404); a change that would take the resource past the modelled
+//! as they now stand. An ARN naming a resource this store does not hold — including one
+//! whose partition, Region or account id is not the called endpoint's own, which names
+//! another endpoint's resource — is `NotFoundException` (404); a change that would take the resource past the modelled
 //! `TagMap` maximum is `ValidationException` (400) and writes nothing; an ARN that is
 //! not an Outposts resource ARN is refused at the boundary with HTTP 400
 //! `BadRequestException` (see `EmulatedService::override_refusal`).
@@ -142,9 +143,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
-        // The region this request is addressed to: a resource is part of its own
-        // region's inventory and of no other's, so that is where the ARN is
-        // resolved — one region's endpoint cannot tag another region's resource.
+        // The endpoint this request reached: an ARN names a resource of it only
+        // when the ARN's own partition, Region and account id are that endpoint's,
+        // so this is the identity the `ResourceArn` is judged against.
         let region = crate::state::request_region(ctx.parts());
         // The same reading of `ResourceArn` every tagging operation does. The
         // modelled `Arn` pattern pins it to `arn:…:outposts:…:<type>/<id>`, so the
@@ -153,8 +154,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`EmulatedService::override_refusal`). The handler still does not assume
         // that; it states the refusal through an error this OPERATION models, since
         // `BadRequestException` is not one of them.
-        let (resource_type, resource_id) = crate::state::resource_arn_parts(&input.resource_arn)
-            .ok_or_else(|| {
+        let (resource_type, resource) =
+            crate::state::resolve_resource_arn(&input.resource_arn, &region).ok_or_else(|| {
                 TagResourceErrorModeled::ValidationException(ValidationException {
                     message: Some(crate::state::resource_arn_pattern_report()),
                 })
@@ -163,12 +164,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Tags live on the resource they were applied to, so this writes them onto
         // that stored record, through the one place that knows which resource kinds
-        // this store holds tags for. Any other kind is a resource this store cannot
-        // hold, which is the not-found error this operation models; its body is the
-        // fixed sentence the tagging paths word that refusal with, which renders no
-        // part of the ARN the request supplied.
-        let tags = store
-            .tags_mut(&region, &resource_type, &resource_id)
+        // this store holds tags for. A kind this store cannot hold, and an ARN that
+        // states the identity of ANOTHER endpoint's resource, are alike resources
+        // this endpoint holds no record of — the not-found error this operation
+        // models; its body is the fixed sentence the tagging paths word that refusal
+        // with, which renders no part of the ARN the request supplied.
+        let tags = resource
+            .here()
+            .and_then(|resource_id| store.tags_mut(&region, &resource_type, resource_id))
             .ok_or_else(|| {
                 TagResourceErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::resource_not_found()),

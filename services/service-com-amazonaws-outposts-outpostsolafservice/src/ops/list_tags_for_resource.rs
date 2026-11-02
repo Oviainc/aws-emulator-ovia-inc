@@ -3,7 +3,9 @@
 //! @op ListTagsForResource
 //! IMPLEMENTED: reads the tags off the stored resource the `ResourceArn` names, so it
 //! answers exactly what the create (or a later tag change) persisted. An ARN naming a
-//! resource this store does not hold is `NotFoundException` (404); an ARN that is not an
+//! resource this store does not hold — including one whose partition, Region or account
+//! id is not the called endpoint's own, which names another endpoint's resource — is
+//! `NotFoundException` (404); an ARN that is not an
 //! Outposts resource ARN is refused at the boundary with HTTP 400 `BadRequestException`
 //! (see `EmulatedService::override_refusal`).
 //!
@@ -141,9 +143,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
-        // The region this request is addressed to: a resource is part of its own
-        // region's inventory and of no other's, so that is where the ARN is
-        // resolved.
+        // The endpoint this request reached: an ARN names a resource of it only
+        // when the ARN's own partition, Region and account id are that endpoint's,
+        // so this is the identity the `ResourceArn` is judged against.
         let region = crate::state::request_region(ctx.parts());
         // The same reading of `ResourceArn` every tagging operation does. The
         // modelled `Arn` pattern pins it to `arn:…:outposts:…:<type>/<id>`, so the
@@ -154,8 +156,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `BadRequestException` is not one of them, and words it through the one
         // report this crate states that refusal with — which names the member and
         // the constraint and renders no value.
-        let (resource_type, resource_id) = crate::state::resource_arn_parts(&input.resource_arn)
-            .ok_or_else(|| {
+        let (resource_type, resource) =
+            crate::state::resolve_resource_arn(&input.resource_arn, &region).ok_or_else(|| {
                 ListTagsForResourceErrorModeled::ValidationException(ValidationException {
                     message: Some(crate::state::resource_arn_pattern_report()),
                 })
@@ -164,12 +166,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // Tags live on the resource they were applied to, so this reads them off
         // that stored record, through the one place that knows which resource kinds
-        // this store holds tags for. Any other kind is a resource this store cannot
-        // hold, which is the not-found error this operation models; its body is the
-        // fixed sentence the tagging paths word that refusal with, which renders no
-        // part of the ARN the request supplied.
-        let tags = store
-            .tags(&region, &resource_type, &resource_id)
+        // this store holds tags for. A kind this store cannot hold, and an ARN that
+        // states the identity of ANOTHER endpoint's resource, are alike resources
+        // this endpoint holds no record of — the not-found error this operation
+        // models; its body is the fixed sentence the tagging paths word that refusal
+        // with, which renders no part of the ARN the request supplied.
+        let tags = resource
+            .here()
+            .and_then(|resource_id| store.tags(&region, &resource_type, resource_id))
             .ok_or_else(|| {
                 ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::resource_not_found()),

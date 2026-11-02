@@ -165,6 +165,8 @@ mod store_ceiling_wording;
 mod supported_instance_types;
 #[path = "all/supported_instance_types_order_scope.rs"]
 mod supported_instance_types_order_scope;
+#[path = "all/tagging_arn_identity.rs"]
+mod tagging_arn_identity;
 #[path = "all/tagging_not_found_wording.rs"]
 mod tagging_not_found_wording;
 #[path = "all/tagging_resource_arn.rs"]

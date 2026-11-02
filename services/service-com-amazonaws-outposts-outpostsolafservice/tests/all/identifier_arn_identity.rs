@@ -43,10 +43,14 @@ const CATALOG_ITEM: &str = "OR-1A2B3C4";
 /// Source: AWS's published Regions and the partitions they belong to — `aws` for the
 /// commercial Regions and `aws-cn` for `cn-*` — which is the mapping every ARN this
 /// service mints follows and which the modelled ARN patterns spell `aws([a-z-]+)?`.
-struct Endpoint {
+///
+/// The same rule holds of the tagging `ResourceArn` member, so
+/// [`crate::tagging_arn_identity`] exercises it over these very endpoints and
+/// forgeries rather than restating them.
+pub(crate) struct Endpoint {
     /// The Region every call of the case is addressed to, and whose inventory holds
     /// the resources it was given.
-    region: &'static str,
+    pub(crate) region: &'static str,
     /// The partition that Region belongs to: the one its own ARNs carry.
     partition: &'static str,
     /// Another Region of the SAME partition.
@@ -58,7 +62,7 @@ struct Endpoint {
 
 /// The endpoints the rule is exercised at: one commercial Region, and one Region of
 /// another partition — so no row's expectation can come from a fixed `aws` literal.
-const ENDPOINTS: &[Endpoint] = &[
+pub(crate) const ENDPOINTS: &[Endpoint] = &[
     Endpoint {
         region: "us-east-1",
         partition: "aws",
@@ -81,7 +85,7 @@ const ENDPOINTS: &[Endpoint] = &[
 /// Every row differs from the endpoint in at least one of the three segments an ARN
 /// identifies a resource by, and together they span each segment alone, two of them
 /// together, and all three.
-fn forgeries(endpoint: &Endpoint) -> Vec<(String, String, String, String)> {
+pub(crate) fn forgeries(endpoint: &Endpoint) -> Vec<(String, String, String, String)> {
     let account = engine::emulator_account_id().to_string();
     vec![
         (
@@ -119,7 +123,13 @@ fn forgeries(endpoint: &Endpoint) -> Vec<(String, String, String, String)> {
 
 /// One Outposts resource ARN: `arn:<partition>:outposts:<region>:<account>:<kind>/<id>`,
 /// the form every ARN branch of an identifier pattern in this model spells.
-fn arn(partition: &str, region: &str, account: &str, kind: &str, resource_id: &str) -> String {
+pub(crate) fn arn(
+    partition: &str,
+    region: &str,
+    account: &str,
+    kind: &str,
+    resource_id: &str,
+) -> String {
     format!("arn:{partition}:outposts:{region}:{account}:{kind}/{resource_id}")
 }
 

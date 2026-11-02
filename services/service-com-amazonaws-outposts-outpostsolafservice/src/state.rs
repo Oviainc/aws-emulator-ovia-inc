@@ -55,7 +55,7 @@ pub const ARN_NAMESPACE: &str = "outposts";
 /// The ARN resource TYPE a site's ARN carries (`…:site/os-…`), as the modelled
 /// `SiteArn` pattern spells it.
 ///
-/// Minting an ARN ([`site_arn`]) and reading one back ([`resource_arn_parts`])
+/// Minting an ARN ([`site_arn`]) and reading one back ([`resolve_resource_arn`])
 /// name the kind through this one constant, so the two can never disagree about
 /// what a site's ARN looks like.
 pub const SITE_RESOURCE_TYPE: &str = "site";
@@ -5617,18 +5617,32 @@ pub fn timestamp(at: std::time::SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
 }
 
-/// The `(resource type, resource id)` an Outposts resource ARN names, e.g.
-/// `("site", "os-…")` for `arn:aws:outposts:<region>:<account>:site/os-…`.
+/// The resource kind an Outposts resource ARN names, and what that ARN resolves to
+/// at the endpoint a request addressed to `region` reached — e.g. `("site",
+/// Here("os-…"))` for `arn:<this partition>:outposts:<region>:<this account>:site/os-…`.
 ///
 /// Every `Arn` member in this API is modelled
 /// `^(arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:([a-z\d-]+)/)[a-z]{2,8}-[a-f0-9]{17}$`,
 /// so the resource field is always `<type>/<id>` and the service field is always
 /// this service's own ARN namespace. `None` means the value is not an ARN of this
 /// service at all.
-pub fn resource_arn_parts(arn: &str) -> Option<(String, String)> {
+///
+/// The partition, the Region and the account id are part of the name, exactly as
+/// they are in the ARN form of an identifier member ([`resolve_id`]), so an ARN is
+/// resolved HERE only when all three are the endpoint's own
+/// ([`ResourceArn::names_endpoint`]); one differing in any of them names a resource
+/// of some other endpoint ([`ResolvedIdentifier::Elsewhere`]), which this endpoint
+/// holds no record of however familiar the bare resource id inside it looks.
+pub fn resolve_resource_arn(arn: &str, region: &str) -> Option<(String, ResolvedIdentifier)> {
     let arn = parse_resource_arn(arn)?;
-    (arn.service == ARN_NAMESPACE)
-        .then(|| (arn.resource_type.to_string(), arn.resource_id.to_string()))
+    if arn.service != ARN_NAMESPACE {
+        return None;
+    }
+    let resolved = match arn.names_endpoint(region) {
+        true => ResolvedIdentifier::Here(arn.resource_id.to_string()),
+        false => ResolvedIdentifier::Elsewhere,
+    };
+    Some((arn.resource_type.to_string(), resolved))
 }
 
 /// Which Availability Zone identifiers a request addressed to a region may name.
