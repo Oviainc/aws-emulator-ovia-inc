@@ -70,11 +70,10 @@ fn assert_refusal(
 
 /// RULE: a read of a resource that does not exist is refused with the modelled
 /// not-found error for that resource — for a speech synthesis task,
-/// `SynthesisTaskNotFoundException` (HTTP 400) — for every identifier of the form the
-/// service mints that identifier in; an identifier the model's pattern does not admit
-/// is refused at the request boundary instead, and neither answer is ever a 501 or a
-/// 5xx. (A value the pattern admits that is no identifier at all is the *other*
-/// modelled refusal, which `crate::task_id_validity` covers.)
+/// `SynthesisTaskNotFoundException` (HTTP 400) — for every identifier the model's
+/// `TaskId` pattern admits; an identifier the pattern does not admit is refused at the
+/// request boundary instead, and neither answer is ever a 501 or a 5xx.
+/// (`crate::task_id_validity` covers that whole class, on both sides of the pattern.)
 #[tokio::test]
 async fn an_unknown_synthesis_task_is_refused_with_its_modeled_not_found_error() {
     let polly = Polly::new();

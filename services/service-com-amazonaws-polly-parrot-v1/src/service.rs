@@ -45,9 +45,10 @@
 //! builds its modelled failures through it, so one error code cannot acquire two
 //! different messages.
 //!
-//! `override_protocol` is the seam this service DOES take, for one thing the generic
+//! `override_protocol` is the seam this service DOES take, for two things the generic
 //! renderer cannot express: an error document whose `message` member is present and
-//! `null` when the code carries no message. See [`wire`].
+//! `null` when the code carries no message, and an errortype header qualified by this
+//! service's error namespace. See [`wire`].
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -183,11 +184,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
-        // The model's own restJson1 codec, with the ONE difference the generic
+        // The model's own restJson1 codec, with the TWO differences the generic
         // renderer cannot express: a modelled exception's `message` member is present
         // in the error document even when the code carries no message, as JSON `null`
-        // rather than dropped (see `wire`). Borrowed from the field built in `new`,
-        // never constructed per request.
+        // rather than dropped, and the `x-amzn-errortype` header names the error shape
+        // qualified by this service's error namespace (see `wire`). Borrowed from the
+        // field built in `new`, never constructed per request.
         //
         // This seam drives the MODELLED sequence only. A framework-level refusal (a
         // `ValidationException` for a `TaskId` outside the model's pattern) still
@@ -212,12 +214,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 /// contract offers. One code carries NO message at all
 /// (`SynthesisTaskNotFoundException`), which is likewise what Amazon Polly answers.
 ///
-/// Two modelled errors are deliberately absent: `UnsupportedPlsAlphabetException` and
-/// `EngineNotSupportedException`. Amazon Polly does not answer with either —
-/// a lexicon declaring an alphabet it does not support is refused as an invalid PLS
-/// document (`InvalidLexiconException`) and a voice/engine mismatch is refused as a
-/// request-shape failure (`ValidationException`, whose message the framework builds
-/// from the request) — so there is nothing here to construct them with.
+/// Three modelled errors are deliberately absent: `UnsupportedPlsAlphabetException`,
+/// `EngineNotSupportedException` and `InvalidTaskIdException`. Amazon Polly does not
+/// answer with any of them — a lexicon declaring an alphabet it does not support is
+/// refused as an invalid PLS document (`InvalidLexiconException`), a voice/engine
+/// mismatch is refused as a request-shape failure (`ValidationException`, whose message
+/// the framework builds from the request), and a `TaskId` is either one the model's
+/// pattern admits, in which case it names a task or names none
+/// (`SynthesisTaskNotFoundException`), or one it does not, which the request boundary
+/// refuses — so there is nothing here to construct them with.
 pub mod errors {
     #[allow(unused_imports)]
     use crate::ops::types::*;
@@ -251,9 +256,6 @@ pub mod errors {
     pub const TEXT_LENGTH_EXCEEDED: &str = "Maximum text length has been exceeded";
     /// OBSERVED: `UnsupportedPlsLanguageException`.
     pub const UNSUPPORTED_PLS_LANGUAGE: &str = "Unsupported PLS language";
-    /// The model's own sentence for `InvalidTaskIdException`.
-    pub const INVALID_TASK_ID: &str =
-        "The provided Task ID is not valid. Please provide a valid Task ID and try again.";
     /// The model's own sentence for `LanguageNotSupportedException`.
     pub const LANGUAGE_NOT_SUPPORTED: &str =
         "The language specified is not currently supported by Amazon Polly in this capacity.";
@@ -270,7 +272,6 @@ pub mod errors {
         ("InvalidNextTokenException", Some(INVALID_NEXT_TOKEN)),
         ("InvalidSampleRateException", Some(INVALID_SAMPLE_RATE)),
         ("InvalidSsmlException", Some(INVALID_SSML)),
-        ("InvalidTaskIdException", Some(INVALID_TASK_ID)),
         ("LanguageNotSupportedException", Some(LANGUAGE_NOT_SUPPORTED)),
         ("LexiconNotFoundException", Some(LEXICON_NOT_FOUND)),
         ("LexiconSizeExceededException", Some(LEXICON_SIZE_EXCEEDED)),
@@ -322,13 +323,6 @@ pub mod errors {
     pub fn invalid_ssml() -> InvalidSsmlException {
         InvalidSsmlException {
             message: Some(INVALID_SSML.to_string()),
-        }
-    }
-
-    /// The `TaskId` is not an identifier Amazon Polly could have minted for a task.
-    pub fn invalid_task_id() -> InvalidTaskIdException {
-        InvalidTaskIdException {
-            message: Some(INVALID_TASK_ID.to_string()),
         }
     }
 
@@ -422,7 +416,6 @@ pub mod errors {
                 ("InvalidNextTokenException", invalid_next_token().message),
                 ("InvalidSampleRateException", invalid_sample_rate().message),
                 ("InvalidSsmlException", invalid_ssml().message),
-                ("InvalidTaskIdException", invalid_task_id().message),
                 (
                     "LanguageNotSupportedException",
                     language_not_supported().message,

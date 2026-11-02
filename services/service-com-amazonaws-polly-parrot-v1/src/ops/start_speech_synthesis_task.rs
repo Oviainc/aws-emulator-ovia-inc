@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSpeechSynthesisTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSpeechSynthesisTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts one asynchronous speech synthesis task: validates the synthesis request the
+//! same way the synchronous path does, mints the task's identifier, records the task in
+//! the store the task reads report ([`crate::state::ComAmazonawsPollyParrotV1State::synthesis_tasks`])
+//! and answers with the task's own record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSpeechSynthesisTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is a CREATE: the task it records is what `GetSpeechSynthesisTask` and
+//! `ListSpeechSynthesisTasks` then report, for the [`crate::state::TASK_RETENTION`]
+//! window the model documents, and a request this handler refuses records nothing. That
+//! window is also what bounds the store: a task is held for it and no longer, so the
+//! records one caller can accumulate do not grow without end.
+//!
+//! The task is created in a NON-TERMINAL status, as the asynchronous API's own contract
+//! has it, and the clock is what moves it on: the record carries the instant its
+//! completion falls due ([`crate::state::TASK_COMPLETION_DELAY`]) and the reads
+//! materialise it when that instant has passed, so a caller that polls straight after
+//! starting still sees the task before it completed.
+//!
+//! ## What is real, and what the emulator cannot do
+//!
+//! THE EMULATOR PERFORMS NO TEXT-TO-SPEECH, and no object is written to the output
+//! bucket: this operation's contribution is the TASK — its identifier, its status
+//! timeline, the request it records and the output location it reports — and the
+//! object that location names is not uploaded here. That upload is the one recorded
+//! behaviour of this operation still outstanding, tracked by its own issue
+//! (`20261022T175007Z-polly-startspeechsynthesistask-stub.md`), so nothing here
+//! pretends the bytes are there. Everything the task record reports is computed from
+//! the request and from state: the billed character count, the resolved output
+//! location, the lexicons resolved in the request's Region, and the voice's engine and
+//! language, all read through the same helpers `SynthesizeSpeech` uses so the
+//! synchronous and the asynchronous path cannot disagree about one request.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +169,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use super::synthesize_speech::{
+    billed_characters, content_type_for, resolve_sample_rate, DEFAULT_ENGINE, DEFAULT_TEXT_TYPE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -192,6 +216,78 @@ impl From<StartSpeechSynthesisTaskErrorModeled> for StartSpeechSynthesisTaskErro
     }
 }
 
+/// The most characters one task's `Text` may carry.
+///
+/// Source: `TextLengthExceededException`'s own documentation — "For the
+/// StartSpeechSynthesisTask API, the maximum is 200,000 characters, of which no more
+/// than 100,000 can be billed characters" — so this bound and
+/// [`MAX_BILLED_CHARACTERS`] are the asynchronous API's own, an order of magnitude
+/// above the synchronous ones `SynthesizeSpeech` enforces.
+pub const MAX_TOTAL_CHARACTERS: usize = 200_000;
+
+/// The most BILLED characters one task's `Text` may carry — the characters actually
+/// synthesized, which for `ssml` input excludes the markup ("SSML tags are not counted
+/// as billed characters").
+pub const MAX_BILLED_CHARACTERS: usize = 100_000;
+
+/// The status a task is created in.
+///
+/// `TaskStatus` is one of `scheduled | inProgress | completed | failed`
+/// (`smithy_query(query="shape", shape="TaskStatus")`), and a task that has just been
+/// accepted has not been synthesized yet: it is scheduled, and the clock moves it on.
+const INITIAL_TASK_STATUS: &str = "scheduled";
+
+/// The status the clock moves a started task to.
+const TERMINAL_TASK_STATUS: &str = "completed";
+
+/// The file suffix the output object carries, per `OutputFormat`.
+///
+/// Keyed by the `OutputFormat` values the model enumerates
+/// (`smithy_query(query="shape", shape="OutputFormat")`). The object is the task's
+/// output in the format the request asked for, so the suffix names that format: `json`
+/// output is a speech-mark stream rather than audio and is written as marks, the two
+/// Ogg-contained formats are named by their container, and the rest are named by the
+/// format itself — AWS documents no suffix for them, so the format's own name is what
+/// this emulator writes.
+const OUTPUT_SUFFIXES: &[(&str, &str)] = &[
+    ("mp3", "mp3"),
+    ("ogg_vorbis", "ogg"),
+    ("ogg_opus", "ogg"),
+    ("pcm", "pcm"),
+    ("alaw", "alaw"),
+    ("mulaw", "mulaw"),
+    ("json", "marks"),
+];
+
+/// The suffix of `output_format`'s output object, or `None` for a value that is no
+/// modeled output format.
+fn output_suffix(output_format: &str) -> Option<&'static str> {
+    OUTPUT_SUFFIXES
+        .iter()
+        .find(|(format, _)| *format == output_format)
+        .map(|(_, suffix)| *suffix)
+}
+
+/// Where this task's output is written: the object in the requested bucket, named by
+/// the key prefix the request asked for and the task's own identifier.
+///
+/// `SynthesisTask$OutputUri` is the "Pathway for the output speech file", and an S3
+/// object's pathway is its URL in the Region the request was made in. The prefix is
+/// taken as the request spelled it — `OutputS3KeyPrefix` is a KEY PREFIX, so the
+/// identifier and the suffix follow it with nothing inserted — and a request that names
+/// no prefix gets the object at the root of the bucket.
+fn output_uri(
+    region: &str,
+    bucket: &str,
+    key_prefix: Option<&str>,
+    task_id: &str,
+    output_format: &str,
+) -> String {
+    let suffix = output_suffix(output_format).unwrap_or(output_format);
+    let prefix = key_prefix.unwrap_or_default();
+    format!("https://s3.{region}.amazonaws.com/{bucket}/{prefix}{task_id}.{suffix}")
+}
+
 /// The `StartSpeechSynthesisTask` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -228,18 +324,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSpeechSynthesisTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSpeechSynthesisTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSpeechSynthesisTask"))
+        let output_format = input.output_format.as_str();
+        // The model's own `OutputFormat` domain, read off the same mapping the
+        // synchronous path encodes with, so a value outside it is refused here rather
+        // than becoming an output location naming a format nothing produces.
+        if content_type_for(output_format).is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "OutputFormat must be one of {}; got {output_format}",
+                OUTPUT_FORMAT_VALUES.join(", ")
+            )));
+        }
+        let engine = input.engine.as_deref().unwrap_or(DEFAULT_ENGINE);
+        let text_type = input.text_type.as_deref().unwrap_or(DEFAULT_TEXT_TYPE);
+        let marks = input.speech_mark_types.clone().unwrap_or_default();
+
+        // Speech marks ride the `json` output, so asking for them with an audio format
+        // is the failure `MarksNotSupportedForFormatException` names — the same rule the
+        // synchronous path applies, because it is a property of the request.
+        if !marks.is_empty() && output_format != "json" {
+            return Err(
+                StartSpeechSynthesisTaskErrorModeled::MarksNotSupportedForFormatException(
+                    crate::service::errors::marks_not_supported_for_format(),
+                )
+                .into(),
+            );
+        }
+        if marks.iter().any(|mark| mark == "ssml") && text_type != "ssml" {
+            return Err(
+                StartSpeechSynthesisTaskErrorModeled::SsmlMarksNotSupportedForTextTypeException(
+                    crate::service::errors::ssml_marks_not_supported_for_text_type(),
+                )
+                .into(),
+            );
+        }
+
+        // The asynchronous API's own two text bounds. `Text` carries no modeled length
+        // constraint, so the boundary validator has checked neither.
+        if input.text.chars().count() > MAX_TOTAL_CHARACTERS {
+            return Err(StartSpeechSynthesisTaskErrorModeled::TextLengthExceededException(
+                crate::service::errors::text_length_exceeded(),
+            )
+            .into());
+        }
+        // What gets billed is what is synthesized: every character of plain text, and
+        // for `ssml` the document's text content — which is also where an `ssml` input
+        // that is not a readable document is refused.
+        let billed = billed_characters(&input.text, text_type).map_err(|_| {
+            StartSpeechSynthesisTaskErrorModeled::InvalidSsmlException(
+                crate::service::errors::invalid_ssml(),
+            )
+        })?;
+        if billed > MAX_BILLED_CHARACTERS {
+            return Err(StartSpeechSynthesisTaskErrorModeled::TextLengthExceededException(
+                crate::service::errors::text_length_exceeded(),
+            )
+            .into());
+        }
+
+        // The sample rate is checked against the values the chosen format documents and
+        // then recorded AS THE REQUEST SPELLED IT: `SynthesisTask$SampleRate` reports
+        // the rate the task was started with, so a request that named none reports
+        // none. `json` output carries speech marks rather than audio and the model
+        // declares no rate for it, so a rate sent with it is not validated.
+        if output_format != "json" {
+            // A request that names no rate has nothing to check: the format's own
+            // default applies to the synthesis, and the task reports the member as the
+            // request left it.
+            if let Some(requested) = input.sample_rate.as_deref() {
+                resolve_sample_rate(output_format, requested).ok_or_else(|| {
+                    StartSpeechSynthesisTaskErrorModeled::InvalidSampleRateException(
+                        crate::service::errors::invalid_sample_rate(),
+                    )
+                })?;
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartSpeechSynthesisTaskErrorModeled::ServiceFailureException(
+                crate::service::errors::service_failure(),
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // Every lexicon the request names must be stored in the Region the request was
+        // signed for — a lexicon is a regional resource — and a name that Region does
+        // not store is refused BEFORE any task is recorded, so a refused request leaves
+        // the store as it was.
+        if let Some(names) = input.lexicon_names.as_ref() {
+            let guard = state.lock();
+            let missing = names
+                .iter()
+                .any(|name| guard.lexicon(&region, name).is_none());
+            drop(guard);
+            if missing {
+                return Err(StartSpeechSynthesisTaskErrorModeled::LexiconNotFoundException(
+                    crate::service::errors::lexicon_not_found(),
+                )
+                .into());
+            }
+        }
+
+        // The voice decides which engines and languages the request may name, read off
+        // the catalog `DescribeVoices` serves so the two cannot disagree about a voice.
+        let voice = {
+            let guard = state.lock();
+            guard
+                .voices
+                .iter()
+                .find(|voice| voice.id == input.voice_id)
+                .copied()
+        };
+        if let Some(voice) = voice {
+            if !voice.supports_engine(engine) {
+                // Amazon Polly refuses this combination as a request-shape failure
+                // rather than with the modelled `EngineNotSupportedException`, which is
+                // how the synchronous path answers it too.
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "This voice does not support the selected engine: {engine}"
+                )));
+            }
+            if let Some(language) = input.language_code.as_deref() {
+                if !voice.speaks(language, true) {
+                    return Err(
+                        StartSpeechSynthesisTaskErrorModeled::LanguageNotSupportedException(
+                            crate::service::errors::language_not_supported(),
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        // Nothing is left to refuse, so the task is minted and recorded. ONE clock
+        // reading for the whole call: the creation time the task reports and the instant
+        // its completion falls due are of the same instant.
+        let now = ::std::time::SystemTime::now();
+        // A clock so far ahead that the sum is not representable leaves the completion
+        // due at once, rather than making an addition the host's clock can panic on.
+        let completion_due_at = now
+            .checked_add(crate::state::TASK_COMPLETION_DELAY)
+            .unwrap_or(now);
+        let task_id = crate::state::mint_task_id();
+        let stored = crate::state::StoredSynthesisTask {
+            output_uri: output_uri(
+                &region,
+                &input.output_s3_bucket_name,
+                input.output_s3_key_prefix.as_deref(),
+                &task_id,
+                output_format,
+            ),
+            task_id,
+            engine: engine.to_string(),
+            output_format: output_format.to_string(),
+            creation_time: now,
+            request_characters: i32::try_from(billed).unwrap_or(i32::MAX),
+            sns_topic_arn: input.sns_topic_arn.clone(),
+            lexicon_names: input.lexicon_names.clone().unwrap_or_default(),
+            sample_rate: input.sample_rate.clone(),
+            speech_mark_types: marks,
+            text_type: text_type.to_string(),
+            voice_id: input.voice_id.clone(),
+            language_code: input.language_code.clone(),
+            task_status: INITIAL_TASK_STATUS.to_string(),
+            task_status_reason: None,
+            // The completion the clock owes this task. Stored as the instant it falls
+            // due rather than waited for, so the reads materialise it exactly when it
+            // was owed.
+            pending_status: Some(crate::state::PendingTaskStatus {
+                due_at: completion_due_at,
+                status: TERMINAL_TASK_STATUS.to_string(),
+                reason: None,
+            }),
+        };
+        let reported = crate::state::synthesis_task(&stored);
+        state
+            .lock()
+            .synthesis_tasks
+            .insert(stored.task_id.clone(), stored);
+
+        Ok(StartSpeechSynthesisTaskOutput {
+            synthesis_task: Some(reported),
+        })
     }
 }

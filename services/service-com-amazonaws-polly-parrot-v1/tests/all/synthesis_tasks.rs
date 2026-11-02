@@ -9,9 +9,10 @@
 //! tie, a transition the clock owes on both sides of its due instant.
 //!
 //! The harness and the response readers come from `crate::lexicons_and_speech`, the
-//! task fixtures from `crate::support`: `StartSpeechSynthesisTask` is still a scaffold
-//! stub with its own issue, so tasks are seeded into the shared store the way that call
-//! will write them.
+//! task fixtures from `crate::support`: a row that fixes a creation time, a status or a
+//! pending transition of its own seeds the shared store directly, the way
+//! `StartSpeechSynthesisTask` writes it (and `crate::speech_synthesis_task_creation`
+//! drives that call end to end).
 
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};

@@ -1,28 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Which of the two `TaskId` refusals `GetSpeechSynthesisTask` answers with.
+//! Which refusal `GetSpeechSynthesisTask` answers for a `TaskId` it holds no task
+//! under.
 //!
-//! RULE: a read keyed by a service-minted identifier judges the identifier's FORM
-//! before it looks anything up — a value the model's pattern admits but that is not of
-//! the form the service mints is refused with the modelled invalid-identifier error for
-//! that resource (`InvalidTaskIdException`, HTTP 400), and only an identifier of the
-//! minted form is looked up, answering the modelled not-found error
-//! (`SynthesisTaskNotFoundException`, HTTP 400) when it names nothing and the resource
-//! when it does.
+//! RULE: a read keyed by a service-generated identifier does not narrow that identifier
+//! beyond what the model says a request may carry — every value the member's pattern
+//! admits reaches the store and is answered by the STORE: the resource when a task is
+//! held under it, and the modelled not-found error for that resource
+//! (`SynthesisTaskNotFoundException`, HTTP 400) when none is. A value the pattern does
+//! not admit never reaches the handler at all: the request boundary refuses it as a
+//! request-shape failure (`ValidationException`, HTTP 400).
 //!
 //! Each test checks the rule over a TABLE (or over identifiers taken from the service's
 //! own minter) rather than over the one request an issue quoted: the rows differ along
 //! what the rule generalises over — the length, the character classes and the shape of
-//! the value, and whether the store holds a task beside it.
+//! the value, whether the store holds a task beside it, and which side of the modelled
+//! pattern the value falls on.
 
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 
-use service_com_amazonaws_polly_parrot_v1::service::errors;
-use service_com_amazonaws_polly_parrot_v1::state::mint_task_id;
-
 use crate::lexicons_and_speech::{error_code, json, Polly};
 use crate::support::{fixture_task_id, get_task, message_slot, seed_task, stored_task};
+use service_com_amazonaws_polly_parrot_v1::state::mint_task_id;
 
 /// How many minted identifiers the not-found rows span. Bounded so the suite stays
 /// quick; each identifier comes from the service's own minter, and a failure prints the
@@ -30,11 +30,11 @@ use crate::support::{fixture_task_id, get_task, message_slot, seed_task, stored_
 const MINTED_CASES: usize = 32;
 
 /// Values the model's `TaskId` pattern (`^[a-zA-Z0-9_-]{1,100}$`) admits that are NOT
-/// identifiers this service could have minted. The rows span the pattern's lower and
-/// upper length bounds, each character class it allows, and the near-misses of the
+/// in the form this service mints an identifier in. The rows span the pattern's lower
+/// and upper length bounds, each character class it allows, and the near-misses of the
 /// minted UUID form (the 32-digit spelling, a group of the wrong length, a non-hex
 /// digit, hyphens in the wrong places).
-fn non_identifiers() -> Vec<(&'static str, String)> {
+fn unminted_forms() -> Vec<(&'static str, String)> {
     vec![
         ("a word", "notataskid".to_string()),
         ("the pattern's lower bound", "a".to_string()),
@@ -66,11 +66,11 @@ fn non_identifiers() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// RULE: a `TaskId` the model's pattern admits but which is not an identifier this
-/// service mints is `InvalidTaskIdException` (HTTP 400), carrying the fixed message for
-/// that code — never the not-found refusal, and whatever the store holds.
+/// RULE: a `TaskId` the model's pattern admits that names no held task is the NOT-FOUND
+/// refusal — whatever form the value takes, and whatever else the store holds. The
+/// identifier's spelling is not what the answer turns on; the store is.
 #[tokio::test]
-async fn a_task_id_that_is_no_identifier_is_refused_as_invalid() {
+async fn a_well_formed_task_id_that_names_no_task_is_refused_as_not_found() {
     let polly = Polly::new();
     for store in ["an empty store", "a store holding a task"] {
         if store == "a store holding a task" {
@@ -79,41 +79,30 @@ async fn a_task_id_that_is_no_identifier_is_refused_as_invalid() {
                 &stored_task(&fixture_task_id("neighbour"), SystemTime::now()),
             );
         }
-        for (case, value) in non_identifiers() {
+        for (case, value) in unminted_forms() {
             let case = format!("{case} ({value:?}) with {store}");
             let response = get_task(&polly, &value).await;
             assert_eq!(
                 (response.status().as_u16(), error_code(&response)),
-                (400, "InvalidTaskIdException".to_string()),
-                "case {case:?}: expected the invalid-identifier refusal, got body {:?}",
+                (400, "SynthesisTaskNotFoundException".to_string()),
+                "case {case:?}: expected the not-found refusal, got body {:?}",
                 json(&response)
             );
+            // Amazon Polly answers this code with no message, rendered as JSON null —
+            // so the document never echoes the identifier the caller sent either.
             let slot = message_slot(&response);
             assert_eq!(
-                slot.as_ref().and_then(serde_json::Value::as_str),
-                Some(errors::INVALID_TASK_ID),
-                "case {case:?}: expected the fixed message for the code, got {slot:?}"
+                slot,
+                Some(serde_json::Value::Null),
+                "case {case:?}: expected a null message member, got {slot:?}"
             );
-            // The sentence is a property of the code, so it never echoes the request.
-            // Checked for the values distinctive enough for a substring test to mean
-            // anything: a one-character value occurs in any English sentence.
-            let message = slot
-                .as_ref()
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if value.len() >= 4 {
-                assert!(
-                    !message.contains(value.as_str()),
-                    "case {case:?}: message {message:?} echoes the request value {value:?}"
-                );
-            }
         }
     }
 }
 
-/// RULE (the other half): an identifier OF the minted form that names no task is
-/// `SynthesisTaskNotFoundException` (HTTP 400) — the error about the store, not about
-/// the identifier — for every identifier this service's minter produces.
+/// RULE (the same answer from the other end of the class): an identifier of the form
+/// the service mints that names no task is the not-found refusal too, for every
+/// identifier the minter produces.
 #[tokio::test]
 async fn a_minted_identifier_that_names_no_task_is_refused_as_not_found() {
     let polly = Polly::new();
@@ -148,27 +137,30 @@ async fn a_minted_identifier_that_names_no_task_is_refused_as_not_found() {
             "case {case:?} ({id:?}): expected the not-found refusal, got body {:?}",
             json(&response)
         );
-        // Amazon Polly answers this code with no message, rendered as JSON null.
-        let slot = message_slot(&response);
-        assert_eq!(
-            slot,
-            Some(serde_json::Value::Null),
-            "case {case:?} ({id:?}): expected a null message member, got {slot:?}"
-        );
     }
 }
 
-/// RULE (the served case): an identifier of the minted form that names a stored task is
-/// answered with that task, while every other identifier beside it keeps the refusal
-/// its own form earns — so the two refusals are a function of the identifier and the
-/// store, not of one another.
+/// RULE (the served case): EVERY identifier the model's pattern admits is looked up, so
+/// a task the store holds reads back whatever form its identifier takes — and the ones
+/// beside it are still not found. The read is a function of the store, not of the
+/// identifier's spelling.
 #[tokio::test]
-async fn a_minted_identifier_that_names_a_task_is_served() {
+async fn any_well_formed_identifier_the_store_holds_is_served() {
     let polly = Polly::new();
-    let stored: Vec<String> = ["alpha", "beta", "gamma"]
+    // Rows spanning the pattern: minted identifiers, and the unminted forms above — a
+    // task held under one of those is still a held task.
+    let mut stored: Vec<String> = ["alpha", "beta", "gamma"]
         .into_iter()
         .map(fixture_task_id)
         .collect();
+    stored.extend(
+        unminted_forms()
+            .into_iter()
+            .map(|(_, value)| value)
+            // The pattern's upper bound is 100 characters, which the rows above stay
+            // within, so every one of them is a value a request can carry.
+            .collect::<Vec<String>>(),
+    );
     for id in &stored {
         let mut task = stored_task(id, SystemTime::now());
         task.task_status = "completed".to_string();
@@ -191,26 +183,40 @@ async fn a_minted_identifier_that_names_a_task_is_served() {
         );
     }
 
-    // Beside those three: another minted identifier is not found, and a value that is
-    // no identifier at all is invalid. Both are 400, and the CODES differ — which is
-    // what a client branching on the code reads.
-    let unknown = get_task(&polly, &mint_task_id()).await;
-    let invalid = get_task(&polly, "notataskid").await;
-    assert_eq!(
-        (
-            unknown.status().as_u16(),
-            error_code(&unknown),
-            invalid.status().as_u16(),
-            error_code(&invalid),
-        ),
-        (
-            400,
-            "SynthesisTaskNotFoundException".to_string(),
-            400,
-            "InvalidTaskIdException".to_string(),
-        ),
-        "the two refusals must stay distinct, got {:?} and {:?}",
-        json(&unknown),
-        json(&invalid)
-    );
+    // Beside those: identifiers of both forms that the store does NOT hold are refused
+    // as not found, so the served rows above are not passing on a read that answers
+    // everything.
+    for unknown in [mint_task_id(), "notheldatall".to_string()] {
+        let response = get_task(&polly, &unknown).await;
+        assert_eq!(
+            (response.status().as_u16(), error_code(&response)),
+            (400, "SynthesisTaskNotFoundException".to_string()),
+            "unknown {unknown:?}: expected the not-found refusal, got body {:?}",
+            json(&response)
+        );
+    }
+}
+
+/// RULE (the other side of the pattern): a `TaskId` the model's pattern does NOT admit
+/// is refused at the request boundary as a request-shape failure, not by the store —
+/// one past the length bound, and one per character class the pattern excludes.
+#[tokio::test]
+async fn a_task_id_outside_the_modeled_pattern_is_refused_at_the_boundary() {
+    let polly = Polly::new();
+    for (case, value) in [
+        ("one past the upper length bound", "a".repeat(101)),
+        ("many past the upper length bound", "a".repeat(400)),
+        ("a punctuation character", "bad!id".to_string()),
+        ("a dot", "bad.id".to_string()),
+        ("a tilde", "bad~id".to_string()),
+    ] {
+        let response = get_task(&polly, &value).await;
+        assert_eq!(
+            (response.status().as_u16(), error_code(&response)),
+            (400, "ValidationException".to_string()),
+            "case {case:?} ({value:?}): a malformed id is a request-shape refusal, \
+             got body {:?}",
+            json(&response)
+        );
+    }
 }

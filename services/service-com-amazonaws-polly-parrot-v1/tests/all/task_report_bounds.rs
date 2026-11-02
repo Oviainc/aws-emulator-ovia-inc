@@ -19,8 +19,8 @@
 //!
 //! The harness and the JSON readers come from `crate::lexicons_and_speech`, the page
 //! readers from `crate::synthesis_tasks` and the task fixtures from `crate::support`:
-//! `StartSpeechSynthesisTask` is still a scaffold stub with its own issue, so tasks are
-//! seeded into the shared store the way that call will write them.
+//! a store of a size and a creation order a row fixes is seeded directly, the way
+//! `StartSpeechSynthesisTask` writes a task.
 
 use std::time::{Duration, SystemTime};
 

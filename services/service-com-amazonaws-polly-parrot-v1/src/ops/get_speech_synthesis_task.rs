@@ -11,15 +11,15 @@
 //! retention window has run out — changes that were owed at that instant whether or
 //! not anybody polled.
 //!
-//! The model declares two distinct refusals for the `TaskId`, and they mean different
-//! things: a value that is not an identifier this service could have minted (the
-//! model's pattern is far wider than the minted form — see
-//! [`crate::state::is_task_id`]) is `InvalidTaskIdException` (HTTP 400), while an
-//! identifier of the minted form that names no task the service holds — never started,
-//! or started longer ago than [`crate::state::TASK_RETENTION`] — is
-//! `SynthesisTaskNotFoundException` (HTTP 400). A `TaskId` that does not satisfy the
-//! model's pattern at all never reaches this handler, because the framework refuses it
-//! at the boundary.
+//! Only ONE of the two refusals the model binds here is about the store, and it is the
+//! one this read answers: a `TaskId` the model's pattern admits is looked up as the
+//! caller spelled it, and when the service holds no task under it — never started, or
+//! started longer ago than [`crate::state::TASK_RETENTION`] — that is
+//! `SynthesisTaskNotFoundException` (HTTP 400). A `TaskId` the model's pattern does NOT
+//! admit never reaches this handler at all: the framework refuses it at the boundary as
+//! a request-shape failure. So nothing here narrows an identifier beyond what the model
+//! says a request may carry, and `InvalidTaskIdException` is not an answer this read
+//! invents for a well-formed identifier it happens not to hold.
 //!
 //! ## Shape of an operation
 //!
@@ -156,15 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // The identifier is judged on its own, before any store lookup: a value that is
-        // not of the form this service mints is no task identifier, whatever the store
-        // happens to hold.
-        if !crate::state::is_task_id(&input.task_id) {
-            return Err(GetSpeechSynthesisTaskErrorModeled::InvalidTaskIdException(
-                crate::service::errors::invalid_task_id(),
-            )
-            .into());
-        }
+        // No gate on the identifier's spelling: the boundary has already refused every
+        // value the model's `TaskId` pattern does not admit, and whether the service
+        // holds a task under the value it does admit is a question for the store.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetSpeechSynthesisTaskErrorModeled::ServiceFailureException(
                 crate::service::errors::service_failure(),
@@ -182,9 +176,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .retained_synthesis_tasks(now)
             .get(&input.task_id)
             .ok_or_else(|| {
-                // The `TaskId` is one this service could have minted and names no task
-                // the service holds, which is this error rather than
-                // `InvalidTaskIdException`.
+                // A well-formed `TaskId` the service holds no task under: the error
+                // about the TASK, not about the identifier.
                 GetSpeechSynthesisTaskErrorModeled::SynthesisTaskNotFoundException(
                     crate::service::errors::synthesis_task_not_found(),
                 )

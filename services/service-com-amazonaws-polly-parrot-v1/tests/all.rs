@@ -19,6 +19,8 @@ mod error_document_message;
 mod error_message_wording;
 #[path = "all/error_semantics.rs"]
 mod error_semantics;
+#[path = "all/error_type_header.rs"]
+mod error_type_header;
 #[path = "all/lexicon_language_code.rs"]
 mod lexicon_language_code;
 #[path = "all/lexicon_listing.rs"]
@@ -47,6 +49,8 @@ mod shared_pls_fixture;
 mod speech_mark_stream_for_every_text_type;
 #[path = "all/speech_synthesis_stream.rs"]
 mod speech_synthesis_stream;
+#[path = "all/speech_synthesis_task_creation.rs"]
+mod speech_synthesis_task_creation;
 #[path = "all/ssml_billed_characters.rs"]
 mod ssml_billed_characters;
 #[path = "all/ssml_vocabulary.rs"]

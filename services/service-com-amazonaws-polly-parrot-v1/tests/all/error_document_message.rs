@@ -125,23 +125,21 @@ async fn every_error_document_carries_its_message_member() {
     let polly = Polly::new();
     let mut rows: Vec<(String, http::Response<Bytes>, u16, &str)> = Vec::new();
 
-    // The two codes with no message and with one, from the same operation: an
-    // identifier of the minted form that names no task, and a value that is no
-    // identifier at all.
-    for id in [mint_task_id(), fixture_task_id("absent")] {
+    // The code with no message and the codes with one, from several operations: an
+    // identifier that names no task, in both the minted form and a form the service
+    // does not mint, since neither is held.
+    for id in [
+        mint_task_id(),
+        fixture_task_id("absent"),
+        "b".to_string(),
+        "unknown-task-id".to_string(),
+        "z".repeat(100),
+    ] {
         rows.push((
             format!("GetSpeechSynthesisTask {id:?}"),
             get_task(&polly, &id).await,
             400,
             "SynthesisTaskNotFoundException",
-        ));
-    }
-    for id in ["b", "unknown-task-id", &"z".repeat(100)] {
-        rows.push((
-            format!("GetSpeechSynthesisTask {id:?}"),
-            get_task(&polly, id).await,
-            400,
-            "InvalidTaskIdException",
         ));
     }
 
@@ -310,7 +308,7 @@ async fn every_error_document_carries_its_message_member() {
     codes.sort_unstable();
     codes.dedup();
     assert!(
-        codes.len() >= 9 && codes.contains(&"SynthesisTaskNotFoundException"),
+        codes.len() >= 8 && codes.contains(&"SynthesisTaskNotFoundException"),
         "the table must span the error codes, got {codes:?}"
     );
 
@@ -338,22 +336,16 @@ async fn the_framework_documents_carry_a_string_message_member() {
         ));
     }
 
-    // StartSpeechSynthesisTask is still scaffolded (it has its own stub issue), so it
-    // answers the 501 whose message names the operation.
+    // `SynthesizeSpeech` with the one output format this emulator cannot encode is the
+    // scaffold channel's 501, whose message names what is not implemented.
     rows.push((
-        "StartSpeechSynthesisTask".to_string(),
+        "SynthesizeSpeech ogg_vorbis".to_string(),
         polly
-            .call(
-                "POST",
-                "/v1/synthesisTasks",
-                &serde_json::json!({
-                    "OutputFormat": "mp3",
-                    "OutputS3BucketName": "polly-output",
-                    "Text": "hello world",
-                    "VoiceId": "Joanna",
-                })
-                .to_string(),
-            )
+            .synthesize(&serde_json::json!({
+                "Text": "hello world",
+                "VoiceId": "Joanna",
+                "OutputFormat": "ogg_vorbis",
+            }))
             .await,
         501,
         "NotImplemented",

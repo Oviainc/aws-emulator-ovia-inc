@@ -442,35 +442,15 @@ pub fn lexicon_attributes(stored: &StoredLexicon) -> crate::ops::types::LexiconA
 // Task identifiers
 // ---------------------------------------------------------------------------
 
-/// Length of a UUID written in the canonical hyphenated form (`8-4-4-4-12` hex
-/// digits), which is the only form [`is_task_id`] accepts.
-const HYPHENATED_UUID_LENGTH: usize = ::uuid::fmt::Hyphenated::LENGTH;
-
 /// A fresh `TaskId`, in the form Amazon Polly mints one: a random UUID written in the
 /// canonical hyphenated form.
 ///
-/// Every `TaskId` the service hands out comes from here, so the identifiers the read
-/// operations accept ([`is_task_id`]) are exactly the identifiers the service can have
-/// minted.
+/// Every `TaskId` the service hands out comes from here. What a READ accepts is not
+/// narrowed to this form: the model's `TaskId` pattern (`^[a-zA-Z0-9_-]{1,100}$`) is
+/// what a request has to satisfy, and an identifier that satisfies it simply names
+/// whatever task the store holds under it — or no task at all.
 pub fn mint_task_id() -> String {
     ::uuid::Uuid::new_v4().hyphenated().to_string()
-}
-
-/// Whether `task_id` is an identifier this service could have minted — that is, a UUID
-/// in the canonical hyphenated form [`mint_task_id`] produces.
-///
-/// The model's `TaskId` pattern (`^[a-zA-Z0-9_-]{1,100}$`) is far wider than the
-/// identifiers the service mints, so a value can satisfy the pattern — and therefore
-/// reach a handler — while being no task identifier at all. That is the case the model
-/// declares `InvalidTaskIdException` for, as distinct from an identifier of the right
-/// form that simply names no stored task.
-///
-/// The length test is what pins the HYPHENATED form: a UUID parser also accepts the
-/// 32-digit, braced and URN spellings, and this service mints none of those. The hex
-/// digits are accepted in either case, since case is not what makes a value an
-/// identifier.
-pub fn is_task_id(task_id: &str) -> bool {
-    task_id.len() == HYPHENATED_UUID_LENGTH && ::uuid::Uuid::try_parse(task_id).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -901,19 +881,15 @@ mod tests {
         );
     }
 
-    /// Every identifier the service mints is one it recognises, and the minted ids are
-    /// distinct — the two halves of [`mint_task_id`]/[`is_task_id`] agreeing is what
-    /// keeps a task the service created readable.
+    /// Every identifier the service mints satisfies the model's own `TaskId` pattern —
+    /// otherwise no request could ever carry one back — and no identifier is minted
+    /// twice, which is what keeps one task's record distinct from another's.
     #[test]
-    fn a_minted_task_id_is_recognised_as_one() {
+    fn a_minted_task_id_is_one_a_request_can_carry() {
         let mut minted = std::collections::BTreeSet::new();
         for round in 0..64 {
             let id = mint_task_id();
-            assert!(
-                is_task_id(&id),
-                "round {round}: the minted id {id:?} must be recognised as a task id"
-            );
-            // A minted id must also satisfy the model's own `TaskId` pattern
+            // A minted id must satisfy the model's own `TaskId` pattern
             // (`^[a-zA-Z0-9_-]{1,100}$`), or no request could ever carry it.
             assert!(
                 (1..=100).contains(&id.len())
@@ -925,33 +901,6 @@ mod tests {
             assert!(
                 minted.insert(id.clone()),
                 "round {round}: the minted id {id:?} was minted twice"
-            );
-        }
-    }
-
-    /// A value the model's pattern admits is NOT thereby an identifier: only the
-    /// canonical hyphenated UUID form is.
-    #[test]
-    fn only_the_minted_form_is_a_task_id() {
-        for (case, value, expected) in [
-            ("a canonical uuid", "6f3a1b2c-9d4e-4f5a-8b6c-7d8e9f0a1b2c", true),
-            ("the nil uuid", "00000000-0000-0000-0000-000000000000", true),
-            ("upper-case hex digits", "6F3A1B2C-9D4E-4F5A-8B6C-7D8E9F0A1B2C", true),
-            ("a word", "notataskid", false),
-            ("one character", "a", false),
-            ("digits", "0123456789", false),
-            // The 32-digit, braced and URN spellings of a UUID: a parser takes them,
-            // but this service mints none of them.
-            ("an unhyphenated uuid", "6f3a1b2c9d4e4f5a8b6c7d8e9f0a1b2c", false),
-            ("a uuid with a group too short", "6f3a1b2c-9d4e-4f5a-8b6c-7d8e9f0a1b2", false),
-            ("a uuid with a non-hex digit", "6f3a1b2c-9d4e-4f5a-8b6c-7d8e9f0a1b2z", false),
-            ("hyphens in the wrong places", "6f3a1b2c9-d4e-4f5a-8b6c-7d8e9f0a1b2c", false),
-            ("a 36-character word", &"a".repeat(36), false),
-        ] {
-            let actual = is_task_id(value);
-            assert_eq!(
-                actual, expected,
-                "case {case:?}: is_task_id({value:?}) is {actual}, expected {expected}"
             );
         }
     }

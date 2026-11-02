@@ -58,8 +58,8 @@ pub(crate) fn pls_with_replacement(element: &str, length: usize) -> String {
 /// form — derived from `label`, so a fixture still reads as the case it is about and
 /// two labels never collide.
 ///
-/// A started task's id is minted, never chosen, and the read path refuses an id that is
-/// not of the minted form, so a fixture cannot use a prose id.
+/// A started task's id is minted, never chosen, so a fixture that stands in for a
+/// started task uses the minted form rather than a prose id.
 pub(crate) fn fixture_task_id(label: &str) -> String {
     ::uuid::Uuid::new_v5(&::uuid::Uuid::NAMESPACE_OID, label.as_bytes())
         .hyphenated()
@@ -91,8 +91,11 @@ pub(crate) fn stored_task(task_id: &str, created: SystemTime) -> StoredSynthesis
 
 /// Put a task in the store the way a start call would.
 ///
-/// `StartSpeechSynthesisTask` is still scaffolded (it has its own stub issue), so the
-/// read paths are seeded through the shared engine rather than through that call.
+/// `StartSpeechSynthesisTask` records a task with the creation time and the status of
+/// the instant it was called, so a suite whose rows fix a creation time, a status or a
+/// pending transition of their own seeds the store through the shared engine instead.
+/// `crate::speech_synthesis_task_creation` is the suite that drives the start call
+/// itself.
 pub(crate) fn seed_task(polly: &Polly, task: &StoredSynthesisTask) {
     let state = service_state(&**polly.engine()).expect("the in-memory engine carries the state");
     state
