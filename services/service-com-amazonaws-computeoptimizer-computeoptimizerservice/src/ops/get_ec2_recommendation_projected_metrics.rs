@@ -307,21 +307,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .visible_instances()
             .find(|instance| instance.instance_arn(&region) == input.instance_arn)
         else {
-            // This operation reports one instance's projection and models no per-resource
-            // error list, so an instance it holds no analysis for is "a resource that is
-            // required for the action doesn't exist".
-            return Err(
-                GetEC2RecommendationProjectedMetricsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(
-                            "Compute Optimizer has no Amazon EC2 instance recommendation for \
-                             the resource this identifier names."
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
+            // An instance this service holds no analysis of has no projection to report, and
+            // that is not a failed request: `recommendedOptionProjectedMetrics` is an
+            // optional list with no required member, so the answer is the EMPTY list of
+            // projections — the state of every instance of a newly enrolled account, which
+            // Compute Optimizer has not accumulated enough metric history for yet.
+            return Ok(GetEC2RecommendationProjectedMetricsOutput {
+                recommended_option_projected_metrics: Some(Vec::new()),
+            });
         };
 
         let options: Vec<RecommendedOptionProjectedMetric> = instance

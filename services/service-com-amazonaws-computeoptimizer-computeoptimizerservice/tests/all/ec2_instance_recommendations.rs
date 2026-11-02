@@ -9,8 +9,8 @@
 //! observed, and one ranked option per candidate instance type carrying the utilization
 //! projected onto that type and the saving adopting it offers — narrowed by `accountIds`,
 //! `instanceArns`, `filters` and `recommendationPreferences`, one page at a time; an
-//! identifier the analysis holds no recommendation for is reported in `errors`, and a request
-//! the service cannot honour is refused with the operation's modelled 400.
+//! identifier the analysis holds no recommendation for is absent from the answer, and a
+//! request the service cannot honour is refused with the operation's modelled 400.
 //!
 //! The analysis of an observed workload is what produces a recommendation, and no operation
 //! of THIS API creates one, so the fixtures below record instances into the store the way
@@ -622,8 +622,8 @@ async fn every_analysed_instance_is_reported_from_its_stored_analysis() {
 
 /// What a request SELECTS: `accountIds` reads the caller's own account only, `instanceArns`
 /// picks instances out of the analysis, an identifier the analysis holds no recommendation
-/// for is reported in `errors`, and an ARN of another Region names an instance this endpoint
-/// does not analyse.
+/// for is simply absent from the answer, and an ARN of another Region names an instance this
+/// endpoint does not analyse.
 #[tokio::test]
 async fn account_ids_and_instance_arns_select_what_is_reported() {
     let (router, _engine) = emulator_with_corpus().await;
@@ -634,75 +634,60 @@ async fn account_ids_and_instance_arns_select_what_is_reported() {
     // service parses, which names an instance this endpoint analyses.
     let other_partition = format!("arn:aws-cn:ec2:{REGION}:{ACCOUNT}:instance/{SIZED_UP}");
 
-    // (case, request, the ARNs reported, the identifiers reported in `errors`)
-    let rows: Vec<(&str, Value, Vec<String>, Vec<String>)> = vec![
+    // (case, request, the ARNs reported)
+    let rows: Vec<(&str, Value, Vec<String>)> = vec![
         (
             "the caller's own account, named",
             json!({"accountIds": [ACCOUNT]}),
             all.clone(),
-            Vec::new(),
         ),
-        (
-            "an empty account list",
-            json!({"accountIds": []}),
-            all.clone(),
-            Vec::new(),
-        ),
+        ("an empty account list", json!({"accountIds": []}), all.clone()),
         (
             "one instance",
             json!({"instanceArns": [instance_arn(SIZED_UP)]}),
             vec![instance_arn(SIZED_UP)],
-            Vec::new(),
         ),
         (
             "two instances",
             json!({"instanceArns": [instance_arn(SIZED_DOWN), instance_arn(TWO_ARCHITECTURES)]}),
             vec![instance_arn(SIZED_DOWN), instance_arn(TWO_ARCHITECTURES)],
-            Vec::new(),
         ),
         (
             "the same instance twice",
             json!({"instanceArns": [instance_arn(SIZED_UP), instance_arn(SIZED_UP)]}),
             vec![instance_arn(SIZED_UP)],
-            Vec::new(),
         ),
         (
             "an instance this analysis does not hold",
             json!({"instanceArns": [unknown.clone()]}),
             Vec::new(),
-            vec![unknown.clone()],
         ),
         (
-            // One entry per identifier, however many times the request named it.
             "the same unheld instance twice",
             json!({"instanceArns": [unknown.clone(), unknown.clone()]}),
             Vec::new(),
-            vec![unknown.clone()],
         ),
         (
             "one held and one unheld instance",
             json!({"instanceArns": [instance_arn(SIZED_UP), unknown.clone()]}),
             vec![instance_arn(SIZED_UP)],
-            vec![unknown.clone()],
         ),
         (
             "an instance of another Region",
             json!({"instanceArns": [other_region.clone()]}),
             Vec::new(),
-            vec![other_region.clone()],
         ),
         (
             // The identifier names an analysed instance of this Region, so it is answered
-            // with that instance's recommendation and reported as missing nowhere — whatever
-            // partition the ARN was written in.
+            // with that instance's recommendation — whatever partition the ARN was written
+            // in.
             "an instance of this Region named in another partition",
             json!({"instanceArns": [other_partition.clone()]}),
             vec![instance_arn(SIZED_UP)],
-            Vec::new(),
         ),
     ];
 
-    for (case, request, expected, expected_errors) in rows {
+    for (case, request, expected) in rows {
         let body = recommendations(&router, case, request).await;
         let mut reported = reported_arns(&body);
         reported.sort();
@@ -712,10 +697,13 @@ async fn account_ids_and_instance_arns_select_what_is_reported() {
             reported, wanted,
             "case {case:?}: expected exactly {wanted:?}, got {body}"
         );
+        // An identifier with no recommendation is absent from the answer and is NOT a
+        // per-resource failure of the request: `errors` carries the instances an analysis
+        // rejected as unsupported, which this inventory holds none of.
         assert_eq!(
             reported_error_identifiers(&body),
-            expected_errors,
-            "case {case:?}: expected {expected_errors:?} in errors, got {body}"
+            Vec::<String>::new(),
+            "case {case:?}: expected no errors entry, got {body}"
         );
     }
 
@@ -1009,12 +997,12 @@ async fn an_unhonourable_request_is_refused() {
             json!({"instanceArns": [
                 format!("arn:aws:ec2:{REGION}:{ACCOUNT}:volume/vol-0123456789abcdef0")
             ]}),
-            "Invalid instance ARN.",
+            "Invalid instance arn.",
         ),
         (
             "a value that is not an ARN at all",
             json!({"instanceArns": ["i-0123456789abcdef0"]}),
-            "Invalid instance ARN.",
+            "Invalid instance arn.",
         ),
         (
             "a page token this service did not issue",
@@ -1044,9 +1032,10 @@ async fn an_unhonourable_request_is_refused() {
     )
     .await;
     assert_eq!(
-        reported_error_identifiers(&body).len(),
-        MAX_REQUESTED_IDENTIFIERS,
-        "a list at the bound is answered, one error per identifier: got {body}"
+        reported_error_identifiers(&body),
+        Vec::<String>::new(),
+        "a list at the bound is answered, and an identifier with no recommendation is no \
+         error of the request: got {body}"
     );
     let past_the_bound: Vec<String> = (0..=MAX_REQUESTED_IDENTIFIERS)
         .map(|index| instance_arn(&format!("i-0c1b2c3d4e5f9{index:05}")))

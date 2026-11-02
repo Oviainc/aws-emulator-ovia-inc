@@ -41,8 +41,8 @@
 //! A service this endpoint has no analysis for — one the ECS store holds no active record of,
 //! one that does not run on Fargate, one whose task definition sets no task size, or one with
 //! no observation inside the look-back window — has no recommendation option to project onto,
-//! and this operation models no per-resource error list, so it is "a resource that is required
-//! for the action doesn't exist".
+//! so it is answered with the EMPTY list of projections ([`no_projection`]) rather than a
+//! failure.
 //!
 //! ## Shape of an operation
 //!
@@ -231,10 +231,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `serviceArn` is "The ARN that identifies the Amazon ECS service", in the form the
         // member documents; anything else cannot identify a service to project for. WHICH
         // service it names is not checked here: a well-formed ARN this endpoint has no
-        // analysis for is reported as a missing resource below, not refused. An ARN whose
-        // ACCOUNT field names another account asks about a service this service cannot report
-        // on, so it is refused with the crate's cross-account message rather than selecting
-        // nothing.
+        // recommendation for is answered with the empty list of projections below, not
+        // refused. An ARN whose ACCOUNT field names another account asks about a service this
+        // service cannot report on, so it is refused with the crate's cross-account message
+        // rather than selecting nothing.
         let Some(reference) = crate::state::parse_ecs_service_arn(&input.service_arn) else {
             return Err(invalid_parameter(format!(
                 "The value supplied for parameter serviceArn is not valid: {} is not the \
@@ -321,34 +321,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .then(|| crate::state::ecs_service_config(&inventory.lock(), &reference))
             .flatten();
         let Some(config) = config else {
-            return Err(no_recommendation(
-                "no Amazon ECS service with that Amazon Resource Name (ARN) exists",
-            ));
+            return Ok(no_projection());
         };
         // "Compute Optimizer generates recommendations for Amazon ECS services on Fargate."
         if crate::state::ecs_launch_type_of(&config)
             != Some(crate::state::ECS_SERVICE_LAUNCH_TYPE_FARGATE)
         {
-            return Err(no_recommendation(format!(
-                "Compute Optimizer generates Amazon ECS service recommendations for services \
-                 on {} only, and that service does not run on it",
-                crate::state::ECS_SERVICE_LAUNCH_TYPE_FARGATE
-            )));
+            return Ok(no_projection());
         }
         // A Fargate task definition carries task-level CPU and memory ("This field is required
         // for Fargate"); without them there is no current size to project a utilization off.
         let (Some(current_cpu), Some(current_memory)) = (config.cpu_units, config.memory_mib)
         else {
-            return Err(no_recommendation(
-                "the task definition of that service sets no task-level cpu and memory, so its \
-                 utilization cannot be sized",
-            ));
+            return Ok(no_projection());
         };
         if current_cpu <= 0 || current_memory <= 0 {
-            return Err(no_recommendation(format!(
-                "the task definition of that service sets a task-level cpu of {current_cpu} and \
-                 memory of {current_memory}, which is not a Fargate task size"
-            )));
+            return Ok(no_projection());
         }
 
         // The utilization the analysis observed over the look-back period in force, and the
@@ -362,11 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
         let Some((cpu, memory)) = observed.both() else {
-            return Err(no_recommendation(format!(
-                "no {} observation of it falls in the {look_back_period} look-back period, so \
-                 there is no utilization to analyse",
-                observed.missing_series().unwrap_or_default(),
-            )));
+            return Ok(no_projection());
         };
         let (option_cpu, option_memory) = crate::state::ecs_recommended_task_size(
             current_cpu,
@@ -433,24 +417,18 @@ fn invalid_parameter(message: String) -> GetECSServiceRecommendationProjectedMet
     .into()
 }
 
-/// The 404 `ResourceNotFoundException` for a request whose service has no recommendation to
-/// project metrics onto, stating `reason`.
+/// What this operation answers for a service it has no recommendation to project metrics
+/// onto: a successful EMPTY list of projections.
 ///
-/// This operation reports ONE resource's projection and models no per-resource error list
-/// (the `errors` channel `GetECSServiceRecommendations` reports the same reasons through), so
-/// a service the analysis has no input for is "a resource that is required for the action
-/// doesn't exist" here.
-fn no_recommendation(
-    reason: impl Into<String>,
-) -> GetECSServiceRecommendationProjectedMetricsError {
-    GetECSServiceRecommendationProjectedMetricsErrorModeled::ResourceNotFoundException(
-        ResourceNotFoundException {
-            message: Some(format!(
-                "Compute Optimizer has no Amazon ECS service recommendation for the resource \
-                 this identifier names: {}.",
-                reason.into()
-            )),
-        },
-    )
-    .into()
+/// `recommendedOptionProjectedMetrics` is an optional list whose member shape requires
+/// nothing, so the empty list is the well-formed answer for a service Compute Optimizer
+/// holds no recommendation for — nothing is recorded for it, no observation of it falls in
+/// the look-back period, or it is not a service the analysis supports. That is the steady
+/// state of a newly enrolled account, which has not accumulated enough metric history for
+/// any recommendation yet, so it is reported as no failure of the request: a caller charting
+/// the projection of each service renders an empty series rather than aborting.
+fn no_projection() -> GetECSServiceRecommendationProjectedMetricsOutput {
+    GetECSServiceRecommendationProjectedMetricsOutput {
+        recommended_option_projected_metrics: Some(Vec::new()),
+    }
 }

@@ -12,7 +12,7 @@
 //! read them back only over the wire. What is asserted is the RULE the read follows — report
 //! one recommendation per analysed database row, each member computed from the stored row and
 //! from the preferences in force for it, selected by resource, account and filter, paged at
-//! `maxResults`, with a requested resource that has no database row reported in `errors` —
+//! `maxResults`, with a requested resource that has no database row absent from the answer —
 //! over a table of inputs, never one recorded call.
 
 use std::collections::BTreeSet;
@@ -25,7 +25,7 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::
 };
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     service_state, AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY, DEFAULT_LOOK_BACK_PERIOD,
-    MAX_PAGE_SIZE, NO_RECOMMENDATION_CODE, SOURCE_TYPE_RDS_DB_INSTANCE,
+    MAX_PAGE_SIZE, SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 
 use crate::harness::{
@@ -802,27 +802,19 @@ async fn another_account_is_refused_and_its_analysed_database_is_reported_to_nob
 
     // Every read that could reach that row reports it to nobody, and each still reports the
     // caller's own databases. The last row also pins what a read that names that database's
-    // very ARN answers: nothing reported, and the row reported as a resource this service
-    // holds no recommendation for — exactly as an ARN nothing analysed is.
-    let no_recommendation = json!([{
-        "identifier": foreign_arn.clone(),
-        "code": NO_RECOMMENDATION_CODE,
-        "message": "Compute Optimizer has no Amazon Aurora or RDS database \
-                    recommendation for the resource this identifier names.",
-    }]);
-    let reads: Vec<(&str, Value, Vec<String>, Value)> = vec![
-        ("no selection", json!({}), own_databases.clone(), json!([])),
+    // very ARN answers: nothing reported, and no error — exactly as an ARN nothing analysed
+    // is answered.
+    let reads: Vec<(&str, Value, Vec<String>)> = vec![
+        ("no selection", json!({}), own_databases.clone()),
         (
             "the caller's own account",
             json!({"accountIds": [own_account()]}),
             own_databases.clone(),
-            json!([]),
         ),
         (
             "an empty account list",
             json!({"accountIds": []}),
             own_databases.clone(),
-            json!([]),
         ),
         (
             "the filter the foreign row's own finding would match",
@@ -832,16 +824,14 @@ async fn another_account_is_refused_and_its_analysed_database_is_reported_to_nob
                 own_databases[1].clone(),
                 own_databases[5].clone(),
             ],
-            json!([]),
         ),
         (
             "the foreign database's own ARN",
             json!({"resourceArns": [foreign_arn.clone()]}),
             Vec::new(),
-            no_recommendation,
         ),
     ];
-    for (case, request, wanted, wanted_errors) in reads {
+    for (case, request, wanted) in reads {
         let body = get_rds(&router, case, request).await;
         assert_eq!(
             reported_arns(&body),
@@ -849,8 +839,9 @@ async fn another_account_is_refused_and_its_analysed_database_is_reported_to_nob
             "case {case:?}: expected {wanted:?} and never {foreign_arn}, got {body}"
         );
         assert_eq!(
-            body["errors"], wanted_errors,
-            "case {case:?}: expected errors {wanted_errors}, got {body}"
+            body["errors"],
+            json!([]),
+            "case {case:?}: expected no errors entry, got {body}"
         );
     }
 
@@ -1266,18 +1257,13 @@ async fn a_request_outside_the_model_is_refused() {
     );
 }
 
-/// A requested resource this service holds no database recommendation for is reported in
-/// `errors`, whatever kind of resource its ARN names — a well-formed ARN is never refused.
+/// A requested resource this service holds no database recommendation for is ABSENT from the
+/// answer, whatever kind of resource its ARN names — a well-formed ARN is never refused, and
+/// never reported as a per-resource failure either.
 #[tokio::test]
-async fn a_requested_resource_with_no_database_recommendation_is_reported_in_errors() {
+async fn a_requested_resource_with_no_database_recommendation_is_absent() {
     let (router, _engine, corpus) = emulator_with_corpus().await;
     let stored = corpus[0].arn_in(REGION);
-    // The wire value of the code every entry carries, pinned here as the literal a client
-    // matches on.
-    assert_eq!(
-        NO_RECOMMENDATION_CODE, "ResourceNotFound",
-        "the no-recommendation code is part of the wire contract"
-    );
 
     // (case, the requested ARN)
     let rows: Vec<(&str, String)> = vec![
@@ -1313,13 +1299,9 @@ async fn a_requested_resource_with_no_database_recommendation_is_reported_in_err
         );
         assert_eq!(
             body["errors"],
-            json!([{
-                "identifier": requested,
-                "code": NO_RECOMMENDATION_CODE,
-                "message": "Compute Optimizer has no Amazon Aurora or RDS database \
-                            recommendation for the resource this identifier names.",
-            }]),
-            "case {case:?}: expected one error entry for {requested}, got {body}"
+            json!([]),
+            "case {case:?}: {requested} has no recommendation yet, which is no error of the \
+             request, got {body}"
         );
     }
 }
@@ -1391,10 +1373,16 @@ async fn the_reported_arn_names_the_region_the_endpoint_serves() {
             "region {region:?}: a well-formed ARN is never refused, got {status}: {body}"
         );
         assert_eq!(
-            body["errors"][0]["identifier"],
-            json!(elsewhere),
+            reported_arns(&body),
+            Vec::<String>::new(),
             "region {region:?}: a database of another region has no recommendation here, \
              got {body}"
+        );
+        assert_eq!(
+            body["errors"],
+            json!([]),
+            "region {region:?}: an ARN with no recommendation here is no error of the \
+             request, got {body}"
         );
     }
 }

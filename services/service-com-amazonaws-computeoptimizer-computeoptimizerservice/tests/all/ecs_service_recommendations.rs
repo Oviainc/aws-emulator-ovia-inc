@@ -19,9 +19,10 @@
 //!   names the pricing source that estimate came from;
 //! * the option's container recommendations are the task definition's own container
 //!   reservations carried to the recommended task size;
-//! * a service the analysis has no input for — unknown, not on Fargate, or with no
-//!   observation inside the window — is reported in `errors` rather than given an invented
-//!   recommendation.
+//! * a service the analysis has no input for is never given an invented recommendation: one
+//!   Compute Optimizer does not support (it does not run on Fargate, or its task definition
+//!   sets no task size) is reported in `errors`, and one the analysis has merely not reached
+//!   — unknown, or with no observation inside the window — is absent from the answer.
 //!
 //! Every row differs along what that rule generalises over: the observed utilization, the
 //! current task size and the form it is registered in, how many tasks the service keeps
@@ -619,8 +620,8 @@ async fn after_discount_savings_are_reported_only_when_the_preference_activates_
     }
 }
 
-/// One row of the no-analysis table: which analysis input is missing, and the error code
-/// the request is answered with for the service that misses it.
+/// One row of the no-analysis table: which analysis input is missing, and how the request
+/// is answered for the service that misses it.
 #[derive(Debug)]
 struct ErrorCase {
     name: &'static str,
@@ -630,11 +631,14 @@ struct ErrorCase {
     /// Which series to publish, and how long ago.
     publish: &'static [&'static str],
     age_secs: i64,
-    code: &'static str,
+    /// The `GetRecommendationError$code` the request is answered with, or `None` when the
+    /// service is simply ABSENT from the answer: `errors` carries the resources the
+    /// analysis REJECTED as unsupported, not the ones it has not analysed yet.
+    code: Option<&'static str>,
 }
 
 #[tokio::test]
-async fn a_service_with_no_analysis_input_is_reported_as_an_error() {
+async fn a_service_with_no_analysis_input_is_absent_or_reported_as_unsupported() {
     let (router, engine) = emulator_with_analysed_services_and_engine();
     opt_in(&router).await;
     let cluster = "errors";
@@ -649,7 +653,7 @@ async fn a_service_with_no_analysis_input_is_reported_as_an_error() {
             launch_type: None,
             publish: &[],
             age_secs: 3_600,
-            code: "ResourceNotFound",
+            code: None,
         },
         ErrorCase {
             name: "the service does not run on Fargate",
@@ -657,7 +661,7 @@ async fn a_service_with_no_analysis_input_is_reported_as_an_error() {
             launch_type: Some("EC2"),
             publish: &[CPU_METRIC, MEMORY_METRIC],
             age_secs: 3_600,
-            code: "UnsupportedResource",
+            code: Some("UnsupportedResource"),
         },
         ErrorCase {
             name: "nothing was ever published for the service",
@@ -665,7 +669,7 @@ async fn a_service_with_no_analysis_input_is_reported_as_an_error() {
             launch_type: Some("FARGATE"),
             publish: &[],
             age_secs: 3_600,
-            code: "InsufficientMetrics",
+            code: None,
         },
         ErrorCase {
             name: "only one of the two series was published",
@@ -673,7 +677,7 @@ async fn a_service_with_no_analysis_input_is_reported_as_an_error() {
             launch_type: Some("FARGATE"),
             publish: &[CPU_METRIC],
             age_secs: 3_600,
-            code: "InsufficientMetrics",
+            code: None,
         },
         ErrorCase {
             name: "every observation is older than the look-back period",
@@ -682,7 +686,7 @@ async fn a_service_with_no_analysis_input_is_reported_as_an_error() {
             publish: &[CPU_METRIC, MEMORY_METRIC],
             // 20 days back, which the default DAYS_14 window does not reach.
             age_secs: 20 * 86_400,
-            code: "InsufficientMetrics",
+            code: None,
         },
     ];
 
@@ -717,40 +721,54 @@ async fn a_service_with_no_analysis_input_is_reported_as_an_error() {
             "case {case:?}: expected no recommendation to be invented, got {body}"
         );
         let errors = list(&body, "errors", case);
-        assert_eq!(
-            errors.len(),
-            1,
-            "case {case:?}: expected exactly one error entry, got {body}"
-        );
-        assert_eq!(
-            errors[0]["identifier"].as_str(),
-            Some(arn.as_str()),
-            "case {case:?}: expected the error to name {arn}, got {body}"
-        );
-        assert_eq!(
-            errors[0]["code"].as_str(),
-            Some(test.code),
-            "case {case:?}: expected the code {}, got {body}",
-            test.code
-        );
-        assert!(
-            errors[0]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(&arn)),
-            "case {case:?}: expected a message naming {arn}, got {body}"
-        );
+        match test.code {
+            Some(code) => {
+                assert_eq!(
+                    errors.len(),
+                    1,
+                    "case {case:?}: expected exactly one error entry, got {body}"
+                );
+                assert_eq!(
+                    errors[0]["identifier"].as_str(),
+                    Some(arn.as_str()),
+                    "case {case:?}: expected the error to name {arn}, got {body}"
+                );
+                assert_eq!(
+                    errors[0]["code"].as_str(),
+                    Some(code),
+                    "case {case:?}: expected the code {code}, got {body}"
+                );
+                assert!(
+                    errors[0]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(&arn)),
+                    "case {case:?}: expected a message naming {arn}, got {body}"
+                );
+            }
+            None => assert!(
+                errors.is_empty(),
+                "case {case:?}: a service with no recommendation yet is absent from the \
+                 answer rather than an error of the request, got {body}"
+            ),
+        }
     }
 
-    // `maxResults` bounds the whole response: a page of services that have no analysis
-    // carries at most that many error entries, plus a token for the rest.
-    let unanalysable: Vec<String> = ["unobserved", "cpuonly", "stale"]
+    // `maxResults` bounds the whole response: a page of services Compute Optimizer does not
+    // support carries at most that many error entries, plus a token for the rest.
+    let unsupported = ["notfargateone", "notfargatetwo", "notfargatethree"];
+    for service in unsupported {
+        let family = format!("{service}family");
+        register_task_definition(&router, &family, "512", "1024", service).await;
+        create_service(&router, cluster, service, &family, "EC2", 1, service).await;
+    }
+    let requested: Vec<String> = unsupported
         .iter()
         .map(|service| service_arn(cluster, service))
         .collect();
     let (status, body) = call(
         &router,
         "GetECSServiceRecommendations",
-        json!({ "serviceArns": unanalysable, "maxResults": 1 }),
+        json!({ "serviceArns": requested, "maxResults": 1 }),
     )
     .await;
     assert_eq!(
@@ -869,8 +887,9 @@ async fn a_malformed_request_is_refused_and_an_unenrolled_account_has_no_analysi
         );
     }
 
-    // A well-formed request for a service nothing holds is NOT a refusal: it is an error
-    // entry about that one service.
+    // A well-formed request for a service nothing holds is NOT a refusal, and not an error
+    // entry either: the service has no recommendation yet, so it is absent from a successful
+    // empty answer.
     let (status, body) = call(
         &router,
         "GetECSServiceRecommendations",
@@ -881,10 +900,13 @@ async fn a_malformed_request_is_refused_and_an_unenrolled_account_has_no_analysi
         status, 200,
         "a well-formed ARN for an unknown service: expected 200, got {status}: {body}"
     );
-    assert_eq!(
-        list(&body, "errors", "unknown service").len(),
-        1,
-        "a well-formed ARN for an unknown service: expected one error entry, got {body}"
+    assert!(
+        list(&body, "ecsServiceRecommendations", "unknown service").is_empty(),
+        "a well-formed ARN for an unknown service: expected no recommendation, got {body}"
+    );
+    assert!(
+        list(&body, "errors", "unknown service").is_empty(),
+        "a well-formed ARN for an unknown service: expected no error entry, got {body}"
     );
 }
 
@@ -1058,7 +1080,7 @@ async fn only_the_services_of_the_requested_region_are_analysed() {
         );
 
         // And an ARN naming another region names no service of THIS endpoint, so it is
-        // reported in the error channel exactly as an ARN naming nothing is.
+        // absent from the answer exactly as an ARN naming nothing is.
         let foreign = format!("arn:aws:ecs:{region}:{ACCOUNT}:service/{cluster}/checkout");
         let case = format!("an ARN naming {region}");
         let (status, body) = call(
@@ -1075,21 +1097,9 @@ async fn only_the_services_of_the_requested_region_are_analysed() {
             list(&body, "ecsServiceRecommendations", &case).is_empty(),
             "case {case:?}: expected no recommendation, got {body}"
         );
-        let errors = list(&body, "errors", &case);
-        assert_eq!(
-            errors.len(),
-            1,
-            "case {case:?}: expected one error entry, got {body}"
-        );
-        assert_eq!(
-            errors[0]["identifier"].as_str(),
-            Some(foreign.as_str()),
-            "case {case:?}: expected the error to name {foreign}, got {body}"
-        );
-        assert_eq!(
-            errors[0]["code"].as_str(),
-            Some("ResourceNotFound"),
-            "case {case:?}: expected ResourceNotFound, got {body}"
+        assert!(
+            list(&body, "errors", &case).is_empty(),
+            "case {case:?}: expected no error entry for {foreign}, got {body}"
         );
     }
 }

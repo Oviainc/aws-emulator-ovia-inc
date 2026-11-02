@@ -13,7 +13,7 @@
 //! member computed from the stored analysis, the ARN naming the Region the request addressed,
 //! an answer only for the one account this emulator presents, selection by resource, account
 //! and filter, sorting on the requested savings dimension, paging at `maxResults`, and a
-//! requested resource with no analysis reported in `errors` — over a table of inputs, never
+//! requested resource with no analysis absent from the answer — over a table of inputs, never
 //! one recorded call.
 
 use std::sync::Arc;
@@ -27,7 +27,6 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
     idle_savings_value, service_state, IdleResourceAnalysis, ANALYSIS_DELAY,
     DIMENSION_SAVINGS_VALUE, DIMENSION_SAVINGS_VALUE_AFTER_DISCOUNT, IDLE_MAX_PAGE_SIZE,
-    NO_RECOMMENDATION_CODE,
 };
 
 use crate::harness::{call, call_in_region, emulator_with_engine, error_code, opt_in};
@@ -499,7 +498,7 @@ async fn a_reported_arn_names_the_region_the_request_addressed() {
     }
 
     // A resource named by the ARN of ANOTHER Region's endpoint is not a resource this
-    // endpoint reports, so it is reported as having no recommendation here.
+    // endpoint reports, so it is simply absent from the answer here.
     let elsewhere = recorded_instance_arn(OTHER_REGION);
     let body = get_idle(
         &router,
@@ -513,9 +512,9 @@ async fn a_reported_arn_names_the_region_the_request_addressed() {
         "the {OTHER_REGION} resource is not reported by the {REGION} endpoint, got {body}"
     );
     assert_eq!(
-        body["errors"][0]["identifier"],
-        json!(elsewhere),
-        "the request's own ARN is what the error entry identifies, got {body}"
+        body["errors"],
+        json!([]),
+        "an ARN this endpoint holds no recommendation for is no error of the request, got {body}"
     );
     assert_eq!(
         stored_count(&engine),
@@ -983,30 +982,25 @@ async fn paging_walks_the_selection_exactly_once() {
     );
 }
 
-/// `errors` is "a list of resources that doesn't have idle recommendations": every resource
-/// the request named that the analysis holds nothing for, identified by its ARN and carrying
-/// the `IdleRecommendationResourceType` the ARN names.
+/// A resource the request names that the analysis holds nothing for is simply ABSENT from the
+/// answer: the call succeeds, the recommendation list carries only the analysed resources, and
+/// `errors` stays empty — it lists resources an idle analysis rejected, not the ones it has
+/// not reached.
 ///
 /// The rows span the ARN forms of the model's own `IdleRecommendationResourceType` value set,
 /// including resource types the analysis covers no resource of, plus an ARN whose namespace
-/// names no idle-recommendable resource — whose type is omitted rather than invented.
+/// names no idle-recommendable resource.
 #[tokio::test]
-async fn a_requested_resource_with_no_recommendation_is_reported_in_errors() {
+async fn a_requested_resource_with_no_recommendation_is_absent_rather_than_an_error() {
     let (router, _engine) = analysed_emulator().await;
     let analysed = seeded()[0].arn_in(REGION);
-    // The wire value of the code every entry carries, pinned here as the literal a client
-    // matches on.
-    assert_eq!(
-        NO_RECOMMENDATION_CODE, "ResourceNotFound",
-        "the no-recommendation code is part of the wire contract"
-    );
 
     // Every ARN below names the caller's own account: an ARN of another account is refused
-    // outright rather than reported as missing a recommendation.
+    // outright rather than answered with an empty result.
     let own = |service: &str, resource: &str| arn(service, REGION, own_account(), resource);
 
-    // (case, the requested ARN, the resourceType expected on the error entry)
-    let rows: Vec<(&str, String, Value)> = vec![
+    // (case, the requested ARN)
+    let rows: Vec<(&str, String)> = vec![
         (
             "an Auto Scaling group",
             own(
@@ -1014,96 +1008,55 @@ async fn a_requested_resource_with_no_recommendation_is_reported_in_errors() {
                 "autoScalingGroup:12345678-1234-1234-1234-123456789012:\
                  autoScalingGroupName/web-tier",
             ),
-            json!("AutoScalingGroup"),
         ),
-        (
-            "an RDS DB instance",
-            own("rds", "db:orders"),
-            json!("RDSDBInstance"),
-        ),
+        ("an RDS DB instance", own("rds", "db:orders")),
         (
             "a DocumentDB cluster the analysis never looked at, which carries the rds namespace",
             own("rds", "cluster:docdb-analytics"),
-            json!("DocumentDBCluster"),
         ),
         (
             "an ElastiCache cluster",
             own("elasticache", "cluster:sessions"),
-            json!("ElastiCacheCluster"),
         ),
-        (
-            "a MemoryDB cluster",
-            own("memorydb", "cluster/leaderboard"),
-            json!("MemoryDBCluster"),
-        ),
-        (
-            "a WorkSpace",
-            own("workspaces", "workspace/ws-0123456789"),
-            json!("WorkSpaces"),
-        ),
-        (
-            "an ECS service",
-            own("ecs", "service/payments/checkout"),
-            json!("ECSService"),
-        ),
+        ("a MemoryDB cluster", own("memorydb", "cluster/leaderboard")),
+        ("a WorkSpace", own("workspaces", "workspace/ws-0123456789")),
+        ("an ECS service", own("ecs", "service/payments/checkout")),
         (
             "an EC2 instance the analysis never looked at",
             own("ec2", "instance/i-00000000000000000"),
-            json!("EC2Instance"),
         ),
         (
             // An ARN whose account field is empty names no other account, so it is not
             // refused — it is simply a resource no idle recommendation covers.
             "an ARN whose namespace names no idle-recommendable resource",
             "arn:aws:s3:::reports-bucket".to_string(),
-            Value::Null,
         ),
     ];
 
-    for (case, requested, wanted_type) in rows {
+    for (case, requested) in rows {
         let body = get_idle(
             &router,
             case,
             json!({"resourceArns": [requested.clone(), analysed.clone()]}),
         )
         .await;
-        // The analysed resource is reported as a recommendation, never as an error.
+        // The analysed resource is reported as a recommendation; the one with none is
+        // reported nowhere.
         assert_eq!(
             reported_arns(&body),
             vec![analysed.clone()],
-            "case {case:?}: expected the analysed recommendation, got {body}"
-        );
-        let errors = body["errors"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: expected a list of errors, got {body}"));
-        assert_eq!(
-            errors.len(),
-            1,
-            "case {case:?}: exactly the resource with no recommendation, got {body}"
-        );
-        let reported = &errors[0];
-        assert_eq!(
-            reported["identifier"],
-            json!(requested),
-            "case {case:?}: the entry must identify the requested resource, got {reported}"
+            "case {case:?}: expected only the analysed recommendation, got {body}"
         );
         assert_eq!(
-            reported["code"],
-            json!(NO_RECOMMENDATION_CODE),
-            "case {case:?}: expected the no-recommendation code, got {reported}"
-        );
-        assert!(
-            reported["message"].is_string(),
-            "case {case:?}: the entry must say why, got {reported}"
-        );
-        assert_eq!(
-            reported["resourceType"], wanted_type,
-            "case {case:?}: expected resourceType {wanted_type}, got {reported}"
+            body["errors"],
+            json!([]),
+            "case {case:?}: a resource with no idle recommendation is no error of the \
+             request, got {body}"
         );
     }
 
-    // A resource the analysis covers puts nothing in `errors`, whatever else the request
-    // names, and a filter that selects it away still leaves it out of `errors`.
+    // A resource the analysis covers puts nothing in `errors` either, whatever else the
+    // request names, and a filter that selects it away still leaves `errors` empty.
     for (case, request) in [
         (
             "only analysed resources",

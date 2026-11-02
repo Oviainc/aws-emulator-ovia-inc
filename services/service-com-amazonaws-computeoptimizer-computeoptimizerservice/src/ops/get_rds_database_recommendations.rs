@@ -15,8 +15,8 @@
 //! codes, performance risk, database configuration and monthly costs) and from the
 //! preferences stored for that database, and a member the analysis recorded nothing for is
 //! omitted rather than filled in. A requested resource the catalog holds no database row for
-//! is reported in the response's `errors` list, which is what `GetRecommendationError`
-//! describes ("Describes an error experienced when getting recommendations").
+//! is simply absent from the answer, which stays a successful empty result rather than a
+//! per-resource failure of the request.
 //!
 //! The rows it reports are those of the ONE account it answers for: `accountIds` names a
 //! member account of an organization, which this emulator has none of, so a well-formed id
@@ -215,8 +215,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `resourceArns`: "The ARN that identifies the Amazon Aurora or RDS database" — so
         // each value is an ARN. WHICH resource an ARN names is not checked here: a
         // well-formed ARN this service holds no database recommendation for — including one
-        // naming a resource of an account it does not answer for — is reported in `errors`
-        // below, not refused.
+        // naming a resource of an account it does not answer for — selects nothing, and is
+        // not refused.
         let resource_arns = input.resource_arns.clone().unwrap_or_default();
         if let Some(value) = resource_arns
             .iter()
@@ -334,31 +334,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // Every ARN the request named that this service holds no database recommendation
-        // for, whatever the filters select. Reported with each page, because it describes
-        // the request rather than the page. A row this account does not own is no
-        // recommendation of this request's, so an ARN naming one is reported here exactly as
-        // an ARN nothing analysed is — never answered with another account's row.
-        let errors: Vec<GetRecommendationError> = resource_arns
-            .iter()
-            .filter(|arn| {
-                !store.visible_analysed_resources().any(|resource| {
-                    resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE
-                        && resource.account_id == account_id
-                        && resource.arn_in(&region) == **arn
-                })
-            })
-            .map(|arn| GetRecommendationError {
-                identifier: Some(arn.clone()),
-                code: Some(crate::state::NO_RECOMMENDATION_CODE.to_string()),
-                message: Some(
-                    "Compute Optimizer has no Amazon Aurora or RDS database recommendation for \
-                     the resource this identifier names."
-                        .to_string(),
-                ),
-            })
-            .collect();
-
         // One page of the selected sequence. A next token is handed out only when the
         // sequence continues past this page, and it resumes exactly where this page stopped.
         let (page, next_token) =
@@ -367,7 +342,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetRDSDatabaseRecommendationsOutput {
             next_token,
             rds_db_recommendations: Some(page),
-            errors: Some(errors),
+            // `errors` describes "errors of the request": the databases an analysis REJECTED,
+            // not the ones it has not reached. An ARN this service holds no database
+            // recommendation for — because nothing analysed it, or because the row belongs to
+            // another account — is simply absent from the answer, which stays a successful
+            // empty result rather than a per-resource failure of the request. This emulator
+            // analyses the databases in `crate::state` and classifies none of them as
+            // unsupported, so it reports no error.
+            errors: Some(Vec::new()),
         })
     }
 }

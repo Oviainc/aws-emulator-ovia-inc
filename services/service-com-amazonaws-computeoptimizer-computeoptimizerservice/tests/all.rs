@@ -105,5 +105,7 @@ mod summary_resource_type_surface;
 mod timestamp_probe;
 #[path = "all/tracked_resource_type_summaries.rs"]
 mod tracked_resource_type_summaries;
+#[path = "all/unanalysed_resources_are_empty_results.rs"]
+mod unanalysed_resources_are_empty_results;
 #[path = "all/unrestricted_preference_resource_types.rs"]
 mod unrestricted_preference_resource_types;

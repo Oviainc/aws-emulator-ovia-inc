@@ -15,8 +15,7 @@
 //! type or reports ONE named resource's, and so in how "no analysis yet" reaches a client —
 //! an empty list from a lister, counts of zero from the roll-up, whose entries are the
 //! resource types the service reports recommendations for and so exist as soon as the
-//! account is enrolled, and the modelled `ResourceNotFoundException` from a reader of one
-//! resource.
+//! account is enrolled, and an empty list of projections from a reader of one resource.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,10 +46,12 @@ enum NoAnalysis {
     /// at zero, which is how a caller tells an enrolled account with nothing analysed apart
     /// from an account with no such surface.
     ZeroCounts(&'static str),
-    /// The reader reports ONE named resource's analysis and models no per-resource error
-    /// list, so a resource with no analysis is "a resource that is required for the action
-    /// doesn't exist" (HTTP 404 `ResourceNotFoundException`).
-    NotFound,
+    /// The reader reports ONE named resource's analysis, so a resource with no analysis has
+    /// no projection to report: its `recommendedOptionProjectedMetrics` is an optional list
+    /// with no required member, so the answer is that list, empty — a successful response
+    /// rather than a failure, which is how a caller tells "nothing analysed yet" apart from
+    /// a request it got wrong.
+    EmptyProjection,
 }
 
 /// One reader of the account's analysis: the operation, the request that drives it, and how
@@ -102,7 +103,7 @@ fn readers(instance_arn: &str, database_arn: &str) -> Vec<Reader> {
                 "startTime": WINDOW_START,
                 "endTime": WINDOW_START + PERIOD,
             }),
-            no_analysis: NoAnalysis::NotFound,
+            no_analysis: NoAnalysis::EmptyProjection,
         },
         Reader {
             operation: "GetRDSDatabaseRecommendationProjectedMetrics",
@@ -113,7 +114,7 @@ fn readers(instance_arn: &str, database_arn: &str) -> Vec<Reader> {
                 "startTime": WINDOW_START,
                 "endTime": WINDOW_START + PERIOD,
             }),
-            no_analysis: NoAnalysis::NotFound,
+            no_analysis: NoAnalysis::EmptyProjection,
         },
     ]
 }
@@ -259,16 +260,17 @@ async fn every_reader_of_the_analysis_waits_for_the_enrollment_and_the_analysis(
                     assert_counts_are_zero(&case, entry);
                 }
             }
-            NoAnalysis::NotFound => {
+            NoAnalysis::EmptyProjection => {
                 assert_eq!(
-                    status, 404,
-                    "case {case:?}: the analysis is not due yet, so the resource has none, \
-                     expected 404, got {status}: {body}"
+                    status, 200,
+                    "case {case:?}: a resource with nothing analysed is not a failed \
+                     request, expected 200, got {status}: {body}"
                 );
                 assert_eq!(
-                    error_code(&body),
-                    "ResourceNotFoundException",
-                    "case {case:?}: expected ResourceNotFoundException, got {body}"
+                    items(&case, "recommendedOptionProjectedMetrics", &body),
+                    Vec::<Value>::new(),
+                    "case {case:?}: the analysis is not due yet, so there is nothing to \
+                     project, got {body}"
                 );
             }
         }
@@ -306,7 +308,7 @@ async fn every_reader_of_the_analysis_waits_for_the_enrollment_and_the_analysis(
                     "case {case:?}: once the analysis is due the roll-up counts it, got {body}"
                 );
             }
-            NoAnalysis::NotFound => assert!(
+            NoAnalysis::EmptyProjection => assert!(
                 !items(&case, "recommendedOptionProjectedMetrics", &body).is_empty(),
                 "case {case:?}: once the analysis is due the projection is served, got {body}"
             ),
@@ -326,9 +328,9 @@ async fn every_reader_of_the_analysis_waits_for_the_enrollment_and_the_analysis(
 }
 
 /// The two readers of ONE analysed resource agree about whether its analysis exists: while
-/// the analysis is not due the resource is missing to the projected-metrics reader and absent
-/// from its lister, and once it is due both report it. A reader that answered from the store
-/// without the gate would disagree with its own lister.
+/// the analysis is not due the resource is absent from its lister and its projected-metrics
+/// reader reports no projection for it, and once it is due both report it. A reader that
+/// answered from the store without the gate would disagree with its own lister.
 #[tokio::test]
 async fn the_two_readers_of_one_resource_agree_about_whether_its_analysis_exists() {
     let (router, engine) = emulator_with_engine();
@@ -376,8 +378,14 @@ async fn the_two_readers_of_one_resource_agree_about_whether_its_analysis_exists
             .clone();
         let (status, metrics) = call(&router, projected, request).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: a resource whose analysis is not due is missing, got {status}: \
+            status, 200,
+            "case {case:?}: a resource whose analysis is not due is no failed request, got \
+             {status}: {metrics}"
+        );
+        assert_eq!(
+            items(&case, "recommendedOptionProjectedMetrics", &metrics),
+            Vec::<Value>::new(),
+            "case {case:?}: a resource whose analysis is not due has no projection, got \
              {metrics}"
         );
     }

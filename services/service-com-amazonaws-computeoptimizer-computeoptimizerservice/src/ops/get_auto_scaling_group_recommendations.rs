@@ -327,22 +327,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|(_, arn)| requested_arns.is_empty() || requested_arns.contains(arn))
             .collect();
 
-        // An identifier the request named that this analysis holds no recommendation for
-        // is reported in `errors` — "an error is returned if you request recommendations
-        // for an unsupported Auto Scaling group" — rather than silently omitted, so a
-        // caller can tell "no recommendation for this group" from "not asked about".
-        let errors: Vec<GetRecommendationError> = requested_arns
-            .iter()
-            .filter(|arn| !for_account.iter().any(|(_, group_arn)| group_arn == *arn))
-            .map(|arn| GetRecommendationError {
-                identifier: Some(arn.clone()),
-                code: Some(NO_RECOMMENDATION_CODE.to_string()),
-                message: Some(format!(
-                    "Compute Optimizer has no Auto Scaling group recommendation for {arn}.",
-                )),
-            })
-            .collect();
-
         // Each surviving group with the preferences its recommendation is generated
         // under: the account's stored preferences resolved for that group's ARN.
         let resolved: Vec<(
@@ -404,20 +388,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetAutoScalingGroupRecommendationsOutput {
             next_token,
             auto_scaling_group_recommendations: Some(recommendations),
-            errors: Some(errors),
+            // `errors` describes "errors of the request": "an error is returned if you
+            // request recommendations for an unsupported Auto Scaling group" — the groups
+            // an analysis REJECTED, not the ones it has not reached. An identifier this
+            // service holds no recommendation for is one Compute Optimizer has not analysed
+            // yet, which is the steady state of a newly enrolled account, so it is simply
+            // absent from the answer and reported as no failure of this request. This
+            // emulator analyses the groups in `crate::state` and classifies none of them as
+            // unsupported, so it reports no error.
+            errors: Some(Vec::new()),
         })
     }
 }
-
-/// The `code` an `errors` entry carries for an identifier this service holds no
-/// recommendation for.
-///
-/// `GetRecommendationError$code` is "the error code", a free-form string the model names
-/// no vocabulary for, so this is the emulator's own stable code — the same one this
-/// service's other per-identifier error reports
-/// ([`crate::state::NO_RECOMMENDATION_CODE`]), so a client sees one spelling of one
-/// condition across the service. The requirement the entry carries is its `identifier`.
-const NO_RECOMMENDATION_CODE: &str = crate::state::NO_RECOMMENDATION_CODE;
 
 /// Refuse a request this operation cannot act on: "the value supplied for the input
 /// parameter is out of range or not valid" (HTTP 400).

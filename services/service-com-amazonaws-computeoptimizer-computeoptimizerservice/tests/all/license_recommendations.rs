@@ -549,17 +549,18 @@ async fn recommendations_are_reported_for_the_region_the_request_addressed() {
             "case {region:?}: {foreign} is not an instance this endpoint observes, got {body}"
         );
         assert_eq!(
-            body["errors"][0]["identifier"].as_str(),
-            Some(foreign.as_str()),
-            "case {region:?}: a resource with no recommendation is reported in errors, got {body}"
+            body["errors"],
+            json!([]),
+            "case {region:?}: a resource with no recommendation is absent from the answer, not \
+             an error of the request, got {body}"
         );
     }
 }
 
 /// `resourceArns` and `accountIds` select WHAT is reported: the named instances of the named
-/// account, a well-formed ARN the service holds no license recommendation for is reported in
-/// `errors` rather than refused, and a value that is not an ARN — or more than one account
-/// id — is refused.
+/// account, a well-formed ARN the service holds no license recommendation for is absent from
+/// the answer rather than refused or reported as an error, and a value that is not an ARN —
+/// or more than one account id — is refused.
 #[tokio::test]
 async fn resource_arns_and_account_ids_select_what_is_reported() {
     let router = emulator();
@@ -568,8 +569,8 @@ async fn resource_arns_and_account_ids_select_what_is_reported() {
     let all = reported_arns(&recommendations(&router, json!({})).await);
     let known = instance_arn(OVER_PROVISIONED_LICENSE_INCLUDED);
     let also_known = instance_arn(ALREADY_OPTIMIZED);
-    // An EC2 instance ARN this service observes no license on: well-formed, so it is
-    // reported as a resource without a recommendation.
+    // An EC2 instance ARN this service observes no license on: well-formed, so it selects
+    // nothing rather than being refused.
     let unknown_instance = instance_arn("i-0a1b2c3d4e5f7ffff");
     // A well-formed ARN of another kind of resource entirely.
     let not_an_instance = format!(
@@ -579,40 +580,31 @@ async fn resource_arns_and_account_ids_select_what_is_reported() {
 
     // Rows: the member absent, empty, one ARN, two ARNs, an unobserved instance, and an ARN
     // of another resource kind.
-    let cases: [(&str, Value, Vec<String>, Vec<String>); 6] = [
-        ("absent", json!({}), all.clone(), Vec::new()),
-        (
-            "empty",
-            json!({"resourceArns": []}),
-            all.clone(),
-            Vec::new(),
-        ),
+    let cases: [(&str, Value, Vec<String>); 6] = [
+        ("absent", json!({}), all.clone()),
+        ("empty", json!({"resourceArns": []}), all.clone()),
         (
             "one ARN",
             json!({"resourceArns": [known.clone()]}),
             vec![known.clone()],
-            Vec::new(),
         ),
         (
             "two ARNs",
             json!({"resourceArns": [known.clone(), also_known.clone()]}),
             vec![known.clone(), also_known.clone()],
-            Vec::new(),
         ),
         (
             "an unobserved instance",
             json!({"resourceArns": [unknown_instance.clone()]}),
             Vec::new(),
-            vec![unknown_instance.clone()],
         ),
         (
             "another resource kind",
             json!({"resourceArns": [not_an_instance.clone()]}),
             Vec::new(),
-            vec![not_an_instance.clone()],
         ),
     ];
-    for (case, request, expected_arns, expected_errors) in cases {
+    for (case, request, expected_arns) in cases {
         let body = recommendations(&router, request).await;
         let mut reported = reported_arns(&body);
         let mut expected = expected_arns.clone();
@@ -622,24 +614,12 @@ async fn resource_arns_and_account_ids_select_what_is_reported() {
             reported, expected,
             "case {case:?}: expected exactly the named instances' recommendations, got {body}"
         );
-        let errors: Vec<String> = body["errors"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|error| {
-                assert_eq!(
-                    error["code"].as_str(),
-                    Some("ResourceNotFound"),
-                    "case {case:?}: an error says why the resource has no recommendation, got \
-                     {error}"
-                );
-                error["identifier"].as_str().unwrap_or_default().to_string()
-            })
-            .collect();
+        // A named resource with no license recommendation is one the analysis has not
+        // reached: absent from the answer, and no per-resource failure of the request.
         assert_eq!(
-            errors, expected_errors,
-            "case {case:?}: expected the named resources without a recommendation, got {body}"
+            body["errors"],
+            json!([]),
+            "case {case:?}: expected no errors entry, got {body}"
         );
     }
 

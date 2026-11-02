@@ -21,7 +21,9 @@
 //!   own traffic is projected by no option;
 //! * `stat` selects which observed statistic is projected, and the CPU vendor architecture
 //!   preference selects which candidates are projected at all;
-//! * an instance the analysis would not move has no option, so there is nothing to project.
+//! * an instance the analysis would not move has no option, so there is nothing to project;
+//! * an instance this endpoint holds no analysis of has no projection either, which is a
+//!   successful empty list rather than a failure.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -852,18 +854,6 @@ async fn a_request_that_is_not_a_series_is_refused() {
             400,
             "InvalidParameterValueException",
         ),
-        (
-            "an instance this service holds no analysis of",
-            request(
-                "i-0b1b2c3d4e5f79999",
-                "Maximum",
-                3_600,
-                window.0,
-                window.1,
-            ),
-            404,
-            "ResourceNotFoundException",
-        ),
     ];
 
     for (case, body, status_wanted, code) in rows {
@@ -884,6 +874,28 @@ async fn a_request_that_is_not_a_series_is_refused() {
             "case {case:?}: expected {code}, got {response}"
         );
     }
+
+    // An instance this service holds no analysis of has no projection to report, which is a
+    // SUCCESSFUL empty list rather than a failure: a caller charting the projection of each
+    // instance renders an empty series instead of aborting.
+    let case = "an instance this service holds no analysis of";
+    let response = projected(
+        &router,
+        case,
+        request(
+            "i-0b1b2c3d4e5f79999",
+            "Maximum",
+            3_600,
+            window.0,
+            window.1,
+        ),
+    )
+    .await;
+    assert_eq!(
+        response["recommendedOptionProjectedMetrics"],
+        json!([]),
+        "case {case:?}: expected an empty list of projections, got {response}"
+    );
 
     // The ceiling itself is served: the bound is on the response, not on the request's shape.
     let case = "the ceiling itself";
@@ -911,7 +923,7 @@ async fn a_request_that_is_not_a_series_is_refused() {
 
 /// Compute Optimizer is a REGIONAL service: the endpoint a request addresses is the region
 /// whose resources it reports on, so an instance named by the ARN of another region is one
-/// this endpoint holds no analysis for.
+/// this endpoint holds no analysis for — and is answered with the empty list of projections.
 #[tokio::test]
 async fn an_instance_of_another_region_is_not_this_endpoints() {
     let (router, _engine) = emulator_with_corpus().await;
@@ -923,10 +935,11 @@ async fn an_instance_of_another_region_is_not_this_endpoints() {
         WINDOW_START + 3_600,
     );
 
-    for (case, region, status_wanted) in [
-        ("the region the instance was read in", REGION, 200u16),
-        ("another commercial region", "eu-west-1", 404),
-        ("a region on another continent", "ap-southeast-2", 404),
+    // (case, the region the read is made at, whether that endpoint holds the analysis)
+    for (case, region, analysed_here) in [
+        ("the region the instance was read in", REGION, true),
+        ("another commercial region", "eu-west-1", false),
+        ("a region on another continent", "ap-southeast-2", false),
     ] {
         let (status, response) = call_in_region(
             &router,
@@ -936,8 +949,14 @@ async fn an_instance_of_another_region_is_not_this_endpoints() {
         )
         .await;
         assert_eq!(
-            status, status_wanted,
-            "case {case:?}: at {region}, expected {status_wanted}, got {status}: {response}"
+            status, 200,
+            "case {case:?}: at {region}, expected 200, got {status}: {response}"
+        );
+        assert_eq!(
+            response["recommendedOptionProjectedMetrics"] != json!([]),
+            analysed_here,
+            "case {case:?}: at {region}, the projection is reported exactly where the \
+             analysis is held, got {response}"
         );
     }
 }
@@ -974,16 +993,12 @@ async fn the_read_waits_for_the_enrollment_and_the_analysis() {
     );
 
     opt_in(&router).await;
-    let (status, response) = call(
-        &router,
-        "GetEC2RecommendationProjectedMetrics",
-        body.clone(),
-    )
-    .await;
+    let response = projected(&router, "just opted in", body.clone()).await;
     assert_eq!(
-        status, 404,
+        response["recommendedOptionProjectedMetrics"],
+        json!([]),
         "just opted in: the analysis is not due yet, so there is nothing to project, got \
-         {status}: {response}"
+         {response}"
     );
 
     tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;

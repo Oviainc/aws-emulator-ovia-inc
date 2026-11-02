@@ -18,7 +18,8 @@
 //!   as both its upper and its lower bound;
 //! * `stat` selects which observed statistic is projected;
 //! * a service this endpoint has no analysis for — unknown, not on Fargate, or with no
-//!   observation inside the window — has no option to project onto.
+//!   observation inside the window — has no option to project onto, so it is answered with
+//!   the empty list of projections.
 //!
 //! Every row differs along what that rule generalises over: the observed utilization, the
 //! current task size and the form it is registered in, the direction the analysis sizes the
@@ -410,10 +411,11 @@ async fn the_projection_agrees_with_the_recommendation_reader() {
 }
 
 /// A request this service cannot answer a series for is refused with the modelled error for
-/// the reason it cannot: a parameter outside what the member documents is a 400, and a
-/// service this endpoint holds no analysis for is a 404.
+/// the reason it cannot: a parameter outside what the member documents is a 400. A service
+/// this endpoint holds no recommendation for is NOT a refusal — it is answered with the
+/// empty list of projections.
 #[tokio::test]
-async fn a_request_with_no_series_to_report_is_refused() {
+async fn a_request_with_no_series_to_report_is_refused_or_answered_empty() {
     let router = emulator_with_cases().await;
     let analysed = cases()[0].service;
     // A service that exists but is not one Compute Optimizer analyses: it does not run on
@@ -515,30 +517,6 @@ async fn a_request_with_no_series_to_report_is_refused() {
             400,
             "InvalidParameterValueException",
         ),
-        (
-            "a service the ECS store holds no record of",
-            request(
-                "neverexisted",
-                "Maximum",
-                3_600,
-                WINDOW_START,
-                WINDOW_START + 3_600,
-            ),
-            404,
-            "ResourceNotFoundException",
-        ),
-        (
-            "a service that does not run on Fargate",
-            request("onec2", "Maximum", 3_600, WINDOW_START, WINDOW_START + 3_600),
-            404,
-            "ResourceNotFoundException",
-        ),
-        (
-            "a service with no observation in the look-back period",
-            request("quiet", "Maximum", 3_600, WINDOW_START, WINDOW_START + 3_600),
-            404,
-            "ResourceNotFoundException",
-        ),
     ];
 
     for (row, body, status_wanted, code) in rows {
@@ -556,6 +534,31 @@ async fn a_request_with_no_series_to_report_is_refused() {
             error_code(&response),
             code,
             "case {row:?}: expected {code}, got {response}"
+        );
+    }
+
+    // A service this endpoint holds no recommendation for — nothing recorded for it, one
+    // Compute Optimizer does not support, or one with no observation in the window — has no
+    // projection to report, which is a SUCCESSFUL empty list rather than a failure: a caller
+    // charting each service's projection renders an empty series instead of aborting.
+    for (row, service) in [
+        ("a service the ECS store holds no record of", "neverexisted"),
+        ("a service that does not run on Fargate", "onec2"),
+        (
+            "a service with no observation in the look-back period",
+            "quiet",
+        ),
+    ] {
+        let response = projected_ok(
+            &router,
+            row,
+            request(service, "Maximum", 3_600, WINDOW_START, WINDOW_START + 3_600),
+        )
+        .await;
+        assert_eq!(
+            response["recommendedOptionProjectedMetrics"],
+            json!([]),
+            "case {row:?}: expected an empty list of projections, got {response}"
         );
     }
 
@@ -652,8 +655,8 @@ async fn the_read_waits_for_the_enrollment() {
 
 /// Compute Optimizer is a REGIONAL service: the endpoint a request addresses is the region
 /// whose resources it reports on, so a service named by the ARN of another region is one this
-/// endpoint holds no analysis for. And a READ reports: it must not change what a later caller
-/// sees.
+/// endpoint holds no recommendation for — answered with the empty list of projections. And a
+/// READ reports: it must not change what a later caller sees.
 #[tokio::test]
 async fn a_service_of_another_region_is_not_this_endpoints() {
     let router = emulator_with_cases().await;
@@ -682,8 +685,14 @@ async fn a_service_of_another_region_is_not_this_endpoints() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {row:?}: at {region}, expected 404, got {status}: {response}"
+            status, 200,
+            "case {row:?}: at {region}, expected 200, got {status}: {response}"
+        );
+        assert_eq!(
+            response["recommendedOptionProjectedMetrics"],
+            json!([]),
+            "case {row:?}: at {region}, this endpoint holds no recommendation for it, so it \
+             reports no projection, got {response}"
         );
         // And an ARN naming another region names no service of THIS endpoint.
         let foreign = json!({
@@ -700,9 +709,15 @@ async fn a_service_of_another_region_is_not_this_endpoints() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {row:?}: {foreign} names no service of {REGION}, expected 404, got {status}: \
+            status, 200,
+            "case {row:?}: {foreign} names no service of {REGION}, expected 200, got {status}: \
              {response}"
+        );
+        assert_eq!(
+            response["recommendedOptionProjectedMetrics"],
+            json!([]),
+            "case {row:?}: {foreign} names no service of {REGION}, so it reports no \
+             projection, got {response}"
         );
     }
 

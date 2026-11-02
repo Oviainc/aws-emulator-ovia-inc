@@ -22,10 +22,11 @@
 //! * this service's own preference store — the effective `lookBackPeriod` for the
 //!   `EcsService` resource type, and the enrollment that gates every read.
 //!
-//! An ECS service the analysis has no input for is NOT given an invented recommendation:
-//! when the request named it, it is reported in `errors` (the modelled channel for "an
-//! error is returned if you request recommendations for an unsupported resource"), and
-//! when the request named no ARNs at all it is simply not an analysed resource.
+//! An ECS service the analysis has no input for is NOT given an invented recommendation.
+//! A service Compute Optimizer does not SUPPORT is reported in `errors` when the request
+//! named it (the modelled channel for "an error is returned if you request
+//! recommendations for an unsupported resource"); a service the analysis has merely not
+//! reached yet is absent from the answer, which stays a successful empty result.
 //!
 //! ## What the recommendation option costs
 //!
@@ -212,19 +213,13 @@ const REASON_MEMORY_OVERPROVISIONED: &str = "MemoryOverprovisioned";
 // reports, so its values are the crate-level constants
 // (`crate::state::PERFORMANCE_RISK_*`) rather than a second copy here.
 
-/// The `GetRecommendationError$code` this emulator reports for a requested service the ECS
-/// store holds no ACTIVE record for. `GetRecommendationError` carries a free-form `Code`
-/// string (the model constrains it to no enum), so these three codes are this emulator's
-/// own labels for the three reasons an analysis cannot be produced; each one's `message`
-/// states the reason in full.
-const ERROR_CODE_RESOURCE_NOT_FOUND: &str = "ResourceNotFound";
-/// The code for a service that exists but is not one Compute Optimizer supports: it does
-/// not run on Fargate, or its task definition sets no task-level CPU and memory.
+/// The `GetRecommendationError$code` this emulator reports for a requested service Compute
+/// Optimizer does not support: it does not run on Fargate, or its task definition sets no
+/// task-level CPU and memory. `GetRecommendationError` carries a free-form `Code` string
+/// (the model constrains it to no enum), so this is this emulator's own label for the one
+/// reason an analysis is REFUSED rather than merely missing; its `message` states the
+/// reason in full.
 const ERROR_CODE_UNSUPPORTED_RESOURCE: &str = "UnsupportedResource";
-/// The code for a Fargate service with no `CPUUtilization`/`MemoryUtilization`
-/// observation in the look-back period: there is nothing to analyse, and a finding
-/// without observed utilization would be invented.
-const ERROR_CODE_INSUFFICIENT_METRICS: &str = "InsufficientMetrics";
 
 /// The public on-demand price of ONE vCPU-hour and ONE GB-hour of AWS Fargate compute, in
 /// [`crate::state::CURRENCY_USD`] — the two figures AWS Fargate's own pricing is published
@@ -478,14 +473,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         recommendations.push(recommendation);
                     }
                 }
-                // A service with no analysis is reported as an error of the REQUEST only
-                // when the request named it; when the request named no ARNs, a service
-                // Compute Optimizer cannot analyse is simply not an analysed resource.
-                Err(error) => {
+                // A service Compute Optimizer does not support is reported as an error of
+                // the REQUEST only when the request named it; when the request named no
+                // ARNs, such a service is simply not an analysed resource. A service the
+                // analysis has merely not reached — nothing is recorded for it, or no
+                // observation of it falls in the look-back period — is no failure of the
+                // request at all, so it is absent from the answer either way.
+                Err(NoAnalysis::Unsupported(error)) => {
                     if explicit {
                         errors.push(error);
                     }
                 }
+                Err(NoAnalysis::NotAnalysed) => {}
             }
         }
 
@@ -644,53 +643,60 @@ fn requested_filters(
     Ok(requested)
 }
 
-/// The recommendation for one service, or the `GetRecommendationError` saying why the
-/// analysis has no input for it.
+/// Why one candidate the request put in scope produced no recommendation.
+enum NoAnalysis {
+    /// Compute Optimizer does not support the resource, so the analysis REFUSED it: the
+    /// `errors` list of a request that named it carries this entry.
+    Unsupported(GetRecommendationError),
+    /// The analysis has not reached the resource — this service holds no record of it, or
+    /// no observation of it falls in the look-back period — so there is no recommendation
+    /// yet, which is the steady state of a newly enrolled account: the resource is absent
+    /// from the answer and the request has not failed.
+    NotAnalysed,
+}
+
+/// The recommendation for one service, or why the analysis produced none for it.
 fn analyse(
     candidate: &Candidate,
     observations: &cloudwatch::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
     now: f64,
-) -> Result<ECSServiceRecommendation, GetRecommendationError> {
+) -> Result<ECSServiceRecommendation, NoAnalysis> {
     let arn = candidate.reference.arn.as_str();
     let Some(config) = &candidate.config else {
-        return Err(recommendation_error(
-            arn,
-            ERROR_CODE_RESOURCE_NOT_FOUND,
-            format!("No Amazon ECS service with the Amazon Resource Name (ARN) {arn} exists."),
-        ));
+        return Err(NoAnalysis::NotAnalysed);
     };
     // "Compute Optimizer generates recommendations for Amazon ECS services on Fargate."
     if crate::state::ecs_launch_type_of(config) != Some(LAUNCH_TYPE_FARGATE) {
-        return Err(recommendation_error(
+        return Err(NoAnalysis::Unsupported(recommendation_error(
             arn,
             ERROR_CODE_UNSUPPORTED_RESOURCE,
             format!(
                 "Compute Optimizer generates Amazon ECS service recommendations for services on \
                  {LAUNCH_TYPE_FARGATE} only, and {arn} does not run on {LAUNCH_TYPE_FARGATE}."
             ),
-        ));
+        )));
     }
     // A Fargate task definition carries task-level CPU and memory ("This field is required
     // for Fargate"); without them there is no current size to compare utilization against.
     let (Some(current_cpu), Some(current_memory)) = (config.cpu_units, config.memory_mib) else {
-        return Err(recommendation_error(
+        return Err(NoAnalysis::Unsupported(recommendation_error(
             arn,
             ERROR_CODE_UNSUPPORTED_RESOURCE,
             format!(
                 "The task definition of {arn} sets no task-level cpu and memory, so its Amazon \
                  ECS service utilization cannot be sized."
             ),
-        ));
+        )));
     };
     if current_cpu <= 0 || current_memory <= 0 {
-        return Err(recommendation_error(
+        return Err(NoAnalysis::Unsupported(recommendation_error(
             arn,
             ERROR_CODE_UNSUPPORTED_RESOURCE,
             format!(
                 "The task definition of {arn} sets a task-level cpu of {current_cpu} and memory \
                  of {current_memory}, which is not a Fargate task size."
             ),
-        ));
+        )));
     }
 
     // The window the analysis reads: the effective look-back period, back from now
@@ -705,16 +711,7 @@ fn analyse(
         now,
     );
     let Some((cpu, memory)) = observed.both() else {
-        return Err(recommendation_error(
-            arn,
-            ERROR_CODE_INSUFFICIENT_METRICS,
-            format!(
-                "No {} observation of {arn} falls in the {} look-back period, so there is no \
-                 utilization to analyse.",
-                observed.missing_series().unwrap_or_default(),
-                candidate.look_back_period,
-            ),
-        ));
+        return Err(NoAnalysis::NotAnalysed);
     };
 
     // The size each dimension needs: the observed PEAK carried with the crate's one

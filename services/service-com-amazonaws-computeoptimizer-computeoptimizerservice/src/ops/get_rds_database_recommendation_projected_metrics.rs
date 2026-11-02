@@ -289,21 +289,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE
                 && resource.arn_in(&region) == input.resource_arn
         }) else {
-            // This operation reports one resource's projection and models no per-resource
-            // error list, so a resource it holds no database analysis for is "a resource that
-            // is required for the action doesn't exist".
-            return Err(
-                GetRDSDatabaseRecommendationProjectedMetricsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(
-                            "Compute Optimizer has no Amazon Aurora or RDS database \
-                             recommendation for the resource this identifier names."
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
+            // A resource this service holds no database analysis for has no projection to
+            // report, and that is not a failed request: `recommendedOptionProjectedMetrics`
+            // is an optional list with no required member, so the answer is the EMPTY list
+            // of projections — the state of every database of a newly enrolled account,
+            // which Compute Optimizer has not accumulated enough metric history for yet.
+            return Ok(GetRDSDatabaseRecommendationProjectedMetricsOutput {
+                recommended_option_projected_metrics: Some(Vec::new()),
+            });
         };
 
         // A row whose instance configuration the analysis would not change carries no

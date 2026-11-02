@@ -714,9 +714,9 @@ async fn pagination_reports_every_group_exactly_once() {
 }
 
 /// `autoScalingGroupArns` and `accountIds` select what is reported; an identifier with no
-/// recommendation is reported in `errors`, and a malformed one is refused.
+/// recommendation is absent from the answer, and a malformed one is refused.
 #[tokio::test]
-async fn requested_identifiers_are_selected_reported_as_errors_or_refused() {
+async fn requested_identifiers_are_selected_omitted_or_refused() {
     let router = emulator();
     analysed(&router).await;
 
@@ -738,8 +738,8 @@ async fn requested_identifiers_are_selected_reported_as_errors_or_refused() {
         "one known ARN: expected no error, got {body}"
     );
 
-    // A known ARN beside an unanalysed one: the group, plus one error for the identifier
-    // the analysis holds no recommendation for.
+    // A known ARN beside an unanalysed one: the group, and no error — an identifier with no
+    // recommendation is absent from the answer rather than reported as a failure.
     let body = recommendations(
         &router,
         json!({"autoScalingGroupArns": [known.arn_in(REGION), unknown.clone()]}),
@@ -750,19 +750,10 @@ async fn requested_identifiers_are_selected_reported_as_errors_or_refused() {
         vec![known.name.clone()],
         "a known and an unanalysed ARN: expected only the analysed group, got {body}"
     );
-    let errors = body["errors"].as_array().cloned().unwrap_or_default();
     assert_eq!(
-        errors.len(),
-        1,
-        "a known and an unanalysed ARN: expected exactly one error, got {body}"
-    );
-    assert_eq!(
-        errors[0]["identifier"], unknown,
-        "the error must name the identifier it is about, got {body}"
-    );
-    assert_eq!(
-        errors[0]["code"], "ResourceNotFound",
-        "the error code must say the recommendation does not exist, got {body}"
+        body["errors"],
+        json!([]),
+        "a known and an unanalysed ARN: expected no error, got {body}"
     );
 
     // `accountIds`: the emulator's own account holds the analysis; any OTHER account is a
@@ -1123,7 +1114,7 @@ async fn the_arns_reported_name_the_region_the_request_addressed() {
         );
 
         // Another Region's ARN of the same group names no group this endpoint analyses, so
-        // it selects nothing and comes back as an identifier with no recommendation.
+        // it selects nothing and is simply absent from the answer.
         let case = format!("{region} asked about the {other} ARN");
         let foreign = group.arn_in(other);
         let (status, body) = call_in_region(
@@ -1142,21 +1133,11 @@ async fn the_arns_reported_name_the_region_the_request_addressed() {
             Vec::<String>::new(),
             "case {case:?}: an ARN of another Region selects nothing here, got {body}"
         );
-        let errors = body["errors"].as_array().cloned().unwrap_or_default();
         assert_eq!(
-            errors.len(),
-            1,
-            "case {case:?}: expected exactly one error entry, got {body}"
-        );
-        assert_eq!(
-            errors[0]["identifier"],
-            json!(foreign),
-            "case {case:?}: the error must name the identifier it is about, got {body}"
-        );
-        assert_eq!(
-            errors[0]["code"], "ResourceNotFound",
-            "case {case:?}: the error code must say the recommendation does not exist, got \
-             {body}"
+            body["errors"],
+            json!([]),
+            "case {case:?}: an identifier with no recommendation is no error of the request, \
+             got {body}"
         );
     }
 }

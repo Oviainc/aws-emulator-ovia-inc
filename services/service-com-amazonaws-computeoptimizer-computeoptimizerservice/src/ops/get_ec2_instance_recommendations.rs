@@ -12,8 +12,8 @@
 //! A request narrows the answer four ways, each applied before the page is cut:
 //! `accountIds` (one account id, as the model documents — naming any account other than the
 //! one this emulator presents is refused, see [`foreign_account`]), `instanceArns` (the
-//! instances asked about; one this service holds no recommendation for is reported in
-//! `errors`), `filters` (the `Filters` vocabulary this surface shares with
+//! instances asked about; one this service holds no recommendation for is simply absent from
+//! the answer), `filters` (the `Filters` vocabulary this surface shares with
 //! `GetAutoScalingGroupRecommendations`) and `recommendationPreferences` (which candidate
 //! instance types the reported options consist of).
 //!
@@ -105,8 +105,6 @@
 //! * `ServiceUnavailableException` (HTTP 503) — The request has failed due to a temporary
 //!   failure of the server.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
-
-use std::collections::HashSet;
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -284,14 +282,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // The instance ids this analysis holds for the selected instances, taken while the
-        // store is read so the `errors` list below can be built without it — one entry per
-        // analysed instance, so this set is bounded by the inventory and not by the request.
-        let held: HashSet<String> = selected
-            .iter()
-            .map(|instance| instance.instance_id.clone())
-            .collect();
-
         // Each surviving instance with its ARN in this Region and the preferences its
         // recommendation is generated under: the account's stored preferences resolved for
         // that instance. The filters are applied to the analysis the recommendation is
@@ -363,54 +353,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         drop(guard);
 
-        // An identifier the request named that this analysis holds no recommendation for is
-        // reported in `errors` — "an error is returned if you request recommendations for an
-        // instance of an unsupported instance family" — rather than silently omitted, so a
-        // caller can tell "no recommendation for this instance" from "not asked about". The
-        // entries are about the REQUEST rather than about the page, so a walk reports them on
-        // every page, and there is one per identifier however many times the request named it,
-        // exactly as the reported recommendations carry one row per instance however often it
-        // was asked for.
-        //
-        // Whether an identifier is held is decided on the instance it NAMES — the Region and
-        // the instance id [`requested_instance_ids`] selected with — not on the ARN string
-        // this endpoint would render for it, so an ARN of another partition naming an analysed
-        // instance of this Region is reported exactly once: as a recommendation, and not also
-        // as a missing one. The identifiers are bounded
-        // ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]) and both tests are set lookups, so
-        // neither the list nor the work that builds it grows with the square of what the
-        // request carried. Built after the store guard is released, so no caller's list of
-        // identifiers holds the store against another request.
-        let mut reported: HashSet<&str> = HashSet::with_capacity(requested_arns.len());
-        let mut errors: Vec<GetRecommendationError> = Vec::new();
-        for arn in &requested_arns {
-            let analysed = crate::state::parse_instance_arn(arn).is_some_and(|instance| {
-                instance.region == region && held.contains(instance.instance_id)
-            });
-            if analysed || !reported.insert(arn.as_str()) {
-                continue;
-            }
-            errors.push(GetRecommendationError {
-                identifier: Some(arn.clone()),
-                code: Some(crate::state::NO_RECOMMENDATION_CODE.to_string()),
-                message: Some(format!(
-                    "Compute Optimizer has no Amazon EC2 instance recommendation for {arn}.",
-                )),
-            });
-        }
-
         Ok(GetEC2InstanceRecommendationsOutput {
             next_token,
             instance_recommendations: Some(instance_recommendations),
-            errors: Some(errors),
+            // `errors` describes "errors of the request": "an error is returned if you request
+            // recommendations for an instance of an unsupported instance family" — the
+            // instances an analysis REJECTED, not the ones it has not reached. An identifier
+            // this service holds no recommendation for is one Compute Optimizer has not
+            // analysed yet, which is the steady state of a newly enrolled account, so it is
+            // simply absent from the answer and reported as no failure of this request. This
+            // emulator observes the inventory in `crate::state` and classifies no instance as
+            // unsupported, so it reports no error.
+            errors: Some(Vec::new()),
         })
     }
 }
 
 /// What this operation answers when an `instanceArns` entry is not an Amazon EC2 instance
-/// ARN: a constant refusal naming the parameter's subject, as this service's other readers
-/// word theirs — it states the member that is wrong, not the value the request carried.
-const INVALID_INSTANCE_ARN_MESSAGE: &str = "Invalid instance ARN.";
+/// ARN: the constant refusal the real service answers for this condition, which states the
+/// member that is wrong rather than the value the request carried — and words `arn` the way
+/// Amazon EC2 instance recommendations word it, not the way the member is spelled.
+const INVALID_INSTANCE_ARN_MESSAGE: &str = "Invalid instance arn.";
 
 /// A 400 `InvalidParameterValueException` — "The value supplied for the input parameter is out
 /// of range or not valid" — carrying why this request's value is not.
@@ -459,7 +422,7 @@ fn requested_account_id(
 /// refused with [`INVALID_INSTANCE_ARN_MESSAGE`], and one that names another account's
 /// instance with [`foreign_account`]. An ARN of ANOTHER Region names an instance this regional
 /// endpoint does not analyse, so it selects nothing, exactly as an unknown instance of this
-/// Region does — and is reported in `errors` the same way. A list naming more instances than
+/// Region does — and is absent from the answer the same way. A list naming more instances than
 /// this service answers for in one request is refused outright
 /// ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]).
 fn requested_instance_ids(
@@ -471,7 +434,7 @@ fn requested_instance_ids(
         return Ok(None);
     }
     // The model bounds this list's length nowhere, so the service does: the identifiers a
-    // request carries drive both the selection and the per-identifier `errors` list, and a
+    // request carries drive the selection, and a
     // request may name at most the crate's ceiling ([`crate::state::MAX_REQUESTED_IDENTIFIERS`])
     // so neither the response nor the work that builds it can be sized by the length of the
     // list a caller sent. Refused before anything is read or allocated per identifier.

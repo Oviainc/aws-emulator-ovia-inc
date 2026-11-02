@@ -12,9 +12,8 @@
 //! produces an idle recommendation, so no request to this API creates one and this handler
 //! never invents one: every member it reports is computed from the stored analysis
 //! ([`crate::state::IdleResourceAnalysis::to_recommendation`]), and a resource the store
-//! holds no analysis for is reported in the response's `errors` list, which is what the
-//! model says that list is ("Returns of list of resources that doesn't have idle
-//! recommendations").
+//! holds no analysis for is simply absent from the answer: the call stays a successful empty
+//! result rather than a per-resource failure of the request.
 //!
 //! It reports for exactly ONE account, the one this emulator presents: a request that asks
 //! about any other account — in `accountIds`, or through a `resourceArns` entry whose
@@ -205,8 +204,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `resourceArns`: "The ARN that identifies the idle resource" — so each value is an
         // ARN, and one whose account field names another account asks about an account this
         // service cannot report on. WHICH resource an ARN of the requested account names is
-        // NOT checked here: a well-formed ARN the service holds no recommendation for is
-        // reported in `errors` below, not refused.
+        // NOT checked here: a well-formed ARN the service holds no recommendation for
+        // selects nothing, and is not refused.
         let resource_arns = input.resource_arns.unwrap_or_default();
         for value in &resource_arns {
             let Some(parsed) = crate::state::parse_arn(value) else {
@@ -311,30 +310,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // "Returns of list of resources that doesn't have idle recommendations": every ARN
-        // the request named that this endpoint reports no recommendation for, whatever the
-        // filters select. Reported with each page, because it describes the request rather
-        // than the page.
-        let errors: Vec<IdleRecommendationError> = resource_arns
-            .iter()
-            .filter(|requested| {
-                !analysed.iter().any(|recommendation| {
-                    recommendation.resource_arn.as_deref() == Some(requested.as_str())
-                })
-            })
-            .map(|arn| IdleRecommendationError {
-                identifier: Some(arn.clone()),
-                code: Some(crate::state::NO_RECOMMENDATION_CODE.to_string()),
-                message: Some(
-                    "Compute Optimizer has no idle resource recommendation for the resource this \
-                     identifier names."
-                        .to_string(),
-                ),
-                resource_type: crate::state::idle_resource_type_of_arn(arn)
-                    .map(ToString::to_string),
-            })
-            .collect();
-
         // The recommendations the request selects: those of the named resources, of the
         // account this request asks about, that satisfy every filter. A member the request
         // omits selects nothing away — except the account, which is always the one account
@@ -395,10 +370,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // "Returns of list of resources that doesn't have idle recommendations": see the
-        // `errors` list built above, which is computed before the page because it describes
-        // the request rather than the page.
-
         // One page of the selected sequence. A next token is handed out only when the
         // sequence continues past this page, and it resumes exactly where this page stopped.
         let (page, next_token) =
@@ -407,7 +378,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetIdleRecommendationsOutput {
             next_token,
             idle_recommendations: Some(page),
-            errors: Some(errors),
+            // `errors` lists the resources an idle analysis REJECTED, not the ones it has not
+            // reached: a resource this service holds no idle recommendation for is one
+            // Compute Optimizer has not analysed yet, which is the steady state of a newly
+            // enrolled account, so it is simply absent from the answer and reported as no
+            // failure of this request — otherwise an account with nothing idle could not be
+            // told apart from one whose every resource failed. This emulator observes the
+            // resources in `crate::state` and classifies none of them as unsupported, so it
+            // reports no error.
+            errors: Some(Vec::new()),
         })
     }
 }

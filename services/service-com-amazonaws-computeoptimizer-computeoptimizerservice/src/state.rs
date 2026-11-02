@@ -2730,15 +2730,6 @@ pub const DIMENSION_SAVINGS_VALUE_AFTER_DISCOUNT: &str = "SavingsValueAfterDisco
 /// `Asc | Desc`); see [`idle_sorts_descending`].
 pub const ORDER_DESC: &str = "Desc";
 
-/// The error `code` a findings reader reports for the one condition it can report: the
-/// request named a resource this service holds no recommendation for, which is exactly what
-/// `IdleRecommendationError` ("Returns of list of resources that doesn't have idle
-/// recommendations") and `GetRecommendationError` ("Describes an error experienced when
-/// getting recommendations") describe. The model documents `code` only as "The error code"
-/// and names no vocabulary for it, so this is the emulator's own stable code, stated once so
-/// every reader reports the same one; the requirement the entry carries is its `identifier`.
-pub const NO_RECOMMENDATION_CODE: &str = "ResourceNotFound";
-
 /// The `IdleFinding` values (`crate::ops::types::IDLE_FINDING_VALUES`), named so the rules
 /// below read as the model's own vocabulary.
 pub const IDLE_FINDING_IDLE: &str = "Idle";
@@ -3141,8 +3132,8 @@ fn seed_idle_resource_analyses() -> Vec<IdleResourceAnalysis> {
     ]
 }
 
-/// The `IdleRecommendationResourceType` an ARN names, or `None` when the ARN names no
-/// resource kind idle recommendations cover.
+/// The `IdleRecommendationResourceType` the `<service>:<resource-kind>` ARN fields name, or
+/// `None` for a resource kind idle recommendations do not cover.
 ///
 /// The catalog is the model's own `IdleRecommendationResourceType` value set
 /// (`crate::ops::types::IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES`), each value paired with
@@ -3150,15 +3141,6 @@ fn seed_idle_resource_analyses() -> Vec<IdleResourceAnalysis> {
 /// carries the `rds` namespace, and the value set declares no other cluster of that
 /// namespace — no Aurora or RDS DB cluster value — so `rds:cluster` maps to
 /// `DocumentDBCluster`, the one cluster type idle recommendations cover.
-pub fn idle_resource_type_of_arn(arn: &str) -> Option<&'static str> {
-    let parsed = parse_arn(arn)?;
-    idle_resource_type_of(parsed.service, parsed.resource_kind())
-}
-
-/// The `IdleRecommendationResourceType` the `<service>:<resource-kind>` ARN fields name, or
-/// `None` for a resource kind idle recommendations do not cover — the catalog
-/// [`idle_resource_type_of_arn`] documents, for a record that keeps those two fields on their
-/// own rather than one ARN to parse.
 pub fn idle_resource_type_of(service: &str, resource_kind: &str) -> Option<&'static str> {
     let resource_type = match (service, resource_kind) {
         ("ec2", "instance") => "EC2Instance",
@@ -7960,21 +7942,6 @@ impl EcsObservedUtilization {
     /// The two series an analysis needs, or `None` when either was not observed.
     pub fn both(&self) -> Option<(&EcsObserved, &EcsObserved)> {
         self.cpu.as_ref().zip(self.memory.as_ref())
-    }
-
-    /// The series the window holds no observation of, named as a reader reports them, or
-    /// `None` when both were observed. Worded once here so the two readers of one analysis
-    /// state the same reason for refusing the same service.
-    pub fn missing_series(&self) -> Option<String> {
-        let missing = match (self.cpu.is_some(), self.memory.is_some()) {
-            (true, true) => return None,
-            (false, true) => ECS_CPU_UTILIZATION_METRIC.to_string(),
-            (true, false) => ECS_MEMORY_UTILIZATION_METRIC.to_string(),
-            (false, false) => {
-                format!("{ECS_CPU_UTILIZATION_METRIC} and {ECS_MEMORY_UTILIZATION_METRIC}")
-            }
-        };
-        Some(format!("{ECS_METRIC_NAMESPACE} {missing}"))
     }
 }
 

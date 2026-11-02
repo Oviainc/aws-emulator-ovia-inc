@@ -13,8 +13,8 @@
 //! ([`crate::state::license_core_monthly_price`]). It writes nothing: Compute Optimizer's own
 //! analysis of an observed workload is what produces a license recommendation, so no request
 //! to this API creates one and this handler never invents one — a resource the service holds
-//! no license recommendation for is reported in the response's `errors` list, which is what
-//! the model says that list is ("An array of objects that describe errors of the request").
+//! no license recommendation for is simply absent from the answer, which stays a successful
+//! empty result rather than a per-resource failure of the request.
 //!
 //! ## Shape of an operation
 //!
@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is an ARN, and one that names another account's instance asks about an account this
         // service cannot report on. WHICH resource an ARN of the requested account names is
         // not checked here: a well-formed ARN this service holds no license recommendation
-        // for is reported in `errors` below, not refused.
+        // for selects nothing, and is not refused.
         let resource_arns = input.resource_arns.clone().unwrap_or_default();
         for value in &resource_arns {
             let Some(parsed) = crate::state::parse_arn(value) else {
@@ -296,23 +296,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let last_refresh_timestamp = guard.enrollment.last_analysis_refresh();
 
         // The account's observed licenses in this Region, each with the ARN it is reported
-        // under, built ONCE: both the selection and the `errors` list below read this one
-        // walk of the inventory. A caller sees the observation only once the analysis its
+        // under, built ONCE. A caller sees the observation only once the analysis its
         // enrollment started is due.
         let observed: Vec<(&crate::state::ObservedLicensedInstance, String)> = guard
             .visible_licenses()
             .filter(|license| license.account_id == account_id)
             .map(|license| (license, license.instance_arn(&region)))
             .collect();
-        // The ARNs each side selects on, indexed once so both passes below are lookups: the
-        // resources the request named, and the resources the service holds a recommendation
-        // for.
+        // The ARNs the request named, indexed once so the selection below is a lookup.
         let requested_arns: ::std::collections::BTreeSet<&str> =
             resource_arns.iter().map(String::as_str).collect();
-        let observed_arns: ::std::collections::BTreeSet<&str> = observed
-            .iter()
-            .map(|(_, resource_arn)| resource_arn.as_str())
-            .collect();
 
         // The licenses the request selects: those of the named resources, whose
         // recommendation satisfies every filter. A member the request omits selects nothing
@@ -334,23 +327,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // Every ARN the request named that this service holds no license recommendation for,
-        // whatever the filters select. Reported with each page, because it describes the
-        // request rather than the page.
-        let errors: Vec<GetRecommendationError> = resource_arns
-            .iter()
-            .filter(|arn| !observed_arns.contains(arn.as_str()))
-            .map(|arn| GetRecommendationError {
-                identifier: Some(arn.clone()),
-                code: Some(crate::state::NO_RECOMMENDATION_CODE.to_string()),
-                message: Some(
-                    "Compute Optimizer has no license recommendation for the resource this \
-                     identifier names."
-                        .to_string(),
-                ),
-            })
-            .collect();
-
         // One page of the selected sequence. A next token is handed out only when the
         // sequence continues past this page, and it resumes exactly where this page stopped.
         let (page, next_token) =
@@ -359,7 +335,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetLicenseRecommendationsOutput {
             next_token,
             license_recommendations: Some(page),
-            errors: Some(errors),
+            // `errors` describes "errors of the request": the resources whose licenses an
+            // analysis REJECTED, not the ones it has not reached. An ARN this service holds
+            // no license recommendation for is one Compute Optimizer has not analysed yet,
+            // which is the steady state of a newly enrolled account, so it is simply absent
+            // from the answer and reported as no failure of this request. This emulator
+            // observes the licensed instances in `crate::state` and classifies none of them
+            // as unsupported, so it reports no error.
+            errors: Some(Vec::new()),
         })
     }
 }
