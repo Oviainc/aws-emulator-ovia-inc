@@ -43,6 +43,8 @@ mod ses_create_receipt_rule;
 mod ses_custom_verification_email_send;
 #[path = "all/ses_custom_verification_email_template_creation.rs"]
 mod ses_custom_verification_email_template_creation;
+#[path = "all/ses_custom_verification_email_template_update.rs"]
+mod ses_custom_verification_email_template_update;
 #[path = "all/ses_custom_verification_email_templates.rs"]
 mod ses_custom_verification_email_templates;
 #[path = "all/ses_custom_verification_template_sender_gate.rs"]

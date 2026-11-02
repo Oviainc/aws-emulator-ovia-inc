@@ -4,7 +4,7 @@
 //! nothing under, driven end to end over the awsQuery wire: form-urlencoded body
 //! in, XML out, one shared engine behind every call.
 //!
-//! One rule, asserted over a SET of names and over EVERY operation that resolves a
+//! One rule, asserted over a SET of names and over every SERVED operation that resolves a
 //! custom verification email template by name: a name the account holds no template
 //! under is refused HTTP 400 `CustomVerificationEmailTemplateDoesNotExist` whose
 //! message is ONE fixed sentence — "Provided custom verification email template name
@@ -17,8 +17,8 @@
 //! trailing whitespace, the empty name, a name carrying XML metacharacters, a
 //! non-ASCII name, a very long name), WHICH operation resolved it, and WHAT the store
 //! holds while it is asked. The positive control on the same store — a name the store
-//! does hold, served by both operations — is what keeps this a statement about the
-//! absence class rather than about every call.
+//! does hold, served by every one of those operations — is what keeps this a statement
+//! about the absence class rather than about every call.
 
 use crate::harness::{
     call, element, emulator_and_engine, error_envelope, field, settle_verifications, Field,
@@ -46,16 +46,16 @@ const RECIPIENT: &str = "recipient@example.net";
 /// The name the store DOES hold, which the misses below are measured against.
 const STORED: &str = "stored-template";
 
-/// The two operations that resolve a custom verification email template by name and
-/// are served today, each named for the assertion messages.
+/// The operations that resolve a custom verification email template by name and are
+/// served today, each named for the assertion messages.
 ///
-/// `UpdateCustomVerificationEmailTemplate` and
-/// `DeleteCustomVerificationEmailTemplate` resolve one too, but both are still
-/// scaffolded (they answer 501), so neither can be driven over the wire here; they
-/// read the same wording once they are implemented.
+/// `DeleteCustomVerificationEmailTemplate` resolves one too, but it is still
+/// scaffolded (it answers 501), so it cannot be driven over the wire here; it reads
+/// the same wording once it is implemented.
 const RESOLVERS: &[&str] = &[
     "GetCustomVerificationEmailTemplate",
     "SendCustomVerificationEmail",
+    "UpdateCustomVerificationEmailTemplate",
 ];
 
 /// Take this account out of the Amazon SES sandbox, which is what
@@ -116,6 +116,11 @@ async fn resolve(router: &MultiServiceRouter, action: &str, name: &str) -> (u16,
             )
             .await
         }
+        // The name is the only member an update needs: every other one is optional,
+        // so the call resolves the template and nothing else.
+        "UpdateCustomVerificationEmailTemplate" => {
+            call(router, action, &[field("TemplateName", name)]).await
+        }
         other => panic!("case {other:?}: this suite drives no such operation"),
     }
 }
@@ -165,7 +170,7 @@ fn assert_absence(case: &str, action: &str, name: &str, status: u16, body: &str)
 }
 
 #[tokio::test]
-async fn both_resolvers_state_an_absent_template_in_one_fixed_sentence() {
+async fn every_resolver_states_an_absent_template_in_one_fixed_sentence() {
     let (router, _engine) = sending_account().await;
     // One template on the store, so each miss below differs from a name that IS held
     // only in the name itself.
@@ -197,7 +202,7 @@ async fn both_resolvers_state_an_absent_template_in_one_fixed_sentence() {
     }
 
     // The positive control on the same store: the name the store HOLDS is served by
-    // both operations, so the sentence above states an absence and not every call.
+    // every one of them, so the sentence above states an absence and not every call.
     let (status, body) = resolve(&router, "GetCustomVerificationEmailTemplate", STORED).await;
     assert_eq!(
         (status, element(&body, "TemplateName")),
@@ -212,6 +217,11 @@ async fn both_resolvers_state_an_absent_template_in_one_fixed_sentence() {
     assert!(
         element(&body, "MessageId").is_some_and(|id| !id.is_empty()),
         "case the stored name: expected a message id, got {body}"
+    );
+    let (status, body) = resolve(&router, "UpdateCustomVerificationEmailTemplate", STORED).await;
+    assert_eq!(
+        status, 200,
+        "case the stored name: expected the update to go through, got {status} with {body}"
     );
 }
 

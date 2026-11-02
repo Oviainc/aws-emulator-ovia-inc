@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCustomVerificationEmailTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCustomVerificationEmailTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCustomVerificationEmailTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the members a request carries on a custom verification email template this
+//! account's store already holds — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +165,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCustomVerificationEmailTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCustomVerificationEmailTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCustomVerificationEmailTemplate"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateCustomVerificationEmailTemplate",
+            ));
+        };
+        let mut state = state.lock();
+
+        // One instant for the whole call, with the verification move the clock
+        // already owes each of this account's identities materialised against it:
+        // the sender gate below reads the status a caller reading the same
+        // identity at this instant is reported.
+        let now = std::time::SystemTime::now();
+        state.settle_identities(now);
+
+        // The request-level bound first, exactly as the creating operation applies
+        // it: `TemplateContent` is "The content of the custom verification email.
+        // The total size of the email must be less than 10 MB", so content from
+        // that size on is content no custom verification email can be built from —
+        // which is what this operation's invalid-content error reports. The bound,
+        // and the megabytes the sentence states it in, are read off the one
+        // constant this crate holds it at
+        // ([`crate::state::MAX_CUSTOM_VERIFICATION_EMAIL_CONTENT_BYTES`]), so both
+        // operations refuse the same sizes with the same sentence. Content the
+        // request OMITS is the stored content, already inside the bound when it was
+        // written.
+        if input.template_content.as_ref().is_some_and(|content| {
+            content.len() >= crate::state::MAX_CUSTOM_VERIFICATION_EMAIL_CONTENT_BYTES
+        }) {
+            return Err(
+                UpdateCustomVerificationEmailTemplateErrorModeled::CustomVerificationEmailInvalidContentException(
+                    CustomVerificationEmailInvalidContentException {
+                        message: Some(format!(
+                            "The total size of the custom verification email must be less than \
+                             {} MB.",
+                            crate::state::MAX_CUSTOM_VERIFICATION_EMAIL_CONTENT_BYTES / 1_000_000
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Updates an EXISTING custom verification email template": this operation
+        // replaces members of a record the store holds and never creates one, so a
+        // name it does not hold is the modelled absence — the same sentence every
+        // operation of this service that resolves a template by name answers with.
+        let Some(stored) = state
+            .custom_verification_email_templates
+            .get(&input.template_name)
+        else {
+            return Err(
+                UpdateCustomVerificationEmailTemplateErrorModeled::CustomVerificationEmailTemplateDoesNotExistException(
+                    CustomVerificationEmailTemplateDoesNotExistException {
+                        custom_verification_email_template_name: Some(
+                            input.template_name.clone(),
+                        ),
+                        message: Some(
+                            crate::state::MISSING_CUSTOM_VERIFICATION_EMAIL_TEMPLATE_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The record as this call would leave it. Every member of this request but
+        // the name is OPTIONAL, and an update replaces what it carries: a member
+        // the request sent becomes the stored one, a member it omitted keeps the
+        // value already stored. Kept VERBATIM either way — a template is rendered
+        // when a send names it, never rewritten here. The name is the record's key,
+        // so it is the one member an update cannot change.
+        let updated = crate::state::CustomVerificationEmailTemplate {
+            template_name: stored.template_name.clone(),
+            from_email_address: input
+                .from_email_address
+                .unwrap_or_else(|| stored.from_email_address.clone()),
+            template_subject: input
+                .template_subject
+                .unwrap_or_else(|| stored.template_subject.clone()),
+            template_content: input
+                .template_content
+                .unwrap_or_else(|| stored.template_content.clone()),
+            success_redirection_url: input
+                .success_redirection_url
+                .unwrap_or_else(|| stored.success_redirection_url.clone()),
+            failure_redirection_url: input
+                .failure_redirection_url
+                .unwrap_or_else(|| stored.failure_redirection_url.clone()),
+        };
+
+        // The sender this template would be left with must be an identity this
+        // account has VERIFIED — what `FromEmailAddressNotVerifiedException`
+        // reports: "the sender address specified for a custom verification email is
+        // not verified, and is therefore not eligible to send the custom
+        // verification email". The address gated is the EFFECTIVE one, so an update
+        // that names a sender is judged on the address it names and an update that
+        // omits it on the address the template keeps — the same address a send of
+        // this template is refused on (`send_custom_verification_email.rs`), read
+        // through the same reading of a verified sender as every send of this
+        // service (`state::is_verified_sender`, off the status just settled above),
+        // so a verified domain covers the mailboxes in it and in its subdomains
+        // here too. Read BEFORE anything is written, so a refused update leaves the
+        // stored template exactly as it stood.
+        if !state.is_verified_sender(&updated.from_email_address) {
+            return Err(
+                UpdateCustomVerificationEmailTemplateErrorModeled::FromEmailAddressNotVerifiedException(
+                    FromEmailAddressNotVerifiedException {
+                        from_email_address: Some(updated.from_email_address.clone()),
+                        message: Some(crate::state::unverified_from_address_message(
+                            &updated.from_email_address,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Written through the store's own writer, which is what replaces a stored
+        // template: it refuses only a NEW name past the account's ceiling, and this
+        // is a name the store already holds, so the record is replaced and the
+        // count of templates this account holds is unchanged.
+        state.put_custom_verification_email_template(updated);
+
+        Ok(UpdateCustomVerificationEmailTemplateOutput)
     }
 }
