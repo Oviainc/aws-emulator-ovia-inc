@@ -1,0 +1,98 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: opensearch-albos-domain-lookup-mistakes
+Issue-Step: task#2
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: opensearch-albos-domain-lookup-mistakes opensearch-osc-custom-endpoint-fix-input-mistakes opensearch-osc-legacy-es-api-domain-lookups
+Issue-Shape-Id: com.amazonaws.opensearch#AmazonOpenSearchService
+Issue-Key: es|DescribeDomain|4xx->4xx|$.message
+Issue-Key: es|ListDomainNames|4xx->4xx|$.message
+Issue-Key: es|UpdateDomainConfig|4xx->4xx|$.message
+Issue-Key: es|DescribeElasticsearchDomain|4xx->4xx|$.message
+Issue-Key: es|UpdateDomainConfig|4xx->4xx|$headers.x-amzn-errortype
+Issue-Related: 20261029T190009Z-es-resourcenotfoundexception-answered-as-http-409-instead-of.md
+Issue-Commit: 486151182441fa9779198fc02e1d6d3c56236874
+
+# es request validation diverges: refusal text on domain-name and enum members, and validation ordered after the existence lookup
+
+> _Note: this issue was identified against the code base at commit `486151182441fa9779198fc02e1d6d3c56236874`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeDomain
+
+## Description
+5 net-new root causes on the `es` service token (the Amazon OpenSearch Service / Elasticsearch Service control plane served on endpoint prefix `es`). They share one component: the request-validation layer for the domain APIs. In four of them the status (400) and the error class (ValidationException) are right but the rendered `message` text is not AWS's; in the fifth the validation never runs at all because the domain-existence lookup preempts it, so the caller gets the wrong status AND the wrong error class. Each cause below is its own replay unit and must be re-replayed separately before this issue is closed.
+
+RELATED OPEN WORK (does NOT cover any of these replay keys — none of the Issue-Key / Issue-Trace-Ids entries in them name these steps): 20261101T193857Z-es-validationexception-message-text-diverges-pattern-anchors-stripped.md (the @pattern-anchor and instanceType enum-set rendering on the VpcEndpoint and DescribeInstanceTypeLimits paths) and 20261029T190009Z-es-resourcenotfoundexception-answered-as-http-409-instead-of.md (the global ResourceNotFoundException->409 status mapping, which cause 5 also trips over). Note that cause 4 below is the OPPOSITE direction from that first issue: on the legacy 2015-01-01 domainName path AWS renders the pattern WITHOUT its anchors, so a blanket 'always emit the trait verbatim' fix regresses this step.
+
+Cause 1 of 5 — DescribeDomain with a domainName that violates both @length and @pattern: AWS omits the echoed value from the aggregate message (fixture opensearch-albos-domain-lookup-mistakes, step task#2).
+AWS: Smithy (com.amazonaws.opensearch): DescribeDomain GET /2021-01-01/opensearch/domain/{DomainName}, input DomainName @httpLabel @required targeting DomainName @length(min 3, max 28) @pattern("^[a-z][a-z0-9\\-]+$"); errors BaseException (client, 400, defaulted), ValidationException (client, 400), ResourceNotFoundException, InternalException. The recording shows 400 ValidationException with the standard aggregate template, one clause per violated constraint joined by '; ', and — for this member — NO echo of the submitted value: `2 validation errors detected: Value at 'domainName' failed to satisfy constraint: Member must have length less than or equal to 28; Value at 'domainName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-z][a-z0-9\\-]+`. Fixed text: `N validation errors detected: `, `Value at '<member path>' failed to satisfy constraint: `, `Member must have length less than or equal to <max>`, `Member must satisfy regular expression pattern: <pattern>`. Variable parts: the error count, the member path (`domainName`), the limit (28) and the quoted pattern, both taken from the model trait — and the pattern is quoted UNANCHORED here. Hypothesis: AWS suppresses the `Value '<submitted>' ` echo on this URI-label member when the submitted token is not a label-shaped value; it is not a length rule, because cause 3 shows an 85-character dotted value echoed in full on a body member.
+Emulator: answers 400 ValidationException with the same two clauses and the same unanchored pattern, but echoes the submitted value into both clauses: `2 validation errors detected: Value '<submitted domain name>' at 'domainName' failed to satisfy constraint: Member must have length less than or equal to 28; Value '<submitted domain name>' at 'domainName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-z][a-z0-9\\-]+`. The replay reports $.message as the only diverging key.
+Why: a client or SDK test that asserts on the refusal text (or logs it to a user) sees a sentence AWS does not emit, and tooling that parses the message to recover the offending value finds one where AWS deliberately emits none.
+Fix: the aggregate constraint-violation message formatter in this service's request validation — the branch that renders the per-clause prefix for the domainName label member.
+Traces: opensearch-albos-domain-lookup-mistakes#task#2.
+
+Cause 2 of 5 — ListDomainNames with an out-of-enum engineType: the enum value set is rendered in sorted order instead of the service's own order (fixture opensearch-albos-domain-lookup-mistakes, step task#5).
+AWS: Smithy: ListDomainNames GET /2015-01-01/domain, input EngineType @httpQuery("engineType") targeting the enum EngineType, whose values are declared in the model in the order [OpenSearch, Elasticsearch]; error ValidationException (client, 400). Recording: 400 with the enum form of the template — `1 validation error detected: Value 'opensearch' at 'engineType' failed to satisfy constraint: Member must satisfy enum value set: [OpenSearch, Elasticsearch]`. Fixed text apart from the echoed value, the member path and the bracketed value set; the value set is a requirement because it is the service's accepted-value list, and it is emitted in the service's declaration order, NOT alphabetically.
+Emulator: 400 ValidationException with the same sentence but the value set rendered `[Elasticsearch, OpenSearch]` — alphabetically sorted. Only $.message diverges.
+Why: the message is how a caller discovers the accepted values; a reordered list breaks any assertion on the refusal text, and a client that takes the first listed value as the service default picks Elasticsearch where AWS names OpenSearch.
+Fix: the enum branch of the constraint-violation message formatter — it must emit the enum's declared member order rather than a sorted copy.
+Traces: opensearch-albos-domain-lookup-mistakes#task#5.
+
+Cause 3 of 5 — UpdateDomainConfig with an out-of-enum domainEndpointOptions.tLSSecurityPolicy: the enum value set is again sorted rather than the service's order (fixture opensearch-osc-custom-endpoint-fix-input-mistakes, step task#4).
+AWS: Smithy: UpdateDomainConfig POST /2021-01-01/opensearch/domain/{DomainName}/config, input member DomainEndpointOptions.TLSSecurityPolicy targeting the enum TLSSecurityPolicy; error ValidationException (client, 400). Recording: 400 with `1 validation error detected: Value '<submitted policy>' at 'domainEndpointOptions.tLSSecurityPolicy' failed to satisfy constraint: Member must satisfy enum value set: [Policy-Min-TLS-1-2-FIPS-PQ-2026-10, Policy-Min-TLS-1-0-2019-07, Policy-Min-TLS-1-2-2019-07, Policy-Min-TLS-1-2-RFC9151-FIPS-2024-08, Policy-Min-TLS-1-2-PFS-2023-10]`. Fixed text apart from the echoed value, the lower-camel member path and the bracketed set. Recorded behavior only for the ORDER: the recording's order is neither alphabetical nor the on-disk model's declaration order (the checked-in com.amazonaws.opensearch#TLSSecurityPolicy declares [Policy-Min-TLS-1-0-2019-07, Policy-Min-TLS-1-2-2019-07, Policy-Min-TLS-1-2-PFS-2023-10, Policy-Min-TLS-1-2-RFC9151-FIPS-2024-08, Policy-Min-TLS-1-2-FIPS-PQ-2026-10]), so the service's own ordering as recorded is the requirement here and rendering the on-disk enum verbatim will not reproduce it either.
+Emulator: 400 ValidationException, same template, value set rendered `[Policy-Min-TLS-1-0-2019-07, Policy-Min-TLS-1-2-2019-07, Policy-Min-TLS-1-2-FIPS-PQ-2026-10, Policy-Min-TLS-1-2-PFS-2023-10, Policy-Min-TLS-1-2-RFC9151-FIPS-2024-08]` — alphabetically sorted. Only $.message diverges.
+Why: same as cause 2; this is the policy set a caller must choose from when hardening a domain endpoint, and the quoted list is the only place the API states it.
+Fix: same enum branch of the formatter as cause 2, plus the TLSSecurityPolicy accepted-value ordering it reads. Listed separately because the value arrives on a nested body member here, not a query parameter, so a query-only fix leaves this step failing.
+Traces: opensearch-osc-custom-endpoint-fix-input-mistakes#task#4.
+
+Cause 4 of 5 — DescribeElasticsearchDomain on the legacy 2015-01-01 surface quotes the domainName pattern WITH its model anchors (fixture opensearch-osc-legacy-es-api-domain-lookups, step task#1).
+AWS: Smithy (com.amazonaws.elasticsearchservice): DescribeElasticsearchDomain GET /2015-01-01/es/domain/{DomainName}, DomainName @httpLabel @required @length(3,28) @pattern("^[a-z][a-z0-9\\-]+$"); errors BaseException (400, defaulted), ValidationException (400), ResourceNotFoundException, InternalException. Recording: 400 ValidationException with `1 validation error detected: Value '<submitted domain name>' at 'domainName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-z][a-z0-9\\-]+` — the quoted expression carries NO `^`/`$`. Fixed text apart from the echoed value, the member path and the quoted expression.
+Emulator: 400 ValidationException with the same sentence but the pattern quoted as `^[a-z][a-z0-9\\-]+$`, i.e. the raw model trait including anchors. Only $.message diverges. Note the 2021-01-01 path in cause 1 already renders this same member unanchored, so the two entry points use different formatters.
+Why: the message is the only statement of the accepted domain-name syntax; a client that compiles the quoted regex to pre-validate names gets a different accept set than AWS states, and any assertion on the refusal text fails. Combined with the related open issue above, the correct behaviour is per-member accurate rendering, not a blanket strip-or-keep of anchors.
+Fix: the constraint-violation message formatter reached from the legacy 2015-01-01 (`/2015-01-01/es/domain/{DomainName}`) validation entry point — it must render this member's pattern the way the service does, unanchored, consistent with the 2021-01-01 path.
+Traces: opensearch-osc-legacy-es-api-domain-lookups#task#1.
+
+Cause 5 of 5 — UpdateDomainConfig resolves the domain before validating the request body, so a constraint violation is reported as a not-found conflict (fixture opensearch-osc-custom-endpoint-fix-input-mistakes, step task#1).
+AWS: Smithy: UpdateDomainConfig POST /2021-01-01/opensearch/domain/{DomainName}/config, input member DomainEndpointOptions.CustomEndpoint targeting DomainNameFqdn @length(1,255) @pattern("^(((?!-)[A-Za-z0-9-]{0,62}[A-Za-z0-9])\\.)+((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])$"); errors ValidationException (client, 400), ResourceNotFoundException, InvalidTypeException, LimitExceededException, BaseException, InternalException. The recording shows AWS refusing the request on INPUT CONSTRAINTS FIRST: 400 ValidationException with `1 validation error detected: Value '<submitted custom endpoint>' at 'domainEndpointOptions.customEndpoint' failed to satisfy constraint: Member must satisfy regular expression pattern: ^(((?!-)[A-Za-z0-9-]{0,62}[A-Za-z0-9])\\.)+((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])$` — here the submitted value IS echoed in full (an 85-character URL), and the pattern IS quoted with its anchors. The errortype header is asserted only as shaped. Fixed text apart from the echoed value, the member path and the quoted trait.
+Emulator: answers 409 with x-amzn-errortype: ResourceNotFoundException and message `Domain not found: <domain name>` — it performs the domain-existence lookup before any body validation, so the customEndpoint constraint is never evaluated and the ValidationException is never produced. Replay detail: `status: expected 400, got 409`, `$.message: value_mismatch`, `$headers.x-amzn-errortype: shape_mismatch`. (The 409-instead-of-404 status for ResourceNotFoundException is separately owned by 20261029T190009Z-es-resourcenotfoundexception-answered-as-http-409-instead-of.md; fixing that mapping alone still leaves this step diverging, because the expected response is a 400 ValidationException, not a not-found at all.)
+Why: a client that submits a malformed custom endpoint is told the domain does not exist. It then retries domain creation or aborts the configuration change, instead of correcting the one malformed member AWS named; the member path that pinpoints the mistake is lost entirely.
+Fix: the operation's handler ordering — input/constraint validation for the request body must run before the domain is resolved from state, as it does on AWS.
+Traces: opensearch-osc-custom-endpoint-fix-input-mistakes#task#1 (the cluster also covers #task#2).
+
+The domain names, endpoint URLs and policy tokens above are this recording's inputs filling the templates; the requirement is each template's fixed text plus the model trait / accepted-value list and ordering it quotes.
+
+## Evidence
+Cause 1 — opensearch-albos-domain-lookup-mistakes#task#2, DescribeDomain, expected 400 / actual 400, diverging key $.message only (divergence_key service=es|DescribeDomain|status=400->400|keys=$.message):
+  expected "2 validation errors detected: Value at 'domainName' failed to satisfy constraint: Member must have length less than or equal to 28; Value at 'domainName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-z][a-z0-9\\-]+"
+  got      "2 validation errors detected: Value 'vpc-sim2real-probe-albos-abc123.us-west-2.es.amazonaws.com' at 'domainName' failed to satisfy constraint: Member must have length less than or equal to 28; Value 'vpc-sim2real-probe-albos-abc123.us-west-2.es.amazonaws.com' at 'domainName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-z][a-z0-9\\-]+"
+  (the echoed FQDN is this recording's input; the requirement is that no value is echoed for this member)
+
+Cause 2 — opensearch-albos-domain-lookup-mistakes#task#5, ListDomainNames, expected 400 / actual 400, $.message only (divergence_key service=es|ListDomainNames|status=400->400|keys=$.message):
+  expected "1 validation error detected: Value 'opensearch' at 'engineType' failed to satisfy constraint: Member must satisfy enum value set: [OpenSearch, Elasticsearch]"
+  got      "1 validation error detected: Value 'opensearch' at 'engineType' failed to satisfy constraint: Member must satisfy enum value set: [Elasticsearch, OpenSearch]"
+  Smithy cited: com.amazonaws.elasticsearchservice#EngineType values declared [OpenSearch, Elasticsearch] — the recorded order is the declaration order.
+
+Cause 3 — opensearch-osc-custom-endpoint-fix-input-mistakes#task#4, UpdateDomainConfig, expected 400 / actual 400, $.message only (divergence_key service=es|UpdateDomainConfig|status=400->400|keys=$.message):
+  expected "1 validation error detected: Value 'policy-min-tls-1-2-2019-07' at 'domainEndpointOptions.tLSSecurityPolicy' failed to satisfy constraint: Member must satisfy enum value set: [Policy-Min-TLS-1-2-FIPS-PQ-2026-10, Policy-Min-TLS-1-0-2019-07, Policy-Min-TLS-1-2-2019-07, Policy-Min-TLS-1-2-RFC9151-FIPS-2024-08, Policy-Min-TLS-1-2-PFS-2023-10]"
+  got      "1 validation error detected: Value 'policy-min-tls-1-2-2019-07' at 'domainEndpointOptions.tLSSecurityPolicy' failed to satisfy constraint: Member must satisfy enum value set: [Policy-Min-TLS-1-0-2019-07, Policy-Min-TLS-1-2-2019-07, Policy-Min-TLS-1-2-FIPS-PQ-2026-10, Policy-Min-TLS-1-2-PFS-2023-10, Policy-Min-TLS-1-2-RFC9151-FIPS-2024-08]"
+  Smithy cited: com.amazonaws.opensearch#TLSSecurityPolicy declares [Policy-Min-TLS-1-0-2019-07, Policy-Min-TLS-1-2-2019-07, Policy-Min-TLS-1-2-PFS-2023-10, Policy-Min-TLS-1-2-RFC9151-FIPS-2024-08, Policy-Min-TLS-1-2-FIPS-PQ-2026-10] — neither the emulator's sorted order nor the on-disk order matches the recording.
+
+Cause 4 — opensearch-osc-legacy-es-api-domain-lookups#task#1, DescribeElasticsearchDomain, expected 400 / actual 400, $.message only (divergence_key service=es|DescribeElasticsearchDomain|status=400->400|keys=$.message):
+  expected "1 validation error detected: Value 'SIM2REAL-PROBE-OSC' at 'domainName' failed to satisfy constraint: Member must satisfy regular expression pattern: [a-z][a-z0-9\\-]+"
+  got      "1 validation error detected: Value 'SIM2REAL-PROBE-OSC' at 'domainName' failed to satisfy constraint: Member must satisfy regular expression pattern: ^[a-z][a-z0-9\\-]+$"
+  Smithy cited: com.amazonaws.elasticsearchservice#DomainName @pattern("^[a-z][a-z0-9\\-]+$"), @length(3,28). Cluster also covers #task#3.
+
+Cause 5 — opensearch-osc-custom-endpoint-fix-input-mistakes#task#1, UpdateDomainConfig, expected 400 / actual 409 (divergence_key service=es|UpdateDomainConfig|status=400->409|keys=$.message,$headers.x-amzn-errortype,status):
+  expected status 400, body message "1 validation error detected: Value 'https://internal-sim2real-probe-osc-24c60c4f-1234567890.us-west-2.elb.amazonaws.com' at 'domainEndpointOptions.customEndpoint' failed to satisfy constraint: Member must satisfy regular expression pattern: ^(((?!-)[A-Za-z0-9-]{0,62}[A-Za-z0-9])\\.)+((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])$", x-amzn-errortype asserted as shaped
+  got      status 409, body message "Domain not found: sim2real-probe-osc-7ce5fa09", x-amzn-errortype "ResourceNotFoundException"
+  Smithy cited: com.amazonaws.opensearch#DomainEndpointOptions.CustomEndpoint -> DomainNameFqdn @length(1,255) @pattern("^(((?!-)[A-Za-z0-9-]{0,62}[A-Za-z0-9])\\.)+((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])$"); UpdateDomainConfig errors include ValidationException (400). The generated domain name in the actual message is a per-run value, not a requirement.
+
+## Steps to Reproduce
+1. Replay fixture opensearch-albos-domain-lookup-mistakes step task#2 (GET /2021-01-01/opensearch/domain/<a VPC-endpoint FQDN>) and diff the `message` body member: the two clauses must read `Value at 'domainName' failed to satisfy constraint: ...` with no echoed value.
+2. Replay fixture opensearch-albos-domain-lookup-mistakes step task#5 (GET /2015-01-01/domain?engineType=opensearch) and check the bracketed enum value set is `[OpenSearch, Elasticsearch]`, in that order.
+3. Replay fixture opensearch-osc-custom-endpoint-fix-input-mistakes step task#4 (POST /2021-01-01/opensearch/domain/{DomainName}/config with an out-of-enum DomainEndpointOptions.TLSSecurityPolicy) and check the bracketed set matches the recorded order, FIPS-PQ first.
+4. Replay fixture opensearch-osc-legacy-es-api-domain-lookups step task#1 (GET /2015-01-01/es/domain/SIM2REAL-PROBE-OSC) and check the quoted regex is `[a-z][a-z0-9\-]+`, with no `^`/`$`.
+5. Replay fixture opensearch-osc-custom-endpoint-fix-input-mistakes step task#1 (POST /2021-01-01/opensearch/domain/{DomainName}/config with DomainEndpointOptions.CustomEndpoint set to a value that violates the FQDN @pattern) and observe 409 ResourceNotFoundException where the recording is 400 ValidationException naming 'domainEndpointOptions.customEndpoint'.
+6. All five steps must pass before this issue is closed.
