@@ -196,8 +196,11 @@ impl ServerProtocol for QuerySignedCalls {
 const UNRESOLVED_CREDENTIAL_CODE: &str = "InvalidClientTokenId";
 
 /// How AWS words that refusal.
+///
+/// The wording of a credential failure is one rule for every emulated service, so it is
+/// read from the module that owns it ([`::service_common::authentication_refusal`]).
 const UNRESOLVED_CREDENTIAL_MESSAGE: &str =
-    "The security token included in the request is invalid.";
+    ::service_common::authentication_refusal::UNRESOLVED_CREDENTIAL_MESSAGE;
 
 /// The error code AWS answers a request whose access key id DOES resolve but whose
 /// signature does not verify under that credential's secret: the credential was found,
@@ -205,11 +208,10 @@ const UNRESOLVED_CREDENTIAL_MESSAGE: &str =
 const SIGNATURE_MISMATCH_CODE: &str = "SignatureDoesNotMatch";
 
 /// How the SigV4 signing layer words that refusal — the fixed sentence it produces for
-/// this one condition, which names the half of the credential pair that is wrong.
+/// this one condition, which names the half of the credential pair that is wrong. Read
+/// from the module that owns the wording, as the sentence above is.
 const SIGNATURE_MISMATCH_MESSAGE: &str =
-    "The request signature we calculated does not match the signature you provided. Check \
-     your AWS Secret Access Key and signing method. Consult the service documentation for \
-     details.";
+    ::service_common::authentication_refusal::SIGNATURE_MISMATCH_MESSAGE;
 
 /// The media type an `awsQuery` request carries its form-encoded body in, which is the
 /// only body this service's protocol reads.

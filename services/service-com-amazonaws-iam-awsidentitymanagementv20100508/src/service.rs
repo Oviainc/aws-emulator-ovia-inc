@@ -70,6 +70,22 @@
 //! — the one seam that sees a whole request before the modelled walk deserializes,
 //! validates and dispatches it.
 //!
+//! ## Wording a request authentication refused
+//!
+//! The emulator verifies every signature and hands this service ONE structural refusal for
+//! every way a credential can fail, carrying a generic code that is an AUTHORIZATION denial
+//! — which is not what AWS answers a credential failure with. The rule, and the two fixed
+//! sentences, live in [`::service_common::authentication_refusal`]; this file names only the
+//! codes this service answers the two failures with ([`AUTHENTICATION_REFUSAL`]) and wires
+//! that layer under the definition wrapper above, so the `<RequestId>` is reported on its
+//! response too. The unknown-credential code is the one the deactivated-key refusal below
+//! already answers with, so a credential this service will not accept and one it cannot
+//! resolve at all are stated alike.
+//!
+//! It is the definition rather than [`Service::override_refusal`] because the seam that is
+//! handed WHICH failure it was is the definition's `refusal_response`; the refusal hook sees
+//! the structural refusal alone, which is why this service uses it for input values.
+//!
 //! ## The audit leg
 //!
 //! Every call this service serves is also a management event of `iam.amazonaws.com`: the
@@ -82,6 +98,9 @@ pub mod management_events;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::{envelope, ProtocolError, Violation, ViolationKind};
+use service_common::authentication_refusal::{
+    AuthenticationRefusalDefinition, StatedAuthenticationRefusal,
+};
 use service_common::query_error_envelope::{
     RequestIdEnvelopeDefinition, RequestIdEnvelopeOperation,
 };
@@ -330,8 +349,20 @@ const UNUSABLE_CREDENTIAL_CODE: &str = "InvalidClientTokenId";
 
 /// How AWS words that refusal: a fixed sentence carrying nothing from the request, so a
 /// caller presenting a credential the service will not accept learns nothing about the
-/// credential or about this account.
-const UNUSABLE_CREDENTIAL_MESSAGE: &str = "The security token included in the request is invalid.";
+/// credential or about this account. The wording of a credential failure is one rule for
+/// every emulated service, so it is read from the module that owns it.
+const UNUSABLE_CREDENTIAL_MESSAGE: &str =
+    ::service_common::authentication_refusal::UNRESOLVED_CREDENTIAL_MESSAGE;
+
+/// The two codes this service answers a request the emulator's authentication layer refused
+/// with (see [`::service_common::authentication_refusal`], which owns the rule and the
+/// sentences): the `awsQuery` unknown-credential code — the same one the deactivated-key
+/// refusal above answers with — for an access key id that resolves to no credential, and the
+/// SigV4 signature code for one that resolves and whose signature does not verify.
+const AUTHENTICATION_REFUSAL: StatedAuthenticationRefusal = StatedAuthenticationRefusal {
+    unresolved_credential: UNUSABLE_CREDENTIAL_CODE,
+    signature_mismatch: "SignatureDoesNotMatch",
+};
 
 /// Answers a request that presented a credential this account will not accept, as a
 /// pre-dispatch operation.
@@ -393,7 +424,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// routing failure, a transport failure and the pre-dispatch refusal below included.
     /// Identity, the protocol and the routing table are the generated entry's untouched.
     entry: RequestIdEnvelopeDefinition<
-        management_events::AuditedDefinition<crate::ServiceDefinition<Eng>>,
+        AuthenticationRefusalDefinition<
+            management_events::AuditedDefinition<crate::ServiceDefinition<Eng>>,
+        >,
     >,
     /// The SAME shared engine the generated entry threaded into every operation, kept
     /// here too because the pre-dispatch credential check below has to read the access
@@ -415,13 +448,16 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: RequestIdEnvelopeDefinition::new(management_events::AuditedDefinition::new(
-                crate::ServiceDefinition::new(Arc::clone(&engine)),
-                // Every operation of this service, each wrapped in the shared
-                // management-event recorder and built from this same shared engine (see
-                // [`management_events`]), so each call this service serves is recorded as
-                // a management event of `iam.amazonaws.com`.
-                management_events::audited_table(&engine),
+            entry: RequestIdEnvelopeDefinition::new(AuthenticationRefusalDefinition::new(
+                management_events::AuditedDefinition::new(
+                    crate::ServiceDefinition::new(Arc::clone(&engine)),
+                    // Every operation of this service, each wrapped in the shared
+                    // management-event recorder and built from this same shared engine (see
+                    // [`management_events`]), so each call this service serves is recorded as
+                    // a management event of `iam.amazonaws.com`.
+                    management_events::audited_table(&engine),
+                ),
+                AUTHENTICATION_REFUSAL,
             )),
             engine,
             unusable_credential: UnusableCredential,
@@ -530,6 +566,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // and how, is [`stated_refusal`] — the member whose whole form AWS answers one
         // fixed sentence for, and the value-free clause a declared bound and an
         // enumerated set are stated with.
+        //
+        // An authentication refusal is declined here: WHICH credential failure it was is
+        // not in the structural refusal this seam is handed, so it is worded by the
+        // definition layer instead (see the module docs).
         match refusal {
             Refusal::Invalid(violations) => stated_refusal(violations),
             _ => None,

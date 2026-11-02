@@ -15,6 +15,8 @@
 mod account_capacity_limits;
 #[path = "all/arn_addressed_tag_refusals.rs"]
 mod arn_addressed_tag_refusals;
+#[path = "all/authentication_refusal_wording.rs"]
+mod authentication_refusal_wording;
 #[path = "all/batch_and_transact_items.rs"]
 mod batch_and_transact_items;
 #[path = "all/batch_execute_statement.rs"]

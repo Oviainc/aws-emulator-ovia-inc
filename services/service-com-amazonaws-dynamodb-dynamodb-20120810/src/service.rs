@@ -68,7 +68,23 @@
 //!
 //! Nothing else about a response changes: the status, the other headers and every byte of
 //! the body stay as the renderer wrote them.
+//!
+//! ## Wording a request authentication refused
+//!
+//! The emulator verifies every signature and hands this service one structural refusal for
+//! every way a credential can fail, carrying a generic code that is an AUTHORIZATION denial
+//! — which is not what AWS answers a credential failure with. The rule, and the sentences,
+//! live in [`service_common::authentication_refusal`]; this file names only the two codes
+//! this service answers the two failures with ([`AUTHENTICATION_REFUSAL`]) and wires that
+//! layer under the definition wrapper above, so the id is reported on its response too.
+//!
+//! It is the definition rather than [`Service::override_refusal`] because the seam that is
+//! handed WHICH failure it was is the definition's `refusal_response`; the refusal hook sees
+//! the structural refusal alone, which is why this service uses it for input constraints.
 
+use service_common::authentication_refusal::{
+    AuthenticationRefusalDefinition, StatedAuthenticationRefusal,
+};
 use service_common::query_error_envelope::{
     with_request_id_header, RequestIdEnvelopeDefinition,
 };
@@ -429,6 +445,17 @@ fn validation_envelope(violations: &[Violation]) -> Option<String> {
 /// is read one way on both sides.
 const STREAMS_TARGET_SERVICE_KEY: &str = "dynamodbstreams";
 
+/// The two codes this service answers a request the emulator's authentication layer refused
+/// with (see [`service_common::authentication_refusal`], which owns the rule and the
+/// sentences): the `awsJson` unknown-credential code for an access key id that resolves to
+/// no credential, and the `awsJson` signature code for one that resolves and whose signature
+/// does not verify. Neither is `AccessDenied`, which is this service's answer to a KNOWN
+/// principal whose policies do not permit the action.
+const AUTHENTICATION_REFUSAL: StatedAuthenticationRefusal = StatedAuthenticationRefusal {
+    unresolved_credential: "UnrecognizedClientException",
+    signature_mismatch: "InvalidSignatureException",
+};
+
 /// The `com-amazonaws-dynamodb-dynamodb-20120810` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -436,8 +463,12 @@ const STREAMS_TARGET_SERVICE_KEY: &str = "dynamodbstreams";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The generated entry, with its three framework-level error renderers wrapped so a
-    /// response no operation produced still names the request it answers.
-    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// response no operation produced still names the request it answers, and inside that
+    /// the layer that states an authentication refusal in this service's own codes
+    /// ([`AUTHENTICATION_REFUSAL`]).
+    entry: RequestIdEnvelopeDefinition<
+        AuthenticationRefusalDefinition<crate::ServiceDefinition<Eng>>,
+    >,
     /// The dispatch `override_operation` hands back, which carries the served
     /// operation's clause form into [`Service::override_refusal`] and names the request
     /// on the response. Held on the service because that seam returns a borrow of
@@ -451,7 +482,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
+            entry: RequestIdEnvelopeDefinition::header_only(AuthenticationRefusalDefinition::new(
+                crate::ServiceDefinition::new(engine),
+                AUTHENTICATION_REFUSAL,
+            )),
             clause_form_scope: OperationScopedClauseForm,
         }
     }
@@ -508,8 +542,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // envelope over one clause per violated member, each clause naming the
         // member and the constraint it failed in the form the SERVED OPERATION
         // states its clauses in (see "Which form a constraint clause takes"). An
-        // authentication refusal keeps the framework's wording: it is not an
-        // input-constraint failure.
+        // authentication refusal is declined here — which failure it was is not in the
+        // structural refusal this seam is handed — and worded by the definition layer
+        // instead (see "Wording a request authentication refused").
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),

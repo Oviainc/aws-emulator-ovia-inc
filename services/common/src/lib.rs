@@ -226,6 +226,10 @@ pub mod arn;
 /// Serving an operation AUDITED: the ONE wrapper that records every call a service serves
 /// as a management event, so no operation has to record its own and none is forgotten.
 pub mod audited_operation;
+/// How a service words the request the emulator's AUTHENTICATION layer refused: the
+/// unknown-credential failure and the signature failure, each in that service's own code,
+/// so neither is collapsed into the authorization denial `AccessDenied`.
+pub mod authentication_refusal;
 pub mod bedrock;
 /// The ONE definition of the IAM principal this emulator's own long-term credential speaks
 /// for: the user STS reports as the caller and IAM holds among the account's users, so the

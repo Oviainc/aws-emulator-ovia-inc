@@ -33,6 +33,8 @@ mod account_authorization_details;
 mod account_properties;
 #[path = "all/account_singleton_authorization.rs"]
 mod account_singleton_authorization;
+#[path = "all/authentication_refusal_wording.rs"]
+mod authentication_refusal_wording;
 #[path = "all/aws_managed_policy_attachability.rs"]
 mod aws_managed_policy_attachability;
 #[path = "all/aws_managed_policy_catalog.rs"]
