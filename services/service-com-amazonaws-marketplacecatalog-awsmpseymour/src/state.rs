@@ -851,6 +851,20 @@ pub const ERROR_CODE_LIMIT_EXCEEDED: &str = "LIMIT_EXCEEDED";
 /// inside `ExceptionMessageContent`'s 2048 characters.
 pub const DETAIL_VALUE_QUOTE_LIMIT: usize = 256;
 
+/// How long a message this service builds around a submitted value may be: the
+/// 2048 characters `ExceptionMessageContent` and `BatchDescribeErrorMessageContent`
+/// both declare, less the two brackets [`validation_message`] wraps a top-level
+/// fault's sentence in. [`quoting`] cuts a quote to whatever room the sentence
+/// around it leaves inside this. A sentence that is NOT wrapped in those
+/// brackets — a `BatchDescribeErrorDetail$ErrorMessage`, a missing-resource
+/// message — is held to the same budget, two characters short of its own bound,
+/// rather than to a second constant.
+const MESSAGE_BUDGET: usize = 2046;
+
+/// What a cut quote ends with, so a reader sees the value was cut rather than
+/// sent that way.
+const CUT_MARK: &str = "...";
+
 /// An `Intent` value — `StartChangeSetRequest$Intent` documents "The default is
 /// APPLY".
 pub const INTENT_APPLY: &str = "APPLY";
@@ -2510,10 +2524,7 @@ fn scope_text(text: &str) -> String {
     if text.is_empty() {
         return "\"\"".to_string();
     }
-    match text.char_indices().nth(SCOPE_VALUE_LIMIT) {
-        Some((cut, _)) => text[..cut].to_string(),
-        None => text.to_string(),
-    }
+    cut_to(text, SCOPE_VALUE_LIMIT, "")
 }
 
 /// The same, for a submitted value that may be no text at all: its JSON
@@ -3267,10 +3278,17 @@ fn contradicting_details(changes: &[ChangeRecord]) -> Option<String> {
 /// [`DETAIL_VALUE_QUOTE_LIMIT`] characters so the message built around it stays
 /// inside `ExceptionMessageContent`'s 2048.
 fn quoted(value: &Value) -> String {
-    let text = value.to_string();
-    match text.char_indices().nth(DETAIL_VALUE_QUOTE_LIMIT) {
-        Some((cut, _)) => format!("{}...", &text[..cut]),
-        None => text,
+    cut_to(&value.to_string(), DETAIL_VALUE_QUOTE_LIMIT, CUT_MARK)
+}
+
+/// `text` cut to `limit` characters, `mark` appended where it was cut and
+/// nothing appended where it was not — the one place this crate shortens a value
+/// it quotes back, so every bound a message or a reported value is held to is
+/// enforced the same way ([`scope_text`], [`quoted`], [`quoting`]).
+fn cut_to(text: &str, limit: usize, mark: &str) -> String {
+    match text.char_indices().nth(limit) {
+        Some((cut, _)) => format!("{}{mark}", &text[..cut]),
+        None => text.to_string(),
     }
 }
 
@@ -3436,18 +3454,25 @@ pub const ASSESSMENT_IDENTIFIER_MAX: usize = 2048;
 /// is neither of the forms [`assessment_id_of`] resolves — built from the
 /// request, naming the identifier it rejected and the syntax it accepts.
 pub fn invalid_assessment_identifier(identifier: &str) -> ValidationException {
-    validation_message(format!(
-        "Requested assessment identifier '{identifier}' is invalid. \
-         It should match with {ASSESSMENT_IDENTIFIER_PATTERN}."
+    validation_message(quoting(
+        "Requested assessment identifier '",
+        identifier,
+        &format!("' is invalid. It should match with {ASSESSMENT_IDENTIFIER_PATTERN}."),
     ))
 }
 
 /// The modelled `ResourceNotFoundException` payload for an assessment id that
 /// names no assessment.
+///
+/// `AssessmentIdentifier` is `@length(max: 2048)`, the very length a `Message`
+/// may be, so the id the sentence names is quoted through [`quoting`]: an
+/// identifier a caller may legally send cannot take the fault out of contract.
 pub fn assessment_not_found(assessment_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            "Requested assessment '{assessment_id}' does not exist."
+        message: Some(quoting(
+            "Requested assessment '",
+            assessment_id,
+            "' does not exist.",
         )),
     }
 }
@@ -3814,6 +3839,24 @@ pub fn validation_message(message: impl Into<String>) -> ValidationException {
     }
 }
 
+/// A message built around a submitted value: `prefix`, the value quoted, then
+/// `suffix` — with the quote cut to the room those two leave inside
+/// [`MESSAGE_BUDGET`], marked [`CUT_MARK`] where it was cut ([`cut_to`]).
+///
+/// The same rule [`quoted`] follows for a submitted details value and
+/// [`scope_text`] for a submitted scope value, for the values a REFUSAL quotes:
+/// a member this service judges with a predicate of its own is not bounded by
+/// the boundary walk, and a member that IS can be as long on its own as a
+/// message may be, so how much of it a sentence can quote is decided here rather
+/// than by what was sent. The sentence itself is never cut — a caller reads the
+/// whole fault, and the value as far as it fits.
+fn quoting(prefix: &str, value: &str, suffix: &str) -> String {
+    let room = MESSAGE_BUDGET.saturating_sub(
+        prefix.chars().count() + suffix.chars().count() + CUT_MARK.chars().count(),
+    );
+    format!("{prefix}{}{suffix}", cut_to(value, room, CUT_MARK))
+}
+
 /// The modelled `ValidationException` payload for a request this service
 /// refuses, naming the member that was wrong — [`validation_message`] with the
 /// member named ahead of what was wrong with it.
@@ -3886,6 +3929,9 @@ pub fn duplicate_change_pair(change_type: &str, entity_id: &str) -> ValidationEx
 
 /// The modelled `ValidationException` payload for a `Catalog` other than the
 /// fixed value every operation documents.
+///
+/// The value has passed [`is_catalog_name`] to get here, so it is inside the
+/// length a catalog name may be and the sentence quotes it whole.
 pub fn wrong_catalog(catalog: &str) -> ValidationException {
     validation(
         "Catalog",
@@ -3951,8 +3997,10 @@ fn is_version_number(value: &str) -> bool {
 /// [`CATALOG_PATTERN`] — built from the request, naming the value it rejected and
 /// the syntax a catalog name has to satisfy.
 pub fn invalid_catalog(catalog: &str) -> ValidationException {
-    validation_message(format!(
-        "Requested catalog '{catalog}' is invalid. It should match with {CATALOG_PATTERN}."
+    validation_message(quoting(
+        "Requested catalog '",
+        catalog,
+        &format!("' is invalid. It should match with {CATALOG_PATTERN}."),
     ))
 }
 
@@ -3985,7 +4033,11 @@ pub fn is_entity_type(value: &str) -> bool {
 /// `EntityType`'s `@pattern` and still name no type, so there is no syntax to
 /// tell the caller to satisfy — the set in [`ENTITY_TYPES`] is what it failed.
 pub fn invalid_entity_type(entity_type: &str) -> ValidationException {
-    validation_message(format!("Requested entity type '{entity_type}' is invalid."))
+    validation_message(quoting(
+        "Requested entity type '",
+        entity_type,
+        "' is invalid.",
+    ))
 }
 
 /// Whether `value` names one of the change types this catalog performs
@@ -4150,9 +4202,10 @@ pub fn entity_id_of(identifier: &str) -> &str {
 /// [`ENTITY_IDENTIFIER_PATTERN`] — built from the request, naming the value and
 /// the syntax it had to satisfy.
 pub fn invalid_entity_identifier(identifier: &str) -> ValidationException {
-    validation_message(format!(
-        "Requested entity identifier '{identifier}' is invalid. \
-         It should match with {ENTITY_IDENTIFIER_PATTERN}."
+    validation_message(quoting(
+        "Requested entity identifier '",
+        identifier,
+        &format!("' is invalid. It should match with {ENTITY_IDENTIFIER_PATTERN}."),
     ))
 }
 
@@ -4216,9 +4269,10 @@ pub fn is_change_name(value: &str) -> bool {
 /// The modelled `ValidationException` payload for a `ChangeName` outside
 /// [`CHANGE_NAME_PATTERN`].
 pub fn invalid_change_name(name: &str) -> ValidationException {
-    validation_message(format!(
-        "Requested change name '{name}' is invalid. \
-         It should match with {CHANGE_NAME_PATTERN}."
+    validation_message(quoting(
+        "Requested change name '",
+        name,
+        &format!("' is invalid. It should match with {CHANGE_NAME_PATTERN}."),
     ))
 }
 
@@ -4290,9 +4344,10 @@ pub fn is_change_set_name(value: &str) -> bool {
 /// The modelled `ValidationException` payload for a `ChangeSetName` outside
 /// [`CHANGE_SET_NAME_PATTERN`].
 pub fn invalid_change_set_name(name: &str) -> ValidationException {
-    validation_message(format!(
-        "Requested change set name '{name}' is invalid. \
-         It should match with {CHANGE_SET_NAME_PATTERN}."
+    validation_message(quoting(
+        "Requested change set name '",
+        name,
+        &format!("' is invalid. It should match with {CHANGE_SET_NAME_PATTERN}."),
     ))
 }
 
@@ -4314,9 +4369,10 @@ pub fn is_client_request_token(value: &str) -> bool {
 /// The modelled `ValidationException` payload for a `ClientRequestToken` outside
 /// [`CLIENT_REQUEST_TOKEN_PATTERN`].
 pub fn invalid_client_request_token(token: &str) -> ValidationException {
-    validation_message(format!(
-        "Requested client request token '{token}' is invalid. \
-         It should match with {CLIENT_REQUEST_TOKEN_PATTERN}."
+    validation_message(quoting(
+        "Requested client request token '",
+        token,
+        &format!("' is invalid. It should match with {CLIENT_REQUEST_TOKEN_PATTERN}."),
     ))
 }
 
@@ -4385,10 +4441,16 @@ pub fn invalid_entity_id(entity_id: &str) -> ValidationException {
 /// top-level `ValidationException` a single entity read answers and the
 /// `BatchDescribeErrorDetail$ErrorMessage` the batch read reports for the same
 /// entry — so one read and a batch of them state a malformed id identically.
+///
+/// The id is quoted through [`quoting`], so however long a value was sent the
+/// sentence stays inside the length of the member that carries it — the 2048 of
+/// `ExceptionMessageContent` on one path and of
+/// `BatchDescribeErrorMessageContent` on the other.
 pub fn invalid_entity_id_message(entity_id: &str) -> String {
-    format!(
-        "Requested entity id '{entity_id}' is invalid. \
-         It should match with {ENTITY_ID_PATTERN}."
+    quoting(
+        "Requested entity id '",
+        entity_id,
+        &format!("' is invalid. It should match with {ENTITY_ID_PATTERN}."),
     )
 }
 
@@ -4448,6 +4510,10 @@ pub fn entity_not_found(entity_id: &str) -> ResourceNotFoundException {
 /// `ResourceNotFoundException` a single entity read answers and the
 /// `BatchDescribeErrorDetail$ErrorMessage` the batch read reports for the same
 /// entity.
+///
+/// Both paths have judged the id an entity id before they look it up, so it is
+/// inside that shape's `@length` and the sentence is inside its own without
+/// cutting the quote.
 pub fn entity_missing_message(entity_id: &str) -> String {
     format!("Requested entity '{entity_id}' does not exist.")
 }
@@ -4533,9 +4599,10 @@ pub fn caller_identity_arn() -> String {
 /// recorded refusals address a member — `catalog`, `entity type`, `change set
 /// name`, `resource arn` — rather than by the wire path.
 pub fn invalid_member_message(member: &str, value: &str, pattern: &str) -> String {
-    format!(
-        "[Requested {} '{value}' is invalid. It should match with {pattern}.]",
-        member_label(member)
+    quoting(
+        &format!("[Requested {} '", member_label(member)),
+        value,
+        &format!("' is invalid. It should match with {pattern}.]"),
     )
 }
 

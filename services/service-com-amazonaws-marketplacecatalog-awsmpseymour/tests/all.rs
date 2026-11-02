@@ -55,6 +55,8 @@ mod filter_value_forms;
 mod framework_id_validation;
 #[path = "all/model_declared_sort_attributes.rs"]
 mod model_declared_sort_attributes;
+#[path = "all/modelled_answer_bounds.rs"]
+mod modelled_answer_bounds;
 #[path = "all/modelled_member_lengths.rs"]
 mod modelled_member_lengths;
 #[path = "all/page_size_rule.rs"]

@@ -20,6 +20,10 @@
 //! `modelled_member_lengths.rs` pins the same rule across the OTHER members this service
 //! judges itself; this suite is the one that also pins the lower bound and the ordering
 //! against a store that already holds an assessment.
+//!
+//! An identifier this member admits can be as long as a `Message` may be, so the sentence
+//! an answer carries is that sentence with the quoted identifier cut to fit — never a
+//! `Message` past `ExceptionMessageContent`'s own `@length`.
 
 use std::sync::Arc;
 
@@ -46,6 +50,12 @@ const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
 /// shape="AssessmentIdentifier")`). Written out here rather than read from the crate so a
 /// wrong implementation cannot make this suite pass by quoting its own bound.
 const ASSESSMENT_IDENTIFIER_MAX: usize = 2048;
+
+/// How long any `Message` of this service may be: `ExceptionMessageContent`'s
+/// `@length(min: 1, max: 2048)` (`smithy_query(query="shape",
+/// shape="ExceptionMessageContent")`). An identifier this member admits can be that long
+/// on its own, so a sentence quoting one whole does not always fit.
+const EXCEPTION_MESSAGE_MAX: usize = 2048;
 
 /// The syntax the service publishes for an `AssessmentIdentifier`, reported verbatim in
 /// the refusal for one outside it: the shape's modelled `@pattern`, which states both
@@ -208,6 +218,37 @@ fn is_refused(case: &str, identifier: String) -> Row {
     )
 }
 
+/// Assert `answer` carries `sentence` — cut to fit when the whole sentence is longer than
+/// a `Message` may be.
+///
+/// An identifier inside this member's own `@length` can be as long as a `Message` may be,
+/// so a sentence quoting one whole does not fit: what the answer must carry is the same
+/// sentence with the quoted value cut, inside the bound.
+fn assert_message(case: &str, answer: &Answer, sentence: &str) {
+    let actual = answer.message();
+    let length = actual.chars().count();
+    assert!(
+        (1..=EXCEPTION_MESSAGE_MAX).contains(&length),
+        "case {case:?}: the Message must stay inside its modelled \
+         {EXCEPTION_MESSAGE_MAX} characters, got {length}"
+    );
+    if sentence.chars().count() <= EXCEPTION_MESSAGE_MAX {
+        assert_eq!(
+            actual, sentence,
+            "case {case:?}: the answer must carry the sentence built from the request, got \
+             {actual:?}"
+        );
+        return;
+    }
+    // The cut falls at the quoted value, far past this prefix, so what the answer
+    // carries begins with what the whole sentence begins with.
+    let shared: String = actual.chars().take(512).collect();
+    assert!(
+        sentence.starts_with(&shared),
+        "case {case:?}: the answer must carry that same sentence, cut to fit, got {actual:?}"
+    );
+}
+
 /// RULE: the predicate this service judges `AssessmentIdentifier` with stands in for the
 /// member's whole modelled constraint, so an identifier shorter than its `@length` minimum
 /// or longer than its maximum is refused as malformed (422 `ValidationException`, naming
@@ -257,13 +298,7 @@ async fn an_assessment_identifier_is_bounded_at_both_ends_of_its_modelled_length
             answer.error_code(),
             answer.body
         );
-        assert_eq!(
-            answer.message(),
-            message,
-            "case {case:?}: the answer must carry the sentence built from the request, got \
-             {:?}",
-            answer.message()
-        );
+        assert_message(&case, &answer, &message);
     }
 }
 
@@ -335,12 +370,7 @@ async fn an_over_long_identifier_is_refused_whatever_the_store_holds() {
             answer.error_code(),
             answer.body
         );
-        assert_eq!(
-            answer.message(),
-            invalid(&identifier),
-            "case {case:?}: the refusal must name the identifier it rejected, got {:?}",
-            answer.message()
-        );
+        assert_message(case, &answer, &invalid(&identifier));
     }
 
     // Padded only up TO the bound, it is well formed — so it reaches the lookup and is

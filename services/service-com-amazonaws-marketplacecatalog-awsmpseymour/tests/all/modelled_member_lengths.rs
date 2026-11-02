@@ -43,6 +43,12 @@ const ENTITY_MEMBER_MAX: usize = 255;
 /// shape="AssessmentIdentifier")`).
 const ASSESSMENT_IDENTIFIER_MAX: usize = 2048;
 
+/// How long any `Message` of this service may be: `ExceptionMessageContent`'s
+/// `@length(min: 1, max: 2048)` (`smithy_query(query="shape",
+/// shape="ExceptionMessageContent")`), the shape every modelled error's `Message`
+/// targets — so a refusal quoting a value longer than that cannot carry it whole.
+const EXCEPTION_MESSAGE_MAX: usize = 2048;
+
 /// The syntax the service publishes for an `Entity$Identifier`: an entity id optionally
 /// at a revision, or the `$<ChangeName>.Entity.Identifier` reference one change uses to
 /// name the entity another change of the same change set creates. The published syntax
@@ -341,6 +347,8 @@ async fn a_hand_judged_member_is_bounded_by_its_modelled_length() {
             } else {
                 "ResourceNotFoundException"
             },
+            // A sentence quoting the whole identifier is longer than a `Message` may
+            // be, so what the answer carries is that sentence cut to fit.
             Some(if refused {
                 format!(
                     "[Requested assessment identifier '{identifier}' is invalid. \
@@ -365,15 +373,41 @@ async fn a_hand_judged_member_is_bounded_by_its_modelled_length() {
             answer.body
         );
         if let Some(expected) = expected {
-            assert_eq!(
-                answer.message(),
-                expected,
-                "case {case:?}: the answer must carry the sentence built from the request, \
-                 got {:?}",
-                answer.message()
-            );
+            assert_message(&case, &answer, &expected);
         }
     }
+}
+
+/// Assert `answer` carries `sentence` — cut to fit when the whole sentence is longer than
+/// a `Message` may be.
+///
+/// A sentence built around a submitted value can be longer than
+/// [`EXCEPTION_MESSAGE_MAX`] for a value its own member admits, and no `Message` can
+/// carry that: what the answer must carry is the same sentence, with the quoted value
+/// cut, inside the bound.
+fn assert_message(case: &str, answer: &Answer, sentence: &str) {
+    let actual = answer.message();
+    let length = actual.chars().count();
+    assert!(
+        (1..=EXCEPTION_MESSAGE_MAX).contains(&length),
+        "case {case:?}: the Message must stay inside its modelled \
+         {EXCEPTION_MESSAGE_MAX} characters, got {length}"
+    );
+    if sentence.chars().count() <= EXCEPTION_MESSAGE_MAX {
+        assert_eq!(
+            actual, sentence,
+            "case {case:?}: the answer must carry the sentence built from the request, got \
+             {actual:?}"
+        );
+        return;
+    }
+    // The cut falls at the quoted value, far past this prefix, so what the answer
+    // carries begins with what the whole sentence begins with.
+    let shared: String = actual.chars().take(512).collect();
+    assert!(
+        sentence.starts_with(&shared),
+        "case {case:?}: the answer must carry that same sentence, cut to fit, got {actual:?}"
+    );
 }
 
 /// RULE, on the reporting side: what a change set serves back is what it was started
@@ -468,7 +502,8 @@ async fn a_change_set_reports_no_entity_type_past_the_modelled_length() {
 
 /// RULE, per batch entry: a batch read judges each `EntityRequest$EntityId` itself, so an
 /// id past the modelled length is reported as the malformed id it is, under the id that
-/// was asked for, beside the entries next to it.
+/// was asked for, beside the entries next to it — and the sentence it carries stays inside
+/// the length `BatchDescribeErrorMessageContent` declares however long that id was.
 #[tokio::test]
 async fn a_batch_read_bounds_each_entity_id_by_its_modelled_length() {
     let router = emulator();
@@ -529,6 +564,12 @@ async fn a_batch_read_bounds_each_entity_id_by_its_modelled_length() {
             answer.body
         );
         let reported_message = answer.text(&format!("/Errors/{asked}/ErrorMessage"));
+        let length = reported_message.chars().count();
+        assert!(
+            (1..=EXCEPTION_MESSAGE_MAX).contains(&length),
+            "case {case:?}: the entry's ErrorMessage must stay inside its modelled \
+             {EXCEPTION_MESSAGE_MAX} characters, got {length}"
+        );
         assert_eq!(
             reported_message, message,
             "case {case:?}: the entry's message must be built from the request, got \

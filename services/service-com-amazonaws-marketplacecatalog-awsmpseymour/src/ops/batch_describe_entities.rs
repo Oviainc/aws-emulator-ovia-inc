@@ -185,11 +185,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // as a validation failure and only a well-formed one as missing —
             // the same two answers, under the same two codes, a single read of
             // that entity gives.
+            //
+            // The entry is keyed by the id that was ASKED FOR, whatever that id
+            // is: this operation's recorded answers report a malformed entry
+            // under the value the caller sent, which is also the only key a
+            // caller could look its own entry up by.
             if !crate::state::is_entity_id(&request.entity_id) {
                 errors.insert(
                     request.entity_id.clone(),
                     BatchDescribeErrorDetail {
                         error_code: Some(crate::state::BATCH_ERROR_VALIDATION.to_string()),
+                        // The sentence quotes the submitted id cut to the room
+                        // it leaves, so an entry of any length is reported
+                        // inside `BatchDescribeErrorMessageContent`'s 2048.
                         error_message: Some(crate::state::invalid_entity_id_message(
                             &request.entity_id,
                         )),

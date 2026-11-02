@@ -847,11 +847,12 @@ async fn a_versioned_entity_type_reaches_the_rules_behind_it() {
 }
 
 /// RULE 4: a batch read reports each entry's own failure in `Errors`, keyed by the id
-/// that was asked for, and serves the rest of the batch — so one bad entry costs the
-/// caller nothing but that entry.
+/// that was asked for — whether that entry named a missing entity or an id that is no
+/// entity id at all — and serves the rest of the batch, so one bad entry costs the caller
+/// nothing but that entry.
 ///
-/// The rows differ along the mix: a malformed id alone, a missing one alone, both
-/// together, and both together beside an entity the catalog holds.
+/// The rows differ along the mix: a missing id alone, two of them, a malformed id alone,
+/// both together, and both together beside an entity the catalog holds.
 #[tokio::test]
 async fn a_mixed_batch_reports_each_entry_under_its_own_id() {
     let router = emulator();
@@ -889,7 +890,9 @@ async fn a_mixed_batch_reports_each_entry_under_its_own_id() {
 
     /// A well-formed entity id no change set ever created.
     const MISSING: &str = "prod-abc123";
-    /// An id that is no entity id at all.
+    /// A second one, so a row can carry two.
+    const MISSING_TWO: &str = "prod-abc124";
+    /// An id that is no entity id at all, reported under the value that was sent.
     const MALFORMED: &str = "bad entity id!";
 
     /// One row of the batch table: the case, the ids the batch asks for, the ids that
@@ -905,16 +908,37 @@ async fn a_mixed_batch_reports_each_entry_under_its_own_id() {
     // (case, requested ids, ids expected in EntityDetails, (id, code) expected in Errors)
     let rows: Vec<BatchRow> = vec![
         (
-            "a malformed id alone",
-            vec![MALFORMED.to_string()],
-            vec![],
-            vec![(MALFORMED, "ValidationException")],
-        ),
-        (
             "a missing id alone",
             vec![MISSING.to_string()],
             vec![],
             vec![(MISSING, "ResourceNotFoundException")],
+        ),
+        (
+            "two missing ids",
+            vec![MISSING.to_string(), MISSING_TWO.to_string()],
+            vec![],
+            vec![
+                (MISSING, "ResourceNotFoundException"),
+                (MISSING_TWO, "ResourceNotFoundException"),
+            ],
+        ),
+        (
+            "a held entity beside a missing one",
+            vec![held.clone(), MISSING.to_string()],
+            vec![held.clone()],
+            vec![(MISSING, "ResourceNotFoundException")],
+        ),
+        (
+            "every entry served",
+            vec![held.clone()],
+            vec![held.clone()],
+            vec![],
+        ),
+        (
+            "a malformed id alone",
+            vec![MALFORMED.to_string()],
+            vec![],
+            vec![(MALFORMED, "ValidationException")],
         ),
         (
             "a missing id and a malformed one",
@@ -934,26 +958,10 @@ async fn a_mixed_batch_reports_each_entry_under_its_own_id() {
                 (MALFORMED, "ValidationException"),
             ],
         ),
-        (
-            "every entry served",
-            vec![held.clone()],
-            vec![held.clone()],
-            vec![],
-        ),
     ];
 
     for (case, requested, served, failed) in rows {
-        let entries: Vec<Value> = requested
-            .iter()
-            .map(|entity_id| json!({"Catalog": CATALOG, "EntityId": entity_id}))
-            .collect();
-        let answer = call(
-            &router,
-            "POST",
-            "/BatchDescribeEntities",
-            Some(json!({"EntityRequestList": entries})),
-        )
-        .await;
+        let answer = batch_read(&router, &requested).await;
         assert_eq!(
             answer.status, 200,
             "case {case:?}: a batch read answers 200 whatever its entries resolve to, \
@@ -1003,6 +1011,21 @@ async fn a_mixed_batch_reports_each_entry_under_its_own_id() {
             );
         }
     }
+}
+
+/// The batch read of `entity_ids`, every entry naming the one catalog this service has.
+async fn batch_read(router: &MultiServiceRouter, entity_ids: &[String]) -> Answer {
+    let entries: Vec<Value> = entity_ids
+        .iter()
+        .map(|entity_id| json!({"Catalog": CATALOG, "EntityId": entity_id}))
+        .collect();
+    call(
+        router,
+        "POST",
+        "/BatchDescribeEntities",
+        Some(json!({"EntityRequestList": entries})),
+    )
+    .await
 }
 
 /// RULE 5: an action on a resource ARN this catalog cannot authorize is refused with the
