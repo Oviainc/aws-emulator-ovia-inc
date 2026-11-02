@@ -75,6 +75,8 @@ mod state_roundtrip;
 mod token_vault_cmk;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
+#[path = "all/workload_identity_arn_region.rs"]
+mod workload_identity_arn_region;
 #[path = "all/workload_identity_lifecycle.rs"]
 mod workload_identity_lifecycle;
 #[path = "all/workload_identity_mutation.rs"]
