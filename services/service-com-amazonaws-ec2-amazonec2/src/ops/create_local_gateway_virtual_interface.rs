@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLocalGatewayVirtualInterface
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLocalGatewayVirtualInterface`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLocalGatewayVirtualInterface::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a virtual interface IN a virtual interface group the account holds, storing it in
+//! [`crate::state`] and answering it in the non-terminal `pending` configuration state the
+//! clock owes `available`. The request's own FORM comes first, those readings depending on
+//! nothing the store holds: a `@required` parameter the request did not carry, and a value
+//! that is not a `LocalGatewayVirtualInterfaceGroupId` at all, which is refused
+//! `InvalidLocalGatewayVirtualInterfaceGroupID.Malformed` even when `DryRun` is set — a
+//! malformed request is refused with ITS OWN reason, the rule this service's read and write
+//! paths share. A `DryRun` then asks about permission rather than about the group named, so it
+//! is answered before the group is LOOKED UP; an id the account holds no group for is answered
+//! `InvalidLocalGatewayVirtualInterfaceGroupID.NotFound` whatever else the request carries,
+//! and the values the interface itself carries — the VLAN, the two addresses and the peer ASN
+//! — are read after it, there being no interface for them to describe until there is a group
+//! to create it in. The local gateway and the local BGP ASN the interface reports are facts of
+//! that GROUP, so they are read off the stored group rather than taken from the request.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +155,237 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLocalGatewayVirtualInterface` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLocalGatewayVirtualInterfaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // The Region of the request's SigV4 credential scope: a virtual interface is a
+        // Region's resource and its own ARN names that Region
+        // (`LocalGatewayVirtualInterface$LocalGatewayVirtualInterfaceArn`). Everything else it
+        // reports comes from the request or from the stored group it is created in.
+        let region = state::request_region(ctx.parts());
+
+        // The request's own FORM first, before anything is resolved. Each of these parameters
+        // is `@required` but modelled `clientOptional`, so a request that left one out reaches
+        // this handler as an empty string (or, for the VLAN, as zero — which is also not a
+        // VLAN a tagged frame can name) rather than being refused by the boundary validator. A
+        // parameter the request did not carry is EC2's `MissingParameter`.
+        for (parameter, value) in [
+            (
+                "localGatewayVirtualInterfaceGroupId",
+                input.local_gateway_virtual_interface_group_id.as_str(),
+            ),
+            ("outpostLagId", input.outpost_lag_id.as_str()),
+            ("localAddress", input.local_address.as_str()),
+            ("peerAddress", input.peer_address.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
+        if input.vlan == 0 {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter vlan",
+            ));
+        }
+
+        // Something that is not a `LocalGatewayVirtualInterfaceGroupId` at all is refused
+        // through the crate's one form check for that id — the same one the resolver below
+        // makes before it looks the id up — and it is refused HERE, before the `DryRun` branch:
+        // a malformed request is refused with its own reason even when the caller only asked
+        // about permission, the order the sibling creates of this surface read their ids in
+        // (`create_local_gateway_route_table`'s `require_well_formed_local_gateway_id`) and the
+        // rule this service's other paths are held to. Reading the FORM needs nothing the store
+        // holds; the LOOKUP, which does, stays after the dry run.
+        if !state::local_gateway_virtual_interface_group_id_is_well_formed(
+            &input.local_gateway_virtual_interface_group_id,
+        ) {
+            return Err(state::invalid_local_gateway_virtual_interface_group_id_malformed(
+                &input.local_gateway_virtual_interface_group_id,
+            ));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // group the request names, so it is answered once the request's own form has been read
+        // and BEFORE the group is looked up — the order the sibling creates of this surface
+        // answer a dry run in. Every caller of this emulator is permitted, and nothing is
+        // written on this path.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The tags to apply to a resource when the local gateway virtual interface is being
+        // created" (`TagSpecifications`), refusing a specification that names any resource type
+        // but the one this action creates. The shared helper also bounds the tag count, each
+        // key and value, a key given twice and the reserved `aws:` prefix.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_LOCAL_GATEWAY_VIRTUAL_INTERFACE,
+            Self::NAME,
+        )?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // A move the clock already owes a record of this store fell due whether or not anybody
+        // called, so those moves are applied before this write reads it.
+        store.materialize_due_transitions();
+
+        // "Create a virtual interface for a local gateway": the interface is created IN the
+        // group `LocalGatewayVirtualInterfaceGroupId` names, so an id this account holds no
+        // group for leaves nothing to create it in. The crate's one resolver for this id makes
+        // the form check above again before looking the id up, so the two cannot drift; an
+        // account without an Outpost holds no virtual interface group at all, so `.NotFound` is
+        // the answer every well-formed id gets until one has been stored.
+        state::require_known_local_gateway_virtual_interface_group(
+            &store,
+            &input.local_gateway_virtual_interface_group_id,
+        )?;
+
+        // "The ID of the local gateway" and "The Border Gateway Protocol (BGP) Autonomous
+        // System Number (ASN) of the local gateway" are facts of the GROUP the interface is
+        // created in, so they are read off the stored group rather than taken from the request.
+        // The resolver above has already proved the group is there and the store's own insert
+        // always sets its local gateway id, so neither being readable is a broken invariant
+        // rather than something to report as an empty member.
+        let group_facts = store
+            .local_gateway_virtual_interface_groups
+            .get(&input.local_gateway_virtual_interface_group_id)
+            .map(|group| (group.local_gateway_id.clone(), group.local_bgp_asn));
+        let (local_gateway_id, local_bgp_asn) = match group_facts {
+            Some((Some(local_gateway_id), local_bgp_asn)) => (local_gateway_id, local_bgp_asn),
+            _ => {
+                return Err(state::internal_error(format!(
+                    "the local gateway virtual interface group '{group_id}' carries no local \
+                     gateway",
+                    group_id = input.local_gateway_virtual_interface_group_id,
+                )))
+            }
+        };
+
+        // The values the interface itself carries, read once the group it is created IN has
+        // been resolved: the interface is created in that group, so a request naming no group
+        // of the account is answered about the GROUP whatever else it carries — the answer the
+        // recorded corpus behind this operation's issue shows EC2 giving — and there is no
+        // interface for these values to describe until there is a group to create it in.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLocalGatewayVirtualInterface"))
+        // "The virtual local area network (VLAN) used for the local gateway virtual interface"
+        // (`Vlan`) is held to the VLAN ids an 802.1Q tag can name — the crate's one definition
+        // of that range, which the model types as a plain integer.
+        if !state::LOCAL_GATEWAY_VIF_VLAN.contains(&input.vlan) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({vlan}) for parameter vlan is invalid. Valid values: {min} to {max}.",
+                vlan = input.vlan,
+                min = state::LOCAL_GATEWAY_VIF_VLAN.start(),
+                max = state::LOCAL_GATEWAY_VIF_VLAN.end(),
+            )));
+        }
+
+        // "The IP address assigned to the local gateway virtual interface on the Outpost side.
+        // ONLY IPV4 IS SUPPORTED" (`LocalAddress`), and the same sentence for the peer's
+        // (`PeerAddress`): both are read by the crate's one reader of a dotted quad, so
+        // "not an IPv4 address" is one answer for both rather than two.
+        for (parameter, address) in [
+            ("localAddress", input.local_address.as_str()),
+            ("peerAddress", input.peer_address.as_str()),
+        ] {
+            if !state::is_ipv4_address(address) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({address}) for parameter {parameter} is invalid. \
+                     Expected: an IPv4 address."
+                )));
+            }
+        }
+
+        // "The Autonomous System Number (ASN) of the Border Gateway Protocol (BGP) peer"
+        // (`PeerBgpAsn`) and "The EXTENDED 32-bit ASN of the BGP peer FOR USE WITH LARGER ASN
+        // VALUES" (`PeerBgpAsnExtended`) are two halves of ONE ASN — the second being the
+        // first's value range widened — so a request naming both names two ASNs for one peer
+        // and is refused rather than having one silently win, the way a customer gateway's own
+        // pair of ASN members is.
+        if input.peer_bgp_asn.is_some() && input.peer_bgp_asn_extended.is_some() {
+            return Err(state::invalid_parameter_combination(
+                "Either PeerBgpAsn or PeerBgpAsnExtended may be specified for a local gateway \
+                 virtual interface, not both",
+            ));
+        }
+        // An ASN is a number of the 32-bit ASN space those two members divide, which starts at
+        // 1: the lower bound is applied here because each member's own type is what bounds it
+        // above.
+        if let Some(asn) = input.peer_bgp_asn.filter(|asn| *asn < 1) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({asn}) for parameter peerBgpAsn is invalid. An Autonomous System \
+                 Number is a positive number."
+            )));
+        }
+        if let Some(asn) = input
+            .peer_bgp_asn_extended
+            .filter(|asn| !(1..=u32::MAX.into()).contains(asn))
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({asn}) for parameter peerBgpAsnExtended is invalid. Valid values: 1 \
+                 to {max}.",
+                max = u32::MAX,
+            )));
+        }
+
+        // The record itself: the interface id, its ARN and the owning account come from the
+        // store, never from the request. A new interface starts in the TRANSIENT `pending`
+        // configuration state with the clock owing it `available` one TRANSITION_DELAY later,
+        // so a caller describing the interfaces straight after this call still sees `pending`.
+        let Some(virtual_interface_id) =
+            store.insert_local_gateway_virtual_interface(state::LocalGatewayVirtualInterfaceSpec {
+                local_gateway_virtual_interface_group_id: Some(
+                    input.local_gateway_virtual_interface_group_id.clone(),
+                ),
+                local_gateway_id,
+                local_bgp_asn,
+                outpost_lag_id: Some(input.outpost_lag_id),
+                vlan: Some(input.vlan),
+                local_address: Some(input.local_address),
+                peer_address: Some(input.peer_address),
+                peer_bgp_asn: input.peer_bgp_asn,
+                peer_bgp_asn_extended: input.peer_bgp_asn_extended,
+                region,
+                configuration_state: state::LOCAL_GATEWAY_VIF_STATE_PENDING.to_string(),
+                tags,
+            })
+        else {
+            return Err(crate::scaffolded::Scaffolded::service_error(
+                state::LOCAL_GATEWAY_VIF_LIMIT_EXCEEDED,
+                400,
+                format!(
+                    "This emulator stores at most {max} local gateway virtual interfaces and at \
+                     most {bytes} bytes of caller-supplied data, and this request would take it \
+                     past one of the two",
+                    max = state::MAX_LOCAL_GATEWAY_VIFS,
+                    bytes = state::MAX_STORED_BYTES,
+                ),
+            ));
+        };
+        // The interface was answered `pending`, so the clock owes it
+        // `LOCAL_GATEWAY_VIF_STATE_AVAILABLE`: the instant is RECORDED here and applied by the
+        // store's own materialisation once it has passed, never slept for.
+        store.owe_local_gateway_virtual_interface_available(&virtual_interface_id);
+
+        // "Information about the local gateway virtual interface"
+        // (`CreateLocalGatewayVirtualInterfaceResult$LocalGatewayVirtualInterface`): the
+        // interface as it was STORED, so this operation and
+        // `DescribeLocalGatewayVirtualInterfaces` cannot report one interface differently.
+        let Some(virtual_interface) = store
+            .local_gateway_virtual_interfaces
+            .get(&virtual_interface_id)
+            .cloned()
+        else {
+            return Err(state::internal_error(format!(
+                "the local gateway virtual interface '{virtual_interface_id}' could not be read \
+                 back"
+            )));
+        };
+        Ok(CreateLocalGatewayVirtualInterfaceOutput {
+            local_gateway_virtual_interface: Some(virtual_interface),
+        })
     }
 }

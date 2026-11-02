@@ -3,10 +3,12 @@
 //! @op DescribeLocalGatewayVirtualInterfaces
 //!
 //! Reports the local gateway virtual interfaces the account holds
-//! ([`crate::state::ComAmazonawsEc2Amazonec2State::local_gateway_virtual_interfaces`]),
-//! narrowed by the `LocalGatewayVirtualInterfaceIds` and `Filters` the request names and
-//! cut into `MaxResults`-sized pages. It is a READ: nothing it does changes what a later
-//! caller sees.
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::local_gateway_virtual_interfaces`]) — the
+//! set `CreateLocalGatewayVirtualInterface` stores — narrowed by the
+//! `LocalGatewayVirtualInterfaceIds` and `Filters` the request names and cut into
+//! `MaxResults`-sized pages. It is a READ: the only state it touches is the clock,
+//! materialising the configuration-state moves that had already fallen due whether or not
+//! anybody called, so nothing it does changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -245,7 +247,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let named_ids: ::std::collections::HashSet<&str> =
             requested.iter().map(String::as_str).collect();
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // A configuration-state move the clock already owed an interface fell due whether or
+        // not anybody called, so those moves are applied before this read reports the store:
+        // an interface whose `available` instant has passed is reported `available`. That is
+        // the ONLY write on this path, and it changes nothing a later caller would not have
+        // seen anyway.
+        store.materialize_due_transitions();
 
         // The default is to describe every virtual interface the account holds; the ids
         // narrow the store to those named, and every filter must then hold ("If you specify

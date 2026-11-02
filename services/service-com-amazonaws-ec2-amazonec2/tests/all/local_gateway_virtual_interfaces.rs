@@ -1,27 +1,160 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for `DescribeLocalGatewayVirtualInterfaces`, driven over the wire the
-//! service actually speaks: `ec2Query` — an `application/x-www-form-urlencoded` POST whose
-//! body carries `Action=DescribeLocalGatewayVirtualInterfaces`, answered with XML
-//! (README.md / OPERATIONS.md "Wire protocol"). ec2Query is selected by the `ec2` signing
-//! name in the request's SigV4 credential scope, so every call here carries one.
+//! End-to-end cover for `CreateLocalGatewayVirtualInterface` and for the
+//! `DescribeLocalGatewayVirtualInterfaces` that reports what it stored, driven over the wire
+//! the service actually speaks: `ec2Query` — an `application/x-www-form-urlencoded` POST whose
+//! body carries `Action=<Operation>`, answered with XML (README.md / OPERATIONS.md "Wire
+//! protocol"). ec2Query is selected by the `ec2` signing name in the request's SigV4
+//! credential scope, so every call here carries one.
 //!
-//! The rule under test is that the operation REPORTS THE STORE: the set it answers with is
-//! the account's local gateway virtual interfaces, narrowed by the
-//! `LocalGatewayVirtualInterfaceIds` and `Filters` the request names and cut into
-//! `MaxResults`-sized pages. Every table row is a distinct input along what that
-//! generalises over — which filter, how many values, how many filters, which ids, which
-//! members a virtual interface holds a value for, which page size — and an account with no
-//! Outpost (the empty store) is one row among them rather than the specification.
+//! Two rules, each with its own table.
+//!
+//! 1. The CREATE computes its answer from the store: it creates the interface IN a virtual
+//!    interface group the account HOLDS, mints the interface id, its ARN and the owning
+//!    account itself, reads the local gateway and the local BGP ASN off that stored group,
+//!    keeps the request's own Outpost LAG, VLAN, addresses and peer ASN, answers the
+//!    non-terminal `pending` configuration state the clock owes `available`, adds the minted
+//!    id to its group's interface list, and refuses a request naming a group the account does
+//!    not hold with that resource's own `NotFound` code (and an id that is not one of that
+//!    kind at all with its `.Malformed`). Its rows differ along which group, on which local
+//!    gateway, with which local BGP ASN and in which Region, which Outpost LAG, which VLAN,
+//!    which addresses, which of the two peer-ASN members, how many tags, which resource type
+//!    a tag specification names, and whether the request only asks about permission.
+//! 2. The DESCRIBE reports THE STORE: the set it answers with is the account's local gateway
+//!    virtual interfaces, narrowed by the `LocalGatewayVirtualInterfaceIds` and `Filters` the
+//!    request names and cut into `MaxResults`-sized pages. Its rows differ along which
+//!    filter, how many values, how many filters, which ids, which members a virtual interface
+//!    holds a value for, which page size — and an account with no Outpost (the empty store) is
+//!    one row among them rather than the specification.
+
+use std::time::Duration;
 
 use ec2::ops::types::Tag;
 use ec2::state::{
-    ComAmazonawsEc2Amazonec2State as Ec2State, LocalGatewayVirtualInterfaceSpec as InterfaceSpec,
+    ComAmazonawsEc2Amazonec2State as Ec2State, LOCAL_GATEWAY_VIF_ID_PREFIX,
+    LOCAL_GATEWAY_VIF_STATE_AVAILABLE, LOCAL_GATEWAY_VIF_STATE_PENDING,
+    LocalGatewayVirtualInterfaceGroupSpec, LocalGatewayVirtualInterfaceSpec as InterfaceSpec,
+    TRANSITION_DELAY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{element, elements, error_code, filters, indexed, unescaped};
+use super::ec2_query::{element, elements, error_code, error_message, filters, indexed, unescaped};
+
+/// The ec2Query action that creates one.
+const CREATE: &str = "CreateLocalGatewayVirtualInterface";
+
+/// Long enough past [`TRANSITION_DELAY`] that the move the clock owes a new interface is
+/// certainly due.
+fn past_the_transition() -> Duration {
+    TRANSITION_DELAY + Duration::from_millis(250)
+}
+
+/// One form field.
+fn param(name: &str, value: &str) -> (String, String) {
+    (name.to_string(), value.to_string())
+}
+
+/// One `CreateLocalGatewayVirtualInterface` call, as its status and body.
+async fn create(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
+    super::ec2_query::call(router, REGION, CREATE, params).await
+}
+
+/// The form fields for one `TagSpecification` naming `resource_type` and `tags`.
+fn tag_specification(resource_type: &str, tags: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut fields = vec![param("TagSpecification.1.ResourceType", resource_type)];
+    for (index, (key, value)) in tags.iter().enumerate() {
+        let position = index + 1;
+        fields.push(param(&format!("TagSpecification.1.Tag.{position}.Key"), key));
+        fields.push(param(
+            &format!("TagSpecification.1.Tag.{position}.Value"),
+            value,
+        ));
+    }
+    fields
+}
+
+/// What one interface request names, beside the group it is created in.
+struct Wire {
+    outpost_lag_id: &'static str,
+    vlan: i32,
+    local_address: &'static str,
+    peer_address: &'static str,
+    /// The peer ASN in `PeerBgpAsn`, in `PeerBgpAsnExtended`, or in neither.
+    peer_bgp_asn: Option<i32>,
+    peer_bgp_asn_extended: Option<i64>,
+}
+
+/// The five `@required` members of a create, with the two optional ASN members when the row
+/// carries one.
+fn request(group_id: &str, wire: &Wire) -> Vec<(String, String)> {
+    let mut fields = vec![
+        param("LocalGatewayVirtualInterfaceGroupId", group_id),
+        param("OutpostLagId", wire.outpost_lag_id),
+        param("Vlan", &wire.vlan.to_string()),
+        param("LocalAddress", wire.local_address),
+        param("PeerAddress", wire.peer_address),
+    ];
+    if let Some(asn) = wire.peer_bgp_asn {
+        fields.push(param("PeerBgpAsn", &asn.to_string()));
+    }
+    if let Some(asn) = wire.peer_bgp_asn_extended {
+        fields.push(param("PeerBgpAsnExtended", &asn.to_string()));
+    }
+    fields
+}
+
+/// A request that would succeed, so a table that varies ONE member can leave the rest alone.
+fn well_formed(group_id: &str) -> Vec<(String, String)> {
+    request(
+        group_id,
+        &Wire {
+            outpost_lag_id: "ola-00000000000000001",
+            vlan: 100,
+            local_address: "10.0.0.1",
+            peer_address: "10.0.0.2",
+            peer_bgp_asn: Some(65000),
+            peer_bgp_asn_extended: None,
+        },
+    )
+}
+
+/// What one seeded virtual interface group is: the local gateway it belongs to, its local BGP
+/// configuration, the Region its own ARN names and its configuration state. Nothing in the EC2
+/// API this emulator serves creates an Outpost, so a group is written straight through the
+/// store's own seam — the one `CreateLocalGatewayVirtualInterfaceGroup` will write through.
+struct GroupRow {
+    local_gateway_id: &'static str,
+    local_bgp_asn: Option<i32>,
+    region: &'static str,
+    /// One of `LocalGatewayVirtualInterfaceGroupConfigurationState`'s members.
+    configuration_state: &'static str,
+}
+
+/// The groups this suite creates interfaces in: two local gateways, a group with and a group
+/// without a local BGP ASN, and one group whose own ARN names another Region.
+fn group_rows() -> Vec<GroupRow> {
+    vec![
+        GroupRow {
+            local_gateway_id: "lgw-00000000000000001",
+            local_bgp_asn: Some(64512),
+            region: REGION,
+            configuration_state: "available",
+        },
+        GroupRow {
+            local_gateway_id: "lgw-00000000000000001",
+            local_bgp_asn: None,
+            region: REGION,
+            configuration_state: "available",
+        },
+        GroupRow {
+            local_gateway_id: "lgw-00000000000000002",
+            local_bgp_asn: Some(64513),
+            region: OTHER_REGION,
+            configuration_state: "pending",
+        },
+    ]
+}
 
 /// The Region every call here is signed for. The virtual interface store is per account
 /// rather than per Region, so the Region only selects the ec2Query envelope — and the
@@ -209,6 +342,34 @@ fn seeded_rows() -> Vec<InterfaceRow> {
     ]
 }
 
+/// Write one virtual interface group into the store and answer the id it was given.
+fn seed_group(engine: &engine::InMemoryEngine, row: &GroupRow) -> String {
+    let case = row.local_gateway_id;
+    engine
+        .state::<Ec2State>()
+        .lock()
+        .insert_local_gateway_virtual_interface_group(LocalGatewayVirtualInterfaceGroupSpec {
+            local_gateway_id: row.local_gateway_id.to_string(),
+            // The groups start with no interface in them, so every id one reports later can
+            // only have been added by a create.
+            local_gateway_virtual_interface_ids: Vec::new(),
+            local_bgp_asn: row.local_bgp_asn,
+            local_bgp_asn_extended: None,
+            region: row.region.to_string(),
+            configuration_state: row.configuration_state.to_string(),
+            tags: Vec::new(),
+        })
+        .unwrap_or_else(|| panic!("case {case:?}: the store must take the seeded group"))
+}
+
+/// Every group of the table above, in row order.
+fn seed_all(engine: &engine::InMemoryEngine) -> Vec<String> {
+    group_rows()
+        .iter()
+        .map(|row| seed_group(engine, row))
+        .collect()
+}
+
 /// The spec one seeded row is written through.
 fn spec_of(row: &InterfaceRow) -> InterfaceSpec {
     InterfaceSpec {
@@ -260,6 +421,823 @@ fn interface_arn(region: &str, interface_id: &str) -> String {
         "arn:aws:ec2:{region}:{}:local-gateway-virtual-interface/{interface_id}",
         engine::emulator_account_id()
     )
+}
+
+/// How many virtual interfaces the store holds.
+fn stored_interfaces(engine: &engine::InMemoryEngine) -> usize {
+    engine
+        .state::<Ec2State>()
+        .lock()
+        .local_gateway_virtual_interfaces
+        .len()
+}
+
+/// "The IDs of the virtual interfaces" one stored group reports.
+fn group_interface_ids(engine: &engine::InMemoryEngine, group_id: &str) -> Vec<String> {
+    engine
+        .state::<Ec2State>()
+        .lock()
+        .local_gateway_virtual_interface_groups
+        .get(group_id)
+        .and_then(|group| group.local_gateway_virtual_interface_ids.clone())
+        .unwrap_or_default()
+}
+
+/// Assert that `body` carries `<member>value</member>`.
+fn assert_member(case: &str, body: &str, member: &str, value: &str) {
+    assert!(
+        body.contains(&format!("<{member}>{value}</{member}>")),
+        "case {case:?}: expected <{member}>{value}</{member}>, got {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The create computes its answer from the store
+// ---------------------------------------------------------------------------
+
+/// One row of the create table: the group to create the interface in, what the request names,
+/// and the tags to assign.
+struct CreateRow {
+    group: usize,
+    wire: Wire,
+    tags: Vec<(&'static str, &'static str)>,
+}
+
+/// Every member of a created interface comes from the request or from the group it is created
+/// in: the minted id and ARN, the group's own id, local gateway and local BGP ASN, the Outpost
+/// LAG, VLAN, addresses and peer ASN the request named, the owning account, the transient
+/// configuration state and the tags — and the interface reads back identically through
+/// `DescribeLocalGatewayVirtualInterfaces`, which is also where the group's interface list is
+/// seen to have gained it.
+#[tokio::test]
+async fn a_created_virtual_interface_reports_its_group_the_request_and_the_minted_members() {
+    let (router, engine) = super::ec2_query::emulator();
+    let groups = seed_all(&engine);
+    let rows = group_rows();
+
+    // Rows differ along the group (its local gateway, its local BGP ASN — present and absent —
+    // its Region and its configuration state), the Outpost LAG, the VLAN, the two addresses,
+    // which of the two peer-ASN members carries the ASN (or neither), and the number of tags.
+    let cases = vec![
+        CreateRow {
+            group: 0,
+            wire: Wire {
+                outpost_lag_id: "ola-00000000000000001",
+                vlan: 1,
+                local_address: "10.0.0.1",
+                peer_address: "10.0.0.2",
+                peer_bgp_asn: Some(65000),
+                peer_bgp_asn_extended: None,
+            },
+            tags: Vec::new(),
+        },
+        CreateRow {
+            group: 1,
+            wire: Wire {
+                outpost_lag_id: "ola-00000000000000002",
+                vlan: 4094,
+                local_address: "192.0.2.17",
+                peer_address: "192.0.2.18",
+                peer_bgp_asn: None,
+                peer_bgp_asn_extended: Some(4_294_967_295),
+            },
+            tags: vec![("Name", "rack-a")],
+        },
+        CreateRow {
+            group: 2,
+            wire: Wire {
+                outpost_lag_id: "ola-00000000000000003",
+                vlan: 2048,
+                local_address: "172.16.31.254",
+                peer_address: "172.16.31.253",
+                peer_bgp_asn: None,
+                peer_bgp_asn_extended: None,
+            },
+            tags: vec![("Name", "rack-b"), ("Owner", "TeamA"), ("Tier", "edge")],
+        },
+    ];
+
+    let mut minted: Vec<String> = Vec::new();
+    for case_row in &cases {
+        let case = format!(
+            "group {} on VLAN {} with {} tag(s)",
+            case_row.group,
+            case_row.wire.vlan,
+            case_row.tags.len()
+        );
+        let group_id = &groups[case_row.group];
+        let row = &rows[case_row.group];
+
+        let mut params = request(group_id, &case_row.wire);
+        if !case_row.tags.is_empty() {
+            params.extend(tag_specification(
+                "local-gateway-virtual-interface",
+                &case_row.tags,
+            ));
+        }
+        let (status, body) = create(&router, &params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from {CREATE}, got {status} with body {body}"
+        );
+
+        let virtual_interface_id = element(&body, ID_ELEMENT)
+            .unwrap_or_else(|| panic!("case {case:?}: no <{ID_ELEMENT}> in {body}"));
+        assert!(
+            virtual_interface_id.starts_with(&format!("{LOCAL_GATEWAY_VIF_ID_PREFIX}-")),
+            "case {case:?}: expected an id minted with the virtual interface prefix, got \
+             {virtual_interface_id:?}"
+        );
+        assert!(
+            !minted.contains(&virtual_interface_id),
+            "case {case:?}: expected a fresh interface id, got the already-minted \
+             {virtual_interface_id:?}"
+        );
+
+        // The members a successful create reports, and the same members as the reader answers
+        // with: the ARN names the Region the REQUEST was signed for, never the group's own.
+        let mut expected = vec![
+            (
+                "localGatewayVirtualInterfaceArn",
+                interface_arn(REGION, &virtual_interface_id),
+            ),
+            (
+                "localGatewayVirtualInterfaceGroupId",
+                group_id.clone(),
+            ),
+            ("localGatewayId", row.local_gateway_id.to_string()),
+            ("outpostLagId", case_row.wire.outpost_lag_id.to_string()),
+            ("vlan", case_row.wire.vlan.to_string()),
+            ("localAddress", case_row.wire.local_address.to_string()),
+            ("peerAddress", case_row.wire.peer_address.to_string()),
+            ("ownerId", engine::emulator_account_id().to_string()),
+            (
+                "configurationState",
+                LOCAL_GATEWAY_VIF_STATE_PENDING.to_string(),
+            ),
+        ];
+        if let Some(asn) = row.local_bgp_asn {
+            expected.push(("localBgpAsn", asn.to_string()));
+        }
+        if let Some(asn) = case_row.wire.peer_bgp_asn {
+            expected.push(("peerBgpAsn", asn.to_string()));
+        }
+        if let Some(asn) = case_row.wire.peer_bgp_asn_extended {
+            expected.push(("peerBgpAsnExtended", asn.to_string()));
+        }
+        for (member, value) in &expected {
+            assert_member(&case, &body, member, value);
+        }
+        for (key, value) in &case_row.tags {
+            assert_member(&case, &body, "key", key);
+            assert_member(&case, &body, "value", value);
+        }
+
+        // The round trip: the interface reads back through the describe with the same members,
+        // so the create answered the record it stored rather than its request.
+        let (read_status, read_body) = describe(
+            &router,
+            &indexed(
+                "LocalGatewayVirtualInterfaceId",
+                &[virtual_interface_id.as_str()],
+            ),
+        )
+        .await;
+        assert_eq!(
+            read_status, 200,
+            "case {case:?}: expected HTTP 200 from {ACTION}, got {read_status} with body \
+             {read_body}"
+        );
+        assert_eq!(
+            elements(&read_body, ID_ELEMENT),
+            vec![virtual_interface_id.clone()],
+            "case {case:?}: expected {ACTION} to report exactly the created interface, got \
+             {read_body}"
+        );
+        for (member, value) in &expected {
+            assert_member(&case, &read_body, member, value);
+        }
+        for (key, value) in &case_row.tags {
+            assert_member(&case, &read_body, "key", key);
+            assert_member(&case, &read_body, "value", value);
+        }
+
+        // A virtual interface is created IN a group, and a group reports the interfaces it
+        // holds, so the group it was created in gained exactly this id.
+        assert!(
+            group_interface_ids(&engine, group_id).contains(&virtual_interface_id),
+            "case {case:?}: the group must report the interface created in it, got {:?}",
+            group_interface_ids(&engine, group_id)
+        );
+
+        minted.push(virtual_interface_id);
+    }
+
+    assert_eq!(
+        stored_interfaces(&engine),
+        cases.len(),
+        "every created interface must be stored once"
+    );
+    // An absent optional member is absent rather than empty: the group with no local BGP ASN
+    // reports none on its interface either.
+    let (status, body) = describe(&router, &indexed("LocalGatewayVirtualInterfaceId", &[minted[1].as_str()])).await;
+    assert_eq!(
+        status, 200,
+        "the ASN-less group: expected HTTP 200, got {status} with body {body}"
+    );
+    assert!(
+        !body.contains("<localBgpAsn>"),
+        "the ASN-less group: an interface of a group with no local BGP ASN must report none, \
+         got {body}"
+    );
+}
+
+/// A new interface is answered in the non-terminal `pending` configuration state, and the clock
+/// owes it `available` one `TRANSITION_DELAY` later whether or not anybody calls again.
+#[tokio::test]
+async fn an_interface_starts_pending_and_the_clock_owes_it_available() {
+    let (router, engine) = super::ec2_query::emulator();
+    let groups = seed_all(&engine);
+
+    let (status, body) = create(&router, &well_formed(&groups[0])).await;
+    assert_eq!(
+        status, 200,
+        "the clock: expected HTTP 200 from {CREATE}, got {status} with body {body}"
+    );
+    assert_eq!(
+        element(&body, "configurationState").as_deref(),
+        Some(LOCAL_GATEWAY_VIF_STATE_PENDING),
+        "the clock: a new interface starts in the transient state, got {body}"
+    );
+    let virtual_interface_id =
+        element(&body, ID_ELEMENT).unwrap_or_else(|| panic!("the clock: no <{ID_ELEMENT}> in {body}"));
+
+    tokio::time::sleep(past_the_transition()).await;
+
+    let (read_status, read_body) = describe(&router, &[]).await;
+    assert_eq!(
+        read_status, 200,
+        "after the transition: expected HTTP 200, got {read_status} with body {read_body}"
+    );
+    assert_eq!(
+        elements(&read_body, ID_ELEMENT),
+        vec![virtual_interface_id],
+        "after the transition: expected the one interface, got {read_body}"
+    );
+    assert_eq!(
+        element(&read_body, "configurationState").as_deref(),
+        Some(LOCAL_GATEWAY_VIF_STATE_AVAILABLE),
+        "after the transition: the clock owed the interface \
+         {LOCAL_GATEWAY_VIF_STATE_AVAILABLE:?}, got {read_body}"
+    );
+    assert_eq!(
+        stored_interfaces(&engine),
+        1,
+        "the clock may not store a second interface"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The group named must be a group of the account
+// ---------------------------------------------------------------------------
+
+/// A `LocalGatewayVirtualInterfaceGroupId` that is not a virtual interface group id of the
+/// account is refused before anything is written: one that is not a group id at all with
+/// `InvalidLocalGatewayVirtualInterfaceGroupID.Malformed`, and a well-formed one the account
+/// holds no group for with `InvalidLocalGatewayVirtualInterfaceGroupID.NotFound` — whatever
+/// else the request carries, the interface being created IN that group.
+#[tokio::test]
+async fn a_virtual_interface_group_the_account_does_not_hold_is_refused() {
+    let (router, engine) = super::ec2_query::emulator();
+    let groups = seed_all(&engine);
+
+    // Rows: the long and the short well-formed id form (both unknown), then ids that are not a
+    // virtual interface group id at all — the interface kind this action mints, the association
+    // kind of this surface, another EC2 resource kind, a bare prefix, a suffix that is not
+    // hexadecimal, and free text.
+    let cases = [
+        (
+            "lgw-vif-grp-0123456789abcdef0",
+            "InvalidLocalGatewayVirtualInterfaceGroupID.NotFound",
+        ),
+        (
+            "lgw-vif-grp-01234567",
+            "InvalidLocalGatewayVirtualInterfaceGroupID.NotFound",
+        ),
+        (
+            "lgw-vif-0123456789abcdef0",
+            "InvalidLocalGatewayVirtualInterfaceGroupID.Malformed",
+        ),
+        (
+            "lgw-vif-grp-assoc-0123456789abcdef0",
+            "InvalidLocalGatewayVirtualInterfaceGroupID.Malformed",
+        ),
+        (
+            "lgw-rtb-0123456789abcdef0",
+            "InvalidLocalGatewayVirtualInterfaceGroupID.Malformed",
+        ),
+        (
+            "lgw-vif-grp-",
+            "InvalidLocalGatewayVirtualInterfaceGroupID.Malformed",
+        ),
+        (
+            "lgw-vif-grp-zzzzzzzzzzzzzzzzz",
+            "InvalidLocalGatewayVirtualInterfaceGroupID.Malformed",
+        ),
+        (
+            "not-a-group-id",
+            "InvalidLocalGatewayVirtualInterfaceGroupID.Malformed",
+        ),
+    ];
+    for (group_id, expected_code) in cases {
+        let case = group_id.to_string();
+        let (status, body) = create(&router, &well_formed(group_id)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected the code {expected_code:?}, got {body}"
+        );
+        if expected_code.ends_with(".NotFound") {
+            assert_eq!(
+                error_message(&body),
+                format!("The local-gateway-virtual-interface-group ID '{group_id}' does not exist"),
+                "case {case:?}: the refusal must name the id the request carried, got {body}"
+            );
+        }
+    }
+
+    assert_eq!(
+        stored_interfaces(&engine),
+        0,
+        "a refused create must store nothing"
+    );
+
+    // The stored group still takes an interface, so the refusals above were about the id.
+    let (status, body) = create(&router, &well_formed(&groups[0])).await;
+    assert_eq!(
+        status, 200,
+        "the stored group: expected HTTP 200, got {status} with body {body}"
+    );
+}
+
+/// One row of the missing-parameter table: what the case is called, the form fields to send,
+/// and the error code the request must be refused with.
+type MissingParameterCase = (&'static str, Vec<(String, String)>, &'static str);
+
+/// A required parameter the request carried as an EMPTY value is refused with EC2's
+/// `MissingParameter` naming it — every one of them is modelled `clientOptional`, so an empty
+/// one reaches the handler rather than the boundary validator — and that refusal is answered
+/// whether or not the request only asks about permission. A parameter left out ALTOGETHER is a
+/// null the boundary validator refuses before the handler, with the framework's own
+/// `MalformedInput`, as every other operation of this service answers it.
+#[tokio::test]
+async fn a_required_parameter_the_request_left_out_is_refused() {
+    let (router, engine) = super::ec2_query::emulator();
+    let groups = seed_all(&engine);
+
+    /// The one request field named `name` replaced by `value`.
+    fn with(group_id: &str, name: &str, value: &str) -> Vec<(String, String)> {
+        well_formed(group_id)
+            .into_iter()
+            .map(|(field, held)| {
+                if field == name {
+                    (field, value.to_string())
+                } else {
+                    (field, held)
+                }
+            })
+            .collect()
+    }
+
+    /// The well-formed request without the field named `name`.
+    fn without(group_id: &str, name: &str) -> Vec<(String, String)> {
+        well_formed(group_id)
+            .into_iter()
+            .filter(|(field, _)| field != name)
+            .collect()
+    }
+
+    // Rows: each required member given empty (the handler's refusal — a VLAN of zero is the
+    // integer form of "not given", 0 being no VLAN at all), then each left out entirely (the
+    // boundary validator's).
+    let mut cases: Vec<MissingParameterCase> = Vec::new();
+    for field in [
+        "LocalGatewayVirtualInterfaceGroupId",
+        "OutpostLagId",
+        "LocalAddress",
+        "PeerAddress",
+    ] {
+        cases.push((field, with(&groups[0], field, ""), "MissingParameter"));
+        cases.push((field, without(&groups[0], field), "MalformedInput"));
+    }
+    cases.push(("Vlan", with(&groups[0], "Vlan", "0"), "MissingParameter"));
+    cases.push(("Vlan", without(&groups[0], "Vlan"), "MalformedInput"));
+
+    for (case, params, expected_code) in cases {
+        for dry_run in [false, true] {
+            let case = format!("{case} ({expected_code}, DryRun={dry_run})");
+            let mut params = params.clone();
+            if dry_run {
+                params.push(param("DryRun", "true"));
+            }
+            let (status, body) = create(&router, &params).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} with body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                expected_code,
+                "case {case:?}: expected the code {expected_code:?}, got {body}"
+            );
+        }
+    }
+    assert_eq!(
+        stored_interfaces(&engine),
+        0,
+        "a refused create must store nothing"
+    );
+}
+
+/// One row of the dry-run table: what the case is called, the form fields to send, and the
+/// status and code the request must be answered with once `DryRun=true` is added.
+type DryRunCase = (&'static str, Vec<(String, String)>, u16, &'static str);
+
+/// A dry run asks about PERMISSION rather than about the group named, so it reports
+/// `DryRunOperation` whatever the request would have gone on to LOOK UP — and writes nothing.
+/// A request that is not well formed is refused with its own reason even so: an id that is not
+/// a virtual interface group id at all is read before the flag. The same requests without the
+/// flag then take the group and the values into account.
+#[tokio::test]
+async fn a_dry_run_reports_it_would_have_succeeded_and_writes_nothing() {
+    let (router, engine) = super::ec2_query::emulator();
+    let groups = seed_all(&engine);
+
+    // Rows: the request that would have succeeded, one naming a group the account does not
+    // hold, one with a VLAN outside the ids a tagged frame can carry, and one with an address
+    // that is not IPv4 — a dry run of each reports the same permission answer, every one of
+    // those being something the handler would have gone on to look up or read. The last row is
+    // the exception the crate's service-wide rule names: a value that is not a group id at all
+    // is refused with ITS OWN reason, `DryRun` or not.
+    let cases: Vec<DryRunCase> = vec![
+        (
+            "a request that would succeed",
+            well_formed(&groups[0]),
+            412,
+            "DryRunOperation",
+        ),
+        (
+            "an unknown group",
+            well_formed("lgw-vif-grp-0123456789abcdef0"),
+            412,
+            "DryRunOperation",
+        ),
+        (
+            "a VLAN outside the range",
+            request(
+                &groups[0],
+                &Wire {
+                    outpost_lag_id: "ola-00000000000000001",
+                    vlan: 4095,
+                    local_address: "10.0.0.1",
+                    peer_address: "10.0.0.2",
+                    peer_bgp_asn: None,
+                    peer_bgp_asn_extended: None,
+                },
+            ),
+            412,
+            "DryRunOperation",
+        ),
+        (
+            "an address that is not IPv4",
+            request(
+                &groups[0],
+                &Wire {
+                    outpost_lag_id: "ola-00000000000000001",
+                    vlan: 100,
+                    local_address: "2001:db8::1",
+                    peer_address: "10.0.0.2",
+                    peer_bgp_asn: None,
+                    peer_bgp_asn_extended: None,
+                },
+            ),
+            412,
+            "DryRunOperation",
+        ),
+        (
+            "a malformed group id",
+            well_formed("not-a-group-id"),
+            400,
+            "InvalidLocalGatewayVirtualInterfaceGroupID.Malformed",
+        ),
+    ];
+    for (case, params, expected_status, expected_code) in cases {
+        let mut params = params;
+        params.push(param("DryRun", "true"));
+        let (status, body) = create(&router, &params).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected the code {expected_code:?}, got {body}"
+        );
+        assert_eq!(
+            stored_interfaces(&engine),
+            0,
+            "case {case:?}: a dry run may write nothing"
+        );
+    }
+
+    let (status, body) = create(&router, &well_formed(&groups[0])).await;
+    assert_eq!(
+        status, 200,
+        "after the dry run: expected HTTP 200, got {status} with body {body}"
+    );
+    assert_eq!(
+        stored_interfaces(&engine),
+        1,
+        "after the dry run: the interface must be stored exactly once"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The values the interface carries
+// ---------------------------------------------------------------------------
+
+/// The VLAN must be one of the ids an 802.1Q tag can carry: 1 to 4094, with 0 reading as the
+/// parameter not given and everything outside refused with `InvalidParameterValue`.
+#[tokio::test]
+async fn a_vlan_outside_the_ids_a_tagged_frame_can_carry_is_refused() {
+    let (router, engine) = super::ec2_query::emulator();
+    let groups = seed_all(&engine);
+
+    // Rows: both published bounds, one inside each, one past each bound, the integer form of
+    // "not given", and a value far outside.
+    let cases: Vec<(i32, u16, &str)> = vec![
+        (1, 200, ""),
+        (2, 200, ""),
+        (4093, 200, ""),
+        (4094, 200, ""),
+        (0, 400, "MissingParameter"),
+        (-1, 400, "InvalidParameterValue"),
+        (4095, 400, "InvalidParameterValue"),
+        (4096, 400, "InvalidParameterValue"),
+        (65535, 400, "InvalidParameterValue"),
+    ];
+    let mut accepted = 0;
+    for (vlan, expected_status, expected_code) in cases {
+        let case = format!("VLAN {vlan}");
+        let params = request(
+            &groups[0],
+            &Wire {
+                outpost_lag_id: "ola-00000000000000001",
+                vlan,
+                local_address: "10.0.0.1",
+                peer_address: "10.0.0.2",
+                peer_bgp_asn: None,
+                peer_bgp_asn_extended: None,
+            },
+        );
+        let (status, body) = create(&router, &params).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        if expected_status == 200 {
+            accepted += 1;
+            assert_eq!(
+                element(&body, "vlan").as_deref(),
+                Some(vlan.to_string().as_str()),
+                "case {case:?}: the interface must report the VLAN asked for, got {body}"
+            );
+        } else {
+            assert_eq!(
+                error_code(&body),
+                expected_code,
+                "case {case:?}: expected the code {expected_code:?}, got {body}"
+            );
+        }
+    }
+    assert_eq!(
+        stored_interfaces(&engine),
+        accepted,
+        "only the VLANs inside the range may be stored"
+    );
+}
+
+/// "Only IPv4 is supported" for both addresses: anything that is not a dotted quad is refused
+/// with `InvalidParameterValue` naming the parameter it arrived in, and every dotted quad is
+/// accepted and reported back.
+#[tokio::test]
+async fn an_address_that_is_not_ipv4_is_refused() {
+    let (router, engine) = super::ec2_query::emulator();
+    let groups = seed_all(&engine);
+
+    // Rows: addresses at both ends of the IPv4 space, then an IPv6 address, an address with a
+    // prefix length, a three-octet address, an octet outside a byte, a leading-zero octet and
+    // free text — each tried in BOTH address members, so neither member is the specification.
+    let cases: Vec<(&str, bool)> = vec![
+        ("0.0.0.0", true),
+        ("10.0.0.1", true),
+        ("255.255.255.255", true),
+        ("2001:db8::1", false),
+        ("10.0.0.1/30", false),
+        ("10.0.0", false),
+        ("10.0.0.256", false),
+        ("10.0.0.01", false),
+        ("not-an-address", false),
+    ];
+    let mut accepted = 0;
+    for (address, valid) in cases {
+        for parameter in ["LocalAddress", "PeerAddress"] {
+            let case = format!("{parameter}={address}");
+            let params: Vec<(String, String)> = well_formed(&groups[0])
+                .into_iter()
+                .map(|(field, held)| {
+                    if field == parameter {
+                        (field, address.to_string())
+                    } else {
+                        (field, held)
+                    }
+                })
+                .collect();
+            let (status, body) = create(&router, &params).await;
+            let expected_status = if valid { 200 } else { 400 };
+            assert_eq!(
+                status, expected_status,
+                "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+            );
+            if valid {
+                accepted += 1;
+            } else {
+                assert_eq!(
+                    error_code(&body),
+                    "InvalidParameterValue",
+                    "case {case:?}: unexpected error code in {body}"
+                );
+                let message = error_message(&body);
+                assert!(
+                    message.contains(address),
+                    "case {case:?}: the refusal must name the value the request carried, got \
+                     {message:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        stored_interfaces(&engine),
+        accepted,
+        "only the requests naming two IPv4 addresses may be stored"
+    );
+}
+
+/// One row of the peer-ASN table: what the case is called, the ASN in each of the two members,
+/// and the status and code the request must be answered with.
+type PeerAsnCase = (&'static str, Option<i32>, Option<i64>, u16, &'static str);
+
+/// The peer ASN is ONE number, given in `PeerBgpAsn` or in the extended member that widens its
+/// range: a request naming both is refused with `InvalidParameterCombination`, and a value
+/// outside the 32-bit ASN space with `InvalidParameterValue`.
+#[tokio::test]
+async fn a_peer_asn_in_both_members_or_outside_the_asn_space_is_refused() {
+    let (router, engine) = super::ec2_query::emulator();
+    let groups = seed_all(&engine);
+
+    // Rows: the lower bound and a 16-bit ASN in the narrow member, the lower bound and the
+    // upper bound of the 32-bit space in the extended one, no ASN at all, then zero and a
+    // negative in each member, one past the extended upper bound, and both members at once.
+    let cases: Vec<PeerAsnCase> = vec![
+        ("the lower bound", Some(1), None, 200, ""),
+        ("a 16-bit ASN", Some(65_535), None, 200, ""),
+        ("an extended lower bound", None, Some(1), 200, ""),
+        (
+            "the extended upper bound",
+            None,
+            Some(4_294_967_295),
+            200,
+            "",
+        ),
+        ("no ASN at all", None, None, 200, ""),
+        ("zero", Some(0), None, 400, "InvalidParameterValue"),
+        ("a negative ASN", Some(-1), None, 400, "InvalidParameterValue"),
+        (
+            "zero, extended",
+            None,
+            Some(0),
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "one past the extended upper bound",
+            None,
+            Some(4_294_967_296),
+            400,
+            "InvalidParameterValue",
+        ),
+        (
+            "both members",
+            Some(65_000),
+            Some(65_000),
+            400,
+            "InvalidParameterCombination",
+        ),
+    ];
+    let mut accepted = 0;
+    for (case, peer_bgp_asn, peer_bgp_asn_extended, expected_status, expected_code) in cases {
+        let params = request(
+            &groups[0],
+            &Wire {
+                outpost_lag_id: "ola-00000000000000001",
+                vlan: 100,
+                local_address: "10.0.0.1",
+                peer_address: "10.0.0.2",
+                peer_bgp_asn,
+                peer_bgp_asn_extended,
+            },
+        );
+        let (status, body) = create(&router, &params).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        if expected_status == 200 {
+            accepted += 1;
+            if let Some(asn) = peer_bgp_asn {
+                assert_member(case, &body, "peerBgpAsn", &asn.to_string());
+            }
+            if let Some(asn) = peer_bgp_asn_extended {
+                assert_member(case, &body, "peerBgpAsnExtended", &asn.to_string());
+            }
+        } else {
+            assert_eq!(
+                error_code(&body),
+                expected_code,
+                "case {case:?}: expected the code {expected_code:?}, got {body}"
+            );
+        }
+    }
+    assert_eq!(
+        stored_interfaces(&engine),
+        accepted,
+        "only the requests naming one ASN inside the space may be stored"
+    );
+}
+
+/// A `TagSpecification` may name only the resource type this action creates; any other is
+/// refused with `InvalidParameterValue` rather than accepted and discarded.
+#[tokio::test]
+async fn a_tag_specification_naming_another_resource_type_is_refused() {
+    let (router, engine) = super::ec2_query::emulator();
+    let groups = seed_all(&engine);
+
+    // Rows from `ResourceType`'s own members: the group this request names, the sibling
+    // resources of this surface, and the type this action actually creates.
+    let cases: Vec<(&str, u16)> = vec![
+        ("local-gateway-virtual-interface-group", 400),
+        ("local-gateway-route-table", 400),
+        ("local-gateway", 400),
+        ("local-gateway-virtual-interface", 200),
+    ];
+    for (resource_type, expected_status) in cases {
+        let mut params = well_formed(&groups[0]);
+        params.extend(tag_specification(resource_type, &[("Name", "tagged")]));
+        let (status, body) = create(&router, &params).await;
+        assert_eq!(
+            status, expected_status,
+            "case {resource_type:?}: expected HTTP {expected_status}, got {status} with body \
+             {body}"
+        );
+        if expected_status == 400 {
+            assert_eq!(
+                error_code(&body),
+                "InvalidParameterValue",
+                "case {resource_type:?}: unexpected error code in {body}"
+            );
+        }
+    }
+    assert_eq!(
+        stored_interfaces(&engine),
+        1,
+        "only the specification naming this action's own resource type may be stored"
+    );
+
+    // The one accepted specification's tags are the interface's, and they read back through the
+    // describe.
+    let (status, body) = describe(&router, &[]).await;
+    assert_eq!(
+        status, 200,
+        "the tagged interface: expected HTTP 200, got {status} with body {body}"
+    );
+    for (member, value) in [("key", "Name"), ("value", "tagged")] {
+        assert_member("the tagged interface", &body, member, value);
+    }
 }
 
 // ---------------------------------------------------------------------------

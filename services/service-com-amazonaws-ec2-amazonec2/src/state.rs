@@ -103,7 +103,11 @@
 //! `DescribeLocalGatewayVirtualInterfaces` reports one exactly as its writer stored it and
 //! pages over the same id order. It starts EMPTY for the reason the group store does, and
 //! [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_virtual_interface`] is the one way
-//! one is stored.
+//! one is stored — which is also where the minted id is added to its group's
+//! `LocalGatewayVirtualInterfaceIds` and, for an interface a writer answered in the
+//! non-terminal `pending` configuration state, where the clock's move to `available` is
+//! recorded ([`ComAmazonawsEc2Amazonec2State::local_gateway_virtual_interface_available_at`],
+//! the way [`ComAmazonawsEc2Amazonec2State::vpc_available_at`] records a `pending` VPC's).
 //!
 //! [`ComAmazonawsEc2Amazonec2State::local_gateway_route_table_vpc_associations`] holds the
 //! associations between a local gateway route table of
@@ -3171,6 +3175,17 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::insert_local_gateway_virtual_interface`] is the one way one is stored.
     pub local_gateway_virtual_interfaces:
         BTreeMap<String, crate::ops::types::LocalGatewayVirtualInterface>,
+    /// When a `pending` local gateway virtual interface's move to `available` falls due, by
+    /// `LocalGatewayVirtualInterfaceId`, on the same monotonic clock and at the same
+    /// [`TRANSITION_DELAY`] span as every other transition this store owes.
+    ///
+    /// Beside [`Self::local_gateway_virtual_interfaces`] rather than on the stored interface,
+    /// the way [`Self::vpc_available_at`] sits beside the VPCs: the modelled
+    /// `LocalGatewayVirtualInterface` shape carries no member for when its next configuration
+    /// state falls due, and holding the instant here keeps the stored interface the modelled
+    /// shape every reader answers with. An interface a writer stored ready carries no entry.
+    /// [`Self::materialize_due_transitions`] is the one place an entry is applied and dropped.
+    pub local_gateway_virtual_interface_available_at: BTreeMap<String, Instant>,
     /// Every local gateway the account holds, by `LocalGatewayId`, as the modelled
     /// [`crate::ops::types::LocalGateway`] shape itself — so a member a writer sets
     /// round-trips through a report of the gateways without a field-by-field copy that can
@@ -4699,8 +4714,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             local_gateway_route_tables: BTreeMap::new(),
             local_gateway_virtual_interface_groups: BTreeMap::new(),
             // A local gateway virtual interface comes with an Outpost, which no EC2 call
-            // creates either.
+            // creates either, so the account holds none and none owes a move.
             local_gateway_virtual_interfaces: BTreeMap::new(),
+            local_gateway_virtual_interface_available_at: BTreeMap::new(),
             // A local gateway is part of an Outpost rack, which no EC2 call creates.
             local_gateways: BTreeMap::new(),
             // A fresh account has created no Client VPN endpoint, so it holds none and no
@@ -8396,6 +8412,27 @@ impl ComAmazonawsEc2Amazonec2State {
             if let Some(state) = due {
                 record.view.state = Some(state);
                 record.pending = None;
+            }
+        }
+        // A virtual interface `CreateLocalGatewayVirtualInterface` answered as `pending` is
+        // carrying traffic once its due instant has passed, whether or not anybody called —
+        // the same contract as the association above, on the same clock. The due instant is
+        // dropped with the move, so an interface reaches `available` once.
+        let due: Vec<String> = self
+            .local_gateway_virtual_interface_available_at
+            .iter()
+            .filter(|(_, available_at)| now >= **available_at)
+            .map(|(virtual_interface_id, _)| virtual_interface_id.clone())
+            .collect();
+        for virtual_interface_id in due {
+            self.local_gateway_virtual_interface_available_at
+                .remove(&virtual_interface_id);
+            if let Some(virtual_interface) = self
+                .local_gateway_virtual_interfaces
+                .get_mut(&virtual_interface_id)
+            {
+                virtual_interface.configuration_state =
+                    Some(LOCAL_GATEWAY_VIF_STATE_AVAILABLE.to_string());
             }
         }
         // A route `CreateLocalGatewayRoute` answered as `pending` is carrying traffic once
@@ -14676,6 +14713,39 @@ pub const LOCAL_GATEWAY_VIF_ID_PREFIX: &str = "lgw-vif";
 /// ([`local_gateway_vif_payload_bytes`]).
 pub const MAX_LOCAL_GATEWAY_VIFS: usize = 4096;
 
+/// The code EC2 answers when a request would take the account past the virtual interfaces it
+/// may hold, in the `<Resource>LimitExceeded` family this service's other quotas are refused
+/// with ([`LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_LIMIT_EXCEEDED`]).
+pub const LOCAL_GATEWAY_VIF_LIMIT_EXCEEDED: &str = "LocalGatewayVirtualInterfaceLimitExceeded";
+
+/// The `ResourceType` enum member a local gateway virtual interface is tagged and named
+/// under: `local-gateway-virtual-interface`
+/// (`smithy_query(query="shape",shape="ResourceType")`), which is also the resource path
+/// [`local_gateway_virtual_interface_arn`] builds its ARNs under. The resource's one
+/// spelling, so the refusals that name it cannot drift from it.
+pub const RESOURCE_TYPE_LOCAL_GATEWAY_VIRTUAL_INTERFACE: &str = "local-gateway-virtual-interface";
+
+/// A virtual interface that is being brought up and is not carrying traffic yet:
+/// `LocalGatewayVirtualInterfaceConfigurationState`'s `pending`
+/// ([`crate::ops::types::LOCAL_GATEWAY_VIRTUAL_INTERFACE_CONFIGURATION_STATE_VALUES`] is the
+/// generated catalog).
+pub const LOCAL_GATEWAY_VIF_STATE_PENDING: &str = "pending";
+
+/// A virtual interface that is up: that same enum's `available`. The move from
+/// [`LOCAL_GATEWAY_VIF_STATE_PENDING`] is owed by the clock ([`TRANSITION_DELAY`], through
+/// [`ComAmazonawsEc2Amazonec2State::local_gateway_virtual_interface_available_at`]), so a
+/// caller that describes the interfaces straight after the create still sees `pending`.
+pub const LOCAL_GATEWAY_VIF_STATE_AVAILABLE: &str = "available";
+
+/// The VLAN ids a local gateway virtual interface may be created on: 1 to 4094.
+///
+/// "The virtual local area network (VLAN) used for the local gateway virtual interface"
+/// (`CreateLocalGatewayVirtualInterfaceRequest$Vlan`) is an IEEE 802.1Q VLAN identifier,
+/// whose 12-bit tag reserves 0 (no VLAN) and 4095, leaving 1 to 4094 as the ids a tagged
+/// frame can carry. The model types the member a plain `Integer` with no `@range`, so the
+/// bound is applied by the handler that reads it.
+pub const LOCAL_GATEWAY_VIF_VLAN: ::std::ops::RangeInclusive<i32> = 1..=4094;
+
 /// The ARN of a local gateway virtual interface:
 /// `arn:aws:ec2:<region>:<account>:local-gateway-virtual-interface/<id>`, the form
 /// `LocalGatewayVirtualInterface$LocalGatewayVirtualInterfaceArn` carries ("The Amazon
@@ -14744,7 +14814,8 @@ pub struct LocalGatewayVirtualInterfaceSpec {
 /// state a writer pinned on it, the local gateway and group ids, the Outpost LAG id, the
 /// local and peer addresses, and the Region, which the stored ARN carries. Everything else
 /// on the record — the virtual interface id, the rest of the ARN, the owning account, the
-/// VLAN and the ASNs — is derived by this module or fixed-size.
+/// VLAN and the ASNs — is derived by this module or fixed-size, which is also why the copy of
+/// the minted id the GROUP keeps in its interface list is not charged.
 ///
 /// The ONE definition of that charge, the way [`local_gateway_vif_group_payload_bytes`] is
 /// for the group store beside it:
@@ -14774,8 +14845,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// A writer may ask this before inserting, the way
     /// [`Self::has_local_gateway_vif_group_capacity`] gates the group store, so it can
     /// refuse in the `<Resource>LimitExceeded` family this service's other quotas are
-    /// refused with rather than discover the refusal from an absent id. The insert itself
-    /// asks it too, so no path can get past it.
+    /// refused with ([`LOCAL_GATEWAY_VIF_LIMIT_EXCEEDED`]) rather than discover the refusal
+    /// from an absent id. The insert itself asks it too, so no path can get past it.
     pub fn has_local_gateway_vif_capacity(&self, count: usize) -> bool {
         self.local_gateway_virtual_interfaces
             .len()
@@ -14791,8 +14862,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// budget ([`Self::would_exceed_stored_bytes`] over
     /// [`local_gateway_vif_payload_bytes`]) — the same contract as
     /// [`Self::insert_local_gateway_virtual_interface_group`]. A caller that gets `None`
-    /// must refuse the request with the `<Resource>LimitExceeded` code for this quota,
-    /// which belongs with that writer rather than here.
+    /// must refuse the request with [`LOCAL_GATEWAY_VIF_LIMIT_EXCEEDED`], the
+    /// `<Resource>LimitExceeded` code for this quota.
+    ///
+    /// A virtual interface created IN a group is also one of "The IDs of the virtual
+    /// interfaces" that group reports
+    /// (`LocalGatewayVirtualInterfaceGroup$LocalGatewayVirtualInterfaceIds`), so when the spec
+    /// names a group this store holds, the minted id is added to that group's list HERE, in
+    /// the one place an interface is stored: a second writer cannot leave the group reporting
+    /// a different set from this store.
     pub fn insert_local_gateway_virtual_interface(
         &mut self,
         spec: LocalGatewayVirtualInterfaceSpec,
@@ -14802,6 +14880,7 @@ impl ComAmazonawsEc2Amazonec2State {
             return None;
         }
         let virtual_interface_id = self.next_id(LOCAL_GATEWAY_VIF_ID_PREFIX);
+        let group_id = spec.local_gateway_virtual_interface_group_id.clone();
         let virtual_interface = crate::ops::types::LocalGatewayVirtualInterface {
             local_gateway_virtual_interface_id: Some(virtual_interface_id.clone()),
             local_gateway_id: Some(spec.local_gateway_id),
@@ -14822,9 +14901,36 @@ impl ComAmazonawsEc2Amazonec2State {
             configuration_state: Some(spec.configuration_state),
         };
         self.add_stored_bytes(payload_bytes);
+        // "The IDs of the virtual interfaces" the group holds, kept in step here rather than
+        // by each writer: a spec naming a group this store does not hold (a seeded interface
+        // of an Outpost whose group nothing stored) leaves the lists it has alone.
+        if let Some(group) = group_id
+            .as_deref()
+            .and_then(|group_id| self.local_gateway_virtual_interface_groups.get_mut(group_id))
+        {
+            group
+                .local_gateway_virtual_interface_ids
+                .get_or_insert_with(Vec::new)
+                .push(virtual_interface_id.clone());
+        }
         self.local_gateway_virtual_interfaces
             .insert(virtual_interface_id.clone(), virtual_interface);
         Some(virtual_interface_id)
+    }
+
+    /// Record the move to [`LOCAL_GATEWAY_VIF_STATE_AVAILABLE`] the clock owes the virtual
+    /// interface `virtual_interface_id`, [`TRANSITION_DELAY`] from now.
+    ///
+    /// A writer that answers a new interface in the non-terminal
+    /// [`LOCAL_GATEWAY_VIF_STATE_PENDING`] state calls this; one that stored an interface
+    /// already up does not, so an interface written ready owes nothing. The instant is
+    /// RECORDED, never slept for: [`Self::materialize_due_transitions`] applies it once the
+    /// clock has passed it, so a caller asking straight after the write still sees `pending`.
+    pub fn owe_local_gateway_virtual_interface_available(&mut self, virtual_interface_id: &str) {
+        self.local_gateway_virtual_interface_available_at.insert(
+            virtual_interface_id.to_string(),
+            Instant::now() + TRANSITION_DELAY,
+        );
     }
 }
 
