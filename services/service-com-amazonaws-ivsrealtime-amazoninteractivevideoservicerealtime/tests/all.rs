@@ -99,6 +99,8 @@ mod list_participant_events_token_participant_scope;
 mod list_participant_replicas_paging;
 #[path = "all/list_participant_replicas_token_publisher_scope.rs"]
 mod list_participant_replicas_token_publisher_scope;
+#[path = "all/list_participants_filtered_token_omission.rs"]
+mod list_participants_filtered_token_omission;
 #[path = "all/list_public_keys.rs"]
 mod list_public_keys;
 #[path = "all/materialised_member_defaults.rs"]
