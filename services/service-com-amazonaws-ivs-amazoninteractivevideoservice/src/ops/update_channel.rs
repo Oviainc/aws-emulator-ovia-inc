@@ -215,9 +215,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         replace(&mut channel.ad_configuration_arn, input.ad_configuration_arn);
         replace_non_empty(&mut channel.container_format, input.container_format);
-        if input.multitrack_input_configuration.is_some() {
-            channel.multitrack_input_configuration = input.multitrack_input_configuration;
-        }
+        // Present replaces, absent keeps — and either way the structure is
+        // materialised, so the member a channel reports never depends on which call
+        // last touched it.
+        channel.multitrack_input_configuration = Some(
+            crate::state::effective_multitrack_input_configuration(
+                input
+                    .multitrack_input_configuration
+                    .or(channel.multitrack_input_configuration),
+            ),
+        );
         // `authorized` and `insecureIngest` are modelled `@default(false)`, so an
         // absent member arrives as `false` and there is no "omitted" to preserve:
         // the request's value is the channel's new value.

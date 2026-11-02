@@ -172,7 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => errors.push(BatchError {
                     arn: Some(arn.clone()),
                     code: Some(NOT_FOUND_CODE.to_string()),
-                    message: Some(format!("stream key {arn} does not exist")),
+                    // Worded by the service's one not-found rule, for the same reason
+                    // the code is the single-ARN read's error shape: a per-ARN entry
+                    // reports the failure that read would have answered.
+                    message: Some(crate::state::resource_not_found_message(arn)),
                 }),
             }
         }

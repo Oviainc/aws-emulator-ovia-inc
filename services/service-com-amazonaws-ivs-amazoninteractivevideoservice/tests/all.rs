@@ -23,6 +23,8 @@ mod batch_get_channel;
 mod batch_get_stream_key;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/default_sub_structures.rs"]
+mod default_sub_structures;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/live_stream_reads.rs"]

@@ -195,6 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The model's documented defaults for every member the caller omitted.
         // `recordingReconnectWindowSeconds` carries `@default(0)`, so the framework
         // has already materialised its default by the time the input reaches here.
+        // Both nested configurations are MATERIALISED rather than echoed: every
+        // member of each has a documented default, so a request that named neither
+        // still has both reported back to it.
         let rendition_configuration =
             crate::state::effective_rendition_configuration(input.rendition_configuration);
         let thumbnail_configuration =
@@ -221,9 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // it `ACTIVE` itself, which is what `active_at` below owes.
             state: crate::state::RECORDING_CONFIGURATION_CREATING.to_string(),
             tags: Some(input.tags.unwrap_or_default()),
-            thumbnail_configuration,
+            thumbnail_configuration: Some(thumbnail_configuration),
             recording_reconnect_window_seconds: input.recording_reconnect_window_seconds,
-            rendition_configuration,
+            rendition_configuration: Some(rendition_configuration),
         };
         store.recording_configurations.insert(
             arn,

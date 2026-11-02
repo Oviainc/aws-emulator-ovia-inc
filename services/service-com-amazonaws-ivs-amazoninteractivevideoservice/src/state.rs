@@ -274,54 +274,58 @@ pub fn check_rendition_configuration(rendition: &RenditionConfiguration) -> Resu
     Ok(())
 }
 
-/// The rendition configuration to persist for what the caller sent: every member it
-/// omitted filled from the model's documented default.
+/// The rendition configuration to persist for what the caller sent: the structure
+/// itself, materialised whether or not the request named it, with every member the
+/// request omitted filled from the model's documented default.
 ///
 /// From the model doc on `RenditionConfiguration$renditionSelection`: "Indicates
-/// which set of renditions are recorded for a stream. … Default: `ALL`." A caller
-/// that sent no `renditionConfiguration` at all chose nothing, and the model
-/// documents no default for the structure itself, so that stays absent.
+/// which set of renditions are recorded for a stream. … Default: `ALL`." A documented
+/// default is what a member reports when the request chose nothing for it, and a
+/// structure every member of which has one is itself defaulted rather than dropped —
+/// which is what the recorded answers show: a recording configuration created with no
+/// `renditionConfiguration` member reports the default selection all the same. So an
+/// absent structure is the same request as an empty one.
 pub fn effective_rendition_configuration(
     requested: Option<RenditionConfiguration>,
-) -> Option<RenditionConfiguration> {
-    requested.map(|mut rendition| {
-        if rendition
-            .rendition_selection
-            .as_deref()
-            .is_none_or(str::is_empty)
-        {
-            rendition.rendition_selection = Some("ALL".to_string());
-        }
-        rendition
-    })
+) -> RenditionConfiguration {
+    let mut rendition = requested.unwrap_or_default();
+    if rendition
+        .rendition_selection
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        rendition.rendition_selection = Some("ALL".to_string());
+    }
+    rendition
 }
 
-/// The thumbnail configuration to persist for what the caller sent: every member it
-/// omitted filled from the model's documented default.
+/// The thumbnail configuration to persist for what the caller sent: the structure
+/// itself, materialised whether or not the request named it, with every member the
+/// request omitted filled from the model's documented default.
 ///
 /// From the model docs on `ThumbnailConfiguration`: `recordingMode` "Default:
 /// `INTERVAL`"; `targetIntervalSeconds` "is configurable (and required) only if
 /// `recordingMode` is `INTERVAL`. Default: 60"; `storage` "Default: `SEQUENTIAL`";
 /// `resolution` "Default: Null (source resolution is returned)", so an omitted
-/// resolution stays absent. As with [`effective_rendition_configuration`], an
-/// omitted structure carries no choice and stays absent.
+/// resolution — and only it — stays absent. As with
+/// [`effective_rendition_configuration`], an omitted structure is the same request as
+/// an empty one, because every other member of it has a documented default.
 pub fn effective_thumbnail_configuration(
     requested: Option<ThumbnailConfiguration>,
-) -> Option<ThumbnailConfiguration> {
-    requested.map(|mut thumbnail| {
-        if thumbnail.recording_mode.as_deref().is_none_or(str::is_empty) {
-            thumbnail.recording_mode = Some("INTERVAL".to_string());
-        }
-        if thumbnail.recording_mode.as_deref() == Some("INTERVAL")
-            && thumbnail.target_interval_seconds.is_none()
-        {
-            thumbnail.target_interval_seconds = Some(60);
-        }
-        if thumbnail.storage.is_none() {
-            thumbnail.storage = Some(vec!["SEQUENTIAL".to_string()]);
-        }
-        thumbnail
-    })
+) -> ThumbnailConfiguration {
+    let mut thumbnail = requested.unwrap_or_default();
+    if thumbnail.recording_mode.as_deref().is_none_or(str::is_empty) {
+        thumbnail.recording_mode = Some("INTERVAL".to_string());
+    }
+    if thumbnail.recording_mode.as_deref() == Some("INTERVAL")
+        && thumbnail.target_interval_seconds.is_none()
+    {
+        thumbnail.target_interval_seconds = Some(60);
+    }
+    if thumbnail.storage.is_none() {
+        thumbnail.storage = Some(vec!["SEQUENTIAL".to_string()]);
+    }
+    thumbnail
 }
 
 /// The ceiling on how many channels this store holds: the cap that bounds
@@ -590,6 +594,44 @@ pub fn effective_preset(channel_type: &str, requested: Option<&str>) -> String {
         _ => String::new(),
     }
 }
+
+/// The multitrack input configuration to persist for what the caller sent: the
+/// structure itself, materialised whether or not the request named it, with every
+/// member the request omitted filled from the default the service applies.
+///
+/// `MultitrackInputConfiguration$enabled` is modelled `@default(false)`, so a channel
+/// that named no multitrack input has multitrack input disabled. The model documents
+/// `policy` and `maximumResolution` only as "Required if `enabled` is `true`" and
+/// gives neither a default in prose, so the pair a channel reports when it chose
+/// neither comes from the recorded answers, which carry the permissive policy and the
+/// largest resolution of each enumeration (`MULTITRACK_POLICY_VALUES`,
+/// `MULTITRACK_MAXIMUM_RESOLUTION_VALUES`) — never a value outside them.
+pub fn effective_multitrack_input_configuration(
+    requested: Option<MultitrackInputConfiguration>,
+) -> MultitrackInputConfiguration {
+    let mut multitrack = requested.unwrap_or_default();
+    if multitrack.policy.as_deref().is_none_or(str::is_empty) {
+        multitrack.policy = Some(MULTITRACK_POLICY_DEFAULT.to_string());
+    }
+    if multitrack
+        .maximum_resolution
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        multitrack.maximum_resolution = Some(MULTITRACK_MAXIMUM_RESOLUTION_DEFAULT.to_string());
+    }
+    multitrack
+}
+
+/// The `policy` a channel reports when neither its request nor an earlier update
+/// named one: multitrack input is ALLOWED rather than required, the permissive member
+/// of `MULTITRACK_POLICY_VALUES`.
+const MULTITRACK_POLICY_DEFAULT: &str = "ALLOW";
+
+/// The `maximumResolution` a channel reports when neither its request nor an earlier
+/// update named one: the largest member of `MULTITRACK_MAXIMUM_RESOLUTION_VALUES`,
+/// so the default caps nothing the channel type itself admits.
+const MULTITRACK_MAXIMUM_RESOLUTION_DEFAULT: &str = "FULL_HD";
 
 /// Refuse a channel whose `containerFormat` and multitrack configuration cannot
 /// hold together, returning the message to put on a `ValidationException`.

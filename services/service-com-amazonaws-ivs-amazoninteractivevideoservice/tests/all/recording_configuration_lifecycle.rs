@@ -12,8 +12,10 @@
 //!    and answers what it stored; `GetRecordingConfiguration` answers the same
 //!    resource afterwards, and a resource that was never created is a modelled
 //!    `ResourceNotFoundException`.
-//! 2. An omitted member of a nested configuration the caller DID send takes the
-//!    default the model documents for it.
+//! 2. A nested configuration structure whose every member has a documented default
+//!    is materialised on the resource, so each of its members is reported with the
+//!    value the caller sent or that default — whether or not the caller sent the
+//!    structure at all.
 //! 3. A new recording configuration is reported `CREATING` and the clock — not a
 //!    read — turns it `ACTIVE` once the activation span is due.
 //! 4. A `renditionConfiguration` that selects `CUSTOM` must name at least one
@@ -332,10 +334,14 @@ async fn a_created_recording_configuration_is_read_back_member_for_member() {
 /// sent, with each omitted member filled from the model's documented default
 /// (`recordingMode` INTERVAL; `targetIntervalSeconds` 60, which is documented only
 /// for INTERVAL mode; `storage` [SEQUENTIAL]; `resolution` null, so it stays out).
-/// A row that sent no `thumbnailConfiguration` chose nothing and the model
-/// documents no default for the structure itself.
+/// A row that sent no `thumbnailConfiguration` at all chose nothing for a structure
+/// every other member of which has a documented default, so it is reported
+/// defaulted — the same answer an empty structure gets.
 fn expected_thumbnail(request: &Value) -> Option<Value> {
-    let sent = request.get("thumbnailConfiguration")?.clone();
+    let sent = request
+        .get("thumbnailConfiguration")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let mut expected = sent.as_object().expect("an object was sent").clone();
     let mode = expected
         .get("recordingMode")
@@ -354,9 +360,12 @@ fn expected_thumbnail(request: &Value) -> Option<Value> {
 
 /// The `renditionConfiguration` the service must report for `request`: what the row
 /// sent, with `renditionSelection` filled from its documented default (ALL) when the
-/// row left it out. As above, an omitted structure stays omitted.
+/// row left it out. As above, an omitted structure is reported defaulted.
 fn expected_rendition(request: &Value) -> Option<Value> {
-    let sent = request.get("renditionConfiguration")?.clone();
+    let sent = request
+        .get("renditionConfiguration")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let mut expected = sent.as_object().expect("an object was sent").clone();
     if !expected.contains_key("renditionSelection") {
         expected.insert("renditionSelection".to_string(), json!("ALL"));

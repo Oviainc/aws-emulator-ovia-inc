@@ -201,10 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let latency_mode = non_empty(input.latency_mode).unwrap_or_else(|| "LOW".to_string());
         let container_format = non_empty(input.container_format).unwrap_or_else(|| "TS".to_string());
         let preset = crate::state::effective_preset(&channel_type, input.preset.as_deref());
+        // Materialised, not echoed: AWS reports a multitrack input configuration on
+        // every channel, so one the request did not name is the defaulted structure
+        // rather than an absent member.
+        let multitrack_input_configuration =
+            crate::state::effective_multitrack_input_configuration(
+                input.multitrack_input_configuration,
+            );
 
         crate::state::check_container_format(
             &container_format,
-            input.multitrack_input_configuration.as_ref(),
+            Some(&multitrack_input_configuration),
         )
         .map_err(|message| {
             crate::state::validation(CreateChannelErrorModeled::ValidationException, message)
@@ -248,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             playback_restriction_policy_arn: Some(
                 input.playback_restriction_policy_arn.unwrap_or_default(),
             ),
-            multitrack_input_configuration: input.multitrack_input_configuration,
+            multitrack_input_configuration: Some(multitrack_input_configuration),
             container_format: Some(container_format),
             ad_configuration_arn: Some(input.ad_configuration_arn.unwrap_or_default()),
         };

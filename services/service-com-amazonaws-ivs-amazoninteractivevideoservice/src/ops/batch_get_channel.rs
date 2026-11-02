@@ -175,7 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => errors.push(BatchError {
                     arn: Some(arn.clone()),
                     code: Some(NOT_FOUND_CODE.to_string()),
-                    message: Some(format!("channel {arn} does not exist")),
+                    // The per-ARN failure is the single-ARN read's failure, so it is
+                    // WORDED the way this service words that failure
+                    // (`crate::state::resource_not_found_message`) rather than in a
+                    // sentence of this operation's own.
+                    message: Some(crate::state::resource_not_found_message(arn)),
                 }),
             }
         }
