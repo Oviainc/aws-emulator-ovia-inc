@@ -9,7 +9,9 @@
 //! `providerName` is a filter over that catalog, `maxResults` bounds the page and
 //! `nextToken` resumes one, both over the catalog's own stable key order
 //! (`<providerName>/<providerServiceName>`), so `GetProviderService` resolves exactly
-//! the ARNs a page reported.
+//! the ARNs a page reported. Every segment of a reported `providerServiceArn` —
+//! including its Region — comes from the catalog entry, so a page reads the same
+//! whatever region the request was signed for.
 //!
 //! ## Shape of an operation
 //!
@@ -148,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListProviderServicesErrorModeled::InternalServerException(InternalServerException {
@@ -171,10 +173,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A `ProviderServiceArn` is region-scoped and derived from the catalog entry,
-        // so the region this request was signed for is what the reported ARNs name.
-        let region = crate::state::request_region(ctx.parts());
-
         // A pure read over the catalog, in its own
         // (`providerName/providerServiceName`) key order.
         let store = state.lock();
@@ -195,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     (
                         catalog_key.clone(),
                         ProviderServiceSummary {
-                            provider_service_arn: stored.arn(&region),
+                            provider_service_arn: stored.arn(),
                             provider_name: stored.provider_name.clone(),
                             provider_service_display_name: stored
                                 .provider_service_display_name

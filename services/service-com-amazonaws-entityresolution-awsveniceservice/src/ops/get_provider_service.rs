@@ -8,9 +8,9 @@
 //!
 //! The two `@httpLabel`s identify the entry together: `providerName` is the provider,
 //! and `providerServiceName` is modelled as a `ProviderServiceArn` — the ARN the list
-//! reported — so it is resolved against the ARN each entry has in the region the
-//! request was signed for. No entry with that pair means the modelled
-//! `ResourceNotFoundException` (HTTP 404).
+//! reported, every segment of which (its Region included) is the entry's own — so an
+//! entry resolves whatever region the request was signed for, and no entry with that
+//! pair means the modelled `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetProviderServiceErrorModeled::InternalServerException(InternalServerException {
@@ -190,21 +190,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A `ProviderServiceArn` is region-scoped, and the region a request carries is
-        // the one in its SigV4 credential scope, so that is the region whose ARNs this
-        // call resolves: an ARN naming another Region is not an entry of THIS Region's
-        // catalog.
-        let region = crate::state::request_region(ctx.parts());
-
         // A pure read: nothing about the store changes, and two consecutive calls
-        // answer identically.
+        // answer identically. The pair the labels carry is resolved against the
+        // catalog's own identifiers — the entry's ARN names the entry's Region, not
+        // the caller's.
         let store = state.lock();
         let stored = store
             .provider_services
             .values()
             .find(|stored| {
                 stored.provider_name == input.provider_name
-                    && stored.arn(&region) == input.provider_service_name
+                    && stored.arn() == input.provider_service_name
             })
             .ok_or_else(|| {
                 GetProviderServiceErrorModeled::ResourceNotFoundException(
@@ -224,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             provider_service_name: stored.provider_service_name.clone(),
             provider_service_display_name: stored.provider_service_display_name.clone(),
             provider_service_type: stored.provider_service_type.clone(),
-            provider_service_arn: stored.arn(&region),
+            provider_service_arn: stored.arn(),
             provider_configuration_definition: stored.provider_configuration_definition.clone(),
             provider_id_name_space_configuration: stored
                 .provider_id_name_space_configuration

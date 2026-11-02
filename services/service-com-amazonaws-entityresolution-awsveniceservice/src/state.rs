@@ -18,6 +18,9 @@
 //! is SEEDED with the catalog when it is first touched (see [`provider_service_catalog`])
 //! and no handler writes to it. `ListProviderServices` pages over exactly those
 //! records and `GetProviderService` reads one of them, so the two cannot disagree.
+//! Every part of an entry is catalog data, the Region its ARN names included
+//! ([`ProviderService::region`]), so neither read composes anything of the request
+//! into what it serves.
 //!
 //! `hasWorkflows` is deliberately NOT a stored field. It is a property of the
 //! relationship between the two maps — "is this schema mapping referenced by some
@@ -314,11 +317,11 @@ pub fn job_output_source_config(workflow: &MatchingWorkflow) -> Option<Vec<JobOu
 /// ever read after that, by `ListProviderServices` and `GetProviderService`.
 ///
 /// Every member is the MODELLED type of the member it is returned on, EXCEPT the ARN,
-/// which is not stored at all: `ProviderServiceArn` is region-scoped
-/// (`^arn:…:entityresolution:<region>::providerservice/<providerName>/<providerServiceName>$`)
-/// and carries no account, so it is a pure function of the entry plus the region the
-/// request was signed for — see [`ProviderService::arn`]. Storing it would mean one
-/// record per region.
+/// which is not stored as a string: `ProviderServiceArn` carries no account and names
+/// a region
+/// (`^arn:…:entityresolution:<region>::providerservice/<providerName>/<providerServiceName>$`),
+/// so it is a pure function of the entry — provider token, service token and the
+/// entry's OWN [`Self::region`] — see [`ProviderService::arn`].
 #[derive(Debug, Clone)]
 pub struct ProviderService {
     pub provider_name: String,
@@ -326,6 +329,12 @@ pub struct ProviderService {
     pub provider_service_display_name: String,
     /// A `ServiceType` value: `ASSIGNMENT` or `ID_MAPPING`.
     pub provider_service_type: String,
+    /// The Region segment of this entry's `providerServiceArn`: a property of the
+    /// catalog entry, not of the caller. The catalog is AWS-managed data published
+    /// with each provider service, and one page of it carries entries whose ARNs name
+    /// DIFFERENT Regions, so the segment cannot be the region a request was signed
+    /// for. Matches the modelled ARN's `[a-z]{2}-[a-z]{1,10}-[0-9]` segment.
+    pub region: String,
     pub anonymized_output: bool,
     pub provider_endpoint_configuration: ProviderEndpointConfiguration,
     pub provider_component_schema: ProviderComponentSchema,
@@ -347,18 +356,19 @@ impl ProviderService {
         format!("{}/{}", self.provider_name, self.provider_service_name)
     }
 
-    /// The `providerServiceArn` for this entry in `region`.
+    /// This entry's `providerServiceArn`.
     ///
     /// The modelled `ProviderServiceArn` pattern
     /// (`smithy_query(query="shape",shape="ProviderServiceSummary")`) fixes the whole
     /// shape of it: an EMPTY account segment, then
-    /// `providerservice/<providerName>/<providerServiceName>`. It is therefore derived
-    /// from the entry, never minted, so the ARN `ListProviderServices` reports is the
-    /// one `GetProviderService` resolves.
-    pub fn arn(&self, region: &str) -> String {
+    /// `providerservice/<providerName>/<providerServiceName>`. Every segment —
+    /// including the Region — comes from the entry, so the ARN is the same whatever
+    /// region a request is signed for, and the ARN `ListProviderServices` reports is
+    /// exactly the one `GetProviderService` resolves.
+    pub fn arn(&self) -> String {
         format!(
-            "arn:aws:entityresolution:{region}::providerservice/{}/{}",
-            self.provider_name, self.provider_service_name
+            "arn:aws:entityresolution:{}::providerservice/{}/{}",
+            self.region, self.provider_name, self.provider_service_name
         )
     }
 }
@@ -737,98 +747,167 @@ struct CatalogRow {
     /// Whether the provider's output is anonymized, i.e. cannot be related back to the
     /// identifying input (`GetProviderService$anonymizedOutput`).
     anonymized_output: bool,
+    /// The Region segment of this entry's ARN — see [`ProviderService::region`]. A
+    /// property of the published entry, so entries of one catalog differ in it.
+    region: &'static str,
     /// Whether this provider needs the caller to hand it an S3 bucket for intermediate
     /// data. `ProviderIntermediateDataAccessConfiguration` is documented as what "is
     /// required by SOME providers", so it is per-entry, and it is the same fact that
     /// decides whether the entry takes an intermediate-source configuration.
     intermediate_data_access: bool,
-    /// The provider's input schema: `(fieldName, SchemaAttributeType, hashing)` per
-    /// `providerSchemaAttributes` member.
-    attributes: &'static [(&'static str, &'static str, bool)],
+    /// The provider's input schema: `(SchemaAttributeType, hashing)` per
+    /// `providerSchemaAttributes` member. The type doubles as the attribute's
+    /// `fieldName`, because a provider service's published schema names its fields by
+    /// the attribute type it accepts there (`providerComponentSchema.schemas` carries
+    /// exactly those type tokens).
+    attributes: &'static [(&'static str, bool)],
+    /// The properties of the `providerConfiguration` document this provider service
+    /// takes, each with whether it is required, in the order the configuration
+    /// definition's `required` list names them. A provider service is reached through
+    /// the provider's own API, so these are the credentials and options that API needs
+    /// (`ProviderProperties$providerConfiguration`,
+    /// `smithy_query(query="shape",shape="ProviderProperties")`).
+    configuration_properties: &'static [(&'static str, bool)],
+    /// The attribute the provider answers per input record: the provider's own
+    /// identifier for the entity, which is what `providerEntityOutputDefinition`
+    /// declares under its `entity` object.
+    output_attribute: &'static str,
 }
 
-/// The provider-service catalog this emulator serves in every Region.
+/// The `providerConfiguration` properties a provider service reached through an
+/// OAuth-style client credential pair takes: the pair, both required.
+const CLIENT_CREDENTIAL_PROPERTIES: &[(&str, bool)] = &[("client_id", true), ("client_secret", true)];
+
+/// The provider-service catalog this emulator serves.
 ///
-/// AWS's own catalog depends on the Data Exchange subscriptions of the account and on
-/// the Region, so there is no single recorded answer to copy; what IS fixed by the
-/// model is WHICH providers Entity Resolution integrates and which
-/// `SchemaAttributeType`s each of them accepts, spelled out per provider in the doc of
+/// These are the provider services AWS Entity Resolution publishes, as a client sees
+/// them on the wire: a LOWERCASE provider token (`liveramp`, `transunion`) and, per
+/// provider, one entry per CAPABILITY (`assignment`, `assignment-pii`, `idmapping`),
+/// each with the display name AWS publishes for it and the Region its own listing
+/// lives in — which is why one page carries entries from more than one Region.
+///
+/// Which providers Entity Resolution integrates, and which `SchemaAttributeType`s
+/// each of them accepts, is also spelled out per provider in the doc of
 /// `ProviderSchemaAttribute$type`
 /// (`smithy_query(query="shape",shape="ProviderSchemaAttribute")`): LiveRamp,
-/// TransUnion and Unified ID 2.0. This table is those three providers, with each
-/// entry's attributes taken from that provider's own list in that doc, and it spans
-/// both `ServiceType`s, both `anonymizedOutput` values, a provider with two services
-/// and providers with one.
+/// TransUnion and Unified ID 2.0. Each entry's attributes are taken from that
+/// provider's own list there, and the table as a whole spans both `ServiceType`s, both
+/// `anonymizedOutput` values, both Region values, a provider with several services and
+/// providers with one.
 const CATALOG: &[CatalogRow] = &[
     CatalogRow {
-        provider_name: "LiveRamp",
-        provider_service_name: "IDENTITY_RESOLUTION",
-        display_name: "LiveRamp Identity Resolution",
+        provider_name: "liveramp",
+        provider_service_name: "assignment",
+        display_name: "Assignment Email",
         service_type: "ASSIGNMENT",
-        anonymized_output: false,
+        region: "us-east-2",
+        // LiveRamp answers a RampID, a pseudonymous identifier that cannot be related
+        // back to the email that was sent in.
+        anonymized_output: true,
         intermediate_data_access: true,
-        // LiveRamp's documented types, PII hashed where the provider takes a hash.
-        attributes: &[
-            ("Unique ID", "UNIQUE_ID", false),
-            ("First Name", "NAME_FIRST", false),
-            ("Last Name", "NAME_LAST", false),
-            ("Address", "ADDRESS", false),
-            ("City", "ADDRESS_CITY", false),
-            ("State", "ADDRESS_STATE", false),
-            ("Postal Code", "ADDRESS_POSTALCODE", false),
-            ("Email", "EMAIL_ADDRESS", true),
-            ("Phone", "PHONE_NUMBER", true),
+        // The email-only assignment service: one hashed `EMAIL_ADDRESS`, which
+        // LiveRamp's documented list admits.
+        attributes: &[("EMAIL_ADDRESS", true)],
+        // LiveRamp's API takes a client credential pair and the resolution flow to run.
+        configuration_properties: &[
+            ("client_id", true),
+            ("client_secret", true),
+            ("resolution_flow", false),
         ],
+        output_attribute: "RAMPID",
     },
     CatalogRow {
-        provider_name: "LiveRamp",
-        provider_service_name: "TRANSCODE",
-        display_name: "LiveRamp Transcode",
+        provider_name: "liveramp",
+        provider_service_name: "assignment-pii",
+        display_name: "Assignment PII",
+        service_type: "ASSIGNMENT",
+        region: "us-east-2",
+        anonymized_output: true,
+        intermediate_data_access: true,
+        // The PII assignment service: name, address, phone and email, each of them a
+        // type LiveRamp's documented list admits, hashed where the provider takes a
+        // hash.
+        attributes: &[
+            ("NAME_FIRST", false),
+            ("NAME_LAST", false),
+            ("ADDRESS", false),
+            ("ADDRESS_CITY", false),
+            ("ADDRESS_STATE", false),
+            ("ADDRESS_POSTALCODE", false),
+            ("PHONE_NUMBER", true),
+            ("EMAIL_ADDRESS", true),
+        ],
+        configuration_properties: &[
+            ("client_id", true),
+            ("client_secret", true),
+            ("resolution_flow", false),
+        ],
+        output_attribute: "RAMPID",
+    },
+    CatalogRow {
+        provider_name: "liveramp",
+        provider_service_name: "idmapping",
+        display_name: "ID Mapping",
         service_type: "ID_MAPPING",
-        anonymized_output: false,
+        region: "us-east-2",
+        anonymized_output: true,
         intermediate_data_access: true,
-        // An id-mapping service takes ids, not PII: `UNIQUE_ID` in, `PROVIDER_ID` out,
-        // both of which LiveRamp's documented list admits.
-        attributes: &[
-            ("Unique ID", "UNIQUE_ID", false),
-            ("RampID", "PROVIDER_ID", false),
+        // An id-mapping service takes ids, not PII: `UNIQUE_ID` in and the provider's
+        // own `PROVIDER_ID`, both of which LiveRamp's documented list admits.
+        attributes: &[("UNIQUE_ID", false), ("PROVIDER_ID", false)],
+        configuration_properties: &[
+            ("client_id", true),
+            ("client_secret", true),
+            ("resolution_flow", false),
         ],
+        output_attribute: "RAMPID",
     },
     CatalogRow {
-        provider_name: "TransUnion",
-        provider_service_name: "IDENTITY_RESOLUTION",
-        display_name: "TransUnion TruAudience Identity Resolution",
+        provider_name: "transunion",
+        provider_service_name: "assignment",
+        display_name: "TruAudience Identity Resolution & Enrichment",
         service_type: "ASSIGNMENT",
+        region: "us-east-1",
+        // An enrichment service answers attributes of the resolved entity, which do
+        // relate back to the identifying input.
         anonymized_output: false,
         intermediate_data_access: false,
         // TransUnion's documented types, which — unlike LiveRamp's — include `DATE`,
         // `IPV4` and `MAID`.
         attributes: &[
-            ("Unique ID", "UNIQUE_ID", false),
-            ("First Name", "NAME_FIRST", false),
-            ("Last Name", "NAME_LAST", false),
-            ("Email", "EMAIL_ADDRESS", true),
-            ("Phone Number", "PHONE_NUMBER", true),
-            ("Date of Birth", "DATE", false),
-            ("IP Address", "IPV4", false),
-            ("Device ID", "MAID", false),
+            ("NAME_FIRST", false),
+            ("NAME_LAST", false),
+            ("ADDRESS", false),
+            ("ADDRESS_CITY", false),
+            ("ADDRESS_STATE", false),
+            ("ADDRESS_POSTALCODE", false),
+            ("PHONE_NUMBER", true),
+            ("EMAIL_ADDRESS", true),
+            ("DATE", false),
+            ("IPV4", false),
+            ("MAID", false),
         ],
+        configuration_properties: CLIENT_CREDENTIAL_PROPERTIES,
+        output_attribute: "TRUAUDIENCE_ID",
     },
     CatalogRow {
-        provider_name: "UnifiedId",
-        provider_service_name: "IDENTITY_RESOLUTION",
+        provider_name: "unifiedid",
+        provider_service_name: "idmapping",
         display_name: "Unified ID 2.0",
         service_type: "ID_MAPPING",
+        region: "us-east-1",
         // UID2 answers with tokens rather than with anything that identifies the
         // input record, which is exactly what `anonymizedOutput` reports.
         anonymized_output: true,
         intermediate_data_access: false,
         // Unified ID 2.0's documented list is the whole of its schema: three types.
         attributes: &[
-            ("Unique ID", "UNIQUE_ID", false),
-            ("Email", "EMAIL_ADDRESS", true),
-            ("Phone Number", "PHONE_NUMBER", true),
+            ("UNIQUE_ID", false),
+            ("EMAIL_ADDRESS", true),
+            ("PHONE_NUMBER", true),
         ],
+        configuration_properties: CLIENT_CREDENTIAL_PROPERTIES,
+        output_attribute: "UID2",
     },
 ];
 
@@ -846,6 +925,7 @@ pub fn provider_service_catalog() -> BTreeMap<String, ProviderService> {
                 provider_service_name: row.provider_service_name.to_string(),
                 provider_service_display_name: row.display_name.to_string(),
                 provider_service_type: row.service_type.to_string(),
+                region: row.region.to_string(),
                 anonymized_output: row.anonymized_output,
                 provider_endpoint_configuration:
                     ProviderEndpointConfiguration::marketplaceConfiguration(
@@ -854,10 +934,7 @@ pub fn provider_service_catalog() -> BTreeMap<String, ProviderService> {
                 provider_component_schema: component_schema(row),
                 provider_configuration_definition: configuration_definition(row),
                 provider_entity_output_definition: entity_output_definition(row),
-                // The optional `providerJobConfiguration` is "provider service job
-                // configurations" — a provider-specific job document. This catalog
-                // declares none, so the member is absent rather than guessed at.
-                provider_job_configuration: None,
+                provider_job_configuration: job_configuration(row),
                 provider_id_name_space_configuration: id_name_space_configuration(row),
                 provider_intermediate_data_access_configuration:
                     intermediate_data_access_configuration(row),
@@ -898,19 +975,21 @@ fn data_exchange_id(row: &CatalogRow, member: &str) -> String {
 ///
 /// `providerSchemaAttributes` is the row's attribute list, and `schemas` — a list of
 /// attribute-name lists — is the single schema those attributes make up, so the two
-/// members cannot name different fields.
+/// members cannot name different fields. A provider service's published schema names
+/// each field by the `SchemaAttributeType` it accepts there, so the attribute's
+/// `fieldName` and its `type` are the same token.
 fn component_schema(row: &CatalogRow) -> ProviderComponentSchema {
     ProviderComponentSchema {
         schemas: Some(vec![row
             .attributes
             .iter()
-            .map(|(field_name, _, _)| (*field_name).to_string())
+            .map(|(attribute_type, _)| (*attribute_type).to_string())
             .collect()]),
         provider_schema_attributes: Some(
             row.attributes
                 .iter()
-                .map(|(field_name, attribute_type, hashing)| ProviderSchemaAttribute {
-                    field_name: (*field_name).to_string(),
+                .map(|(attribute_type, hashing)| ProviderSchemaAttribute {
+                    field_name: (*attribute_type).to_string(),
                     r#type: (*attribute_type).to_string(),
                     // `subType` is modelled optional and none of these attributes has
                     // one, so it is absent rather than echoed from `type`.
@@ -924,13 +1003,47 @@ fn component_schema(row: &CatalogRow) -> ProviderComponentSchema {
 
 /// `providerConfigurationDefinition` — "the definition of the provider
 /// configuration", i.e. the schema of the `providerConfiguration` document a workflow
-/// hands this provider.
+/// hands this provider (`ProviderProperties$providerConfiguration`).
 ///
-/// An entry that needs intermediate storage is exactly the one whose configuration
-/// takes an intermediate S3 path, so the definition is derived from
-/// [`CatalogRow::intermediate_data_access`]; an entry that takes no configuration has
-/// no definition and the optional member is absent.
+/// A JSON Schema object over the row's own
+/// [`CatalogRow::configuration_properties`]: every property a string, and the
+/// required ones listed in the order the row declares them. An entry that takes no
+/// configuration has no definition and the optional member is absent.
 fn configuration_definition(row: &CatalogRow) -> Option<Document> {
+    if row.configuration_properties.is_empty() {
+        return None;
+    }
+    Some(json_object([
+        ("type", json_string("object")),
+        (
+            "properties",
+            json_object(row.configuration_properties.iter().map(|(name, _)| {
+                (*name, json_object([("type", json_string("string"))]))
+            })),
+        ),
+        (
+            "required",
+            Document::Array(
+                row.configuration_properties
+                    .iter()
+                    .filter(|(_, required)| *required)
+                    .map(|(name, _)| json_string(name))
+                    .collect(),
+            ),
+        ),
+    ]))
+}
+
+/// `providerJobConfiguration` — "provider service job configurations", i.e. the
+/// schema of the per-job options this provider service takes.
+///
+/// The one job-level option a provider service takes is the S3 location its job stages
+/// data through (`ProviderProperties$intermediateSourceConfiguration`, whose
+/// `intermediateS3Path` is @required,
+/// `smithy_query(query="shape",shape="IntermediateSourceConfiguration")`), so exactly
+/// the entries that need intermediate storage declare one and the rest leave the
+/// optional member absent.
+fn job_configuration(row: &CatalogRow) -> Option<Document> {
     if !row.intermediate_data_access {
         return None;
     }
@@ -965,27 +1078,30 @@ fn configuration_definition(row: &CatalogRow) -> Option<Document> {
 
 /// `providerEntityOutputDefinition` — "the definition of the provider entity output".
 ///
-/// Whatever the service type, the provider answers per input record with the record's
-/// own `UNIQUE_ID` and the id the provider holds for it, so the definition is those
-/// two fields, the second named for the provider and typed `PROVIDER_ID` (both are
-/// modelled `SchemaAttributeType` values).
+/// The provider answers one `entity` per input record, carrying the identifier that
+/// provider holds for it ([`CatalogRow::output_attribute`]), so the definition is a
+/// JSON Schema object requiring `entity` and declaring that one property under it.
 fn entity_output_definition(row: &CatalogRow) -> Document {
-    Document::Object(HashMap::from([
-        ("type".to_string(), json_string("object")),
+    json_object([
+        ("type", json_string("object")),
         (
-            "properties".to_string(),
-            Document::Object(HashMap::from([
-                (
-                    "Unique ID".to_string(),
-                    json_object([("type", json_string("UNIQUE_ID"))]),
-                ),
-                (
-                    format!("{} ID", row.provider_name),
-                    json_object([("type", json_string("PROVIDER_ID"))]),
-                ),
-            ])),
+            "properties",
+            json_object([(
+                "entity",
+                json_object([
+                    ("type", json_string("object")),
+                    (
+                        "properties",
+                        json_object([(
+                            row.output_attribute,
+                            json_object([("type", json_string("string"))]),
+                        )]),
+                    ),
+                ]),
+            )]),
         ),
-    ]))
+        ("required", Document::Array(vec![json_string("entity")])),
+    ])
 }
 
 /// `providerIdNameSpaceConfiguration` — "the provider configuration required for
@@ -1038,10 +1154,16 @@ fn intermediate_data_access_configuration(
         aws_account_ids: Some(vec![
             ::emulator_server::EMULATOR_ACCOUNT_ID.to_string()
         ]),
+        // The S3 actions a provider performs on the intermediate bucket: it writes
+        // its output there, reads the input it was handed, lists and cleans up the
+        // prefix, and resolves the bucket itself before any of that.
         required_bucket_actions: Some(vec![
+            "s3:PutObject".to_string(),
             "s3:GetObject".to_string(),
             "s3:ListBucket".to_string(),
-            "s3:PutObject".to_string(),
+            "s3:DeleteObject".to_string(),
+            "s3:GetBucketLocation".to_string(),
+            "s3:GetBucketAcl".to_string(),
         ]),
     })
 }
@@ -1099,11 +1221,12 @@ pub mod messages {
 
     /// `GetProviderService`'s `ResourceNotFoundException$message` (HTTP 404), answered
     /// when no catalog entry has the requested `providerName` and
-    /// `providerServiceArn`. Not itself recorded; it is this operation's own constant,
-    /// in the same form as the recorded [`GET_SCHEMA_MAPPING_NOT_FOUND`] and spelled
-    /// with the resource type the API uses, and like it, it does not name what was
-    /// asked for.
-    pub const GET_PROVIDER_SERVICE_NOT_FOUND: &str = "ProviderService does not exist";
+    /// `providerServiceArn`. This fixed string is what AWS answers on the wire for
+    /// that miss — it names the catalog entry by the service's OWN internal term for
+    /// one rather than by the API's `ProviderService`, and, like
+    /// [`GET_SCHEMA_MAPPING_NOT_FOUND`], it composes nothing of the request into
+    /// itself: neither the provider nor the service that was asked for.
+    pub const GET_PROVIDER_SERVICE_NOT_FOUND: &str = "PartnerComponent Not Found";
 
     /// `CreateSchemaMapping`'s `ConflictException$message` (HTTP 400) when the
     /// `schemaName` is already taken. AWS answers this constant with no resource name

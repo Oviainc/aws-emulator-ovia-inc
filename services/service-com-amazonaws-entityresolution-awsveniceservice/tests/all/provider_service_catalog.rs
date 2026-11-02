@@ -13,18 +13,20 @@
 //! field-for-field; `providerName` selects exactly that provider's entries;
 //! `maxResults` bounds a page inside the modelled range and anything outside it is
 //! refused; a `nextToken` that is a catalog key resumes at that key and one this
-//! service never minted is refused; and the `providerServiceArn` both operations
-//! report is
+//! service never minted is refused; the `providerServiceArn` both operations report is
 //! `arn:aws:entityresolution:<region>::providerservice/<providerName>/<providerServiceName>`
-//! for the region the request was signed for, so an ARN from another Region resolves
-//! to nothing. Neither operation changes what a later caller sees.
+//! with EVERY segment — the Region included — taken from the catalog entry, so the
+//! same entry reads identically whatever region a request is signed for and an ARN
+//! whose Region segment is not the entry's resolves to nothing; and every miss is a
+//! 404 carrying this operation's one fixed not-found text. Neither operation changes
+//! what a later caller sees.
 //!
 //! Each table spans what the rule generalises over: every entry of the catalog (both
-//! `ServiceType`s, both `anonymizedOutput` values, a provider with several services
-//! and providers with one), several Regions, the modelled `maxResults` minimum,
-//! maximum and one past each, every catalog key as a resume point, and each way a
-//! token or an identifier can fail to name an entry. The recorded
-//! list-then-get round trip is one row of these.
+//! `ServiceType`s, both `anonymizedOutput` values, entries whose ARNs name different
+//! Regions, a provider with several services and providers with one), several signed
+//! Regions, the modelled `maxResults` minimum, maximum and one past each, every
+//! catalog key as a resume point, and each way a token or an identifier can fail to
+//! name an entry. The recorded list-then-get round trip is one row of these.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -51,12 +53,26 @@ fn label(arn: &str) -> String {
     arn.replace('/', "%2F")
 }
 
-/// The ARN the rule says both operations report for an entry in `region`.
+/// The ARN the rule says both operations report for a catalog entry whose own Region
+/// is `region`.
 fn expected_arn(region: &str, provider_name: &str, provider_service_name: &str) -> String {
     format!(
         "arn:aws:entityresolution:{region}::providerservice/{provider_name}/{provider_service_name}"
     )
 }
+
+/// The Region segment of a `providerServiceArn`.
+fn arn_region(case: &str, arn: &str) -> String {
+    arn.split(':')
+        .nth(3)
+        .unwrap_or_else(|| panic!("case {case:?}: {arn:?} is not a provider-service ARN"))
+        .to_string()
+}
+
+/// The fixed `ResourceNotFoundException$message` `GetProviderService` answers for a
+/// provider/service pair that is in no catalog: AWS's own text for the miss, which
+/// echoes nothing of the request.
+const NOT_FOUND_MESSAGE: &str = "PartnerComponent Not Found";
 
 async fn list(emulator: &Emulator, region: &str, query: &str) -> Reply {
     emulator
@@ -136,11 +152,27 @@ async fn every_listed_provider_service_round_trips_through_get() {
         let provider_service_name = string_member(summary, "providerServiceName");
         let case = format!("{provider_name}/{provider_service_name}");
         let arn = string_member(summary, "providerServiceArn");
+        // Every segment of the ARN is the entry's own: the provider and service
+        // tokens, and a Region segment of the modelled `[a-z]{2}-[a-z]{1,10}-[0-9]`
+        // form that the entry carries rather than the caller.
+        let entry_region = arn_region(&case, &arn);
         assert_eq!(
             arn,
-            expected_arn(REGION, &provider_name, &provider_service_name),
-            "case {case:?}: the summary's providerServiceArn must be the entry's ARN in the \
-             signed region, got {arn:?}"
+            expected_arn(&entry_region, &provider_name, &provider_service_name),
+            "case {case:?}: the summary's providerServiceArn must be the entry's own ARN, got \
+             {arn:?}"
+        );
+        let region_parts: Vec<&str> = entry_region.split('-').collect();
+        assert!(
+            region_parts.len() == 3
+                && region_parts[0].len() == 2
+                && (1..=10).contains(&region_parts[1].len())
+                && region_parts[2].len() == 1
+                && entry_region
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'),
+            "case {case:?}: the ARN's Region segment must match the modelled \
+             [a-z]{{2}}-[a-z]{{1,10}}-[0-9], got {entry_region:?}"
         );
         let service_type = string_member(summary, "providerServiceType");
         assert!(
@@ -239,6 +271,105 @@ async fn every_listed_provider_service_round_trips_through_get() {
             "case {case:?}: `schemas` must name the same fields as `providerSchemaAttributes`, \
              got {schemas:?}"
         );
+        for attribute in list_member(component_schema, "providerSchemaAttributes") {
+            // A provider service's published schema names each field by the
+            // `SchemaAttributeType` it accepts there, which is what the single
+            // `schemas` entry lists.
+            assert_eq!(
+                string_member(attribute, "fieldName"),
+                string_member(attribute, "type"),
+                "case {case:?}: a provider schema attribute's fieldName is the attribute type, \
+                 got {attribute:?}"
+            );
+        }
+
+        // `providerEntityOutputDefinition` declares the one `entity` the provider
+        // answers per input record, and that entity's own identifier property.
+        assert_eq!(
+            strings(&case, member(&case, output_definition, "required")),
+            vec!["entity".to_string()],
+            "case {case:?}: the entity output definition requires `entity`, got \
+             {output_definition:?}"
+        );
+        let entity = member(
+            &case,
+            member(&case, output_definition, "properties"),
+            "entity",
+        );
+        let entity_properties = member(&case, entity, "properties")
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: `entity` declares properties, got {entity:?}"));
+        assert_eq!(
+            entity_properties.len(),
+            1,
+            "case {case:?}: the entity carries the provider's own identifier, got \
+             {entity_properties:?}"
+        );
+
+        // `providerConfigurationDefinition` is the schema of the `providerConfiguration`
+        // document a workflow hands this provider, so everything it REQUIRES is one of
+        // the properties it declares.
+        if let Some(definition) = read
+            .body
+            .get("providerConfigurationDefinition")
+            .filter(|value| !value.is_null())
+        {
+            let properties = member(&case, definition, "properties")
+                .as_object()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the configuration definition declares properties")
+                });
+            for required in strings(&case, member(&case, definition, "required")) {
+                assert!(
+                    properties.contains_key(&required),
+                    "case {case:?}: the configuration definition requires {required:?}, which it \
+                     must also declare, got {definition:?}"
+                );
+            }
+        }
+
+        // The accounts-and-actions configuration is present only for a provider that
+        // needs an intermediate bucket, and exactly those entries declare the job
+        // option that names one.
+        let intermediate = read
+            .body
+            .get("providerIntermediateDataAccessConfiguration")
+            .filter(|value| !value.is_null());
+        let job_configuration = read
+            .body
+            .get("providerJobConfiguration")
+            .filter(|value| !value.is_null());
+        assert_eq!(
+            intermediate.is_some(),
+            job_configuration.is_some(),
+            "case {case:?}: the intermediate-data configuration and the job configuration that \
+             names the intermediate location go together, got {:?}",
+            read.body
+        );
+        if let (Some(intermediate), Some(job_configuration)) = (intermediate, job_configuration) {
+            for action in strings(&case, member(&case, intermediate, "requiredBucketActions")) {
+                assert!(
+                    action.starts_with("s3:"),
+                    "case {case:?}: a required bucket action is an S3 action, got {action:?}"
+                );
+            }
+            for account_id in strings(&case, member(&case, intermediate, "awsAccountIds")) {
+                assert!(
+                    account_id.len() == 12 && account_id.chars().all(|ch| ch.is_ascii_digit()),
+                    "case {case:?}: an awsAccountIds entry is a 12-digit account id, got \
+                     {account_id:?}"
+                );
+            }
+            let job_properties = member(&case, job_configuration, "properties");
+            let intermediate_source = member(&case, job_properties, "intermediateSourceConfiguration");
+            assert!(
+                member(&case, intermediate_source, "properties")
+                    .get("intermediateS3Path")
+                    .is_some(),
+                "case {case:?}: the job configuration names the intermediate S3 path, got \
+                 {job_configuration:?}"
+            );
+        }
 
         // `providerIdNameSpaceConfiguration` is "the provider configuration required
         // for different ID namespace types", and an ID namespace is the source or the
@@ -329,8 +460,9 @@ async fn provider_name_filters_the_catalog() {
     }
 
     // A provider nobody offers selects nothing — an empty page, not every entry, and
-    // not a refusal.
-    for unknown in ["NoSuchProvider", "liveramp", "L"] {
+    // not a refusal. `providerName` is matched exactly, so a provider token that
+    // differs only in case or is a prefix of a real one selects nothing either.
+    for unknown in ["NoSuchProvider", "LiveRamp", "live"] {
         let reply = list(&emulator, REGION, &format!("?providerName={unknown}")).await;
         let filtered = summaries(unknown, &reply);
         assert!(
@@ -409,10 +541,10 @@ async fn next_token_resumes_at_a_catalog_key_and_refuses_anything_else() {
     // A token this service never issued is refused, including ones the modelled
     // `NextToken` pattern (`^[a-zA-Z_0-9-=+/]*$`) itself admits.
     for token in [
-        "LiveRamp",
-        "LiveRamp/IDENTITY_RESOLUTION/EXTRA",
-        "/IDENTITY_RESOLUTION",
-        "LiveRamp/",
+        "liveramp",
+        "liveramp/assignment/EXTRA",
+        "/assignment",
+        "liveramp/",
         "AAAAFQ==",
     ] {
         let reply = list(&emulator, REGION, &format!("?nextToken={token}")).await;
@@ -430,46 +562,75 @@ async fn next_token_resumes_at_a_catalog_key_and_refuses_anything_else() {
     }
 }
 
-/// A `providerServiceArn` is region-scoped: every ARN reported is the one for the
-/// region the request was signed for, and an ARN from another Region names no entry
-/// of this one.
+/// A `providerServiceArn` is catalog data: every segment of it, its Region included,
+/// comes from the entry, so a page and a read answer the same whatever region the
+/// request was signed for, and an ARN whose Region segment is not the entry's names no
+/// entry at all.
 #[tokio::test]
-async fn provider_service_arns_are_scoped_to_the_signed_region() {
+async fn provider_service_arns_come_from_the_entry_not_the_request() {
     let emulator = Emulator::new();
-    // Three Regions, each matching the modelled `[a-z]{2}-[a-z]{1,10}-[0-9]` ARN
-    // segment, including the default one.
-    let regions = [REGION, "us-west-2", "eu-central-1"];
+    // Several signing Regions, each matching the modelled `[a-z]{2}-[a-z]{1,10}-[0-9]`
+    // ARN segment: the default one and two no catalog entry is published in.
+    let signed_regions = [REGION, "us-west-2", "eu-central-1"];
 
-    for region in regions {
+    let baseline = summaries("the whole catalog", &list(&emulator, REGION, "").await);
+    // The catalog really does span Regions, so "the ARN's Region is the entry's" is
+    // not satisfiable by any one region.
+    let entry_regions: BTreeSet<String> = baseline
+        .iter()
+        .map(|summary| {
+            arn_region(
+                "the whole catalog",
+                &string_member(summary, "providerServiceArn"),
+            )
+        })
+        .collect();
+    assert!(
+        entry_regions.len() >= 2,
+        "the catalog must publish entries in more than one Region, got {entry_regions:?}"
+    );
+
+    for region in signed_regions {
         let listed = summaries(region, &list(&emulator, region, "").await);
-        assert!(
-            !listed.is_empty(),
-            "case {region:?}: every Region offers the catalog, got {listed:?}"
+        assert_eq!(
+            listed, baseline,
+            "case {region:?}: the catalog a page reports must not depend on the region the \
+             request was signed for, got {listed:?}"
         );
         for summary in &listed {
             let provider_name = string_member(summary, "providerName");
             let provider_service_name = string_member(summary, "providerServiceName");
-            let case = format!("{region} {provider_name}/{provider_service_name}");
+            let case = format!("signed {region}, {provider_name}/{provider_service_name}");
             let arn = string_member(summary, "providerServiceArn");
-            assert_eq!(
-                arn,
-                expected_arn(region, &provider_name, &provider_service_name),
-                "case {case:?}: the ARN must name the signed region, got {arn:?}"
-            );
+            let entry_region = arn_region(&case, &arn);
 
             let read = get(&emulator, region, &provider_name, &arn).await;
             assert_eq!(
                 read.status, 200,
-                "case {case:?}: the ARN a page reported must resolve in that Region, got {read:?}"
+                "case {case:?}: the ARN a page reported must resolve however the read is \
+                 signed, got {read:?}"
+            );
+            assert_eq!(
+                string_member(&read.body, "providerServiceArn"),
+                arn,
+                "case {case:?}: the read must report the entry's own ARN, got {:?}",
+                read.body
             );
 
-            // The same entry's ARN in another Region is not an entry of this one.
-            for other in regions.iter().filter(|other| **other != region) {
+            // The same provider and service under any other Region segment — the
+            // signed region among them — is not an entry of the catalog.
+            for other in signed_regions
+                .iter()
+                .copied()
+                .chain(entry_regions.iter().map(String::as_str))
+                .filter(|other| *other != entry_region)
+            {
                 let foreign = expected_arn(other, &provider_name, &provider_service_name);
                 let refused = get(&emulator, region, &provider_name, &foreign).await;
                 assert_eq!(
                     refused.status, 404,
-                    "case {case:?}: an ARN scoped to {other} must not resolve here, got {refused:?}"
+                    "case {case:?}: an ARN naming {other} rather than the entry's {entry_region} \
+                     must not resolve, got {refused:?}"
                 );
             }
         }
@@ -477,7 +638,7 @@ async fn provider_service_arns_are_scoped_to_the_signed_region() {
 }
 
 /// Everything that is not an entry of the catalog is a 404
-/// `ResourceNotFoundException`.
+/// `ResourceNotFoundException` carrying this operation's one fixed not-found text.
 #[tokio::test]
 async fn an_unknown_provider_service_is_not_found() {
     let emulator = Emulator::new();
@@ -486,6 +647,9 @@ async fn an_unknown_provider_service_is_not_found() {
     let last = listed
         .last()
         .expect("the catalog holds at least one provider service");
+    // The first entry's own Region, so a case that is meant to differ from it in one
+    // way only differs in that one way.
+    let first_region = arn_region("the first entry", &string_member(first, "providerServiceArn"));
 
     let cases = [
         (
@@ -497,7 +661,7 @@ async fn an_unknown_provider_service_is_not_found() {
             "a service name no provider offers",
             string_member(first, "providerName"),
             expected_arn(
-                REGION,
+                &first_region,
                 &string_member(first, "providerName"),
                 "NO_SUCH_SERVICE",
             ),
@@ -505,15 +669,24 @@ async fn an_unknown_provider_service_is_not_found() {
         (
             "a provider name nobody offers",
             "NoSuchProvider".to_string(),
-            expected_arn(REGION, "NoSuchProvider", "IDENTITY_RESOLUTION"),
+            expected_arn(&first_region, "NoSuchProvider", "assignment"),
         ),
         (
             "a provider name that differs only in case",
-            string_member(first, "providerName").to_lowercase(),
+            string_member(first, "providerName").to_uppercase(),
             expected_arn(
-                REGION,
-                &string_member(first, "providerName").to_lowercase(),
+                &first_region,
+                &string_member(first, "providerName").to_uppercase(),
                 &string_member(first, "providerServiceName"),
+            ),
+        ),
+        (
+            "a service name that differs only in case",
+            string_member(first, "providerName"),
+            expected_arn(
+                &first_region,
+                &string_member(first, "providerName"),
+                &string_member(first, "providerServiceName").to_uppercase(),
             ),
         ),
     ];
@@ -534,9 +707,13 @@ async fn an_unknown_provider_service_is_not_found() {
                 .is_some_and(|code| code.contains("ResourceNotFoundException")),
             "case {case:?}: the refusal is a ResourceNotFoundException, got {reply:?}"
         );
-        assert!(
-            !string_member(&reply.body, "message").is_empty(),
-            "case {case:?}: the refusal carries a message, got {:?}",
+        // One fixed text for every miss: it names neither the provider nor the service
+        // that was asked for, so it cannot vary with the request.
+        assert_eq!(
+            string_member(&reply.body, "message"),
+            NOT_FOUND_MESSAGE,
+            "case {case:?}: the refusal carries this operation's fixed not-found message, got \
+             {:?}",
             reply.body
         );
     }
