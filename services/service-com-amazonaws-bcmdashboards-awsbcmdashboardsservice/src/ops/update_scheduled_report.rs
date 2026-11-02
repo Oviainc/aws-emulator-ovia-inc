@@ -7,13 +7,15 @@
 //! (`smithy_query(query="doc",shape="UpdateScheduledReport")`). So every optional member
 //! the request carries REPLACES the stored one and every member it omits leaves the
 //! stored value alone — `name`, `description`, `dashboardArn`,
-//! `scheduledReportExecutionRoleArn`, `scheduleConfig` (whose `state` is carried over from
-//! the stored config when the submitted one names none, through
-//! [`crate::state::updated_schedule_config`]: the ENABLED default the model documents is a
-//! property of the CREATE member, and nothing on this request can clear or re-default a
-//! schedule state, so an update that does not name one leaves a paused report paused),
-//! `widgetIds` and `widgetDateRangeOverride`. `updatedAt` is set to the moment of the
-//! call; `createdAt`, the tags, the execution history and the health the last refresh
+//! `scheduledReportExecutionRoleArn`, `scheduleConfig`, `widgetIds` and
+//! `widgetDateRangeOverride`. A property of a submitted STRUCTURE is named only when that
+//! structure carries it, so a submitted `scheduleConfig` is MERGED into the stored one
+//! property by property ([`crate::state::updated_schedule_config`]): the expression, the
+//! time zone, the active period and the state each move only when the submitted config
+//! names them, and nothing on this request can clear or re-default any of them, so an
+//! update that only re-crons a report keeps the time zone and the period it was configured
+//! with and leaves a paused report paused. `updatedAt` is set to the moment of the call;
+//! `createdAt`, the tags, the execution history and the health the last refresh
 //! established are properties this request does not include, so they are left untouched
 //! (health is established by a refresh, which is `ExecuteScheduledReport`).
 //!
@@ -375,12 +377,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             report.execution_role_arn = role_arn;
         }
         if let Some(schedule_config) = input.schedule_config {
-            // The config the request carries replaces the stored one, with ONE property
-            // carried over: its `state`. The ENABLED default the model documents belongs
-            // to the create member alone, and this request models no flag to clear or
-            // re-default the schedule state, so a request that does not name a state
-            // leaves the report as enabled or as paused as the account last left it
-            // (`crate::state::updated_schedule_config`).
+            // The config the request carries is merged into the stored one property by
+            // property: each property it names replaces the stored one and each property
+            // it omits is left alone, since this request models no flag that clears or
+            // re-defaults any of them (`crate::state::updated_schedule_config`).
             report.schedule_config =
                 crate::state::updated_schedule_config(&report.schedule_config, schedule_config);
         }

@@ -129,16 +129,20 @@ fn cases(other_dashboard: &str, other_widget: &str) -> Vec<UpdateCase> {
             )],
         },
         UpdateCase {
-            // The whole `scheduleConfig` is the parameter, so the config that arrives
-            // replaces the stored one — including dropping the time zone the baseline
-            // carried.
+            // A property of the submitted `scheduleConfig` is named only when that config
+            // carries it, so the two properties this one names move and the time zone the
+            // baseline carried stays exactly as stored.
             label: "schedule config replaced with a rate expression and DISABLED",
             request: json!({
                 "scheduleConfig": {"scheduleExpression": "rate(7 days)", "state": "DISABLED"}
             }),
             expected: vec![(
                 "scheduleConfig",
-                Some(json!({"scheduleExpression": "rate(7 days)", "state": "DISABLED"})),
+                Some(json!({
+                    "scheduleExpression": "rate(7 days)",
+                    "scheduleExpressionTimeZone": "UTC",
+                    "state": "DISABLED"
+                })),
             )],
         },
         UpdateCase {
@@ -155,6 +159,7 @@ fn cases(other_dashboard: &str, other_widget: &str) -> Vec<UpdateCase> {
                 "scheduleConfig",
                 Some(json!({
                     "scheduleExpression": "cron(0 6 1 1,4,7,10 ? *)",
+                    "scheduleExpressionTimeZone": "UTC",
                     "state": "ENABLED"
                 })),
             )],

@@ -188,8 +188,8 @@ async fn listed_state(router: &MultiServiceRouter, arn: &str, label: &str) -> St
 }
 
 /// Every row: the update moves the schedule state only when it names one, the state it
-/// leaves behind is what both reads report, and the members the submitted config carries
-/// replace the stored ones.
+/// leaves behind is what both reads report, and a property the submitted config does not
+/// name keeps the stored value.
 #[tokio::test]
 async fn an_update_moves_the_schedule_state_only_when_it_names_one() {
     let router = router();
@@ -229,17 +229,23 @@ async fn an_update_moves_the_schedule_state_only_when_it_names_one() {
             "case {label}: the listing must report the same state as the detail view",
         );
 
-        // The members the submitted config carries are the update's own parameters, so
-        // each of them replaces what was stored.
+        // A property of the submitted config is named only when that config carries it:
+        // the properties it names replace what was stored, and the ones it leaves out keep
+        // the stored value (the create above names a time zone, so there is one to keep).
         if let Some(submitted) = &case.submitted {
-            for member in ["scheduleExpression", "scheduleExpressionTimeZone"] {
+            for (member, created) in [
+                ("scheduleExpression", json!("cron(0 8 1 * ? *)")),
+                ("scheduleExpressionTimeZone", json!("UTC")),
+            ] {
+                let expected = submitted.get(member).unwrap_or(&created);
                 assert_eq!(
                     schedule.get(member),
-                    submitted.get(member),
-                    "case {label}: expected scheduleConfig.{member} {:?}, got {schedule}",
-                    submitted.get(member)
+                    Some(expected),
+                    "case {label}: expected scheduleConfig.{member} {expected:?}, got {schedule}"
                 );
             }
+            // The create names no period, so a row that submits one reads it back and a
+            // row that submits none has none stored to keep.
             for member in ["startTime", "endTime"] {
                 assert_eq!(
                     schedule

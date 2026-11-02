@@ -1532,26 +1532,57 @@ pub fn resolve_schedule_config(mut config: ScheduleConfig) -> ScheduleConfig {
 }
 
 /// The `scheduleConfig` to store for an UPDATE of a report whose stored config is
-/// `stored`: the submitted config, with the STORED state carried over when the request
-/// left `state` unset.
+/// `stored`: the STORED config with each property the submitted one names written over
+/// it, property by property.
 ///
 /// An update applies only the properties its request names — "Only the parameters
 /// included in the request are updated; all other properties remain unchanged"
-/// (`smithy_query(query="doc",shape="UpdateScheduledReport")`) — and this service spells
-/// out how a caller unsets or re-defaults an optional property: an explicit flag on the
-/// request (`clearWidgetIds`, `clearWidgetDateRangeOverride`). `UpdateScheduledReportRequest`
-/// models no such flag for the schedule state and its `scheduleConfig` member documents no
-/// default of its own, so an omitted `state` is not an instruction to re-default a paused
-/// schedule to [`SCHEDULE_STATE_ENABLED`]: the state the account last decided stands, and a
-/// caller changing a cron expression cannot resume a report it paused.
+/// (`smithy_query(query="doc",shape="UpdateScheduledReport")`) — and a property of a
+/// submitted STRUCTURE is named only when that structure carries it, so a submitted
+/// `scheduleConfig` is merged into the stored one rather than swapped for it: the
+/// expression, the time zone, the active period and the state each move only when the
+/// request carries that member. This service spells out how a caller unsets or re-defaults
+/// an optional property — an explicit flag on the request (`clearWidgetIds`,
+/// `clearWidgetDateRangeOverride`) — and `UpdateScheduledReportRequest` models no such flag
+/// for any member of `ScheduleConfig` (`smithy_query(query="operation",
+/// operation="UpdateScheduledReport")`), so an absent member is never an instruction to
+/// drop or re-default a stored one: a caller re-cronning a report keeps the time zone and
+/// the period it configured, and cannot resume a report it paused
+/// ([`SCHEDULE_STATE_ENABLED`] is documented on the CREATE member alone,
+/// [`resolve_schedule_config`]).
+///
+/// The merge stops at the members of `ScheduleConfig`: inside a submitted
+/// `schedulePeriod`, an omitted bound is not "unchanged" but the default its own member
+/// documents ("defaults to the time of the create or update request" / "defaults to 3 years
+/// from the time of the create or update request",
+/// `smithy_query(query="shape",shape="SchedulePeriod")`), so a period the request carries
+/// is one whole parameter and replaces the stored period.
 pub fn updated_schedule_config(
     stored: &ScheduleConfig,
-    mut submitted: ScheduleConfig,
+    submitted: ScheduleConfig,
 ) -> ScheduleConfig {
-    if submitted.state.as_deref().is_none_or(str::is_empty) {
-        submitted.state = Some(schedule_config_state(stored).to_string());
+    // Destructured rather than mutated, so a member added to `ScheduleConfig` later
+    // cannot slip through this merge unconsidered: the build stops here until it is.
+    let ScheduleConfig {
+        schedule_expression,
+        schedule_expression_time_zone,
+        schedule_period,
+        state,
+    } = submitted;
+    ScheduleConfig {
+        schedule_expression: schedule_expression.or_else(|| stored.schedule_expression.clone()),
+        schedule_expression_time_zone: schedule_expression_time_zone
+            .or_else(|| stored.schedule_expression_time_zone.clone()),
+        schedule_period: schedule_period.or_else(|| stored.schedule_period.clone()),
+        // `state` is the one member whose target is an enum, so an empty string is no
+        // value of it at all and counts as unnamed; the other three are strings and a
+        // structure the model admits as submitted.
+        state: Some(
+            state
+                .filter(|state| !state.is_empty())
+                .unwrap_or_else(|| schedule_config_state(stored).to_string()),
+        ),
     }
-    submitted
 }
 
 /// How far past the write request that submits it the END of a schedule period may reach,
