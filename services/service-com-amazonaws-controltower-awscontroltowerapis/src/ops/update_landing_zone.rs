@@ -235,28 +235,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Updating a landing zone whose own asynchronous operation has not finished would
-        // leave it in an inconsistent state, which is what `ConflictException` reports.
-        if store.has_operation_in_flight(&arn) {
-            return Err(UpdateLandingZoneErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "landing zone {arn} has an operation in progress; updating it now \
-                         would leave it in an inconsistent state"
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // A landing zone moves FORWARD only. The catalog check above says the requested
-        // version EXISTS; this one says the landing zone can get there from where it is:
-        // an update deploys the requested version over the version the landing zone
-        // already has, so the same version (re-applying the configuration) or a newer one
-        // is reachable and an older one is not. Ordered against the version an in-flight
-        // deployment is on its way to, when there is one, so the answer does not depend on
-        // whether the clock has made that deployment due yet. Decided through a SHARED
-        // borrow, before anything takes a mutable one: a refused update writes nothing.
+        // WHAT the request asks for is settled before the landing zone's own in-flight
+        // state is looked at, the order the sibling `UpdateEnabledControl` and
+        // `UpdateEnabledBaseline` apply: a landing zone moves FORWARD only. The catalog
+        // check above says the requested version EXISTS; this one says the landing zone can
+        // get there from where it is: an update deploys the requested version over the
+        // version the landing zone already has, so the same version (re-applying the
+        // configuration) or a newer one is reachable and an older one is not. Ordered
+        // against the version an in-flight deployment is on its way to, when there is one,
+        // so a request that could never be accepted is answered with the same
+        // `ValidationException` whether or not the clock has made that deployment due.
+        // Decided through a SHARED borrow, before anything takes a mutable one: a refused
+        // update writes nothing.
         let refusal = store
             .landing_zones
             .get(&arn)
@@ -271,6 +261,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 UpdateLandingZoneErrorModeled::ValidationException(ValidationException { message })
                     .into(),
             );
+        }
+
+        // The request itself is one the service accepts, so now the landing zone's own
+        // state decides: updating a landing zone whose own asynchronous operation has not
+        // finished would leave it in an inconsistent state, which is what
+        // `ConflictException` reports.
+        if store.has_operation_in_flight(&arn) {
+            return Err(UpdateLandingZoneErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "landing zone {arn} has an operation in progress; updating it now \
+                         would leave it in an inconsistent state"
+                    ),
+                },
+            )
+            .into());
         }
 
         // `resolve_landing_zone_arn` only answers with a key this map holds, so the lookup

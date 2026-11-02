@@ -95,6 +95,8 @@ mod landing_zone_pending_transitions;
 mod landing_zone_reset;
 #[path = "all/landing_zone_update.rs"]
 mod landing_zone_update;
+#[path = "all/landing_zone_update_refusal_order.rs"]
+mod landing_zone_update_refusal_order;
 #[path = "all/landing_zone_validation.rs"]
 mod landing_zone_validation;
 #[path = "all/landing_zone_version_order.rs"]

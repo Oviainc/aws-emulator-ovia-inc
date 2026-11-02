@@ -1008,11 +1008,12 @@ impl LandingZone {
     ///
     /// A further update is ordered against THIS rather than against `version`, so a
     /// version already on its way to being deployed cannot be walked backwards by a
-    /// second call that arrives before the first is due. DEFENSIVE on the wire path:
-    /// `UpdateLandingZone` refuses a landing zone with an operation in flight with
-    /// `ConflictException` before it gets here, and a deployment the clock has made due
-    /// has already been applied by [`settle`], so the pending branch is what keeps the
-    /// order right if either of those ever stops holding.
+    /// second call that arrives before the first is due. REACHED on the wire path:
+    /// `UpdateLandingZone` settles what the request asks for before it looks at whether
+    /// the landing zone has an operation in flight, so a move backwards is refused with
+    /// `ValidationException` whether or not the clock has made the deployment in flight
+    /// due — once it has, [`settle`] has applied it and the deployed branch answers the
+    /// same question.
     ///
     /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
     pub fn configured_version(&self) -> &str {
