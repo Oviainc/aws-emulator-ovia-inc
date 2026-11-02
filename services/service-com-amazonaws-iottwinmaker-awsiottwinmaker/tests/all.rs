@@ -152,6 +152,9 @@ mod not_found_constructions;
 #[path = "all/page_size_rule.rs"]
 mod page_size_rule;
 
+#[path = "all/page_token_spelling.rs"]
+mod page_token_spelling;
+
 #[path = "all/pricing_plan.rs"]
 mod pricing_plan;
 

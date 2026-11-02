@@ -5114,6 +5114,10 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// this service's listings resume at all exclude; the LAST part keeps any
 /// newline it carries (see [`decode_page_token`]), so a scope part that is free
 /// text — a query statement — goes last.
+///
+/// One cursor has exactly ONE token: the body is rendered in lower-case hex and
+/// nothing else, so a differently cased rendering of the same bytes is a value
+/// no caller was handed ([`decode_page_token`]).
 pub fn encode_page_token(envelope: &str, region: &str, scope: &[&str], key: &str) -> String {
     let mut body = format!("{envelope}{key}\n{region}");
     for part in scope {
@@ -5133,6 +5137,16 @@ pub fn encode_page_token(envelope: &str, region: &str, scope: &[&str], key: &str
 /// last scope part may itself contain newlines. A token carrying an EMPTY key is
 /// rejected too: a listing never mints one, since a page is only resumed at a
 /// row that exists.
+///
+/// Decoding is only the first half of reading a token: `::hex::decode` reads
+/// spellings [`encode_page_token`] never writes — an upper-case or a mixed-case
+/// digit beside the lower-case one `::hex::encode` emits — so a value that
+/// decodes here is NOT yet a token this service handed out. The read is finished
+/// by minting the token again from the cursor it understood and keeping it only
+/// when that token is the one it was given, byte for byte: a token is this
+/// service's own opaque value, so the only value that carries a cursor is the
+/// one value a caller was handed, and every other rendering of the same cursor
+/// is a token nothing minted ([`invalid_next_token_message`]).
 pub fn decode_page_token(
     envelope: &str,
     region: &str,
@@ -5151,7 +5165,10 @@ pub fn decode_page_token(
             return None;
         }
     }
-    (!key.is_empty()).then(|| key.to_string())
+    if key.is_empty() {
+        return None;
+    }
+    (encode_page_token(envelope, region, scope, key) == token).then(|| key.to_string())
 }
 
 /// The opaque `nextToken` for a page that resumes at a row's ORDINAL rather
