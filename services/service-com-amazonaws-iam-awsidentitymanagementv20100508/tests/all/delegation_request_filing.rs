@@ -56,8 +56,11 @@ const MAX_CONSOLE_DEEP_LINK_CHARACTERS: usize = 255;
 
 /// The message AWS states a value supplied for a member its documentation says is an ARN
 /// with, when that value cannot be read as an ARN at all — recorded wording, which quotes
-/// nothing of the value or the member.
-const NOT_AN_ARN: &str = "Invalid ARN: Could not be parsed!";
+/// nothing of the value or the member: the sentence states the ARN between `Invalid ARN:`
+/// and `Could not be parsed!`, one space on either side, so a value nothing can be read
+/// from renders that slot empty and the two spaces meet
+/// (`tests/all/unparseable_arn_refusal_wording.rs` is this crate's table for it).
+const NOT_AN_ARN: &str = "Invalid ARN:  Could not be parsed!";
 
 /// The message AWS states a well-formed ARN naming a resource the member cannot address
 /// with — the wording measured for the sibling read of an `EntityArn` of the wrong
@@ -200,7 +203,7 @@ fn reported_instant(case: &str, body: &str, tag: &str) -> Option<i64> {
 
 /// The identifiers of the delegation requests the account holds, read straight out of the
 /// service's own store: what a refused filing must leave untouched.
-fn held(engine: &engine::InMemoryEngine) -> Vec<String> {
+pub(crate) fn held(engine: &engine::InMemoryEngine) -> Vec<String> {
     let store = state::service_state(engine).expect("the IAM store");
     let held = store.lock().delegation_requests.keys().cloned().collect();
     held

@@ -4155,9 +4155,17 @@ pub fn delegation_request_console_link(delegation_request_id: &str) -> String {
 /// that value cannot be read as an ARN at all.
 ///
 /// Measured wording, and it quotes NOTHING of the value or the member: the refusal states
-/// only that what arrived is not an ARN. Stated ONCE here so the operations reading a
-/// caller-supplied ARN cannot word that refusal two ways.
-pub const ARN_UNPARSEABLE: &str = "Invalid ARN: Could not be parsed!";
+/// only that what arrived is not an ARN.
+///
+/// The sentence states the ARN IAM managed to read BETWEEN two fixed halves — `Invalid
+/// ARN:`, one space, that reading, one space, `Could not be parsed!` — and a value nothing
+/// can be read as an ARN from fills that slot with nothing, so the rendered sentence
+/// carries the template's two spaces, one on each side of an empty slot, after the colon.
+/// The spaces belong to the template rather than to the value, so the slot is RENDERED
+/// empty rather than dropped: a sentence with the whitespace around it collapsed is not
+/// the one AWS answers. Stated ONCE here so the operations reading a caller-supplied ARN
+/// cannot word that refusal two ways.
+pub const ARN_UNPARSEABLE: &str = "Invalid ARN:  Could not be parsed!";
 
 /// How IAM refuses a value that IS a well-formed ARN but names a resource the member
 /// cannot address — a resource of another service, or of another type in the same service
