@@ -22,9 +22,7 @@
 //! other real-time inference operation rather than a second time here.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::{
-    LANGUAGE_CODE_VALUES, PII_ENTITY_TYPE_VALUES,
-};
+use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::PII_ENTITY_TYPE_VALUES;
 
 use crate::comprehend_client::Comprehend;
 
@@ -320,18 +318,20 @@ async fn offsets_are_character_offsets_whatever_the_preceding_text_encodes_to() 
     }
 }
 
-/// Recorded behaviour
-/// (`comprehend.detect-pii-entities-unsupported-language-still-succeeds`): a
-/// `LanguageCode` this operation's member documentation does not name still SUCCEEDS,
-/// and the entities answered are the ones the document's own forms support, so they
-/// do not depend on the code at all.
+/// Every language this operation's own accepted set admits is analysed, and the
+/// entities answered are the ones the document's own forms support, so they do not
+/// depend on which accepted code was sent. A code OUTSIDE that set is refused as a
+/// request-validation constraint — the rule `language_value_sets` asserts over every
+/// value the modelled enum names, for every operation applying a set of its own.
 #[tokio::test]
-async fn every_modelled_language_code_is_accepted_and_answers_the_same_entities() {
+async fn every_accepted_language_code_answers_the_same_entities() {
     let comprehend = Comprehend::new();
     let text = "Write to jane.roe@example.com or call 206-555-0147 today.";
     let mut baseline: Option<Value> = None;
 
-    for code in LANGUAGE_CODE_VALUES {
+    // `DetectPiiEntitiesRequest$LanguageCode`: "Enter the language code for English
+    // (en) or Spanish (es)."
+    for code in ["en", "es"] {
         let (status, body) = comprehend
             .call(
                 "DetectPiiEntities",

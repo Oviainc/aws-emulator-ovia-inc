@@ -80,7 +80,10 @@
 use super::types::*;
 
 use super::contains_pii_entities::{recognize_pii, PiiSpan};
-use crate::state::{text_size_refusal, PII_TEXT_QUOTA_BYTES};
+use crate::state::{
+    enum_value_set_refusal, text_size_refusal, LANGUAGE_CODE_PATH, PII_LANGUAGES,
+    PII_TEXT_QUOTA_BYTES,
+};
 
 /// The largest `Text` this operation accepts, in UTF-8 bytes: the real-time quota
 /// Comprehend publishes for PII analysis, stated once for the whole family in
@@ -187,6 +190,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // alone, so this reads and writes nothing a later caller can observe.
         let _ = (ctx, &self.engine);
 
+        // Membership of the `LanguageCode` enum the member targets is enforced at the
+        // boundary; this operation's OWN accepted set is narrower than that enum
+        // ("Enter the language code for English (en) or Spanish (es)", the set stated
+        // once in [`crate::state::PII_LANGUAGES`]), and that narrowing is a
+        // REQUEST-VALIDATION rule, so it decides before anything about the document is
+        // read — as the same enum-constraint refusal the validator answers an
+        // out-of-enum value with. The modelled `UnsupportedLanguageException` is not
+        // this condition: it reports a language the service cannot process, where this
+        // is a value the operation does not admit at all.
+        if !PII_LANGUAGES.contains(&input.language_code.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                enum_value_set_refusal(LANGUAGE_CODE_PATH, &input.language_code, PII_LANGUAGES),
+            ));
+        }
+
         // The model's `@length` floor of 1 is enforced at the boundary; the byte
         // ceiling its documentation states in prose is not, so it is enforced here,
         // through the one size check and the one size-report message every real-time
@@ -202,19 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `LanguageCode` is `@required` and membership of its enum is enforced at the
-        // boundary. No FURTHER language precondition runs here: recorded behaviour
-        // (`comprehend.detect-pii-entities-unsupported-language-still-succeeds`) is
-        // that this operation answers 200 for a language code its member
-        // documentation does not name, so the modelled
-        // `UnsupportedLanguageException` is never raised and no member of the enum is
-        // refused. Nothing is fabricated by accepting it: the recognizer places
-        // entities by the published form of each identifier, which a document writes
-        // the same way whatever language it is in, so the analysis a non-English,
-        // non-Spanish document gets is the analysis its text supports — and the
-        // operations that DO document a set they refuse outside of
-        // (`ContainsPiiEntities`, `StartPiiEntitiesDetectionJob`, through
-        // `crate::state::PII_LANGUAGES`) keep refusing it.
+        // Nothing about the analysis itself depends on the accepted language code: the
+        // recognizer places entities by the published form of each identifier, which a
+        // document writes the same way whichever of the accepted languages it is in.
         //
         // The scan runs on the blocking pool; a scan that did not finish is this
         // operation's own server error, never an empty entity list no analysis

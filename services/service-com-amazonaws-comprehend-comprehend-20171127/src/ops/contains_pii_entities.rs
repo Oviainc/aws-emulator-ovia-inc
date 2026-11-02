@@ -87,7 +87,19 @@ use std::time::Duration;
 
 use regex::Regex;
 
-use crate::state::{text_size_refusal, PII_LANGUAGES, PII_TEXT_QUOTA_BYTES};
+use crate::state::{
+    enum_value_set_refusal, text_size_refusal, LANGUAGE_CODE_PATH, PII_TEXT_QUOTA_BYTES,
+};
+
+/// The `LanguageCode` values THIS operation admits.
+///
+/// Narrower than [`crate::state::PII_LANGUAGES`], the set the PII operations that
+/// analyse a document's text accept: recorded behaviour of this operation is that a
+/// value other than `en` is refused with the request validator's enum-constraint
+/// clause naming `[en]`, so the label surface admits English alone. The set is stated
+/// here, beside the handler that owns it, exactly as the engine-bounded sets of the
+/// other real-time families are (`crate::ops::detect_syntax::TAGGABLE_LANGUAGES`).
+const LABELLED_LANGUAGES: &[&str] = &["en"];
 
 /// The largest `Text` this operation accepts, in UTF-8 bytes: the real-time quota
 /// Comprehend publishes for PII analysis, stated once for every real-time inference
@@ -1020,6 +1032,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // can observe.
         let _ = (ctx, &self.engine);
 
+        // Membership of the `LanguageCode` enum the member targets is enforced at the
+        // boundary; this operation's OWN accepted set is narrower than that enum
+        // ([`LABELLED_LANGUAGES`]), and that narrowing is a REQUEST-VALIDATION rule, so
+        // it decides before anything about the document is read — as the same
+        // enum-constraint refusal the validator answers an out-of-enum value with. The
+        // modelled `UnsupportedLanguageException` is not this condition: it reports a
+        // language the service cannot process, where this is a value the operation does
+        // not admit at all.
+        if !LABELLED_LANGUAGES.contains(&input.language_code.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                enum_value_set_refusal(
+                    LANGUAGE_CODE_PATH,
+                    &input.language_code,
+                    LABELLED_LANGUAGES,
+                ),
+            ));
+        }
+
         // The model's `@length` floor of 1 is enforced at the boundary; the byte
         // ceiling its documentation states in prose is not, so it is enforced here,
         // through the one size check and the one size-report message every real-time
@@ -1033,23 +1063,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
-
-        // Membership of the `LanguageCode` enum is enforced at the boundary; whether
-        // PII analysis accepts that language is not, so it is checked here against
-        // the one set the PII family shares.
-        if !PII_LANGUAGES.contains(&input.language_code.as_str()) {
-            return Err(ContainsPiiEntitiesErrorModeled::UnsupportedLanguageException(
-                UnsupportedLanguageException {
-                    message: Some(format!(
-                        "Amazon Comprehend can't process the language '{}' for PII \
-                         analysis. Supported languages: {}.",
-                        input.language_code,
-                        PII_LANGUAGES.join(", ")
-                    )),
-                },
-            )
-            .into());
         }
 
         // The scan runs on the blocking pool; a scan that did not finish is this

@@ -521,6 +521,10 @@ async fn contains_pii_entities_is_deterministic() {
 async fn a_spanish_document_is_analysed_too() {
     let comprehend = Comprehend::new();
 
+    // `DetectPiiEntities` is the PII operation whose accepted set includes Spanish
+    // (`ContainsPiiEntities` admits English alone — see `language_value_sets`), so the
+    // Spanish document goes through it; the recognizer both operations project is the
+    // same one, so the types it places are the same types.
     for (case, text, expected) in [
         (
             "spanish document with pii",
@@ -535,17 +539,24 @@ async fn a_spanish_document_is_analysed_too() {
     ] {
         let output = comprehend
             .ok(
-                "ContainsPiiEntities",
+                "DetectPiiEntities",
                 &json!({ "Text": text, "LanguageCode": "es" }),
             )
             .await;
-        let mut found = labels(case, &output);
+        let mut found: Vec<String> = output["Entities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|entity| entity["Type"].as_str().map(str::to_string))
+            .collect();
         found.sort();
+        found.dedup();
         let mut wanted: Vec<String> = expected.iter().map(|name| (*name).to_string()).collect();
         wanted.sort();
         assert_eq!(
             found, wanted,
-            "case {case:?}: expected the label set {wanted:?}, got {found:?} in {output}"
+            "case {case:?}: expected the type set {wanted:?}, got {found:?} in {output}"
         );
     }
 }
@@ -554,9 +565,11 @@ async fn a_spanish_document_is_analysed_too() {
 async fn a_language_pii_analysis_does_not_accept_is_refused() {
     let comprehend = Comprehend::new();
 
-    // `DetectPiiEntitiesRequest$LanguageCode`: "Enter the language code for English
-    // (en) or Spanish (es)."
-    let accepted = ["en", "es"];
+    // This operation admits English alone, and a value outside that set is refused at
+    // the request-validation boundary rather than with the modelled
+    // `UnsupportedLanguageException`. The clause itself is asserted over every
+    // operation applying a set of its own in `language_value_sets`.
+    let accepted = ["en"];
     for code in LANGUAGE_CODE_VALUES {
         let (status, body) = comprehend
             .call(
@@ -578,8 +591,8 @@ async fn a_language_pii_analysis_does_not_accept_is_refused() {
             );
             assert_eq!(
                 error_code(&body),
-                "UnsupportedLanguageException",
-                "case {code:?}: expected UnsupportedLanguageException, got {body}"
+                "ValidationException",
+                "case {code:?}: expected ValidationException, got {body}"
             );
         }
     }

@@ -43,6 +43,14 @@ use service_com_amazonaws_comprehend_comprehend_20171127::state::{
 
 use crate::comprehend_client::{error_code, error_message, Comprehend, ACCOUNT_ID, REGION};
 
+/// The ONE sentence a `ResourceNotFoundException` of this service carries, whichever
+/// operation raised it and whatever ARN was asked for
+/// (`crate::state::RESOURCE_NOT_FOUND_MESSAGE`): the service's own reason code and
+/// NOTHING derived from the request, so the refusal never echoes the ARN back.
+/// Written out here rather than imported from the service, so the suite pins the
+/// sentence instead of whatever the code currently believes.
+const RESOURCE_NOT_FOUND_MESSAGE: &str = "RESOURCE_NOT_FOUND: Could not find specified resource.";
+
 /// Longest a suite waits for the clock to owe an endpoint its settled status. The
 /// `ENDPOINT_CREATING_SPAN` in `crate::state` is well under a second; this leaves
 /// ample head-room on a loaded machine.
@@ -808,6 +816,13 @@ async fn a_create_that_names_no_usable_model_is_refused() {
 
     // (case, body, expected HTTP status, expected error code, the message the rule
     // requires — `None` where the message is an example rather than a rule)
+    //
+    // THE RULE for the not-found rows: an ARN that names no resource this account
+    // holds is refused with the service's ONE fixed, value-free sentence
+    // ([`RESOURCE_NOT_FOUND_MESSAGE`], `crate::state::RESOURCE_NOT_FOUND_MESSAGE`),
+    // whichever resource kind the ARN named — a classifier, a model version, a
+    // recognizer or a flywheel — so no row discloses more about the request than
+    // another.
     let cases: Vec<(&str, Value, u16, &str, Option<&str>)> = vec![
         (
             "a classifier ARN that was never created",
@@ -818,7 +833,7 @@ async fn a_create_that_names_no_usable_model_is_refused() {
             }),
             400,
             "ResourceNotFoundException",
-            None,
+            Some(RESOURCE_NOT_FOUND_MESSAGE),
         ),
         (
             "a version of a model that exists unversioned",
@@ -829,7 +844,7 @@ async fn a_create_that_names_no_usable_model_is_refused() {
             }),
             400,
             "ResourceNotFoundException",
-            None,
+            Some(RESOURCE_NOT_FOUND_MESSAGE),
         ),
         (
             "an entity-recognizer model this emulator persists none of",
@@ -842,7 +857,7 @@ async fn a_create_that_names_no_usable_model_is_refused() {
             }),
             400,
             "ResourceNotFoundException",
-            None,
+            Some(RESOURCE_NOT_FOUND_MESSAGE),
         ),
         (
             "a flywheel this emulator persists none of",
@@ -855,10 +870,10 @@ async fn a_create_that_names_no_usable_model_is_refused() {
             }),
             400,
             "ResourceNotFoundException",
-            None,
+            Some(RESOURCE_NOT_FOUND_MESSAGE),
         ),
-        // The refusal names the resource ARN it validated, and this request named
-        // none at all, so the message is built from the request: `null`.
+        // The refusal for a request that named NO resource ARN at all is built from
+        // the request: `null`.
         (
             "neither a model nor a flywheel",
             json!({
@@ -995,7 +1010,7 @@ async fn describing_an_endpoint_that_does_not_exist_is_refused() {
 
     for (case, arn) in cases {
         let (status, body) = comprehend
-            .call("DescribeEndpoint", &json!({ "EndpointArn": arn }))
+            .call("DescribeEndpoint", &json!({ "EndpointArn": &arn }))
             .await;
         assert_eq!(
             status, 400,
@@ -1005,6 +1020,18 @@ async fn describing_an_endpoint_that_does_not_exist_is_refused() {
             error_code(&body),
             "ResourceNotFoundException",
             "case {case:?}: expected ResourceNotFoundException, got {body}"
+        );
+        // The service's ONE fixed sentence, whichever ARN was asked for — and,
+        // stated as the property it is, the ARN the request carried appears nowhere
+        // in the refusal.
+        let message = error_message(&body);
+        assert_eq!(
+            message, RESOURCE_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the service's fixed sentence, got {body}"
+        );
+        assert!(
+            !message.contains(&arn),
+            "case {case:?}: the refusal echoed the submitted ARN {arn:?}: {message:?}"
         );
     }
 }

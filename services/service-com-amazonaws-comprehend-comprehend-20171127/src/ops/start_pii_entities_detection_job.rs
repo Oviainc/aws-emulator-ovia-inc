@@ -115,8 +115,8 @@ use super::types::*;
 use std::time::SystemTime;
 
 use crate::state::{
-    AnalysisJob, JobFamily, JobOutcome, JobSubmission, SubmissionKey, PII_LANGUAGES,
-    PROCESSING_SPAN, QUEUE_SPAN,
+    enum_value_set_refusal, AnalysisJob, JobFamily, JobOutcome, JobSubmission, SubmissionKey,
+    LANGUAGE_CODE_PATH, PII_LANGUAGES, PROCESSING_SPAN, QUEUE_SPAN,
 };
 
 /// The family every job this operation creates belongs to.
@@ -263,28 +263,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Membership of the `LanguageCode` enum is enforced at the boundary; which of
-        // its values a PII job accepts is documented in prose only, so it is enforced
-        // here, against the one set the PII family shares
-        // ([`crate::state::PII_LANGUAGES`]). This operation models no
-        // `UnsupportedLanguageException`, so the refusal is its
-        // `InvalidRequestException`.
+        // Membership of the `LanguageCode` enum the member targets is enforced at the
+        // boundary; which of its values a PII job accepts is documented in prose only
+        // ("Enter the language code for English (en) or Spanish (es)", the one set
+        // [`crate::state::PII_LANGUAGES`] states for the family), so that narrowing is
+        // applied here — as the same enum-constraint refusal the validator answers an
+        // out-of-enum value with, because it is a value the operation does not admit at
+        // all rather than a condition any modelled exception of this operation names.
+        //
+        // The CLASS of this refusal is derived rather than observed: no recording of
+        // THIS operation exists, and the class is the one the recorded refusals of the
+        // other two operations of this family establish for a per-operation
+        // accepted-value set (`DetectPiiEntities`, `ContainsPiiEntities`). Where the
+        // restriction is enforced is a property of the front door rather than of one
+        // operation, so a PII job cannot word it as a modelled exception while its
+        // siblings word it as the validator's clause. A recording of this operation
+        // showing otherwise would narrow the rule to the synchronous operations, and
+        // this is the one arm it would have to move back.
         if !PII_LANGUAGES.contains(&input.language_code.as_str()) {
-            return Err(
-                StartPiiEntitiesDetectionJobErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(format!(
-                            "LanguageCode '{}' is not supported for PII entity detection. \
-                             Enter one of: {}.",
-                            input.language_code,
-                            PII_LANGUAGES.join(", ")
-                        )),
-                        reason: None,
-                        detail: None,
-                    },
-                )
-                .into(),
-            );
+            return Err(crate::scaffolded::Scaffolded::validation(
+                enum_value_set_refusal(LANGUAGE_CODE_PATH, &input.language_code, PII_LANGUAGES),
+            ));
         }
 
         let region = crate::state::request_region(ctx.parts());

@@ -256,8 +256,9 @@ pub fn remove_tags(held: &mut Vec<Tag>, tag_keys: &[String]) {
 /// echoes the ARN back. Fixed for the same reason as [`JOB_NOT_FOUND_MESSAGE`], and
 /// shared by every operation that resolves a resource by ARN — the tagging
 /// operations (`TagResource`, `UntagResource`, `ListTagsForResource`), the
-/// custom-model Describe/Delete/StopTraining operations and the resource-policy
-/// operations — so no two of them can disclose a different amount about the request.
+/// custom-model Describe/Delete/StopTraining operations, the resource-policy
+/// operations and the endpoint operations (`CreateEndpoint`, `DescribeEndpoint`) —
+/// so no two of them can disclose a different amount about the request.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str =
     "RESOURCE_NOT_FOUND: Could not find specified resource.";
 
@@ -3174,25 +3175,50 @@ pub const PII_TEXT_QUOTA_BYTES: usize = 100_000;
 /// the list's total size is needed.
 pub const TOXIC_CONTENT_SEGMENT_QUOTA_BYTES: usize = 1_000;
 
-/// The `LanguageCode` values Comprehend's PII analysis accepts.
+/// The `LanguageCode` values the PII operations that analyse a document's TEXT accept.
 ///
-/// ONE set for the operations that DOCUMENT a set — `ContainsPiiEntities` and the
-/// asynchronous detection job — so they can never drift apart on which languages PII
-/// analysis accepts. The set is the one the member documentation that names a set
-/// states, `StartPiiEntitiesDetectionJobRequest$LanguageCode` and
-/// `DetectPiiEntitiesRequest$LanguageCode`: "Enter the language code for English
-/// (en) or Spanish (es)." `ContainsPiiEntitiesRequest$LanguageCode` is "The language
-/// of the input documents" — it names no set, so it neither widens nor narrows this
-/// one. Every other value the `LanguageCode` enum names is refused with the error the
-/// calling operation models for it, rather than answered with an empty result that no
-/// analysis produced.
+/// ONE set for the operations whose member documentation names a set —
+/// `DetectPiiEntitiesRequest$LanguageCode` and
+/// `StartPiiEntitiesDetectionJobRequest$LanguageCode`, both "Enter the language code
+/// for English (en) or Spanish (es)." — so they can never drift apart on which
+/// languages PII analysis accepts. `ContainsPiiEntities` admits a NARROWER set of its
+/// own, which lives beside that operation's handler.
 ///
-/// `DetectPiiEntities` is the one member of the family that does NOT check this set:
-/// recorded behaviour
-/// (`comprehend.detect-pii-entities-unsupported-language-still-succeeds`) is that it
-/// answers 200 for a language its own documentation does not name, so the check lives
-/// in each caller rather than in the recognizer.
+/// Every other value the `LanguageCode` enum names is refused through
+/// [`enum_value_set_refusal`], rather than answered with a result no analysis of that
+/// language produced.
 pub const PII_LANGUAGES: &[&str] = &["en", "es"];
+
+/// The path the request validator names the `LanguageCode` input member at.
+///
+/// The validator spells a member path in the casing the WIRE carries, which the
+/// awsJson protocols lower-case the first letter of; stated once so every operation
+/// that applies its own accepted-value set names the member identically.
+pub const LANGUAGE_CODE_PATH: &str = "languageCode";
+
+/// The refusal for a value outside the set ONE operation admits for an enumerated
+/// member: the request validator's enum-constraint clause, naming the member path, the
+/// value the request carried and the set that operation accepts.
+///
+/// ONE sentence for every operation of this service whose own accepted set is narrower
+/// than the enumerated type its member targets, so no two of them can word that
+/// refusal differently. The CLASS is the request validator's rather than a modelled
+/// exception, because the value is one the operation does not admit at all — where the
+/// modelled `UnsupportedLanguageException` reports a language the service cannot
+/// PROCESS. Callers pair it with [`crate::scaffolded::Scaffolded::validation`], which
+/// carries the HTTP 400 and the `ValidationException` code the validator answers with.
+///
+/// The clause is the validator's own down to its punctuation: no
+/// `<N> validation error(s) detected: ` envelope — this clause is raised for one named
+/// member rather than collected from a walk over every member — and no space between
+/// the quoted value and `failed`.
+pub fn enum_value_set_refusal(member_path: &str, submitted: &str, accepted: &[&str]) -> String {
+    format!(
+        "Value '{submitted}' at '{member_path}'failed to satisfy constraint: Member must \
+         satisfy enum value set: [{}]",
+        accepted.join(", ")
+    )
+}
 
 /// The refusal message for a document past `quota_bytes`: `Some(message)` when
 /// `text` exceeds the quota, `None` when it fits.

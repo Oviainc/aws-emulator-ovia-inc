@@ -50,17 +50,20 @@ use std::sync::Arc;
 /// here because `override_refusal` replaces the code and the message together.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
-/// The requirement a NUMERIC-bound violation states, in the phrasing the
+/// The requirement a violation that states NO value reports, in the phrasing the
 /// validation envelope uses. `None` for every other violation class, which keeps
 /// the framework's own clause for it ([`ViolationKind`] is `#[non_exhaustive]`, so
 /// a class added upstream falls here too).
-fn range_requirement(kind: &ViolationKind) -> Option<String> {
+fn valueless_requirement(kind: &ViolationKind) -> Option<String> {
     Some(match kind {
         ViolationKind::MinValue(min) => {
             format!("Member must have value greater than or equal to {min}")
         }
         ViolationKind::MaxValue(max) => {
             format!("Member must have value less than or equal to {max}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
         }
         _ => return None,
     })
@@ -69,15 +72,21 @@ fn range_requirement(kind: &ViolationKind) -> Option<String> {
 /// One clause for one violated member.
 ///
 /// Whether the rejected value is echoed follows the violation's CLASS, as AWS's
-/// own request validator does: a value outside a member's `@range` is reported
-/// WITHOUT it — `Value at '<member>' failed to satisfy constraint: Member must
-/// have value greater than or equal to <bound>` — because the bound and the
-/// member name are the whole of what a caller has to act on, and the magnitude it
-/// sent is not restated. Every other class (an absent member, a `@length`, a
-/// `@pattern`, an enum value set) keeps the framework's clause, which does echo
-/// the value, so only the numeric classes are reworded here.
+/// own request validator does. Two classes are reported WITHOUT it — `Value at
+/// '<member>' failed to satisfy constraint: <requirement>`:
+///
+/// * a value outside a member's numeric `@range`, because the bound and the member
+///   name are the whole of what a caller has to act on and the magnitude it sent is
+///   not restated;
+/// * a value longer than a member's `@length` MAXIMUM, which the clause has just
+///   called oversized — restating it would quote back the very bytes the limit
+///   refuses, and a collection has no scalar rendering to quote at all.
+///
+/// Every other class (an absent member, a `@length` MINIMUM, a `@pattern`, an enum
+/// value set) keeps the framework's clause, which does echo the value: there the
+/// value is what a caller has to read the requirement against.
 fn violation_clause(violation: &Violation) -> String {
-    match range_requirement(&violation.kind) {
+    match valueless_requirement(&violation.kind) {
         Some(requirement) => format!(
             "Value at '{}' failed to satisfy constraint: {requirement}",
             violation.path
@@ -90,12 +99,13 @@ fn violation_clause(violation: &Violation) -> String {
 /// `<N> validation error(s) detected: ` envelope the framework renders, over one
 /// clause per violated member.
 ///
-/// `None` when no violation is a numeric-bound one, which declines the refusal
-/// and keeps the framework's wording verbatim rather than re-deriving it here.
+/// `None` when no violation is one of the valueless classes, which declines the
+/// refusal and keeps the framework's wording verbatim rather than re-deriving it
+/// here.
 fn validation_envelope(violations: &[Violation]) -> Option<String> {
     if !violations
         .iter()
-        .any(|violation| range_requirement(&violation.kind).is_some())
+        .any(|violation| valueless_requirement(&violation.kind).is_some())
     {
         return None;
     }
@@ -170,10 +180,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Comprehend words such a refusal as a `ValidationException` (HTTP 400 —
         // the status and code the framework would also have answered, so only the
         // wording changes). The one difference from the framework's own rendering
-        // is the clause for a numeric `@range` violation, which names the member
-        // and the bound and echoes NO value; see [`violation_clause`]. An
-        // authentication refusal keeps the framework's wording: it is not an
-        // input-constraint failure.
+        // is which clauses state the rejected value: a numeric `@range` violation
+        // and a `@length` maximum name the member and the bound and echo NO value;
+        // see [`violation_clause`]. An authentication refusal keeps the
+        // framework's wording: it is not an input-constraint failure.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),

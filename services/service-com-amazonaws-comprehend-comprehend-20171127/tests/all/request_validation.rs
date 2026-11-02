@@ -5,14 +5,16 @@
 //! The refusal is a `ValidationException` (HTTP 400) carrying the
 //! `<N> validation error(s) detected: ` envelope over one clause per violated
 //! member. Which member is named, and whether the rejected value is echoed,
-//! follows the violation's CLASS: a value outside a numeric `@range` is reported
-//! WITHOUT it, naming only the member and the bound; every other class (an absent
-//! required member, a `@length`, a `@pattern`, an enumerated value set) echoes
-//! the value the request sent.
+//! follows the violation's CLASS: a value outside a numeric `@range`, and a value
+//! longer than a member's `@length` MAXIMUM, are reported WITHOUT it, naming only
+//! the member and the bound; every other class (an absent required member, a
+//! `@length` MINIMUM, a `@pattern`, an enumerated value set) echoes the value the
+//! request sent.
 //!
 //! Each suite asserts that rule over a SET of members and operations rather than
 //! one request: both `@range` members the model declares, both bound directions,
-//! values at each published bound and past it.
+//! values at each published bound and past it, and every `@length` maximum a
+//! top-level input member of an implemented operation carries.
 
 use serde_json::{json, Value};
 
@@ -204,8 +206,10 @@ async fn a_value_inside_a_published_range_bound_is_not_refused() {
 async fn a_violation_of_another_class_still_echoes_the_rejected_value() {
     let comprehend = Comprehend::new();
 
-    // A `@length` bound and an absent required member: both state the value the
-    // request held, exactly as the framework's validator renders them.
+    // A `@length` MINIMUM and an absent required member: both state the value the
+    // request held, exactly as the framework's validator renders them. The maximum
+    // direction is the one class that echoes nothing — see
+    // [`a_length_maximum_violation_names_the_member_and_the_limit_and_echoes_no_value`].
     for (case, operation, body, expected) in [
         (
             "NextToken shorter than its @length minimum",
@@ -264,4 +268,181 @@ async fn a_violation_of_another_class_still_echoes_the_rejected_value() {
         "case \"EndpointName outside its @pattern\": expected the rejected value to be \
          echoed, got {message:?}"
     );
+}
+
+/// The clause a `@length` maximum violation states: the member and the limit, with
+/// no value echoed.
+fn length_clause(member_path: &str, max: usize) -> String {
+    format!(
+        "Value at '{member_path}' failed to satisfy constraint: Member must have length \
+         less than or equal to {max}"
+    )
+}
+
+/// A Comprehend ARN of exactly `total` characters naming `resource_type`, whose local
+/// name is pattern-conforming — so the only constraint it breaks is the `@length`
+/// maximum of the member it is sent in.
+fn arn_of_length(resource_type: &str, total: usize) -> String {
+    let prefix = format!("arn:aws:comprehend:{REGION}:{ACCOUNT_ID}:{resource_type}/");
+    let name_length = total
+        .checked_sub(prefix.len())
+        .expect("the requested length leaves room for the ARN's local name");
+    format!("{prefix}{}", "a".repeat(name_length))
+}
+
+#[tokio::test]
+async fn a_length_maximum_violation_names_the_member_and_the_limit_and_echoes_no_value() {
+    let comprehend = Comprehend::new();
+
+    // Every `@length` maximum a top-level input member of an implemented operation
+    // carries, from `smithy_query(query="operation",
+    // operation="CreateEndpoint,DescribeEndpoint")`: `CreateEndpoint.EndpointName` ->
+    // `ComprehendEndpointName` max 40, `CreateEndpoint.ClientRequestToken` ->
+    // `ClientRequestTokenString` max 64, `CreateEndpoint.ModelArn` ->
+    // `ComprehendModelArn` max 256 and `DescribeEndpoint.EndpointArn` ->
+    // `ComprehendEndpointArn` max 256. Rows differ along the member, the operation,
+    // the limit and how far past it the value reaches — one character past, the
+    // length the issue cited, and far past — and every value also conforms to its
+    // member's `@pattern`, so the length is the only constraint it breaks.
+    let hyphenated = format!("{}-{}", "a".repeat(20), "b".repeat(22));
+    let rows: Vec<(&str, &str, Value, &str, usize, String)> = vec![
+        (
+            "EndpointName one character past its maximum",
+            "CreateEndpoint",
+            json!({ "EndpointName": "a".repeat(41), "DesiredInferenceUnits": 1 }),
+            "endpointName",
+            40,
+            "a".repeat(41),
+        ),
+        (
+            "EndpointName at the length the issue cited",
+            "CreateEndpoint",
+            json!({ "EndpointName": &hyphenated, "DesiredInferenceUnits": 1 }),
+            "endpointName",
+            40,
+            hyphenated.clone(),
+        ),
+        (
+            "EndpointName far past its maximum",
+            "CreateEndpoint",
+            json!({ "EndpointName": "a".repeat(400), "DesiredInferenceUnits": 1 }),
+            "endpointName",
+            40,
+            "a".repeat(400),
+        ),
+        (
+            "ClientRequestToken one character past its maximum",
+            "CreateEndpoint",
+            json!({
+                "EndpointName": "endpoint",
+                "DesiredInferenceUnits": 1,
+                "ClientRequestToken": "a".repeat(65),
+            }),
+            "clientRequestToken",
+            64,
+            "a".repeat(65),
+        ),
+        (
+            "ModelArn one character past its maximum",
+            "CreateEndpoint",
+            json!({
+                "EndpointName": "endpoint",
+                "DesiredInferenceUnits": 1,
+                "ModelArn": arn_of_length("document-classifier", 257),
+            }),
+            "modelArn",
+            256,
+            arn_of_length("document-classifier", 257),
+        ),
+        (
+            "EndpointArn one character past its maximum",
+            "DescribeEndpoint",
+            json!({ "EndpointArn": arn_of_length("document-classifier-endpoint", 257) }),
+            "endpointArn",
+            256,
+            arn_of_length("document-classifier-endpoint", 257),
+        ),
+    ];
+
+    for (case, operation, body, member_path, max, submitted) in rows {
+        let (status, response) = comprehend.call(operation, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            VALIDATION_EXCEPTION,
+            "case {case:?}: expected {VALIDATION_EXCEPTION}, got {response}"
+        );
+        let message = error_message(&response);
+        assert_eq!(
+            message,
+            one_error(&length_clause(member_path, max)),
+            "case {case:?}: unexpected validation message"
+        );
+        // The same rule, stated as the property it is: the oversized value the
+        // request carried appears nowhere in the refusal.
+        assert!(
+            !message.contains(&submitted),
+            "case {case:?}: the refusal echoed the rejected value {submitted:?}: \
+             {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_value_at_a_published_length_maximum_is_not_refused_for_its_length() {
+    let comprehend = Comprehend::new();
+
+    // The other side of the same rule: a `@length` maximum is INCLUSIVE, so a value
+    // exactly at it is not a validation error. `CreateEndpoint` gets past validation
+    // and is then refused for the model it names — a classifier this store does not
+    // hold — so the request was not refused as invalid.
+    //
+    // The discriminator is the CODE, not the status: both refusals are HTTP 400 here,
+    // and `ResourceNotFoundException` can only come from the handler, which runs only
+    // after validation passed. The rows that prove validation is applied to these
+    // members at all — rather than skipped — are the oversized ones above, which this
+    // test is the inclusive-bound half of.
+    let absent_model = arn_of_length("document-classifier", 100);
+    for (case, body) in [
+        (
+            "EndpointName exactly at its maximum",
+            json!({
+                "EndpointName": "a".repeat(40),
+                "ModelArn": absent_model.clone(),
+                "DesiredInferenceUnits": 1,
+            }),
+        ),
+        (
+            "ClientRequestToken exactly at its maximum",
+            json!({
+                "EndpointName": "endpoint",
+                "ModelArn": absent_model.clone(),
+                "DesiredInferenceUnits": 1,
+                "ClientRequestToken": "a".repeat(64),
+            }),
+        ),
+        (
+            "ModelArn exactly at its maximum",
+            json!({
+                "EndpointName": "endpoint",
+                "ModelArn": arn_of_length("document-classifier", 256),
+                "DesiredInferenceUnits": 1,
+            }),
+        ),
+    ] {
+        let (status, response) = comprehend.call("CreateEndpoint", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ResourceNotFoundException",
+            "case {case:?}: a value at the published maximum must not be refused as \
+             invalid, got {response}"
+        );
+    }
 }

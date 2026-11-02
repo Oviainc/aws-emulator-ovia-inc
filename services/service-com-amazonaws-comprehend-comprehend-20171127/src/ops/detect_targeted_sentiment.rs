@@ -1211,16 +1211,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same kind of refusal the boundary validator answers an out-of-enum
         // value with: `ValidationException`, in the validator's own enum-constraint
         // wording, naming the member path, the value that broke it and the set it
-        // had to come from. The modelled `UnsupportedLanguageException` is not this
-        // condition: it reports a language the service cannot process, where this is
-        // a value the operation does not accept at all.
+        // had to come from ([`crate::state::enum_value_set_refusal`], the one
+        // sentence every operation of this service states that refusal with). The
+        // modelled `UnsupportedLanguageException` is not this condition: it reports
+        // a language the service cannot process, where this is a value the
+        // operation does not accept at all.
         if !ANALYSABLE_LANGUAGES.contains(&input.language_code.as_str()) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Value '{}' at 'languageCode'failed to satisfy constraint: Member must \
-                 satisfy enum value set: [{}]",
-                input.language_code,
-                ANALYSABLE_LANGUAGES.join(", ")
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::enum_value_set_refusal(
+                    crate::state::LANGUAGE_CODE_PATH,
+                    &input.language_code,
+                    ANALYSABLE_LANGUAGES,
+                ),
+            ));
         }
 
         Ok(DetectTargetedSentimentOutput {

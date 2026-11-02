@@ -289,8 +289,8 @@ async fn only_the_languages_the_job_supports_are_accepted() {
             );
             assert_eq!(
                 error_code(&response),
-                "InvalidRequestException",
-                "case {code:?}: expected InvalidRequestException, got {response}"
+                "ValidationException",
+                "case {code:?}: expected ValidationException, got {response}"
             );
         }
     }
