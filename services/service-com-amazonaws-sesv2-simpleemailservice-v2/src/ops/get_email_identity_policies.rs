@@ -175,7 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every policy the identity carries, under the name it was stored with and
-        // with its document byte-for-byte as submitted. The whole set fits one
+        // with its document exactly as the store holds it — the submitted document's own
+        // tokens, with the whitespace between them dropped, which is the form the write
+        // normalised it to. The whole set fits one
         // response: an identity holds at most the maximum this operation documents a
         // caller can retrieve at a time, which the create enforces
         // (`crate::ops::create_email_identity_policy::MAX_IDENTITY_POLICIES`). An

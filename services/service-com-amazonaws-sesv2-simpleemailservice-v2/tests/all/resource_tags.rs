@@ -70,6 +70,14 @@ const MAX_TAGS_PER_RESOURCE: usize =
 /// these rows.
 const NOT_AN_SES_RESOURCE_ARN: &str = "Provided ARN is not in SES resource ARN format";
 
+/// The sentence the tagging surface answers a `ResourceArn` naming no resource the
+/// account holds: the resource KIND and the NAME the ARN addresses it by, never the whole
+/// ARN. Spelled out here rather than read from the crate, so a change to the handler's
+/// wording fails these rows.
+fn not_present(kind: &str, name: &str) -> String {
+    format!("No {kind} present with name: {name}")
+}
+
 /// The longest a tag key may be, taken from the crate's own constant: `Tag$Key`
 /// documents "The maximum length of a tag key is 128 characters. The minimum length is
 /// 1 character" (`smithy_query(query="doc",shape="Tag",member="Key")`).
@@ -499,8 +507,8 @@ async fn list_tags_for_resource_reports_the_tags_stored_on_the_resource_the_arn_
 #[tokio::test]
 async fn list_tags_for_resource_agrees_with_the_resource_read_that_reports_the_same_tags() {
     // The one stored tag set has two readers, so a row of the accepted table pins that
-    // both report it: `GetContactList` carries no `Tags` member at all for a list that
-    // carries none, while `ListTagsForResource` always reports a list.
+    // both report it: each reports the tag set as a list, and an EMPTY list for a list
+    // that carries no tag.
     for case in accepted_cases()
         .into_iter()
         .filter(|case| case.kind == Kind::ContactList)
@@ -632,60 +640,42 @@ async fn list_tags_for_resource_refuses_an_arn_it_cannot_resolve() {
             resource_arn: arn(HOME, ACCOUNT_ID, "contact-list", "never-created"),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, ACCOUNT_ID, "contact-list", "never-created")
-            ),
+            message: not_present("ContactList", "never-created"),
         },
         RefusalCase {
             case: "an email identity the account never created",
             resource_arn: arn(HOME, ACCOUNT_ID, "identity", "sender@example.net"),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, ACCOUNT_ID, "identity", "sender@example.net")
-            ),
+            message: not_present("EmailIdentity", "sender@example.net"),
         },
         RefusalCase {
             case: "another resource type under a name the account does hold",
             resource_arn: arn(HOME, ACCOUNT_ID, "configuration-set", held.name),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, ACCOUNT_ID, "configuration-set", held.name)
-            ),
+            message: not_present("ConfigurationSet", held.name),
         },
         RefusalCase {
             case: "a resource kind nothing creates in this emulator yet",
             resource_arn: arn(HOME, ACCOUNT_ID, "template", "welcome"),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, ACCOUNT_ID, "template", "welcome")
-            ),
+            message: not_present("Template", "welcome"),
         },
         RefusalCase {
             case: "the held resource's name under another account",
             resource_arn: arn(HOME, OTHER_ACCOUNT_ID, "contact-list", held.name),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, OTHER_ACCOUNT_ID, "contact-list", held.name)
-            ),
+            message: not_present("ContactList", held.name),
         },
         RefusalCase {
             case: "the held resource's name in another Region",
             resource_arn: arn(AWAY, ACCOUNT_ID, "contact-list", held.name),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(AWAY, ACCOUNT_ID, "contact-list", held.name)
-            ),
+            message: not_present("ContactList", held.name),
         },
         RefusalCase {
             case: "the held tenant's name with an id that is not the stored tenant's",
@@ -1130,10 +1120,7 @@ async fn tag_resource_refuses_an_arn_it_cannot_resolve_and_a_tag_no_caller_may_d
             tags: one_tag.clone(),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, ACCOUNT_ID, "contact-list", "never-created")
-            ),
+            message: not_present("ContactList", "never-created"),
         },
         WriteRefusalCase {
             case: "another resource type under a name the account does hold",
@@ -1141,10 +1128,7 @@ async fn tag_resource_refuses_an_arn_it_cannot_resolve_and_a_tag_no_caller_may_d
             tags: one_tag.clone(),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, ACCOUNT_ID, "configuration-set", held.name)
-            ),
+            message: not_present("ConfigurationSet", held.name),
         },
         WriteRefusalCase {
             case: "the held resource's name under another account",
@@ -1152,10 +1136,7 @@ async fn tag_resource_refuses_an_arn_it_cannot_resolve_and_a_tag_no_caller_may_d
             tags: one_tag.clone(),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, OTHER_ACCOUNT_ID, "contact-list", held.name)
-            ),
+            message: not_present("ContactList", held.name),
         },
         WriteRefusalCase {
             case: "the held resource's name in another Region",
@@ -1163,10 +1144,7 @@ async fn tag_resource_refuses_an_arn_it_cannot_resolve_and_a_tag_no_caller_may_d
             tags: one_tag.clone(),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(AWAY, ACCOUNT_ID, "contact-list", held.name)
-            ),
+            message: not_present("ContactList", held.name),
         },
         WriteRefusalCase {
             case: "a tag key with no characters at all",

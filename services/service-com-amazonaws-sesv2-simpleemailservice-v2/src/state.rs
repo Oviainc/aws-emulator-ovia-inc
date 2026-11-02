@@ -418,31 +418,54 @@ pub fn ses_resource_of(resource_arn: &str) -> Option<(&str, &str)> {
 /// How the tagging surface words `NotFoundException` for a `ResourceArn` that names
 /// no resource the account holds in this Region.
 ///
-/// One wording per resource KIND for every operation that resolves a `ResourceArn` to
-/// a tag set, so a client sees the same sentence whichever of them first tells it the
-/// resource is gone.
+/// One wording for every operation that resolves a `ResourceArn` to a tag set, so a
+/// client sees the same sentence whichever of them first tells it the resource is gone.
 ///
-/// A tenant is addressed by an ARN carrying both its name and its id ([`tenant_arn`]),
-/// and this surface is RECORDED answering a tagging call whose tenant ARN resolves to no
-/// tenant with the fixed text `No Tenant present with name: ` and `with tenantId: ` run
-/// together without a separator, naming those two parts of the ARN the request
-/// addressed the tenant by — so a caller reads which tenant record was looked for.
+/// This surface is RECORDED answering such a call with the fixed text
+/// `No <Kind> present with name: ` followed by the NAME the ARN addresses the resource
+/// by — never the whole ARN — where `<Kind>` is the resource kind the ARN's resource
+/// type names ([`tagged_resource_kind`]). A tenant is addressed by an ARN carrying both
+/// its name and its id ([`tenant_arn`]), and is recorded with ` with tenantId: ` run on
+/// after the name without a separator, so a caller reads which tenant record was looked
+/// for.
 ///
-/// For every other kind neither the model nor a recording of this surface states the
-/// sentence, so it is this service's own sentence for a named resource it does not hold
-/// — the form [`tenant_not_found`] states for the resource it names — with the resource
-/// written as the ARN the request addressed it by, which is the only name those
-/// operations are given.
+/// A value that is no resource ARN of this service at all never reaches here: every
+/// operation refuses that on the input ([`UNSUPPORTED_RESOURCE_ARN`]).
 pub fn tagged_resource_not_found(resource_arn: &str) -> String {
-    let tenant = ses_resource_of(resource_arn)
-        .filter(|(resource_type, _)| *resource_type == "tenant")
-        .and_then(|(_, resource_id)| resource_id.split_once('/'));
-    match tenant {
-        Some((tenant_name, tenant_id)) => {
-            format!("No Tenant present with name: {tenant_name}with tenantId: {tenant_id}")
+    let Some((resource_type, resource_id)) = ses_resource_of(resource_arn) else {
+        return format!("Resource {resource_arn} does not exist.");
+    };
+    let kind = tagged_resource_kind(resource_type);
+    match (resource_type, resource_id.split_once('/')) {
+        ("tenant", Some((tenant_name, tenant_id))) => {
+            format!("No {kind} present with name: {tenant_name}with tenantId: {tenant_id}")
         }
-        None => format!("Resource {resource_arn} does not exist."),
+        _ => format!("No {kind} present with name: {resource_id}"),
     }
+}
+
+/// The resource KIND the ARN resource type `resource_type` names, as this service
+/// spells one in a sentence about a resource it does not hold.
+///
+/// SES writes a resource type in an ARN in lower case with dashes and names the kind
+/// itself in the model's own CamelCase spelling, so the kind is that type with each
+/// dash-separated word capitalised — `contact-list` is a `ContactList` — except for the
+/// identity, whose ARN type is `identity` while the model and the recorded sentence
+/// both name the resource `EmailIdentity`.
+fn tagged_resource_kind(resource_type: &str) -> String {
+    if resource_type == "identity" {
+        return "EmailIdentity".to_string();
+    }
+    resource_type
+        .split('-')
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 /// Tenants the account may hold.
@@ -4693,6 +4716,18 @@ pub fn email_identity_not_found(identity: &str) -> String {
 /// differently.
 pub fn email_identity_not_found_unquoted(identity: &str) -> String {
     format!("Email identity {identity} does not exist.")
+}
+
+/// How this service words `AlreadyExistsException` for a sending-authorization policy
+/// name an identity already carries.
+///
+/// This surface is RECORDED answering a duplicate `CreateEmailIdentityPolicy` with the
+/// fixed text `Policy <` + `> already exists` — the policy name QUOTED in angle
+/// brackets, no trailing period — and the `PolicyName` the request spelled is its only
+/// variable part: the identity the policy hangs off is not named, because the name the
+/// caller has to change is the policy's.
+pub fn identity_policy_already_exists(policy_name: &str) -> String {
+    format!("Policy <{policy_name}> already exists")
 }
 
 /// The key an identity is stored and looked up under.

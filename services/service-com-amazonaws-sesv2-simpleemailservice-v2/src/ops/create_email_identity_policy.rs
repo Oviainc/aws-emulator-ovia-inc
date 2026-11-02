@@ -291,9 +291,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if record.policies.contains_key(&input.policy_name) {
             return Err(CreateEmailIdentityPolicyErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    message: Some(format!(
-                        "Policy {} already exists for email identity {}.",
-                        input.policy_name, input.email_identity
+                    message: Some(crate::state::identity_policy_already_exists(
+                        &input.policy_name,
                     )),
                 },
             )
@@ -315,10 +314,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Stored VERBATIM under the name the request spelled, so a read reports back
-        // the document that was submitted — whitespace and member order included —
-        // rather than a re-rendering of it.
-        record.policies.insert(input.policy_name, input.policy);
+        // Stored as the service REPORTS it: the document's own tokens byte for byte —
+        // member order, number spellings and every string literal as they were submitted
+        // — with the insignificant whitespace BETWEEN those tokens dropped, which is the
+        // one minification `::service_common::json_document` states for every service that
+        // takes a JSON document as an opaque member and reports it back. Normalising on
+        // the way IN is what keeps every reader of the identity reporting the same bytes.
+        record.policies.insert(
+            input.policy_name,
+            ::service_common::json_document::minified(&input.policy),
+        );
 
         // Which principals may send through an identity is a fact about the ACCOUNT's
         // identity, not about this API, so the account's identity registry takes the

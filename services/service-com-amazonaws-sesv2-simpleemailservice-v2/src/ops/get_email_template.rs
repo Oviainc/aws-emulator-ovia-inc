@@ -165,10 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Reported as it was stored: the parts a create or an update supplied, and
             // no part it did not.
             template_content: record.content.clone(),
-            // A template created with no tags has no `Tags` member at all, rather than
-            // an empty list — as the sibling readers of this service report an absent
-            // tag set.
-            tags: (!record.tags.is_empty()).then(|| record.tag_list()),
+            // The template's tag set, reported as the list it is: a template that carries
+            // no tag is read back with an EMPTY `Tags` list rather than no member at all,
+            // so a client reading the member of a template that exists always gets a list
+            // — the same reading every other read of a taggable resource of this service
+            // takes.
+            tags: Some(record.tag_list()),
         })
     }
 }

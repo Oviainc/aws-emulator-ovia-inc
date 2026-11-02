@@ -131,6 +131,8 @@ mod send_unverified_identity_refusal;
 mod state_roundtrip;
 #[path = "all/suppressed_destinations.rs"]
 mod suppressed_destinations;
+#[path = "all/template_policy_and_tag_reads.rs"]
+mod template_policy_and_tag_reads;
 #[path = "all/tenant_deletion.rs"]
 mod tenant_deletion;
 #[path = "all/tenant_deletion_reputation_entity.rs"]

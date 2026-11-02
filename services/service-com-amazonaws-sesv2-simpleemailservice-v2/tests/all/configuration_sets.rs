@@ -217,7 +217,8 @@ struct ConfigurationSetCase {
     tracking_options: Value,
     suppression_options: Value,
     vdm_options: Value,
-    /// `Tags`, or `Value::Null` for a set created with none.
+    /// `Tags`: the tag set the create supplied, as the list a read reports — an EMPTY
+    /// list for a set created with none.
     tags: Value,
 }
 
@@ -242,7 +243,7 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
             tracking_options: Value::Null,
             suppression_options: Value::Null,
             vdm_options: Value::Null,
-            tags: Value::Null,
+            tags: json!([]),
         },
         ConfigurationSetCase {
             case: "nothing configured, longest allowed name",
@@ -255,7 +256,7 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
             tracking_options: Value::Null,
             suppression_options: Value::Null,
             vdm_options: Value::Null,
-            tags: Value::Null,
+            tags: json!([]),
         },
         ConfigurationSetCase {
             case: "tracking domain only, hyphenated name",
@@ -271,7 +272,7 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
             tracking_options: json!({"CustomRedirectDomain": "click.example.com"}),
             suppression_options: Value::Null,
             vdm_options: Value::Null,
-            tags: Value::Null,
+            tags: json!([]),
         },
         ConfigurationSetCase {
             // `HttpsPolicy` value set from the model's own enum (smithy_query
@@ -295,7 +296,7 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
             }),
             suppression_options: Value::Null,
             vdm_options: Value::Null,
-            tags: Value::Null,
+            tags: json!([]),
         },
         ConfigurationSetCase {
             // `MaxDeliverySeconds` range from the model (smithy_query
@@ -313,7 +314,7 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
             tracking_options: Value::Null,
             suppression_options: Value::Null,
             vdm_options: Value::Null,
-            tags: Value::Null,
+            tags: json!([]),
         },
         ConfigurationSetCase {
             // ... and this row the published maximum, with the other `TlsPolicy` value.
@@ -330,7 +331,7 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
             tracking_options: Value::Null,
             suppression_options: Value::Null,
             vdm_options: Value::Null,
-            tags: Value::Null,
+            tags: json!([]),
         },
         ConfigurationSetCase {
             case: "reputation metrics on and sending paused",
@@ -347,7 +348,7 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
             tracking_options: Value::Null,
             suppression_options: Value::Null,
             vdm_options: Value::Null,
-            tags: Value::Null,
+            tags: json!([]),
         },
         ConfigurationSetCase {
             // `SuppressionListReason` and `SuppressionListScope` value sets from the
@@ -372,7 +373,7 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                 "SuppressionScope": "ACCOUNT",
             }),
             vdm_options: Value::Null,
-            tags: Value::Null,
+            tags: json!([]),
         },
         ConfigurationSetCase {
             case: "one suppression reason, tenant scope",
@@ -394,7 +395,7 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                 "SuppressionScope": "TENANT",
             }),
             vdm_options: Value::Null,
-            tags: Value::Null,
+            tags: json!([]),
         },
         ConfigurationSetCase {
             // `FeatureStatus` value set from the model (smithy_query
@@ -418,7 +419,7 @@ fn configuration_set_cases() -> Vec<ConfigurationSetCase> {
                 "DashboardOptions": {"EngagementMetrics": "ENABLED"},
                 "GuardianOptions": {"OptimizedSharedDelivery": "DISABLED"},
             }),
-            tags: Value::Null,
+            tags: json!([]),
         },
         ConfigurationSetCase {
             case: "every option object together, tagged, digits in the name",

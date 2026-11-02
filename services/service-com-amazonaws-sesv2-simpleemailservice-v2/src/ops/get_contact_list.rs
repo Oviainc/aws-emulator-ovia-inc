@@ -170,7 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_timestamp: Some(::aws_smithy_types::DateTime::from(
                 record.last_updated_at,
             )),
-            tags: (!record.tags.is_empty()).then(|| record.tag_list()),
+            // The list's tag set, reported as the list it is: a contact list that carries
+            // no tag is read back with an EMPTY `Tags` list rather than no member at all,
+            // as every read of a taggable resource of this service reports one.
+            tags: Some(record.tag_list()),
         })
     }
 }

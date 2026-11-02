@@ -346,11 +346,9 @@ async fn an_update_replaces_the_stored_content_whole_and_keeps_everything_else()
             "case {case:?}: expected the content the update carried and nothing else, got {:?}",
             read.member("TemplateContent")
         );
-        let expected_tags = if tags.is_empty() {
-            Value::Null
-        } else {
-            tag_list(&tags)
-        };
+        // The tag set the create supplied, as the list it is — empty where the create
+        // supplied none; an update changes the content alone.
+        let expected_tags = tag_list(&tags);
         assert_eq!(
             read.member("Tags"),
             expected_tags,

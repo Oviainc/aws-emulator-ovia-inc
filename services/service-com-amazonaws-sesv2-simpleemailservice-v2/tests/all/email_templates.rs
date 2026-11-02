@@ -308,11 +308,9 @@ async fn a_created_email_template_round_trips_through_its_own_read() {
             "case {case:?}: expected the content to be reported exactly as supplied, got {:?}",
             read.member("TemplateContent")
         );
-        let expected_tags = if tags.is_empty() {
-            Value::Null
-        } else {
-            tag_list(&tags)
-        };
+        // A template that exists reports its tag set as the list it is: the tags it was
+        // created with, and an EMPTY list when it was created with none.
+        let expected_tags = tag_list(&tags);
         assert_eq!(
             read.member("Tags"),
             expected_tags,
@@ -597,11 +595,9 @@ async fn a_template_may_carry_the_documented_number_of_tags_and_no_more() {
                 created.status, created.body
             );
             let read = ses.get_template(name).await;
-            let expected = if borrowed.is_empty() {
-                Value::Null
-            } else {
-                tag_list(&borrowed)
-            };
+            // Every tag supplied, as a list — an empty one for a template created with
+            // no tags at all.
+            let expected = tag_list(&borrowed);
             assert_eq!(
                 read.member("Tags"),
                 expected,

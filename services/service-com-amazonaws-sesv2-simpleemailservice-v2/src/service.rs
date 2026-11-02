@@ -43,7 +43,33 @@
 //! `override_protocol` is the sixth seam, and this service takes it for one thing the
 //! generic renderer cannot express: an error document whose `message` member is present
 //! and `null` when the code carries no message. See [`wire`].
+//!
+//! ## The media type this service announces
+//!
+//! The model declares the `restJson1` protocol trait, whose generic default response
+//! media type is `application/json`, and that is what every recorded response of this
+//! service to a request CARRYING A BODY announces, while a response to a request that
+//! declared no media type of its own — a `GET` or a `DELETE` with no body — is recorded
+//! announcing `application/x-amz-json-1.1`, on a success and on a refusal alike. The rule
+//! this service's front door follows is therefore: a response announces the media type
+//! the REQUEST declared for its own body, and a request that declared none is answered
+//! under this front door's own default. The media type a client reads is what it keys its
+//! parsing off, so the default is announced rather than left at the protocol-implied
+//! value.
+//!
+//! The pair, and the one function that re-announces across it, are
+//! [`service_common::response_media_type`]'s; [`RESPONSE_MEDIA_TYPE`] is this service's
+//! own pair and [`announced`] applies it under the condition above. The seams it is
+//! applied at are `override_operation` (every routed request, including the responses the
+//! framework renders inside the request walk), the `ListEmailIdentities` wire route this
+//! file serves itself, and `override_routing_error`.
+//!
+//! Two responses keep the protocol-implied value because no seam that reaches them is
+//! handed the request whose media type decides it: the transport-level failure
+//! (`override_framework_error`) and the authentication refusal, which the router renders
+//! before this service is asked anything.
 
+use service_common::response_media_type::ResponseMediaType;
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
 };
@@ -61,6 +87,95 @@ pub const ENDPOINT_PREFIX: &str = "email";
 
 /// The routing key the generated table holds `ListEmailIdentities` under.
 const LIST_EMAIL_IDENTITIES: &str = "ListEmailIdentities";
+
+/// The media type the `restJson1` protocol trait this service's model declares implies,
+/// which the framework's renderers stamp on every response — the one value
+/// [`RESPONSE_MEDIA_TYPE`] replaces.
+const REST_JSON_MEDIA_TYPE: &str = "application/json";
+
+/// The pair this service's responses are re-announced across: the media type its model's
+/// protocol trait implies, which the framework's renderers stamp, and this front door's
+/// own default (see the module header). Named once, so every seam that re-announces reads
+/// the same two values.
+pub const RESPONSE_MEDIA_TYPE: ResponseMediaType = ResponseMediaType::new(
+    REST_JSON_MEDIA_TYPE,
+    service_common::response_media_type::AWS_JSON_1_1,
+);
+
+/// The request header a caller declares its own body's media type in.
+const CONTENT_TYPE: &str = "content-type";
+
+/// `resp` as this service announces it for `req`: left exactly as the framework rendered
+/// it when the request declared a media type of its own, and re-announced under this
+/// front door's default when it declared none (see the module header).
+///
+/// Only the one header is ever touched, and only where it still carries the
+/// protocol-implied value — [`ResponseMediaType::announce`] leaves a body whose own
+/// producer chose another media type alone.
+fn announced(req: &RtRequest, resp: RtResponse) -> RtResponse {
+    if declares_a_media_type(req) {
+        resp
+    } else {
+        RESPONSE_MEDIA_TYPE.announce(resp)
+    }
+}
+
+/// Whether `req` declared a media type for its own body.
+///
+/// A request carrying a body declares one; a `GET` or a `DELETE` that carries none sends
+/// the header empty or not at all, and nothing it said decides the media type of the
+/// answer.
+fn declares_a_media_type(req: &RtRequest) -> bool {
+    req.headers()
+        .get(CONTENT_TYPE)
+        .is_some_and(|declared| !declared.trim().is_empty())
+}
+
+/// Serves the modelled operation this service's routing table names for the request,
+/// exactly as that table would, then announces the media type this service announces on
+/// what it answered.
+///
+/// Wrapping the whole walk is what reaches the responses the framework renders INSIDE it —
+/// the refusal of a value outside a modelled bound — which `Service::override_protocol`
+/// deliberately does not. It holds no operation of its own: the one it delegates to is the
+/// one the routing table names for the request, resolved from the `svc` the framework
+/// passes in, so every status, code, message and body byte stays the framework's and this
+/// wrapper owns one header.
+#[derive(Debug, Default)]
+struct AnnouncedMediaTypeRoute;
+
+impl ErasedOperation for AnnouncedMediaTypeRoute {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            let definition = svc.definition();
+            let modelled = definition
+                .protocol()
+                .routing_key(req)
+                .ok()
+                .and_then(|key| definition.routing_table().get(key));
+            let answered = match modelled {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                // Unreachable through an `override_operation` that claims a request only
+                // when the routing table holds its key; answered as the framework answers
+                // an unroutable request rather than guessed at.
+                None => definition.routing_error_response(req),
+            };
+            announced(req, answered)
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // `None` is "defer to the modelled operation the routing key names" — the
+        // operation this wrapper delegates to, so its model-declared schemes decide and
+        // this wrapper cannot weaken them.
+        None
+    }
+}
 
 /// The method and URI every AWS SDK, and the CLI, sends `ListEmailIdentities` on.
 ///
@@ -112,12 +227,16 @@ impl ErasedOperation for SdkListIdentitiesRoute {
                 .routing_table()
                 .get(LIST_EMAIL_IDENTITIES)
                 .and_then(|operation| Some((operation, on_modelled_route(req)?)));
-            match routed {
+            let answered = match routed {
                 Some((operation, adapted)) => operation.run(svc, &adapted, ctx).await,
                 // The request could not be restated, so nothing modelled answers it
                 // after all; report it exactly as the framework would have.
                 None => svc.definition().routing_error_response(req),
-            }
+            };
+            // Announced from the request the CLIENT sent, not from the restated one this
+            // route dispatches: the media type of the answer is decided by what the caller
+            // declared (see the module header).
+            announced(req, answered)
         })
     }
 }
@@ -217,6 +336,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// Serves `ListEmailIdentities` on the method and URI real clients send it on;
     /// [`Service::override_operation`] hands such a request to it.
     sdk_list_identities_route: SdkListIdentitiesRoute,
+    /// The wrapper every routable request is served through, so the media type this
+    /// service announces is on the responses the framework renders inside the request
+    /// walk too. Held in a field because [`Service::override_operation`] hands back a
+    /// borrow of it.
+    media_type: AnnouncedMediaTypeRoute,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -228,6 +352,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
             protocol: wire::NullMessageRestJson::new(),
             sdk_list_identities_route: SdkListIdentitiesRoute,
+            media_type: AnnouncedMediaTypeRoute,
         }
     }
 }
@@ -267,9 +392,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // The model's own routing table resolves every route the model binds.
-        if self.entry.protocol().routing_key(req).is_ok() {
-            return None;
+        // Every request the model's own routing table resolves is served through the
+        // shared media-type wrapper, which delegates to that same table entry and then
+        // announces the media type of what it answered — reaching the responses the
+        // framework renders inside the request walk (see the module header). The routing
+        // stays the model's.
+        if service_common::response_media_type::routes(&self.entry, req) {
+            return Some(&self.media_type);
         }
         // What it cannot: `ListEmailIdentities`. The checked-in model binds it to
         // `POST /v2/email/list-identities`, while the wire form the service answers —
@@ -314,12 +443,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it. The framework's protocol-correct default for this
+        // service's envelope is kept word for word, status, code and body alike; only the
+        // media type is announced the way this service announces one (see the module
+        // header).
+        Some(announced(req, self.entry.routing_error_response(req)))
     }
 
     fn override_framework_error(
@@ -328,10 +456,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this on a transport-level failure it detects up front —
         // before (or instead of) naming an operation — such as a malformed
-        // `aws-chunked` body. Returning `None` keeps the entry's protocol-correct
-        // rendering. Return `Some(resp)` to reword that failure in your own
-        // envelope. The error is borrowed, so the default renderer can still
-        // consume it on `None`.
+        // `aws-chunked` body. The seam is handed the failure alone, and the media type of
+        // an answer is decided by what the REQUEST declared, so there is nothing to
+        // announce from here: the entry's protocol-correct rendering is kept (see the
+        // module header). The error is borrowed, so the default renderer can still consume
+        // it on `None`.
         let _ = error;
         None
     }

@@ -201,8 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             delivery_options: Some(record.delivery_options()),
             reputation_options: Some(record.reputation_options()),
             sending_options: Some(record.sending_options()),
-            // A set with no tags has no `Tags` member, rather than an empty list.
-            tags: (!record.tags.is_empty()).then(|| record.tag_list()),
+            // The set's tag set, reported as the list it is: a configuration set that
+            // carries no tag is read back with an EMPTY `Tags` list rather than no member
+            // at all, as every read of a taggable resource of this service reports one.
+            tags: Some(record.tag_list()),
             // The options below are reported only where the set configures them: a set
             // that configures none follows the account's (or tenant's) own preferences
             // instead of holding one of its own.

@@ -70,6 +70,14 @@ const MAX_TAGS_PER_RESOURCE: usize =
 /// these rows.
 const NOT_AN_SES_RESOURCE_ARN: &str = "Provided ARN is not in SES resource ARN format";
 
+/// The sentence the tagging surface answers a `ResourceArn` naming no resource the
+/// account holds: the resource KIND and the NAME the ARN addresses it by, never the whole
+/// ARN. Spelled out here rather than read from the crate, so a change to the handler's
+/// wording fails these rows.
+fn not_present(kind: &str, name: &str) -> String {
+    format!("No {kind} present with name: {name}")
+}
+
 /// One answered request: the status, the error shape when there was one, and the parsed
 /// body.
 struct Reply {
@@ -766,60 +774,42 @@ async fn untag_resource_refuses_an_arn_it_cannot_resolve_and_writes_nothing() {
             resource_arn: arn(HOME, ACCOUNT_ID, "contact-list", "never-created"),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, ACCOUNT_ID, "contact-list", "never-created")
-            ),
+            message: not_present("ContactList", "never-created"),
         },
         RefusalCase {
             case: "an email identity the account never created",
             resource_arn: arn(HOME, ACCOUNT_ID, "identity", "sender@example.net"),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, ACCOUNT_ID, "identity", "sender@example.net")
-            ),
+            message: not_present("EmailIdentity", "sender@example.net"),
         },
         RefusalCase {
             case: "another resource type under a name the account does hold",
             resource_arn: arn(HOME, ACCOUNT_ID, "configuration-set", held_name),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, ACCOUNT_ID, "configuration-set", held_name)
-            ),
+            message: not_present("ConfigurationSet", held_name),
         },
         RefusalCase {
             case: "a resource kind nothing creates in this emulator yet",
             resource_arn: arn(HOME, ACCOUNT_ID, "template", "welcome"),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, ACCOUNT_ID, "template", "welcome")
-            ),
+            message: not_present("Template", "welcome"),
         },
         RefusalCase {
             case: "the held resource's name under another account",
             resource_arn: arn(HOME, OTHER_ACCOUNT_ID, "contact-list", held_name),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, OTHER_ACCOUNT_ID, "contact-list", held_name)
-            ),
+            message: not_present("ContactList", held_name),
         },
         RefusalCase {
             case: "the held resource's name in another Region",
             resource_arn: arn(AWAY, ACCOUNT_ID, "contact-list", held_name),
             status: 404,
             error_code: "NotFoundException",
-            message: format!(
-                "Resource {} does not exist.",
-                arn(AWAY, ACCOUNT_ID, "contact-list", held_name)
-            ),
+            message: not_present("ContactList", held_name),
         },
         RefusalCase {
             case: "a tenant the account never created, addressed by name and id",
@@ -834,12 +824,9 @@ async fn untag_resource_refuses_an_arn_it_cannot_resolve_and_writes_nothing() {
             resource_arn: arn(HOME, ACCOUNT_ID, "tenant", "tenant_never"),
             status: 404,
             error_code: "NotFoundException",
-            // The ARN names no tenant record at all — no id to report — so the resource
-            // is named the way every other kind's is, by the ARN the request passed.
-            message: format!(
-                "Resource {} does not exist.",
-                arn(HOME, ACCOUNT_ID, "tenant", "tenant_never")
-            ),
+            // The ARN names no tenant id to report, so the tenant is named the way every
+            // other kind's resource is: by its kind and the name the ARN carries.
+            message: not_present("Tenant", "tenant_never"),
         },
         RefusalCase {
             case: "the held tenant's name with an id that is not the stored tenant's",
