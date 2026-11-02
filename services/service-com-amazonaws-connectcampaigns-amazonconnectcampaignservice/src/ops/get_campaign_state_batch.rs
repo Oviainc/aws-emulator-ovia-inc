@@ -7,6 +7,11 @@
 //! `failedRequests` with the `ResourceNotFound` failure code — a per-id outcome, so one
 //! absent id does not refuse the whole batch.
 //!
+//! How MANY ids one call may name is the service's own cap
+//! (`crate::state::CAMPAIGN_IDS_PER_BATCH`), applied here rather than at the boundary:
+//! the refusal states the list the caller submitted, which only this layer holds. The
+//! model's `@length` minimum of one is still the boundary validator's.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -49,16 +54,18 @@
 //!
 //! ## Input
 //!
-//! * `campaignIds` (CampaignIdList, len 1..25) **required** — List of CampaignId. Each
-//!   entry is a `CampaignId` (len 0..256, pattern ^[\S]*$); the list's own bound is what
-//!   refuses a batch, and the boundary validator applies both before `handle` runs.
+//! * `campaignIds` (CampaignIdList, len 1..) **required** — List of CampaignId. Each
+//!   entry is a `CampaignId` (len 0..256, pattern ^[\S]*$), and the boundary validator
+//!   applies those entry constraints and the list's own minimum before `handle` runs; the
+//!   list's MAXIMUM is the service's cap and is applied by `handle` itself.
 //!
 //! ## Output
 //!
-//! * `failedRequests` (FailedCampaignStateResponseList, len 0..25) — List of failed requests
-//!   of campaign state
-//! * `successfulRequests` (SuccessfulCampaignStateResponseList, len 0..25) — List of
-//!   successful response of campaign state
+//! * `failedRequests` (FailedCampaignStateResponseList) — List of failed requests of
+//!   campaign state. One entry per requested id that resolved to nothing, so the list is as
+//!   long as the batch the caller sent.
+//! * `successfulRequests` (SuccessfulCampaignStateResponseList) — List of successful
+//!   response of campaign state
 //!
 //! ## Errors
 //!
@@ -163,13 +170,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // A batch read is per-id: `campaignIds` is the only thing that can refuse the
-        // whole call, through the `@length(min: 1, max: 25)` its `CampaignIdList` carries
-        // in this service's model (and each entry's own `CampaignId` constraints), which
-        // the boundary validator applies before this runs — so reaching here means the
-        // request carries between one and twenty-five well-formed ids. Each is then
-        // answered on its own — resolved or not — in the order it was asked for, so a
-        // caller can line the answers up with what it sent.
+        // A batch read is per-id: the only thing that can refuse the whole call is
+        // `campaignIds` itself. Its `@length` minimum of one (and every entry's own
+        // `CampaignId` constraints) is applied by the boundary validator before this runs,
+        // so reaching here means the request carries at least one well-formed id; the
+        // MAXIMUM is the service's own cap ([`crate::state::CAMPAIGN_IDS_PER_BATCH`]) and
+        // is applied here, where the submitted ids are at hand to state in the refusal.
+        // Nothing is read until the batch is one this service accepts.
+        if input.campaign_ids.len() > crate::state::CAMPAIGN_IDS_PER_BATCH {
+            return Err(GetCampaignStateBatchErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::campaign_ids_over_cap_message(&input.campaign_ids),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        }
+
+        // Each id is then answered on its own — resolved or not — in the order it was
+        // asked for, so a caller can line the answers up with what it sent.
         let guard = state.lock();
         let mut successful_requests = Vec::new();
         let mut failed_requests = Vec::new();

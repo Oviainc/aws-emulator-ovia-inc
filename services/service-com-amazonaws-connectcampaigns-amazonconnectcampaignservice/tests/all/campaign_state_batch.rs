@@ -6,9 +6,10 @@
 //! OWN — an id the store holds goes to `successfulRequests` carrying the run state the
 //! last start/pause/stop left it in, an id it does not hold goes to `failedRequests`
 //! carrying the `ResourceNotFound` failure code, and the whole call is refused (HTTP 400
-//! `ValidationException`) only when the request breaks `campaignIds`' own modelled bounds
-//! (1..25 entries). Reporting state changes nothing, so the same batch asked twice, and
-//! the single-id read beside it, answer alike.
+//! `ValidationException`) only when the request breaks `campaignIds`' own bounds — its
+//! modelled minimum of one entry, and the service's own cap on how many ids one batch may
+//! name. Reporting state changes nothing, so the same batch asked twice, and the single-id
+//! read beside it, answer alike.
 //!
 //! Each rule is asserted over a table whose rows differ along what it generalises over —
 //! how many ids are asked for, how many of them resolve, which run state each resolved
@@ -35,10 +36,12 @@ const INSTANCE: &str = "batch-instance";
 /// rather than reading it back out of the implementation.
 const RESOURCE_NOT_FOUND: &str = "ResourceNotFound";
 
-/// The largest batch `campaignIds` admits, and one past it: its modelled `@length`
-/// (min 1, max 25) from
-/// `smithy_query(query="operation", operation="GetCampaignStateBatch")`.
-const MAX_BATCH: usize = 25;
+/// The largest batch `campaignIds` admits: the cap the SERVICE enforces, since the
+/// modelled `@length` on that member states a minimum of one entry and no maximum
+/// (`smithy_query(query="operation", operation="GetCampaignStateBatch")`). Written out
+/// here rather than read back out of the implementation, so this suite pins it; the sizes
+/// around it are `input_constraint_refusals.rs`'s own table.
+const MAX_BATCH: usize = 500;
 
 /// The sentence a request refused for ONE broken input constraint is answered with: the
 /// envelope around a clause naming the value half the class states, the member it sits
@@ -107,6 +110,12 @@ async fn batch(router: &Harness, ids: &[String]) -> super::common::Answer {
         &json!({"campaignIds": ids}),
     )
     .await
+}
+
+/// One id past [`MAX_BATCH`], as the refusal row below sends them: well-formed under
+/// `CampaignId` and naming no campaign.
+fn oversize_ids() -> Vec<String> {
+    (0..=MAX_BATCH).map(|index| format!("id-{index}")).collect()
 }
 
 /// The single-id run-state read, for the same campaign.
@@ -358,7 +367,7 @@ async fn every_requested_id_is_answered_once_in_the_order_it_was_asked_for() {
             vec![absent.clone(), absent.clone()],
         ),
         (
-            "the largest batch the bound admits",
+            "the largest batch the cap admits",
             (0..MAX_BATCH)
                 .map(|index| match index % 3 {
                     0 => first.clone(),
@@ -423,15 +432,15 @@ async fn every_requested_id_is_answered_once_in_the_order_it_was_asked_for() {
 }
 
 #[tokio::test]
-async fn a_batch_outside_the_modelled_bounds_is_refused_as_a_bad_request() {
+async fn a_batch_outside_the_bounds_of_campaign_ids_is_refused_as_a_bad_request() {
     let router = router();
     let known = a_campaign(&router, "known").await;
 
-    // `campaignIds` is required and carries `@length(min 1, max 25)`, so the three ways a
-    // batch can break that contract are refused as bad requests rather than answered with
-    // an empty pair of lists: no list at all, an empty list, and one id too many. Each row
-    // carries the sentence that class is refused with — the one envelope, with the value
-    // half each class states.
+    // `campaignIds` is required and carries a `@length` minimum of one entry, so the three
+    // ways a batch can break the contract are refused as bad requests rather than answered
+    // with an empty pair of lists: no list at all, an empty list, and one id past the
+    // service's cap. Each row carries the sentence that class is refused with — the one
+    // envelope, with the value half each class states.
     let rows: Vec<(&str, Value, String)> = vec![
         (
             "no campaignIds member at all",
@@ -447,15 +456,13 @@ async fn a_batch_outside_the_modelled_bounds_is_refused_as_a_bad_request() {
             ),
         ),
         (
-            // The oversize clause states no value: the structural refusal carries only
-            // the element COUNT of the list the caller sent, and a count is not that
-            // list, so the shared renderer's valueless clause is what this states. (The
-            // cap this names is the model's; the service's own cap, and the echo of the
-            // submitted ids, are causes of the separate open v1 refusal-wording issue.)
-            "one id past the maximum",
-            json!({"campaignIds": (0..=MAX_BATCH).map(|index| format!("id-{index}")).collect::<Vec<_>>()}),
+            // The oversize clause states the list the caller submitted as the value of the
+            // member that broke the cap: a list has a rendering of its own, which is the
+            // half a scalar member's clause drops.
+            "one id past the cap",
+            json!({"campaignIds": oversize_ids()}),
             envelope(
-                "Value at 'campaignIds'",
+                &format!("Value '[{}]' at 'campaignIds'", oversize_ids().join(", ")),
                 &format!("Member must have length less than or equal to {MAX_BATCH}"),
             ),
         ),

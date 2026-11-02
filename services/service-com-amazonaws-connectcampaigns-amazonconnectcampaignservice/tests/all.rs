@@ -19,6 +19,8 @@ mod campaign_plane_refusals;
 mod campaign_state_batch;
 #[path = "all/common.rs"]
 mod common;
+#[path = "all/input_constraint_refusals.rs"]
+mod input_constraint_refusals;
 #[path = "all/signing_name_path_claim.rs"]
 mod signing_name_path_claim;
 #[path = "all/state_roundtrip.rs"]

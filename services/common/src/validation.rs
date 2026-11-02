@@ -1136,7 +1136,13 @@ fn collection_count(stored: &str) -> Option<usize> {
 
 /// `elements` as a list renders: the elements in order, comma-separated, in brackets —
 /// the form AWS echoes a list-valued member back in.
-fn rendered_list(elements: &[&str]) -> String {
+///
+/// `pub` for the same reason [`rendered_map`] is: where the cap a list is held to is the
+/// SERVICE's rather than the model's, no walk ahead of the handler reports it, so the
+/// HANDLER that applies that cap words its own clause and has to quote the list the same
+/// way a clause restored from the walk does ([`submitted_lists`]).
+#[must_use]
+pub fn rendered_list(elements: &[&str]) -> String {
     format!("[{}]", elements.join(", "))
 }
 
