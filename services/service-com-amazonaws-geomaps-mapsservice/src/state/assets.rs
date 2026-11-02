@@ -583,14 +583,10 @@ pub fn style_descriptor(
     // would put members in the document that the published style does not
     // declare.
     let mut metadata = serde_json::Map::new();
+    // The published release version, carried whole: the string the catalog
+    // publishes, qualifier and all, is what the `id` ends with too.
     metadata.insert("version".to_string(), record.version.clone().into());
-    metadata.insert(
-        "aws:virtual-variant".to_string(),
-        serde_json::json!([{
-            "key": TERRAIN_VARIANT_KEY,
-            "variants": terrain_variants(options.terrain.as_deref()),
-        }]),
-    );
+    metadata.insert("aws:virtual-variant".to_string(), virtual_variants());
 
     let mut document = serde_json::Map::new();
     document.insert("version".to_string(), 8.into());
@@ -640,33 +636,45 @@ pub fn style_descriptor(
     to_json_bytes(&serde_json::Value::Object(document))
 }
 
-/// The id of the virtual style variant a `Terrain` request is served by, or
-/// `None` when the request asked for no terrain rendering.
-fn terrain_variant(terrain: Option<&str>) -> Option<&'static str> {
-    // The two values `Terrain` declares, as the variant ids the published
-    // style catalog names them with.
-    match terrain? {
-        "Terrain3D" => Some("3d_terrain"),
-        "Hillshade" => Some("hillshade"),
-        _ => None,
-    }
-}
-
-/// The request knob the published styles' virtual variants are keyed on.
-const TERRAIN_VARIANT_KEY: &str = "terrain";
-
-/// The virtual variants of this knob the request put IN EFFECT: the one variant
-/// that renders the terrain the request asked for, and none when it asked for
-/// no terrain rendering.
+/// The virtual variants the published styles declare, by the request knob each
+/// one varies, as the document's variant block lists them.
 ///
-/// The entry is part of the document either way — a client reads it to find out
-/// which variants are in effect, and an absent entry is indistinguishable from
-/// a document that cannot carry them at all.
-fn terrain_variants(terrain: Option<&str>) -> Vec<serde_json::Value> {
-    terrain_variant(terrain)
-        .into_iter()
-        .map(|id| serde_json::json!({ "id": id }))
-        .collect()
+/// A VIRTUAL VARIANT is a rendering of the whole style a client can switch to —
+/// the three-dimensional terrain rendering is one — as opposed to a detail
+/// drawn from a tile layer added to the same rendering (the hillshade shading,
+/// the contour lines, a travel mode's network), which is a layer of this style
+/// and not another rendering of it.
+///
+/// The block is published content of the style: it states what the style HAS,
+/// so a client reads it to discover which variants it may ask for. It therefore
+/// does not vary with the request — a document that listed only the variant
+/// this request already selected would tell a client nothing it did not
+/// already know, and would make a feature it has not asked for yet look
+/// unavailable.
+const VIRTUAL_VARIANTS: &[(&str, &[&str])] = &[(TERRAIN_VARIANT_KEY, &[TERRAIN_3D_VARIANT])];
+
+/// The request knob the published styles' virtual variants are keyed on, and
+/// the id of the three-dimensional terrain rendering it names. `Terrain`'s
+/// `Terrain3D` value is valid for every map style — the model restricts only
+/// `Hillshade`, to `Standard` and `Monochrome` — so every published style
+/// declares it.
+const TERRAIN_VARIANT_KEY: &str = "terrain";
+const TERRAIN_3D_VARIANT: &str = "3d_terrain";
+
+/// The document's variant block: one entry per knob in [`VIRTUAL_VARIANTS`],
+/// naming the knob and the variants published under it.
+fn virtual_variants() -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = VIRTUAL_VARIANTS
+        .iter()
+        .map(|(key, variants)| {
+            let listed: Vec<serde_json::Value> = variants
+                .iter()
+                .map(|id| serde_json::json!({ "id": id }))
+                .collect();
+            serde_json::json!({ "key": key, "variants": listed })
+        })
+        .collect();
+    serde_json::Value::Array(entries)
 }
 
 /// A style-document source entry for one tileset: its type, its tile template,
@@ -825,27 +833,69 @@ fn layer_object(
             );
         }
         layer.insert("layout".to_string(), layout.into());
+    } else if let Some(layout) = line_layout(spec.role) {
+        layer.insert("layout".to_string(), layout);
     }
 
     serde_json::Value::Object(layer)
 }
+
+/// The layout block a LINE layer declares, which is how the segments of one way
+/// are joined where they meet.
+///
+/// A layer's layout is part of its published definition just as its paint is: a
+/// published way, casing or shadow is drawn as one continuous stroke, so its
+/// corners are rounded rather than mitred, and a document that states no layout
+/// leaves a renderer to join them its own way. A layer type with nothing to lay
+/// out (a fill, an extrusion) declares no layout block at all.
+fn line_layout(role: LayerRole) -> Option<serde_json::Value> {
+    match role {
+        LayerRole::Way | LayerRole::Casing | LayerRole::Shadow => {
+            Some(serde_json::json!({ "line-join": LINE_JOIN }))
+        }
+        _ => None,
+    }
+}
+
+/// How the segments of a published line layer are joined: the MapLibre
+/// `line-join` value that rounds a corner.
+const LINE_JOIN: &str = "round";
 
 /// How wide a label's halo is drawn, and how large its text is set, in style
 /// pixels.
 const LABEL_HALO_WIDTH: f64 = 1.0;
 const LABEL_TEXT_SIZE: u32 = 12;
 
-/// The features a layer selects: the geometry role its [`LayerRole`] can draw,
-/// narrowed by the knob that narrows this family — the political view whose
-/// alternative boundary alignment a disputed layer draws, and the categories a
-/// point-of-interest band was asked for.
+/// The features a layer selects, as a published style states a filter: an
+/// `all`-rooted list of CLAUSES, each a complete expression, so a renderer that
+/// evaluates them draws exactly the features the layer is for.
+///
+/// Three kinds of clause, in this order:
+///
+/// * the attribute values this layer draws, as a `match` over the attribute
+///   with its value list and its true/false arms — the form that states a set
+///   of values rather than a single comparison;
+/// * the geometry this layer's type can render, as an `==` against
+///   `geometry-type`, so a layer never tries to stroke a polygon or fill a
+///   line;
+/// * the narrowing a request knob asks for — the political view whose
+///   alternative boundary alignment a disputed layer draws, and the categories
+///   a point-of-interest band was asked for.
+///
+/// The ATTRIBUTES named are the ones the tiles behind these layers carry (see
+/// [`vector_tile_bytes`]), so the filter a client evaluates and the features it
+/// evaluates them against cannot drift apart.
 fn geometry_filter(spec: &StyleLayerSpec, options: &StyleOptions) -> serde_json::Value {
-    let role = match spec.role {
-        LayerRole::Area | LayerRole::Shading | LayerRole::Extrusion => AREA_ROLE,
-        LayerRole::Way | LayerRole::Casing | LayerRole::Shadow => WAY_ROLE,
-        LayerRole::Label | LayerRole::Icon => POINT_ROLE,
+    let (role, geometry) = match spec.role {
+        LayerRole::Area | LayerRole::Shading | LayerRole::Extrusion => (AREA_ROLE, "Polygon"),
+        LayerRole::Way | LayerRole::Casing | LayerRole::Shadow => (WAY_ROLE, "LineString"),
+        LayerRole::Label | LayerRole::Icon => (POINT_ROLE, "Point"),
     };
-    let role_filter = serde_json::json!(["==", ["get", ROLE_ATTRIBUTE], role]);
+    let mut clauses: Vec<serde_json::Value> = vec![
+        serde_json::json!("all"),
+        serde_json::json!(["match", ["get", ROLE_ATTRIBUTE], [role], true, false]),
+        serde_json::json!(["==", ["geometry-type"], geometry]),
+    ];
     // A disputed alignment is a boundary under ONE country's view, so the layer
     // that draws it selects the territories the view IN EFFECT claims, on the
     // `political_view` attribute such a feature carries — and selects nothing
@@ -853,23 +903,21 @@ fn geometry_filter(spec: &StyleLayerSpec, options: &StyleOptions) -> serde_json:
     // boundary standing.
     if style_layers::is_disputed(spec) {
         let views: Vec<&str> = options.political_view.as_deref().into_iter().collect();
-        return serde_json::json!([
-            "all",
-            role_filter,
-            ["in", ["get", POLITICAL_VIEW_ATTRIBUTE], ["literal", views]],
-        ]);
-    }
-    let narrowing = match spec.gate {
+        clauses.push(serde_json::json!([
+            "in",
+            ["get", POLITICAL_VIEW_ATTRIBUTE],
+            ["literal", views],
+        ]));
+    } else if spec.gate == LayerGate::Poi && !options.poi_categories.is_empty() {
         // Only the requested categories are rendered, filtered on the
         // `category` attribute a point feature carries.
-        LayerGate::Poi if !options.poi_categories.is_empty() => serde_json::json!([
+        clauses.push(serde_json::json!([
             "in",
             ["get", "category"],
             ["literal", options.poi_categories.clone()],
-        ]),
-        _ => return role_filter,
-    };
-    serde_json::json!(["all", role_filter, narrowing])
+        ]));
+    }
+    serde_json::Value::Array(clauses)
 }
 
 /// The palette entry a style layer is painted from, and how its role shades it.

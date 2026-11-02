@@ -23,3 +23,5 @@ mod state_roundtrip;
 mod static_map_knobs;
 #[path = "all/style_descriptor.rs"]
 mod style_descriptor;
+#[path = "all/style_release_document.rs"]
+mod style_release_document;

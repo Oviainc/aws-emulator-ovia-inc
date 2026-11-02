@@ -603,22 +603,24 @@ async fn a_casing_outlines_the_way_above_it() {
     }
 }
 
-/// The variant entry is part of every document, whatever the request asked for,
-/// and the light block belongs to the published style rather than to the colour
-/// scheme.
+/// The variant block is part of every document and states what the published
+/// style HAS, so it is the same whatever the request asked for; the light block
+/// belongs to the published style rather than to the colour scheme.
 #[tokio::test]
 async fn the_document_always_reports_its_variants_and_its_light() {
     let emulator = Emulator::new();
-    // Row = a query, and the variant ids it must put in effect. The terrain
-    // values are the model's own `Terrain` enum.
-    let rows: [(&str, &[&str]); 4] = [
-        ("", &[]),
-        ("traffic=All&buildings=Buildings3D", &[]),
-        ("terrain=Hillshade", &["hillshade"]),
-        ("terrain=Terrain3D&poi-density=Off", &["3d_terrain"]),
+    // Row = a query. The terrain values are the model's own `Terrain` enum, so
+    // a request that selects a variant, one that selects the other and ones
+    // that select none are all covered.
+    let rows = [
+        "",
+        "traffic=All&buildings=Buildings3D",
+        "terrain=Hillshade",
+        "terrain=Terrain3D&poi-density=Off",
     ];
     let mut lights: BTreeSet<String> = BTreeSet::new();
-    for (query, expected) in rows {
+    let mut advertised: BTreeSet<String> = BTreeSet::new();
+    for query in rows {
         for (name, path) in style_cases() {
             let case = format!("{name}?{query}");
             let document = document(&emulator, &case, &format!("{path}&{query}")).await;
@@ -631,9 +633,9 @@ async fn the_document_always_reports_its_variants_and_its_light() {
                 .flat_map(|entry| entry["variants"].as_array().into_iter().flatten())
                 .filter_map(|variant| variant["id"].as_str())
                 .collect();
-            assert_eq!(
-                ids, expected,
-                "case {case:?}: expected the variants {expected:?}, got {recorded}"
+            assert!(
+                !ids.is_empty(),
+                "case {case:?}: the block must state the variants the style has, got {recorded}"
             );
             for entry in entries {
                 assert_eq!(
@@ -642,9 +644,15 @@ async fn the_document_always_reports_its_variants_and_its_light() {
                     "case {case:?}: a variant entry names the knob it varies, got {entry}"
                 );
             }
+            advertised.insert(recorded.to_string());
             lights.insert(document["light"].to_string());
         }
     }
+    assert_eq!(
+        advertised.len(),
+        1,
+        "the variants a style publishes do not depend on the request that read them, got {advertised:?}"
+    );
     assert_eq!(
         lights.len(),
         1,
@@ -711,8 +719,23 @@ async fn the_requested_political_view_selects_the_boundary_alignment() {
             );
         }
         for id in disputed {
+            // The clause that narrows the layer to a view, found by the
+            // attribute it reads rather than by its position, so the clause
+            // list can grow without this case moving with it.
+            let clause = by_id[id]["filter"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|clause| clause[1] == serde_json::json!(["get", "political_view"]))
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: layer {id} must carry a clause on the view attribute, got {}",
+                        by_id[id]["filter"]
+                    )
+                });
             // The selected views: the one asked for, and none otherwise.
-            let selected = &by_id[id]["filter"][2][2][1];
+            let selected = &clause[2][1];
             assert_eq!(
                 selected,
                 &serde_json::json!(view.into_iter().collect::<Vec<_>>()),

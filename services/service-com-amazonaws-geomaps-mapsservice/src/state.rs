@@ -857,10 +857,19 @@ pub const STYLE_NAME_PREFIX: &str = "AmazonLocation";
 /// canonical name.
 pub const STYLE_COVERAGE: &str = "Global";
 
-/// The version of the style documents this catalog publishes. It is reported in
-/// a document's metadata and is the suffix of its `id`, so a client can tell
-/// two published versions apart.
-pub const STYLE_VERSION: &str = "4.1.0";
+/// The version of the style documents this catalog publishes, as ONE release
+/// version string. It is reported in a document's metadata and is the suffix of
+/// its `id`, so a client can tell two published versions apart.
+///
+/// A style release is versioned semantically, so its version is a three-part
+/// core and, while the release is still a pre-release of that core, a
+/// qualifier after it. The qualifier is PART OF the version — `4.1.0-beta.1`
+/// and `4.1.0` are two different releases — so the whole string is carried
+/// verbatim into both `metadata.version` and the document's `id`, and nothing
+/// reassembles a version from its core alone: two releases that differ only in
+/// the qualifier would otherwise report one identity and collide in a client's
+/// cache.
+pub const STYLE_VERSION: &str = "4.1.0-beta.1";
 
 /// When [`STYLE_VERSION`] was published, and when it last changed. Catalog data
 /// rather than a clock reading: a style document is published content, so every

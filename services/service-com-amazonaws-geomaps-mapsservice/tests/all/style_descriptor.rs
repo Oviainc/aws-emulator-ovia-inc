@@ -428,23 +428,25 @@ async fn the_ground_is_the_documents_background_layer() {
     }
 }
 
-/// A terrain request is served by a virtual variant of the published style, and
-/// the document records which one; a request that asks for no terrain records
-/// none.
+/// The virtual variants a published style can be rendered as are declared in
+/// the document, keyed on the request knob that selects between them — the
+/// block a client reads to discover what it may ask for, so it states what the
+/// style has rather than what this request asked for.
 #[tokio::test]
 async fn a_terrain_request_records_the_virtual_variant_it_is_served_by() {
     let emulator = Emulator::new();
-    // Row = (query, the variant id the document must record). The terrain
-    // values are the model's own `Terrain` enum (Hillshade | Terrain3D).
-    let cases: [(&str, Option<&str>); 5] = [
-        ("", None),
-        ("terrain=Terrain3D", Some("3d_terrain")),
-        ("terrain=Hillshade", Some("hillshade")),
-        ("terrain=Terrain3D&traffic=All&buildings=Buildings3D", Some("3d_terrain")),
-        ("traffic=Congestion", None),
+    // Row = a query. The terrain values are the model's own `Terrain` enum
+    // (Hillshade | Terrain3D), plus requests that name no terrain at all.
+    let cases = [
+        "",
+        "terrain=Terrain3D",
+        "terrain=Hillshade",
+        "terrain=Terrain3D&traffic=All&buildings=Buildings3D",
+        "traffic=Congestion",
     ];
 
-    for (query, expected) in cases {
+    let mut blocks: BTreeMap<String, String> = BTreeMap::new();
+    for query in cases {
         let case = format!("Standard?{query}");
         let document = style_document(
             &emulator,
@@ -468,18 +470,23 @@ async fn a_terrain_request_records_the_virtual_variant_it_is_served_by() {
             Some("terrain"),
             "case {case:?}: the recorded variant must be keyed on terrain, got {recorded}"
         );
-        let in_effect: Vec<&str> = recorded[0]["variants"]
+        let declared: Vec<&str> = recorded[0]["variants"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|variant| variant["id"].as_str())
             .collect();
-        assert_eq!(
-            in_effect,
-            expected.into_iter().collect::<Vec<_>>(),
-            "case {case:?}: expected the variants {expected:?} in effect, got {recorded}"
+        assert!(
+            !declared.is_empty(),
+            "case {case:?}: the style's terrain variants must be declared, got {recorded}"
         );
+        blocks.insert(recorded.to_string(), case.clone());
     }
+    assert_eq!(
+        blocks.len(),
+        1,
+        "the declared variants are the style's own, not the request's, got {blocks:?}"
+    );
 }
 
 /// Every layer in the document is there because the tiles behind it carry it,
