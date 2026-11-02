@@ -198,7 +198,9 @@ pub struct ResponseDetails {
     pub import_assets_from_lake_formation_tag_policy: Option<ImportAssetsFromLakeFormationTagPolicyResponseDetails>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#ExportAssetToSignedUrlResponseDetails")]
+/// `ExportAssetToSignedUrlResponseDetails`, with its schema written out instead of
+/// derived so `SignedUrlExpiresAt` carries its modelled `date-time` format; see
+/// [`super::date_time_wire`].
 #[derive(Debug, Clone, Default)]
 pub struct ExportAssetToSignedUrlResponseDetails {
     pub asset_id: String,
@@ -207,6 +209,24 @@ pub struct ExportAssetToSignedUrlResponseDetails {
     pub signed_url: Option<String>,
     pub signed_url_expires_at: Option<::aws_smithy_types::DateTime>,
 }
+
+dx_response_shape!(
+    ExportAssetToSignedUrlResponseDetails,
+    EXPORT_ASSET_TO_SIGNED_URL_RESPONSE_DETAILS_SCHEMA,
+    "ExportAssetToSignedUrlResponseDetails",
+    (M_ASSET_ID, asset_id, "AssetId", 0, req, string),
+    (M_DATA_SET_ID, data_set_id, "DataSetId", 1, req, string),
+    (M_REVISION_ID, revision_id, "RevisionId", 2, req, string),
+    (M_SIGNED_URL, signed_url, "SignedUrl", 3, opt, string),
+    (
+        M_SIGNED_URL_EXPIRES_AT,
+        signed_url_expires_at,
+        "SignedUrlExpiresAt",
+        4,
+        opt,
+        date_time
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#ExportAssetsToS3ResponseDetails")]
 #[derive(Debug, Clone, Default)]
@@ -226,7 +246,9 @@ pub struct ExportRevisionsToS3ResponseDetails {
     pub event_action_arn: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#ImportAssetFromSignedUrlResponseDetails")]
+/// `ImportAssetFromSignedUrlResponseDetails`, with its schema written out instead of
+/// derived so `SignedUrlExpiresAt` carries its modelled `date-time` format; see
+/// [`super::date_time_wire`].
 #[derive(Debug, Clone, Default)]
 pub struct ImportAssetFromSignedUrlResponseDetails {
     pub asset_name: String,
@@ -236,6 +258,25 @@ pub struct ImportAssetFromSignedUrlResponseDetails {
     pub signed_url: Option<String>,
     pub signed_url_expires_at: Option<::aws_smithy_types::DateTime>,
 }
+
+dx_response_shape!(
+    ImportAssetFromSignedUrlResponseDetails,
+    IMPORT_ASSET_FROM_SIGNED_URL_RESPONSE_DETAILS_SCHEMA,
+    "ImportAssetFromSignedUrlResponseDetails",
+    (M_ASSET_NAME, asset_name, "AssetName", 0, req, string),
+    (M_DATA_SET_ID, data_set_id, "DataSetId", 1, req, string),
+    (M_MD5_HASH, md5_hash, "Md5Hash", 2, opt, string),
+    (M_REVISION_ID, revision_id, "RevisionId", 3, req, string),
+    (M_SIGNED_URL, signed_url, "SignedUrl", 4, opt, string),
+    (
+        M_SIGNED_URL_EXPIRES_AT,
+        signed_url_expires_at,
+        "SignedUrlExpiresAt",
+        5,
+        opt,
+        date_time
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#ImportAssetsFromS3ResponseDetails")]
 #[derive(Debug, Clone, Default)]
@@ -253,7 +294,9 @@ pub struct ImportAssetsFromRedshiftDataSharesResponseDetails {
     pub revision_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#ImportAssetFromApiGatewayApiResponseDetails")]
+/// `ImportAssetFromApiGatewayApiResponseDetails`, with its schema written out instead of
+/// derived so `ApiSpecificationUploadUrlExpiresAt` carries its modelled `date-time`
+/// format; see [`super::date_time_wire`].
 #[derive(Debug, Clone)]
 pub struct ImportAssetFromApiGatewayApiResponseDetails {
     pub api_description: Option<String>,
@@ -268,6 +311,51 @@ pub struct ImportAssetFromApiGatewayApiResponseDetails {
     pub revision_id: String,
     pub stage: String,
 }
+
+dx_response_shape!(
+    ImportAssetFromApiGatewayApiResponseDetails,
+    IMPORT_ASSET_FROM_API_GATEWAY_API_RESPONSE_DETAILS_SCHEMA,
+    "ImportAssetFromApiGatewayApiResponseDetails",
+    (
+        M_API_DESCRIPTION,
+        api_description,
+        "ApiDescription",
+        0,
+        opt,
+        string
+    ),
+    (M_API_ID, api_id, "ApiId", 1, req, string),
+    (M_API_KEY, api_key, "ApiKey", 2, opt, string),
+    (M_API_NAME, api_name, "ApiName", 3, req, string),
+    (
+        M_API_SPECIFICATION_MD5_HASH,
+        api_specification_md5_hash,
+        "ApiSpecificationMd5Hash",
+        4,
+        req,
+        string
+    ),
+    (
+        M_API_SPECIFICATION_UPLOAD_URL,
+        api_specification_upload_url,
+        "ApiSpecificationUploadUrl",
+        5,
+        req,
+        string
+    ),
+    (
+        M_API_SPECIFICATION_UPLOAD_URL_EXPIRES_AT,
+        api_specification_upload_url_expires_at,
+        "ApiSpecificationUploadUrlExpiresAt",
+        6,
+        req,
+        date_time
+    ),
+    (M_DATA_SET_ID, data_set_id, "DataSetId", 7, req, string),
+    (M_PROTOCOL_TYPE, protocol_type, "ProtocolType", 8, req, string),
+    (M_REVISION_ID, revision_id, "RevisionId", 9, req, string),
+    (M_STAGE, stage, "Stage", 10, req, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#CreateS3DataAccessFromS3BucketResponseDetails")]
 #[derive(Debug, Clone, Default)]
@@ -335,7 +423,9 @@ pub struct RedshiftDataShareAsset {
     pub arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#ApiGatewayApiAsset")]
+/// `ApiGatewayApiAsset`, with its schema written out instead of derived so
+/// `ApiSpecificationDownloadUrlExpiresAt` carries its modelled `date-time` format; see
+/// [`super::date_time_wire`].
 #[derive(Debug, Clone, Default)]
 pub struct ApiGatewayApiAsset {
     pub api_description: Option<String>,
@@ -348,6 +438,42 @@ pub struct ApiGatewayApiAsset {
     pub protocol_type: Option<String>,
     pub stage: Option<String>,
 }
+
+dx_response_shape!(
+    ApiGatewayApiAsset,
+    API_GATEWAY_API_ASSET_SCHEMA,
+    "ApiGatewayApiAsset",
+    (
+        M_API_DESCRIPTION,
+        api_description,
+        "ApiDescription",
+        0,
+        opt,
+        string
+    ),
+    (M_API_ENDPOINT, api_endpoint, "ApiEndpoint", 1, opt, string),
+    (M_API_ID, api_id, "ApiId", 2, opt, string),
+    (M_API_KEY, api_key, "ApiKey", 3, opt, string),
+    (M_API_NAME, api_name, "ApiName", 4, opt, string),
+    (
+        M_API_SPECIFICATION_DOWNLOAD_URL,
+        api_specification_download_url,
+        "ApiSpecificationDownloadUrl",
+        5,
+        opt,
+        string
+    ),
+    (
+        M_API_SPECIFICATION_DOWNLOAD_URL_EXPIRES_AT,
+        api_specification_download_url_expires_at,
+        "ApiSpecificationDownloadUrlExpiresAt",
+        6,
+        opt,
+        date_time
+    ),
+    (M_PROTOCOL_TYPE, protocol_type, "ProtocolType", 7, opt, string),
+    (M_STAGE, stage, "Stage", 8, opt, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#S3DataAccessAsset")]
 #[derive(Debug, Clone, Default)]

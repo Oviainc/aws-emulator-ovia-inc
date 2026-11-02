@@ -17,7 +17,9 @@ pub struct GetEventActionInput {
     pub event_action_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#GetEventActionResponse")]
+/// `GetEventActionResponse`, with its schema written out instead of derived so
+/// `CreatedAt`/`UpdatedAt` carry their modelled `date-time` format; see
+/// [`super::date_time_wire`].
 #[derive(Debug, Clone, Default)]
 pub struct GetEventActionOutput {
     pub action: Option<Action>,
@@ -28,4 +30,17 @@ pub struct GetEventActionOutput {
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+dx_response_shape!(
+    GetEventActionOutput,
+    GET_EVENT_ACTION_OUTPUT_SCHEMA,
+    "GetEventActionResponse",
+    (M_ACTION, action, "Action", 0, opt, struct_of(Action)),
+    (M_ARN, arn, "Arn", 1, opt, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 2, opt, date_time),
+    (M_EVENT, event, "Event", 3, opt, struct_of(Event)),
+    (M_ID, id, "Id", 4, opt, string),
+    (M_TAGS, tags, "Tags", 5, opt, map_of_string),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 6, opt, date_time),
+);
 

@@ -14,6 +14,14 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The schema/serializer macros every structure carrying a `@timestampFormat("date-time")`
+// member uses, because the vendored codegen does not carry that trait onto the member
+// schemas it emits. Hand-added, not generated; see the module's own note.
+// `#[macro_use]`, and declared FIRST, so the macros are in the textual scope of every
+// `*_types` module below.
+#[macro_use]
+pub mod date_time_wire;
+
 pub mod accept_data_grant_types;
 pub mod cancel_job_types;
 pub mod create_data_grant_types;

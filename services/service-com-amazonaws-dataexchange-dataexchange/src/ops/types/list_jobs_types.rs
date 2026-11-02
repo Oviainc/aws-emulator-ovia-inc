@@ -35,7 +35,9 @@ pub struct ListJobsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#JobEntry")]
+/// `JobEntry`, with its schema written out instead of derived so `CreatedAt`/`UpdatedAt`
+/// carry their modelled `date-time` format inside the list projection too; see
+/// [`super::date_time_wire`].
 #[derive(Debug, Clone)]
 pub struct JobEntry {
     pub arn: String,
@@ -48,4 +50,26 @@ pub struct JobEntry {
     pub r#type: String,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+dx_response_shape!(
+    JobEntry,
+    JOB_ENTRY_SCHEMA,
+    "JobEntry",
+    (M_ARN, arn, "Arn", 0, req, string),
+    (
+        M_ASSET_CONFIGURATION,
+        asset_configuration,
+        "AssetConfiguration",
+        1,
+        opt,
+        struct_of(AssetConfiguration)
+    ),
+    (M_CREATED_AT, created_at, "CreatedAt", 2, req, date_time),
+    (M_DETAILS, details, "Details", 3, req, struct_of(ResponseDetails)),
+    (M_ERRORS, errors, "Errors", 4, opt, list_of(JobError)),
+    (M_ID, id, "Id", 5, req, string),
+    (M_STATE, state, "State", 6, req, string),
+    (M_TYPE, r#type, "Type", 7, req, string),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 8, req, date_time),
+);
 

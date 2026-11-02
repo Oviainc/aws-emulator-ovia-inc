@@ -20,7 +20,9 @@ pub struct CreateDataSetInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#CreateDataSetResponse")]
+/// `CreateDataSetResponse`, with its schema written out instead of derived so
+/// `CreatedAt`/`UpdatedAt` carry their modelled `date-time` format; see
+/// [`super::date_time_wire`].
 #[derive(Debug, Clone, Default)]
 pub struct CreateDataSetOutput {
     pub arn: Option<String>,
@@ -35,4 +37,28 @@ pub struct CreateDataSetOutput {
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+dx_response_shape!(
+    CreateDataSetOutput,
+    CREATE_DATA_SET_OUTPUT_SCHEMA,
+    "CreateDataSetResponse",
+    (M_ARN, arn, "Arn", 0, opt, string),
+    (M_ASSET_TYPE, asset_type, "AssetType", 1, opt, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 2, opt, date_time),
+    (M_DESCRIPTION, description, "Description", 3, opt, string),
+    (M_ID, id, "Id", 4, opt, string),
+    (M_NAME, name, "Name", 5, opt, string),
+    (M_ORIGIN, origin, "Origin", 6, opt, string),
+    (
+        M_ORIGIN_DETAILS,
+        origin_details,
+        "OriginDetails",
+        7,
+        opt,
+        struct_of(OriginDetails)
+    ),
+    (M_SOURCE_ID, source_id, "SourceId", 8, opt, string),
+    (M_TAGS, tags, "Tags", 9, opt, map_of_string),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 10, opt, date_time),
+);
 

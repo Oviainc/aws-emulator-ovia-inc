@@ -20,7 +20,9 @@ pub struct UpdateAssetInput {
     pub revision_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#UpdateAssetResponse")]
+/// `UpdateAssetResponse`, with its schema written out instead of derived so
+/// `CreatedAt`/`UpdatedAt` carry their modelled `date-time` format; see
+/// [`super::date_time_wire`].
 #[derive(Debug, Clone, Default)]
 pub struct UpdateAssetOutput {
     pub arn: Option<String>,
@@ -34,4 +36,27 @@ pub struct UpdateAssetOutput {
     pub source_id: Option<String>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+dx_response_shape!(
+    UpdateAssetOutput,
+    UPDATE_ASSET_OUTPUT_SCHEMA,
+    "UpdateAssetResponse",
+    (M_ARN, arn, "Arn", 0, opt, string),
+    (
+        M_ASSET_DETAILS,
+        asset_details,
+        "AssetDetails",
+        1,
+        opt,
+        struct_of(AssetDetails)
+    ),
+    (M_ASSET_TYPE, asset_type, "AssetType", 2, opt, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 3, opt, date_time),
+    (M_DATA_SET_ID, data_set_id, "DataSetId", 4, opt, string),
+    (M_ID, id, "Id", 5, opt, string),
+    (M_NAME, name, "Name", 6, opt, string),
+    (M_REVISION_ID, revision_id, "RevisionId", 7, opt, string),
+    (M_SOURCE_ID, source_id, "SourceId", 8, opt, string),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 9, opt, date_time),
+);
 

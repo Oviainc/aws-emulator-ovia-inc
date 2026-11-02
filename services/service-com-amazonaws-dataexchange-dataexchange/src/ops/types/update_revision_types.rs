@@ -20,7 +20,9 @@ pub struct UpdateRevisionInput {
     pub revision_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#UpdateRevisionResponse")]
+/// `UpdateRevisionResponse`, with its schema written out instead of derived so
+/// `CreatedAt`/`UpdatedAt`/`RevokedAt` carry their modelled `date-time` format; see
+/// [`super::date_time_wire`].
 #[derive(Debug, Clone, Default)]
 pub struct UpdateRevisionOutput {
     pub arn: Option<String>,
@@ -35,4 +37,28 @@ pub struct UpdateRevisionOutput {
     pub revoked: bool,
     pub revoked_at: Option<::aws_smithy_types::DateTime>,
 }
+
+dx_response_shape!(
+    UpdateRevisionOutput,
+    UPDATE_REVISION_OUTPUT_SCHEMA,
+    "UpdateRevisionResponse",
+    (M_ARN, arn, "Arn", 0, opt, string),
+    (M_COMMENT, comment, "Comment", 1, opt, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 2, opt, date_time),
+    (M_DATA_SET_ID, data_set_id, "DataSetId", 3, opt, string),
+    (M_FINALIZED, finalized, "Finalized", 4, dflt, boolean),
+    (M_ID, id, "Id", 5, opt, string),
+    (M_SOURCE_ID, source_id, "SourceId", 6, opt, string),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 7, opt, date_time),
+    (
+        M_REVOCATION_COMMENT,
+        revocation_comment,
+        "RevocationComment",
+        8,
+        opt,
+        string
+    ),
+    (M_REVOKED, revoked, "Revoked", 9, dflt, boolean),
+    (M_REVOKED_AT, revoked_at, "RevokedAt", 10, opt, date_time),
+);
 

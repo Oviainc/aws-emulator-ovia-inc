@@ -34,7 +34,9 @@ pub struct ListEventActionsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#EventActionEntry")]
+/// `EventActionEntry`, with its schema written out instead of derived so
+/// `CreatedAt`/`UpdatedAt` carry their modelled `date-time` format inside the list
+/// projection too; see [`super::date_time_wire`].
 #[derive(Debug, Clone)]
 pub struct EventActionEntry {
     pub action: Action,
@@ -44,4 +46,16 @@ pub struct EventActionEntry {
     pub id: String,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+dx_response_shape!(
+    EventActionEntry,
+    EVENT_ACTION_ENTRY_SCHEMA,
+    "EventActionEntry",
+    (M_ACTION, action, "Action", 0, req, struct_of(Action)),
+    (M_ARN, arn, "Arn", 1, req, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 2, req, date_time),
+    (M_EVENT, event, "Event", 3, req, struct_of(Event)),
+    (M_ID, id, "Id", 4, req, string),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 5, req, date_time),
+);
 

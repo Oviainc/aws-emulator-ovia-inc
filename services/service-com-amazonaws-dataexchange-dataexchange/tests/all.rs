@@ -39,3 +39,5 @@ mod revisions;
 mod signed_url_uploads;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/timestamp_wire_form.rs"]
+mod timestamp_wire_form;

@@ -26,7 +26,9 @@ pub struct ListReceivedDataGrantsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#ReceivedDataGrantSummariesEntry")]
+/// `ReceivedDataGrantSummariesEntry`, with its schema written out instead of derived so
+/// `AcceptedAt`/`EndsAt`/`CreatedAt`/`UpdatedAt` carry their modelled `date-time` format
+/// inside the list projection too; see [`super::date_time_wire`].
 #[derive(Debug, Clone)]
 pub struct ReceivedDataGrantSummariesEntry {
     pub name: String,
@@ -41,4 +43,42 @@ pub struct ReceivedDataGrantSummariesEntry {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+dx_response_shape!(
+    ReceivedDataGrantSummariesEntry,
+    RECEIVED_DATA_GRANT_SUMMARIES_ENTRY_SCHEMA,
+    "ReceivedDataGrantSummariesEntry",
+    (M_NAME, name, "Name", 0, req, string),
+    (
+        M_SENDER_PRINCIPAL,
+        sender_principal,
+        "SenderPrincipal",
+        1,
+        req,
+        string
+    ),
+    (
+        M_RECEIVER_PRINCIPAL,
+        receiver_principal,
+        "ReceiverPrincipal",
+        2,
+        req,
+        string
+    ),
+    (
+        M_ACCEPTANCE_STATE,
+        acceptance_state,
+        "AcceptanceState",
+        3,
+        req,
+        string
+    ),
+    (M_ACCEPTED_AT, accepted_at, "AcceptedAt", 4, opt, date_time),
+    (M_ENDS_AT, ends_at, "EndsAt", 5, opt, date_time),
+    (M_DATA_SET_ID, data_set_id, "DataSetId", 6, req, string),
+    (M_ID, id, "Id", 7, req, string),
+    (M_ARN, arn, "Arn", 8, req, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 9, req, date_time),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 10, req, date_time),
+);
 

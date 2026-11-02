@@ -116,7 +116,8 @@ pub struct ImportAssetsFromLakeFormationTagPolicyRequestDetails {
     pub revision_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#CreateJobResponse")]
+/// `CreateJobResponse`, with its schema written out instead of derived so `CreatedAt`,
+/// `UpdatedAt` carry their modelled `date-time` format; see [`super::date_time_wire`].
 #[derive(Debug, Clone, Default)]
 pub struct CreateJobOutput {
     pub arn: Option<String>,
@@ -129,4 +130,26 @@ pub struct CreateJobOutput {
     pub r#type: Option<String>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+dx_response_shape!(
+    CreateJobOutput,
+    CREATE_JOB_OUTPUT_SCHEMA,
+    "CreateJobResponse",
+    (M_ARN, arn, "Arn", 0, opt, string),
+    (
+        M_ASSET_CONFIGURATION,
+        asset_configuration,
+        "AssetConfiguration",
+        1,
+        opt,
+        struct_of(AssetConfiguration)
+    ),
+    (M_CREATED_AT, created_at, "CreatedAt", 2, opt, date_time),
+    (M_DETAILS, details, "Details", 3, opt, struct_of(ResponseDetails)),
+    (M_ERRORS, errors, "Errors", 4, opt, list_of(JobError)),
+    (M_ID, id, "Id", 5, opt, string),
+    (M_STATE, state, "State", 6, opt, string),
+    (M_TYPE, r#type, "Type", 7, opt, string),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 8, opt, date_time),
+);
 

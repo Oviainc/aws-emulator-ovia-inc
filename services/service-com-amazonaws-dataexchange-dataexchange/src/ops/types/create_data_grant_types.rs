@@ -23,7 +23,9 @@ pub struct CreateDataGrantInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#CreateDataGrantResponse")]
+/// `CreateDataGrantResponse`, with its schema written out instead of derived so
+/// `AcceptedAt`/`EndsAt`/`CreatedAt`/`UpdatedAt` carry their modelled `date-time` format;
+/// see [`super::date_time_wire`].
 #[derive(Debug, Clone)]
 pub struct CreateDataGrantOutput {
     pub name: String,
@@ -42,4 +44,60 @@ pub struct CreateDataGrantOutput {
     pub updated_at: ::aws_smithy_types::DateTime,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+dx_response_shape!(
+    CreateDataGrantOutput,
+    CREATE_DATA_GRANT_OUTPUT_SCHEMA,
+    "CreateDataGrantResponse",
+    (M_NAME, name, "Name", 0, req, string),
+    (
+        M_SENDER_PRINCIPAL,
+        sender_principal,
+        "SenderPrincipal",
+        1,
+        req,
+        string
+    ),
+    (
+        M_RECEIVER_PRINCIPAL,
+        receiver_principal,
+        "ReceiverPrincipal",
+        2,
+        req,
+        string
+    ),
+    (M_DESCRIPTION, description, "Description", 3, opt, string),
+    (
+        M_ACCEPTANCE_STATE,
+        acceptance_state,
+        "AcceptanceState",
+        4,
+        req,
+        string
+    ),
+    (M_ACCEPTED_AT, accepted_at, "AcceptedAt", 5, opt, date_time),
+    (M_ENDS_AT, ends_at, "EndsAt", 6, opt, date_time),
+    (
+        M_GRANT_DISTRIBUTION_SCOPE,
+        grant_distribution_scope,
+        "GrantDistributionScope",
+        7,
+        req,
+        string
+    ),
+    (M_DATA_SET_ID, data_set_id, "DataSetId", 8, req, string),
+    (
+        M_SOURCE_DATA_SET_ID,
+        source_data_set_id,
+        "SourceDataSetId",
+        9,
+        req,
+        string
+    ),
+    (M_ID, id, "Id", 10, req, string),
+    (M_ARN, arn, "Arn", 11, req, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 12, req, date_time),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 13, req, date_time),
+    (M_TAGS, tags, "Tags", 14, opt, map_of_string),
+);
 

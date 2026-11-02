@@ -34,7 +34,9 @@ pub struct ListDataSetsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dataexchange#DataSetEntry")]
+/// `DataSetEntry`, with its schema written out instead of derived so
+/// `CreatedAt`/`UpdatedAt` carry their modelled `date-time` format inside the list
+/// projection too; see [`super::date_time_wire`].
 #[derive(Debug, Clone)]
 pub struct DataSetEntry {
     pub arn: String,
@@ -48,4 +50,27 @@ pub struct DataSetEntry {
     pub source_id: Option<String>,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+dx_response_shape!(
+    DataSetEntry,
+    DATA_SET_ENTRY_SCHEMA,
+    "DataSetEntry",
+    (M_ARN, arn, "Arn", 0, req, string),
+    (M_ASSET_TYPE, asset_type, "AssetType", 1, req, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 2, req, date_time),
+    (M_DESCRIPTION, description, "Description", 3, req, string),
+    (M_ID, id, "Id", 4, req, string),
+    (M_NAME, name, "Name", 5, req, string),
+    (M_ORIGIN, origin, "Origin", 6, req, string),
+    (
+        M_ORIGIN_DETAILS,
+        origin_details,
+        "OriginDetails",
+        7,
+        opt,
+        struct_of(OriginDetails)
+    ),
+    (M_SOURCE_ID, source_id, "SourceId", 8, opt, string),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 9, req, date_time),
+);
 
