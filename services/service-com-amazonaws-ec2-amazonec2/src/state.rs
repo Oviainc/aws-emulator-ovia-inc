@@ -3797,6 +3797,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// submitting one "does not change the value returned by DescribeInstanceStatus"
     /// (`ReportInstanceStatus`).
     pub instance_status_reports: BTreeMap<String, Vec<InstanceStatusReport>>,
+    /// The SQL Server High Availability registration of every instance that has one, by
+    /// `InstanceId` — see [`instance_sql_ha`], the submodule that owns this slice. Starts
+    /// EMPTY: an instance holds no registration until it is enabled for SQL Server High
+    /// Availability standby detection monitoring, and an instance with no entry is one
+    /// `DescribeInstanceSqlHaStates` does not report at all. Ordered by instance id in a
+    /// [`BTreeMap`], the arrangement every other store here uses: that order is the one
+    /// stable order the describe reports and pages over.
+    pub sql_ha_registrations: BTreeMap<String, SqlHaRegistrationRecord>,
     /// The CONFIGURATION of every application status check the account holds, by
     /// `ApplicationStatusCheckId` — see [`application_status_checks`], the submodule that
     /// owns this slice. Ordered by id in a [`BTreeMap`], the arrangement every other store
@@ -4769,6 +4777,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             capacity_reservation_cancellation_quote_client_tokens: HashMap::new(),
             application_status: BTreeMap::new(),
             instance_status_reports: BTreeMap::new(),
+            sql_ha_registrations: BTreeMap::new(),
             application_status_checks: BTreeMap::new(),
             application_status_check_client_tokens: HashMap::new(),
             fast_launch_images: BTreeMap::new(),
@@ -10266,6 +10275,23 @@ pub const SHORT_RESOURCE_ID_DIGITS: usize = 8;
 ///   `eni-00000000000000000` -> `NotFound` counter-example comes from.
 pub fn instance_id_is_well_formed(id: &str) -> bool {
     issued_id_is_well_formed("i", id)
+}
+
+/// Whether `id` READS as an instance id: `i-` followed by 8 or 17 lowercase hexadecimal
+/// digits, the two forms EC2 publishes, with NO clause on the digits themselves.
+///
+/// Weaker than [`instance_id_is_well_formed`], which also refuses the all-zero placeholder
+/// and a long form whose leading digit is above zero. The gap between the two is a value EC2
+/// can READ as an instance id but never minted one of, and WHICH of the two readings an
+/// operation takes is a fact of that operation rather than of the id kind: the SQL Server
+/// High Availability describes are recorded LOOKING UP an id in that gap and answering
+/// `InvalidInstanceID.NotFound` for it, while `Enable`/`DisableInstanceSqlHaStandbyDetections`
+/// and `CreateMacSystemIntegrityProtectionModificationTask` are recorded answering
+/// `InvalidInstanceID.Malformed` for the very same value. So an operation reads ids through
+/// the one it was recorded answering, and neither reading is generalised to the other's
+/// operations.
+pub fn instance_id_reads_as_one(id: &str) -> bool {
+    prefixed_id_is_well_formed("i", id)
 }
 
 /// Refuse an instance id the request named that this service cannot resolve: a
@@ -19940,6 +19966,18 @@ pub use application_status_checks::*;
 /// reachable as `crate::state::<name>`, which is where the handler names it.
 pub mod instance_status_reports;
 pub use instance_status_reports::*;
+
+// ---------------------------------------------------------------------------
+// SQL Server High Availability: what `DescribeInstanceSqlHaStates` reports
+// ---------------------------------------------------------------------------
+
+/// This service's SQL Server High Availability slice: the registration one enabled instance
+/// is stored as, the modelled status words it is reported with, and the one projection of it
+/// into the modelled `RegisteredInstance` shape. A SUBMODULE for the same reason
+/// [`application_status_checks`] is one; `pub use` keeps every name reachable as
+/// `crate::state::<name>`, which is where each handler names it.
+pub mod instance_sql_ha;
+pub use instance_sql_ha::*;
 
 // ---------------------------------------------------------------------------
 // Pagination tokens

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceSqlHaStates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceSqlHaStates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceSqlHaStates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the SQL Server High Availability registrations [`crate::state`]
+//! holds, each projected through the one
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::sql_ha_instance_view`], narrowed by the
+//! `InstanceIds` and the documented `Filters` the request names and cut into
+//! `MaxResults`-sized pages. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +146,303 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceSqlHaStates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceSqlHaStatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_RESOURCE_IDS, MatchBudget, PageTokenRule, decode_page_token,
+            instance_id_reads_as_one, invalid_pagination_token_for, matches_every_filter,
+            page_from_cursor, require_service_state, sql_ha_instance_ids_not_found,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — a
+        // registration is a fact of the instance, not of the Region the request was signed
+        // for. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The IDs of the SQL Server High Availability instances to describe. If omitted,
+        // the API returns SQL Server High Availability states for all SQL Server High
+        // Availability instances" (`InstanceIds`): every entry is resolved against the store
+        // below, so the list is capped the way every other EC2 request's id list is, before
+        // any work proportional to it is done.
+        let requested_ids: &[String] = input.instance_ids.as_deref().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // "The maximum number of results to return for the request in a single page"
+        // (`MaxResults`). The modelled `@range` of 1..1000 refuses anything outside it
+        // before this handler runs, so the refusal below cannot be reached today — but a
+        // page size is REFUSED rather than silently repaired, so widening that range can
+        // never turn into a quietly truncated page. A request that names none gets the
+        // largest page this operation serves, so the `NextToken` path behaves the same
+        // whether or not a page size was asked for.
+        let limit = match input.max_results {
+            None => MAX_INSTANCES_PER_PAGE,
+            Some(max_results) => usize::try_from(max_results)
+                .ok()
+                .filter(|page_size| {
+                    (MIN_INSTANCES_PER_PAGE..=MAX_INSTANCES_PER_PAGE).contains(page_size)
+                })
+                .ok_or_else(|| {
+                    Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{max_results}' for maxResults. It must be between \
+                         {MIN_INSTANCES_PER_PAGE} and {MAX_INSTANCES_PER_PAGE}"
+                    ))
+                })?,
+        };
+
+        // Matching cost is filters x values x value length x stored registrations, and the
+        // model bounds none of them, so every request-controlled factor is capped HERE,
+        // before any work proportional to it is done and before the store is locked — and
+        // their PRODUCT is charged to one [`MatchBudget`] below, which is the bound the
+        // per-factor caps cannot give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // registration would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here rather than per
+        // candidate.
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token to use to retrieve the next page of results" (`NextToken`) — anything
+        // else is refused rather than read as an id, and refused against the store's
+        // contents nowhere: whether a bogus token is caught never depends on what the
+        // account holds, only on the token itself.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        // "The IDs of the SQL Server High Availability instances to describe": a value that
+        // is no instance id at all is refused as malformed HERE, before the store is read at
+        // all, through the one place this crate reads an id in either published form
+        // (`crate::state::instance_id_reads_as_one`, whose doc says why this operation takes
+        // that reading) — the request itself is unreadable, which does not depend on what the
+        // account holds.
+        for instance_id in requested_ids {
+            if !instance_id_reads_as_one(instance_id) {
+                return Err(Scaffolded::invalid_instance_id_malformed(instance_id));
+            }
+        }
+
+        // DryRun sits after every parameter has been validated and the ids have been read,
+        // but BEFORE they are RESOLVED: the flag asks whether the caller is permitted to
+        // make the request, and this operation was recorded answering that question ahead of
+        // looking up the instances it names — so a dry run naming an id that resolves to
+        // nothing still answers `DryRunOperation`, while one whose request is unreadable is
+        // refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // An id this operation cannot resolve is an error, not an absent row, and its
+        // validator does not distinguish an id the account holds no instance for from one
+        // whose instance is not enabled for monitoring — both are refused together, in one
+        // refusal naming every id it could not resolve
+        // (`crate::state::sql_ha_instance_ids_not_found`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceSqlHaStates"))
+        // Each unresolved id is named ONCE however many times the request repeated it: one
+        // id is one answer.
+        let mut seen = ::std::collections::HashSet::new();
+        let unresolved: Vec<&str> = requested_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|instance_id| !store.sql_ha_registrations.contains_key(*instance_id))
+            .filter(|instance_id| seen.insert(*instance_id))
+            .collect();
+        if !unresolved.is_empty() {
+            return Err(sql_ha_instance_ids_not_found(&unresolved));
+        }
+
+        // A set, so narrowing by `InstanceIds` costs one lookup per stored registration
+        // rather than a scan of the requested list, and a repeated id cannot multiply the
+        // work.
+        let wanted: ::std::collections::HashSet<&str> =
+            requested_ids.iter().map(String::as_str).collect();
+
+        // The default is to describe every registered instance the account holds; the ids
+        // narrow that set to those named, and every filter must then hold ("If you specify
+        // multiple filters, the filters are joined with an AND" — `Filter`).
+        //
+        // Every row is DERIVED from the stored registration and the clock
+        // (`crate::state::ComAmazonawsEc2Amazonec2State::sql_ha_instance_view`), so this read
+        // writes nothing and changes nothing a later caller sees.
+        //
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored
+        // registrations, filters, values, held values and value length is bounded however the
+        // caller combines them — which is also what bounds how long this holds the state
+        // lock.
+        let now = ::std::time::SystemTime::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<RegisteredInstance> = Vec::new();
+        for instance_id in store.sql_ha_registrations.keys() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the key, so a registration the request did not
+            // name costs no projection and no comparison at all.
+            if !wanted.is_empty() && !wanted.contains(instance_id.as_str()) {
+                continue;
+            }
+            let Some(view) = store.sql_ha_instance_view(instance_id, now) else {
+                continue;
+            };
+            if matches_every_filter(&selectors, &mut budget, &|name| filter_values(&view, name)) {
+                selected.push(view);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `InstanceId` order, which the cursor names a position in. The store is an
+        // ordered map, so its iteration order already satisfies this sort; doing it here
+        // establishes the invariant the cursor depends on at the point of use rather than
+        // inheriting it from the container `crate::state` happens to hold.
+        selected.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+
+        // "This value is null when there are no more results to return" (`NextToken`): a
+        // token only when a further registration follows this page.
+        let (page, next_token) = page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |instance| instance.instance_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(DescribeInstanceSqlHaStatesOutput {
+            instances: Some(page.to_vec()),
+            next_token,
+        })
+    }
+}
+
+/// The most registered instances this operation reports in one page: the top of the modelled
+/// `@range` on `DescribeInstanceSqlHaStatesRequestMaxResultsInteger` (1..1000,
+/// `smithy_query(query="operation",operation="DescribeInstanceSqlHaStates")`), which is
+/// therefore also the page a request naming no `MaxResults` gets.
+const MAX_INSTANCES_PER_PAGE: usize = 1000;
+
+/// The smallest page `MaxResults` may ask for: the bottom of that same modelled `@range`.
+const MIN_INSTANCES_PER_PAGE: usize = 1;
+
+/// The filter names this operation documents, from
+/// `DescribeInstanceSqlHaStatesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeInstanceSqlHaStatesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part — "The tag key and value pair assigned to
+/// the instance … specify tag:Owner for the filter name and TeamA for the filter value" — so
+/// it is matched by prefix rather than listed here. Every entry must be answered by
+/// [`filter_values`].
+const SQL_HA_STATE_FILTERS: [&str; 3] = ["haStatus", "sqlServerLicenseUsage", "tag-key"];
+
+/// Is `name` a filter this operation documents? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no
+/// tag, so it is as undocumented as any other misspelling.
+fn is_documented_filter(name: &str) -> bool {
+    name.strip_prefix(crate::state::TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || SQL_HA_STATE_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against one registered instance — the
+/// per-operation half of [`crate::state::matches_every_filter`], which holds the AND/OR
+/// evaluation every filtered describe of this crate shares.
+///
+/// Each one is read off the SAME projection the response reports, so a filter can never
+/// select on something the row does not show. A filter naming an attribute this row does not
+/// carry compares against NO values, so it selects nothing — the answer for `tag:<key>` on an
+/// instance carrying no tag of that key. `name` is one of [`SQL_HA_STATE_FILTERS`] or a
+/// `tag:<key>`.
+fn filter_values<'a>(
+    instance: &'a RegisteredInstance,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(crate::state::TAG_FILTER_PREFIX) {
+        return instance
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        // "haStatus - The SQL Server High Availability status of the SQL Server High
+        // Availability instance (processing | active | standby | invalid)."
+        "haStatus" => text(instance.ha_status.as_deref()),
+        // "sqlServerLicenseUsage - The license type for the SQL Server license
+        // (full | waived)."
+        "sqlServerLicenseUsage" => text(instance.sql_server_license_usage.as_deref()),
+        // "tag-key - The tag key assigned to the instance", regardless of the tag value.
+        "tag-key" => instance
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
     }
 }

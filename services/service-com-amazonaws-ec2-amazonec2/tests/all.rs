@@ -730,6 +730,9 @@ mod instance_event_windows;
 mod instance_lifecycle;
 #[path = "all/instance_metadata_defaults.rs"]
 mod instance_metadata_defaults;
+// The SQL Server High Availability state every enabled instance is reported in.
+#[path = "all/instance_sql_ha_states.rs"]
+mod instance_sql_ha_states;
 #[path = "all/instance_type_offerings.rs"]
 mod instance_type_offerings;
 #[path = "all/instance_types.rs"]
