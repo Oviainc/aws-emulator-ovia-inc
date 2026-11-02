@@ -254,31 +254,66 @@ const COMPONENT_REF_PREFIX: &str = "comp-";
 /// release, and a scan summarises the two separately.
 const CWE_EMBEDDED_MALICIOUS_CODE: u32 = 506;
 
-/// `ScanSbom`'s `ValidationException.reason` values, from the model's
-/// `ValidationExceptionReason` enum (`super::types::VALIDATION_EXCEPTION_REASON_VALUES`).
-const REASON_CANNOT_PARSE: &str = "CANNOT_PARSE";
-const REASON_FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
-const REASON_UNSUPPORTED_SBOM_TYPE: &str = "UNSUPPORTED_SBOM_TYPE";
-
 // ---------------------------------------------------------------------------
 // Modeled failures
 // ---------------------------------------------------------------------------
 
-/// A modeled `ValidationException` (HTTP 400) naming the offending member.
+/// The fixed text an input-SBOM refusal's `message` opens with. What follows it
+/// is the condition that failed, one clause per [`SbomDefect`].
+const SBOM_VALIDATION_PREFIX: &str = "Input SBOM failed validation: ";
+
+/// What an input SBOM was refused FOR: the class of defect, never an instance
+/// of it.
 ///
-/// The modeled shape carries `reason` and `fields` beside `message`, and a real
-/// client reads both, so every refusal fills all three.
-fn invalid(reason: &str, field: &str, message: impl Into<String>) -> ScanSbomError {
-    let message = message.into();
-    ScanSbomErrorModeled::ValidationException(ValidationException {
-        message: message.clone(),
-        reason: reason.to_string(),
-        fields: Some(vec![ValidationExceptionField {
-            name: field.to_string(),
-            message,
-        }]),
-    })
-    .into()
+/// The refusal text is a statement about the class alone — no index, no member
+/// path and no value read back out of the submitted document — so two documents
+/// defective the same way are refused with the same sentence.
+#[derive(Debug, Clone, Copy)]
+enum SbomDefect<'m> {
+    /// `sbom` is not a document a scan can read at all: not a JSON object, or
+    /// JSON this operation cannot take in (see [`MAX_SBOM_DEPTH`]).
+    CannotParse,
+    /// The CycloneDX member `m` is absent where the specification requires it,
+    /// or carries a value the specification does not allow there. `m` is the
+    /// member's name as CycloneDX spells it (`bomFormat`, `components`,
+    /// `bom-ref`, …), not a path into the submitted document.
+    InvalidValue(&'m str),
+    /// The document carries more components than one scan accepts; the limit is
+    /// the clause's only variable part.
+    TooManyComponents(usize),
+}
+
+impl SbomDefect<'_> {
+    /// The refusal `message` for this class of defect.
+    fn message(self) -> String {
+        let condition = match self {
+            Self::CannotParse => "Invalid json".to_string(),
+            Self::InvalidValue(member) => format!("Invalid value for \"{member}\""),
+            Self::TooManyComponents(limit) => {
+                format!("Max number of components exceeded ({limit})")
+            }
+        };
+        format!("{SBOM_VALIDATION_PREFIX}{condition}")
+    }
+}
+
+/// Refuse the submitted SBOM with `ValidationException` (HTTP 400), the status
+/// and error code the model gives that failure.
+///
+/// The body carries `message` ALONE. The modeled shape also declares `reason`
+/// (required) and `fields`, but the service populates neither on this refusal:
+/// it reports a whole-document validation failure, not a member-level field
+/// error, so a `reason`/`fields` pair here would be two members a client is
+/// told to read and the service never sends. `message` alone is what
+/// [`crate::scaffolded::ValidationException`] serializes, under the same 400 +
+/// `ValidationException` envelope the modeled shape renders in.
+fn invalid(defect: SbomDefect<'_>) -> ScanSbomError {
+    refused(defect.message())
+}
+
+/// A `ValidationException` (HTTP 400) carrying `message` and nothing else.
+fn refused(message: impl Into<String>) -> ScanSbomError {
+    ScanSbomError::validation(message)
 }
 
 /// A modeled `InternalServerException` (HTTP 500).
@@ -472,14 +507,12 @@ fn is_purl_type(ty: &str) -> bool {
 /// remainder, and the rest is a path read right-to-left as name, then namespace,
 /// with its first segment the type.
 ///
-/// The error is a sentence naming the defect, because the only caller answers a
-/// modelled `ValidationException` whose `message` has to say which member is
-/// wrong and why.
-fn parse_purl(raw: &str) -> Result<ParsedPurl, String> {
+/// `None` when `raw` is not a package URL at all: the caller refuses the whole
+/// document for the CLASS of defect (a `purl` member it cannot read), so there
+/// is no per-defect sentence for this to carry.
+fn parse_purl(raw: &str) -> Option<ParsedPurl> {
     // The specification fixes the scheme to the lowercase literal `pkg`.
-    let rest = raw
-        .strip_prefix("pkg:")
-        .ok_or_else(|| "a package URL starts with the \"pkg:\" scheme".to_string())?;
+    let rest = raw.strip_prefix("pkg:")?;
     let rest = rest.trim_start_matches('/');
 
     // Subpath, then qualifiers: both are suffixes of the coordinate, and
@@ -496,22 +529,17 @@ fn parse_purl(raw: &str) -> Result<ParsedPurl, String> {
     };
 
     let mut segments = path.split('/').filter(|segment| !segment.is_empty());
-    let ty = segments
-        .next()
-        .ok_or_else(|| "a package URL names a type after the scheme".to_string())?;
+    // A package URL names a type after the scheme, and the specification
+    // constrains that type to its own grammar.
+    let ty = segments.next()?;
     if !is_purl_type(ty) {
-        return Err(format!(
-            "\"{ty}\" is not a package URL type (letters, digits, \".\", \"+\" and \"-\", \
-             starting with a letter)"
-        ));
+        return None;
     }
     let mut remaining: Vec<&str> = segments.collect();
-    let name = remaining
-        .pop()
-        .ok_or_else(|| format!("a \"{ty}\" package URL names no package"))?;
-    let name = percent_decode(name);
+    // A package URL names a package, as the last segment of its path.
+    let name = percent_decode(remaining.pop()?);
     if name.is_empty() {
-        return Err(format!("a \"{ty}\" package URL names no package"));
+        return None;
     }
 
     let namespace = if remaining.is_empty() {
@@ -526,7 +554,7 @@ fn parse_purl(raw: &str) -> Result<ParsedPurl, String> {
 
     let version = version.map(percent_decode);
 
-    Ok(ParsedPurl {
+    Some(ParsedPurl {
         ty: ty.to_ascii_lowercase(),
         namespace,
         name,
@@ -553,18 +581,12 @@ fn canonical_package_name(package_type: &str, namespace: Option<&str>, name: &st
     }
 }
 
-/// The component object at `field`, or a refusal.
-fn component_object<'v>(
-    field: &str,
-    entry: &'v Value,
-) -> Result<&'v Map<String, Value>, ScanSbomError> {
-    entry.as_object().ok_or_else(|| {
-        invalid(
-            REASON_FIELD_VALIDATION_FAILED,
-            field,
-            format!("{field} must be a CycloneDX component object"),
-        )
-    })
+/// The component object of a `components[]` entry, or a refusal: an entry that
+/// is not an object is not a CycloneDX component.
+fn component_object(entry: &Value) -> Result<&Map<String, Value>, ScanSbomError> {
+    entry
+        .as_object()
+        .ok_or_else(|| invalid(SbomDefect::InvalidValue("components")))
 }
 
 /// FIRST PASS over the component tree: count every entry and collect every
@@ -582,55 +604,28 @@ fn component_object<'v>(
 /// retained) before it is refused.
 fn collect_component_refs(
     entries: &[Value],
-    path: &str,
     depth: usize,
     submitted_refs: &mut BTreeSet<String>,
     counted: &mut usize,
 ) -> Result<(), ScanSbomError> {
     if depth > MAX_COMPONENT_NESTING {
-        return Err(invalid(
-            REASON_FIELD_VALIDATION_FAILED,
-            path,
-            format!(
-                "{path} nests components more than {MAX_COMPONENT_NESTING} levels deep, which \
-                 exceeds what a scan resolves"
-            ),
-        ));
+        return Err(invalid(SbomDefect::InvalidValue("components")));
     }
-    for (index, entry) in entries.iter().enumerate() {
-        let field = format!("{path}[{index}]");
-        let object = component_object(&field, entry)?;
+    for entry in entries {
+        let object = component_object(entry)?;
         *counted += 1;
         if *counted > MAX_COMPONENTS {
-            return Err(invalid(
-                REASON_FIELD_VALIDATION_FAILED,
-                "sbom.components",
-                format!(
-                    "sbom.components carries more than the {MAX_COMPONENTS} components a \
-                     CycloneDX {CYCLONEDX_SPEC_VERSION} scan accepts"
-                ),
-            ));
+            return Err(invalid(SbomDefect::TooManyComponents(MAX_COMPONENTS)));
         }
-        if let Some(submitted) = submitted_bom_ref(&field, object)? {
+        if let Some(submitted) = submitted_bom_ref(object)? {
             if !submitted_refs.insert(submitted.to_string()) {
-                return Err(invalid(
-                    REASON_FIELD_VALIDATION_FAILED,
-                    &field,
-                    format!(
-                        "{field} repeats bom-ref \"{submitted}\", which CycloneDX requires to be \
-                         unique within a document"
-                    ),
-                ));
+                // CycloneDX requires `bom-ref` to be unique within a document,
+                // so a repeat is not a value that member can hold.
+                return Err(invalid(SbomDefect::InvalidValue("bom-ref")));
             }
         }
-        if let Some(children) = nested_components(&field, object)? {
-            collect_component_refs(
-                children,
-                &format!("{field}.components"),
-                depth + 1,
-                submitted_refs,
-                counted,
-            )?;
+        if let Some(children) = nested_components(object)? {
+            collect_component_refs(children, depth + 1, submitted_refs, counted)?;
         }
     }
     Ok(())
@@ -643,18 +638,13 @@ fn collect_component_refs(
 /// array is not a CycloneDX component list, and left to fall through it would
 /// drop the whole subtree silently — neither counted against the documented
 /// limit, nor matched, nor reported.
-fn nested_components<'v>(
-    field: &str,
-    object: &'v Map<String, Value>,
-) -> Result<Option<&'v Vec<Value>>, ScanSbomError> {
+fn nested_components(
+    object: &Map<String, Value>,
+) -> Result<Option<&Vec<Value>>, ScanSbomError> {
     match object.get("components") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Array(children)) => Ok(Some(children)),
-        Some(_) => Err(invalid(
-            REASON_FIELD_VALIDATION_FAILED,
-            &format!("{field}.components"),
-            format!("{field}.components must be an array of CycloneDX components"),
-        )),
+        Some(_) => Err(invalid(SbomDefect::InvalidValue("components"))),
     }
 }
 
@@ -667,10 +657,7 @@ fn nested_components<'v>(
 /// times but at an unbounded SIZE. Bounding it here, at the one site that reads
 /// it, is what makes neither the component count nor the nesting depth the only
 /// limit on what one request can allocate.
-fn submitted_bom_ref<'v>(
-    field: &str,
-    object: &'v Map<String, Value>,
-) -> Result<Option<&'v str>, ScanSbomError> {
+fn submitted_bom_ref(object: &Map<String, Value>) -> Result<Option<&str>, ScanSbomError> {
     let Some(submitted) = object
         .get("bom-ref")
         .and_then(Value::as_str)
@@ -678,16 +665,8 @@ fn submitted_bom_ref<'v>(
     else {
         return Ok(None);
     };
-    let length = submitted.chars().count();
-    if length > MAX_BOM_REF_LEN {
-        return Err(invalid(
-            REASON_FIELD_VALIDATION_FAILED,
-            &format!("{field}.bom-ref"),
-            format!(
-                "{field}.bom-ref is {length} characters, which exceeds the {MAX_BOM_REF_LEN} \
-                 characters a scan resolves a component reference from"
-            ),
-        ));
+    if submitted.chars().count() > MAX_BOM_REF_LEN {
+        return Err(invalid(SbomDefect::InvalidValue("bom-ref")));
     }
     Ok(Some(submitted))
 }
@@ -717,25 +696,16 @@ fn submitted_bom_ref<'v>(
 /// passes cannot reintroduce an unbounded recursion.
 fn resolve_component_tree(
     entries: &[Value],
-    path: &str,
     depth: usize,
     next_ref: &mut usize,
     out: &mut Vec<ScannedComponent>,
 ) -> Result<Vec<Value>, ScanSbomError> {
     if depth > MAX_COMPONENT_NESTING {
-        return Err(invalid(
-            REASON_FIELD_VALIDATION_FAILED,
-            path,
-            format!(
-                "{path} nests components more than {MAX_COMPONENT_NESTING} levels deep, which \
-                 exceeds what a scan resolves"
-            ),
-        ));
+        return Err(invalid(SbomDefect::InvalidValue("components")));
     }
     let mut normalized: Vec<Value> = Vec::with_capacity(entries.len());
-    for (index, entry) in entries.iter().enumerate() {
-        let field = format!("{path}[{index}]");
-        let object = component_object(&field, entry)?;
+    for entry in entries {
+        let object = component_object(entry)?;
 
         let name = object.get("name").and_then(Value::as_str).unwrap_or_default();
         let declared_version = object
@@ -752,49 +722,17 @@ fn resolve_component_tree(
         // advisory — see below.
         match object.get("type").and_then(Value::as_str) {
             Some(declared) if CYCLONEDX_COMPONENT_TYPES.contains(&declared) => {}
-            Some(other) => {
-                return Err(invalid(
-                    REASON_FIELD_VALIDATION_FAILED,
-                    &format!("{field}.type"),
-                    format!(
-                        "{field}.type is \"{other}\", which is not one of the CycloneDX \
-                         {CYCLONEDX_SPEC_VERSION} component types: {}",
-                        CYCLONEDX_COMPONENT_TYPES.join(", ")
-                    ),
-                ))
-            }
-            None => {
-                return Err(invalid(
-                    REASON_FIELD_VALIDATION_FAILED,
-                    &format!("{field}.type"),
-                    format!(
-                        "{field}.type is required on a CycloneDX {CYCLONEDX_SPEC_VERSION} \
-                         component and must be one of: {}",
-                        CYCLONEDX_COMPONENT_TYPES.join(", ")
-                    ),
-                ))
-            }
+            // Absent, or not one of the specification's component types.
+            _ => return Err(invalid(SbomDefect::InvalidValue("type"))),
         }
         if name.is_empty() {
-            return Err(invalid(
-                REASON_FIELD_VALIDATION_FAILED,
-                &format!("{field}.name"),
-                format!(
-                    "{field}.name is required on a CycloneDX {CYCLONEDX_SPEC_VERSION} component \
-                     and must not be empty"
-                ),
-            ));
+            return Err(invalid(SbomDefect::InvalidValue("name")));
         }
 
         let (package_type, package_name, version) = match purl {
             Some(raw) => {
-                let parsed = parse_purl(raw).map_err(|problem| {
-                    invalid(
-                        REASON_FIELD_VALIDATION_FAILED,
-                        &format!("{field}.purl"),
-                        format!("{field}.purl is not a valid package URL: {problem}"),
-                    )
-                })?;
+                let parsed =
+                    parse_purl(raw).ok_or_else(|| invalid(SbomDefect::InvalidValue("purl")))?;
                 let version = parsed
                     .version
                     .as_deref()
@@ -818,13 +756,7 @@ fn resolve_component_tree(
         // failing the scan. Only a component that resolves no NAME is refused,
         // because without one there is nothing to look up at all.
         if package_name.is_empty() {
-            return Err(invalid(
-                REASON_FIELD_VALIDATION_FAILED,
-                &field,
-                format!(
-                    "{field} must resolve a package name, from `name` or from `purl`"
-                ),
-            ));
+            return Err(invalid(SbomDefect::InvalidValue("name")));
         }
 
         *next_ref += 1;
@@ -843,14 +775,8 @@ fn resolve_component_tree(
         // report.
         let mut stamped = object.clone();
         stamped.insert("bom-ref".to_string(), Value::String(bom_ref.clone()));
-        if let Some(children) = nested_components(&field, object)? {
-            let resolved = resolve_component_tree(
-                children,
-                &format!("{field}.components"),
-                depth + 1,
-                next_ref,
-                out,
-            )?;
+        if let Some(children) = nested_components(object)? {
+            let resolved = resolve_component_tree(children, depth + 1, next_ref, out)?;
             stamped.insert("components".to_string(), Value::Array(resolved));
         }
         normalized.push(Value::Object(stamped));
@@ -871,72 +797,26 @@ struct ParsedSbom {
 
 /// Refuse anything that is not a CycloneDX 1.5 BOM, and resolve its components.
 fn parse_sbom(sbom: &Value) -> Result<ParsedSbom, ScanSbomError> {
-    let object = sbom.as_object().ok_or_else(|| {
-        invalid(
-            REASON_CANNOT_PARSE,
-            "sbom",
-            "sbom must be a CycloneDX 1.5 JSON object",
-        )
-    })?;
+    let object = sbom
+        .as_object()
+        .ok_or_else(|| invalid(SbomDefect::CannotParse))?;
 
     match object.get("bomFormat").and_then(Value::as_str) {
         Some(CYCLONEDX_BOM_FORMAT) => {}
-        Some(other) => {
-            return Err(invalid(
-                REASON_UNSUPPORTED_SBOM_TYPE,
-                "sbom.bomFormat",
-                format!(
-                    "sbom.bomFormat must be \"{CYCLONEDX_BOM_FORMAT}\", got \"{other}\"; only \
-                     CycloneDX {CYCLONEDX_SPEC_VERSION} documents can be scanned"
-                ),
-            ))
-        }
-        None => {
-            return Err(invalid(
-                REASON_UNSUPPORTED_SBOM_TYPE,
-                "sbom.bomFormat",
-                format!(
-                    "sbom.bomFormat is required and must be \"{CYCLONEDX_BOM_FORMAT}\"; only \
-                     CycloneDX {CYCLONEDX_SPEC_VERSION} documents can be scanned"
-                ),
-            ))
-        }
+        // Absent, or naming a format that is not CycloneDX at all.
+        _ => return Err(invalid(SbomDefect::InvalidValue("bomFormat"))),
     }
 
     match object.get("specVersion").and_then(Value::as_str) {
         Some(CYCLONEDX_SPEC_VERSION) => {}
-        Some(other) => {
-            return Err(invalid(
-                REASON_UNSUPPORTED_SBOM_TYPE,
-                "sbom.specVersion",
-                format!(
-                    "sbom.specVersion must be \"{CYCLONEDX_SPEC_VERSION}\", got \"{other}\"; \
-                     only CycloneDX {CYCLONEDX_SPEC_VERSION} documents can be scanned"
-                ),
-            ))
-        }
-        None => {
-            return Err(invalid(
-                REASON_UNSUPPORTED_SBOM_TYPE,
-                "sbom.specVersion",
-                format!(
-                    "sbom.specVersion is required and must be \"{CYCLONEDX_SPEC_VERSION}\"; only \
-                     CycloneDX {CYCLONEDX_SPEC_VERSION} documents can be scanned"
-                ),
-            ))
-        }
+        // Absent, or a CycloneDX revision other than the one a scan reads.
+        _ => return Err(invalid(SbomDefect::InvalidValue("specVersion"))),
     }
 
     let components = match object.get("components") {
         None | Some(Value::Null) => return Ok(ParsedSbom::default()),
         Some(Value::Array(items)) => items,
-        Some(_) => {
-            return Err(invalid(
-                REASON_FIELD_VALIDATION_FAILED,
-                "sbom.components",
-                "sbom.components must be an array of CycloneDX components",
-            ))
-        }
+        Some(_) => return Err(invalid(SbomDefect::InvalidValue("components"))),
     };
 
     // Count the WHOLE tree against the documented limit, not just the top
@@ -944,23 +824,11 @@ fn parse_sbom(sbom: &Value) -> Result<ParsedSbom, ScanSbomError> {
     // limit is enforced inside the walk, as the count passes it.
     let mut submitted_refs = BTreeSet::new();
     let mut total = 0usize;
-    collect_component_refs(
-        components,
-        "sbom.components",
-        0,
-        &mut submitted_refs,
-        &mut total,
-    )?;
+    collect_component_refs(components, 0, &mut submitted_refs, &mut total)?;
 
     let mut resolved = Vec::with_capacity(total);
     let mut next_ref = 0usize;
-    let normalized = resolve_component_tree(
-        components,
-        "sbom.components",
-        0,
-        &mut next_ref,
-        &mut resolved,
-    )?;
+    let normalized = resolve_component_tree(components, 0, &mut next_ref, &mut resolved)?;
     Ok(ParsedSbom {
         components_value: Some(Value::Array(normalized)),
         components: resolved,
@@ -1661,31 +1529,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `outputFormat` is OPTIONAL, and a request that names none is answered
         // the Inspector-native report: the format a scan reports in by default
         // is the service's own, not the CycloneDX document the request carried.
+        //
+        // An `outputFormat` outside the modeled enum never reaches here — the
+        // boundary refuses it against the model's own value set, before any
+        // handler runs — so this arm is the defensive floor under that check,
+        // and it names the member and the values it accepts.
         let output_format = match input.output_format.as_deref() {
             None => OutputFormat::Inspector,
             Some(requested) => OutputFormat::from_wire(requested).ok_or_else(|| {
-                invalid(
-                    REASON_FIELD_VALIDATION_FAILED,
-                    "outputFormat",
-                    format!(
-                        "outputFormat must be one of {}, got \"{requested}\"",
-                        super::types::OUTPUT_FORMAT_VALUES.join(", ")
-                    ),
-                )
+                refused(format!(
+                    "outputFormat must be one of {}, got \"{requested}\"",
+                    super::types::OUTPUT_FORMAT_VALUES.join(", ")
+                ))
             })?,
         };
 
-        let submitted = document_to_json(&input.sbom, 0).ok_or_else(|| {
-            invalid(
-                REASON_CANNOT_PARSE,
-                "sbom",
-                format!(
-                    "sbom could not be parsed as a CycloneDX {CYCLONEDX_SPEC_VERSION} document: \
-                     it nests more than {MAX_SBOM_DEPTH} levels deep, or carries a number JSON \
-                     cannot express"
-                ),
-            )
-        })?;
+        // A document this operation cannot take in at all (too deeply nested,
+        // or carrying a number JSON cannot express) is refused for the same
+        // class as one that is not a JSON object: it does not parse.
+        let submitted =
+            document_to_json(&input.sbom, 0).ok_or_else(|| invalid(SbomDefect::CannotParse))?;
         let parsed = parse_sbom(&submitted)?;
         let digest = sbom_digest(&submitted)
             .ok_or_else(|| internal("the submitted document could not be canonicalized"))?;

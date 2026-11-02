@@ -15,7 +15,8 @@
 //! * the operation is `@idempotent`: the same SBOM scanned twice answers the
 //!   identical report and records one scan;
 //! * a document that is not a CycloneDX 1.5 BOM, or that exceeds the documented
-//!   2000-component limit, is refused with a modeled `ValidationException`.
+//!   2000-component limit, is refused with a `ValidationException` (what that
+//!   refusal SAYS is pinned in `scan_sbom_refusals.rs`).
 //!
 //! The advisory catalog these cases are written against is
 //! `src/state.rs::seed_vulnerability_db`.
@@ -977,14 +978,15 @@ async fn the_scan_audit_store_stays_bounded_however_many_documents_are_scanned()
     );
 }
 
-/// One row of the refusal table: a request body and the modeled
-/// `ValidationException.reason` it must be refused with.
+/// One row of the refusal table: a document that is not a CycloneDX 1.5 BOM.
+///
+/// What the refusal SAYS is pinned in `scan_sbom_refusals.rs`, which asserts
+/// the service's wording per class of defect; this table asserts that each of
+/// these documents is refused at all rather than scanned.
 #[derive(Debug)]
 struct RefusalCase {
     what: &'static str,
     sbom: Value,
-    reason: &'static str,
-    field: &'static str,
 }
 
 #[tokio::test]
@@ -994,76 +996,52 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
         RefusalCase {
             what: "a string document",
             sbom: json!("not a bom"),
-            reason: "CANNOT_PARSE",
-            field: "sbom",
         },
         RefusalCase {
             what: "an array document",
             sbom: json!([1, 2, 3]),
-            reason: "CANNOT_PARSE",
-            field: "sbom",
         },
         RefusalCase {
             what: "a number document",
             sbom: json!(7),
-            reason: "CANNOT_PARSE",
-            field: "sbom",
         },
         RefusalCase {
             what: "a missing bomFormat",
             sbom: json!({ "specVersion": "1.5", "components": [] }),
-            reason: "UNSUPPORTED_SBOM_TYPE",
-            field: "sbom.bomFormat",
         },
         RefusalCase {
             what: "a non-CycloneDX bomFormat",
             sbom: json!({ "bomFormat": "SPDX", "specVersion": "1.5", "components": [] }),
-            reason: "UNSUPPORTED_SBOM_TYPE",
-            field: "sbom.bomFormat",
         },
         RefusalCase {
             what: "a missing specVersion",
             sbom: json!({ "bomFormat": "CycloneDX", "components": [] }),
-            reason: "UNSUPPORTED_SBOM_TYPE",
-            field: "sbom.specVersion",
         },
         RefusalCase {
             what: "an earlier CycloneDX spec version",
             sbom: json!({ "bomFormat": "CycloneDX", "specVersion": "1.4", "components": [] }),
-            reason: "UNSUPPORTED_SBOM_TYPE",
-            field: "sbom.specVersion",
         },
         RefusalCase {
             what: "a later CycloneDX spec version",
             sbom: json!({ "bomFormat": "CycloneDX", "specVersion": "1.6", "components": [] }),
-            reason: "UNSUPPORTED_SBOM_TYPE",
-            field: "sbom.specVersion",
         },
         RefusalCase {
             what: "components that are not an array",
             sbom: json!({ "bomFormat": "CycloneDX", "specVersion": "1.5", "components": {} }),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components",
         },
         RefusalCase {
             what: "a component that is not an object",
             sbom: bom(vec![json!("lodash@4.17.20")]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0]",
         },
         RefusalCase {
             what: "a component with neither name/version nor purl",
             sbom: bom(vec![json!({ "type": "library" })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].name",
         },
         RefusalCase {
             // CycloneDX 1.5 makes `type` required on a component and constrains
             // it to the specification's `classification` enumeration.
             what: "a component carrying no type",
             sbom: bom(vec![json!({ "name": "lodash", "version": "4.17.20" })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].type",
         },
         RefusalCase {
             what: "a component whose type is not a CycloneDX component type",
@@ -1072,8 +1050,6 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
                 "name": "lodash",
                 "version": "4.17.20",
             })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].type",
         },
         RefusalCase {
             // `name` is required too, even when a purl could supply one.
@@ -1083,8 +1059,6 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
                 "version": "4.17.20",
                 "purl": "pkg:npm/lodash@4.17.20",
             })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].name",
         },
         RefusalCase {
             // Every submitted `bom-ref` is retained for the uniqueness check
@@ -1096,8 +1070,6 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
                 "name": "lodash",
                 "version": "4.17.20",
             })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].bom-ref",
         },
         RefusalCase {
             // A nested `components` member that is not an array would drop the
@@ -1110,8 +1082,6 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
                 "version": "1.0.0",
                 "components": { "name": "lodash" },
             })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].components",
         },
         RefusalCase {
             what: "a component carrying a malformed purl",
@@ -1121,8 +1091,6 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
                 "version": "4.17.20",
                 "purl": "lodash@4.17.20",
             })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].purl",
         },
         RefusalCase {
             // The purl specification fixes the scheme to the lowercase literal
@@ -1134,8 +1102,6 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
                 "version": "4.17.20",
                 "purl": "PKG:npm/lodash@4.17.20",
             })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].purl",
         },
         RefusalCase {
             // A purl names a type and a name; a coordinate carrying only the
@@ -1147,8 +1113,6 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
                 "version": "4.17.20",
                 "purl": "pkg:npm",
             })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].purl",
         },
         RefusalCase {
             // A purl names a type and a name; a coordinate carrying only the
@@ -1160,8 +1124,6 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
                 "version": "4.17.20",
                 "purl": "pkg:",
             })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].purl",
         },
         RefusalCase {
             // The type is the first path segment, and purl types are
@@ -1173,8 +1135,6 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
                 "version": "4.17.20",
                 "purl": "pkg:np m/lodash@4.17.20",
             })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].purl",
         },
         RefusalCase {
             // CycloneDX requires `bom-ref` to be unique within a document.
@@ -1183,8 +1143,6 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
                 component("same", "lodash", "4.17.20", "pkg:npm/lodash@4.17.20"),
                 component("same", "minimist", "1.2.5", "pkg:npm/minimist@1.2.5"),
             ]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[1]",
         },
         RefusalCase {
             what: "a nested component that is not an object",
@@ -1195,14 +1153,10 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
                 "version": "1.0.0",
                 "components": ["lodash@4.17.20"],
             })]),
-            reason: "FIELD_VALIDATION_FAILED",
-            field: "sbom.components[0].components[0]",
         },
         RefusalCase {
             what: "a document nested deeper than it can be parsed",
             sbom: deeply_nested_value(96),
-            reason: "CANNOT_PARSE",
-            field: "sbom",
         },
     ];
 
@@ -1219,23 +1173,16 @@ async fn a_document_that_is_not_a_cyclonedx_1_5_bom_is_refused() {
             "case {:?}: expected a modeled ValidationException, got {response}",
             case.what
         );
-        assert_eq!(
-            response["reason"].as_str(),
-            Some(case.reason),
-            "case {:?}: expected reason {:?}, got {response}",
-            case.what,
-            case.reason
-        );
-        assert_eq!(
-            response["fields"][0]["name"].as_str(),
-            Some(case.field),
-            "case {:?}: expected the refusal to name field {:?}, got {response}",
-            case.what,
-            case.field
+        assert!(
+            response["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("Input SBOM failed validation: ")),
+            "case {:?}: a refusal must carry the service's own sentence, got {response}",
+            case.what
         );
         assert!(
-            response["message"].as_str().is_some_and(|m| !m.is_empty()),
-            "case {:?}: a refusal must say what was wrong, got {response}",
+            response["reason"].is_null() && response["fields"].is_null(),
+            "case {:?}: the service sends neither reason nor fields here, got {response}",
             case.what
         );
     }
@@ -1263,13 +1210,10 @@ async fn the_documented_two_thousand_component_limit_is_enforced_at_its_bound() 
             "case {count} components: expected HTTP {expected_status}, got {status}"
         );
         if expected_status == 400 {
-            assert_eq!(
-                response["reason"].as_str(),
-                Some("FIELD_VALIDATION_FAILED"),
-                "case {count} components: expected a field-validation refusal, got {response}"
-            );
             assert!(
-                response["message"].as_str().is_some_and(|m| m.contains("2000")),
+                response["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("2000")),
                 "case {count} components: the refusal must name the documented limit, got {response}"
             );
         }
@@ -1354,16 +1298,15 @@ async fn a_component_tree_nested_too_deep_is_refused() {
         status, 400,
         "a component tree deeper than a scan resolves is refused, got {status}: {response}"
     );
-    assert_eq!(
-        response["reason"].as_str(),
-        Some("FIELD_VALIDATION_FAILED"),
-        "expected a field-validation refusal, got {response}"
+    assert!(
+        response["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("components")),
+        "the refusal must name the components member, got {response}"
     );
     assert!(
-        response["fields"][0]["name"]
-            .as_str()
-            .is_some_and(|name| name.starts_with("sbom.components")),
-        "the refusal must name the nested components member, got {response}"
+        response["reason"].is_null() && response["fields"].is_null(),
+        "the service sends neither reason nor fields here, got {response}"
     );
 }
 

@@ -17,5 +17,7 @@ mod scan_invariants;
 mod scan_report_annotations;
 #[path = "all/scan_sbom.rs"]
 mod scan_sbom;
+#[path = "all/scan_sbom_refusals.rs"]
+mod scan_sbom_refusals;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
