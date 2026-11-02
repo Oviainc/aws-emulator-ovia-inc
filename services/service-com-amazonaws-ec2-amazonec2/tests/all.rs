@@ -797,6 +797,12 @@ mod local_gateway_virtual_interfaces;
 mod mac_dedicated_hosts;
 #[path = "all/mac_modification_tasks.rs"]
 mod mac_modification_tasks;
+// The order in which an operation reads a caller-supplied identifier or format-constrained
+// parameter — its form first, the store second — read across the cancel of an export task, the
+// deletes of an AFI, an AMI usage report and a secondary network, and the restore task's bucket
+// name. Declared here, in sorted position inside the long-settled block.
+#[path = "all/malformed_before_lookup.rs"]
+mod malformed_before_lookup;
 #[path = "all/modify_route_server.rs"]
 mod modify_route_server;
 #[path = "all/modify_subnet_attribute.rs"]

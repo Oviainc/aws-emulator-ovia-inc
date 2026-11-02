@@ -734,8 +734,10 @@ async fn attach_image_watermark_refuses_an_ami_it_cannot_watermark() {
 // AMI usage reports
 // ---------------------------------------------------------------------------
 
-/// Store one AMI usage report, and answer its `ReportId`.
-fn seed_image_usage_report(engine: &engine::InMemoryEngine, image_id: &str) -> String {
+/// Store one AMI usage report, and answer its `ReportId`. Shared with
+/// [`super::malformed_before_lookup`], which plants a copy of the record it stores under a
+/// malformed key, so the two suites store one report the one way.
+pub(super) fn seed_image_usage_report(engine: &engine::InMemoryEngine, image_id: &str) -> String {
     let store = engine.state::<Ec2State>();
     let mut guard = store.lock();
     let report_id = guard.next_id(IMAGE_USAGE_REPORT_ID_PREFIX);

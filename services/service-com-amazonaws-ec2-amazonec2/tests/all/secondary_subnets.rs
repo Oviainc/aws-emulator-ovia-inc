@@ -37,7 +37,11 @@ const REGION: &str = "us-east-1";
 /// Create one secondary network for the seeded subnets to belong to, so a subnet's
 /// `SecondaryNetworkId` names a network this store really holds. `ordinal` keeps the
 /// networks' own CIDR blocks apart.
-fn create_network(guard: &mut Ec2State, ordinal: u8) -> String {
+///
+/// Shared with [`super::malformed_before_lookup`], which needs one stored network to resolve
+/// and one record to copy under a malformed key: both suites write a network the one way, so
+/// the spec members live here only.
+pub(super) fn create_network(guard: &mut Ec2State, ordinal: u8) -> String {
     guard.insert_secondary_network(SecondaryNetworkSpec {
         ipv4_cidr_block: format!("10.{ordinal}.0.0/16"),
         network_type: SECONDARY_NETWORK_TYPE_RDMA.to_string(),
