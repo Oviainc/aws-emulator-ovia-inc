@@ -71,16 +71,6 @@ use super::types::*;
 // `DeleteRouteSettingsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-apigatewayv2-apigatewayv2.json");
 
-/// The `NotFoundException` message the service answers when the stage carries no route
-/// settings under the addressed key.
-///
-/// The route key is the last label of this operation's URI, so it addresses a resource of
-/// its own, and a key the stage holds no settings for resolves to nothing. Like the other
-/// keyed entries of this service — a route response, a route's request parameter — the
-/// level is reported as one fixed sentence naming the kind that resolved to nothing and
-/// nothing from the request, so the refusal is the same for every key.
-const NO_SUCH_ROUTE_SETTINGS_MESSAGE: &str = "Invalid route settings specified";
-
 #[derive(Debug, Clone, Default)]
 pub struct DeleteRouteSettingsOutput;
 
@@ -208,9 +198,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not hold resolves to nothing. The stage's `DefaultRouteSettings` is a member of
         // its own, addressed by no route key, so it is never what this removes.
         if stage.route_settings.remove(&input.route_key).is_none() {
+            // The key level names the kind that resolved to nothing and QUOTES the key the
+            // request addressed it with, so the sentence is built from the request rather
+            // than fixed for the whole class (see
+            // [`crate::state::route_settings_not_found_message`]).
             return Err(DeleteRouteSettingsErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(NO_SUCH_ROUTE_SETTINGS_MESSAGE.to_string()),
+                    message: Some(crate::state::route_settings_not_found_message(
+                        &input.route_key,
+                    )),
                     resource_type: ::std::option::Option::None,
                 },
             )

@@ -2094,6 +2094,20 @@ pub const ROUTE_RESOURCE: &str = "route";
 /// reader, the writer and the delete of one route response cannot word it three ways.
 pub const ROUTE_RESPONSE_NOT_FOUND_MESSAGE: &str = "Invalid route response specified";
 
+/// The sentence this service answers `NotFoundException` with for a `RouteKey` the
+/// addressed stage holds no route settings under — including one a `DeleteRouteSettings`
+/// has already removed.
+///
+/// The route settings of one route are addressed by the ROUTE KEY they are stored under
+/// (`routesettings/{RouteKey}`), and the sentence states exactly that: it names the kind
+/// of resource that resolved to nothing and quotes the key the request addressed it with,
+/// so a caller can tell "this stage carries no settings for that key" from a refusal of
+/// the key itself. The key is the REQUEST's — the template is the sentence, the value is
+/// each call's own.
+pub fn route_settings_not_found_message(route_key: &str) -> String {
+    format!("The settings for the Route with key '{route_key}' does not exist")
+}
+
 /// How [`invalid_identifier_message`] names a DEPLOYMENT of an api ("Invalid Deployment
 /// identifier specified").
 pub const DEPLOYMENT_RESOURCE: &str = "Deployment";

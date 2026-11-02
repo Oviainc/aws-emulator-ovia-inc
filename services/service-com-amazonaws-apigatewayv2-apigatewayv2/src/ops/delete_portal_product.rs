@@ -2,7 +2,9 @@
 
 //! @op DeletePortalProduct
 //! IMPLEMENTED: removes the [`crate::state::PortalProduct`] record the account holds
-//! under the requested `PortalProductId`, with the pages it owns. This is the ONLY file
+//! under the requested `PortalProductId`, with the pages it owns, and answers the modelled
+//! 204 with an empty body whether or not the account held one — an id that resolves to
+//! nothing asks for a state the store is already in. This is the ONLY file
 //! to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -175,20 +177,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // map can keep a product this one no longer holds. A portal references its
         // products by ARN rather than owning them, so an inclusion is not a record this
         // delete has to rewrite.
-        if store.portal_products.remove(&input.portal_product_id).is_none() {
-            // A SECOND delete of the same id, and an id the account never held, are the
-            // same miss: the sentence every reader and writer of one product answers for
-            // an id that resolves to nothing.
-            return Err(DeletePortalProductErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::portal_product_not_found_message(
-                        &input.portal_product_id,
-                    )),
-                    resource_type: ::std::option::Option::None,
-                },
-            )
-            .into());
-        }
+        //
+        // Taking the entry out IS the whole delete, and it is IDEMPOTENT: an account
+        // holding no product under this id is already in the state the call asks for, so
+        // an id that resolves to nothing — a second delete of the same id, a teardown
+        // racing another cleanup, an id nothing was ever minted with — is answered with
+        // the same empty 204 as the first delete, removing nothing again. That is what
+        // the deletes of the resources UNDER a product already do
+        // (`DeleteProductPage`, `DeleteProductRestEndpointPage`,
+        // `DeletePortalProductSharingPolicy`). The readers and the update of one product
+        // still refuse an unresolved id: they have a resource to report and this call has
+        // only a state to reach.
+        store.portal_products.remove(&input.portal_product_id);
 
         Ok(DeletePortalProductOutput)
     }

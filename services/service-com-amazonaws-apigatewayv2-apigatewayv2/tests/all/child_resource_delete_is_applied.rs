@@ -345,7 +345,10 @@ async fn rows(emulator: &MultiServiceRouter) -> Vec<Row> {
                 format!("{PRODUCTS}/{}/sharingpolicy", product_ids[0]),
             )],
             collection: Some((PRODUCTS.to_string(), "portalProductId")),
-            repeat_delete_status: 404,
+            // A product that is already gone is in the state the call asks for, so the
+            // repeat answers the first delete's empty 204 (the rule the
+            // `absent_portal_product_delete_idempotence` suite owns).
+            repeat_delete_status: 204,
         },
         Row {
             kind: "ProductPage",

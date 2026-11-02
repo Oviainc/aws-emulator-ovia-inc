@@ -35,9 +35,13 @@ use crate::api_lifecycle::{as_str, call, emulator, error_code, instant};
 /// `CreateStage$StageName` targets.
 const MAX_STAGE_NAME_LEN: usize = 128;
 
-/// The sentence the key level of the path is refused with when the stage carries no route
-/// settings under it: one fixed sentence, carrying nothing from the request.
-const NO_SUCH_ROUTE_SETTINGS: &str = "Invalid route settings specified";
+/// AWS's sentence for a `RouteKey` the addressed stage holds no route settings under: the
+/// kind that resolved to nothing, with the route key the request addressed it with quoted
+/// inside it. Written out here rather than taken from the service, so the cases assert the
+/// rule.
+fn no_such_route_settings(route_key: &str) -> String {
+    format!("The settings for the Route with key '{route_key}' does not exist")
+}
 
 /// `RouteKey` is a NON-greedy label of this operation's URI, so the route key a client
 /// addresses arrives percent-encoded INSIDE that one path segment: its space is `%20`,
@@ -446,27 +450,44 @@ async fn route_settings_the_store_does_not_hold_are_not_found() {
     }
 
     // A known api and stage, and a key that stage holds no settings under: the key level
-    // is what resolved to nothing, and it reports a fixed sentence. Each label below is
-    // the wire form of the route key its case names.
-    for (case, label) in [
-        ("a route key no entry is stored under: GET /nope", "GET%20%2Fnope"),
+    // is what resolved to nothing, and the refusal quotes the key it was addressed with.
+    // Each case names the route key and the wire label that carries it.
+    for (case, key, label) in [
         (
-            "the same method and a different path: GET /items/{id}",
+            "a route key no entry is stored under",
+            "GET /nope",
+            "GET%20%2Fnope",
+        ),
+        (
+            "the same method and a different path",
+            "GET /items/{id}",
             "GET%20%2Fitems%2F%7Bid%7D",
         ),
         (
-            "the same path and a different method: POST /items",
+            "the same path and a different method",
+            "POST /items",
             "POST%20%2Fitems",
         ),
         (
-            "a key stored only on a stage of another api: GET /elsewhere",
+            "a key stored only on a stage of another api",
+            "GET /elsewhere",
             "GET%20%2Felsewhere",
         ),
-        ("the WebSocket $connect key on an HTTP stage", "$connect"),
-        ("a key differing only in case: get /items", "get%20%2Fitems"),
         (
-            "a key differing only in trailing whitespace: 'GET /items '",
+            "the WebSocket $connect key on an HTTP stage",
+            "$connect",
+            "$connect",
+        ),
+        ("a key differing only in case", "get /items", "get%20%2Fitems"),
+        (
+            "a key differing only in trailing whitespace",
+            "GET /items ",
             "GET%20%2Fitems%20",
+        ),
+        (
+            "a greedy proxy key no entry is stored under",
+            "ANY /{proxy+}",
+            "ANY%20%2F%7Bproxy%2B%7D",
         ),
     ] {
         let (status, body) = call(
@@ -487,8 +508,8 @@ async fn route_settings_the_store_does_not_hold_are_not_found() {
         );
         assert_eq!(
             as_str(&body, "message"),
-            NO_SUCH_ROUTE_SETTINGS,
-            "case {case:?}: expected the route settings sentence, got {body}"
+            no_such_route_settings(key),
+            "case {case:?}: expected the route settings sentence naming {key:?}, got {body}"
         );
     }
 
@@ -548,8 +569,8 @@ async fn deleting_the_same_route_settings_twice_is_not_found_the_second_time() {
     );
     assert_eq!(
         as_str(&body, "message"),
-        NO_SUCH_ROUTE_SETTINGS,
-        "second delete: expected the route settings sentence, got {body}"
+        no_such_route_settings("$connect"),
+        "second delete: expected the route settings sentence naming the key, got {body}"
     );
 
     // The entry that was never deleted survived both calls.

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/absent_page_delete_idempotence.rs"]
 mod absent_page_delete_idempotence;
+#[path = "all/absent_portal_product_delete_idempotence.rs"]
+mod absent_portal_product_delete_idempotence;
 #[path = "all/access_log_settings_deletion.rs"]
 mod access_log_settings_deletion;
 #[path = "all/api_endpoint_scheme.rs"]
