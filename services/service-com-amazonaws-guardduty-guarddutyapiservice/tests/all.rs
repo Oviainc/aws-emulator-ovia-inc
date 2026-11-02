@@ -243,6 +243,8 @@ mod resource_tag_removal;
 mod runtime_monitoring_exclusion;
 #[path = "all/sample_finding_catalog.rs"]
 mod sample_finding_catalog;
+#[path = "all/sample_finding_detector_timestamp.rs"]
+mod sample_finding_detector_timestamp;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_map_projection.rs"]

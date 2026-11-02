@@ -4,7 +4,9 @@
 //! IMPLEMENTED: inserts one finding per requested finding type into the detector's
 //! finding store, so `ListFindings` and `GetFindings` read them back. A generated
 //! finding a saved archiving filter selects is archived as it is generated. An unknown
-//! detector id is refused with `BadRequestException`.
+//! detector id is refused with `BadRequestException`. A generation that leaves the
+//! detector holding a finding it did not hold moves the detector's own `UpdatedAt`; one
+//! that only aggregates onto a finding already stored leaves it where it was.
 //!
 //! A requested finding type must be a GuardDuty finding type: the service generates a
 //! sample only for a type in its own catalogue, and rejects any other entry with the
@@ -287,6 +289,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     };
                     detector.findings.remove(&oldest);
                 }
+                // The detector itself changed: it holds one more sub-resource than
+                // before (and, once the window is full, one fewer of the oldest),
+                // which is the change `UpdatedAt` — "the last-updated timestamp for
+                // the detector" (`smithy_query(operation="GetDetector")`) — records,
+                // the same way every other create of a sub-resource the detector
+                // holds records it. The aggregation branch above moves only the
+                // existing finding's own clock and so returns before this write: the
+                // set of sub-resources the detector holds is unchanged there, as it
+                // is for a refused request, which never reaches this loop.
+                detector.updated_at_millis = now;
             }
         }
 

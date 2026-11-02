@@ -61,7 +61,7 @@ async fn create_sample_findings(
 
 /// Read findings back by id, in chunks of 50 — `GetFindings.findingIds` is
 /// `len 0..50` (`smithy_query(operation="GetFindings")`).
-async fn get_findings(
+pub(crate) async fn get_findings(
     router: &super::detector_lifecycle::Router,
     detector_id: &str,
     ids: &[String],
