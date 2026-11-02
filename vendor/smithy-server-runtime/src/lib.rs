@@ -24,6 +24,7 @@ pub mod pre_dispatch;
 pub mod router;
 pub mod service;
 pub mod wire;
+pub mod wire_protocol;
 
 pub use extract::{Akid, FromSmithyParts, RequestTelemetry};
 // The operation contract: one modeled operation, its typed-call step, and the
@@ -43,6 +44,10 @@ pub use service::{
 // The multi-service router: the emulator core that mounts N services and
 // dispatches each request to the one service that claims it.
 pub use multi_service_router::MultiServiceRouter;
+// Per-request protocol selection. The `#[smithy_service]` expansion builds a
+// `DeclaredProtocols` from the model's protocol traits and names the other
+// types.
+pub use wire_protocol::{DeclaredProtocol, DeclaredProtocols, WireProtocol, WireProtocolKind};
 // Re-exported because a `RefusalRenderer` cannot be written without naming them:
 // a `Refusal` carries `Violation`s, and deciding how to word one means reading
 // its `kind`. Requiring a second crate just to branch on a refusal would make the
@@ -52,7 +57,7 @@ pub use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 // expansion instead of being emitted into every service crate.
 pub use pre_dispatch::{
     protocol_error_response, protocol_error_response_with, refusal_of, render_refusal,
-    PreDispatchProtocol, Refusal, RefusalRenderer, Refused,
+    PreDispatchProtocol, Refusal, RefusalRenderer, Refused, UNRECOGNISED_PROTOCOL_BODY,
 };
 
 // Re-export the schema-aware traits so generated code (the

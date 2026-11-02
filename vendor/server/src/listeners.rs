@@ -252,6 +252,77 @@ impl Listeners {
     ) -> Result<ResourceListener, SurfaceError> {
         let server_config = self.rustls_server_config()?;
         let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        serve_native(handler, idle, Some(acceptor)).await
+    }
+
+    /// Open a native-protocol (TCP) listener that hands the RAW, unencrypted
+    /// connection to `handler`: no TLS on byte 0. For a wire protocol whose
+    /// encryption is negotiated in-band (PostgreSQL `SSLRequest`, MySQL's
+    /// server-greeting-first handshake, SMTP `STARTTLS`), the protocol itself
+    /// must see the client's first bytes. Same interface, port range, caps, idle
+    /// timeout and teardown as [`Self::tcp`]. The handler owns the in-band
+    /// refusal of plaintext (e.g. `rds.force_ssl`); the core does not encrypt.
+    pub async fn tcp_plaintext<H: NativeHandler>(
+        &self,
+        handler: H,
+    ) -> Result<ResourceListener, SurfaceError> {
+        serve_native(handler, Duration::from_secs(caps::IDLE_TIMEOUT_SECS), None).await
+    }
+}
+
+impl Listeners {
+    /// Lend a plaintext handler ([`Self::tcp_plaintext`]) the core's TLS, for
+    /// a protocol that negotiates encryption in-band (PostgreSQL answers its
+    /// `SSLRequest` with `S`, MySQL sets `CLIENT_SSL`, SMTP says `STARTTLS`).
+    /// The certificate, key and rustls configuration stay in the core: the
+    /// handler can only run the server side of a handshake on its connection.
+    pub fn tls_upgrader(&self) -> Result<TlsUpgrader, SurfaceError> {
+        Ok(TlsUpgrader { config: self.rustls_server_config()? })
+    }
+}
+
+/// The core's TLS server, lent to a plaintext native handler. See
+/// [`Listeners::tls_upgrader`].
+#[derive(Clone)]
+pub struct TlsUpgrader {
+    config: Arc<rustls::ServerConfig>,
+}
+
+impl TlsUpgrader {
+    /// Run the server side of a TLS handshake on `conn` (bounded by the same
+    /// handshake deadline as [`Listeners::tcp`]) and return the decrypted
+    /// stream with the ALPN protocol the client and server agreed on, if any.
+    /// With `alpn = Some(id)` the server offers only `id`: a client offering
+    /// other protocols is refused with `no_application_protocol`, a client
+    /// offering none proceeds without ALPN (the handler decides whether that is
+    /// acceptable, e.g. PostgreSQL direct TLS requires it).
+    pub async fn accept(
+        &self,
+        conn: ListenerConn,
+        alpn: Option<&[u8]>,
+    ) -> std::io::Result<(ListenerConn, Option<Vec<u8>>)> {
+        let mut config = (*self.config).clone();
+        if let Some(id) = alpn {
+            config.alpn_protocols = vec![id.to_vec()];
+        }
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(conn))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
+        let negotiated = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        Ok((Box::new(tls), negotiated))
+    }
+}
+
+/// The accept loop shared by [`Listeners::tcp`] (`tls = Some`) and
+/// [`Listeners::tcp_plaintext`] (`tls = None`).
+async fn serve_native<H: NativeHandler>(
+    handler: H,
+    idle: Duration,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) -> Result<ResourceListener, SurfaceError> {
+    {
+        let acceptor = tls;
         let listener = bind_tokio(bind_ip_from_env()?, listener_port_range_from_env()?).await?;
         let addr = listener.local_addr().map_err(|e| SurfaceError::Bind(e.to_string()))?;
 
@@ -300,15 +371,24 @@ impl Listeners {
                         // half-open connection can't hold the permit (slowloris):
                         // a plaintext/HTTP preface also fails the handshake here
                         // and never reaches the handler.
-                        let accepted =
-                            tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
-                        if let Ok(Ok(tls)) = accepted {
-                            let last = Arc::new(Mutex::new(Instant::now()));
-                            let guarded = ActivityStream { inner: tls, last: Arc::clone(&last) };
-                            tokio::select! {
-                                _ = handler.serve(Box::new(guarded)) => {}
-                                _ = idle_elapsed(last, idle) => {}
-                            }
+                        let conn: ListenerConn = match acceptor {
+                            Some(acceptor) => match tokio::time::timeout(
+                                HANDSHAKE_TIMEOUT,
+                                acceptor.accept(stream),
+                            )
+                            .await
+                            {
+                                Ok(Ok(tls)) => Box::new(tls),
+                                _ => return,
+                            },
+                            // Plaintext handover: the handler reads byte 0.
+                            None => Box::new(stream),
+                        };
+                        let last = Arc::new(Mutex::new(Instant::now()));
+                        let guarded = ActivityStream { inner: conn, last: Arc::clone(&last) };
+                        tokio::select! {
+                            _ = handler.serve(Box::new(guarded)) => {}
+                            _ = idle_elapsed(last, idle) => {}
                         }
                     };
                     // Listener Drop (parent cancel) severs the connection mid-flight.
@@ -325,7 +405,9 @@ impl Listeners {
             shutdown: Shutdown::Tcp { accept: task.abort_handle(), cancel: cancel_tx },
         })
     }
+}
 
+impl Listeners {
     /// Open an HTTP listener, TLS, on the configured interface
     /// (`EMULATOR_BIND_ADDRESS`, loopback by default) and a port from
     /// `EMULATOR_LISTENER_PORT_RANGE` (OS-assigned when unset). The core

@@ -31,7 +31,8 @@
 //!   and the integrity property this module exists for (payload bytes in ==
 //!   payload bytes out) does not depend on it.
 //! * Chunk signatures (`;chunk-signature=…`, sent when the SDK signs each chunk)
-//!   are parsed and ignored — the emulator does not verify SigV4.
+//!   are skipped here: request authentication verifies them on the framed body
+//!   before it is decoded.
 //! * Malformed framing is an **error**, never a pass-through: a body that claims
 //!   `aws-chunked` and is not decodable must not be silently stored, which is the
 //!   exact failure mode being fixed.

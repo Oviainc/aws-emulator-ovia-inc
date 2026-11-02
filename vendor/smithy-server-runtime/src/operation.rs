@@ -354,9 +354,14 @@ pub trait Operation: Send + Sync + 'static {
 /// wording is single-homed on the service and the sequence needs no per-operation
 /// refusal state.
 ///
-/// `pre_dispatch` is the per-service [`PreDispatchProtocol`](crate::PreDispatchProtocol)
-/// value (`Copy`); the shim passes it in because it is a value, not a type the
-/// generic signature could name.
+/// `pre_dispatch` is the [`PreDispatchProtocol`](crate::PreDispatchProtocol)
+/// envelope framework errors render in (`Copy`). The generated shim passes the
+/// envelope of the protocol the request is served in,
+/// [`ErasedServiceDefinition::wire_protocol`](crate::ErasedServiceDefinition::wire_protocol),
+/// which is the codec this sequence picks unless the author's
+/// [`override_protocol`](crate::Service::override_protocol) replaces it. An
+/// override does not change this envelope; that seam's contract says how such a
+/// service rewords its framework errors.
 pub async fn run_operation_http<'r, O: Operation>(
     op: &'r O,
     svc: &'r dyn crate::Service,
@@ -368,12 +373,12 @@ pub async fn run_operation_http<'r, O: Operation>(
 
     // The service's wire protocol for the modeled sequence below, selected by
     // `resolve_protocol` (the author's `override_protocol` if any, else the
-    // model-derived protocol). The deserialize and serialize steps drive it as a
+    // protocol the request is served in). The deserialize and serialize steps drive it as a
     // `&dyn ServerHttpProtocol`, so the sequence takes no separate protocol argument.
     // This is a shared borrow of `*svc` alongside `op` (which the router looked
     // up from `svc`) and `svc` itself — all under `'r`, which the router holds
     // alive while it awaits.
-    let protocol = resolve_protocol(svc);
+    let protocol = resolve_protocol(svc, req);
 
     // Telemetry is recorded here, in the one framework sequence, so every
     // operation is instrumented once by code the service author never writes.
@@ -530,13 +535,16 @@ pub async fn run_operation_http<'r, O: Operation>(
 
 /// The wire protocol the dispatch sequence runs for `svc`: the author's
 /// [`override_protocol`](crate::Service::override_protocol) when it returns
-/// `Some`, else the model-derived protocol from
-/// [`definition`](crate::Service::definition). The one selection site the
-/// sequence and its test both call; the seam's own contract lives on
-/// `override_protocol`.
-fn resolve_protocol(svc: &dyn crate::Service) -> &dyn crate::ServerHttpProtocol {
+/// `Some`, else the model-derived protocol `req` is served in, from
+/// [`ErasedServiceDefinition::wire_protocol`](crate::ErasedServiceDefinition::wire_protocol).
+/// The one selection site the sequence and its test both call; the seam's own
+/// contract lives on `override_protocol`.
+fn resolve_protocol<'r>(
+    svc: &'r dyn crate::Service,
+    req: &aws_smithy_runtime_api::http::Request,
+) -> &'r dyn crate::ServerHttpProtocol {
     svc.override_protocol()
-        .unwrap_or_else(|| svc.definition().protocol())
+        .unwrap_or_else(|| svc.definition().wire_protocol(req).protocol())
 }
 
 /// The wire shape name used to classify a framework-level failure for
@@ -631,7 +639,7 @@ mod tests {
         ))
     }
 
-    /// The model-derived half: only `protocol()` is real, since the selection
+    /// The model-derived half: only `wire_protocol()` is real, since the selection
     /// path reads nothing else. The routing table, identity, and error
     /// renderers are never reached on this path, so they are left unreachable
     /// rather than given stub behaviour that could mislead.
@@ -645,7 +653,7 @@ mod tests {
         }
 
         fn protocol(&self) -> &dyn ServerHttpProtocol {
-            &self.protocol
+            unreachable!("the framework never reads the legacy protocol accessor")
         }
 
         fn routing_table(&self) -> &OperationRoutingTable {
@@ -656,15 +664,20 @@ mod tests {
             unreachable!("the selection test never renders a routing error")
         }
 
-        fn framework_error_response(&self, _error: ProtocolError) -> RtResponse {
+        fn framework_error_response(&self, _error: ProtocolError, _req: &RtRequest) -> RtResponse {
             unreachable!("the selection test never renders a framework error")
+        }
+
+        fn wire_protocol(&self, _req: &RtRequest) -> crate::WireProtocol<'_> {
+            // Selection reads only the codec; the envelope is never rendered.
+            crate::WireProtocol::new(&self.protocol, crate::PreDispatchProtocol::RpcV2Cbor)
         }
     }
 
     /// A service that carries a model-derived protocol on its definition and,
     /// optionally, an author-overridden one. `override_protocol` returns
-    /// `Some(&self.overridden)` exactly when a service was built with one, which
-    /// is the fallback behaviour the dispatch sequence relies on.
+    /// `Some(&self.overridden)` exactly when a service was built with one, and the
+    /// dispatch sequence serves it in place of the definition's.
     struct ProtocolService {
         definition: ModelDefinition,
         overridden: Option<NamedProtocol>,
@@ -691,7 +704,8 @@ mod tests {
     /// that stops the sequence consulting `override_protocol` fails this test rather
     /// than passing against a copy of the rule.
     fn selected_protocol_id(svc: &dyn Service) -> ShapeId {
-        *super::resolve_protocol(svc).protocol_id()
+        let req = RtRequest::new(aws_smithy_types::body::SdkBody::empty());
+        *super::resolve_protocol(svc, &req).protocol_id()
     }
 
     #[test]

@@ -3646,6 +3646,175 @@ fn diagnose_op_targets(
     }
 }
 
+/// A wire protocol a service can declare. The rest of this crate matches on it to
+/// pick the protocol's codec, error envelope and content type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ProtocolKind {
+    AwsJson10,
+    AwsJson11,
+    RpcV2Cbor,
+    AwsQuery,
+    Ec2Query,
+    RestXml,
+    RestJson1,
+}
+
+impl ProtocolKind {
+    /// The protocol's Smithy name, as diagnostics spell it.
+    fn name(self) -> &'static str {
+        match self {
+            ProtocolKind::AwsJson10 => "awsJson1_0",
+            ProtocolKind::AwsJson11 => "awsJson1_1",
+            ProtocolKind::RpcV2Cbor => "rpcv2Cbor",
+            ProtocolKind::AwsQuery => "awsQuery",
+            ProtocolKind::Ec2Query => "ec2Query",
+            ProtocolKind::RestXml => "restXml",
+            ProtocolKind::RestJson1 => "restJson1",
+        }
+    }
+}
+
+impl std::fmt::Display for ProtocolKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The Smithy trait a service shape carries to declare a protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ProtocolTraitId {
+    AwsJson10,
+    AwsJson11,
+    RpcV2Cbor,
+    AwsQuery,
+    Ec2Query,
+    RestXml,
+    RestJson1,
+}
+
+impl ProtocolTraitId {
+    /// The trait's absolute shape id, the key it has in a service's `traits`.
+    fn shape_id(self) -> &'static str {
+        match self {
+            ProtocolTraitId::AwsJson10 => "aws.protocols#awsJson1_0",
+            ProtocolTraitId::AwsJson11 => "aws.protocols#awsJson1_1",
+            ProtocolTraitId::RpcV2Cbor => "smithy.protocols#rpcv2Cbor",
+            ProtocolTraitId::AwsQuery => "aws.protocols#awsQuery",
+            ProtocolTraitId::Ec2Query => "aws.protocols#ec2Query",
+            ProtocolTraitId::RestXml => "aws.protocols#restXml",
+            ProtocolTraitId::RestJson1 => "aws.protocols#restJson1",
+        }
+    }
+}
+
+/// The family of request headers that recognises a protocol's requests
+/// (`WireProtocolKind::detect`), shared by every member of the family. Each
+/// variant names the runtime's `WireProtocolKind` variant of the same name; this
+/// crate cannot depend on the runtime crate, so it emits that variant by ident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ProtocolRequestMarker {
+    AwsJson,
+    RpcV2Cbor,
+    Query,
+}
+
+impl ProtocolRequestMarker {
+    /// The ident of the runtime's `WireProtocolKind` variant for this marker.
+    fn wire_protocol_kind_variant(self) -> proc_macro2::Ident {
+        let name = match self {
+            ProtocolRequestMarker::AwsJson => "AwsJson",
+            ProtocolRequestMarker::RpcV2Cbor => "RpcV2Cbor",
+            ProtocolRequestMarker::Query => "Query",
+        };
+        quote::format_ident!("{name}")
+    }
+}
+
+/// A protocol, the trait that declares it, and the marker its requests carry.
+///
+/// `marker` is `None` for a protocol whose requests carry no marker: the REST
+/// protocols route by a static method + URI table and mark nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Protocol {
+    kind: ProtocolKind,
+    trait_id: ProtocolTraitId,
+    marker: Option<ProtocolRequestMarker>,
+}
+
+/// Every wire protocol a service can declare. A service's protocol list is the
+/// entries whose trait its shape carries, in this order.
+const PROTOCOLS: [Protocol; 7] = [
+    Protocol {
+        kind: ProtocolKind::AwsJson10,
+        trait_id: ProtocolTraitId::AwsJson10,
+        marker: Some(ProtocolRequestMarker::AwsJson),
+    },
+    Protocol {
+        kind: ProtocolKind::AwsJson11,
+        trait_id: ProtocolTraitId::AwsJson11,
+        marker: Some(ProtocolRequestMarker::AwsJson),
+    },
+    Protocol {
+        kind: ProtocolKind::RpcV2Cbor,
+        trait_id: ProtocolTraitId::RpcV2Cbor,
+        marker: Some(ProtocolRequestMarker::RpcV2Cbor),
+    },
+    Protocol {
+        kind: ProtocolKind::AwsQuery,
+        trait_id: ProtocolTraitId::AwsQuery,
+        marker: Some(ProtocolRequestMarker::Query),
+    },
+    Protocol {
+        kind: ProtocolKind::Ec2Query,
+        trait_id: ProtocolTraitId::Ec2Query,
+        marker: Some(ProtocolRequestMarker::Query),
+    },
+    Protocol {
+        kind: ProtocolKind::RestXml,
+        trait_id: ProtocolTraitId::RestXml,
+        marker: None,
+    },
+    Protocol {
+        kind: ProtocolKind::RestJson1,
+        trait_id: ProtocolTraitId::RestJson1,
+        marker: None,
+    },
+];
+
+/// Refuse a protocol list that cannot be served per request. Selection reads the
+/// request's marker, so two protocols behind one marker cannot be told apart, and
+/// a protocol with no marker can only be recognised when it is the only one.
+/// Returns the problem as a clause that continues "Service `X` ...".
+fn check_protocols(protocols: &[Protocol]) -> Result<(), String> {
+    if protocols.len() > 1 {
+        if let Some(rest) = protocols.iter().find(|protocol| protocol.marker.is_none()) {
+            let names: Vec<&str> = protocols
+                .iter()
+                .map(|protocol| protocol.kind.name())
+                .collect();
+            return Err(format!(
+                "declares {} together: {} routes by method and URI and its requests carry no \
+                 protocol marker, so a service that declares it must declare no other protocol",
+                names.join(" and "),
+                rest.kind
+            ));
+        }
+    }
+    for (index, protocol) in protocols.iter().enumerate() {
+        if let Some(earlier) = protocols[..index]
+            .iter()
+            .find(|earlier| earlier.marker == protocol.marker)
+        {
+            return Err(format!(
+                "declares both {} and {}: a request names its protocol by the same marker for \
+                 both, so it cannot choose between them",
+                earlier.kind, protocol.kind
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn smithy_service_impl(
     attr: TokenStream,
     item_struct: syn::ItemStruct,
@@ -3691,12 +3860,6 @@ fn smithy_service_impl(
     // Auto-detect the wire protocol from the service shape's traits.
     let service_traits = service_shape.get("traits").and_then(|t| t.as_object());
     let has_trait = |id: &str| service_traits.is_some_and(|t| t.contains_key(id));
-    let is_rest_xml = has_trait("aws.protocols#restXml");
-    let is_rest_json = has_trait("aws.protocols#restJson1");
-    // Both REST protocols share URI-based routing and the HTTP-binding layer;
-    // they differ only in body codec (XML vs JSON). `is_rest` gates all the
-    // routing/bridge machinery that is common to both.
-    let is_rest = is_rest_xml || is_rest_json;
 
     // The XML namespace the restXml codec stamps on the root element and on the
     // error envelopes comes from the SERVICE's `@xmlNamespace` trait — S3 says
@@ -3744,23 +3907,14 @@ fn smithy_service_impl(
     let signing_name = signing_name.trim().to_ascii_lowercase();
     let service_shape_id: String = opts.service.clone();
 
-    // We'll build the protocol_ctor after processing operations (REST needs route table).
-    // For now, just validate the protocol exists.
-    let protocol_kind = if has_trait("aws.protocols#awsJson1_0") {
-        "awsJson1_0"
-    } else if has_trait("aws.protocols#awsJson1_1") {
-        "awsJson1_1"
-    } else if has_trait("smithy.protocols#rpcv2Cbor") {
-        "rpcv2Cbor"
-    } else if has_trait("aws.protocols#awsQuery") {
-        "awsQuery"
-    } else if has_trait("aws.protocols#ec2Query") {
-        "ec2Query"
-    } else if is_rest_xml {
-        "restXml"
-    } else if is_rest_json {
-        "restJson1"
-    } else {
+    // Every protocol the model declares. The list is the service's protocol set:
+    // codecs, error envelopes and per-request selection are all built from it,
+    // and no entry outranks another. A service that declares none is refused.
+    let protocols: Vec<Protocol> = PROTOCOLS
+        .into_iter()
+        .filter(|protocol| has_trait(protocol.trait_id.shape_id()))
+        .collect();
+    if protocols.is_empty() {
         return Err(syn::Error::new_spanned(
             &item_struct,
             format!(
@@ -3768,55 +3922,49 @@ fn smithy_service_impl(
                 opts.service
             ),
         ));
-    };
+    }
+    check_protocols(&protocols).map_err(|problem| {
+        syn::Error::new_spanned(
+            &item_struct,
+            format!("Service '{}' {problem}", opts.service),
+        )
+    })?;
 
-    // rpcv2Cbor is body-only like the awsJson family, but it routes by request
-    // URI path (`POST /service/{Service}/operation/{Op}`) instead of the
-    // `x-amz-target` header. Like the REST protocols, its router must therefore
-    // accept arbitrary paths and preserve the request URI/method (and response
-    // headers) end to end — otherwise `routing_key_from_path` never sees the
-    // path and the `application/cbor` + `smithy-protocol` response headers are
-    // dropped. `uri_routed` captures "routing depends on the request URI".
-    let is_rpcv2_cbor = protocol_kind == "rpcv2Cbor";
-    // Query protocols (awsQuery/ec2Query) are NOT uri_routed: they route by the
-    // `Action` field in the form-urlencoded body, which the protocol's
-    // `routing_key` reads directly — the same non-URI flow the awsJson family
-    // uses. `is_ec2_query` selects the ec2 error-envelope shape below.
-    let is_query = protocol_kind == "awsQuery" || protocol_kind == "ec2Query";
-    let is_ec2_query = protocol_kind == "ec2Query";
-    // Routing depends on the request URI for every REST protocol (restXml +
-    // restJson1, which route by a static method+URI table) and for rpcv2Cbor
-    // (which routes dynamically via `/service/{S}/operation/{Op}`). The awsJson
-    // and query families route by header/body instead.
+    // Both REST protocols share URI-based routing and the HTTP-binding layer;
+    // they differ only in body codec (XML vs JSON). `is_rest` gates all the
+    // routing/bridge machinery that is common to both. A REST protocol is always
+    // the service's only one (`check_protocols`).
+    //
+    // rpcv2Cbor is also routed by request URI (`POST /service/{Service}/operation/{Op}`),
+    // but dynamically, so it needs no route table. The awsJson family routes by
+    // the `x-amz-target` header. awsQuery and ec2Query are NOT URI-routed either:
+    // they route by the `Action` field of the form-urlencoded body, which the
+    // protocol's `routing_key` reads directly, the same non-URI flow the awsJson
+    // family uses.
+    let is_rest = protocols.iter().any(|protocol| protocol.marker.is_none());
 
-    // THE one place a protocol's response content-type is named. Consumed twice:
-    // as `runtime_api_response_to_axum`'s fallback (applied only when no
-    // content-type was set upstream) and as the pre-dispatch JSON error
-    // envelope's content-type below.
+    // THE one place a protocol's response content-type is named.
     //
-    // Two entries are deliberately absent rather than guessed:
+    // Only `PreDispatchProtocol::Json` reads it, and only restJson1, awsJson1_0
+    // and awsJson1_1 select that variant (`envelope_of`): restXml, the query
+    // family and rpcv2Cbor each have their own envelope variant. rpcv2Cbor has no
+    // entry: it always stamps `application/cbor` itself, and labelling CBOR bytes
+    // with any text type is parse-fatal for clients.
     //
-    //   * rpcv2Cbor always stamps `application/cbor` itself, so it must have NO
-    //     silent fallback — defaulting CBOR bytes to any text type mislabels them
-    //     and is parse-fatal for clients.
-    //   * an unrecognised protocol cannot reach here; `protocol_kind` already
-    //     errored out on one.
-    //
-    // Every entry must be present: a consumer that hardcodes one value instead is
-    // wrong twice over, because awsJson1_1 must answer `application/x-amz-json-1.1`
-    // (102 of 431 published AWS models are awsJson1_1) and the response converter
-    // covers awsQuery/ec2Query too, whose bodies are XML. The same per-protocol
+    // awsJson1_1 must answer `application/x-amz-json-1.1`, not awsJson1_0's
+    // type. The same per-protocol
     // values also exist in `aws_smithy_schema_server::rpc::{AwsJson10, AwsJson11}`,
     // so the two are pinned together by
     // `protocol_content_type_matches_the_server_protocol_constructors`.
-    let protocol_content_type: Option<&str> = match protocol_kind {
-        "restXml" => Some("application/xml"),
-        "restJson1" => Some("application/json"),
-        "awsQuery" | "ec2Query" => Some("text/xml"),
-        "awsJson1_0" => Some("application/x-amz-json-1.0"),
-        "awsJson1_1" => Some("application/x-amz-json-1.1"),
-        // rpcv2Cbor: see above.
-        _ => None,
+    let content_type_of = |kind: ProtocolKind| -> Option<&'static str> {
+        match kind {
+            ProtocolKind::RestXml => Some("application/xml"),
+            ProtocolKind::RestJson1 => Some("application/json"),
+            ProtocolKind::AwsQuery | ProtocolKind::Ec2Query => Some("text/xml"),
+            ProtocolKind::AwsJson10 => Some("application/x-amz-json-1.0"),
+            ProtocolKind::AwsJson11 => Some("application/x-amz-json-1.1"),
+            ProtocolKind::RpcV2Cbor => None,
+        }
     };
 
     // Enumerate every operation the service binds — its own top-level
@@ -3919,49 +4067,6 @@ fn smithy_service_impl(
     let mut op_items: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut table_inits: Vec<proc_macro2::TokenStream> = Vec::new();
 
-    // Content-type for the JSON pre-dispatch error envelope (validation /
-    // internal errors), from the single `protocol_content_type` table above.
-    //
-    // Only `PreDispatchProtocol::Json` reads this, and only restJson1 /
-    // awsJson1_0 / awsJson1_1 select that variant — restXml, the query family and
-    // rpcv2Cbor each have their own variant with their own envelope. So the
-    // `unwrap_or` arm is reachable only for a protocol that never consumes the
-    // value, and `application/json` is the inert choice for it.
-
-    // Pre-dispatch protocol-error rendering lives in the runtime crate
-    // (`smithy_server_runtime::pre_dispatch`), not here, so it is compiled once
-    // for the whole workspace. The macro emits only the protocol selector and one call; its
-    // only per-service inputs are the protocol kind and (restXml only) the
-    // `@xmlNamespace`.
-    // Behaviour, including the per-protocol status/code asymmetries, is
-    // unchanged — see that module's doc comment for the table.
-    //
-    // Computed BEFORE the operation loop because the generated
-    // `ErasedOperation::run` emitted per op reuses this same
-    // `pre_dispatch_protocol` token for its framework-error render, as the
-    // builder-path `dispatch` does; its inputs are all known before the loop.
-    let json_error_content_type = protocol_content_type.unwrap_or("application/json");
-    let pre_dispatch_protocol = if is_rest_xml {
-        let xmlns = match &xml_namespace {
-            Some(ns) => quote! { Some(#ns) },
-            None => quote! { None },
-        };
-        quote! {
-            ::smithy_server_runtime::PreDispatchProtocol::RestXml { xml_namespace: #xmlns, no_error_wrapping: #no_error_wrapping }
-        }
-    } else if is_rpcv2_cbor {
-        quote! { ::smithy_server_runtime::PreDispatchProtocol::RpcV2Cbor }
-    } else if is_query {
-        quote! { ::smithy_server_runtime::PreDispatchProtocol::Query { ec2: #is_ec2_query } }
-    } else {
-        quote! {
-            ::smithy_server_runtime::PreDispatchProtocol::Json {
-                content_type: #json_error_content_type,
-                errortype_header: #is_rest_json,
-            }
-        }
-    };
-
     let types_path = &opts.types;
 
     for op_target in &operation_targets {
@@ -4038,11 +4143,11 @@ fn smithy_service_impl(
             .unwrap_or(200) as u16;
 
         // The REST protocols (restXml + restJson1) use a static route table
-        // (method + URI → operation). rpcv2Cbor is uri_routed too, but routes
+        // (method + URI → operation). rpcv2Cbor is URI-routed too, but routes
         // dynamically via `routing_key_from_path`
         // (`/service/{S}/operation/{Op}`) and needs no route entries; the awsJson
-        // family routes by the `x-amz-target` header. `is_rest` is
-        // `is_rest_xml || is_rest_json`, so rpcv2Cbor is correctly excluded here.
+        // family routes by the `x-amz-target` header. `is_rest` holds when the
+        // service declares a REST protocol, so rpcv2Cbor is correctly excluded here.
         if is_rest {
             // Every `@required` member bound to a header or a query parameter is
             // a routing discriminator: REST services overload one method + URI
@@ -4099,16 +4204,17 @@ fn smithy_service_impl(
         // deserialize, validate, handle, serialize, the `awsQueryCompatible`
         // header, and the framework-error tail that reaches the service's own
         // refusal wording via `svc.override_refusal` -- lives in the vended
-        // `run_operation_http`, so nothing of it is emitted per operation. The
-        // sequence reads the service's wire protocol from `svc.protocol()`, so `run`
-        // takes no separate protocol argument. For a streaming op the body
+        // `run_operation_http`, so nothing of it is emitted per operation. The shim
+        // passes the envelope of the protocol the request is served in
+        // (`svc.definition().wire_protocol(req)`), and the sequence reads the codec
+        // from the same place. For a streaming op the body
         // declines, rendered through the same per-service pre-dispatch envelope
         // the sequence uses, so the two never diverge.
         let run_body = if is_streaming_output {
             quote! {
-                let _ = (self, svc, req, ctx);
+                let _ = (self, ctx);
                 ::smithy_server_runtime::protocol_error_response_with(
-                    #pre_dispatch_protocol,
+                    svc.definition().wire_protocol(req).envelope(),
                     ::aws_smithy_schema_server::ProtocolError::UnknownOperation(
                         #op_name.to_string(),
                     ),
@@ -4122,7 +4228,7 @@ fn smithy_service_impl(
                     svc,
                     req,
                     ctx,
-                    #pre_dispatch_protocol,
+                    svc.definition().wire_protocol(req).envelope(),
                 )
                 .await
             }
@@ -4169,53 +4275,124 @@ fn smithy_service_impl(
         });
     }
 
-    // Build the protocol constructor now that we have the route table
-    let protocol_ctor: proc_macro2::TokenStream = match protocol_kind {
-        "awsJson1_0" => quote! { ::aws_smithy_schema_server::rpc::AwsJson10() },
-        "awsJson1_1" => quote! { ::aws_smithy_schema_server::rpc::AwsJson11() },
-        "rpcv2Cbor" => quote! { ::aws_smithy_schema_server::rpc::Rpcv2Cbor() },
-        "awsQuery" => {
-            let with_ns = match &xml_namespace {
-                Some(ns) => quote! { .with_namespace(#ns) },
-                None => quote! {},
-            };
-            quote! { ::aws_smithy_schema_server::QueryServerProtocol::aws_query()#with_ns }
-        }
-        "ec2Query" => {
-            let with_ns = match &xml_namespace {
-                Some(ns) => quote! { .with_namespace(#ns) },
-                None => quote! {},
-            };
-            quote! { ::aws_smithy_schema_server::QueryServerProtocol::ec2_query()#with_ns }
-        }
-        "restXml" => {
-            let with_ns = match &xml_namespace {
-                Some(ns) => quote! { .with_namespace(#ns) },
-                None => quote! {},
-            };
-            // Only emit the builder call when the model actually sets the flag,
-            // so a service without it generates the exact same constructor as
-            // before (the default is already wrapped).
-            let with_no_wrap = if no_error_wrapping {
-                quote! { .with_no_error_wrapping(true) }
-            } else {
-                quote! {}
-            };
-            quote! {
-                ::aws_smithy_schema_server::RestXmlServerProtocol::new(&[
-                    #(#route_entries),*
-                ])#with_ns #with_no_wrap
+    // One codec per protocol. Built after the operation loop because a REST
+    // codec carries the route table the loop collected.
+    let protocol_ctor_of = |kind: ProtocolKind| -> proc_macro2::TokenStream {
+        let with_namespace = match &xml_namespace {
+            Some(ns) => quote! { .with_namespace(#ns) },
+            None => quote! {},
+        };
+        match kind {
+            ProtocolKind::AwsJson10 => quote! { ::aws_smithy_schema_server::rpc::AwsJson10() },
+            ProtocolKind::AwsJson11 => quote! { ::aws_smithy_schema_server::rpc::AwsJson11() },
+            ProtocolKind::RpcV2Cbor => quote! { ::aws_smithy_schema_server::rpc::Rpcv2Cbor() },
+            ProtocolKind::AwsQuery => {
+                quote! { ::aws_smithy_schema_server::QueryServerProtocol::aws_query()#with_namespace }
+            }
+            ProtocolKind::Ec2Query => {
+                quote! { ::aws_smithy_schema_server::QueryServerProtocol::ec2_query()#with_namespace }
+            }
+            ProtocolKind::RestXml => {
+                // Only emit the builder call when the model sets the flag: the
+                // codec's default is the wrapped error envelope.
+                let with_no_wrap = if no_error_wrapping {
+                    quote! { .with_no_error_wrapping(true) }
+                } else {
+                    quote! {}
+                };
+                quote! {
+                    ::aws_smithy_schema_server::RestXmlServerProtocol::new(&[
+                        #(#route_entries),*
+                    ])#with_namespace #with_no_wrap
+                }
+            }
+            ProtocolKind::RestJson1 => {
+                quote! {
+                    ::aws_smithy_schema_server::RestJsonServerProtocol::new(&[
+                        #(#route_entries),*
+                    ])
+                }
             }
         }
-        "restJson1" => {
-            quote! {
-                ::aws_smithy_schema_server::RestJsonServerProtocol::new(&[
-                    #(#route_entries),*
-                ])
-            }
-        }
-        _ => unreachable!(),
     };
+
+    // One error format per protocol: the envelope a framework-level failure
+    // (validation, an unrouted operation, a malformed body) is rendered in.
+    // Pre-dispatch protocol-error rendering lives in the runtime crate
+    // (`smithy_server_runtime::pre_dispatch`), so it is compiled once for the
+    // whole workspace; the macro emits only the protocol selector, whose only
+    // per-service inputs are the protocol and (restXml only) the
+    // `@xmlNamespace`. See that module's doc comment for the per-protocol
+    // status/code asymmetries. ec2Query selects the ec2 shape of the query
+    // error envelope.
+    let envelope_of = |kind: ProtocolKind| -> proc_macro2::TokenStream {
+        match kind {
+            ProtocolKind::RestXml => {
+                let xmlns = match &xml_namespace {
+                    Some(ns) => quote! { Some(#ns) },
+                    None => quote! { None },
+                };
+                quote! {
+                    ::smithy_server_runtime::PreDispatchProtocol::RestXml {
+                        xml_namespace: #xmlns,
+                        no_error_wrapping: #no_error_wrapping,
+                    }
+                }
+            }
+            ProtocolKind::RpcV2Cbor => {
+                quote! { ::smithy_server_runtime::PreDispatchProtocol::RpcV2Cbor }
+            }
+            ProtocolKind::AwsQuery => {
+                quote! { ::smithy_server_runtime::PreDispatchProtocol::Query { ec2: false } }
+            }
+            ProtocolKind::Ec2Query => {
+                quote! { ::smithy_server_runtime::PreDispatchProtocol::Query { ec2: true } }
+            }
+            // The awsJson family and restJson1 share one envelope, parameterised
+            // by the protocol's content type; only restJson1 resolves an error
+            // shape from `x-amzn-errortype`.
+            ProtocolKind::AwsJson10 | ProtocolKind::AwsJson11 | ProtocolKind::RestJson1 => {
+                let content_type = content_type_of(kind)
+                    .expect("every JSON protocol has an entry in the content-type table");
+                let errortype_header = kind == ProtocolKind::RestJson1;
+                quote! {
+                    ::smithy_server_runtime::PreDispatchProtocol::Json {
+                        content_type: #content_type,
+                        errortype_header: #errortype_header,
+                    }
+                }
+            }
+        }
+    };
+
+    // The marker a request names the protocol by, as the argument of
+    // `DeclaredProtocol::new`.
+    let marker_of = |marker: Option<ProtocolRequestMarker>| -> proc_macro2::TokenStream {
+        match marker {
+            Some(marker) => {
+                let variant = marker.wire_protocol_kind_variant();
+                quote! { ::std::option::Option::Some(::smithy_server_runtime::WireProtocolKind::#variant) }
+            }
+            None => quote! { ::std::option::Option::None },
+        }
+    };
+
+    // Every declared protocol, each built by the same three functions.
+    let declared_protocols: Vec<proc_macro2::TokenStream> = protocols
+        .iter()
+        .map(|protocol| {
+            let marker = marker_of(protocol.marker);
+            let codec = protocol_ctor_of(protocol.kind);
+            let envelope = envelope_of(protocol.kind);
+            quote! {
+                ::smithy_server_runtime::DeclaredProtocol::new(
+                    #marker,
+                    ::std::boxed::Box::new(#codec),
+                    #envelope,
+                )
+            }
+        })
+        .collect();
 
     // ========================================================================
     // Generated-service-entry assembly.
@@ -4252,7 +4429,7 @@ fn smithy_service_impl(
     let generate_service_and_operations = quote! {
         #struct_vis struct #service_entry_name<__Eng: ::std::marker::Send + ::std::marker::Sync + 'static> {
             identity: ::smithy_server_runtime::ServiceIdentity,
-            protocol: ::std::boxed::Box<dyn ::smithy_server_runtime::ServerHttpProtocol>,
+            protocols: ::smithy_server_runtime::DeclaredProtocols,
             routing_table: ::smithy_server_runtime::OperationRoutingTable,
             // Keeps `__Eng` used even for a zero-operation service, whose routing
             // table names no `__Eng`. `fn() -> __Eng` so the marker never adds a
@@ -4277,7 +4454,9 @@ fn smithy_service_impl(
                         #service_shape_id,
                         #signing_name,
                     ),
-                    protocol: ::std::boxed::Box::new(#protocol_ctor),
+                    protocols: ::smithy_server_runtime::DeclaredProtocols::new(
+                        ::std::vec![#(#declared_protocols),*],
+                    ),
                     routing_table,
                     __engine_marker: ::core::marker::PhantomData,
                 }
@@ -4290,12 +4469,12 @@ fn smithy_service_impl(
                 &self.identity
             }
 
-            /// This service's wire protocol. Reached through the
-            /// `ErasedServiceDefinition` the scaffolded `Service::definition` hands
-            /// back; the centralized dispatch reads it to resolve a request's
-            /// routing key before consulting the routing table.
+            /// The legacy request-independent codec; see
+            /// `smithy_server_runtime::ErasedServiceDefinition::protocol` for
+            /// which codec it is, what to call instead, and why it is not
+            /// marked deprecated.
             pub fn protocol(&self) -> &dyn ::smithy_server_runtime::ServerHttpProtocol {
-                self.protocol.as_ref()
+                self.protocols.first_declared()
             }
 
             /// This service's model-derived operation routing table, built once
@@ -4324,39 +4503,59 @@ fn smithy_service_impl(
                 &self,
                 req: &::aws_smithy_runtime_api::http::Request,
             ) -> ::aws_smithy_runtime_api::http::Response {
-                use ::smithy_server_runtime::ServerProtocol;
-                let __err = match self.protocol.routing_key(req) {
-                    ::std::result::Result::Ok(op) => {
-                        ::aws_smithy_schema_server::ProtocolError::UnknownOperation(op.to_string())
-                    }
-                    ::std::result::Result::Err(e) => e,
-                };
-                ::smithy_server_runtime::protocol_error_response(#pre_dispatch_protocol, __err)
+                self.wire_protocol(req).routing_error_response(req)
             }
 
-            /// Render an arbitrary framework-level `ProtocolError` in THIS
-            /// service's own protocol envelope. The default the orchestrator
+            /// The protocol `req` is served in: its codec and error envelope. A
+            /// service that declares one protocol serves every request in it; one
+            /// that declares several serves the protocol the request's headers
+            /// name, and refuses a request that names none of them (see
+            /// `smithy_server_runtime::wire_protocol`). Reached through the
+            /// `ErasedServiceDefinition`; the router and every operation read it,
+            /// so each step of a request uses one protocol.
+            pub fn wire_protocol(
+                &self,
+                req: &::aws_smithy_runtime_api::http::Request,
+            ) -> ::smithy_server_runtime::WireProtocol<'_> {
+                self.protocols.select(req)
+            }
+
+            /// Render an arbitrary framework-level `ProtocolError` for `req` in
+            /// the envelope of the protocol `req` is served in. The default the orchestrator
             /// renders when a service does not override it via
             /// `Service::override_framework_error`; reached through the
             /// `ErasedServiceDefinition`. Model-derived,
             /// not an author seam: a transport-level failure the router detects up
             /// front (e.g. a malformed `aws-chunked` body, stripped once before any
-            /// protocol reads it) is rendered through the SAME per-service
-            /// pre-dispatch declaration `routing_error_response` uses, so a
+            /// protocol reads it) is rendered through the SAME envelope
+            /// `routing_error_response` uses for `req`, so a
             /// transport-level refusal and a routing refusal cannot answer in
             /// different envelopes.
             pub fn framework_error_response(
                 &self,
                 error: ::aws_smithy_schema_server::ProtocolError,
+                req: &::aws_smithy_runtime_api::http::Request,
             ) -> ::aws_smithy_runtime_api::http::Response {
-                ::smithy_server_runtime::protocol_error_response(#pre_dispatch_protocol, error)
+                self.wire_protocol(req).framework_error_response(error)
+            }
+
+            /// `framework_error_response` worded as the service chose through
+            /// `Service::override_refusal`, in the envelope of the protocol `req`
+            /// is served in. Reached through the `ErasedServiceDefinition`.
+            pub fn refusal_response(
+                &self,
+                error: ::aws_smithy_schema_server::ProtocolError,
+                chosen: ::std::option::Option<::smithy_server_runtime::Refused>,
+                req: &::aws_smithy_runtime_api::http::Request,
+            ) -> ::aws_smithy_runtime_api::http::Response {
+                self.wire_protocol(req).refusal_response(error, chosen)
             }
         }
 
         // The engine-erased view the router reads this entry through. The
         // scaffolded `Service::definition` hands back `&self.entry` as a
-        // `&dyn ErasedServiceDefinition`, so the router reads identity, protocol,
-        // routing table, and the protocol-correct error renderers off a
+        // `&dyn ErasedServiceDefinition`, so the router reads identity, wire
+        // protocol, routing table, and the protocol-correct error renderers off a
         // `&dyn Service` without naming `__Eng`. Each method delegates to the
         // inherent method above — the inherent form stays the single home of the
         // body so the entry is also usable by its concrete type.
@@ -4385,16 +4584,25 @@ fn smithy_service_impl(
             fn framework_error_response(
                 &self,
                 error: ::aws_smithy_schema_server::ProtocolError,
+                req: &::aws_smithy_runtime_api::http::Request,
             ) -> ::aws_smithy_runtime_api::http::Response {
-                #service_entry_name::framework_error_response(self, error)
+                #service_entry_name::framework_error_response(self, error, req)
             }
 
             fn refusal_response(
                 &self,
                 error: ::aws_smithy_schema_server::ProtocolError,
                 chosen: ::std::option::Option<::smithy_server_runtime::Refused>,
+                req: &::aws_smithy_runtime_api::http::Request,
             ) -> ::aws_smithy_runtime_api::http::Response {
-                ::smithy_server_runtime::protocol_error_response_with(#pre_dispatch_protocol, error, chosen)
+                #service_entry_name::refusal_response(self, error, chosen, req)
+            }
+
+            fn wire_protocol(
+                &self,
+                req: &::aws_smithy_runtime_api::http::Request,
+            ) -> ::smithy_server_runtime::WireProtocol<'_> {
+                #service_entry_name::wire_protocol(self, req)
             }
         }
 
@@ -5502,5 +5710,103 @@ mod default_and_schema_const_tests {
 
         assert!(usable_default(Some(&parse("{}"))).is_none());
         assert!(usable_default(None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod protocol_list_tests {
+    use super::*;
+
+    use ProtocolKind::{AwsJson10, AwsJson11, AwsQuery, Ec2Query, RestJson1, RestXml, RpcV2Cbor};
+
+    /// The table entry for each of `kinds`, in order.
+    fn protocols(kinds: &[ProtocolKind]) -> Vec<Protocol> {
+        kinds
+            .iter()
+            .map(|kind| {
+                *PROTOCOLS
+                    .iter()
+                    .find(|protocol| protocol.kind == *kind)
+                    .unwrap_or_else(|| panic!("{kind} is in the protocol table"))
+            })
+            .collect()
+    }
+
+    fn accepted(kinds: &[ProtocolKind]) {
+        assert_eq!(check_protocols(&protocols(kinds)), Ok(()), "{kinds:?}");
+    }
+
+    fn refused(kinds: &[ProtocolKind]) -> String {
+        check_protocols(&protocols(kinds)).expect_err(&format!("{kinds:?} must be refused"))
+    }
+
+    #[test]
+    fn every_protocol_is_accepted_alone() {
+        for protocol in PROTOCOLS {
+            assert_eq!(check_protocols(&[protocol]), Ok(()), "{protocol:?}");
+        }
+    }
+
+    #[test]
+    fn protocols_with_different_markers_are_accepted_together() {
+        accepted(&[AwsJson10, RpcV2Cbor]);
+        accepted(&[AwsJson11, RpcV2Cbor]);
+        accepted(&[AwsJson10, RpcV2Cbor, AwsQuery]);
+        accepted(&[AwsJson11, RpcV2Cbor, Ec2Query]);
+    }
+
+    #[test]
+    fn two_json_versions_share_a_marker_and_are_refused() {
+        let problem = refused(&[AwsJson10, AwsJson11]);
+        assert!(
+            problem.contains("awsJson1_0") && problem.contains("awsJson1_1"),
+            "{problem}"
+        );
+    }
+
+    #[test]
+    fn two_query_flavours_share_a_marker_and_are_refused() {
+        let problem = refused(&[AwsQuery, Ec2Query]);
+        assert!(
+            problem.contains("awsQuery") && problem.contains("ec2Query"),
+            "{problem}"
+        );
+    }
+
+    #[test]
+    fn a_collision_is_found_among_other_protocols() {
+        refused(&[AwsJson10, RpcV2Cbor, AwsJson11]);
+    }
+
+    #[test]
+    fn a_rest_protocol_with_any_other_protocol_is_refused() {
+        for rest in [RestJson1, RestXml] {
+            for other in [AwsJson10, RpcV2Cbor, AwsQuery] {
+                let problem = refused(&[other, rest]);
+                assert!(
+                    problem.contains(rest.name()) && problem.contains("no protocol marker"),
+                    "{problem}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_rest_protocols_are_refused() {
+        refused(&[RestXml, RestJson1]);
+    }
+
+    #[test]
+    fn the_protocol_table_lists_each_kind_once_with_its_trait() {
+        let kinds: HashSet<ProtocolKind> = PROTOCOLS.iter().map(|protocol| protocol.kind).collect();
+        assert_eq!(kinds.len(), PROTOCOLS.len());
+        for protocol in PROTOCOLS {
+            let shape_id = protocol.trait_id.shape_id();
+            assert!(
+                shape_id.ends_with(&format!("#{}", protocol.kind)),
+                "{}: {shape_id}",
+                protocol.kind
+            );
+        }
     }
 }

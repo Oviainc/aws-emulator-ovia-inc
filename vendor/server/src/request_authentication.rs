@@ -7,7 +7,7 @@
 
 use aws_sigv4::http_request::{PercentEncodingMode, SignableBody, SignableRequest, sign};
 use aws_sigv4::http_request::{SignatureLocation, SigningSettings, UriPathNormalizationMode};
-use crate::aws_credentials::{SECRET_ACCESS_KEY, SIGV4_SCHEME};
+use crate::aws_credentials::{SECRET_ACCESS_KEY, SESSION_TOKEN, SIGV4_SCHEME};
 use crate::credential_store::{CredentialStore, random_from, same_secret};
 use std::time::{Duration, SystemTime};
 
@@ -87,6 +87,18 @@ const SIGNATURE_MISMATCH: Denied = Denied {
     code: "SignatureDoesNotMatch",
     message: "The request signature does not match",
 };
+const REQUEST_TIME_TOO_SKEWED: Denied = Denied {
+    code: "RequestTimeTooSkewed",
+    message: "The difference between the request time and the current time is too large",
+};
+
+const INVALID_SESSION_TOKEN: Denied = Denied {
+    code: "InvalidClientTokenId",
+    message: "The security token included in the request is invalid",
+};
+
+/// How far a header-signed request's `x-amz-date` may be from this clock, as AWS allows.
+const MAX_CLOCK_SKEW: Duration = Duration::from_secs(15 * 60);
 
 static AUTHENTICATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -137,29 +149,16 @@ impl SigV4Authenticator {
         signed: &Signature,
         secret: &str,
     ) -> Option<String> {
-        let [key, _, region, service, _] = &signed.scope[..] else {
-            return None;
-        };
-        let credentials = aws_credential_types::Credentials::builder().provider_name("emulator");
-        let credentials = credentials.access_key_id(key).secret_access_key(secret);
-        let identity = credentials.build().into();
-        let settings = signing_settings(service, signed.expires_secs);
-        let params = aws_sigv4::sign::v4::SigningParams::builder().identity(&identity);
-        let params = params.region(region).name(service).settings(settings);
-        let params = params
-            .time(parse_amz_date(&signed.amz_date)?)
-            .build()
-            .ok()?;
-        let headers = signed.headers.iter().filter(|name| *name != X_AMZ_DATE);
-        let headers = headers.flat_map(|name| header_values(parts, name));
-        let (method, uri) = (parts.method.as_str(), signable_uri_with_signed_host(parts, signed)?);
-        let request = SignableRequest::new(method, uri, headers, payload(parts, body, signed));
-        Some(
-            sign(request.ok()?, &params.into())
-                .ok()?
-                .signature()
-                .to_string(),
-        )
+        let settings = signing_settings(signed.signing_name(), signed.expires_secs);
+        with_signing_params(signed, secret, settings, |params| {
+            let headers = signed.headers.iter().filter(|name| *name != X_AMZ_DATE);
+            let headers = headers.flat_map(|name| header_values(parts, name));
+            let uri = signable_uri_with_signed_host(parts, signed)?;
+            let payload = payload(parts, body, signed);
+            let request = SignableRequest::new(parts.method.as_str(), uri, headers, payload);
+            let signing = sign(request.ok()?, &params.into()).ok()?;
+            Some(signing.signature().to_string())
+        })
     }
 }
 
@@ -217,10 +216,18 @@ impl RequestAuthenticator for SigV4Authenticator {
         let (Some(key_id), false) = (scoped_key_id, expired) else {
             return Err(ACCESS_DENIED);
         };
+        if signed.expires_secs.is_none() && !within_clock_skew(&signed.amz_date) {
+            return Err(REQUEST_TIME_TOO_SKEWED);
+        }
         let secret = self.secret_for(key_id, credentials)?;
+        own_session_token_presented(parts, key_id, credentials)?;
         let expected = self.signature_for(parts, body, &signed, &secret);
         let matches = expected.is_some_and(|expected| same_secret(&expected, &signed.value));
-        matches.then_some(()).ok_or(SIGNATURE_MISMATCH)
+        let chunks_match =
+            || !streams_signed_chunks(parts) || chunk_signatures_match(body, &signed, &secret);
+        (matches && chunks_match())
+            .then_some(())
+            .ok_or(SIGNATURE_MISMATCH)
     }
 }
 
@@ -291,6 +298,91 @@ fn presigned_field(parts: &Parts, name: &str) -> Option<String> {
         .filter_map(|item| item.split_once('='));
     let value = pairs.find(|(key, _)| decode(key) == *name)?.1;
     Some(decode(value))
+}
+
+/// A created session credential is served only with its own session token, from the
+/// `x-amz-security-token` header or a presigned URL's `X-Amz-Security-Token`, as AWS serves
+/// temporary credentials. A credential without a session token needs none.
+fn own_session_token_presented(
+    parts: &Parts,
+    key_id: &str,
+    credentials: &CredentialStore,
+) -> Result<(), Denied> {
+    let Ok(expected) = credentials.secret_for(key_id, SIGV4_SCHEME, SESSION_TOKEN) else {
+        return Ok(());
+    };
+    let header = parts.headers.get("x-amz-security-token");
+    let header = header.and_then(|value| value.to_str().ok()).map(str::to_string);
+    let presented = header.or_else(|| presigned_field(parts, "X-Amz-Security-Token"));
+    let matches = presented.is_some_and(|presented| same_secret(&expected, &presented));
+    matches.then_some(()).ok_or(INVALID_SESSION_TOKEN)
+}
+
+/// Calls `with` with the SigV4 signing parameters `signed` names, for `secret`.
+fn with_signing_params<S: Default, T>(
+    signed: &Signature,
+    secret: &str,
+    settings: S,
+    with: impl FnOnce(aws_sigv4::sign::v4::SigningParams<'_, S>) -> Option<T>,
+) -> Option<T> {
+    let [key, _, region, service, _] = &signed.scope[..] else {
+        return None;
+    };
+    let credentials = aws_credential_types::Credentials::builder().provider_name("emulator");
+    let credentials = credentials.access_key_id(key).secret_access_key(secret);
+    let identity = credentials.build().into();
+    let params = aws_sigv4::sign::v4::SigningParams::builder().identity(&identity);
+    let params = params.region(region).name(service).settings(settings);
+    let params = params
+        .time(parse_amz_date(&signed.amz_date)?)
+        .build()
+        .ok()?;
+    with(params)
+}
+
+/// Whether the body is an `aws-chunked` stream whose every chunk is signed
+/// (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, with or without trailers).
+fn streams_signed_chunks(parts: &Parts) -> bool {
+    let declared = parts.headers.get(X_AMZ_CONTENT_SHA256);
+    let declared = declared.and_then(|value| value.to_str().ok());
+    declared.is_some_and(|marker| marker.starts_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"))
+}
+
+/// Every chunk of a signed `aws-chunked` stream carries the signature of its data chained from
+/// the request's own signature, as SDKs sign a streamed payload. A chunk without one, or framing
+/// that cannot be read, fails.
+fn chunk_signatures_match(body: &[u8], signed: &Signature, secret: &str) -> bool {
+    let chained = with_signing_params(signed, secret, (), |params| {
+        let mut previous = signed.value.clone();
+        for (data, signature) in signed_chunks(body)? {
+            let data = bytes::Bytes::copy_from_slice(data);
+            let expected = aws_sigv4::sign::v4::sign_chunk(&data, &previous, &params).ok()?;
+            if !same_secret(expected.signature(), signature) {
+                return Some(false);
+            }
+            previous = signature.to_string();
+        }
+        Some(true)
+    });
+    chained.unwrap_or(false)
+}
+
+/// The data and `chunk-signature` of each chunk of an `aws-chunked` body, through the final
+/// empty chunk; `None` when the framing is malformed or a chunk is unsigned.
+fn signed_chunks(mut body: &[u8]) -> Option<Vec<(&[u8], &str)>> {
+    let mut chunks = Vec::new();
+    loop {
+        let header_end = body.windows(2).position(|pair| pair == b"\r\n")?;
+        let header = std::str::from_utf8(&body[..header_end]).ok()?;
+        let (size, signature) = header.split_once(";chunk-signature=")?;
+        let size = usize::from_str_radix(size, 16).ok()?;
+        let data = body.get(header_end + 2..)?.get(..size)?;
+        chunks.push((data, signature));
+        if size == 0 {
+            return Some(chunks);
+        }
+        body = body.get(header_end + 2 + size..)?.strip_prefix(b"\r\n")?;
+    }
 }
 
 fn header_values<'p>(parts: &'p Parts, name: &'p str) -> impl Iterator<Item = (&'p str, &'p str)> {
@@ -404,6 +496,17 @@ fn parse_amz_date(raw: &str) -> Option<SystemTime> {
     )
 }
 
+fn within_clock_skew(amz_date: &str) -> bool {
+    let Some(signed_at) = parse_amz_date(amz_date) else {
+        return false;
+    };
+    let now = SystemTime::now();
+    let skew = now
+        .duration_since(signed_at)
+        .or_else(|_| signed_at.duration_since(now));
+    skew.is_ok_and(|skew| skew <= MAX_CLOCK_SKEW)
+}
+
 /// Writes `keys` to `<emulator home>/<port>/emulator_credentials` (AWS shared credentials format,
 /// owner-only); the file is removed when the returned guard drops. Refused where the file cannot be
 /// made owner-only (non-Unix), rather than leaving the secret readable by other users.
@@ -428,6 +531,8 @@ pub fn write_emulator_file(port: u16, name: &str, text: &str) -> std::io::Result
     let home = emulator_paths::emulator_home().ok_or(std::io::ErrorKind::NotFound)?;
     let folder = home.join(port.to_string());
     std::fs::create_dir_all(&folder)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&folder, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
     let path = folder.join(name);
     match std::fs::remove_file(&path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),

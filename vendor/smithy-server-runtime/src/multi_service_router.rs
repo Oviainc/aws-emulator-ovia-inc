@@ -111,7 +111,8 @@ impl MultiServiceRouter {
 
     /// Dispatch a buffered request to the one service that claims it.
     ///
-    /// STEP 1 — filter by `can_handle`, require exactly one claimant.
+    /// STEP 1 — filter by `can_handle`, require exactly one claimant; refuse a
+    /// request that names none of the service's protocols.
     /// STEP 2 — name the operation: the service's `override_operation` first,
     /// else the model-derived `routing_table` keyed by the protocol's routing key;
     /// then refuse it unless a registered authenticator its model lists verifies it.
@@ -172,6 +173,23 @@ impl MultiServiceRouter {
         // deserialization see identical bytes.
         let mut rt_req = runtime_api_request_from_parts(&parts, _body.to_vec());
 
+        // The protocol this request is served in (see `crate::wire_protocol`):
+        // every step below, from operation lookup to every error, uses it. Read
+        // from the headers and path alone, so it is decided before the body is
+        // touched. A request that names none of the service's protocols is
+        // refused here, before anything else is done for it: by the author's
+        // `override_routing_error` when it answers, otherwise by the definition's
+        // routing renderer, so a definition that wraps the generated entry answers
+        // it too. `override_operation` is not asked, because the request is never
+        // served.
+        let wire = svc.definition().wire_protocol(&rt_req);
+        if wire.is_unrecognised() {
+            let rt_resp = svc
+                .override_routing_error(&rt_req)
+                .unwrap_or_else(|| svc.definition().routing_error_response(&rt_req));
+            return http_response_from_runtime_api(rt_resp);
+        }
+
         // `aws-chunked` is a transfer encoding, not a payload, so it is stripped
         // once here — before any protocol or the operation lookup reads the body
         // — exactly as an HTTP server strips `Transfer-Encoding: chunked`, and
@@ -186,14 +204,14 @@ impl MultiServiceRouter {
         // never a pass-through that would silently store the framing bytes.
         if let Err(e) = aws_smithy_schema_server::aws_chunked::decode_request(&mut rt_req) {
             // The author's `override_framework_error` gets first refusal; on
-            // `None` the entry renders the protocol-correct default. The error is
+            // `None` the definition renders it in the request's protocol. The error is
             // borrowed by the override and, if it declines, moved into the default
             // renderer — consumed exactly once, so no `Clone` of the non-`Clone`
             // `ProtocolError` is needed.
             let err = aws_smithy_schema_server::ProtocolError::Malformed(e.to_string());
             let rt_resp = svc
                 .override_framework_error(&err)
-                .unwrap_or_else(|| svc.definition().framework_error_response(err));
+                .unwrap_or_else(|| svc.definition().framework_error_response(err, &rt_req));
             return http_response_from_runtime_api(rt_resp);
         }
 
@@ -206,7 +224,7 @@ impl MultiServiceRouter {
         // operation's `run` later deserializes it.
         let op = match svc.override_operation(&rt_req) {
             Some(op) => Some(op),
-            None => match svc.definition().protocol().routing_key(&rt_req) {
+            None => match wire.protocol().routing_key(&rt_req) {
                 Ok(key) => svc.definition().routing_table().get(key),
                 Err(_) => None,
             },
@@ -223,18 +241,24 @@ impl MultiServiceRouter {
                 .unwrap_or_else(|| svc.definition().routing_error_response(&rt_req));
             return http_response_from_runtime_api(rt_resp);
         };
-        if let Err(denied) = self.authenticate(svc, op, &rt_req, &parts, &_body) {
+        let admitted = refuse_cross_site_browsers(&parts);
+        let admitted =
+            admitted.and_then(|()| self.authenticate(svc, wire, op, &rt_req, &parts, &_body));
+        if let Err(denied) = admitted {
             let (code, message) = (denied.code, denied.message);
             let err = aws_smithy_schema_server::ProtocolError::Unauthenticated { code, message };
             let chosen = crate::refusal_of(&err).and_then(|r| svc.override_refusal(&r));
-            return http_response_from_runtime_api(svc.definition().refusal_response(err, chosen));
+            return http_response_from_runtime_api(
+                svc.definition().refusal_response(err, chosen, &rt_req),
+            );
         }
 
         // STEPS 3–11 — run the op against the same request, convert the response
         // back to the buffered `http` shape. The service is passed back into
         // `run` (it was looked up FROM `svc`), so the centralized sequence can read
-        // this service's wire protocol via `svc.definition().protocol()` and
-        // reach its own refusal wording via `Service::override_refusal`.
+        // the protocol this request is served in via
+        // `svc.definition().wire_protocol(req)` and reach its own refusal wording
+        // via `Service::override_refusal`.
         //
         // The handler is handed a callback into this same, live emulator: an
         // `EmbeddedEmulator` over `self` (which is already an SDK transport via
@@ -258,6 +282,7 @@ impl MultiServiceRouter {
     fn authenticate(
         &self,
         svc: &dyn Service,
+        wire: crate::WireProtocol<'_>,
         op: &dyn ErasedOperation,
         rt_req: &RtRequest,
         parts: &http::request::Parts,
@@ -266,7 +291,7 @@ impl MultiServiceRouter {
         if self.authenticators.is_empty() {
             return Ok(());
         }
-        let schemes = modeled_operation(svc, rt_req)
+        let schemes = modeled_operation(svc, wire, rt_req)
             .and_then(|modeled| modeled.auth_schemes())
             .or_else(|| op.auth_schemes());
         if schemes.is_some_and(<[_]>::is_empty) {
@@ -278,9 +303,41 @@ impl MultiServiceRouter {
     }
 }
 
-/// The operation the model's routing table names for the request's routing key.
-fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dyn ErasedOperation> {
-    let key = svc.definition().protocol().routing_key(req).ok()?;
+/// What a browser request from another site is refused with.
+const CROSS_SITE_REFUSED: emulator_server::request_authentication::Denied =
+    emulator_server::request_authentication::Denied {
+        code: "AccessDenied",
+        message: "Requests a browser sends from another site are refused",
+    };
+
+/// Refuses a request a browser sent from another site (its `Origin` or `Sec-Fetch-Site` says so),
+/// before authentication, so a web page the developer visits cannot drive the emulator, even an
+/// operation served unsigned. SDKs and CLIs send neither header.
+fn refuse_cross_site_browsers(
+    parts: &http::request::Parts,
+) -> Result<(), emulator_server::request_authentication::Denied> {
+    let header = |name| parts.headers.get(name).and_then(|value| value.to_str().ok());
+    let origins = emulator_server::RemoteOrigins::SameOriginOnly;
+    let verdict = emulator_server::classify_browser_request(
+        header("origin"),
+        header("sec-fetch-site"),
+        &origins,
+        false,
+    );
+    match verdict {
+        emulator_server::BrowserVerdict::Allow => Ok(()),
+        emulator_server::BrowserVerdict::Forbid(_) => Err(CROSS_SITE_REFUSED),
+    }
+}
+
+/// The operation the model's routing table names for the request's routing key,
+/// read in the protocol the request is served in.
+fn modeled_operation<'s>(
+    svc: &'s dyn Service,
+    wire: crate::WireProtocol<'_>,
+    req: &RtRequest,
+) -> Option<&'s dyn ErasedOperation> {
+    let key = wire.protocol().routing_key(req).ok()?;
     svc.definition().routing_table().get(key)
 }
 
@@ -491,8 +548,8 @@ mod tests {
             &self.identity
         }
 
-        fn protocol(&self) -> &dyn crate::service::ServerHttpProtocol {
-            unreachable!("selection answers before the protocol is read")
+        fn protocol(&self) -> &dyn crate::ServerHttpProtocol {
+            unreachable!("the framework never reads the legacy protocol accessor")
         }
 
         fn routing_table(&self) -> &crate::service::OperationRoutingTable {
@@ -509,8 +566,13 @@ mod tests {
         fn framework_error_response(
             &self,
             _error: aws_smithy_schema_server::ProtocolError,
+            _req: &RtRequest,
         ) -> aws_smithy_runtime_api::http::Response {
             unreachable!("selection answers before a framework error is rendered")
+        }
+
+        fn wire_protocol(&self, _req: &RtRequest) -> crate::WireProtocol<'_> {
+            unreachable!("selection answers before the wire protocol is read")
         }
     }
 

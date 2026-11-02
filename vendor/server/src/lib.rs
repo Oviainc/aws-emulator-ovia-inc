@@ -37,7 +37,7 @@ pub use listener_guard::{
 };
 pub use listeners::{
     Listeners, ListenerConn, ListenerStream, HttpHandler, HttpPolicy, NativeHandler,
-    ResourceListener,
+    ResourceListener, TlsUpgrader,
 };
 
 /// Extract AWS Access Key ID from SigV4 Authorization header.
@@ -875,6 +875,16 @@ pub async fn serve_on_ephemeral_port<S: EmulatorService>(service: S) -> (String,
 /// stream. A larger request is answered `413 Payload Too Large`.
 const MAX_PRODUCTION_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// How long a client on the production data port may take to send a request's
+/// headers before its connection is closed, so a client that opens connections
+/// and trickles their headers cannot hold them open.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a client on the production data port may take to send a request's
+/// body before it is answered `408 Request Timeout`, for the same reason.
+const BODY_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(listener_caps::HTTP_REQUEST_DEADLINE_SECS);
+
 /// Errors from the long-lived [`serve_production`] path.
 #[derive(Debug)]
 pub enum ServeError {
@@ -925,19 +935,49 @@ async fn emulator_service_fallback<S: EmulatorService>(
     req: axum::extract::Request,
 ) -> axum::response::Response {
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, MAX_PRODUCTION_BODY_BYTES).await {
+    let body_bytes = match read_production_body(body).await {
         Ok(b) => b,
-        Err(_) => {
+        Err(status) => {
             return axum::response::Response::builder()
-                .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                .status(status)
                 .body(axum::body::Body::empty())
-                .expect("static 413 response is always valid");
+                .expect("a status-only response is always valid");
         }
     };
     let emulator_req = http::Request::from_parts(parts, body_bytes);
     let emulator_resp = service.handle_request(emulator_req).await;
     let (resp_parts, resp_body) = emulator_resp.into_parts();
     axum::response::Response::from_parts(resp_parts, axum::body::Body::from(resp_body))
+}
+
+/// Buffers a request body: declared past [`MAX_PRODUCTION_BODY_BYTES`] it is a `413` before any
+/// of it is read, past the cap as it arrives a `413`, not finished within [`BODY_READ_TIMEOUT`] a
+/// `408`, and unreadable (a reset or malformed stream) a `400`.
+async fn read_production_body(body: axum::body::Body) -> Result<bytes::Bytes, http::StatusCode> {
+    let declared = axum::body::HttpBody::size_hint(&body).exact();
+    if declared.is_some_and(|length| length > MAX_PRODUCTION_BODY_BYTES as u64) {
+        return Err(refused_unread(body));
+    }
+    let read = axum::body::to_bytes(body, MAX_PRODUCTION_BODY_BYTES);
+    match tokio::time::timeout(BODY_READ_TIMEOUT, read).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) if is_over_the_size_cap(&error) => Err(http::StatusCode::PAYLOAD_TOO_LARGE),
+        Ok(Err(_)) => Err(http::StatusCode::BAD_REQUEST),
+        Err(_) => Err(http::StatusCode::REQUEST_TIMEOUT),
+    }
+}
+
+fn is_over_the_size_cap(error: &axum::Error) -> bool {
+    let cause = std::error::Error::source(error);
+    cause.is_some_and(|cause| cause.is::<http_body_util::LengthLimitError>())
+}
+
+/// A `413` before an over-cap declared body is read; the rest is dropped so its client reads it.
+fn refused_unread(mut body: axum::body::Body) -> http::StatusCode {
+    let discard =
+        async move { while let Some(Ok(_)) = http_body_util::BodyExt::frame(&mut body).await {} };
+    tokio::spawn(tokio::time::timeout(BODY_READ_TIMEOUT, discard));
+    http::StatusCode::PAYLOAD_TOO_LARGE
 }
 
 /// Default data (HTTPS) listener port when [`DATA_PORT_ENV`] is unset — the
@@ -1159,12 +1199,9 @@ pub async fn serve_production_on_address<S: EmulatorService>(
         ip => ip,
     };
     let cert = self_signed_certificate(client_host).map_err(|e| ServeError::Tls(e.to_string()))?;
-    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
-        cert.cert.pem().into_bytes(),
-        cert.key_pair.serialize_pem().into_bytes(),
-    )
-    .await
-    .map_err(|e| ServeError::Tls(e.to_string()))?;
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(
+        data_listener_tls_config(&cert).map_err(|e| ServeError::Tls(e.to_string()))?,
+    );
 
     // Bind before announcing so the logged address is the REAL post-bind port
     // — essential when the port is `0` (OS-assigned).
@@ -1181,6 +1218,9 @@ pub async fn serve_production_on_address<S: EmulatorService>(
             .with_state(Arc::new(service)),
     );
 
+    // Listen before publishing: a client that stops the emulator once it sees the published
+    // files must get a clean stop, which removes them, not the signal's default exit.
+    let shutdown = shutdown_signal();
     let credentials_file = match SigV4Authenticator::minted_credentials() {
         Some(keys) => Some(
             request_authentication::write_credentials_file(keys, data_addr.port())
@@ -1212,12 +1252,17 @@ pub async fn serve_production_on_address<S: EmulatorService>(
         telemetry.mark_ready();
     }
 
+    let mut data_server = axum_server::from_tcp_rustls(data_listener, tls_config);
+    data_server
+        .http_builder()
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT);
     tokio::select! {
-        result = axum_server::from_tcp_rustls(data_listener, tls_config)
-            .serve(data_router.into_make_service()) => {
+        result = data_server.serve(data_router.into_make_service()) => {
             result.map_err(ServeError::Io)?;
         }
-        _ = shutdown_signal() => {
+        _ = shutdown => {
             tracing::info!("shutdown signal received; stopping emulator server");
         }
         _ = cli::idle_timeout_reached() => {
@@ -1235,6 +1280,35 @@ fn self_signed_certificate(client_host: IpAddr) -> Result<rcgen::CertifiedKey, r
     rcgen::generate_simple_self_signed(names)
 }
 
+/// ALPN protocols the data listener offers: HTTP/1.1 only.
+///
+/// The server stack answers `Expect: 100-continue` with an interim
+/// `100 Continue` on HTTP/1.1, but not on HTTP/2. A client that negotiates `h2`
+/// and sends `Expect: 100-continue` (the AWS SDK for Kotlin does for S3 bodies
+/// of 2 MiB or more) holds the body back waiting for that interim response,
+/// while the emulator waits for the body, so the request stalls until the
+/// client times out. Offering only `http/1.1` keeps every client on the path
+/// that answers it, which also matches the S3 endpoints these clients target.
+/// Every request on this listener is fully buffered, so nothing here relies on
+/// HTTP/2 streaming.
+const DATA_LISTENER_ALPN: &[&[u8]] = &[b"http/1.1"];
+
+/// The rustls server config for the data listener: the self-signed `cert`, no
+/// client auth, and [`DATA_LISTENER_ALPN`].
+fn data_listener_tls_config(
+    cert: &rcgen::CertifiedKey,
+) -> Result<Arc<rustls::ServerConfig>, rustls::Error> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(cert.cert.der().to_vec())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())),
+        )?;
+    config.alpn_protocols = DATA_LISTENER_ALPN.iter().map(|p| p.to_vec()).collect();
+    Ok(Arc::new(config))
+}
+
 /// The AWS shared config (`AWS_CONFIG_FILE`) that points an SDK or the CLI at this emulator.
 fn shared_config_text(endpoint: SocketAddr, ca_file: &std::path::Path) -> String {
     let ca_file = ca_file.display();
@@ -1244,31 +1318,37 @@ fn shared_config_text(endpoint: SocketAddr, ca_file: &std::path::Path) -> String
     )
 }
 
-/// Wait for a shutdown signal (Ctrl+C, or SIGTERM on Unix — the signal ECS
-/// `StopTask` sends before the SIGKILL grace period) so the emulator stops
-/// cleanly between sweeps instead of being force-killed.
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-
-    #[cfg(unix)]
-    {
-        let mut sigterm =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => {
-                    let _ = ctrl_c.await;
-                    return;
-                }
-            };
+/// Listen for a shutdown signal (SIGTERM or Ctrl+C) from now on, so a stop request ends the
+/// emulator cleanly instead of by the signal's default action. Each signal is listened for on its
+/// own, so one that cannot be registered does not disable the other. The returned future
+/// completes once one arrives, even if it arrived before the future was polled.
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let terminate = signal(SignalKind::terminate()).ok();
+    let interrupt = signal(SignalKind::interrupt()).ok();
+    async move {
         tokio::select! {
-            _ = ctrl_c => {}
-            _ = sigterm.recv() => {}
+            _ = signal_received(terminate) => {}
+            _ = signal_received(interrupt) => {}
         }
     }
+}
 
-    #[cfg(not(unix))]
-    {
-        let _ = ctrl_c.await;
+/// Completes when `listening` receives its signal; never, when it could not be registered.
+#[cfg(unix)]
+async fn signal_received(listening: Option<tokio::signal::unix::Signal>) {
+    match listening {
+        Some(mut listening) => drop(listening.recv().await),
+        None => std::future::pending().await,
+    }
+}
+
+/// [`shutdown_signal`] where only Ctrl+C exists.
+#[cfg(not(unix))]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    async {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

@@ -463,6 +463,15 @@ emulator-core-build-support = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
+# What the emulator_core test target in tests/emulator_core/ uses.
+reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-webpki = { workspace = true }
+aws-sigv4 = { workspace = true }
+aws-credential-types = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true }
 
 [lints]
 workspace = true

@@ -194,6 +194,8 @@ fn suites_under_all(all_dir: &Path) -> Vec<String> {
 pub fn check_integration_test_layout() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     check_test_layout(&manifest_dir);
+    // The vendored suite skips some checks unless this is set, as the core library sets it.
+    println!("cargo::rustc-check-cfg=cfg(emulator_full_security_suite)");
 }
 
 /// Generate the `#[smithy_service]` decl and ops module for one service crate.

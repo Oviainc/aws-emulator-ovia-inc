@@ -603,8 +603,14 @@ pub struct Constraints {
     /// Older `@enum` string-constraint value set. Applies to plain `string`
     /// members (NOT typed `enum` shapes, which codegen handles separately).
     pub enum_values: Option<Vec<String>>,
+    /// Whether `enum_values` match without regard to ASCII case. Set only for a header
+    /// the service serves in the case its clients send (see
+    /// [`binds_a_client_cased_header`]); every other value set is matched exactly.
+    pub enum_ignores_case: bool,
     /// `@uniqueItems`. Applies to list.
     pub unique_items: bool,
+    /// `@sensitive`: a violation never shows the value. Applies to every kind.
+    pub sensitive: bool,
 }
 
 impl Constraints {
@@ -615,6 +621,7 @@ impl Constraints {
             && self.pattern.is_none()
             && self.enum_values.is_none()
             && !self.unique_items
+            && !self.sensitive
     }
 }
 
@@ -654,8 +661,31 @@ pub fn extract_constraints(smithy_member: &Value, model: &HashMap<String, Value>
     }
     if c.enum_values.is_some() && binds_a_negotiated_header(smithy_member) {
         c.enum_values = None;
+    } else if c.enum_values.is_some() && binds_a_client_cased_header(smithy_member) {
+        c.enum_ignores_case = true;
     }
     c
+}
+
+/// Whether the member is bound to an HTTP header whose value AWS's own clients send in a
+/// case the model's value set does not list, and which the service accepts in that case.
+///
+/// `x-amz-checksum-mode` is modeled as the enum `[ENABLED]`, but the AWS Common Runtime
+/// (CRT) S3 client, which the AWS CLI v2 can pick for `aws s3 cp`, `sync` and `mv`, sends
+/// `x-amz-checksum-mode: enabled`, and S3 serves those requests. Enforcing the set as
+/// case-sensitive equality refuses every such download: HeadObject answers a bare 400 and
+/// GetObject a `ValidationException`.
+///
+/// The set is still enforced, but matched without regard to ASCII case: `ENABLED`,
+/// `enabled` and `Enabled` pass, and any other value is refused as before. Every other
+/// bound on the member still applies.
+fn binds_a_client_cased_header(smithy_member: &Value) -> bool {
+    const CLIENT_CASED: [&str; 1] = ["x-amz-checksum-mode"];
+    smithy_member
+        .get("traits")
+        .and_then(|t| t.get("smithy.api#httpHeader"))
+        .and_then(|h| h.as_str())
+        .is_some_and(|name| CLIENT_CASED.contains(&name.to_ascii_lowercase().as_str()))
 }
 
 /// Whether the member is bound to an HTTP header whose own grammar is wider than any
@@ -854,6 +884,10 @@ fn merge_constraint_traits(
     if traits.contains_key("smithy.api#uniqueItems") {
         c.unique_items = true;
     }
+    // `@sensitive` is a marker too, on the member or its target.
+    if traits.contains_key("smithy.api#sensitive") {
+        c.sensitive = true;
+    }
 }
 
 /// Emit the `TraitMap` insert statements for every constraint captured from a
@@ -927,9 +961,14 @@ pub fn emit_constraint_trait_inserts(
     if let Some(values) = &constraints.enum_values {
         if matches!(kind, ShapeKind::String | ShapeKind::Enum) {
             let value_lits = values.iter().map(|v| quote! { #v });
+            let ctor = if constraints.enum_ignores_case {
+                quote! { new_ignoring_case }
+            } else {
+                quote! { new }
+            };
             inserts.push(quote! {
                 m.insert(::std::boxed::Box::new(
-                    ::aws_smithy_schema_server::constraints::EnumTrait::new(&[#(#value_lits),*])
+                    ::aws_smithy_schema_server::constraints::EnumTrait::#ctor(&[#(#value_lits),*])
                 ));
             });
         }
@@ -941,6 +980,13 @@ pub fn emit_constraint_trait_inserts(
             m.insert(::std::boxed::Box::new(
                 ::aws_smithy_schema_server::constraints::UniqueItemsTrait::new()
             ));
+        });
+    }
+
+    // `@sensitive`: any kind, so the walk can hide the value of any violation.
+    if constraints.sensitive {
+        inserts.push(quote! {
+            m.insert(::std::boxed::Box::new(::aws_smithy_schema::traits::SensitiveTrait));
         });
     }
 
@@ -1293,6 +1339,59 @@ mod tests {
             ));
             assert!(c.enum_values.is_none(), "{header} kept the set: {c:?}");
         }
+    }
+
+    /// `x-amz-checksum-mode` is modeled as `[ENABLED]`, but the AWS CLI's CRT S3 client
+    /// sends `enabled` and S3 serves it, so the set is kept and matched without regard to
+    /// case. Any header casing selects it, and a co-declared bound still applies.
+    #[test]
+    fn the_checksum_mode_header_member_matches_its_enum_set_ignoring_case() {
+        for header in ["x-amz-checksum-mode", "X-Amz-Checksum-Mode"] {
+            let c = member_constraints(&format!(
+                r#"{{"target":"test#KeyType","traits":{{"smithy.api#httpHeader":"{header}"}}}}"#
+            ));
+            assert!(c.enum_values.is_some(), "{header} lost the set: {c:?}");
+            assert!(c.enum_ignores_case, "{header} matched exactly: {c:?}");
+        }
+
+        let bounded = member_constraints(
+            r#"{"target":"test#KeyType","traits":{"smithy.api#httpHeader":"x-amz-checksum-mode","smithy.api#length":{"min":1,"max":9}}}"#,
+        );
+        assert!(bounded.enum_values.is_some(), "{bounded:?}");
+        assert!(bounded.enum_ignores_case, "{bounded:?}");
+        assert_eq!(bounded.length, Some((Some(1), Some(9))), "{bounded:?}");
+    }
+
+    /// Case-insensitive matching is for that header alone: any other header, and a
+    /// member bound to none, matches its set exactly.
+    #[test]
+    fn only_the_client_cased_header_matches_ignoring_case() {
+        for member in [
+            r#"{"target":"test#KeyType","traits":{"smithy.api#httpHeader":"x-amz-key-type"}}"#,
+            r#"{"target":"test#KeyType"}"#,
+        ] {
+            let c = member_constraints(member);
+            assert!(c.enum_values.is_some(), "{c:?}");
+            assert!(!c.enum_ignores_case, "{c:?}");
+        }
+    }
+
+    /// The emitted trait is the case-insensitive constructor only when asked for.
+    #[test]
+    fn an_ignore_case_enum_emits_the_ignoring_constructor() {
+        let mut c = Constraints::default();
+        c.enum_values = Some(vec!["ENABLED".to_string()]);
+        let exact = emit_constraint_trait_inserts(&c, &ShapeKind::Enum);
+        assert!(
+            !exact[0].to_string().contains("new_ignoring_case"),
+            "{exact:?}"
+        );
+        c.enum_ignores_case = true;
+        let loose = emit_constraint_trait_inserts(&c, &ShapeKind::Enum);
+        assert!(
+            loose[0].to_string().contains("new_ignoring_case"),
+            "{loose:?}"
+        );
     }
 
     /// The suppression is scoped to enum membership and to those headers only: a

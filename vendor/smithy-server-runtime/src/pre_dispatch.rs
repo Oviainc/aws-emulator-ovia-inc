@@ -29,6 +29,10 @@
 //! | awsQuery / ec2Query | **400** `InvalidAction` | no (falls to `InvalidRequest`) | `text/xml` |
 //! | awsJson / restJson1 | **501** `NotImplemented` | no (falls to `InternalServerError`) | caller-supplied |
 //!
+//! A request that names none of its service's protocols has no protocol to render
+//! in; [`PreDispatchProtocol::Unrecognised`] answers it with one fixed `404`
+//! whatever the error.
+//!
 //! restXml is the only family with a dedicated `Malformed` arm. That is
 //! intentional: a bad `aws-chunked` framing or an unparseable body envelope is
 //! the *client's* fault, and reporting it as `InternalError` would make AWS SDKs
@@ -114,7 +118,7 @@ pub enum PreDispatchProtocol<'a> {
     /// is per-protocol: `application/json` for restJson1, and `-1.0` / `-1.1` for
     /// awsJson1_0 / awsJson1_1 respectively. It is NOT a constant here — naming one
     /// is what made every awsJson1_1 service answer errors with awsJson1_0's
-    /// content-type. The single source is `protocol_content_type` in the macro.
+    /// content-type. The single source is the macro's `content_type_of` table.
     Json {
         content_type: &'a str,
         /// Whether this protocol resolves an error shape from `x-amzn-errortype`.
@@ -122,7 +126,22 @@ pub enum PreDispatchProtocol<'a> {
         /// body's `__type` and real services send no such header on them.
         errortype_header: bool,
     },
+    /// The request names none of the protocols its service declares, so there is
+    /// no protocol to render in. Answered with one fixed, protocol-neutral
+    /// refusal whatever the error: `404`, no `content-type` header, and
+    /// [`UNRECOGNISED_PROTOCOL_BODY`] as the body. This is the answer AWS
+    /// endpoints give such a request.
+    Unrecognised,
 }
+
+/// The body of the refusal for a request that names none of its service's
+/// protocols (see [`PreDispatchProtocol::Unrecognised`]): an empty
+/// `UnknownOperationException` element and one newline.
+pub const UNRECOGNISED_PROTOCOL_BODY: &str = "<UnknownOperationException/>\n";
+
+/// The status of the refusal for a request that names none of its service's
+/// protocols.
+const UNRECOGNISED_PROTOCOL_STATUS: u16 = 404;
 
 /// Render a pre-dispatch [`ProtocolError`] as a wire response in `protocol`'s
 /// error format.
@@ -185,6 +204,7 @@ pub fn refusal_of(error: &ProtocolError) -> Option<Refusal> {
             path: member_name.clone(),
             kind: ViolationKind::MissingRequiredMember,
             value: None,
+            sensitive: false,
         }])),
         ProtocolError::Invalid(violations) => Some(Refusal::Invalid(violations.clone())),
         ProtocolError::Unauthenticated { .. } => Some(Refusal::Unauthenticated),
@@ -221,6 +241,10 @@ pub fn protocol_error_response_with(
             content_type,
             errortype_header,
         } => json(content_type, errortype_header, error, chosen),
+        PreDispatchProtocol::Unrecognised => Response::new(
+            StatusCode::try_from(UNRECOGNISED_PROTOCOL_STATUS).expect("status is a valid constant"),
+            SdkBody::from(UNRECOGNISED_PROTOCOL_BODY),
+        ),
     }
 }
 
@@ -493,6 +517,46 @@ mod tests {
     use super::*;
     use aws_smithy_schema::serde::SerdeError;
 
+    /// A request that names none of its service's protocols is answered with the
+    /// `404` AWS endpoints send: no `content-type`, and an empty
+    /// `UnknownOperationException` element plus one newline as the body.
+    #[test]
+    fn an_unrecognised_request_is_answered_with_a_404_and_no_content_type() {
+        let response = protocol_error_response(
+            PreDispatchProtocol::Unrecognised,
+            ProtocolError::Malformed("x".into()),
+        );
+        assert_eq!(response.status().as_u16(), 404);
+        assert_eq!(response.headers().get("content-type"), None);
+        assert_eq!(
+            response.body().bytes(),
+            Some(&b"<UnknownOperationException/>\n"[..])
+        );
+        assert_eq!(response.body().bytes().map(<[u8]>::len), Some(29));
+    }
+
+    /// The answer does not depend on the error or on a chosen wording: there is no
+    /// protocol to word it in.
+    #[test]
+    fn an_unrecognised_request_ignores_the_error_and_the_chosen_wording() {
+        let chosen = Refused {
+            code: "Reworded".to_string(),
+            message: "reworded".to_string(),
+        };
+        let reworded = protocol_error_response_with(
+            PreDispatchProtocol::Unrecognised,
+            ProtocolError::UnknownOperation("Op".into()),
+            Some(chosen),
+        );
+        let plain = protocol_error_response(
+            PreDispatchProtocol::Unrecognised,
+            ProtocolError::Malformed("other".into()),
+        );
+        assert_eq!(reworded.status(), plain.status());
+        assert_eq!(reworded.headers().get("content-type"), None);
+        assert_eq!(reworded.body().bytes(), plain.body().bytes());
+    }
+
     /// Both validation classes reach the renderer as the same refusal: absence,
     /// found while reading the request, and a bad value, found while walking the
     /// one that was read. Anything else has no structured form.
@@ -507,12 +571,14 @@ mod tests {
                 path: "tableName".to_string(),
                 kind: ViolationKind::MissingRequiredMember,
                 value: None,
+                sensitive: false,
             }]))
         );
         let bad_value = ProtocolError::Invalid(vec![Violation {
             path: "limit".to_string(),
             kind: ViolationKind::MinValue("1".to_string()),
             value: Some("0".to_string()),
+            sensitive: false,
         }]);
         assert!(matches!(refusal_of(&bad_value), Some(Refusal::Invalid(v)) if v.len() == 1));
         assert_eq!(refusal_of(&ProtocolError::Malformed("x".into())), None);
@@ -730,6 +796,7 @@ mod tests {
                     path: "tags".to_string(),
                     kind: aws_smithy_schema_server::ViolationKind::MissingRequiredMember,
                     value: None,
+                    sensitive: false,
                 }]),
                 None,
             ));

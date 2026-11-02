@@ -65,6 +65,9 @@ pub struct Violation {
     /// [`Violation::message`] interpolates it as-is, so a value stored unelided
     /// would amplify a request into an arbitrarily long response.
     pub value: Option<String>,
+    /// The member is `@sensitive`: `value` is `None` and the message names only the path, so the
+    /// value never reaches a response or an author's refusal override.
+    pub sensitive: bool,
 }
 
 /// How a dotted member path is spelled.
@@ -163,6 +166,12 @@ impl Violation {
     /// so a new constraint cannot drift from the others by spelling its own.
     pub fn message(&self) -> String {
         let requirement = self.requirement();
+        if self.sensitive {
+            return format!(
+                "Value at '{}' failed to satisfy constraint: {requirement}",
+                self.path
+            );
+        }
         match &self.value {
             Some(shown) => format!(
                 "Value '{shown}' at '{}' failed to satisfy constraint: {requirement}",
@@ -213,6 +222,7 @@ impl LengthTrait {
                     path: path.to_string(),
                     kind: ViolationKind::MinLength(min),
                     value: Some(echoed(value).into_owned()),
+                    sensitive: false,
                 });
             }
         }
@@ -222,6 +232,7 @@ impl LengthTrait {
                     path: path.to_string(),
                     kind: ViolationKind::MaxLength(max),
                     value: Some(echoed(value).into_owned()),
+                    sensitive: false,
                 });
             }
         }
@@ -284,6 +295,7 @@ impl RangeTrait {
                     path: path.to_string(),
                     kind: ViolationKind::MinValue(render_bound(min)),
                     value: Some(echoed(value).into_owned()),
+                    sensitive: false,
                 });
             }
         }
@@ -293,6 +305,7 @@ impl RangeTrait {
                     path: path.to_string(),
                     kind: ViolationKind::MaxValue(render_bound(max)),
                     value: Some(echoed(value).into_owned()),
+                    sensitive: false,
                 });
             }
         }
@@ -351,6 +364,7 @@ impl PatternTrait {
             path: path.to_string(),
             kind: ViolationKind::Pattern(self.regex.to_string()),
             value: Some(echoed(value).into_owned()),
+            sensitive: false,
         })
     }
 }
@@ -481,6 +495,8 @@ pub struct EnumTrait {
     /// The permitted values, in declaration order (used verbatim in the
     /// message's value-set rendering).
     pub values: &'static [&'static str],
+    /// Whether a value matches one of `values` without regard to ASCII case.
+    pub ignore_case: bool,
 }
 
 impl EnumTrait {
@@ -489,17 +505,38 @@ impl EnumTrait {
 
     /// Construct an `@enum` trait from its permitted value set.
     pub const fn new(values: &'static [&'static str]) -> Self {
-        Self { values }
+        Self {
+            values,
+            ignore_case: false,
+        }
+    }
+
+    /// Construct an `@enum` trait whose values match without regard to ASCII case.
+    ///
+    /// For a header the service serves in the case its clients send, such as
+    /// `x-amz-checksum-mode: enabled` against the modeled `ENABLED`. A value outside the
+    /// set is still refused.
+    pub const fn new_ignoring_case(values: &'static [&'static str]) -> Self {
+        Self {
+            values,
+            ignore_case: true,
+        }
     }
 
     fn check(&self, value: &str, path: &str) -> Option<Violation> {
-        if self.values.contains(&value) {
+        let permitted = if self.ignore_case {
+            self.values.iter().any(|v| v.eq_ignore_ascii_case(value))
+        } else {
+            self.values.contains(&value)
+        };
+        if permitted {
             return None;
         }
         Some(Violation {
             path: path.to_string(),
             kind: ViolationKind::EnumValue(self.values.iter().map(|v| v.to_string()).collect()),
             value: Some(echoed(value).into_owned()),
+            sensitive: false,
         })
     }
 }
@@ -810,14 +847,29 @@ impl ValidatingSerializer {
             // `walk_list`/`walk_map`. The element/value shape's own constraints
             // live in the `ElementConstraintsTrait` wrapper; run those instead.
             if let Some(inner) = element_constraints(schema) {
+                let from = self.violations.len();
                 self.run_leaf_traits(inner, value, len, numeric, &path);
+                self.redact_since(from, holds_sensitive_values(schema));
             }
             return;
         }
         let Some(traits) = schema.traits() else {
             return;
         };
+        let from = self.violations.len();
         self.run_leaf_traits(traits, value, len, numeric, &path);
+        self.redact_since(from, is_sensitive(traits));
+    }
+
+    /// Hides the value of every violation recorded since `from` when the member is `@sensitive`.
+    fn redact_since(&mut self, from: usize, sensitive: bool) {
+        if !sensitive {
+            return;
+        }
+        for violation in &mut self.violations[from..] {
+            violation.value = None;
+            violation.sensitive = true;
+        }
     }
 
     /// Run the length/range/pattern/enum constraints found in `traits` against a
@@ -928,6 +980,20 @@ fn element_constraints(schema: &Schema) -> Option<&TraitMap> {
     let t = schema.traits()?.get(&ElementConstraintsTrait::TRAIT_ID)?;
     let wrapper = t.as_any().downcast_ref::<ElementConstraintsTrait>()?;
     Some(wrapper.inner())
+}
+
+/// `true` if `traits` marks its member `@sensitive`.
+fn is_sensitive(traits: &TraitMap) -> bool {
+    traits
+        .get(&aws_smithy_schema::traits::SensitiveTrait::TRAIT_ID)
+        .is_some()
+}
+
+/// `true` if a collection member or the shape of its elements is `@sensitive`, so no element's
+/// value may be shown.
+fn holds_sensitive_values(schema: &Schema) -> bool {
+    let element = element_constraints(schema);
+    schema.traits().is_some_and(is_sensitive) || element.is_some_and(is_sensitive)
 }
 
 /// `true` if the schema's trait map carries `@uniqueItems`.
@@ -1245,6 +1311,7 @@ impl ValidatingSerializer {
             if let Some(seen) = seen {
                 if let Some(dup) = first_duplicate(&seen) {
                     if !this.done() {
+                        let from = this.violations.len();
                         this.push_violation(Violation {
                             path: list_path.clone(),
                             kind: ViolationKind::UniqueItems,
@@ -1252,7 +1319,9 @@ impl ValidatingSerializer {
                             // caller-supplied and arbitrarily long, and the clause
                             // interpolates it as-is.
                             value: Some(echoed(&dup).into_owned()),
+                            sensitive: false,
                         });
+                        this.redact_since(from, holds_sensitive_values(schema));
                     }
                 }
             }
@@ -1380,6 +1449,7 @@ pub fn missing_member_message(member_path: &str) -> String {
         path,
         kind: ViolationKind::MissingRequiredMember,
         value: None,
+        sensitive: false,
     };
     // One absent member is one violation, so the envelope always renders.
     envelope(&[violation]).unwrap_or_default()
@@ -1792,6 +1862,27 @@ mod tests {
             select: "B".to_string(),
         };
         assert!(validate(&input, &ENUM_INPUT_SCHEMA).is_empty());
+    }
+
+    /// An enum built with `new_ignoring_case` accepts a listed value in any ASCII case and
+    /// still refuses a value outside the set; one built with `new` matches exactly.
+    #[test]
+    fn an_ignoring_case_enum_accepts_any_casing_of_a_listed_value_only() {
+        static MODES: &[&str] = &["ENABLED"];
+        let loose = EnumTrait::new_ignoring_case(MODES);
+        for ok in ["ENABLED", "enabled", "Enabled", "eNaBlEd"] {
+            assert!(loose.check(ok, "ChecksumMode").is_none(), "{ok} refused");
+        }
+        for bad in ["", "xyz", "ENABLE", "enabled ", "DISABLED"] {
+            assert!(
+                loose.check(bad, "ChecksumMode").is_some(),
+                "{bad:?} accepted"
+            );
+        }
+
+        let exact = EnumTrait::new(MODES);
+        assert!(exact.check("ENABLED", "ChecksumMode").is_none());
+        assert!(exact.check("enabled", "ChecksumMode").is_some());
     }
 
     // ---- list element path fidelity + collection @length -------------------

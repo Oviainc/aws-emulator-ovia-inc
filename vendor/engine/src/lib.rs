@@ -22,7 +22,9 @@
 //!   broker, a search engine) may be served by the emulator itself: run the protocol
 //!   server and its engine in-process, and hand a connection handler to
 //!   `engine.listeners().tcp(handler)` (or `.http(handler, policy)` for an HTTP
-//!   resource). The service never binds a socket, chooses a port, or configures TLS
+//!   resource). A protocol that negotiates encryption in-band (PostgreSQL
+//!   `SSLRequest`, MySQL greeting-first) uses `.tcp_plaintext(handler)` and, to
+//!   upgrade, the core-owned `.tls_upgrader()`. The service never binds a socket, chooses a port, or configures TLS
 //!   itself — the core owns the socket, TLS and bind interface and returns the host
 //!   and port to report in the control plane's endpoint fields, so a client connects
 //!   with its normal driver.

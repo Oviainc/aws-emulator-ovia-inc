@@ -8,7 +8,7 @@
 //!   framework-error renderers — is reached (not edited) through one accessor,
 //!   [`Service::definition`], which hands back a [`ErasedServiceDefinition`].
 //! - [`ErasedServiceDefinition`] — the engine-erased, object-safe view of a service's
-//!   generated `ServiceDefinition`, exposing its identity, protocol, routing table,
+//!   generated `ServiceDefinition`, exposing its identity, wire protocol, routing table,
 //!   and default error renderers so the router reads model data off a
 //!   `&dyn Service` without naming the concrete engine the entry is generic over.
 //! - [`ErasedOperation`] — the type-erased, object-safe form of one operation, so
@@ -40,9 +40,9 @@ pub type BoxFuture<'r, T> = Pin<Box<dyn Future<Output = T> + Send + 'r>>;
 /// The runtime-API server protocol every emulated service speaks: HTTP, with
 /// `aws_smithy_runtime_api::http::{Request, Response}` as the message types.
 ///
-/// A `&dyn` of this is what [`ErasedServiceDefinition::protocol`] hands back; the
-/// centralized sequence reads it from the service it is running the operation for, so
-/// the router never names a concrete protocol type.
+/// A `&dyn` of this is what [`WireProtocol::protocol`](crate::WireProtocol::protocol)
+/// hands back; the centralized sequence reads it from the service it is running the
+/// operation for, so the router never names a concrete protocol type.
 pub trait ServerHttpProtocol: ServerProtocol<Request = RtRequest, Response = RtResponse> {}
 impl<P> ServerHttpProtocol for P where P: ServerProtocol<Request = RtRequest, Response = RtResponse> {}
 
@@ -107,7 +107,7 @@ pub trait ErasedOperation: Send + Sync {
     ///
     /// `svc` is the service the router looked this operation up from, passed
     /// back through so the centralized sequence can read the service's wire protocol
-    /// ([`ErasedServiceDefinition::protocol`], reached via [`Service::definition`])
+    /// ([`ErasedServiceDefinition::wire_protocol`], reached via [`Service::definition`])
     /// and reach the service's own refusal wording
     /// ([`Service::override_refusal`]) on a framework-level failure. The protocol
     /// is read off the service's `ServiceDefinition` — the macro-generated carrier the
@@ -195,8 +195,9 @@ impl Default for OperationRoutingTable {
 /// naming that engine. This object-safe trait is the bridge: the
 /// `#[smithy_service]` expansion implements it for `ServiceDefinition<Eng>` for every
 /// `Eng`, and [`Service::definition`] hands back a `&dyn ErasedServiceDefinition`, so
-/// the router reads identity, protocol, routing table, and the protocol-correct
-/// error renderers off a `&dyn Service` through one engine-free surface.
+/// the router reads identity, wire protocol, routing table, and the
+/// protocol-correct error renderers off a `&dyn Service` through one engine-free
+/// surface.
 ///
 /// Every method here is model-derived and NOT an author seam: the values are
 /// baked at codegen from the Smithy model, and the two error renderers reproduce
@@ -208,9 +209,22 @@ pub trait ErasedServiceDefinition {
     /// This service's vended identity: its Smithy shape id and SigV4 signing name.
     fn identity(&self) -> &ServiceIdentity;
 
-    /// This service's wire protocol, as a runtime-API server protocol. The
-    /// centralized dispatch reads it to resolve a request's routing key before
-    /// consulting the [`routing_table`](Self::routing_table).
+    /// Legacy accessor for a codec independent of any request: the codec of the
+    /// service's first declared protocol, in the generated order awsJson1_0,
+    /// awsJson1_1, rpcv2Cbor, awsQuery, ec2Query, restXml, restJson1.
+    ///
+    /// For a service that declares one protocol this is the codec every request
+    /// is served in. For a service that declares several it is the first one, NOT
+    /// the protocol a given request is served in. The framework never calls it;
+    /// it exists so code written against it keeps compiling. Code that serves a
+    /// request calls [`wire_protocol(req)`](Self::wire_protocol)`.protocol()`.
+    ///
+    /// It is deliberately not marked `#[deprecated]`: a tenant's release gate
+    /// runs clippy with warnings denied, so a deprecation warning would stop the
+    /// code this accessor exists for from building.
+    ///
+    /// Required, so a definition that wraps the generated entry forwards it like
+    /// every other method here.
     fn protocol(&self) -> &dyn ServerHttpProtocol;
 
     /// This service's model-derived operation routing table, built once in the
@@ -230,20 +244,26 @@ pub trait ErasedServiceDefinition {
     fn routing_error_response(&self, req: &RtRequest) -> RtResponse;
 
     /// Render an arbitrary framework-level
-    /// [`ProtocolError`](aws_smithy_schema_server::ProtocolError) in THIS
-    /// service's own protocol envelope — for a failure the router detects before
-    /// (or instead of) naming an operation, such as a malformed `aws-chunked`
-    /// body stripped once up front. The default rendering the router uses when a
-    /// service does not override it (see [`Service::override_framework_error`]).
+    /// [`ProtocolError`](aws_smithy_schema_server::ProtocolError) for `req` in
+    /// the envelope of the protocol `req` is served in
+    /// ([`wire_protocol`](Self::wire_protocol)) — for a failure the router
+    /// detects before (or instead of) naming an operation, such as a malformed
+    /// `aws-chunked` body stripped once up front. The default rendering the
+    /// router uses when a service does not override it (see
+    /// [`Service::override_framework_error`]).
     ///
-    /// Rendered through the SAME per-service pre-dispatch declaration
-    /// [`routing_error_response`](Self::routing_error_response) uses, so a
-    /// transport-level refusal and a routing refusal cannot answer in different
-    /// envelopes (a malformed `aws-chunked` body on a `restXml` S3 service is a
-    /// `400 InvalidRequest` as `application/xml`).
+    /// Rendered through the SAME envelope
+    /// [`routing_error_response`](Self::routing_error_response) uses for `req`,
+    /// so a transport-level refusal and a routing refusal cannot answer in
+    /// different envelopes (a malformed `aws-chunked` body on a `restXml` S3
+    /// service is a `400 InvalidRequest` as `application/xml`).
+    ///
+    /// The router calls this method rather than the envelope's renderer; see
+    /// [`WireProtocol`](crate::WireProtocol) for why.
     fn framework_error_response(
         &self,
         error: aws_smithy_schema_server::ProtocolError,
+        req: &RtRequest,
     ) -> RtResponse;
 
     /// [`Self::framework_error_response`] worded as the service chose through
@@ -252,10 +272,21 @@ pub trait ErasedServiceDefinition {
         &self,
         error: aws_smithy_schema_server::ProtocolError,
         chosen: Option<crate::Refused>,
+        req: &RtRequest,
     ) -> RtResponse {
         let _ = chosen;
-        self.framework_error_response(error)
+        self.framework_error_response(error, req)
     }
+
+    /// The protocol `req` is served in: the codec and error envelope every step of
+    /// the request uses. The [`wire_protocol`](crate::wire_protocol) module says how
+    /// it is selected, including for a request that names none of the service's
+    /// protocols; the three error renderers above give the router's answer for
+    /// such a request, so a tenant that calls them directly sees it too.
+    ///
+    /// The three error renderers above read it for the `req` they are given, so
+    /// they are the only place an error's envelope is chosen.
+    fn wire_protocol(&self, req: &RtRequest) -> crate::WireProtocol<'_>;
 }
 
 /// One emulated service: the predicate that claims a request plus the optional
@@ -279,13 +310,13 @@ pub trait ErasedServiceDefinition {
 /// defaulting to "let the framework do the default." No deserialization, no
 /// telemetry, and no response construction happens here.
 pub trait Service: Send + Sync + 'static {
-    /// This service's model-derived half (identity, protocol, routing table, and
+    /// This service's model-derived half (identity, wire protocol, routing table, and
     /// the protocol-correct error renderers), as an engine-erased
     /// [`ErasedServiceDefinition`].
     ///
     /// Not an author seam: the scaffolded impl returns a reference to the
     /// service's generated `ServiceDefinition`, whose values are baked at codegen from
-    /// the model. The router reads identity, protocol, and the routing table
+    /// the model. The router reads identity, wire protocol, and the routing table
     /// through this one accessor rather than through per-datum trait methods, so
     /// adding or changing a model-derived datum never grows the author-facing
     /// trait surface.
@@ -318,10 +349,16 @@ pub trait Service: Send + Sync + 'static {
         None
     }
 
-    /// An author override of the framework-level routing failure — when neither
-    /// [`override_operation`](Self::override_operation) nor the model-derived
-    /// routing table names an operation, so the request reached the one claiming
-    /// service but named no modeled operation (an unknown or absent routing key).
+    /// An author override of the framework-level routing failure. It is asked in
+    /// two cases:
+    ///
+    /// - neither [`override_operation`](Self::override_operation) nor the
+    ///   model-derived routing table names an operation, so the request reached the
+    ///   one claiming service in one of its protocols but named no modeled
+    ///   operation (an unknown or absent routing key);
+    /// - the request is in none of the protocols the service declares. Then
+    ///   `override_operation` is not asked, because such a request is never served.
+    ///
     /// Return `Some` to word that failure in a custom envelope; `None` (the
     /// default) renders [`ErasedServiceDefinition::routing_error_response`], reached via
     /// [`definition`](Service::definition).
@@ -367,8 +404,8 @@ pub trait Service: Send + Sync + 'static {
     }
 
     /// An author override of this service's wire protocol for the dispatch
-    /// sequence. Return `None` (the default) to serve the model-derived protocol from
-    /// [`ErasedServiceDefinition::protocol`], reached via
+    /// sequence. Return `None` (the default) to serve the protocol the request is in,
+    /// from [`ErasedServiceDefinition::wire_protocol`], reached via
     /// [`definition`](Service::definition); return `Some` to serve a different
     /// codec than the model declares — e.g. `rpcv2Cbor` selected from a request's
     /// content-type, or `awsQuery` kept for a legacy caller.
