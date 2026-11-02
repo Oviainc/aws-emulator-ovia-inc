@@ -209,7 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 UpdateAutomatedReasoningPolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(
-                            crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND.to_string(),
+                            crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND_ON_WRITE
+                                .to_string(),
                         ),
                     },
                 )

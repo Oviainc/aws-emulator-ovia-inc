@@ -8,8 +8,10 @@
 //! ([`crate::state::EnforcedGuardrailConfiguration`]), so an id the account does not hold
 //! — and any id at all while the account holds no configuration — addresses nothing and is
 //! refused 404 `ResourceNotFoundException`, the error this operation models for a resource
-//! that was not found. This `@idempotent` delete is therefore refused the same way when it
-//! is repeated: the configuration it named is no longer there.
+//! that was not found, in the sentence Amazon Bedrock words that class with for this
+//! resource ([`crate::state::ENFORCED_GUARDRAIL_CONFIGURATION_NOT_FOUND`]). This
+//! `@idempotent` delete is therefore refused the same way when it is repeated: the
+//! configuration it named is no longer there.
 //!
 //! Deleting the configuration also WITHDRAWS the enforcement it put in force on inference
 //! ([`crate::state::enforce_guardrail_on_inference`]): an account that deleted its
@@ -178,9 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteEnforcedGuardrailConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(
-                            crate::state::enforced_guardrail_configuration_not_found(
-                                &input.config_id,
-                            ),
+                            crate::state::ENFORCED_GUARDRAIL_CONFIGURATION_NOT_FOUND.to_string(),
                         ),
                     },
                 )

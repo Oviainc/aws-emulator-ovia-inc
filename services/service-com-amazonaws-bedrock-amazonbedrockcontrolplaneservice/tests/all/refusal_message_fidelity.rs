@@ -1056,6 +1056,19 @@ async fn a_policy_arn_naming_a_version_that_was_never_cut_reports_the_missing_ve
 /// request sent nor the account it looked in.
 const POLICY_NOT_FOUND: &str = "Policy does not exist";
 
+/// The same class as [`POLICY_NOT_FOUND`], as the two calls that write the POLICY ITSELF
+/// word it: `UpdateAutomatedReasoningPolicy` rewriting its draft and
+/// `DeleteAutomatedReasoningPolicy` removing it. Recorded from those two operations, which
+/// is why the sentence a row expects is chosen by the operation it drives.
+const POLICY_NOT_FOUND_ON_WRITE: &str = "Policy was not found";
+
+/// The operations that answer [`POLICY_NOT_FOUND_ON_WRITE`]; every other row of this
+/// suite's table answers [`POLICY_NOT_FOUND`].
+const POLICY_WRITES: [&str; 2] = [
+    "UpdateAutomatedReasoningPolicy",
+    "DeleteAutomatedReasoningPolicy",
+];
+
 /// An `AutomatedReasoningPolicyTestCaseId` nothing has minted (`^[0-9A-Z]{12}$`) and an
 /// `AutomatedReasoningPolicyBuildWorkflowId` nothing has started (the UUIDv4 form
 /// `^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}$`), so a row
@@ -1072,10 +1085,12 @@ fn well_formed_hash() -> String {
 
 /// Every request this suite drives at `policy_arn`, as
 /// `(operation, method, path, body)` — one row per operation that resolves an
-/// `AutomatedReasoningPolicyArn`, since the sentence belongs to the RESOURCE and not to the
-/// operation that addressed it. `versioned` says whether the ARN carries a `:<version>`
-/// suffix: a write of the DRAFT refuses such an ARN on its own terms ("policyArn must be the
-/// ARN of a draft policy"), so those two rows are driven at the unversioned spellings only.
+/// `AutomatedReasoningPolicyArn`, since the sentence belongs to the RESOURCE rather than to
+/// the operation that addressed it — save for the two writes of the policy itself, which
+/// word it their own way ([`POLICY_WRITES`]). `versioned` says whether the ARN carries a
+/// `:<version>` suffix: a write of the DRAFT refuses such an ARN on its own terms
+/// ("policyArn must be the ARN of a draft policy"), so those two rows are driven at the
+/// unversioned spellings only.
 fn policy_requests(policy_arn: &str, versioned: bool) -> Vec<(&'static str, &'static str, String, Option<Value>)> {
     let policy = format!("/automated-reasoning-policies/{}", label(policy_arn));
     let tests = format!("{policy}/test-cases");
@@ -1163,6 +1178,12 @@ fn policy_requests(policy_arn: &str, versioned: bool) -> Vec<(&'static str, &'st
             ),
             None,
         ),
+        (
+            "DeleteAutomatedReasoningPolicy",
+            "DELETE",
+            format!("{policy}?force=true"),
+            None,
+        ),
     ];
     if !versioned {
         rows.push((
@@ -1206,13 +1227,12 @@ async fn a_policy_this_account_does_not_hold_is_refused_in_one_fixed_sentence() 
         for (operation, method, path, body) in policy_requests(policy_arn, is_versioned) {
             let case = format!("{operation} / {arn_case}");
             let reply = emu.call(method, &path, body).await;
-            assert_refusal(
-                &case,
-                &reply,
-                404,
-                "ResourceNotFoundException",
-                POLICY_NOT_FOUND,
-            );
+            let expected = if POLICY_WRITES.contains(&operation) {
+                POLICY_NOT_FOUND_ON_WRITE
+            } else {
+                POLICY_NOT_FOUND
+            };
+            assert_refusal(&case, &reply, 404, "ResourceNotFoundException", expected);
             // The sentence carries no part of the request: not the ARN it addressed, not
             // the account inside that ARN.
             let message = message_of(&reply);

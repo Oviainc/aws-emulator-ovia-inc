@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The account's enforced guardrail configuration end to end:
-//! `PutEnforcedGuardrailConfiguration` and `ListEnforcedGuardrailsConfiguration` over
-//! HTTP, through the same `MultiServiceRouter` the emulator boots.
+//! `PutEnforcedGuardrailConfiguration`, `ListEnforcedGuardrailsConfiguration` and
+//! `DeleteEnforcedGuardrailConfiguration` over HTTP, through the same `MultiServiceRouter`
+//! the emulator boots.
 //!
 //! # The rule
 //!
@@ -606,6 +607,101 @@ async fn a_put_naming_something_the_account_does_not_hold_is_refused_and_changes
         rows(&list(&emulator, None).await),
         baseline,
         "case the DRAFT version: a refused put must change nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_removes_the_configuration_and_refuses_an_id_the_account_does_not_hold() {
+    // `DeleteEnforcedGuardrailConfiguration` is bound to
+    // `DELETE /enforcedGuardrailsConfiguration/{configId}` with `@http(code: 200)`
+    // (`smithy_query(query="operation",operation="DeleteEnforcedGuardrailConfiguration")`).
+    async fn delete(emulator: &Emulator, config_id: &str) -> Reply {
+        emulator
+            .call("DELETE", &format!("{CONFIGURATION_URI}/{config_id}"), None)
+            .await
+    }
+
+    /// The `ResourceNotFoundException` message this delete answers for a `configId` the
+    /// account holds no configuration under — Amazon Bedrock's wording for that error
+    /// class, which carries no part of the request.
+    const NOT_FOUND: &str = "No default guardrail configuration found for the specified config identifier.";
+
+    let emulator = emulator();
+    let (id, _) = guardrail_with_two_versions(&emulator, "deleted-configuration").await;
+    let installed = put(
+        &emulator,
+        json!({
+            "guardrailInferenceConfig": {
+                "guardrailIdentifier": id.clone(),
+                "guardrailVersion": "1",
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        installed.status, 200,
+        "case setup: the put must answer 200, got {} {:?}",
+        installed.status, installed.body
+    );
+    let config_id = installed.text("configId");
+
+    // Rows differ along WHICH `configId` the delete addresses, over the ids
+    // `AccountEnforcedGuardrailConfigurationId` (`^[a-z0-9]+$`) admits: one the account
+    // does not hold is refused while the installed configuration stays listed.
+    for (case, addressed) in [
+        ("an id nothing minted", "zzzzzzzzzzzz".to_string()),
+        ("the installed id with a digit appended", format!("{config_id}0")),
+    ] {
+        let refused = delete(&emulator, &addressed).await;
+        assert_eq!(
+            (refused.status, refused.error.as_deref()),
+            (404, Some("ResourceNotFoundException")),
+            "case {case:?}: {addressed:?} addresses no configuration, so the delete must \
+             answer 404, got {} {:?}",
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.get("message"),
+            json!(NOT_FOUND),
+            "case {case:?}: the refusal must carry the service's wording for that class, got \
+             {:?}",
+            refused.body
+        );
+        assert_eq!(
+            rows(&list(&emulator, None).await).len(),
+            1,
+            "case {case:?}: a refused delete must leave the configuration installed"
+        );
+    }
+
+    let removed = delete(&emulator, &config_id).await;
+    assert_eq!(
+        removed.status, 200,
+        "case \"the installed id\": the delete must answer 200, got {} {:?}",
+        removed.status, removed.body
+    );
+    assert_eq!(
+        rows(&list(&emulator, None).await),
+        Vec::<Value>::new(),
+        "case \"the installed id\": nothing is installed once the configuration is deleted"
+    );
+
+    // The account holds no configuration any more, so the same id addresses nothing and is
+    // refused in the same sentence.
+    let again = delete(&emulator, &config_id).await;
+    assert_eq!(
+        (again.status, again.error.as_deref()),
+        (404, Some("ResourceNotFoundException")),
+        "case \"deleted twice\": the second delete must answer 404, got {} {:?}",
+        again.status,
+        again.body
+    );
+    assert_eq!(
+        again.get("message"),
+        json!(NOT_FOUND),
+        "case \"deleted twice\": the refusal must carry the same wording, got {:?}",
+        again.body
     );
 }
 

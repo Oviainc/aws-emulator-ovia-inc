@@ -95,6 +95,9 @@
 //! `ops/export_automated_reasoning_policy_version.rs` reads the
 //! DEFINITION of whichever of those revisions the ARN names, so what a revision was written
 //! with is what the export reports.
+//! `ops/delete_automated_reasoning_policy.rs` removes whichever of those revisions the ARN
+//! names — one numbered version, or the policy with every artifact of it held below — so a
+//! revision one request deleted is a revision no later request finds.
 //!
 //! And it holds the build workflows of those policies —
 //! `ops/start_automated_reasoning_policy_build_workflow.rs` starts them,
@@ -1384,13 +1387,28 @@ impl Guardrail {
         std::iter::once(&self.draft).chain(self.versions.values())
     }
 
-    /// Remove version `number` and release the idempotency tokens that named it, so
-    /// a token never outlives the version it minted.
+    /// Remove version `number` and release the idempotency tokens that named it, through
+    /// the one rule [`drop_version`] states for both versioned resources of this service.
     pub fn remove_version(&mut self, number: u32) -> Option<GuardrailRevision> {
-        let removed = self.versions.remove(&number)?;
-        self.version_tokens.retain(|_, minted| *minted != number);
-        Some(removed)
+        drop_version(&mut self.versions, &mut self.version_tokens, number)
     }
+}
+
+/// Remove version `number` from `versions` and release the entries of `tokens` that named
+/// it, handing back what was removed.
+///
+/// Here rather than on each record because this service has TWO versioned resources — a
+/// guardrail and an Automated Reasoning policy — and each holds its snapshots and the
+/// idempotency tokens that cut them in this same pair of maps, so dropping one version is
+/// ONE rule: a token never outlives the version it minted.
+fn drop_version<V>(
+    versions: &mut BTreeMap<u32, V>,
+    tokens: &mut HashMap<String, u32>,
+    number: u32,
+) -> Option<V> {
+    let removed = versions.remove(&number)?;
+    tokens.retain(|_, minted| *minted != number);
+    Some(removed)
 }
 
 /// One stored prompt router: the identity `CreatePromptRouter` minted, the
@@ -2978,14 +2996,23 @@ impl AutomatedReasoningPolicyRecord {
     pub fn version(&self, number: u32) -> Option<&AutomatedReasoningPolicyVersionRecord> {
         self.versions.get(&number)
     }
+
+    /// Remove version `number` and release the idempotency tokens that named it, through
+    /// the one rule [`drop_version`] states for both versioned resources of this service.
+    pub fn remove_version(
+        &mut self,
+        number: u32,
+    ) -> Option<AutomatedReasoningPolicyVersionRecord> {
+        drop_version(&mut self.versions, &mut self.version_tokens, number)
+    }
 }
 
 /// The most numbered versions one Automated Reasoning policy may hold at once, past which
 /// cutting another is refused with `ServiceQuotaExceededException`.
 ///
 /// The emulator's own bound rather than a published quota: version numbers are never
-/// reused and no operation of this service removes a single version, so without a
-/// server-side cap a caller could grow one policy's snapshots without end.
+/// reused, so even with `DeleteAutomatedReasoningPolicy` removing one version at a time a
+/// caller could grow one policy's snapshots without end were there no server-side cap.
 pub const MAX_AUTOMATED_REASONING_POLICY_VERSIONS_PER_POLICY: usize = 100;
 
 /// One numbered version of an Automated Reasoning policy: the snapshot
@@ -3093,17 +3120,28 @@ pub const AUTOMATED_REASONING_POLICY_TEST_WORKFLOW_IN_PROGRESS: &str =
 pub const AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND: &str = "Policy version does not exist";
 
 /// What a request addressing an Automated Reasoning policy this account holds no record of
-/// answers as its `ResourceNotFoundException` message, wherever that request came from: a
-/// read of the policy, a write of it, a listing of its children, or a call addressing one of
-/// those children.
+/// answers as its `ResourceNotFoundException` message: a read of the policy, a listing of
+/// its children, or a call addressing one of those children.
 ///
 /// RECORDED behaviour, and a message with NO variable parts: Amazon Bedrock reports that the
 /// policy is not there and names neither the ARN the request carried nor the account it
-/// looked in, so the wording is the whole requirement and is shared by every operation that
-/// resolves an `AutomatedReasoningPolicyArn` — the message belongs to the RESOURCE, not to
-/// one operation. Worded as its sibling [`AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND`] is,
-/// which reports the missing VERSION of a policy that IS there.
+/// looked in, so the wording is the whole requirement. Worded as its sibling
+/// [`AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND`] is, which reports the missing VERSION of
+/// a policy that IS there. The two writes of the POLICY ITSELF word this same error class
+/// their own way ([`AUTOMATED_REASONING_POLICY_NOT_FOUND_ON_WRITE`]).
 pub const AUTOMATED_REASONING_POLICY_NOT_FOUND: &str = "Policy does not exist";
+
+/// What a write of the POLICY ITSELF — `UpdateAutomatedReasoningPolicy` rewriting its draft,
+/// `DeleteAutomatedReasoningPolicy` removing it — answers as its `ResourceNotFoundException`
+/// message for an `AutomatedReasoningPolicyArn` this account holds no policy under.
+///
+/// RECORDED behaviour, and a message with NO variable parts like its sibling
+/// [`AUTOMATED_REASONING_POLICY_NOT_FOUND`]: Amazon Bedrock words this error class
+/// differently for the two calls that write the policy as a whole, so the two sentences are
+/// held apart here rather than one standing for both. The calls that address a CHILD of the
+/// policy — its tests, its build workflows, its versions — report the absent policy in the
+/// other sentence, whether they read or write that child.
+pub const AUTOMATED_REASONING_POLICY_NOT_FOUND_ON_WRITE: &str = "Policy was not found";
 
 /// One stored Automated Reasoning policy test: the identity
 /// `CreateAutomatedReasoningPolicyTestCase` minted, and the sample input and expected
@@ -3396,15 +3434,27 @@ pub struct AccountDataRetention {
     pub updated_at: SystemTime,
 }
 
-/// What this control plane answers when a request addresses an enforced guardrail
-/// configuration this account does not hold: the `configId` names no configuration, which
-/// is the 404 `ResourceNotFoundException` both the put that addresses one and the delete
-/// that removes one answer. Stated once here because two operations make the same refusal
-/// for the same reason and two spellings of it could drift.
+/// What this control plane answers when a PUT addresses an enforced guardrail configuration
+/// this account does not hold: the `configId` names no configuration, which is the 404
+/// `ResourceNotFoundException` that put answers.
+///
+/// The emulator's own wording, and NOT the sentence the delete of a configuration answers
+/// ([`ENFORCED_GUARDRAIL_CONFIGURATION_NOT_FOUND`]), which is recorded: the two refusals of
+/// this resource are worded independently, each from its own evidence, so the sentence one
+/// answers is no evidence about the other.
 #[must_use]
 pub fn enforced_guardrail_configuration_not_found(config_id: &str) -> String {
     format!("no enforced guardrail configuration {config_id} exists in this account")
 }
+
+/// What `DeleteEnforcedGuardrailConfiguration` answers when the `configId` it carries names
+/// no configuration this account holds.
+///
+/// RECORDED behaviour, and a message with NO variable parts: Amazon Bedrock reports that no
+/// configuration was found for the identifier the request carried without repeating that
+/// identifier, so the wording is the whole requirement.
+pub const ENFORCED_GUARDRAIL_CONFIGURATION_NOT_FOUND: &str =
+    "No default guardrail configuration found for the specified config identifier.";
 
 /// Put the account's enforced guardrail configuration IN FORCE on the inference plane:
 /// `config`, enforcing `revision`, becomes the guardrail every covered invocation of this
@@ -4257,15 +4307,33 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// version of a policy this account DOES hold addressed a revision that policy has not
     /// cut, so the refusal reports the missing version
     /// ([`AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND`]) rather than the policy, which is
-    /// there. Here rather than in one handler because every operation addressed by this ARN
-    /// reports one unresolvable ARN the same way, and that wording is one rule.
+    /// there. Here rather than in one handler because the operations that READ this ARN, and
+    /// those that address a CHILD of the policy it names, all report one unresolvable ARN the
+    /// same way, and that wording is one rule; the policy's own writes report the absent
+    /// policy through [`Self::automated_reasoning_policy_write_not_found_message`].
     #[must_use]
     pub fn automated_reasoning_policy_revision_not_found_message(&self, policy_arn: &str) -> String {
+        self.revision_not_found_message(policy_arn, AUTOMATED_REASONING_POLICY_NOT_FOUND)
+    }
+
+    /// The same message for a WRITE of the policy itself, which words the absent policy as
+    /// [`AUTOMATED_REASONING_POLICY_NOT_FOUND_ON_WRITE`] — the missing VERSION of a policy
+    /// that IS there is reported in the one sentence every operation reports it in.
+    #[must_use]
+    pub fn automated_reasoning_policy_write_not_found_message(&self, policy_arn: &str) -> String {
+        self.revision_not_found_message(policy_arn, AUTOMATED_REASONING_POLICY_NOT_FOUND_ON_WRITE)
+    }
+
+    /// Which half of an unresolvable `AutomatedReasoningPolicyArn` resolved to nothing,
+    /// reported with `absent_policy` as the sentence for a policy this account does not
+    /// hold. The branch lives here once, so the two sentences a caller can be refused with
+    /// differ only in that wording.
+    fn revision_not_found_message(&self, policy_arn: &str, absent_policy: &str) -> String {
         let (base_arn, version) = automated_reasoning_policy_arn_parts(policy_arn);
         if version.is_some() && self.automated_reasoning_policy(base_arn).is_some() {
             AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND.to_string()
         } else {
-            AUTOMATED_REASONING_POLICY_NOT_FOUND.to_string()
+            absent_policy.to_string()
         }
     }
 

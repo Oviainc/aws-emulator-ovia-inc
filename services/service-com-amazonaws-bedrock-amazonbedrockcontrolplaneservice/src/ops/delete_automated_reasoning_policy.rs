@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAutomatedReasoningPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAutomatedReasoningPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAutomatedReasoningPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one revision of an Automated Reasoning policy, addressed by the same
+//! `AutomatedReasoningPolicyArn` a read of it is addressed by: the unversioned ARN removes
+//! the POLICY, and an ARN carrying a `:<version>` suffix removes just that numbered
+//! version. An ARN this store resolves to no revision is refused with the modelled 404 —
+//! RECORDED behaviour, which the modelled contract below does not describe: a repeated
+//! delete reports the policy as missing rather than succeeding, in the sentence a write of
+//! the policy reports an absent one with
+//! ([`crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND_ON_WRITE`]).
+//!
+//! A policy removal takes every artifact that hangs off the policy with it, which `force`
+//! governs: a request that did not force it is refused while the policy still holds one. A
+//! revision another resource is using — a guardrail that checks against it — is refused
+//! whichever way `force` was sent. Both of those refusals carry this emulator's own wording
+//! rather than a recorded sentence; see [`in_use`].
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +167,223 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAutomatedReasoningPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAutomatedReasoningPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAutomatedReasoningPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+        let mut store = state.lock();
+
+        // The ARN selects exactly as a read of the policy selects: its region is part of
+        // the key, and the `:<version>` suffix the shape admits names one numbered version
+        // while the unversioned ARN names the policy itself.
+        let (base_arn, version) =
+            crate::state::automated_reasoning_policy_arn_parts(&input.policy_arn);
+        let base_arn = base_arn.to_string();
+
+        // An ARN that resolves to NO revision is refused with the 404 the model declares —
+        // the documented idempotency is about repeating a delete of a policy this account
+        // holds, not about an ARN naming nothing, which Amazon Bedrock reports as missing in
+        // the sentence a write of the policy reports it with. WHICH half of the ARN resolved
+        // to nothing decides that sentence, which is the store's own rule.
+        if store
+            .automated_reasoning_policy_revision(&input.policy_arn)
+            .is_none()
+        {
+            return Err(not_found(
+                store.automated_reasoning_policy_write_not_found_message(&input.policy_arn),
+            ));
+        }
+
+        // A revision a guardrail's Automated Reasoning policy configuration names is in use
+        // by that guardrail — the case `ResourceInUseException` documents — so it is refused
+        // whatever `force` asked for: `force` governs the policy's OWN artifacts, and a
+        // guardrail is not one of them.
+        if let Some(guardrail) = referencing_guardrail(&store, &input.policy_arn) {
+            return Err(in_use(format!(
+                "automated reasoning policy {} is referenced by guardrail {guardrail}, so it \
+                 cannot be deleted",
+                input.policy_arn
+            )));
+        }
+
+        match version {
+            // One numbered version: the snapshot goes, and with it the create-version
+            // tokens that named it, so no replayed token hands a later caller a version
+            // that is gone. The policy's draft and its other versions are untouched.
+            Some(number) => {
+                let Some(policy) = store.automated_reasoning_policy_mut(&base_arn) else {
+                    return Err(server_error());
+                };
+                if policy.remove_version(number).is_none() {
+                    return Err(server_error());
+                }
+            }
+            None => {
+                // `force` false: "Amazon Bedrock validates if all artifacts have been
+                // deleted (e.g. policy version, test case, test result) for a policy before
+                // deletion", so a policy still holding one is refused rather than taking it
+                // with the policy.
+                if !input.force {
+                    let held = held_artifacts(&store, &base_arn);
+                    if !held.is_empty() {
+                        return Err(in_use(format!(
+                            "automated reasoning policy {} still has {} that have not been \
+                             deleted; delete them or retry the request with force set to true",
+                            input.policy_arn,
+                            held.join(", ")
+                        )));
+                    }
+                }
+
+                // The record was resolved under this same lock above, so it is there to
+                // take and no caller can have removed it in between. Its versions and their
+                // tokens live INSIDE it, so they go with it.
+                let Some(removed) = store.automated_reasoning_policies.remove(&base_arn) else {
+                    return Err(server_error());
+                };
+                // The name is free again in that region, and no replayed create token may
+                // hand a later caller the policy that is now gone.
+                store
+                    .automated_reasoning_policy_names
+                    .remove(&(removed.region.clone(), removed.name.clone()));
+                store
+                    .automated_reasoning_policy_create_tokens
+                    .retain(|_, minted| *minted != base_arn);
+                // Every artifact of the policy is addressed and reported THROUGH it, so
+                // nothing could read one that outlived it: each goes with the policy rather
+                // than staying behind as state no caller can reach.
+                store
+                    .automated_reasoning_policy_build_workflows
+                    .retain(|(policy_arn, _), _| *policy_arn != base_arn);
+                store
+                    .automated_reasoning_policy_build_workflow_tokens
+                    .retain(|(policy_arn, _), _| *policy_arn != base_arn);
+                store
+                    .automated_reasoning_policy_test_cases
+                    .retain(|(policy_arn, _), _| *policy_arn != base_arn);
+                store
+                    .automated_reasoning_policy_test_case_create_tokens
+                    .retain(|(policy_arn, _), _| *policy_arn != base_arn);
+                store
+                    .automated_reasoning_policy_test_runs
+                    .retain(|(policy_arn, _, _), _| *policy_arn != base_arn);
+                store
+                    .automated_reasoning_policy_test_workflow_tokens
+                    .retain(|(policy_arn, _), _| *policy_arn != base_arn);
+            }
+        }
+
+        Ok(DeleteAutomatedReasoningPolicyOutput {})
     }
+}
+
+/// The artifacts of the policy `base_arn` this store still holds, named as the refusal of an
+/// unforced delete names them.
+///
+/// The kinds `force` itself lists — "policy version, test case, test result" — plus the
+/// build workflows those results were produced by, which hang off the policy the same way.
+/// Reported as names rather than counts, so the sentence a caller is refused with is the
+/// same however many of each the policy holds.
+fn held_artifacts(
+    store: &crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState,
+    base_arn: &str,
+) -> Vec<&'static str> {
+    let versions = store
+        .automated_reasoning_policy(base_arn)
+        .is_some_and(|policy| !policy.versions.is_empty());
+    let build_workflows = store
+        .automated_reasoning_policy_build_workflows
+        .keys()
+        .any(|(policy_arn, _)| policy_arn == base_arn);
+    let test_cases = store
+        .automated_reasoning_policy_test_cases
+        .keys()
+        .any(|(policy_arn, _)| policy_arn == base_arn);
+    let test_results = store
+        .automated_reasoning_policy_test_runs
+        .keys()
+        .any(|(policy_arn, _, _)| policy_arn == base_arn);
+
+    [
+        (versions, "policy versions"),
+        (build_workflows, "build workflows"),
+        (test_cases, "test cases"),
+        (test_results, "test results"),
+    ]
+    .into_iter()
+    .filter_map(|(held, kind)| held.then_some(kind))
+    .collect()
+}
+
+/// The identifier of a guardrail whose Automated Reasoning policy configuration names a
+/// revision this delete would remove, or `None` when no guardrail references one.
+///
+/// A delete of the POLICY takes every revision of it with it, so a guardrail naming ANY
+/// revision of that policy is using what the call would remove; a delete of ONE version
+/// takes only that revision, so only a guardrail naming exactly it is.
+///
+/// Every revision of every guardrail is searched, because a guardrail VERSION keeps the
+/// configuration it was cut with: a policy a published version still checks against is as
+/// much in use as one the draft checks against.
+fn referencing_guardrail(
+    store: &crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState,
+    policy_arn: &str,
+) -> Option<String> {
+    let (base_arn, version) = crate::state::automated_reasoning_policy_arn_parts(policy_arn);
+    let references = |configured_arn: &String| {
+        if version.is_some() {
+            configured_arn == policy_arn
+        } else {
+            crate::state::automated_reasoning_policy_arn_parts(configured_arn).0 == base_arn
+        }
+    };
+    store
+        .guardrails
+        .values()
+        .find(|guardrail| {
+            guardrail.revisions().any(|revision| {
+                revision
+                    .automated_reasoning_policy
+                    .as_ref()
+                    .is_some_and(|configured| configured.policies.iter().any(references))
+            })
+        })
+        .map(|guardrail| guardrail.id.clone())
+}
+
+/// The modelled 404 this operation answers for an `AutomatedReasoningPolicyArn` this store
+/// resolves to no revision — the policy, or the version a versioned ARN names.
+fn not_found(message: String) -> DeleteAutomatedReasoningPolicyError {
+    DeleteAutomatedReasoningPolicyErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 400 this operation answers for a policy another resource is using, and for
+/// one whose own artifacts an unforced delete may not take with it.
+///
+/// Both sentences are the EMULATOR's own wording: no recording of this service covers either
+/// refusal, unlike the two 404 sentences in `crate::state`, which are recorded. Each states
+/// what is in the way and takes its variable parts — the ARN the request carried, the
+/// guardrail using it, the artifact kinds the policy still holds — from the request and the
+/// store, so a later recording can correct the fixed text and nothing else.
+fn in_use(message: String) -> DeleteAutomatedReasoningPolicyError {
+    DeleteAutomatedReasoningPolicyErrorModeled::ResourceInUseException(ResourceInUseException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 500 this operation answers when the engine carries no store for this
+/// service — never a fresh engine, which would drop the delete on return.
+fn server_error() -> DeleteAutomatedReasoningPolicyError {
+    DeleteAutomatedReasoningPolicyErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "automated reasoning policy state is not available on this engine".to_string(),
+        ),
+    })
+    .into()
 }
