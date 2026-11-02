@@ -58,7 +58,10 @@ fn ambient_account() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// The entries `ListInstances` serves in `region`, following every `NextToken` it hands
 /// out so an entry is asserted on whichever page it arrives on.
-async fn listed(
+///
+/// Shared with the suite that pins WHERE the `State` view is read from
+/// (`listed_instance_state_source.rs`), so both drive one enumeration helper.
+pub(crate) async fn listed(
     case: &str,
     router: &MultiServiceRouter,
     region: &str,
@@ -103,7 +106,10 @@ async fn listed(
 
 /// THE RULE, asserted on one served entry: its `State` is a structure whose `Name` is the
 /// entry's own `Status`, and that status is a value the model's enum declares.
-fn assert_state_mirrors_status(case: &str, entry: &Value) {
+///
+/// Shared with `listed_instance_state_source.rs`, which asserts the same rule over the
+/// records a `State` could wrongly be read from.
+pub(crate) fn assert_state_mirrors_status(case: &str, entry: &Value) {
     let status = entry["Status"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: the entry reports no Status: {entry}"));

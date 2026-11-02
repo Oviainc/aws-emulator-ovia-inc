@@ -141,6 +141,8 @@ mod instance_write_stamp_instant;
 mod list_application_access_scopes;
 #[path = "all/list_instances_pagination.rs"]
 mod list_instances_pagination;
+#[path = "all/listed_instance_state_source.rs"]
+mod listed_instance_state_source;
 #[path = "all/managed_policies.rs"]
 mod managed_policies;
 #[path = "all/managed_policies_in_permission_set.rs"]
