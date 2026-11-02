@@ -157,6 +157,8 @@ mod open_id_connect_provider_tag_listing;
 mod open_id_connect_provider_tag_removal;
 #[path = "all/open_id_connect_provider_tag_updates.rs"]
 mod open_id_connect_provider_tag_updates;
+#[path = "all/open_id_connect_provider_thumbprint_updates.rs"]
+mod open_id_connect_provider_thumbprint_updates;
 #[path = "all/open_id_connect_providers.rs"]
 mod open_id_connect_providers;
 #[path = "all/organization_root_access_features.rs"]
