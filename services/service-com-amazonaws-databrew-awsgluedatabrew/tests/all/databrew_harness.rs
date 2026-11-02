@@ -64,6 +64,17 @@ impl Reply {
     pub fn is_absent(&self, member: &str) -> bool {
         self.body.get(member).is_none()
     }
+
+    /// The `Message` of a modelled DataBrew error, whichever casing the protocol put it
+    /// on the wire with, or `""` when the reply carries none.
+    pub fn error_message(&self) -> String {
+        self.body
+            .get("Message")
+            .or_else(|| self.body.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
 }
 
 /// The emulator under test: this one service mounted on one shared engine.

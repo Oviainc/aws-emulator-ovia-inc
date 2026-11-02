@@ -196,13 +196,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A schedule runs the jobs it names, so it can only name jobs this account
         // holds. `ResourceNotFoundException` is not an error this operation models
         // (model: `ConflictException`, `ServiceQuotaExceededException`,
-        // `ValidationException`), so a name that resolves to no job is a bad input.
+        // `ValidationException`), so a name that resolves to no job is a bad input —
+        // reported as the miss it is, naming the job the request asked for.
         if let Some(missing) = job_names
             .iter()
             .find(|job_name| !store.jobs.contains_key(*job_name))
         {
             return Err(CreateScheduleErrorModeled::ValidationException(ValidationException {
-                message: Some(format!("JobNames names a job that does not exist: {missing}")),
+                message: Some(crate::state::job_not_found_message(missing)),
             })
             .into());
         }

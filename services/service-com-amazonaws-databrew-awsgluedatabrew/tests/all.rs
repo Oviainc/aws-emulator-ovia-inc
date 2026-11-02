@@ -27,5 +27,7 @@ mod recipe_version_resolution;
 mod resource_not_found_message;
 #[path = "all/schedule_lifecycle.rs"]
 mod schedule_lifecycle;
+#[path = "all/schedule_update.rs"]
+mod schedule_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

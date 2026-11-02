@@ -47,6 +47,17 @@ pub fn recipe_version_not_found_message(name: &str, version: &str) -> String {
     format!("The recipe {name} for version {version} wasn't found.")
 }
 
+/// The message a schedule write answers its refusal with when a name in `JobNames`
+/// resolves to no job: the fixed `Job ` / ` not found` text, with the name the request
+/// carried, so a client can tell WHICH of the jobs it named does not exist.
+///
+/// A schedule runs the jobs it names, so a name that resolves to no job is reported as
+/// the miss it is, in DataBrew's `<resource> <identifier> not found` phrasing, rather
+/// than as a nameless complaint about the member.
+pub fn job_not_found_message(name: &str) -> String {
+    format!("Job {name} not found")
+}
+
 /// The message DataBrew answers a `ConflictException` with when a create names a
 /// resource that already exists: the resource kind, capitalised, and the name the
 /// request carried, so the message states which resource conflicted.
@@ -569,6 +580,30 @@ fn version_major(version: &str) -> Option<u64> {
     let (major, minor) = version.split_once('.')?;
     minor.parse::<u64>().ok()?;
     major.parse().ok()
+}
+
+impl ScheduleRecord {
+    /// Apply an `UpdateSchedule` request's definition onto this record and stamp the
+    /// audit's last-modified pair, so a later read serves what the update wrote.
+    ///
+    /// `UpdateSchedule` is a PUT that carries the schedule's whole definition (model:
+    /// `UpdateSchedule` `PUT /schedules/{Name}` with `CronExpression` required and
+    /// `JobNames` optional), so each definition member is REPLACED by what the request
+    /// carries: an omitted `JobNames` leaves the schedule naming no job, exactly as an
+    /// empty list does, rather than keeping the jobs it named before. `Name`, the ARN,
+    /// the tags and the create pair are not this operation's to change — it carries no
+    /// member for any of them.
+    pub fn apply_update(
+        &mut self,
+        cron_expression: String,
+        job_names: Vec<String>,
+        at: SystemTime,
+        principal: String,
+    ) {
+        self.cron_expression = cron_expression;
+        self.job_names = job_names;
+        self.audit.modified(at, principal);
+    }
 }
 
 impl JobRunRecord {
