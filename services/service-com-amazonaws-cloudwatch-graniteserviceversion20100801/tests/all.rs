@@ -133,6 +133,8 @@ mod metric_math_alarm_advances;
 mod metric_math_alarms;
 #[path = "all/metric_query_ids.rs"]
 mod metric_query_ids;
+#[path = "all/metric_range_selection.rs"]
+mod metric_range_selection;
 #[path = "all/metric_read_identity.rs"]
 mod metric_read_identity;
 #[path = "all/metric_storage_resolution.rs"]

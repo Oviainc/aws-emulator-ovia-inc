@@ -191,11 +191,23 @@ impl StoredDatum {
     /// serves every reader that lays period windows over a series and the alarm evaluation that
     /// grades them.
     pub fn aggregated_instant(&self) -> f64 {
-        let resolution = f64::from(self.storage_resolution);
+        let resolution = self.aggregated_span();
         if resolution <= 1.0 {
             return self.timestamp_secs;
         }
         (self.timestamp_secs / resolution).floor() * resolution
+    }
+
+    /// How long the span this datapoint is aggregated into lasts: its own declared
+    /// `StorageResolution` in seconds — one minute for a regular-resolution datapoint, one
+    /// second for a high-resolution one.
+    ///
+    /// Beside [`Self::aggregated_instant`], which is where that span begins, this is what says
+    /// where it ENDS, and so which requested ranges it reaches into: a regular-resolution
+    /// datapoint stands for the whole minute it is stored in, not for the instant it happened to
+    /// be published at inside that minute.
+    pub fn aggregated_span(&self) -> f64 {
+        f64::from(self.storage_resolution).max(1.0)
     }
 }
 
@@ -658,12 +670,19 @@ pub fn granularity_available_from(requested_start: f64, period: i32, now: f64) -
 /// Fold one series' datapoints into the `period`-wide windows of `[start, end)`, keyed by the
 /// window's index from `start` and by the UNIT the datapoints in it were published with.
 ///
-/// `start` is INCLUSIVE and `end` EXCLUSIVE, as both readers' members document. A window
-/// holding no datapoint is never inserted, so what this allocates is bounded by the
-/// datapoints the series holds in the range rather than by the range the request spans.
-/// A datapoint the retention tier of `period` no longer holds is not in any window
-/// ([`retained_at_period`]), and which window a datapoint falls in is decided by the instant
-/// its own `StorageResolution` stores it at ([`StoredDatum::aggregated_instant`]).
+/// `start` is INCLUSIVE and `end` EXCLUSIVE, as both readers' members document, and what the
+/// range selects is every datapoint whose STORED SPAN — the span its own `StorageResolution`
+/// aggregates it into ([`StoredDatum::aggregated_instant`] to that instant plus
+/// [`StoredDatum::aggregated_span`]): the whole minute for a regular-resolution datapoint and
+/// its own second for a high-resolution one — reaches into `[start, end)`. A regular-resolution
+/// datapoint stands for the minute it is stored in rather than for the instant inside that
+/// minute it happened to be published at, so a range that opens or closes part way through that
+/// minute holds it, and it is reported under the whole minute either way — which may be an
+/// instant before the range's own start, that minute having no other instant to be reported at.
+/// A window holding no datapoint is never inserted, so what this allocates is bounded by the
+/// datapoints the series holds in the range rather than by the range the request spans. A
+/// datapoint the retention tier of `period` no longer holds is not in any window
+/// ([`retained_at_period`]).
 ///
 /// The unit is part of the key because it is part of a datapoint's identity: "If you omit
 /// Unit, all data that was collected with any unit is returned, along with the corresponding
@@ -688,19 +707,24 @@ pub fn windows_by_unit<'a>(
     let span = f64::from(period);
     let mut windows: BTreeMap<(i64, &str), Vec<&StoredDatum>> = BTreeMap::new();
     for datum in data {
-        // The instant the datapoint is AGGREGATED at, which is the start of its own minute for
-        // one published at regular resolution ([`StoredDatum::aggregated_instant`]): a read sees
-        // a datapoint at the granularity it is stored at, not at a finer one it asks for.
+        // The span the datapoint is stored as: a read sees it at the granularity it is stored
+        // at, not at a finer one the read asks for, so what the range is judged against is
+        // that whole span rather than the instant inside it the observation was published at.
         let instant = datum.aggregated_instant();
-        if instant < start || instant >= end {
+        if instant >= end || instant + datum.aggregated_span() <= start {
             continue;
         }
         if unit.is_some_and(|wanted| datum.unit() != wanted) {
             continue;
         }
-        if !retained_at_period(instant, period, now) {
+        // How old a datapoint is, for the tier that still holds it, is the age of its own
+        // time stamp.
+        if !retained_at_period(datum.timestamp_secs, period, now) {
             continue;
         }
+        // The window the stored span's start falls in, which is where the datapoint is
+        // REPORTED: a span that began before the range did is reported at its own start, so
+        // the index may reach back past the range's first window.
         #[allow(clippy::cast_possible_truncation)]
         let index = ((instant - start) / span).floor() as i64;
         windows.entry((index, datum.unit())).or_default().push(datum);

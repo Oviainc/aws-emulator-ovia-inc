@@ -327,19 +327,22 @@ async fn a_read_sees_a_series_at_the_granularity_it_is_stored_at() {
 }
 
 #[tokio::test]
-async fn a_range_inside_one_minute_holds_a_regular_resolution_datapoint_only_where_it_is_stored() {
-    // The instant a datapoint is STORED at is what the requested range is judged against, so a
-    // range that opens after the minute a regular-resolution datapoint is stored in holds it no
-    // more than a range that closes before it: a read reports the datapoint where it is, not
-    // where it was published inside the minute. The same range over a high-resolution series
-    // holds the datapoint, because that series stores the second it was published at.
+async fn a_range_inside_one_minute_holds_a_datapoint_published_inside_it_at_either_resolution() {
+    // What the requested range is judged against is the SPAN the datapoint is stored as, at
+    // either resolution: a range opening forty seconds into a minute holds an observation
+    // published fifty seconds into it — the second it is stored in for a high-resolution
+    // series, and the minute it is stored in for a regular-resolution one. What the resolution
+    // decides is the bucket the selected observation is REPORTED under: the second it was
+    // published at where that detail is stored, and the whole minute it was published in
+    // otherwise, which is the only instant such a datapoint has even where that minute began
+    // before the range did.
     let router = build_router();
     let base = base_time();
 
-    // (case, the StorageResolution published, whether the sub-minute range holds the datapoint)
-    for (case, resolution, held) in [
-        ("regular resolution", 60, false),
-        ("high resolution", 1, true),
+    // (case, the StorageResolution published, the offset from the base the read reports)
+    for (case, resolution, reported_at) in [
+        ("regular resolution", 60, 0.0),
+        ("high resolution", 1, 50.0),
     ] {
         let metric = format!("Ranged{resolution}");
         ok(
@@ -376,20 +379,17 @@ async fn a_range_inside_one_minute_holds_a_regular_resolution_datapoint_only_whe
         .await;
         let points = body["Datapoints"].as_array().cloned().unwrap_or_default();
         assert_eq!(
-            !points.is_empty(),
-            held,
-            "case {case:?}: expected the twenty-second range inside the minute to {} the \
-             datapoint, got {body}",
-            if held { "hold" } else { "miss" }
+            points.len(),
+            1,
+            "case {case:?}: expected the twenty-second range inside the minute to hold the one \
+             observation published inside it, got {body}"
         );
-        if held {
-            assert_eq!(
-                points[0]["Timestamp"].as_f64().map(|stamp| stamp - base),
-                Some(50.0),
-                "case {case:?}: expected the ten-second bucket the publish instant falls in, \
-                 got {body}"
-            );
-        }
+        assert_eq!(
+            points[0]["Timestamp"].as_f64().map(|stamp| stamp - base),
+            Some(reported_at),
+            "case {case:?}: expected the datapoint reported at the offset {reported_at} the \
+             series stores it at, got {body}"
+        );
     }
 }
 

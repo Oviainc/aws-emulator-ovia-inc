@@ -367,6 +367,8 @@ mod update_rollback_recovery;
 mod update_stack_instances;
 #[path = "all/validate_template.rs"]
 mod validate_template;
+#[path = "all/vpc_network_teardown.rs"]
+mod vpc_network_teardown;
 #[path = "all/waf_regional_ip_set_resources.rs"]
 mod waf_regional_ip_set_resources;
 #[path = "all/wait_conditions.rs"]
