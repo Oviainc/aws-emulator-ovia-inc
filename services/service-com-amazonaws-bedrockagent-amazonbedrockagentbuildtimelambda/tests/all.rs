@@ -29,6 +29,8 @@ mod immutable_configuration_members;
 mod ingestion_job_lifecycle;
 #[path = "all/knowledge_base_lifecycle.rs"]
 mod knowledge_base_lifecycle;
+#[path = "all/managed_connector_defaults.rs"]
+mod managed_connector_defaults;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_round_trip.rs"]

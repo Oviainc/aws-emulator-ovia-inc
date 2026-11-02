@@ -3,8 +3,10 @@
 //! @op CreateDataSource
 //!
 //! Attaches a data source to an existing knowledge base: it mints a
-//! `dataSourceId`, persists the connection configuration the request supplied
-//! in [`crate::state::DataSourceRecord`], and answers with that stored record.
+//! `dataSourceId`, persists the connection configuration the request supplied —
+//! completed with the connector defaults the service applies, through
+//! [`crate::state::complete_connector_defaults`] — in
+//! [`crate::state::DataSourceRecord`], and answers with that stored record.
 //! `GetDataSource` reports the same record back.
 //!
 //! ## Shape of an operation
@@ -201,6 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // What this service STORES is the data source's EFFECTIVE connector
+        // configuration: the service runs the connector, so it completes the
+        // members the request left unset with its own defaults before the
+        // record is stored, and a reader reports that one configuration rather
+        // than the request's.
+        let mut data_source_configuration = input.data_source_configuration;
+        crate::state::complete_connector_defaults(&mut data_source_configuration);
+        let connects_out = crate::state::connects_to_an_external_source(&data_source_configuration);
+
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialise_due_transitions(now);
@@ -277,7 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             data_source_id: data_source_id.clone(),
             name: input.name,
             description: input.description,
-            data_source_configuration: input.data_source_configuration,
+            data_source_configuration,
             server_side_encryption_configuration: input.server_side_encryption_configuration,
             vector_ingestion_configuration: input.vector_ingestion_configuration,
             // Only a managed knowledge base publishes a default deletion
@@ -287,11 +298,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (knowledge_base_type == crate::state::MANAGED_KNOWLEDGE_BASE_TYPE)
                     .then(|| crate::state::MANAGED_DATA_DELETION_POLICY.to_string())
             }),
-            // This operation completes synchronously (HTTP 200) and the
-            // modelled `DataSource$status` documents AVAILABLE as the status of
-            // a data source that has been created and is ready for ingestion,
-            // so no transition is owed here.
-            status: crate::state::DataSourceStatus::Available,
+            // A data source the service has nothing to connect out for is ready
+            // for ingestion as soon as it is stored, which is what the modelled
+            // `DataSource$status` documents AVAILABLE as. One whose connector
+            // has a source outside the service to reach is not ready yet: it is
+            // stored in the modelled transient CREATING, and the clock owes it
+            // the outcome of bringing that connection up.
+            status: if connects_out {
+                crate::state::DataSourceStatus::Creating
+            } else {
+                crate::state::DataSourceStatus::Available
+            },
+            // That outcome is FAILED: this emulator runs no connector, so a
+            // connection to a source outside it never comes up, and reporting
+            // the data source ready to ingest from a source nothing ever read
+            // would be a readiness it does not have.
+            pending_status: connects_out.then(|| {
+                (
+                    now + crate::state::DATA_SOURCE_VALIDATION_SPAN,
+                    crate::state::DataSourceStatus::Failed,
+                )
+            }),
             // Nothing has been deleted: a removal is owed only once a delete is
             // accepted for this data source or for the knowledge base that
             // contains it.

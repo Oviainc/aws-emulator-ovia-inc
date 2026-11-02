@@ -31,7 +31,15 @@
 //! `GetDataSource`) are backed by the
 //! [`data_sources`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::data_sources)
 //! map, keyed by `dataSourceId` and carrying the `knowledgeBaseId` it belongs
-//! to, with [`DataSourceRecord::to_data_source`] as its single projection.
+//! to, with [`DataSourceRecord::to_data_source`] as its single projection. What
+//! that map holds is the data source's EFFECTIVE configuration: the connector
+//! defaults the service applies to the members a request left unset are
+//! completed once, in [`complete_connector_defaults`], before the record is
+//! stored, so create, update and every read report one configuration. A data
+//! source whose connector has a source outside the service to reach
+//! ([`connects_to_an_external_source`]) is stored `CREATING` and reaches its
+//! outcome on the CLOCK alone, through
+//! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::materialise_due_transitions`].
 //!
 //! Both `UpdateDataSource` and `UpdateKnowledgeBase` hold members their own
 //! contracts document as unchangeable once the resource exists; the one rule
@@ -69,13 +77,15 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, SystemTime};
 
+use ::aws_smithy_types::Document;
+
 use crate::ops::types::{
     Agent, AgentSummary, CreateFlowOutput, CustomOrchestration, DataSource,
     DataSourceConfiguration, FlowDefinition, FlowValidation, FlowVersionSummary, GetFlowOutput,
-    GuardrailConfiguration, IngestionJob, IngestionJobStatistics, KnowledgeBase,
-    KnowledgeBaseConfiguration, MemoryConfiguration, PromptOverrideConfiguration,
-    ServerSideEncryptionConfiguration, StorageConfiguration, UpdateFlowOutput,
-    VectorIngestionConfiguration,
+    GuardrailConfiguration, ImageExtractionConfiguration, IngestionJob, IngestionJobStatistics,
+    KnowledgeBase, KnowledgeBaseConfiguration, MediaExtractionConfiguration, MemoryConfiguration,
+    PromptOverrideConfiguration, ServerSideEncryptionConfiguration, StorageConfiguration,
+    UpdateFlowOutput, VectorIngestionConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned, so it names no
@@ -855,15 +865,368 @@ pub fn data_source_configuration_problem(
     })
 }
 
+/// The `connectorParameters` member naming which connector a managed knowledge
+/// base connector data source uses.
+pub const CONNECTOR_TYPE_PARAMETER: &str = "type";
+
+/// The `connectorParameters` member naming the version of the parameter set the
+/// rest of the document is written against.
+pub const CONNECTOR_VERSION_PARAMETER: &str = "version";
+
+/// The `connectorParameters` member carrying the coordinates of the source a
+/// managed connector reads from.
+pub const CONNECTOR_CONNECTION_PARAMETER: &str = "connectionConfiguration";
+
+/// The one managed connector that reads from no source of its own: its
+/// documents are pushed into the knowledge base through the service's own
+/// document API instead of being taken from somewhere the service has to reach.
+pub const CUSTOM_CONNECTOR: &str = "CUSTOM";
+
+/// The `connectorParameters` member saying whether the connector carries the
+/// source's access-control lists into the knowledge base.
+pub const CONNECTOR_ACL_ENABLED_PARAMETER: &str = "aclEnabled";
+
+/// The value [`CONNECTOR_ACL_ENABLED_PARAMETER`] is stored with when the
+/// request leaves it unset.
+///
+/// RECORDED, not documented: the API reference documents `connectorParameters`
+/// as connector-specific without publishing its defaults, so this is the value
+/// the service itself completes the parameters with.
+pub const CONNECTOR_ACL_ENABLED_DEFAULT: bool = false;
+
+/// The `connectorParameters` member holding the connector's file filter.
+pub const CONNECTOR_FILTER_PARAMETER: &str = "filterConfiguration";
+
+/// The filter member bounding the size of a file the connector takes in.
+pub const CONNECTOR_MAX_FILE_SIZE_PARAMETER: &str = "maxFileSizeInMegaBytes";
+
+/// The bound [`CONNECTOR_MAX_FILE_SIZE_PARAMETER`] is stored with when the
+/// request leaves it unset, in megabytes and spelled as the parameter document
+/// spells its numbers.
+///
+/// RECORDED, not documented, as [`CONNECTOR_ACL_ENABLED_DEFAULT`].
+pub const CONNECTOR_MAX_FILE_SIZE_DEFAULT: &str = "500";
+
+/// The `imageExtractionStatus` a managed connector's
+/// `mediaExtractionConfiguration` takes when the request configures no media
+/// extraction of its own: a modelled `EnabledOrDisabledState` value
+/// (`smithy_query(query="shape",shape="EnabledOrDisabledState")`).
+///
+/// RECORDED, not documented, as [`CONNECTOR_ACL_ENABLED_DEFAULT`].
+pub const IMAGE_EXTRACTION_STATUS_DEFAULT: &str = "ENABLED";
+
+/// Complete `configuration` with the connector defaults the service applies to
+/// the members the request left unset, so what is STORED is the data source's
+/// EFFECTIVE configuration and every reader reports the same one.
+///
+/// Only a managed knowledge base connector has them: it is the service, not the
+/// caller, that runs the connector, so the service completes the caller's
+/// connector parameters rather than taking them as the whole configuration. A
+/// member the request did supply is left exactly as it wrote it, and a
+/// self-managed configuration is not the service's to complete.
+///
+/// The completed parameters are stored — and so reported — as the JSON TEXT of
+/// the document, which is the form the service carries them in: they are the
+/// connector's own parameter document rather than a modelled structure, so what
+/// crosses the wire is that document, not an inlining of its members.
+pub fn complete_connector_defaults(configuration: &mut DataSourceConfiguration) {
+    let Some(connector) = configuration
+        .managed_knowledge_base_connector_configuration
+        .as_mut()
+    else {
+        return;
+    };
+
+    // The connector extracts media from the files it takes in, so a request
+    // that configures none still gets the configuration the connector runs
+    // with.
+    let media = connector
+        .media_extraction_configuration
+        .get_or_insert(MediaExtractionConfiguration {
+            image_extraction_configuration: None,
+            audio_extraction_configuration: None,
+            video_extraction_configuration: None,
+        });
+    media
+        .image_extraction_configuration
+        .get_or_insert(ImageExtractionConfiguration {
+            image_extraction_status: IMAGE_EXTRACTION_STATUS_DEFAULT.to_string(),
+        });
+
+    // `connectorParameters` is a free-form document, so the defaults are
+    // completed member by member: nothing the request wrote is replaced, and
+    // parameters are not invented for a connector the request named none for.
+    let Some(parameters) = connector.connector_parameters.as_ref() else {
+        return;
+    };
+    let Some(supplied) = connector_parameter_members(parameters) else {
+        return;
+    };
+    connector.connector_parameters = Some(Document::String(completed_parameters_text(&supplied)));
+}
+
+/// The text a connector's parameter document is reported as: the members the
+/// request supplied, completed with the defaults the service applies to the
+/// ones it left unset.
+///
+/// The form is RECORDED, not documented: AWS publishes no serialization for
+/// this document, and its responses carry the connector discriminator first and
+/// the parameter-set version last, the parameters the request supplied before
+/// the ones the service completed, each group in reverse member order. A
+/// `Document::Object` is a `HashMap`, whose own iteration order says nothing, so
+/// the text is built from that order alone — one parameter document therefore
+/// has exactly one text, and a caller that diffs a read against an earlier one,
+/// or hashes it to detect drift, sees a difference only where the document
+/// itself differs.
+fn completed_parameters_text(supplied: &HashMap<String, Document>) -> String {
+    let mut members: Vec<String> = Vec::new();
+
+    // The discriminator opens the document.
+    if let Some(connector) = supplied.get(CONNECTOR_TYPE_PARAMETER) {
+        members.push(member_text(
+            CONNECTOR_TYPE_PARAMETER,
+            document_json_text(connector),
+        ));
+    }
+
+    // Then the parameters the request supplied, the file filter completed with
+    // its bound.
+    let edges = [CONNECTOR_TYPE_PARAMETER, CONNECTOR_VERSION_PARAMETER];
+    for (name, value) in group_order(
+        supplied
+            .iter()
+            .filter(|(name, _)| !edges.contains(&name.as_str())),
+    ) {
+        let text = if name == CONNECTOR_FILTER_PARAMETER {
+            completed_filter_text(value)
+        } else {
+            document_json_text(value)
+        };
+        members.push(member_text(name, text));
+    }
+
+    // Then the parameters the service completes for a request that named none.
+    let mut completed: Vec<(&str, String)> = Vec::new();
+    if !supplied.contains_key(CONNECTOR_ACL_ENABLED_PARAMETER) {
+        completed.push((
+            CONNECTOR_ACL_ENABLED_PARAMETER,
+            document_json_text(&Document::Bool(CONNECTOR_ACL_ENABLED_DEFAULT)),
+        ));
+    }
+    if !supplied.contains_key(CONNECTOR_FILTER_PARAMETER) {
+        completed.push((
+            CONNECTOR_FILTER_PARAMETER,
+            completed_filter_text(&Document::Object(HashMap::new())),
+        ));
+    }
+    completed.sort_by(|left, right| right.0.cmp(left.0));
+    for (name, text) in completed {
+        members.push(member_text(name, text));
+    }
+
+    // And the parameter-set version closes it.
+    if let Some(version) = supplied.get(CONNECTOR_VERSION_PARAMETER) {
+        members.push(member_text(
+            CONNECTOR_VERSION_PARAMETER,
+            document_json_text(version),
+        ));
+    }
+
+    format!("{{{}}}", members.join(","))
+}
+
+/// The connector's file filter as its text, completed with the file-size bound
+/// the connector applies: the members the request supplied, and the bound
+/// closing the filter whether the request named it or the service completed it.
+fn completed_filter_text(filter: &Document) -> String {
+    let Document::Object(supplied) = filter else {
+        // A filter that is not a set of members is not the service's to
+        // complete, so it is reported as the request wrote it.
+        return document_json_text(filter);
+    };
+    let mut members: Vec<String> = group_order(
+        supplied
+            .iter()
+            .filter(|(name, _)| name.as_str() != CONNECTOR_MAX_FILE_SIZE_PARAMETER),
+    )
+    .into_iter()
+    .map(|(name, value)| member_text(name, document_json_text(value)))
+    .collect();
+    let bound = supplied
+        .get(CONNECTOR_MAX_FILE_SIZE_PARAMETER)
+        .cloned()
+        .unwrap_or_else(|| Document::String(CONNECTOR_MAX_FILE_SIZE_DEFAULT.to_string()));
+    members.push(member_text(
+        CONNECTOR_MAX_FILE_SIZE_PARAMETER,
+        document_json_text(&bound),
+    ));
+    format!("{{{}}}", members.join(","))
+}
+
+/// One group of a document's members, in the order the group is emitted in.
+fn group_order<'a>(
+    members: impl Iterator<Item = (&'a String, &'a Document)>,
+) -> Vec<(&'a String, &'a Document)> {
+    let mut members: Vec<(&String, &Document)> = members.collect();
+    members.sort_by(|(left, _), (right, _)| right.cmp(left));
+    members
+}
+
+/// One member of a JSON object: its name, quoted, and its value's text.
+fn member_text(name: &str, value: String) -> String {
+    format!("{}:{value}", ::serde_json::Value::String(name.to_string()))
+}
+
+/// The connector parameters as their member map, whether the request carried
+/// them inlined as a document object or as the JSON text the service itself
+/// reports them as — so a caller may put back exactly what it read. `None` when
+/// they are neither, in which case there are no members to complete and the
+/// request's value stands.
+///
+/// The text is parsed by `serde_json`, which refuses input nested past its own
+/// recursion limit, so a caller's text cannot drive this walk arbitrarily deep.
+fn connector_parameter_members(parameters: &Document) -> Option<HashMap<String, Document>> {
+    match parameters {
+        Document::Object(members) => Some(members.clone()),
+        Document::String(text) => match ::serde_json::from_str::<::serde_json::Value>(text) {
+            Ok(::serde_json::Value::Object(members)) => Some(
+                members
+                    .iter()
+                    .map(|(name, value)| (name.clone(), document_of_json(value)))
+                    .collect(),
+            ),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A parsed JSON value as the Smithy document holding the same value.
+fn document_of_json(value: &::serde_json::Value) -> Document {
+    use ::aws_smithy_types::Number;
+
+    match value {
+        ::serde_json::Value::Null => Document::Null,
+        ::serde_json::Value::Bool(flag) => Document::Bool(*flag),
+        ::serde_json::Value::Number(number) => {
+            if let Some(number) = number.as_u64() {
+                Document::Number(Number::PosInt(number))
+            } else if let Some(number) = number.as_i64() {
+                Document::Number(Number::NegInt(number))
+            } else {
+                Document::Number(Number::Float(number.as_f64().unwrap_or_default()))
+            }
+        }
+        ::serde_json::Value::String(text) => Document::String(text.clone()),
+        ::serde_json::Value::Array(elements) => {
+            Document::Array(elements.iter().map(document_of_json).collect())
+        }
+        ::serde_json::Value::Object(members) => Document::Object(
+            members
+                .iter()
+                .map(|(name, member)| (name.clone(), document_of_json(member)))
+                .collect(),
+        ),
+    }
+}
+
+/// `document` as the compact JSON text the connector parameters are reported as.
+///
+/// An object's members are emitted in the order [`group_order`] gives them, and
+/// nothing carries insignificant whitespace, so one document has exactly one
+/// text. (A `Document::Object` is a `HashMap`, whose own iteration order says
+/// nothing.)
+///
+/// The walk follows the document's own nesting, which is bounded before it gets
+/// here: a document arrives either through the request deserializer or through
+/// [`connector_parameter_members`], and both refuse input nested past a fixed
+/// depth, so a caller cannot choose how deep this descends.
+fn document_json_text(document: &Document) -> String {
+    use ::aws_smithy_types::Number;
+
+    match document {
+        Document::Null => "null".to_string(),
+        Document::Bool(flag) => flag.to_string(),
+        Document::Number(Number::PosInt(number)) => number.to_string(),
+        Document::Number(Number::NegInt(number)) => number.to_string(),
+        Document::Number(Number::Float(number)) => ::serde_json::Value::from(*number).to_string(),
+        Document::String(text) => ::serde_json::Value::String(text.clone()).to_string(),
+        Document::Array(elements) => {
+            let elements: Vec<String> = elements.iter().map(document_json_text).collect();
+            format!("[{}]", elements.join(","))
+        }
+        Document::Object(members) => {
+            let members: Vec<String> = group_order(members.iter())
+                .into_iter()
+                .map(|(name, member)| member_text(name, document_json_text(member)))
+                .collect();
+            format!("{{{}}}", members.join(","))
+        }
+    }
+}
+
+/// Whether the data source `configuration` describes has a source OUTSIDE this
+/// service that the service itself has to reach before the data source can
+/// serve ingestion.
+///
+/// A managed knowledge base connector is run BY the service: it connects the
+/// knowledge base to the source its `connectorParameters` name — the
+/// `connectionConfiguration` parameter carries that source's coordinates — so
+/// the connection has to come up before the data source is ready. The `CUSTOM`
+/// connector names no source, since its documents are pushed in through the
+/// service's own document API, and a self-managed configuration is read by an
+/// ingestion job rather than connected to when the data source is created.
+pub fn connects_to_an_external_source(configuration: &DataSourceConfiguration) -> bool {
+    let Some(connector) = configuration
+        .managed_knowledge_base_connector_configuration
+        .as_ref()
+    else {
+        return false;
+    };
+    let Some(parameters) = connector
+        .connector_parameters
+        .as_ref()
+        .and_then(connector_parameter_members)
+    else {
+        return false;
+    };
+    if parameters.contains_key(CONNECTOR_CONNECTION_PARAMETER) {
+        return true;
+    }
+    match parameters.get(CONNECTOR_TYPE_PARAMETER) {
+        Some(Document::String(connector)) => connector != CUSTOM_CONNECTOR,
+        _ => false,
+    }
+}
+
+/// How long after `CreateDataSource` a data source whose connector has a source
+/// outside the service to reach leaves `CREATING` for the outcome of bringing
+/// that connection up.
+///
+/// CHOSEN, not documented: AWS publishes no duration for the creation of a data
+/// source. It is deliberately non-zero so a caller that reads the data source
+/// back immediately still observes the transient `CREATING` status the modelled
+/// `DataSourceStatus` declares, and it is the span a knowledge base's own
+/// creation takes ([`KNOWLEDGE_BASE_ACTIVATION_SPAN`]), so a client script
+/// converges just as promptly.
+pub const DATA_SOURCE_VALIDATION_SPAN: Duration = KNOWLEDGE_BASE_ACTIVATION_SPAN;
+
 /// The `DataSourceStatus` values this slice of the service can hold, named as
 /// the model's `DataSourceStatus` enum names them on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataSourceStatus {
-    /// Created and ready to be ingested from — what `CreateDataSource` answers
-    /// with, since it completes synchronously (HTTP 200) and the modelled
-    /// `DataSource$status` documents this as the status of a data source that
-    /// "has been created and is ready for ingestion into the knowledge base".
+    /// The data source is stored and the connection to the source its connector
+    /// names is being brought up; the clock owes it the outcome of that once
+    /// [`DATA_SOURCE_VALIDATION_SPAN`] has elapsed.
+    Creating,
+    /// Created and ready to be ingested from — the modelled `DataSource$status`
+    /// documents this as the status of a data source that "has been created and
+    /// is ready for ingestion into the knowledge base", which a data source the
+    /// service has no source to reach for is as soon as it is stored.
     Available,
+    /// The connection to the source the data source's connector names did not
+    /// come up, so the data source serves no ingestion.
+    Failed,
     /// `DeleteDataSource` accepted, or the deletion of the knowledge base that
     /// contains it — the modelled `DataSource$status` documents this as the
     /// status of a data source that "is being deleted". The record is removed
@@ -875,7 +1238,9 @@ impl DataSourceStatus {
     /// The member value for the modelled `DataSourceStatus` enum.
     pub fn as_wire(self) -> &'static str {
         match self {
+            Self::Creating => "CREATING",
             Self::Available => "AVAILABLE",
+            Self::Failed => "FAILED",
             Self::Deleting => "DELETING",
         }
     }
@@ -894,6 +1259,10 @@ pub struct DataSourceRecord {
     pub vector_ingestion_configuration: Option<VectorIngestionConfiguration>,
     pub data_deletion_policy: Option<String>,
     pub status: DataSourceStatus,
+    /// A status the CLOCK owes this data source, and the instant it comes due.
+    /// A reporting operation may materialise it once that instant has passed;
+    /// it never invents a transition of its own.
+    pub pending_status: Option<(SystemTime, DataSourceStatus)>,
     /// The instant the CLOCK owes this data source's removal, set by the delete
     /// that was accepted for it — or for the knowledge base that contains it —
     /// and `None` while none was.
@@ -1409,6 +1778,14 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                 }
             }
         }
+        for data_source in self.data_sources.values_mut() {
+            if let Some((due, next)) = data_source.pending_status {
+                if now >= due {
+                    data_source.status = next;
+                    data_source.pending_status = None;
+                }
+            }
+        }
         // An ingestion job's status is a CHAIN, so a job left unread for long
         // enough is owed more than one of them: each is applied at the instant
         // it came due, and the next is due that instant plus its own span. The
@@ -1477,6 +1854,9 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .filter(|record| record.knowledge_base_id == knowledge_base_id)
         {
             record.status = DataSourceStatus::Deleting;
+            // A status the clock still owed this data source is not owed any
+            // more, for the same reason: it is being deleted, not created.
+            record.pending_status = None;
             record.removal_due_at = Some(removal_due_at);
             record.updated_at = now;
         }
@@ -1494,6 +1874,8 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         let removal_due_at = now + DELETION_SPAN;
         if let Some(record) = self.data_source_of_mut(knowledge_base_id, data_source_id) {
             record.status = DataSourceStatus::Deleting;
+            // As above: a status the clock still owed it is not owed any more.
+            record.pending_status = None;
             record.removal_due_at = Some(removal_due_at);
             record.updated_at = now;
         }

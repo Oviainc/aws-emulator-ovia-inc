@@ -558,13 +558,33 @@ async fn created_data_sources_round_trip_through_get_data_source() {
         (
             // A managed knowledge base: the documented default for
             // `dataDeletionPolicy` applies here and nowhere else.
+            //
+            // This row supplies the whole EFFECTIVE connector configuration —
+            // the media-extraction configuration and the connector parameters a
+            // request may instead leave to the service — so it asserts that
+            // what the request DID write is stored exactly as written. What the
+            // service completes for a request that leaves them unset, and the
+            // status a connector with a source to reach takes, are asserted in
+            // `managed_connector_defaults.rs`.
             "a managed-connector data source of a MANAGED knowledge base",
             managed_knowledge_base("managed-kb"),
             json!({
                 "name": "managed-connector",
                 "dataSourceConfiguration": {
                     "type": "MANAGED_KNOWLEDGE_BASE_CONNECTOR",
-                    "managedKnowledgeBaseConnectorConfiguration": {},
+                    "managedKnowledgeBaseConnectorConfiguration": {
+                        // The connector's own parameter document, as the
+                        // service reports it: a JSON text whose members are in
+                        // sorted order.
+                        "connectorParameters": "{\"type\":\"CUSTOM\",\
+                             \"filterConfiguration\":{\"maxFileSizeInMegaBytes\":\"250\"},\
+                             \"aclEnabled\":false,\"version\":\"1\"}",
+                        "mediaExtractionConfiguration": {
+                            "imageExtractionConfiguration": {
+                                "imageExtractionStatus": "DISABLED",
+                            },
+                        },
+                    },
                 },
             }),
         ),

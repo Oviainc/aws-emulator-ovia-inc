@@ -157,11 +157,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
-        // The ONLY write a read performs: a removal the CLOCK already made due
-        // — the delete that was accepted for this data source, or for the
-        // knowledge base containing it, completing — was owed at this instant
-        // whether or not anybody called. Nothing else about the store changes
-        // here.
+        // The ONLY write a read performs: a change the CLOCK already made due —
+        // the outcome of bringing a connector's connection up, and the removal
+        // a delete accepted for this data source or for the knowledge base
+        // containing it completes — was owed at this instant whether or not
+        // anybody called. Nothing else about the store changes here.
         state.materialise_due_transitions(now);
 
         // A data source is identified by the knowledge base it belongs to as

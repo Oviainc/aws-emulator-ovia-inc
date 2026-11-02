@@ -192,6 +192,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The stored configuration is the EFFECTIVE one, here as at create: the
+        // service completes the connector members the request left unset with
+        // its own defaults before writing them, so an update cannot leave a
+        // data source carrying less than the connector actually runs with.
+        let mut data_source_configuration = input.data_source_configuration;
+        crate::state::complete_connector_defaults(&mut data_source_configuration);
+
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialise_due_transitions(now);
@@ -282,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are not the request's to set.
         record.name = input.name;
         record.description = input.description;
-        record.data_source_configuration = input.data_source_configuration;
+        record.data_source_configuration = data_source_configuration;
         record.server_side_encryption_configuration = input.server_side_encryption_configuration;
         record.vector_ingestion_configuration = input.vector_ingestion_configuration;
         // The member's documented default, applied by the rule the create applies
