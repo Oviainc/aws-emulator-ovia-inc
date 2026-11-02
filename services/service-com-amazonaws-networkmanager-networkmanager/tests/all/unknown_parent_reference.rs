@@ -9,7 +9,10 @@
 //! `x-amzn-errortype: ValidationException`, `Reason` = `FieldValidationFailed` and one
 //! `Fields` entry whose `Name` is that member (the service's own lowerCamelCase field
 //! name) and whose `Message` is the top-level `Message` — "<Kind> not found." for the kind
-//! the member references. An operation that acts on an EXISTING resource keeps answering
+//! the member references. Every other store under a global network — an association, a
+//! registration, an analysis — refuses its parent reference the same way, which
+//! `crate::unknown_global_network_on_a_new_record` pins over that family.
+//! An operation that acts on an EXISTING resource keeps answering
 //! the absent resource with `ResourceNotFoundException` (404); that half of the rule is
 //! pinned by `resource_not_found_message`.
 //!

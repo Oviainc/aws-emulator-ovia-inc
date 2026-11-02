@@ -424,12 +424,15 @@ async fn associate_link_refuses_a_pair_that_is_not_two_resources_of_one_site() {
             "ResourceNotFoundException",
         ),
         (
+            // The association is a new record stored under the global network the path
+            // addresses, so that parent reference is a field failure rather than the
+            // missing-resource answer the resources inside it get.
             "an unknown global network",
             "global-network-0000000000000beef",
             device.as_str(),
             link.as_str(),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a device stored under another global network",

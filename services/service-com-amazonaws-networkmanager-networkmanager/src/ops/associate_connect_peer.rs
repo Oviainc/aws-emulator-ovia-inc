@@ -3,8 +3,10 @@
 //! @op AssociateConnectPeer
 //! Ties one stored core network Connect peer to one device of the global network the path
 //! addresses, optionally over one of that device's links, and registers the peering with
-//! that global network's telemetry. A reference that names nothing is
-//! `ResourceNotFoundException` (404), a link not associated with the named device is
+//! that global network's telemetry. A global network the path addresses and the store does
+//! not hold is a field failure on `globalNetworkId` (`ValidationException`, 400), a peer,
+//! device or link inside it that names nothing is `ResourceNotFoundException` (404), a link
+//! not associated with the named device is
 //! `ValidationException` (400), and a peer already tied to another device is
 //! `ConflictException` (409). This is the ONLY file to touch for this operation.
 //!
@@ -151,16 +153,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // Every resource this call acts on already exists — the association ties them
-        // together rather than minting a resource of its own — so a reference that names
-        // nothing is the missing-resource answer (404), exactly as `AssociateLink` answers
-        // for the pair it ties. The global network the path addresses is checked first,
-        // then the resources inside it.
+        // The association is a NEW record stored under the global network the path
+        // addresses, so that parent reference is validated before anything is stored: an
+        // id naming no stored global network is a FIELD failure on the member that carried
+        // it ([`crate::state::unknown_reference`]), exactly as `AssociateLink` answers.
+        // The resources the association ties are looked up afterwards, inside the global
+        // network that resolved.
         if !store.global_networks.contains_key(&input.global_network_id) {
-            return Err(AssociateConnectPeerErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
+            return Err(AssociateConnectPeerErrorModeled::ValidationException(
+                crate::state::unknown_reference(
+                    crate::state::FIELD_GLOBAL_NETWORK_ID,
                     crate::state::GLOBAL_NETWORK_KIND,
-                    &input.global_network_id,
                 ),
             )
             .into());

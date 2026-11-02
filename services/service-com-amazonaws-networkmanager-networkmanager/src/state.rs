@@ -530,8 +530,10 @@ pub fn requested_reference(supplied: Option<&str>) -> Option<Option<&str>> {
 /// its input carries — the parent a new resource must hang off, or the resource a
 /// reporting operation is addressed through — names no stored resource.
 ///
-/// A create validates its input before anything is minted, so a reference that resolves
-/// to nothing is a FIELD failure on the member that carried it rather than a missing
+/// An operation that STORES A NEW RECORD — a resource of its own, a job, or a tie that has
+/// no id (an association, a registration) — validates the references its input carries
+/// before anything is stored, so a reference that resolves to nothing is a FIELD failure on
+/// the member that carried it rather than a missing
 /// resource: `Reason` is `FieldValidationFailed` and `Fields` carries one entry naming
 /// that member (see [`FIELD_GLOBAL_NETWORK_ID`]). The prose is the one the recordings
 /// show — "<Kind> not found." for the kind the member references, from [`kind_label`] —
@@ -539,10 +541,12 @@ pub fn requested_reference(supplied: Option<&str>) -> Option<Option<&str>> {
 ///
 /// This is the crate's SINGLE construction for an unresolvable reference refused as a
 /// validation failure, so one service reports one field name and one message for the same
-/// member whichever operation refused it. An operation that MODELS
-/// `ResourceNotFoundException` answers the absent resource with that 404 instead (see
-/// [`resource_not_found`]); one that does not — a reporting operation whose only client
-/// error is the `ValidationException` — refuses the reference through here.
+/// member whichever operation refused it. Which errors the operation MODELS does not decide
+/// the class: the recorded refusals of a create and of an association under a global network
+/// the store does not hold are both this 400 on operations that model the 404 as well. An
+/// operation addressed AT a resource that already exists — a read, an update, a delete, a
+/// disassociation — answers the absent resource with that 404 instead (see
+/// [`resource_not_found`]).
 ///
 /// `member` is the field name the refusal reports; `kind` is the resource kind the
 /// member references ([`GLOBAL_NETWORK_KIND`], [`SITE_KIND`], [`CORE_NETWORK_KIND`]).

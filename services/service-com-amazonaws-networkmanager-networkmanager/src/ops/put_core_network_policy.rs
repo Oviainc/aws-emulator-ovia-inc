@@ -104,6 +104,12 @@ impl From<PutCoreNetworkPolicyErrorModeled> for PutCoreNetworkPolicyError {
     }
 }
 
+/// The message a failed version guard carries: the fixed sentence the service answers for a
+/// `LatestVersionId` that is not the version the history ends at. It names no version and no
+/// core network — the identifying detail travels in the `Fields` entry's member name — so one
+/// put's refusal reads the same as any other's.
+const INVALID_LATEST_VERSION_ID: &str = "Invalid input. Invalid latest version ID.";
+
 /// The `PutCoreNetworkPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -233,16 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::field_rejection(
                         crate::state::FIELD_LATEST_VERSION_ID,
                         crate::state::REASON_FIELD_VALIDATION_FAILED,
-                        match latest {
-                            Some(latest) => format!(
-                                "policy version {named} is not the latest version of core network {}; its latest version is {latest}",
-                                input.core_network_id
-                            ),
-                            None => format!(
-                                "policy version {named} is not the latest version of core network {}, which holds no policy version",
-                                input.core_network_id
-                            ),
-                        },
+                        INVALID_LATEST_VERSION_ID.to_string(),
                     ),
                 )
                 .into());

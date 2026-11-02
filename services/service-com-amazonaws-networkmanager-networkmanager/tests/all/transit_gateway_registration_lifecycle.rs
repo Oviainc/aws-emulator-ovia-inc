@@ -502,13 +502,14 @@ async fn a_string_that_names_no_transit_gateway_is_refused_on_the_member_that_ca
 }
 
 #[tokio::test]
-async fn a_global_network_that_is_not_stored_is_not_found_on_every_registration_operation() {
+async fn a_global_network_that_is_not_stored_is_refused_on_every_registration_operation() {
     let emulator = Emulator::new();
     let absent = "global-network-0000000000000dead";
     let arn = transit_gateway_arn("aws", "us-west-2", &own_account(), 9, 17);
 
-    let calls: [(&str, (u16, Value)); 3] = [
-        ("RegisterTransitGateway", register(&emulator, absent, &arn).await),
+    // The REPORTING and the DEREGISTERING calls are addressed at state the store already
+    // holds, so a global network it does not hold is the missing-resource answer.
+    let calls: [(&str, (u16, Value)); 2] = [
         (
             "GetTransitGatewayRegistrations",
             get_registrations(&emulator, absent, "").await,
@@ -535,6 +536,30 @@ async fn a_global_network_that_is_not_stored_is_not_found_on_every_registration_
             "case {case}: the refusal must name the global network, got {body}"
         );
     }
+
+    // REGISTERING stores a new record under the global network the path addresses, so that
+    // parent reference is validated before anything is stored: the refusal is the field
+    // failure the creates under a global network answer, naming the member at fault.
+    let (status, body) = register(&emulator, absent, &arn).await;
+    assert_eq!(
+        status, 400,
+        "case RegisterTransitGateway: expected 400 for an unknown global network, got {status} with {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "case RegisterTransitGateway: expected ValidationException, got {body}"
+    );
+    assert_eq!(
+        body["Reason"].as_str(),
+        Some("FieldValidationFailed"),
+        "case RegisterTransitGateway: expected Reason FieldValidationFailed, got {body}"
+    );
+    assert_eq!(
+        body["Fields"],
+        json!([{ "Name": "globalNetworkId", "Message": "Global network not found." }]),
+        "case RegisterTransitGateway: expected one Fields entry naming globalNetworkId, got {body}"
+    );
 
     // The combined case: a request whose gateway ARN names no transit gateway at all is a
     // FIELD failure, decided before any stored state is consulted — the same order the

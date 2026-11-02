@@ -3,8 +3,9 @@
 //! One service, ONE refusal for a reference that names no stored resource.
 //!
 //! Wherever this service refuses a request because a reference it carries resolves to no
-//! stored resource and the operation's modelled client errors do not include
-//! `ResourceNotFoundException`, the refusal is the same shape whichever operation answered
+//! stored resource and the request is not addressed AT that resource — a reporting
+//! operation reached through it, a create or another store hanging a new record off it —
+//! the refusal is the same shape whichever operation answered
 //! it: HTTP 400 with `x-amzn-errortype: ValidationException`, `Reason` =
 //! `FieldValidationFailed`, and one `Fields` entry whose `Name` is the offending request
 //! member in this service's own lowerCamelCase field naming and whose `Message` is the

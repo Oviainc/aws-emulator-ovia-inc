@@ -657,11 +657,14 @@ async fn a_request_the_store_cannot_serve_is_refused_and_changes_nothing() {
     // Each row: the request, and the status and error code the store's answer must carry.
     let rows: Vec<(&str, String, Value, u16, &str)> = vec![
         (
+            // The association is a new record stored under the global network the path
+            // addresses, so that parent reference is a field failure rather than the
+            // missing-resource answer the resources inside it get.
             "an unknown global network",
             unknown_network.to_string(),
             json!({ "ConnectPeerId": peer, "DeviceId": fixture.sited_device }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "an unknown Connect peer",

@@ -159,14 +159,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // A route analysis is started ON a global network, which the URI addresses
-        // (`POST /global-networks/{GlobalNetworkId}/route-analyses`), so one the store does
-        // not hold is the missing-resource answer rather than a field failure.
+        // The analysis is a NEW record stored under the global network the path addresses
+        // (`POST /global-networks/{GlobalNetworkId}/route-analyses`), so that parent
+        // reference is validated before anything is stored: an id naming no stored global
+        // network is a FIELD failure on the member that carried it
+        // ([`crate::state::unknown_reference`]), exactly as `AssociateLink` answers.
         if !store.global_networks.contains_key(&input.global_network_id) {
-            return Err(StartRouteAnalysisErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
+            return Err(StartRouteAnalysisErrorModeled::ValidationException(
+                crate::state::unknown_reference(
+                    crate::state::FIELD_GLOBAL_NETWORK_ID,
                     crate::state::GLOBAL_NETWORK_KIND,
-                    &input.global_network_id,
                 ),
             )
             .into());

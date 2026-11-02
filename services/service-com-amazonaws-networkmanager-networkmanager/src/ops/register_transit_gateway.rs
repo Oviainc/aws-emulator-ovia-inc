@@ -186,14 +186,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // The registration ties a gateway to a global network that already exists rather
-        // than minting a resource of its own, so a global network the path names and the
-        // store does not hold is the missing-resource answer.
+        // The registration is a NEW record stored under the global network the path
+        // addresses, so that parent reference is validated before anything is stored: an
+        // id naming no stored global network is a FIELD failure on the member that carried
+        // it ([`crate::state::unknown_reference`]), exactly as `AssociateLink` answers.
         let Some(network) = store.global_networks.get(&input.global_network_id) else {
-            return Err(RegisterTransitGatewayErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
+            return Err(RegisterTransitGatewayErrorModeled::ValidationException(
+                crate::state::unknown_reference(
+                    crate::state::FIELD_GLOBAL_NETWORK_ID,
                     crate::state::GLOBAL_NETWORK_KIND,
-                    &input.global_network_id,
                 ),
             )
             .into());

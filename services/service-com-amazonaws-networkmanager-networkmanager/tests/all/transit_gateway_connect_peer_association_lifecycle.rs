@@ -983,24 +983,14 @@ async fn a_string_that_names_no_connect_peer_is_refused_on_the_member_that_carri
 }
 
 #[tokio::test]
-async fn a_global_network_that_is_not_stored_is_not_found_on_every_operation() {
+async fn a_global_network_that_is_not_stored_is_refused_on_every_operation() {
     let emulator = Emulator::new();
     let absent = "global-network-0000000000000dead";
     let arn = connect_peer_arn("aws", "us-west-2", "123456789012", 9, 17);
 
-    let calls: [(&str, (u16, Value)); 3] = [
-        (
-            "AssociateTransitGatewayConnectPeer",
-            associate(
-                &emulator,
-                absent,
-                json!({
-                    "TransitGatewayConnectPeerArn": arn,
-                    "DeviceId": "device-0000000000000beef",
-                }),
-            )
-            .await,
-        ),
+    // The REPORTING and the DISASSOCIATING calls are addressed at state the store already
+    // holds, so a global network it does not hold is the missing-resource answer.
+    let calls: [(&str, (u16, Value)); 2] = [
         (
             "GetTransitGatewayConnectPeerAssociations",
             get_associations(&emulator, absent, "").await,
@@ -1027,6 +1017,38 @@ async fn a_global_network_that_is_not_stored_is_not_found_on_every_operation() {
             "case {case}: the refusal must name the global network, got {body}"
         );
     }
+
+    // ASSOCIATING stores a new record under the global network the path addresses, so that
+    // parent reference is validated before anything is stored: the refusal is the field
+    // failure the creates under a global network answer, naming the member at fault.
+    let (status, body) = associate(
+        &emulator,
+        absent,
+        json!({
+            "TransitGatewayConnectPeerArn": arn,
+            "DeviceId": "device-0000000000000beef",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case AssociateTransitGatewayConnectPeer: expected 400 for an unknown global network, got {status} with {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "case AssociateTransitGatewayConnectPeer: expected ValidationException, got {body}"
+    );
+    assert_eq!(
+        body["Reason"].as_str(),
+        Some("FieldValidationFailed"),
+        "case AssociateTransitGatewayConnectPeer: expected Reason FieldValidationFailed, got {body}"
+    );
+    assert_eq!(
+        body["Fields"],
+        json!([{ "Name": "globalNetworkId", "Message": "Global network not found." }]),
+        "case AssociateTransitGatewayConnectPeer: expected one Fields entry naming globalNetworkId, got {body}"
+    );
 
     // The combined case: a request whose peer ARN names no Connect peer at all is a FIELD
     // failure, decided before any stored state is consulted — the same order the

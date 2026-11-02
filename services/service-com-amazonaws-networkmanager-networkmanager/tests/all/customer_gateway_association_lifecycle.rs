@@ -602,15 +602,31 @@ async fn a_request_naming_nothing_stored_or_no_customer_gateway_is_refused_and_s
         );
     }
 
-    // A reference that names nothing stored is the missing-resource answer (404), and the
-    // global network in the path is judged before the resources inside it.
+    // A resource INSIDE the global network that names nothing stored is the missing-resource
+    // answer (404); the global network in the path is judged before them, and — the
+    // association being a new record stored under it — as a field failure.
     let arn = plain_cgw_arn("0123456789abcdef1");
+    let (status, refused) = associate(
+        &emulator,
+        unknown_network,
+        json!({ "CustomerGatewayArn": arn, "DeviceId": subject.device }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case associate under an unknown global network: expected 400, got {status} with {refused}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "case associate under an unknown global network: expected ValidationException, got {refused}"
+    );
+    assert_eq!(
+        refused["Fields"],
+        json!([{ "Name": "globalNetworkId", "Message": "Global network not found." }]),
+        "case associate under an unknown global network: expected one Fields entry naming globalNetworkId, got {refused}"
+    );
     let not_found = [
-        (
-            "unknown global network",
-            unknown_network.to_string(),
-            json!({ "CustomerGatewayArn": arn, "DeviceId": subject.device }),
-        ),
         (
             "unknown device",
             network.clone(),

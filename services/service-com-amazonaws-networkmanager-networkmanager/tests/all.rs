@@ -233,6 +233,8 @@ mod transit_gateway_registration_lifecycle;
 mod transit_gateway_route_table_attachment;
 #[path = "all/transit_gateway_route_table_attachment_lifecycle.rs"]
 mod transit_gateway_route_table_attachment_lifecycle;
+#[path = "all/unknown_global_network_on_a_new_record.rs"]
+mod unknown_global_network_on_a_new_record;
 #[path = "all/unknown_parent_reference.rs"]
 mod unknown_parent_reference;
 #[path = "all/unminted_page_token_refusal.rs"]

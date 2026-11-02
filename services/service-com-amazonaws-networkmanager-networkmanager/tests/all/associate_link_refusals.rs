@@ -2,12 +2,18 @@
 
 //! `AssociateLink`'s two refusal classes, and the fact that neither writes anything.
 //!
-//! An association ties two resources the store already holds together — it mints no
-//! resource of its own — so every reference the request carries has to resolve inside the
-//! global network the path addresses. That splits the refusals in two, and this suite
-//! tables both:
+//! An association is a new record stored under the global network the path addresses, and
+//! it ties two resources that global network already holds. That splits the refusals in
+//! three, and this suite tables all of them:
 //!
-//! * a reference that resolves to nothing stored there is the missing-resource answer:
+//! * the global network the path addresses, naming nothing stored, is a FIELD failure on
+//!   the member that carried it: 400 `ValidationException` with
+//!   `Reason` = `FieldValidationFailed` and one `Fields` entry naming `globalNetworkId`,
+//!   the refusal every store under a global network gives for that parent reference
+//!   (`crate::unknown_global_network_on_a_new_record` owns that rule over the operations
+//!   that share it).
+//! * a device or link INSIDE a global network that does resolve, naming nothing stored
+//!   there, is the missing-resource answer:
 //!   404 `ResourceNotFoundException`, carrying the service's constant message and
 //!   identifying the resource in `ResourceId` / `ResourceType`
 //!   (`crate::resource_not_found_message` owns that rule, and this suite asserts
@@ -36,11 +42,21 @@ use crate::link_association_lifecycle::{associate, associate_ok, get_association
 use crate::link_lifecycle::{create_link_ok, plain_link};
 // The `ResourceType` values — the ARN resource types this service mints — live with the
 // not-found message rule they travel with, in `crate::resource_not_found_message`.
-use crate::resource_not_found_message::{assert_not_found_answer, DEVICE, GLOBAL_NETWORK, LINK};
+use crate::resource_not_found_message::{assert_not_found_answer, DEVICE, LINK};
 
 /// The `ValidationException$Reason` a refusal about stored state carries: no single input
 /// member is at fault, so it is the modelled catch-all.
 const REASON_OTHER: &str = "Other";
+
+/// The `ValidationException$Reason` a refusal of one input MEMBER carries, and the field
+/// name and prose this service reports for a global-network reference that resolves to
+/// nothing (the spelling and text the recorded refusals answer, pinned over every operation
+/// that shares them by `crate::unknown_global_network_on_a_new_record`).
+const REASON_FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
+/// See [`REASON_FIELD_VALIDATION_FAILED`].
+const FIELD_GLOBAL_NETWORK_ID: &str = "globalNetworkId";
+/// See [`REASON_FIELD_VALIDATION_FAILED`].
+const GLOBAL_NETWORK_NOT_FOUND: &str = "Global network not found.";
 
 /// The route `AssociateLink` is bound to (`smithy_query query="operation"
 /// operation="AssociateLink"`): POST on the global network's link-association collection.
@@ -66,7 +82,7 @@ struct SiteMismatchCase {
 }
 
 #[tokio::test]
-async fn associate_link_refuses_every_unresolvable_reference_as_not_found_and_stores_nothing() {
+async fn associate_link_refuses_every_unresolvable_reference_and_stores_nothing() {
     let emulator = Emulator::new();
     let network = emulator.create_global_network("associate-link refusals").await;
     let site = emulator.create_site(&network, "hq").await;
@@ -115,22 +131,6 @@ async fn associate_link_refuses_every_unresolvable_reference_as_not_found_and_st
 
     let rows = vec![
         MissingCase {
-            case: "a global network that was never minted",
-            network: unknown_network.clone(),
-            device: device.clone(),
-            link: link.clone(),
-            resource_type: GLOBAL_NETWORK,
-            resource_id: unknown_network.clone(),
-        },
-        MissingCase {
-            case: "a global network that was deleted",
-            network: gone_network.clone(),
-            device: device.clone(),
-            link: link.clone(),
-            resource_type: GLOBAL_NETWORK,
-            resource_id: gone_network.clone(),
-        },
-        MissingCase {
             case: "a device that was never minted",
             network: network.clone(),
             device: unknown_device.clone(),
@@ -178,16 +178,8 @@ async fn associate_link_refuses_every_unresolvable_reference_as_not_found_and_st
             resource_type: LINK,
             resource_id: foreign_link.clone(),
         },
-        // The outside-in order: with several unresolvable references, the one reported is
-        // the global network the path addresses, then the device, then the link.
-        MissingCase {
-            case: "no reference resolving at all",
-            network: unknown_network.clone(),
-            device: unknown_device.clone(),
-            link: unknown_link.clone(),
-            resource_type: GLOBAL_NETWORK,
-            resource_id: unknown_network,
-        },
+        // The outside-in order: with both resources of the pair unresolvable, the one
+        // reported is the device.
         MissingCase {
             case: "neither resource of the pair resolving",
             network: network.clone(),
@@ -209,6 +201,57 @@ async fn associate_link_refuses_every_unresolvable_reference_as_not_found_and_st
             row.resource_type,
         )
         .await;
+    }
+
+    // The global network the path addresses is a different refusal: the association is a
+    // NEW record stored under it, so that parent reference is validated before anything is
+    // stored and an id naming no stored global network is the field failure — whether it
+    // was never minted or minted and deleted, and whatever else the request names.
+    for (case, network, device_named, link_named) in [
+        (
+            "a global network that was never minted",
+            unknown_network.clone(),
+            device.clone(),
+            link.clone(),
+        ),
+        (
+            "a global network that was deleted",
+            gone_network.clone(),
+            device.clone(),
+            link.clone(),
+        ),
+        (
+            "no reference resolving at all",
+            unknown_network.clone(),
+            unknown_device.clone(),
+            unknown_link.clone(),
+        ),
+    ] {
+        let (status, refused) = associate(&emulator, &network, &device_named, &link_named).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: AssociateLink expected 400, got {status} with {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {refused}"
+        );
+        assert_eq!(
+            refused["Reason"].as_str(),
+            Some(REASON_FIELD_VALIDATION_FAILED),
+            "case {case:?}: expected Reason {REASON_FIELD_VALIDATION_FAILED}, got {refused}"
+        );
+        assert_eq!(
+            refused["Fields"],
+            json!([{ "Name": FIELD_GLOBAL_NETWORK_ID, "Message": GLOBAL_NETWORK_NOT_FOUND }]),
+            "case {case:?}: expected one Fields entry naming {FIELD_GLOBAL_NETWORK_ID}, got {refused}"
+        );
+        assert_eq!(
+            refused["Message"].as_str(),
+            Some(GLOBAL_NETWORK_NOT_FOUND),
+            "case {case:?}: expected Message {GLOBAL_NETWORK_NOT_FOUND:?}, got {refused}"
+        );
     }
 
     // Not one of those requests stored anything: the only resolvable pair among them is

@@ -3,10 +3,11 @@
 //! @op AssociateLink
 //! Associates a stored link with a stored device of the same global network and site, and
 //! reports the association as `PENDING` until the settle span the clock owes has passed:
-//! an unknown global network, device or link is a 404, a device and link that do not sit
-//! at the same site are refused with `ValidationException` (400), and re-associating a
-//! pair already associated reports the stored association unchanged. This is the ONLY
-//! file to touch for this operation.
+//! a global network the path addresses and the store does not hold is a field failure on
+//! `globalNetworkId` (`ValidationException`, 400), an unknown device or link inside it is
+//! a 404, a device and link that do not sit at the same site are refused with
+//! `ValidationException` (400), and re-associating a pair already associated reports the
+//! stored association unchanged. This is the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -147,16 +148,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // Every resource this call acts on already exists — the association ties two of
-        // them together rather than minting a resource of its own — so a reference that
-        // names nothing is the missing-resource answer (404), not the field failure a
-        // create of a new resource gives. The global network the path addresses is
-        // checked first, then the two resources inside it.
+        // The association is a NEW record stored under the global network the path
+        // addresses, so that parent reference is validated before anything is stored and
+        // an id naming no stored global network is a FIELD failure on the member that
+        // carried it — the same answer every other store under a global network gives
+        // ([`crate::state::unknown_reference`]). The resources the association ties
+        // together are looked up afterwards, inside the global network that resolved.
         if !store.global_networks.contains_key(&input.global_network_id) {
-            return Err(AssociateLinkErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
+            return Err(AssociateLinkErrorModeled::ValidationException(
+                crate::state::unknown_reference(
+                    crate::state::FIELD_GLOBAL_NETWORK_ID,
                     crate::state::GLOBAL_NETWORK_KIND,
-                    &input.global_network_id,
                 ),
             )
             .into());

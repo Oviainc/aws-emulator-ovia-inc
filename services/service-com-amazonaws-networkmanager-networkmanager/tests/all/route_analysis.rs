@@ -717,12 +717,6 @@ async fn an_analysis_is_only_found_through_the_global_network_it_was_started_on(
     let unknown_network = "global-network-00000000000000fff";
     let cases: Vec<(&str, String, &str, &str)> = vec![
         (
-            "start on a global network the store does not hold",
-            analyses_uri(unknown_network),
-            "POST",
-            "global-network",
-        ),
-        (
             "read under a global network the store does not hold",
             analysis_uri(unknown_network, &id),
             "GET",
@@ -763,6 +757,32 @@ async fn an_analysis_is_only_found_through_the_global_network_it_was_started_on(
             "case {case:?}: expected the refusal to name {kind}, got {refused}"
         );
     }
+
+    // Starting an analysis is a different refusal: the analysis is a NEW record stored
+    // under the global network the path addresses, so the parent reference is validated
+    // before anything is stored and an id naming no stored global network is the field
+    // failure the creates under a global network answer — not the missing-resource answer
+    // the reads above give.
+    let (status, refused) = emulator.post(&analyses_uri(unknown_network), body.clone()).await;
+    assert_eq!(
+        status, 400,
+        "case start on a global network the store does not hold: expected 400, got {status} with {refused}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "case start on a global network the store does not hold: expected ValidationException, got {refused}"
+    );
+    assert_eq!(
+        refused["Reason"].as_str(),
+        Some("FieldValidationFailed"),
+        "case start on a global network the store does not hold: expected Reason FieldValidationFailed, got {refused}"
+    );
+    assert_eq!(
+        refused["Fields"],
+        json!([{ "Name": "globalNetworkId", "Message": "Global network not found." }]),
+        "case start on a global network the store does not hold: expected one Fields entry naming globalNetworkId, got {refused}"
+    );
 
     // The refusals stored nothing: the one analysis the owner holds is still readable, and
     // still the only one.

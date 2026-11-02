@@ -965,6 +965,11 @@ async fn the_policy_version_history_is_capped_and_a_delete_frees_room_but_never_
 /// The input member a put's version guard is carried in, as the refusal names it.
 const GUARD_MEMBER: &str = "latestVersionId";
 
+/// The prose a failed version guard carries: the service's fixed sentence for the member,
+/// naming neither the version asserted nor the one the history ends at, so every failed
+/// guard of every core network reads identically.
+const GUARD_MESSAGE: &str = "Invalid input. Invalid latest version ID.";
+
 /// Assert that `body` is the refusal a failed version guard answers: HTTP 400 with
 /// `ValidationException`, a field-level `Reason` and one `Fields` entry naming
 /// [`GUARD_MEMBER`].
@@ -987,6 +992,16 @@ fn assert_guard_refusal(case: &str, status: u16, body: &Value) {
         body["Fields"][0]["Name"],
         json!(GUARD_MEMBER),
         "case {case:?}: the refusal must name the member at fault, got {body}"
+    );
+    assert_eq!(
+        body["Message"].as_str(),
+        Some(GUARD_MESSAGE),
+        "case {case:?}: expected Message {GUARD_MESSAGE:?}, got {body}"
+    );
+    assert_eq!(
+        body["Fields"][0]["Message"].as_str(),
+        Some(GUARD_MESSAGE),
+        "case {case:?}: the field entry must repeat the envelope's message, got {body}"
     );
 }
 
