@@ -39,6 +39,14 @@
 //! * an image recipe is keyed by its own ARN, which carries the [`normalized_name`] and
 //!   the semantic version, so one name+version pair is stored at most once.
 //!
+//! A **resource policy** is held beside the resource it is applied to, keyed by that
+//! resource's own ARN
+//! ([`ComAmazonawsImagebuilderImagebuilderState::resource_policies`]): every policy pair
+//! in this model names its resource by that ARN and carries nothing but the document, a
+//! write REPLACES the document the matching read then reports verbatim, and a resource no
+//! policy was ever applied to has no entry at all — which a read reports as
+//! [`UNSET_RESOURCE_POLICY`] rather than as a missing resource.
+//!
 //! `clientToken` is an idempotency token: a repeat of a request that already
 //! succeeded answers with the ORIGINAL response, and the same token carrying
 //! different creation parameters is a mismatch. Both need the first request's
@@ -238,6 +246,24 @@ pub const MAX_COMPONENTS: usize = 1_000;
 /// The most image recipes this emulator will hold. An emulator resource guard, for the
 /// same reason as [`MAX_COMPONENTS`].
 pub const MAX_IMAGE_RECIPES: usize = 1_000;
+
+/// The policy document a resource-policy read reports for a resource no policy has been
+/// applied to.
+///
+/// A resource carries a policy only once a `Put*Policy` call applies one, and the absence
+/// is not an error: the read answers the empty JSON document. The modelled
+/// `ResourcePolicyDocument` has a minimum length of one
+/// (`smithy_query(query="shape",shape="ResourcePolicyDocument")`), so an unset policy is
+/// reported as this document rather than as empty text.
+pub const UNSET_RESOURCE_POLICY: &str = "{}";
+
+/// The resource-type token a missing-resource report names a component build version by:
+/// the modelled `Component` shape's own name.
+pub const COMPONENT_RESOURCE_TYPE: &str = "Component";
+
+/// The modelled member name a policy document arrives in (`PutComponentPolicy`'s
+/// `policy`), which is the member an invalid-value refusal names.
+pub const POLICY_MEMBER: &str = "policy";
 
 /// The most `clientToken` receipts this emulator keeps.
 ///
@@ -535,6 +561,16 @@ pub struct ComAmazonawsImagebuilderImagebuilderState {
     pub create_receipts: BTreeMap<(String, String, String), CreateReceipt>,
     /// How many receipts have been filed, which is what orders them by age.
     pub create_receipts_filed: u64,
+    /// The resource policy applied to each resource that carries one, keyed by the
+    /// resource's OWN ARN.
+    ///
+    /// A resource policy is attached to a resource rather than being part of it — every
+    /// policy pair in this model (`Put*Policy` / `Get*Policy`) names its resource by that
+    /// resource's own ARN and carries nothing else — so one index serves every resource
+    /// kind, and a resource that was never given a policy simply has no entry here. The
+    /// ARN carries the Region, and the resource lookup a policy call makes first is what
+    /// keeps a regional endpoint to its own Region's resources.
+    pub resource_policies: BTreeMap<String, String>,
 }
 
 impl ComAmazonawsImagebuilderImagebuilderState {
@@ -786,6 +822,7 @@ impl ComAmazonawsImagebuilderImagebuilderState {
     /// Forget the component `arn` names, when it belongs to `request_region`.
     pub fn remove_component(&mut self, arn: &str, request_region: &str) -> Option<ComponentRecord> {
         self.component(arn, request_region)?;
+        self.resource_policies.remove(arn);
         self.components.remove(arn)
     }
 
@@ -833,7 +870,27 @@ impl ComAmazonawsImagebuilderImagebuilderState {
         request_region: &str,
     ) -> Option<ImageRecipeRecord> {
         self.image_recipe(arn, request_region)?;
+        self.resource_policies.remove(arn);
         self.image_recipes.remove(arn)
+    }
+
+    /// The policy document applied to the resource `arn` names, when one has been applied.
+    ///
+    /// `None` says no policy was ever applied to that ARN, which a read reports as
+    /// [`UNSET_RESOURCE_POLICY`] — whether the ARN names a stored resource is a separate
+    /// question, answered by that resource's own lookup.
+    #[must_use]
+    pub fn resource_policy(&self, arn: &str) -> Option<&str> {
+        self.resource_policies.get(arn).map(String::as_str)
+    }
+
+    /// Apply `policy` to the resource `arn` names, replacing whatever policy it carried.
+    ///
+    /// A policy write is a REPLACEMENT, not a merge: the document stored here is the
+    /// document the matching read reports back, verbatim.
+    pub fn put_resource_policy(&mut self, arn: &str, policy: &str) {
+        self.resource_policies
+            .insert(arn.to_string(), policy.to_string());
     }
 
     /// Whether the store is already holding as many image recipes as this emulator will
@@ -2152,6 +2209,27 @@ pub fn unsupported_filter_message(name: &str) -> String {
 #[must_use]
 pub fn incomplete_filter_message() -> String {
     "Each filter must specify a name and one or more values.".to_string()
+}
+
+/// Why a call naming a resource this Region holds nothing under reports it missing.
+///
+/// Names the resource TYPE the request needed and the ARN it named, and nothing about any
+/// resource that does exist.
+#[must_use]
+pub fn required_resource_not_found_message(resource_type: &str, arn: &str) -> String {
+    format!("The following required resource '{resource_type}' cannot be found: '{arn}'.")
+}
+
+/// Why a policy document that is not parseable JSON is refused.
+///
+/// A resource policy is a JSON document, so a value that cannot be parsed as one is an
+/// invalid value for the member it arrived in — which the wording names.
+#[must_use]
+pub fn malformed_policy_message(member: &str) -> String {
+    format!(
+        "The value supplied for parameter '{member}' is not valid. Policy is malformed and cannot \
+         be parsed"
+    )
 }
 
 /// Why a list carrying a token this service did not issue for it is refused.
