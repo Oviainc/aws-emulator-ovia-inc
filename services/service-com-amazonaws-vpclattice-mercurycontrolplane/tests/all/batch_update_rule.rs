@@ -32,10 +32,17 @@
 //! 5. A `serviceIdentifier` or `listenerIdentifier` naming nothing persisted is a 404
 //!    `ResourceNotFoundException`; both modelled identifier forms (the bare id and the
 //!    ARN) reach the same listener and the same rule.
+//! 6. The batch is bounded by what the model publishes for it: a `rules` list whose
+//!    length `RuleUpdateList`'s `@length(1, 10)` admits is applied in full, and one past
+//!    either published bound is a 400 `ValidationException` that stores nothing — as is
+//!    an entry whose `priority` falls past either bound of `RuleUpdate`'s
+//!    `@range(1, 2000)`.
 
 use crate::listeners::{a_service, listener_kind, target_group};
 use crate::resource_not_found_messages::absent_id;
-use crate::rules::{a_listener, create_rule, fixed_response_rule, get_rule, rule_kind};
+use crate::rules::{
+    a_listener, assert_refused, create_rule, fixed_response_rule, get_rule, rule_kind,
+};
 use crate::vpclattice_service_slice::{
     as_label, expected_arn, is_timestamp, message_of, Answer, Lattice,
 };
@@ -870,4 +877,131 @@ async fn unknown_identifiers_are_404_and_both_identifier_forms_reach_the_rule() 
         "case {case:?}: expected the ARN-addressed update persisted, got {}",
         read.body
     );
+}
+
+/// Rule 6: the published bounds of the batch itself.
+///
+/// `rules`' length bound is `RuleUpdateList`'s `@length(1, 10)` and an entry's priority
+/// bound is `RuleUpdate`'s `priority` `@range(1, 2000)` — both read off the model
+/// (`smithy_query(query="shape",shape="RuleUpdateList,RuleUpdate")`). Each published
+/// bound is driven, and so is one value past each: a batch the bound admits applies
+/// every entry it carries, and a request outside the bound is the modelled 400 and
+/// leaves every rule of the listener where it was.
+#[tokio::test]
+async fn the_published_batch_size_and_priority_bounds_bound_the_call() {
+    let lattice = Lattice::new();
+    let (service_id, _) = a_service(&lattice, "bounds-host").await;
+
+    // (case, how many entries the batch carries, whether `@length(1, 10)` admits it)
+    let sizes: Vec<(&str, usize, bool)> = vec![
+        ("the published minimum", 1, true),
+        ("between the published bounds", 5, true),
+        ("the published maximum", 10, true),
+        ("one below the published minimum", 0, false),
+        ("one above the published maximum", 11, false),
+    ];
+
+    for (case, size, admitted) in sizes {
+        // One listener per row, so each row's batch spans exactly its own rules.
+        let listener_id = a_listener(&lattice, &service_id, &format!("bounds-of-{size}")).await;
+        // A rule per entry the row sends — and one even when it sends none, so every row
+        // has a stored rule whose priority a refused call must leave alone.
+        let mut ids = Vec::new();
+        for index in 0..size.max(1) {
+            let step = i64::try_from(index).expect("the table is small");
+            ids.push(
+                a_rule(
+                    &lattice,
+                    &service_id,
+                    &listener_id,
+                    &format!("bounds-{size}-{index}"),
+                    step + 1,
+                )
+                .await,
+            );
+        }
+        // Every entry moves its rule onto a priority no rule of this listener holds, so
+        // only the batch SIZE decides how the call is answered.
+        let entries: Vec<serde_json::Value> = ids
+            .iter()
+            .take(size)
+            .enumerate()
+            .map(|(index, id)| {
+                let assigned = i64::try_from(index).expect("the table is small") + 1_000;
+                serde_json::json!({ "ruleIdentifier": id, "priority": assigned })
+            })
+            .collect();
+
+        let answer = batch_update(
+            &lattice,
+            &service_id,
+            &listener_id,
+            serde_json::json!(entries),
+        )
+        .await;
+
+        if admitted {
+            assert_eq!(
+                successful_of(case, &answer).len(),
+                size,
+                "case {case:?}: expected all {size} entries applied, got {}",
+                answer.body
+            );
+            assert!(
+                unsuccessful_of(case, &answer).is_empty(),
+                "case {case:?}: expected no refused entry, got {}",
+                answer.body
+            );
+        } else {
+            assert_refused(&answer, &format!("{case} ({size} entries)"));
+        }
+
+        // Read every rule back: an admitted batch persisted each entry, and a refused
+        // one stored nothing, so each rule still holds the priority it was created at.
+        for (index, id) in ids.iter().enumerate() {
+            let step = i64::try_from(index).expect("the table is small");
+            let expected = if admitted { step + 1_000 } else { step + 1 };
+            let read = get_rule(&lattice, &service_id, &listener_id, id).await;
+            assert_eq!(
+                read.body["priority"].as_i64(),
+                Some(expected),
+                "case {case:?}: expected rule {id} at {expected}, got {}",
+                read.body
+            );
+        }
+    }
+
+    // One past each published bound of an entry's `priority`. The bounds themselves (1
+    // and 2000) are driven by the accepted-entry table above; a value past either is
+    // outside the modelled range, so the whole call is refused and the entry beside it
+    // is not applied either.
+    let listener_id = a_listener(&lattice, &service_id, "bounds-of-priority").await;
+    let moved = a_rule(&lattice, &service_id, &listener_id, "bounds-moved", 7).await;
+    let sibling = a_rule(&lattice, &service_id, &listener_id, "bounds-sibling", 8).await;
+    for (case, priority) in [
+        ("one below the published minimum priority", 0),
+        ("one above the published maximum priority", 2001),
+    ] {
+        let answer = batch_update(
+            &lattice,
+            &service_id,
+            &listener_id,
+            serde_json::json!([
+                { "ruleIdentifier": sibling, "priority": 1_500 },
+                { "ruleIdentifier": moved, "priority": priority },
+            ]),
+        )
+        .await;
+        assert_refused(&answer, &format!("{case} (priority {priority})"));
+        for (id, expected) in [(&moved, 7), (&sibling, 8)] {
+            let read = get_rule(&lattice, &service_id, &listener_id, id).await;
+            assert_eq!(
+                read.body["priority"].as_i64(),
+                Some(expected),
+                "case {case:?}: a refused batch stores nothing, so rule {id} must still \
+                 be at {expected}, got {}",
+                read.body
+            );
+        }
+    }
 }

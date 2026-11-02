@@ -891,7 +891,7 @@ async fn input_outside_a_documented_or_modelled_constraint_is_400() {
 }
 
 /// A refusal is HTTP 400 carrying the modelled `ValidationException` wire code.
-fn assert_refused(answer: &Answer, case: &str) {
+pub(crate) fn assert_refused(answer: &Answer, case: &str) {
     assert_eq!(
         answer.status, 400,
         "case {case}: expected 400, got {} / {}",
