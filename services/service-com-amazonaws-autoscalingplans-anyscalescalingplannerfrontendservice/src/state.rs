@@ -1660,11 +1660,16 @@ fn validate_predictive_scaling(
         check_resource_label(&member, specification.resource_label.as_deref())?;
     }
     if let Some(specification) = customized {
+        let member = format!("{}.Statistic", at("CustomizedLoadMetricSpecification"));
+        // The member targets the modelled `MetricStatistic` enum, so a value that enum
+        // does not list is refused by [`one_of`] like every other enum-typed member of
+        // this service — BEFORE the narrower rule below, which speaks about a statistic
+        // the enum does list.
+        one_of(&member, &specification.statistic, METRIC_STATISTIC_VALUES)?;
         // "The statistic of the metric. The only valid value is Sum."
         if specification.statistic != LOAD_METRIC_STATISTIC {
             return Err(format!(
-                "{}.Statistic: the only valid value is {LOAD_METRIC_STATISTIC}",
-                at("CustomizedLoadMetricSpecification")
+                "{member}: the only valid value is {LOAD_METRIC_STATISTIC}"
             ));
         }
     }

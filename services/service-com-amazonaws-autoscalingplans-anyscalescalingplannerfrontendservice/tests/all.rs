@@ -17,6 +17,8 @@ mod absent_plan_reads;
 mod application_source_exclusivity;
 #[path = "all/applied_policies_and_status_narratives.rs"]
 mod applied_policies_and_status_narratives;
+#[path = "all/customized_metric_statistic_rules.rs"]
+mod customized_metric_statistic_rules;
 #[path = "all/describe_scaling_plans_selector_bounds.rs"]
 mod describe_scaling_plans_selector_bounds;
 #[path = "all/describe_scaling_plans_version_member.rs"]
