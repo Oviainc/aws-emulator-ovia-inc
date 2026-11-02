@@ -6,6 +6,10 @@
 //! record is the only thing `DescribeCollection`, `ListCollections` and `IndexFaces`
 //! read, so nothing here is answered without being persisted first.
 //!
+//! The ARN this answer carries is the collection's own, in the form Rekognition's
+//! `CreateCollection` reports it: without the leading `arn:` label (see
+//! [`crate::state::create_collection_arn_form`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -222,7 +226,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // This operation's own documentation for `StatusCode`: "HTTP status code
             // indicating the result of the operation", which succeeded.
             status_code: Some(i32::from(Self::SUCCESS_STATUS)),
-            collection_arn: Some(arn),
+            // The create's own answer carries the collection's ARN without the leading
+            // `arn:` label; the record keeps the canonical form every other reader
+            // reports and resolves.
+            collection_arn: Some(crate::state::create_collection_arn_form(&arn)),
             face_model_version: Some(face_model_version),
         })
     }

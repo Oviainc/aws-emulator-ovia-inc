@@ -4,8 +4,10 @@
 //! Reports the tags stored for a resource named by ARN.
 //!
 //! The ARN is resolved against the stored resources themselves — the ARN a collection
-//! was created with, not a re-derivation of it — and the tags reported are the ones
-//! `CreateCollection` persisted. Rekognition also tags stream processors and Custom
+//! was created with, not a re-derivation of it — in either of the two forms a caller
+//! holds it in (`CreateCollection`'s answer omits the `arn:` label), and the tags
+//! reported are the ones `CreateCollection` persisted and `TagResource` /
+//! `UntagResource` changed. Rekognition also tags stream processors and Custom
 //! Labels models; neither resource exists in this store yet, so an ARN naming one is
 //! not found like any other unknown ARN.
 //!
@@ -77,10 +79,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-
-// Every modelled error this handler answers with is built through this trait, so each
-// one carries its `Code` member beside its `Message`.
-use crate::state::modeled_error::ModeledError;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -163,16 +161,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
+        // Either form of a collection's ARN names it: `CreateCollection` hands the caller
+        // the label-less form, and the value it handed out is one a caller tags with.
         let collection = state
-            .collections
-            .values()
-            .find(|collection| collection.arn == input.resource_arn)
+            .collection_by_arn(&input.resource_arn)
             .ok_or_else(|| {
                 ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException::with_message(format!(
-                        "The resource {} does not exist",
-                        input.resource_arn
-                    )),
+                    crate::state::modeled_error::resource_arn_not_found(&input.resource_arn),
                 )
             })?;
 

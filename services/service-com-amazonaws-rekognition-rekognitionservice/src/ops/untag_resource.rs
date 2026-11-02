@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes tags from a resource named by ARN, out of that resource's own record — so
+//! `ListTagsForResource` stops reporting them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Removes one or more tags": each key named is dropped and every other tag the resource
+//! carries stays, so a key the resource does not carry leaves the set as it was rather
+//! than being an error — removing a tag twice removes it once. The ARN is resolved the way
+//! every tagging operation of this service resolves one, in either of the two forms a
+//! caller holds it in (`CreateCollection`'s answer omits the `arn:` label).
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +149,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        let collection = state
+            .collection_by_arn_mut(&input.resource_arn)
+            .ok_or_else(|| {
+                UntagResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::modeled_error::resource_arn_not_found(&input.resource_arn),
+                )
+            })?;
+
+        for key in &input.tag_keys {
+            collection.tags.remove(key);
+        }
+        Ok(UntagResourceOutput {})
     }
 }

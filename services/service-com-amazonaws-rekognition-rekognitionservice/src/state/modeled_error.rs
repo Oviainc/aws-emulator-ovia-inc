@@ -137,6 +137,13 @@ pub fn invalid_pagination_token() -> InvalidPaginationTokenException {
     InvalidPaginationTokenException::with_message(INVALID_PAGINATION_TOKEN_MESSAGE)
 }
 
+/// A resource ARN no live resource of this store carries, as the tagging operations word
+/// it: the request's own ARN between two pieces of fixed text. One wording for all three,
+/// since they resolve the resource the same way.
+pub fn resource_arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException::with_message(format!("The resource {resource_arn} does not exist"))
+}
+
 /// A submitted image in which the analysis found no face to work on; see
 /// [`NO_FACE_IN_IMAGE_MESSAGE`].
 pub fn no_face_in_image() -> InvalidParameterException {

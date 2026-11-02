@@ -213,17 +213,17 @@ async fn an_image_that_identifies_content_is_never_the_no_content_refusal() {
             "",
         ),
         (
-            // `IndexFaces` records the identity of the image it was given, which an S3
-            // address identifies as much as inline bytes do, so this is content and is
-            // indexed as such.
-            "IndexFaces on an S3 object",
+            // An S3 address identifies content as much as inline bytes do, so this is
+            // content: it is refused for the object the store does not serve, never for
+            // an image that named nothing.
+            "IndexFaces on an S3 object the store does not serve",
             "IndexFaces",
             json!({
                 "CollectionId": COLLECTION,
                 "Image": { "S3Object": { "Bucket": "indexed-bucket", "Name": "portrait.png" } },
             }),
-            200,
-            "",
+            400,
+            "InvalidS3ObjectException",
         ),
     ];
 

@@ -1,25 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op IndexFaces
-//! Stores one face per supplied image in the named collection and answers with the
-//! `FaceRecord` it persisted — the minted `FaceId` and `ImageId`, and the
-//! `ExternalImageId` carried through.
+//! Detects the faces in a supplied image, stores one face per DETECTED face in the named
+//! collection and answers with the `FaceRecord` it persisted for each — the minted
+//! `FaceId` and `ImageId`, the `ExternalImageId` carried through, and what the detector
+//! measured about the face.
 //!
-//! No face detector runs in this process, so this operation does not detect. It treats
-//! each supplied image as contributing exactly ONE face and records that face's
-//! IDENTITY; it reports no value a detector would have had to measure, so `Face`'s
-//! `BoundingBox` and `Confidence`, the whole of `FaceDetail` (including every member
-//! `DetectionAttributes` selects) and `OrientationCorrection` are absent rather than
-//! filled in with an unmeasured number. Everything it does report is what it stored, so
-//! `ListFaces`, `DescribeCollection`, `SearchFaces` and `DeleteFaces` see exactly these
-//! faces.
+//! What is indexed is what the PIXELS hold: the geometric detector in
+//! [`crate::state::face_detection`] — the same one `DetectFaces` reports and
+//! `CompareFaces` compares with — decides how many faces the image carries, so an image
+//! carrying none indexes none and answers with an empty `FaceRecords`, and an image
+//! carrying several indexes each of them. Nothing is synthesised for an image the detector
+//! found no face in.
 //!
-//! For the same reason, the two inputs that only a detector could act on have no
-//! effect here and are not pretended to: `QualityFilter` names a quality bar, but
-//! nothing measures a face's quality, so no face is ever filtered out by it; and
-//! `DetectionAttributes` selects members of `FaceDetail`, which is reported by no
-//! record at all. Both are accepted — they constrain nothing the store needs — and the
-//! answer is the same whatever they say.
+//! Everything reported is either what was stored or what was measured, so `ListFaces`,
+//! `DescribeCollection`, `SearchFaces` and `DeleteFaces` see exactly these faces. The
+//! members no step of the detection measured stay absent: `OrientationCorrection` (null
+//! for every collection on a face model later than 3.0, per the member's own
+//! documentation) and every `FaceDetail` member a classifier would have had to judge — so
+//! `DetectionAttributes`, which selects those, is accepted and changes no answer.
+//!
+//! `QualityFilter` and `MaxFaces` both act on measured values and are honoured: a face
+//! below the `Quality.Sharpness` bar the filter sets is not indexed and is reported in
+//! `UnindexedFaces` as `LOW_SHARPNESS`, and when more faces pass the bar than `MaxFaces`
+//! allows, the lowest-quality and then the smallest-boxed of them are the ones dropped,
+//! reported as `EXCEEDS_MAX_FACES` — "the faces with the lowest quality are filtered out
+//! first. If there are still more faces than the value of MaxFaces, the faces with the
+//! smallest bounding boxes are filtered out".
 //!
 //! ## Shape of an operation
 //!
@@ -184,6 +191,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// What the detector hands back for one face it found: its measured detail, which is what
+// decides whether the face is indexed and what the answer reports about it.
+use crate::state::face_detection::MeasuredFace;
+
 // Every modelled error this handler answers with is built through this trait, so each
 // one carries its `Code` member beside its `Message`.
 use crate::state::modeled_error::ModeledError;
@@ -265,25 +276,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             IndexFacesErrorModeled::InternalServerError(
                 crate::state::modeled_error::store_unavailable(),
             )
         })?;
-        let mut state = state.lock();
 
         // The resource is resolved before the request's own parameters, so a call
         // naming a collection that does not exist is answered as not found whatever
-        // else is wrong with it.
-        let collection = state
-            .collections
-            .get_mut(&input.collection_id)
-            .ok_or_else(|| {
-                IndexFacesErrorModeled::ResourceNotFoundException(
-                    crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
-                )
-            })?;
+        // else is wrong with it. The guard is dropped before the detection below: no
+        // other request may be kept waiting while this one reads pixels.
+        if !state.lock().collections.contains_key(&input.collection_id) {
+            return Err(IndexFacesErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+            .into());
+        }
 
         // An `Image` carries its content either inline or as an S3 object, and the
         // model marks both members optional, so a request naming neither reaches the
@@ -304,23 +312,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         })?;
 
+        // What the image HOLDS, measured off its pixels, largest face first. This is the
+        // whole of what gets indexed: an image with no face in it indexes nothing.
+        let detected = crate::state::face_detection::measured_faces_in_submitted_image(
+            ctx,
+            &input.image,
+        )
+        .await
+        .map_err(unreadable_error)?;
+
+        // "Filtered faces aren't indexed": a face too blurry to meet the bar the filter
+        // sets is reported as unindexed, with the reason the model names for the quality
+        // this detector measures.
+        let bar = crate::state::face_detection::quality_bar(input.quality_filter.as_deref());
+        let mut unindexed: Vec<UnindexedFace> = Vec::new();
+        let mut candidates: Vec<MeasuredFace> = Vec::new();
+        for face in detected {
+            if face.meets_quality_bar(bar) {
+                candidates.push(face);
+            } else {
+                unindexed.push(unindexed_face(face, LOW_SHARPNESS));
+            }
+        }
+
         // `MaxFaces` caps how many of the image's faces are indexed, the rest being
-        // reported as `UnindexedFaces` with `EXCEEDS_MAX_FACES`. One face per image is
-        // all this emulator has, so a cap of one or more leaves nothing over; the cap
-        // is applied rather than ignored so the rule holds whatever the count is.
+        // reported with `EXCEEDS_MAX_FACES`.
         let max_faces = input.max_faces.map_or(usize::MAX, |max| {
             // A value that is not a cap at all (a negative one, which the modelled
             // range 1.. refuses at the boundary) asks for no faces, as the clamps in
             // `search_faces` and `state::page_size` do.
             usize::try_from(max).unwrap_or(0)
         });
-        let indexed = usize::min(1, max_faces);
+        for face in over_the_cap(&mut candidates, max_faces) {
+            unindexed.push(unindexed_face(face, EXCEEDS_MAX_FACES));
+        }
+
+        let mut state = state.lock();
+        // The collection is resolved again on the write: the detection above ran without
+        // the lock, so a `DeleteCollection` may have landed in between.
+        let collection = state
+            .collections
+            .get_mut(&input.collection_id)
+            .ok_or_else(|| {
+                IndexFacesErrorModeled::ResourceNotFoundException(
+                    crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+                )
+            })?;
 
         // The store is held in memory, so a collection has a capacity: past it an
         // index is refused with the modelled quota error rather than allowed to grow
         // the process without limit. The check precedes the write, so a refused
         // request stores nothing.
-        if collection.faces.len() + indexed > crate::state::MAX_FACES_PER_COLLECTION {
+        if collection.faces.len() + candidates.len() > crate::state::MAX_FACES_PER_COLLECTION {
             return Err(IndexFacesErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException::with_message(format!(
                     "The collection {} holds the maximum of {} faces",
@@ -335,27 +378,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One `ImageId` per call: it identifies the image this request submitted, and
         // every face indexed from it shares it.
         let image_id = crate::state::new_image_id();
-        let mut records = Vec::with_capacity(indexed);
-        // The faces the cap left no room for are reported rather than dropped: that is
-        // what `UnindexedFaces` is for, and `EXCEEDS_MAX_FACES` is the reason the model
-        // names for it. Reachable only through a `MaxFaces` of 0, which the modelled
-        // range 1.. refuses at the boundary — so the list is normally empty, and the
-        // image's one face is never silently lost if that ever changes.
-        let unindexed: Vec<UnindexedFace> = if indexed == 0 {
-            vec![UnindexedFace {
-                reasons: Some(vec!["EXCEEDS_MAX_FACES".to_string()]),
-                // Nothing measured a face detail here; see `FaceRecord` below.
-                face_detail: None,
-            }]
-        } else {
-            Vec::new()
-        };
-        for _ in 0..indexed {
+        let mut records = Vec::with_capacity(candidates.len());
+        for detected in candidates {
             let face = crate::state::StoredFace {
                 face_id: crate::state::new_face_id(),
                 image_id: image_id.clone(),
                 external_image_id: input.external_image_id.clone(),
                 index_faces_model_version: face_model_version.clone(),
+                bounding_box: detected.detail.bounding_box.clone(),
+                confidence: detected.detail.confidence,
                 user_id: None,
                 signature,
                 sequence: collection.next_sequence,
@@ -363,9 +394,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             collection.next_sequence += 1;
             records.push(FaceRecord {
                 face: Some(face.modeled()),
-                // Every member of `FaceDetail` is something a detector measures, and
-                // nothing measured it here, so no detail is reported at all.
-                face_detail: None,
+                // "Structure containing attributes of the face that the algorithm
+                // detected": what the detector measured, and only that.
+                face_detail: Some(detected.detail),
             });
             collection.faces.push(face);
         }
@@ -379,4 +410,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             unindexed_faces: Some(unindexed),
         })
     }
+}
+
+/// The `Reason` a face that measured below the `QualityFilter`'s bar was not indexed
+/// with: the quality this detector measures is how sharp a face's own pixels are, and
+/// "LOW_SHARPNESS - The image is too blurry"
+/// (`smithy_query(query="shape",shape="Reason")`).
+const LOW_SHARPNESS: &str = "LOW_SHARPNESS";
+
+/// The `Reason` a face the `MaxFaces` cap left no room for was not indexed with.
+const EXCEEDS_MAX_FACES: &str = "EXCEEDS_MAX_FACES";
+
+/// A detected face that was NOT indexed, with the reason it was not: the face's own
+/// measured detail is carried, since that is what `UnindexedFace` is for — "the structure
+/// that contains attributes of a face that IndexFaces detected, but didn't index".
+fn unindexed_face(face: MeasuredFace, reason: &str) -> UnindexedFace {
+    UnindexedFace {
+        reasons: Some(vec![reason.to_string()]),
+        face_detail: Some(face.detail),
+    }
+}
+
+/// Remove and answer the faces that do not fit under a cap of `max_faces`, leaving
+/// `candidates` in its original largest-first order.
+///
+/// Which ones go is what the operation documents: "the faces with the lowest quality are
+/// filtered out first. If there are still more faces than the value of MaxFaces, the faces
+/// with the smallest bounding boxes are filtered out" — both measured values, so the
+/// choice is made on what the detector read off the image.
+fn over_the_cap(candidates: &mut Vec<MeasuredFace>, max_faces: usize) -> Vec<MeasuredFace> {
+    if candidates.len() <= max_faces {
+        return Vec::new();
+    }
+    let mut by_quality: Vec<usize> = (0..candidates.len()).collect();
+    by_quality.sort_by(|left, right| {
+        sharpness(&candidates[*left])
+            .total_cmp(&sharpness(&candidates[*right]))
+            .then_with(|| box_area(&candidates[*left]).total_cmp(&box_area(&candidates[*right])))
+    });
+    by_quality.truncate(candidates.len() - max_faces);
+    let mut dropped = Vec::with_capacity(by_quality.len());
+    // Highest index first, so each removal leaves the positions still to go where they are.
+    by_quality.sort_unstable_by(|left, right| right.cmp(left));
+    for at in by_quality {
+        dropped.push(candidates.remove(at));
+    }
+    dropped.reverse();
+    dropped
+}
+
+/// The `Quality.Sharpness` the detector measured for a face, which is the quality both
+/// the filter and the cap rank faces by.
+fn sharpness(face: &MeasuredFace) -> f32 {
+    face.detail
+        .quality
+        .as_ref()
+        .and_then(|quality| quality.sharpness)
+        .unwrap_or_default()
+}
+
+/// How much of the image a detected face's box covers, as the product of the fractions
+/// a `BoundingBox` is expressed in.
+fn box_area(face: &MeasuredFace) -> f32 {
+    face.detail
+        .bounding_box
+        .as_ref()
+        .map(|rect| rect.width.unwrap_or_default() * rect.height.unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// The modelled answer for an image whose faces could not be detected: one modelled error
+/// per reason, each carrying the reason's own message.
+fn unreadable_error(reason: crate::state::image_source::UnreadableImage) -> IndexFacesError {
+    use crate::state::image_source::UnreadableImage;
+
+    let message = reason.message().to_string();
+    match reason {
+        UnreadableImage::InvalidFormat(_) => IndexFacesErrorModeled::InvalidImageFormatException(
+            InvalidImageFormatException::with_message(message),
+        ),
+        UnreadableImage::TooLarge(_) => {
+            IndexFacesErrorModeled::ImageTooLargeException(ImageTooLargeException::with_message(
+                message,
+            ))
+        }
+        UnreadableImage::S3Unreadable(_) => IndexFacesErrorModeled::InvalidS3ObjectException(
+            InvalidS3ObjectException::with_message(message),
+        ),
+        UnreadableImage::InvalidParameter(_) => IndexFacesErrorModeled::InvalidParameterException(
+            InvalidParameterException::with_message(message),
+        ),
+        // Nothing was established about the image itself, so this is the server fault it
+        // is rather than anything about the request.
+        UnreadableImage::NotAnalysed(_) => IndexFacesErrorModeled::InternalServerError(
+            InternalServerError::with_message(message),
+        ),
+    }
+    .into()
 }

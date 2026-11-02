@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches key-value tags to a resource named by ARN, writing them into that
+//! resource's own record — so `ListTagsForResource` reports exactly what this
+//! operation stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Adds one or more key-value tags": a key the resource already carries takes the new
+//! value and every other tag it carries stays, so tagging adds and updates and never
+//! replaces the set. The ARN is resolved the way every tagging operation of this service
+//! resolves one, in either of the two forms a caller holds it in
+//! (`CreateCollection`'s answer omits the `arn:` label). Rekognition also tags stream
+//! processors and Custom Labels models; neither resource exists in this store yet, so an
+//! ARN naming one is not found like any other unknown ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +80,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// Every modelled error this handler answers with is built through this trait, so each
+// one carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +159,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        let collection = state
+            .collection_by_arn_mut(&input.resource_arn)
+            .ok_or_else(|| {
+                TagResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::modeled_error::resource_arn_not_found(&input.resource_arn),
+                )
+            })?;
+
+        // How many tags the resource would end up carrying: a key it already has takes
+        // the new value rather than counting twice. Past the limit nothing is written, so
+        // a refused request leaves the resource's tags as they were.
+        let after: ::std::collections::BTreeSet<&String> = collection
+            .tags
+            .keys()
+            .chain(input.tags.keys())
+            .collect();
+        if after.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException::with_message(format!(
+                    "The number of tags on resource {} exceeds the limit of {}",
+                    input.resource_arn,
+                    crate::state::MAX_TAGS_PER_RESOURCE
+                )),
+            )
+            .into());
+        }
+
+        for (key, value) in input.tags {
+            collection.tags.insert(key, value);
+        }
+        Ok(TagResourceOutput {})
     }
 }

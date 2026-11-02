@@ -25,13 +25,15 @@
 //! resemblance [`face_detection::FaceAppearance`] measures between them, which is a
 //! measured correlation of two faces and still not an identity.
 //!
-//! Nothing here reports a value nothing measured. A STORED face therefore carries its
-//! identity and nothing else: no bounding box, no confidence, no landmarks, pose or
-//! quality, no demographic attribute and no orientation correction — `IndexFaces` records
-//! what the collection holds, and the pixels of a stored face are not among them, so the
-//! operations that would match a submitted image against the faces a collection holds
-//! (`SearchFacesByImage`, `SearchUsersByImage`, `RecognizeCelebrities`, …) stay
-//! unimplemented 501s.
+//! Nothing here reports a value nothing measured. The same detector is what decides what
+//! `IndexFaces` stores: a collection holds one face per face DETECTED in a submitted
+//! image, and an image carrying none adds nothing to it. A STORED face therefore carries
+//! its minted identity plus the two members the detector measured for it and `Face`
+//! models — its `BoundingBox` and its `Confidence` — and nothing else: no landmarks, pose
+//! or quality, no demographic attribute and no orientation correction. The feature vector
+//! AWS stores for a face is not among them, so the operations that would match a
+//! submitted image against the faces a collection holds (`SearchFacesByImage`,
+//! `SearchUsersByImage`, `RecognizeCelebrities`, …) stay unimplemented 501s.
 //!
 //! The one comparison this emulator can make about stored faces is IDENTITY:
 //! [`image_signature`] digests what an image is, so two indexed faces can be told to have
@@ -48,7 +50,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{Face, Image, ProjectDescription};
+use crate::ops::types::{BoundingBox, Face, Image, ProjectDescription};
 
 /// The region an emulated request is treated as having been made in when its
 /// SigV4 credential scope does not name one (an unsigned or anonymous request).
@@ -61,10 +63,11 @@ pub const ARN_NAMESPACE: &str = "rekognition";
 
 /// The face model version a collection created by this emulator is associated
 /// with. `CreateCollection` documents that "when you create a collection, it is
-/// associated with the latest version of the face model version"; the version is
-/// an opaque string on the wire, so one value is pinned here and every operation
-/// echoes the collection's own stored copy rather than this constant.
-pub const FACE_MODEL_VERSION: &str = "6.0";
+/// associated with the latest version of the face model version", which is the generation
+/// Rekognition associates a collection created today with; the version is an opaque
+/// string on the wire, so one value is pinned here and every operation echoes the
+/// collection's own stored copy rather than this constant.
+pub const FACE_MODEL_VERSION: &str = "7.0";
 
 /// The page size `ListFaces` / `ListCollections` use when the caller sends no
 /// `MaxResults`: the largest page the model allows (`PageSize` range 0..4096).
@@ -128,6 +131,13 @@ pub const PROJECT_STATUS_CREATED: &str = "CREATED";
 pub const MAX_COLLECTIONS: usize = 100;
 pub const MAX_FACES_PER_COLLECTION: usize = 1_000;
 
+/// How many tags one resource of this store will hold: the top of the modelled `TagMap`
+/// length range (`length 0..200`,
+/// `smithy_query(query="operation",operation="TagResource")`), which is also AWS's own
+/// published limit of tags per resource. Past it a tagging request is refused with the
+/// modelled quota error rather than growing the record without limit.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
 /// How many projects this store will hold before a create is refused with the modelled
 /// `LimitExceededException`. The same reasoning as [`MAX_COLLECTIONS`]: the store is
 /// this process's memory, so a caller repeating `CreateProject` is refused rather than
@@ -137,8 +147,8 @@ pub const MAX_PROJECTS: usize = 100;
 /// One face stored in a collection by `IndexFaces`.
 ///
 /// Its members are the face's IDENTITY — what the service minted and what the caller
-/// supplied. Nothing a detector would have had to measure is stored, because nothing
-/// measured it.
+/// supplied — plus the two measurements `Face` models for a stored face, taken by the
+/// detector that found it. Nothing nothing measured is stored.
 #[derive(Debug, Clone)]
 pub struct StoredFace {
     /// The id this service minted for the face; the collection's key for it.
@@ -149,6 +159,11 @@ pub struct StoredFace {
     pub external_image_id: Option<String>,
     /// The face model version of the collection at the time of indexing.
     pub index_faces_model_version: String,
+    /// Where in the indexed image the detector found this face, as the fractions of the
+    /// image a `BoundingBox` is expressed in.
+    pub bounding_box: Option<BoundingBox>,
+    /// The detector's own measured agreement that the box holds a face.
+    pub confidence: Option<f32>,
     /// The user this face is associated with, set by `AssociateFaces` (not yet
     /// implemented), so it is `None` for every face this slice stores. It is carried
     /// here, and honoured by `ListFaces`' `UserId` filter and `DeleteFaces`'
@@ -168,16 +183,15 @@ pub struct StoredFace {
 impl StoredFace {
     /// This face as the modelled `Face`.
     ///
-    /// `BoundingBox` and `Confidence` are absent for the same reason the rest of the
-    /// detector's output is: no detector ran, so there is no box and no confidence to
-    /// report.
+    /// `BoundingBox` and `Confidence` are the detector's own measurements of the face in
+    /// the image it was indexed from, carried through unchanged.
     pub fn modeled(&self) -> Face {
         Face {
             face_id: Some(self.face_id.clone()),
-            bounding_box: None,
+            bounding_box: self.bounding_box.clone(),
             image_id: Some(self.image_id.clone()),
             external_image_id: self.external_image_id.clone(),
-            confidence: None,
+            confidence: self.confidence,
             index_faces_model_version: Some(self.index_faces_model_version.clone()),
             user_id: self.user_id.clone(),
         }
@@ -323,6 +337,23 @@ pub struct ComAmazonawsRekognitionRekognitionserviceState {
     pub projects: BTreeMap<String, Project>,
 }
 
+impl ComAmazonawsRekognitionRekognitionserviceState {
+    /// The collection `resource_arn` names, in either form of its ARN (see [`arn_names`]),
+    /// or `None` when no live collection carries it.
+    pub fn collection_by_arn(&self, resource_arn: &str) -> Option<&Collection> {
+        self.collections
+            .values()
+            .find(|collection| arn_names(&collection.arn, resource_arn))
+    }
+
+    /// The same resolution, for the operations that CHANGE what the collection holds.
+    pub fn collection_by_arn_mut(&mut self, resource_arn: &str) -> Option<&mut Collection> {
+        self.collections
+            .values_mut()
+            .find(|collection| arn_names(&collection.arn, resource_arn))
+    }
+}
+
 /// The position of a project in the order `DescribeProjects` reports projects in —
 /// documented on the output member itself
 /// (`smithy_query(query="doc",shape="DescribeProjectsResponse",member="ProjectDescriptions")`:
@@ -382,6 +413,36 @@ pub fn collection_arn(region: &str, collection_id: &str) -> String {
         region,
         &format!("collection/{collection_id}"),
     )
+}
+
+/// A collection's ARN as `CreateCollection` reports it: the stored ARN without the
+/// leading `arn:` label.
+///
+/// Rekognition's `CreateCollection` answers with
+/// `aws:rekognition:<region>:<account>:collection/<CollectionId>` — the form in that
+/// operation's own published response example, and the one a recorded create answers with
+/// — while `DescribeCollection`'s `CollectionARN` carries the full ARN. Only the create's
+/// answer drops the label: the record keeps the canonical ARN, so no other operation has
+/// to know about the difference, and [`arn_names`] is what lets the value the create
+/// handed out still name its collection.
+pub fn create_collection_arn_form(arn: &str) -> String {
+    arn_identity(arn).to_string()
+}
+
+/// Whether `requested` names the resource whose stored ARN is `stored`.
+///
+/// The ARN a caller holds for a collection is the one `CreateCollection` handed it, which
+/// omits the `arn:` label, and the tagging operations resolve that value, so an ARN is
+/// matched on the part that identifies the resource. Nothing else matches: the partition,
+/// service, region, account and resource path all still have to agree.
+pub fn arn_names(stored: &str, requested: &str) -> bool {
+    arn_identity(stored) == arn_identity(requested)
+}
+
+/// The part of an ARN that identifies the resource: everything after the optional `arn:`
+/// label.
+fn arn_identity(arn: &str) -> &str {
+    arn.strip_prefix("arn:").unwrap_or(arn)
 }
 
 /// The ARN of a project in `region` created at `creation_timestamp`:

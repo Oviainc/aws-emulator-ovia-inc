@@ -25,7 +25,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The router harness, the dispatch helper and the reduced reply all come from the
 // collection-lifecycle suite rather than being built a second time here.
-use crate::face_collections::{bytes_image, call, harness, Reply};
+use crate::face_collections::{bytes_image, call, harness, one_face_png, Reply};
 
 /// A collection this suite creates, so every "the collection exists" row has one.
 const EXISTING_COLLECTION: &str = "error-bodies-existing";
@@ -99,7 +99,7 @@ async fn seeded() -> (MultiServiceRouter, String, String) {
         "IndexFaces",
         json!({
             "CollectionId": EXISTING_COLLECTION,
-            "Image": bytes_image(b"error-bodies-seed-image"),
+            "Image": bytes_image(&one_face_png(61)),
         }),
     )
     .await;
@@ -316,7 +316,7 @@ async fn a_face_id_the_collection_does_not_hold_is_a_parameter_refusal() {
         "IndexFaces",
         json!({
             "CollectionId": other_collection,
-            "Image": bytes_image(b"error-bodies-other-image"),
+            "Image": bytes_image(&one_face_png(62)),
         }),
     )
     .await;
@@ -334,7 +334,7 @@ async fn a_face_id_the_collection_does_not_hold_is_a_parameter_refusal() {
             "IndexFaces",
             json!({
                 "CollectionId": EXISTING_COLLECTION,
-                "Image": bytes_image(b"error-bodies-doomed-image"),
+                "Image": bytes_image(&one_face_png(63)),
             }),
         )
         .await;

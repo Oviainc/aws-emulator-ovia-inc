@@ -3,11 +3,14 @@
 //! @op DeleteFaces
 //! Removes faces from a collection and reports which ids it actually removed.
 //!
-//! `DeletedFaces` names only the ids the collection held and no longer does, so a
-//! following `ListFaces` / `DescribeCollection` reflects the removal. Every other
-//! requested id is reported in `UnsuccessfulFaceDeletions` with the reason it survived:
-//! `FACE_NOT_FOUND` when the collection never held it, `ASSOCIATED_TO_AN_EXISTING_USER`
-//! when the face belongs to a user and has to be disassociated first.
+//! `DeletedFaces` names the ids the collection held and no longer does — always present,
+//! and empty when the request matched nothing — so a following `ListFaces` /
+//! `DescribeCollection` reflects the removal and a caller reading the member never
+//! dereferences an absent one. `UnsuccessfulFaceDeletions`, also always present, is for a
+//! face the collection HOLDS and the service would not remove:
+//! `ASSOCIATED_TO_AN_EXISTING_USER`, which has to be disassociated first. A requested id
+//! the collection does not hold is nothing to delete rather than a failed deletion, so it
+//! is reported in neither list.
 //!
 //! ## Shape of an operation
 //!
@@ -189,24 +192,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     collection.faces.remove(at);
                     deleted.push(face_id.clone());
                 }
-                // Also the second mention of an id already deleted by this very
-                // request: it is no longer in the collection.
-                None => unsuccessful.push(UnsuccessfulFaceDeletion {
-                    face_id: Some(face_id.clone()),
-                    user_id: None,
-                    reasons: Some(vec!["FACE_NOT_FOUND".to_string()]),
-                }),
+                // An id the collection does not hold — including the second mention of
+                // an id this very request already deleted — names no face to remove, so
+                // there is neither a deletion to report nor a face that survived one.
+                None => {}
             }
         }
 
         Ok(DeleteFacesOutput {
-            // `FaceIdList` is constrained to 1..4096 entries, so "nothing was deleted"
-            // is an absent member rather than an empty list the model cannot carry.
-            deleted_faces: if deleted.is_empty() {
-                None
-            } else {
-                Some(deleted)
-            },
+            // The ids this call removed: the member is always there, and empty when it
+            // removed none, so a caller reading it to learn what went always finds a list.
+            deleted_faces: Some(deleted),
+            // The faces that survived the request, which is also always a list: a caller
+            // that branches on a partial failure reads an empty one when there was none.
             unsuccessful_face_deletions: Some(unsuccessful),
         })
     }
