@@ -3,16 +3,22 @@
 //! End-to-end HTTP coverage of the resolution of a caller-supplied `roleArn` against this
 //! emulator's own IAM records.
 //!
-//! The rule under test: Entity Resolution does the work a resource describes ITSELF,
-//! acting as the role the request hands it ("Entity Resolution assumes this role to
-//! create resources on your behalf as part of workflow execution"), so every write that
-//! would STORE a role resolves it BEFORE it stores anything and refuses the request with
-//! the modelled `AccessDeniedException` (HTTP 403) — persisting nothing — when IAM
-//! ANSWERED that the service cannot assume it: this account holds no such role, or the
-//! trust document the role carries does not admit the Entity Resolution service
-//! principal. A role nothing can be shown about is NOT refused, which is why every other
-//! suite in this crate — each of which mounts Entity Resolution alone, with no IAM to ask
-//! — still creates workflows whose `roleArn` no IAM record backs.
+//! The rule under test: a WORKFLOW's role is one Entity Resolution assumes to do that
+//! workflow's own work ("Entity Resolution assumes this role to create resources on your
+//! behalf as part of workflow execution"), so each of the four workflow writes resolves it
+//! BEFORE it stores anything and refuses the request with the modelled
+//! `AccessDeniedException` (HTTP 403) — persisting nothing — when IAM ANSWERED that the
+//! service cannot assume it: this account holds no such role, or the trust document the
+//! role carries does not admit the Entity Resolution service principal. A role nothing can
+//! be shown about is NOT refused, which is why every other suite in this crate — each of
+//! which mounts Entity Resolution alone, with no IAM to ask — still creates workflows whose
+//! `roleArn` no IAM record backs.
+//!
+//! The ID-NAMESPACE writes are the other side of that rule and are covered here too: a
+//! namespace's role is one "Entity Resolution assumes … to access the resources defined in
+//! this `IdNamespace` on your behalf as part of the workflow run", i.e. assumed by the ID
+//! mapping workflow run that uses the namespace as a Source or a Target, so those writes
+//! RECORD the role they are given and resolve nothing.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: what the
 //! role's trust document says (which principal, which action, which effect, which casing,
@@ -331,11 +337,11 @@ async fn a_matching_workflow_is_created_only_for_a_role_iam_shows_the_service_ca
     }
 }
 
-/// The SAME decision on every other write that stores a role: the two updates that
-/// REPLACE one, and the two other creates that take one. A refused update leaves the
-/// stored resource with the role it had.
+/// The SAME decision on every other WORKFLOW write that stores a role: the two updates
+/// that REPLACE one, and the ID mapping workflow create that takes one. A refused update
+/// leaves the stored resource with the role it had.
 #[tokio::test]
-async fn every_write_that_stores_a_role_is_held_to_the_same_resolution() {
+async fn every_workflow_write_that_stores_a_role_is_held_to_the_same_resolution() {
     let emulator = Emulator::with_iam();
     let seeded = emulator.create_schema_mapping(&schema_request("customers")).await;
     assert_eq!(
@@ -424,36 +430,94 @@ async fn every_write_that_stores_a_role_is_held_to_the_same_resolution() {
              got {read:?}",
             row.case
         );
+    }
+}
 
-        // `CreateIdNamespace` and `UpdateIdNamespace`, the other pair that stores a role.
-        let namespace = format!("id-namespace-{index}");
-        let reply = emulator
-            .create_id_namespace(&id_namespace_request(Some(&namespace), Some(&role)))
-            .await;
-        assert_verdict(row, &reply, &role);
+/// RULE: an ID namespace only RECORDS the role whose resources an ID mapping workflow run
+/// later reads through it, so `CreateIdNamespace` and `UpdateIdNamespace` store the
+/// `roleArn` they are given and resolve it against nothing — whatever IAM would answer
+/// about it. The rows span the whole table the workflow writes are decided by (every form
+/// of trust document, a role carrying none, a role this account does not hold) plus the
+/// forms of the VALUE that reach the handler, and every row is admitted and reads back
+/// through `GetIdNamespace` carrying exactly the role it was created with.
+#[tokio::test]
+async fn an_id_namespace_records_the_role_it_is_given_whatever_iam_answers() {
+    let emulator = Emulator::with_iam();
 
-        let namespace_update = format!("id-namespace-update-{index}");
+    // Every row of the workflow table, named by its case: here each one is ADMITTED.
+    let mut cases: Vec<(String, String)> = Vec::new();
+    for (index, row) in rows().iter().enumerate() {
+        cases.push((
+            row.case.to_string(),
+            role_of(&emulator, row, &format!("namespace-role-{index}")),
+        ));
+    }
+    // The forms of the value itself, which decide whether IAM could be asked at all.
+    cases.push((
+        "another account's role ARN".to_string(),
+        "arn:aws:iam::123456789012:role/their-role".to_string(),
+    ));
+    cases.push((
+        // `CreateIdNamespace$roleArn` is a `RoleArn` whose modelled pattern the boundary
+        // walk applies, so the values that reach the handler are ARN-shaped; this one is
+        // an IAM role ARN under a path, which IAM holds by its last segment.
+        "a role under a service-role path this account does not hold".to_string(),
+        format!("arn:aws:iam::{}:role/service-role/namespace-absent", account_id()),
+    ));
+
+    for (index, (case, role)) in cases.iter().enumerate() {
+        let namespace = format!("records-{index}");
         let created = emulator
-            .create_id_namespace(&id_namespace_request(
-                Some(&namespace_update),
-                Some(&assumable),
-            ))
+            .create_id_namespace(&id_namespace_request(Some(&namespace), Some(role)))
             .await;
         assert_eq!(
             created.status, 200,
-            "case {:?}: seeding {namespace_update:?} failed: {created:?}",
-            row.case
+            "case {case:?}: expected the create to record the role it was given, got \
+             {created:?}"
         );
-        let updated = emulator
-            .update_id_namespace(&namespace_update, &id_namespace_request(None, Some(&role)))
-            .await;
-        assert_verdict(row, &updated, &role);
-        let read = emulator.get_id_namespace(&namespace_update).await;
+        assert_eq!(
+            created.body.get("roleArn").and_then(Value::as_str),
+            Some(role.as_str()),
+            "case {case:?}: expected the create to answer with {role:?}, got {:?}",
+            created.body
+        );
+        // Round trip: the namespace the create admitted is readable, carrying that role.
+        let read = emulator.get_id_namespace(&namespace).await;
         assert_eq!(
             read.body.get("roleArn").and_then(Value::as_str),
-            Some(expected_role.as_str()),
-            "case {:?}: expected the stored namespace to carry {expected_role:?}, got {read:?}",
-            row.case
+            Some(role.as_str()),
+            "case {case:?}: expected the stored namespace to carry {role:?}, got {read:?}"
+        );
+
+        // And the UPDATE that REPLACES the role is admitted on the same terms: the
+        // namespace below was created with a role this service can assume, and the row's
+        // role replaces it whatever IAM would answer about it.
+        let replaced = format!("replaced-{index}");
+        let assumable = seed_role(
+            &emulator,
+            &format!("namespace-assumable-{index}"),
+            Some(service_trust()),
+        );
+        let seeded = emulator
+            .create_id_namespace(&id_namespace_request(Some(&replaced), Some(&assumable)))
+            .await;
+        assert_eq!(
+            seeded.status, 200,
+            "case {case:?}: seeding {replaced:?} failed: {seeded:?}"
+        );
+        let updated = emulator
+            .update_id_namespace(&replaced, &id_namespace_request(None, Some(role)))
+            .await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case:?}: expected the update to record the role it was given, got \
+             {updated:?}"
+        );
+        let read = emulator.get_id_namespace(&replaced).await;
+        assert_eq!(
+            read.body.get("roleArn").and_then(Value::as_str),
+            Some(role.as_str()),
+            "case {case:?}: expected the updated namespace to carry {role:?}, got {read:?}"
         );
     }
 }

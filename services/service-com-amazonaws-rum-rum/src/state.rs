@@ -570,6 +570,17 @@ fn whole_seconds(seconds: f64) -> i64 {
 /// optional `DestinationArn` — so it is the key the destinations map is held under.
 pub type MetricDestinationKey = (String, String);
 
+/// The position a metric definition was created at, counted per destination: the key its
+/// destination's definitions are held under, and the only order `BatchGetRumMetricDefinitions`
+/// enumerates them in.
+///
+/// A definition's own `MetricDefinitionId` is a minted value, so ordering by it is arbitrary
+/// with respect to the order the definitions were created in and differs from run to run,
+/// while the listing a caller reads correlates a destination's definitions BY POSITION. The
+/// rank is therefore what the store is keyed by, assigned once by
+/// [`AppMonitorRecord::insert_metric_definition`] and never changed afterwards.
+pub type MetricDefinitionRank = u64;
+
 /// The text an optional string member declares, with an absent, empty or whitespace-only
 /// value all read as "nothing declared".
 ///
@@ -956,16 +967,24 @@ pub struct AppMonitorRecord {
     pub metric_destinations: BTreeMap<MetricDestinationKey, MetricDestinationRecord>,
     /// The metric definitions stored for each of this monitor's extended-metrics
     /// destinations: keyed by the SAME [`MetricDestinationKey`] the destinations map uses,
-    /// and inside that by `MetricDefinitionId`.
+    /// and inside that by the destination's own CREATION RANK — the position the
+    /// definition was created at, counted per destination
+    /// ([`Self::insert_metric_definition`]).
+    ///
+    /// The rank, and not the `MetricDefinitionId`, is the inner key because a listing of a
+    /// destination's definitions enumerates them in the order they were CREATED: the id is
+    /// a minted value whose ordering is arbitrary with respect to that, so a map keyed by
+    /// it would report position N of the listing as a different definition on every run.
+    /// A `BTreeMap` over the rank is that creation order, and it is resumable, so
+    /// `BatchGetRumMetricDefinitions` pages through it with a range query.
     ///
     /// Definitions hang off the destination they were created under because that is the
     /// resource they belong to — "You must have already created a destination for the
     /// metrics before you send them" — so they go away with it
     /// ([`Self::remove_metric_destination`]) and with the monitor. Each inner map is
-    /// bounded by [`MAX_METRIC_DEFINITIONS_PER_DESTINATION`] and a `BTreeMap`, so
-    /// `BatchGetRumMetricDefinitions` pages in a stable, resumable order.
+    /// bounded by [`MAX_METRIC_DEFINITIONS_PER_DESTINATION`].
     pub metric_definitions:
-        BTreeMap<MetricDestinationKey, BTreeMap<String, MetricDefinitionRecord>>,
+        BTreeMap<MetricDestinationKey, BTreeMap<MetricDefinitionRank, MetricDefinitionRecord>>,
     /// This monitor's one resource-based policy, or `None` while it carries none — the
     /// state `GetResourcePolicy` and `DeleteResourcePolicy` answer
     /// `PolicyNotFoundException` for, and what the authorization evaluation reads beside
@@ -1084,7 +1103,7 @@ impl AppMonitorRecord {
         &self,
         destination: &str,
         destination_arn: Option<&str>,
-    ) -> Option<&BTreeMap<String, MetricDefinitionRecord>> {
+    ) -> Option<&BTreeMap<MetricDefinitionRank, MetricDefinitionRecord>> {
         self.metric_definitions
             .get(&metric_destination_key(destination, destination_arn))
     }
@@ -1135,9 +1154,13 @@ impl AppMonitorRecord {
         destination_arn: Option<&str>,
         metric_definition_id: &str,
     ) -> Option<&mut MetricDefinitionRecord> {
+        // The map is keyed by creation rank, so a caller's id is resolved by the id each
+        // record CARRIES — the same single-valued identity the map is written under, since
+        // no two ids this state mints are equal.
         self.metric_definitions
             .get_mut(&metric_destination_key(destination, destination_arn))?
-            .get_mut(metric_definition_id)
+            .values_mut()
+            .find(|stored| stored.metric_definition_id == metric_definition_id)
     }
 
     /// Remove the ONE definition the `(Destination, DestinationArn, MetricDefinitionId)`
@@ -1153,26 +1176,42 @@ impl AppMonitorRecord {
         destination_arn: Option<&str>,
         metric_definition_id: &str,
     ) -> Option<MetricDefinitionRecord> {
-        self.metric_definitions
-            .get_mut(&metric_destination_key(destination, destination_arn))?
-            .remove(metric_definition_id)
+        let held = self
+            .metric_definitions
+            .get_mut(&metric_destination_key(destination, destination_arn))?;
+        // The rank the id is held at, read from the record's own id, then dropped: the
+        // ranks of the definitions that remain are untouched, so a delete cannot move a
+        // surviving definition's position in the listing.
+        let rank = *held
+            .iter()
+            .find(|(_, stored)| stored.metric_definition_id == metric_definition_id)
+            .map(|(rank, _)| rank)?;
+        held.remove(&rank)
     }
 
-    /// Store `record` as a definition of that destination, under the id it carries.
+    /// Store `record` as the NEWEST definition of that destination, at the next creation
+    /// rank.
     ///
-    /// The ONE writer of [`Self::metric_definitions`]: the id in the record IS the map
-    /// key, so the id a create reports and the id a later read or update resolves cannot
-    /// differ.
+    /// The ONE writer of [`Self::metric_definitions`], so creation order is decided in one
+    /// place: the rank is one past the highest the destination holds, which is past every
+    /// definition already there whatever has been deleted meanwhile, and ranks already
+    /// taken are never reused while their definition is held — so a definition's position
+    /// in the listing is fixed when it is created and never moves afterwards.
     pub fn insert_metric_definition(
         &mut self,
         destination: &str,
         destination_arn: Option<&str>,
         record: MetricDefinitionRecord,
     ) {
-        self.metric_definitions
+        let held = self
+            .metric_definitions
             .entry(metric_destination_key(destination, destination_arn))
-            .or_default()
-            .insert(record.metric_definition_id.clone(), record);
+            .or_default();
+        let rank = held
+            .keys()
+            .next_back()
+            .map_or(0, |highest| highest.saturating_add(1));
+        held.insert(rank, record);
     }
 
     /// The revision id of this monitor's stored resource policy, or `None` while it

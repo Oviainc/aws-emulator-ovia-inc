@@ -1129,9 +1129,9 @@ pub mod messages {
         )
     }
 
-    /// The `AccessDeniedException$message` (HTTP 403) every write that hands this
+    /// The `AccessDeniedException$message` (HTTP 403) a WORKFLOW write that hands this
     /// service a caller-supplied `roleArn` answers when IAM shows the service cannot
-    /// assume it (see [`super::role_is_unassumable`]).
+    /// assume it (see [`super::role_refusal`], which states which writes ask).
     ///
     /// A TEMPLATE over the request: AWS names the role the caller passed, which is what
     /// tells a caller WHICH value to fix when a request carries more than one role, so
@@ -2082,12 +2082,22 @@ pub const SERVICE_PRINCIPAL: &str = "entityresolution.amazonaws.com";
 /// Why a request naming a `roleArn` this service cannot assume is refused — `None` when
 /// the request names no role, or when nothing is KNOWN about the one it names.
 ///
-/// Every operation that STORES a caller-supplied role asks this before it writes,
-/// because the resource it creates RUNS AS that role, and refuses a request it answers
-/// for with the operation's modelled `AccessDeniedException` (HTTP 403) with nothing
-/// persisted. `roleArn` is optional on the ID-mapping and ID-namespace writes (modelled
-/// `default: ""`), and a request that names NO role hands the service nothing to assume,
-/// so there is nothing to resolve for it.
+/// Asked by the WORKFLOW writes — `CreateMatchingWorkflow`, `UpdateMatchingWorkflow`,
+/// `CreateIdMappingWorkflow` and `UpdateIdMappingWorkflow` — before they write, and by
+/// those only: their `roleArn` is the role "Entity Resolution assumes … to create
+/// resources on your behalf as part of workflow execution"
+/// (`smithy_query(query="doc",shape="CreateMatchingWorkflowInput",member="roleArn")`), so
+/// the resource each of them stores is one this service itself runs AS that role, and a
+/// request this answers for is refused with the operation's modelled
+/// `AccessDeniedException` (HTTP 403) with nothing persisted. The ID-NAMESPACE writes do
+/// NOT ask: a namespace's role is one "Entity Resolution assumes … to access the resources
+/// defined in this `IdNamespace` on your behalf as part of the workflow run"
+/// (`smithy_query(query="doc",shape="CreateIdNamespaceInput",member="roleArn")`) — assumed
+/// by the ID mapping workflow run that uses the namespace as a Source or a Target, which
+/// the namespace's resource policy may share with another account — so that write records
+/// the role instead of resolving it. `roleArn` is optional on the ID-mapping writes
+/// (modelled `default: ""`), and a request that names NO role hands the service nothing to
+/// assume, so there is nothing to resolve for it.
 ///
 /// The whole question — which role of this account the value names, what IAM answers
 /// about it, and whether the trust document it carries admits a service principal — is

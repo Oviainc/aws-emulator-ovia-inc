@@ -5,8 +5,9 @@
 //! Reports the metric definitions one extended-metrics destination of the app monitor the
 //! request names holds, read off this service's persisted state: the map
 //! `BatchCreateRumMetricDefinitions` writes and `UpdateRumMetricDefinition` replaces
-//! entries of. `@readonly` and `@paginated`, so a page is a window onto that map in
-//! definition-id order and paging it changes nothing a later caller sees.
+//! entries of. `@readonly` and `@paginated`, so a page is a window onto that map in the
+//! order the definitions were CREATED — the order a caller correlates a destination's
+//! definitions by position in — and paging it changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -285,28 +286,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A range query over the id-ordered map, not a scan: resuming costs
-        // O(log n) + O(page) and a page boundary cannot drift from the map it indexes.
-        let start = match resume_after.as_deref() {
+        // A range query over the CREATION-ordered map, not a scan: resuming costs
+        // O(log n) + O(page) and a page boundary cannot drift from the map it indexes. The
+        // order is the one the definitions were created in — the only order this listing
+        // offers a caller, who correlates a destination's definitions by position in it —
+        // so position N is the Nth definition created, on this call and on every later one.
+        let start = match resume_after {
             Some(after) => ::std::ops::Bound::Excluded(after),
             None => ::std::ops::Bound::Unbounded,
         };
-        let (definitions, last_id, more) =
+        let (definitions, last_rank, more) =
             match monitor.metric_definitions_for(&input.destination, destination_arn) {
                 Some(held) => {
-                    let mut remaining =
-                        held.range::<str, _>((start, ::std::ops::Bound::Unbounded));
-                    let mut last_id = None;
+                    let mut remaining = held.range((start, ::std::ops::Bound::Unbounded));
+                    let mut last_rank = None;
                     let page: Vec<MetricDefinition> = remaining
                         .by_ref()
                         .take(page_size)
-                        .map(|(id, record)| {
-                            last_id = Some(id.clone());
+                        .map(|(rank, record)| {
+                            last_rank = Some(*rank);
                             record.to_metric_definition()
                         })
                         .collect();
                     let more = remaining.next().is_some();
-                    (page, last_id, more)
+                    (page, last_rank, more)
                 }
                 // The destination exists and holds no definition yet.
                 None => (Vec::new(), None, false),
@@ -314,13 +317,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A token is emitted only when something is actually left to return, so the last
         // page carries none.
-        let next_token = match last_id {
+        let next_token = match last_rank {
             Some(last) if more => Some(encode_next_token(
                 &region,
                 &input.app_monitor_name,
                 &input.destination,
                 destination_arn,
-                &last,
+                last,
             )),
             _ => None,
         };
@@ -343,18 +346,23 @@ const TOKEN_MARKER: &str = "BatchGetRumMetricDefinitions/1/";
 /// The app monitor AND the destination the listing is scoped to are part of the key — and,
 /// through the shared codec, the region the listing ran in — so a token is only honoured
 /// by the listing that issued it: definitions are per-destination, a destination belongs
-/// to a monitor of one region, and two destinations' maps can hold the same ids. The
+/// to a monitor of one region, and two destinations' maps hold the same ranks. The
 /// `DestinationArn` goes LAST
 /// because it is the one component whose modelled pattern ends in an unconstrained `.*`,
 /// and the codec delimits every component but the last (see
-/// [`crate::state::decode_pagination_token`]); the definition id ahead of it is minted by
-/// this service, so it carries no separator.
+/// [`crate::state::decode_pagination_token`]); the creation rank ahead of it is a decimal
+/// number, so it carries no separator.
+///
+/// The resume point is the RANK the page ended on rather than that definition's id: the
+/// rank is the order this listing walks, and a rank still orders the definitions that
+/// remain even once the definition it named has been deleted, so a token issued before a
+/// delete resumes exactly where it said it would.
 fn encode_next_token(
     region: &str,
     app_monitor_name: &str,
     destination: &str,
     destination_arn: Option<&str>,
-    last_returned: &str,
+    last_returned: crate::state::MetricDefinitionRank,
 ) -> String {
     crate::state::encode_pagination_token(
         TOKEN_MARKER,
@@ -362,13 +370,13 @@ fn encode_next_token(
         &[
             app_monitor_name,
             destination,
-            last_returned,
+            &last_returned.to_string(),
             destination_arn.unwrap_or_default(),
         ],
     )
 }
 
-/// The definition id a token issued by [`encode_next_token`] for this app monitor and
+/// The creation rank a token issued by [`encode_next_token`] for this app monitor and
 /// destination of `region` resumes after, or `None` for any value this operation never
 /// issued for them.
 fn decode_next_token(
@@ -377,12 +385,13 @@ fn decode_next_token(
     destination: &str,
     destination_arn: Option<&str>,
     token: &str,
-) -> Option<String> {
+) -> Option<crate::state::MetricDefinitionRank> {
     let key = crate::state::decode_pagination_token(TOKEN_MARKER, region, token, 4)?;
     let [issued_for, issued_destination, last_returned, issued_arn] =
         <[String; 4]>::try_from(key).ok()?;
-    (issued_for == app_monitor_name
+    let issued = (issued_for == app_monitor_name
         && issued_destination == destination
         && issued_arn == destination_arn.unwrap_or_default())
-    .then_some(last_returned)
+    .then_some(last_returned)?;
+    issued.parse().ok()
 }

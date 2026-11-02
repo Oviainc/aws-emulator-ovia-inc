@@ -13,10 +13,9 @@
 //! `inputSourceConfig`, `idMappingWorkflowProperties`, `roleArn`) is cleared rather
 //! than kept. An `idNamespaceName` no namespace is stored under answers the modelled
 //! `ResourceNotFoundException` (HTTP 404) and persists nothing — an update is not a
-//! create. A replacement `roleArn` this account's IAM shows the service cannot assume
-//! answers the modelled `AccessDeniedException` (HTTP 403), the rule
-//! [`crate::state::role_refusal`] states, leaving the stored namespace with the role it
-//! had.
+//! create. A replacement `roleArn` is stored AS GIVEN and resolved against nothing, for
+//! the reason `CreateIdNamespace` states: the role an ID namespace carries is assumed by
+//! the ID mapping workflow run that reads its sources, not by this write.
 //!
 //! Unlike `GetIdNamespace`, whose label is an `EntityNameOrIdNamespaceArn`, this
 //! operation's `idNamespaceName` label is an `EntityName`
@@ -188,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateIdNamespaceErrorModeled::InternalServerException(InternalServerException {
@@ -198,22 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The namespace's ID mapping RUNS AS the role this request would store on it, so
-        // a role it names is resolved against this account's IAM BEFORE the store is
-        // touched, and awaited with no store guard held. Only what IAM ANSWERED refuses
-        // the request.
-        let region = crate::state::request_region(ctx.parts());
-        if let Some(message) =
-            crate::state::role_refusal(ctx, &region, input.role_arn.as_deref()).await
-        {
-            return Err(UpdateIdNamespaceErrorModeled::AccessDeniedException(
-                AccessDeniedException {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
-
+        // NOTHING is asked of IAM about a replacement `roleArn`: an ID namespace only
+        // RECORDS the role a later ID mapping workflow run assumes through it — see the
+        // header and `CreateIdNamespace`.
         let updated = crate::state::now();
 
         let mut store = state.lock();

@@ -63,6 +63,8 @@ mod metric_definition_answers;
 mod metric_definition_declared_members;
 #[path = "all/metric_definition_identity.rs"]
 mod metric_definition_identity;
+#[path = "all/metric_definition_listing_order.rs"]
+mod metric_definition_listing_order;
 #[path = "all/metric_definition_validation.rs"]
 mod metric_definition_validation;
 #[path = "all/metric_definitions.rs"]
