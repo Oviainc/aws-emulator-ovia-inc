@@ -3,15 +3,16 @@
 //! The INVARIANT `encoding-type=url` owes a client, over a table of key bytes.
 //!
 //! `tests/all/listing_encoding_type.rs` pins what the encoding WRITES, value by value
-//! (`train/train.csv` → `train%2Ftrain.csv`, and so on). This suite pins the property that
+//! (`a+b=c&d` → `a%2Bb%3Dc%26d`, and so on). This suite pins the property that
 //! makes those values usable rather than merely stable, which no literal expectation can
-//! state: **percent-decoding what an `encoding-type=url` listing reports yields exactly the
+//! state: **decoding what an `encoding-type=url` listing reports yields exactly the
 //! key that was stored, and the listing reports the same keys, in the same order, as the
 //! same request without the parameter** — so a client that decodes every key-name element
-//! (which is what botocore's `decode_list_object_v2` handler does on every page) sees the
-//! objects it stored, and `encoding-type` is a rendering of one listing rather than a
-//! different listing. The two halves are complementary: a wrong-but-reversible encoder is
-//! caught there, and a right-looking-but-lossy one is caught here.
+//! (which is what botocore's `decode_list_object_v2` handler does on every page, through the
+//! plus-aware `unquote_plus`) sees the objects it stored, and `encoding-type` is a rendering
+//! of one listing rather than a different listing. The two halves are complementary: a
+//! wrong-but-reversible encoder is caught there, and a right-looking-but-lossy one is caught
+//! here.
 //!
 //! The rows are keys the literal table does not carry, chosen along what the encoder
 //! generalises over: how many separators a key has, the ASCII punctuation a URI reserves,
@@ -44,12 +45,15 @@ fn in_path(key: &str) -> String {
     utf8_percent_encode(key, PATH_LITERAL).to_string()
 }
 
-/// What a client does with every key-name element of an `encoding-type=url` page.
+/// What a client does with every key-name element of an `encoding-type=url` page: the
+/// plus-aware unquoting botocore applies to each of them, where `+` is a space and `%XX` is
+/// the byte it names.
 ///
 /// `pub(crate)`: the optional-member suite ([`super::listing_optional_members`]) decodes
 /// the pages it reads through this one helper rather than keeping a second copy.
 pub(crate) fn decoded(written: &str) -> String {
-    percent_decode_str(written)
+    let plus_decoded = written.replace('+', " ");
+    percent_decode_str(&plus_decoded)
         .decode_utf8()
         .unwrap_or_else(|error| panic!("the response must carry valid UTF-8: {error}"))
         .into_owned()
@@ -141,11 +145,12 @@ async fn decoding_an_encoded_listing_yields_the_keys_that_were_stored() {
             "case {case:?}: decoding {:?} must yield the stored key",
             written_keys[index]
         );
-        // And it is genuinely ENCODED where the key carries a character outside the
-        // unreserved set, so the row cannot pass by the response being verbatim.
+        // And it is genuinely ENCODED where the key carries a character the listing does not
+        // leave literal — anything outside the unreserved set and the `/` of a key prefix —
+        // so the row cannot pass by the response being verbatim.
         let needs_encoding = key
             .chars()
-            .any(|character| !(character.is_ascii_alphanumeric() || "-_.~".contains(character)));
+            .any(|character| !(character.is_ascii_alphanumeric() || "-_.~/".contains(character)));
         assert_eq!(
             written_keys[index] != *key,
             needs_encoding,

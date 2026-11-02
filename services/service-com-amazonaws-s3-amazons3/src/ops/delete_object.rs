@@ -443,11 +443,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
             // `InvalidArgument` with HTTP 400, which leaves `NoSuchVersion` for a
             // well-formed id the bucket holds no version for.
             if !crate::state::version_id_is_well_formed(version_id) {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::INVALID_ARGUMENT_CODE,
-                    crate::state::INVALID_ARGUMENT_STATUS,
-                    crate::state::INVALID_VERSION_ID_MESSAGE,
-                ));
+                return Err(crate::scaffolded::Scaffolded::invalid_version_id(version_id));
             }
             // S3 OBJECT LOCK protects the VERSION this delete names, so the lock is read
             // off that version before anything is taken away: a legal hold on it, or a

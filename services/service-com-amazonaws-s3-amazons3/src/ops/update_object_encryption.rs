@@ -243,14 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it is a malformed argument rather than an absent version — judged by the one
         // shared rule every operation that takes a `versionId` uses.
         let version_id = input.version_id.as_deref();
-        if version_id
-            .is_some_and(|version_id| !crate::state::version_id_is_well_formed(version_id))
+        if let Some(rejected) =
+            version_id.filter(|version_id| !crate::state::version_id_is_well_formed(version_id))
         {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::INVALID_ARGUMENT_CODE,
-                crate::state::INVALID_ARGUMENT_STATUS,
-                crate::state::INVALID_VERSION_ID_MESSAGE,
-            ));
+            return Err(crate::scaffolded::Scaffolded::invalid_version_id(rejected));
         }
 
         // The ENCRYPTION the request asks for, and the object it asks for it on, are both

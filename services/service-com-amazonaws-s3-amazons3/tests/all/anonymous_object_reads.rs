@@ -128,6 +128,11 @@ struct Row {
     /// Whether the ACL put above must be ACCEPTED: a public ACL is refused while
     /// `BlockPublicAcls` is on, and that refusal is itself part of the row's setup.
     acl_accepted: bool,
+    /// Whether the bucket owner's own SIGNED read is refused too. A bucket policy is a
+    /// resource-based policy in force on every caller, so an explicit `Deny` reaching every
+    /// principal reaches the owner as well — every other row's refusal is about the caller
+    /// presenting no credential and leaves the owner's read served.
+    signed_read_refused: bool,
     /// What the unsigned read must answer.
     expected: Expected,
 }
@@ -145,6 +150,7 @@ impl Default for Row {
             policy: None,
             payer: None,
             acl_accepted: true,
+            signed_read_refused: false,
             expected: REFUSED,
         }
     }
@@ -499,6 +505,8 @@ fn rows() -> Vec<Row> {
                     &object_arn("anon-policy-denied", "*")
                 ),
             ))),
+            // The deny reaches EVERY principal, the bucket's owner included.
+            signed_read_refused: true,
             ..Row::default()
         },
         Row {
@@ -583,10 +591,29 @@ async fn an_unsigned_read_is_served_only_what_the_bucket_grants_to_everyone() {
             );
         }
 
-        // The bucket owner's own SIGNED read is unaffected by every row above: the refusals
-        // are about the caller presenting no credential, not about the object being
-        // unreadable.
+        // The bucket owner's own SIGNED read is unaffected by every row above except the one
+        // whose policy DENIES every principal: the other refusals are about the caller
+        // presenting no credential, not about the object being unreadable, while a
+        // resource-based explicit deny reaches the owner too.
         let signed = get_object(&router, bucket, KEY, "", &[]).await;
+        if row.signed_read_refused {
+            assert_eq!(
+                signed.status, 403,
+                "case {:?}: a policy denying every principal must refuse the owner's signed \
+                 read too, got {} with body {:?}",
+                row.case,
+                signed.status,
+                text(&signed)
+            );
+            assert_eq!(
+                signed.error_code(),
+                ACCESS_DENIED,
+                "case {:?}: expected the {ACCESS_DENIED:?} code, got {:?}",
+                row.case,
+                signed.error_code()
+            );
+            continue;
+        }
         assert_eq!(
             signed.status, 200,
             "case {:?}: the owner's signed read must still be served, got {} with body {:?}",

@@ -376,6 +376,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "If the account ID that you provide does not match the actual owner of the bucket,
+        // the request fails with the HTTP status code 403 Forbidden (access denied)"
+        // (`GetObjectRequest$ExpectedBucketOwner`), judged exactly as `HeadObject` and
+        // `PutObject` judge it: this emulator serves one account, so the owner of every
+        // bucket it holds is that account. Answered ahead of the store, so a mismatched guard
+        // says nothing about what the bucket holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                crate::state::ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        // A `versionId` that is not SHAPED like one cannot name a version of anything, so it
+        // is a malformed argument rather than an absent version: `InvalidArgument` with HTTP
+        // 400, naming the parameter and the token it rejected, which leaves
+        // `NoSuchVersion`/404 for a well-formed id the bucket holds no version for. Judged on
+        // the request alone, so it is settled before the store is read and before
+        // authorization, the way a value the boundary validator refuses is.
+        if let Some(version_id) = input
+            .version_id
+            .as_deref()
+            .filter(|version_id| !crate::state::version_id_is_well_formed(version_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_version_id(version_id));
+        }
+
         // Read-only: the guard is taken, the object is copied out, and nothing is
         // written — a later caller sees exactly what this one saw.
         let store = state.lock();
@@ -383,27 +415,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
 
-        // WHO is asking comes before anything this read reports. A request presenting no
-        // credential speaks for no principal, so it is served only what the bucket grants to
-        // everyone ([`crate::state::Bucket::anonymous_object_read_refusal`] carries that
-        // rule) and is otherwise refused with S3's authorization code — ahead of the key
-        // lookup, so a refusal says nothing about whether the key is there.
-        if crate::state::request_is_anonymous(ctx.parts()) {
-            let addressed = match input.version_id.as_deref() {
-                None => bucket.object(&input.key),
-                Some(version_id) => bucket
-                    .stored_version(&input.key, version_id)
-                    .and_then(crate::state::StoredVersion::as_object),
-            };
-            if let Some(message) =
-                bucket.anonymous_object_read_refusal(&input.bucket, &input.key, addressed)
-            {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::ACCESS_DENIED_CODE,
-                    crate::state::ACCESS_DENIED_STATUS,
-                    message,
-                ));
-            }
+        // WHO is asking comes before anything this read reports, and is judged against the
+        // version the address resolves to — read here, ahead of the key lookup below, so a
+        // refusal says nothing about whether the key is there.
+        let addressed = match input.version_id.as_deref() {
+            None => bucket.object(&input.key),
+            Some(version_id) => bucket
+                .stored_version(&input.key, version_id)
+                .and_then(crate::state::StoredVersion::as_object),
+        };
+        // A request presenting no credential speaks for no principal, so it is served only
+        // what the bucket grants to everyone
+        // ([`crate::state::Bucket::anonymous_object_read_refusal`] carries that rule); one
+        // presenting a credential speaks for this account, and the bucket's own policy is in
+        // force on it too ([`crate::state::Bucket::caller_object_read_refusal`]) — an
+        // explicit deny refuses the read whatever the store holds. Either way the refusal is
+        // S3's authorization code.
+        let refusal = match crate::state::request_is_anonymous(ctx.parts()) {
+            true => bucket
+                .anonymous_object_read_refusal(&input.bucket, &input.key, addressed)
+                .map(str::to_string),
+            false => bucket.caller_object_read_refusal(&input.bucket, &input.key, addressed),
+        };
+        if let Some(message) = refusal {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
         }
 
         // "To retrieve a specific version, you must be the bucket owner and you must use
@@ -416,17 +455,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let object = match input.version_id.as_deref() {
             None => bucket.object(&input.key),
             Some(version_id) => {
-                // A `versionId` that is not SHAPED like one cannot name a version of
-                // anything, so it is a malformed argument rather than an absent version:
-                // `InvalidArgument` with HTTP 400, which leaves `NoSuchVersion`/404 for a
-                // well-formed id the bucket holds no version for.
-                if !crate::state::version_id_is_well_formed(version_id) {
-                    return Err(crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::INVALID_ARGUMENT_CODE,
-                        crate::state::INVALID_ARGUMENT_STATUS,
-                        crate::state::INVALID_VERSION_ID_MESSAGE,
-                    ));
-                }
                 let Some(held) = bucket.stored_version(&input.key, version_id) else {
                     return Err(crate::scaffolded::Scaffolded::unmodeled(
                         crate::state::NO_SUCH_VERSION_CODE,

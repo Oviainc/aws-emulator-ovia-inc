@@ -274,6 +274,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 date.secs()
                             )));
                         };
+                        // A retention period "will expire" at the date it names
+                        // (`ObjectLockRetention$RetainUntilDate`), so a date that is not in
+                        // the future describes a period that protects nothing: the VALUE is
+                        // wrong, which is `InvalidArgument` naming the member and echoing
+                        // what it carried — not an authorization decision, so it is settled
+                        // here, before the store is read and before the Object Lock in force
+                        // on the version is consulted at all.
+                        if retain_until <= ::std::time::SystemTime::now() {
+                            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                                crate::state::RETAIN_UNTIL_DATE_ARGUMENT,
+                                &crate::state::echoed_retain_until_date(
+                                    crate::service::wire::spelled_in_request(
+                                        crate::state::RETAIN_UNTIL_DATE_ARGUMENT,
+                                    )
+                                    .as_deref(),
+                                    Some(date),
+                                ),
+                                crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE,
+                            ));
+                        }
                         Some(crate::state::ObjectRetention {
                             mode: mode.to_string(),
                             retain_until,

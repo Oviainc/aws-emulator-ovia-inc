@@ -462,8 +462,9 @@ pub const MAX_ANNOTATIONS_PER_OBJECT: usize = 1_000;
 /// The longest an annotation name may be, in BYTES.
 ///
 /// "Length Constraints: Minimum length of 1. Maximum length of 512 bytes"
-/// (`PutObjectAnnotationRequest$AnnotationName`), the same bound the
-/// `AnnotationNameTooLong` error reports ("The annotation name exceeds 512 bytes").
+/// (`PutObjectAnnotationRequest$AnnotationName`), which is the bound the
+/// `AnnotationNameTooLong` error is answered past (the sentence that error carries states
+/// the rule rather than this number — see `crate::scaffolded::DOCUMENTED_ERROR_MESSAGES`).
 /// `AnnotationName` carries no `length` trait in the model, so nothing refuses an
 /// over-long name before a handler does.
 pub const MAX_ANNOTATION_NAME_BYTES: usize = 512;
@@ -5217,10 +5218,25 @@ impl Bucket {
     /// ([`caller_principal_arn`]) together with the spellings that name its whole account —
     /// a statement denying the account refuses each of its principals.
     ///
-    /// Only a DENY is reported, because this emulator serves one account and the caller is
-    /// that account: a document that says nothing about the request leaves the bucket's own
-    /// owner able to act on it, which is how every other object operation here treats it.
-    /// A bucket carrying no policy denies nothing.
+    /// The request carries a value for every condition key this service can ANSWER
+    /// ([`REQUEST_CONDITION_KEYS`]) and declares those keys as ones it models, so a clause
+    /// over one of them is DECIDED: the guardrail clause AWS publishes for a bucket policy —
+    /// a `Deny` of everything that did not arrive over a secure transport — holds for no
+    /// request this emulator serves, and the same clause stated the other way holds for
+    /// every one.
+    ///
+    /// Only a deny this evaluation could decide refuses: a clause over a key this service
+    /// does not answer leaves the statement UNDECIDED, and the evaluation's reading of an
+    /// undecided `Deny` is that it still refuses — fail-closed, which is right where a GRANT
+    /// is at stake and wrong here, because it would refuse the bucket owner's own read of
+    /// every bucket whose policy conditions anything on a key nothing in this emulator
+    /// models. The keys a decision needed and the request did not carry are what says which
+    /// case this is (`Outcome::required_context_keys`).
+    ///
+    /// Only a DENY is reported at all, because this emulator serves one account and the
+    /// caller is that account: a document that says nothing about the request leaves the
+    /// bucket's own owner able to act on it, which is how every other object operation here
+    /// treats it. A bucket carrying no policy denies nothing.
     fn caller_is_denied(&self, action: &str, resource: &str) -> bool {
         let Some(policy) = self.policy.as_deref() else {
             return false;
@@ -5230,10 +5246,18 @@ impl Bucket {
         principals.extend(::service_common::iam_authorization::account_principals(
             &caller,
         ));
-        ::service_common::iam_authorization::resource_decision(
-            policy,
-            &::service_common::iam_authorization::Request::new(action, resource, &principals),
-        ) == ::service_common::iam_authorization::Decision::Denied
+        let context = [(
+            SECURE_TRANSPORT_KEY.to_string(),
+            SECURE_TRANSPORT_VALUE.to_string(),
+        )];
+        let outcome = ::service_common::iam_authorization::resource_outcome_prepared(
+            &::service_common::iam_authorization::PreparedDocument::read(policy),
+            &::service_common::iam_authorization::Request::new(action, resource, &principals)
+                .with_context(&context)
+                .with_published_keys(REQUEST_CONDITION_KEYS),
+        );
+        outcome.decision == ::service_common::iam_authorization::Decision::Denied
+            && outcome.required_context_keys.is_empty()
     }
 
     /// The object a delete that names NO `versionId` would remove PERMANENTLY, or `None`
@@ -5607,6 +5631,52 @@ impl Bucket {
             ::service_common::iam_authorization::Decision::NotStated => granted_by_acl,
         };
         (!granted).then_some(ACCESS_DENIED_MESSAGE)
+    }
+
+    /// Why S3 refuses a read of `key` — the bytes or the metadata of the version `addressed`
+    /// names, `None` for an address this bucket holds no object at — to the CREDENTIALED
+    /// caller, or `None` when this bucket's policy leaves the read to it.
+    ///
+    /// A bucket policy is a RESOURCE-BASED policy, so it is in force on every request against
+    /// the bucket's resources and not only on the public ones
+    /// ([`Self::anonymous_object_read_refusal`] is the same question asked for the caller that
+    /// presents none): an explicit `Deny` about the request "wins, whatever any `Allow` says"
+    /// (IAM's own evaluation order, which [`Self::caller_is_denied`] answers by), and this
+    /// emulator serves one account that owns its buckets, so a document saying nothing about
+    /// the request leaves the read to that owner.
+    ///
+    /// WHICH refusal it is depends on what the address resolved to, and the two are worded as
+    /// S3 words them:
+    ///
+    /// * a version the read DID resolve, whose read the policy denies, is refused the read
+    ///   itself — the `AccessDenied` [`ACCESS_DENIED_MESSAGE`] states, about
+    ///   [`GET_OBJECT_ACTION`] on that object;
+    /// * an address holding NOTHING is answered by what the caller may learn about the
+    ///   bucket's contents at all: "if you have the `s3:ListBucket` permission on the bucket,
+    ///   Amazon S3 returns an HTTP status code 404 Not Found error. If you don't have the
+    ///   `s3:ListBucket` permission, Amazon S3 returns an HTTP status code 403 Access Denied
+    ///   error" (`GetObject`'s own documentation) — so a policy denying
+    ///   [`LIST_BUCKET_ACTION`] on this bucket refuses the read instead of reporting the key
+    ///   absent, with the sentence an explicit deny carries
+    ///   ([`explicit_resource_policy_denial`]), and one that does not leaves the 404 to be
+    ///   answered.
+    ///
+    /// Asked BEFORE anything about the key is reported, which is what keeps a refusal from
+    /// saying whether the object is there.
+    pub fn caller_object_read_refusal(
+        &self,
+        bucket: &str,
+        key: &str,
+        addressed: Option<&Object>,
+    ) -> Option<String> {
+        if addressed.is_some() {
+            return self
+                .caller_is_denied(GET_OBJECT_ACTION, &object_arn(bucket, key))
+                .then(|| ACCESS_DENIED_MESSAGE.to_string());
+        }
+        let resource = self.arn(bucket);
+        self.caller_is_denied(LIST_BUCKET_ACTION, &resource)
+            .then(|| explicit_resource_policy_denial(LIST_BUCKET_ACTION, &resource))
     }
 
     /// Why REQUESTER PAYS refuses a request against this bucket that carries no credential
@@ -7225,6 +7295,69 @@ impl ObjectRetention {
     }
 }
 
+/// The request field a `RetainUntilDate` that does not end in the future is reported
+/// against: the member of the `Retention` document that carries it
+/// (`smithy_query(query="shape",shape="ObjectLockRetention")` reports
+/// `RetainUntilDate`), which is how S3's `InvalidArgument` document names the argument it
+/// rejected.
+pub const RETAIN_UNTIL_DATE_ARGUMENT: &str = "RetainUntilDate";
+
+/// The `<Message>` S3 refuses a retention whose period does not end in the FUTURE with —
+/// fixed text, with no variable part.
+///
+/// A retention period is the span a version is protected FOR, and it "will expire" at the
+/// date it names (`ObjectLockRetention$RetainUntilDate`), so a date at or before now
+/// describes a period that protects nothing: the value is a bad ARGUMENT rather than a
+/// permission the caller lacks, which is why it is refused with
+/// [`INVALID_ARGUMENT_CODE`] and HTTP 400 and not with [`ACCESS_DENIED_CODE`].
+pub const RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE: &str =
+    "The retain until date must be in the future!";
+
+/// The request field a `x-amz-object-lock-retain-until-date` a WRITE carries is reported
+/// against: the header itself, which is where that write's retention date arrives
+/// (`smithy_query(query="operation",operation="PutObject")` reports
+/// `ObjectLockRetainUntilDate: {httpHeader: "x-amz-object-lock-retain-until-date"}`).
+pub const OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER: &str = "x-amz-object-lock-retain-until-date";
+
+/// The text a request spelled a HEADER in, for a refusal that must echo the value that
+/// header carried ([`echoed_retain_until_date`] is the one that does).
+///
+/// A header's value reaches a handler already parsed into the member's own type, so the
+/// spelling is gone; `parts` is where it is still the caller's own text.
+pub fn header_text<'p>(parts: &'p ::http::request::Parts, name: &str) -> Option<&'p str> {
+    parts
+        .headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// A retention date as a refusal ECHOES it: the text the REQUEST spelled it in, and a
+/// rendering of the parsed instant only where that text cannot be recovered.
+///
+/// S3's `InvalidArgument` names the field it rejected and the value that field CARRIED, so
+/// the echo is the caller's own text: a timestamp parses to an instant, which can be written
+/// several ways and is no longer what the caller sent, and a client matching the envelope
+/// against what it sent reads that text. The fallback — for a date whose spelling the
+/// request did not keep — is the ISO 8601 `date-time` the member is bound in
+/// (`ObjectLockRetention$RetainUntilDate`'s `timestampFormat`), which is the spelling a
+/// request carrying the canonical form sent.
+///
+/// One place, so the header-borne date of a write and the document-borne date of a retention
+/// write are echoed identically.
+pub fn echoed_retain_until_date(
+    spelled: Option<&str>,
+    date: Option<&::aws_smithy_types::DateTime>,
+) -> String {
+    if let Some(spelled) = spelled.map(str::trim).filter(|text| !text.is_empty()) {
+        return spelled.to_string();
+    }
+    date.and_then(|date| {
+        date.fmt(::aws_smithy_types::date_time::Format::DateTime)
+            .ok()
+    })
+    .unwrap_or_default()
+}
+
 /// The IAM action that LIFTING a governance-mode retention is authorized under: "to
 /// override or remove governance-mode retention settings you must have the
 /// `s3:BypassGovernanceRetention` permission" (Amazon S3 User Guide, *S3 Object Lock*),
@@ -7297,6 +7430,9 @@ pub enum ObjectLockRequestRejection {
     /// A `x-amz-object-lock-retain-until-date` outside the range of instants this platform
     /// can hold, which no period a version is locked for can run to.
     UnrepresentableRetainUntilDate,
+    /// A `x-amz-object-lock-retain-until-date` that is not in the FUTURE, which describes a
+    /// period that protects nothing — see [`RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE`].
+    RetainUntilDateNotInFuture,
 }
 
 /// The Object Lock an object write asked for, read off the three members that carry it, or
@@ -7314,10 +7450,15 @@ pub enum ObjectLockRequestRejection {
 /// ONE place for the rule, so every write that declares these members — the one-shot write,
 /// the copy and the multipart initiation whose settings the completed object carries —
 /// records the same lock from the same values.
+/// `now` is the instant the period is judged against: a retention "will expire" at the date
+/// it names, so one that does not end after `now` protects nothing and is refused rather
+/// than recorded ([`RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE`] is the sentence, the same rule
+/// `PutObjectRetention` judges its own `RetainUntilDate` by).
 pub fn requested_object_lock(
     mode: Option<&str>,
     retain_until_date: Option<&::aws_smithy_types::DateTime>,
     legal_hold_status: Option<&str>,
+    now: SystemTime,
 ) -> Result<RequestedObjectLock, ObjectLockRequestRejection> {
     let retention = match (mode, retain_until_date) {
         (None, None) => None,
@@ -7325,6 +7466,9 @@ pub fn requested_object_lock(
             let Some(retain_until) = instant_of(date) else {
                 return Err(ObjectLockRequestRejection::UnrepresentableRetainUntilDate);
             };
+            if retain_until <= now {
+                return Err(ObjectLockRequestRejection::RetainUntilDateNotInFuture);
+            }
             Some(ObjectRetention {
                 mode: mode.to_string(),
                 retain_until,
@@ -9207,6 +9351,28 @@ const KEY_UNRESERVED: &::percent_encoding::AsciiSet = &::percent_encoding::NON_A
     .remove(b'.')
     .remove(b'~');
 
+/// The characters a LISTING leaves literal in a key-name element it writes under
+/// `encoding-type=url`: [`KEY_UNRESERVED`]'s set plus the `/` that separates the elements of
+/// a key prefix, which S3 reports as itself so a prefix reads as the prefix it is. The space
+/// is not here — it is written `+` — see [`listing_encoded_key`].
+const LISTING_KEY_LITERAL: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'/');
+
+/// `value` as a URI PATH carries it: percent-encoded per UTF-8 code value, leaving RFC
+/// 3986's unreserved set alone.
+///
+/// What a URI reads a key out of — the path of the `Location` a completed multipart upload
+/// reports, and the `rule-id` of an `x-amz-expiration` header ("the value of the rule-id is
+/// URL-encoded", `GetObjectOutput$Expiration`). A LISTING writes its key-name elements in the
+/// other form S3 uses ([`listing_encoded_key`]), which is not this one.
+pub fn url_encoded_key(value: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(value, KEY_UNRESERVED).to_string()
+}
+
 /// `value` as a listing reports it when the request asked for `encoding-type=url`.
 ///
 /// The elements this applies to are the ones `ListObjectsV2Output$EncodingType` names —
@@ -9214,8 +9380,23 @@ const KEY_UNRESERVED: &::percent_encoding::AsciiSet = &::percent_encoding::NON_A
 /// Prefix, Key, and StartAfter" — plus the same key-name elements of the other listings
 /// (`ListObjectVersions`' markers and its `CommonPrefixes`). A listing that asked for no
 /// encoding type reports every one of them verbatim.
-pub fn url_encoded_key(value: &str) -> String {
-    ::percent_encoding::utf8_percent_encode(value, KEY_UNRESERVED).to_string()
+///
+/// The form is the one S3 answers with, which is a FORM encoding rather than a path one:
+/// a character outside the unreserved set becomes `%XX` per UTF-8 code value — "the object
+/// `test_file(3).png` will appear as `test_file%283%29.png`" (the `EncodingType` enum's own
+/// documentation) — a SPACE becomes `+`, and the `/` that separates the elements of a key
+/// prefix is left as it is. The two exceptions are what makes the element decodable back to
+/// the stored key by the plus-aware unquoting every SDK applies to it (botocore's
+/// `decode_list_object_v2` passes each key-name element through `unquote_plus`), and they
+/// are what a recorded listing of keys carrying a space and a `/` shows.
+pub fn listing_encoded_key(value: &str) -> String {
+    value
+        .split(' ')
+        .map(|run| {
+            ::percent_encoding::utf8_percent_encode(run, LISTING_KEY_LITERAL).to_string()
+        })
+        .collect::<Vec<String>>()
+        .join("+")
 }
 
 /// The canonical user id of the one account this emulator serves — what an S3 response
@@ -10956,7 +11137,8 @@ pub const VERSION_ID_CHARS: usize = 32;
 
 /// The most characters a version id may carry: `ObjectVersionId` is a plain string in the
 /// model (`smithy_query(query="shape",shape="ObjectVersionId")` reports no length), and S3
-/// documents a version id of up to 1024 bytes, so a longer token cannot be one.
+/// documents a version id of "no more than 1,024 bytes" (Amazon S3 User Guide, *Using
+/// versioning in S3 buckets*), so a longer token cannot be one.
 pub const MAX_VERSION_ID_CHARS: usize = 1024;
 
 /// The characters a version id is drawn from, beside the ASCII alphanumerics.
@@ -10965,6 +11147,13 @@ pub const MAX_VERSION_ID_CHARS: usize = 1024;
 /// the alphanumerics and the unreserved characters that survive that round trip.
 const VERSION_ID_EXTRA_CHARS: [char; 3] = ['-', '_', '.'];
 
+/// The character a version id's alphabet writes the value ZERO as: the first digit of the
+/// URL-safe Base64 alphabet S3's own published ids are written in.
+///
+/// A token made of nothing but it carries the zero value — see
+/// [`version_id_is_well_formed`].
+const VERSION_ID_ZERO_DIGIT: char = 'A';
+
 /// Whether `version_id` is SHAPED like a version id S3 issues.
 ///
 /// A `versionId` is one of exactly two things: the literal [`NULL_VERSION_ID`], which names
@@ -10972,13 +11161,22 @@ const VERSION_ID_EXTRA_CHARS: [char; 3] = ['-', '_', '.'];
 /// published shape — between [`VERSION_ID_CHARS`] and [`MAX_VERSION_ID_CHARS`] characters,
 /// each an ASCII alphanumeric or one of [`VERSION_ID_EXTRA_CHARS`]. The width is a RANGE
 /// rather than one number because the token is opaque: this store mints ids of its own
-/// width, and an id another S3 issued is just as much a version id. Anything else cannot
-/// name a version of any object in any bucket, so it is a malformed ARGUMENT rather than an
-/// absent version: S3 answers the former [`INVALID_ARGUMENT_CODE`] with HTTP 400 and
-/// reserves [`NO_SUCH_VERSION_CODE`] with HTTP 404 for a well-formed id that names no stored
-/// version — which is why an id of the published shape that this store never minted is a
-/// 404 and not a 400. Checked by every operation that takes a `versionId`, so one id is
-/// well-formed or malformed everywhere.
+/// width, and an id another S3 issued is just as much a version id.
+///
+/// An opaque token's text IS the identity it names, and one identity is not nameable: the
+/// ZERO value, which a token writes as nothing but [`VERSION_ID_ZERO_DIGIT`]. No issuer
+/// mints it — an issued id carries the moment and the sequence the version was recorded at
+/// — so a caller that sends it has invented a token rather than named a version, which is
+/// what S3 reports by refusing the ARGUMENT instead of the version.
+///
+/// Anything outside that is not a version id of any object in any bucket either, so both are
+/// a malformed ARGUMENT rather than an absent version: S3 answers the former
+/// [`INVALID_ARGUMENT_CODE`] with HTTP 400 and reserves [`NO_SUCH_VERSION_CODE`] with HTTP
+/// 404 for a well-formed id that names no stored version — which is why an id of the
+/// published shape that this store never minted is a 404 and not a 400. Checked by every
+/// operation that takes one `versionId` as an argument, so one id is well-formed or
+/// malformed everywhere; the batch delete reports per identifier what it could not do with
+/// that pair instead (`ops/delete_objects.rs`).
 pub fn version_id_is_well_formed(version_id: &str) -> bool {
     if version_id == NULL_VERSION_ID {
         return true;
@@ -10988,7 +11186,17 @@ pub fn version_id_is_well_formed(version_id: &str) -> bool {
         && version_id.chars().all(|character| {
             character.is_ascii_alphanumeric() || VERSION_ID_EXTRA_CHARS.contains(&character)
         })
+        && version_id
+            .chars()
+            .any(|character| character != VERSION_ID_ZERO_DIGIT)
 }
+
+/// The request field a malformed `versionId` is reported against — the `versionId` query
+/// parameter every operation that takes one binds it from
+/// (`smithy_query(query="operation",operation="GetObject")` reports
+/// `VersionId: {httpQuery: "versionId"}`), which is how S3's `InvalidArgument` document names
+/// the argument it rejected.
+pub const VERSION_ID_ARGUMENT: &str = "versionId";
 
 /// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for a `versionId` that is not
 /// shaped like a version id ([`version_id_is_well_formed`]).
@@ -12066,6 +12274,34 @@ pub fn policy_decision_for_anonymous(
 /// is the same permission a read of that object's metadata needs — "A `HEAD` request has
 /// the same options as a `GET` operation on an object" (`HeadObject`'s own documentation).
 pub const GET_OBJECT_ACTION: &str = "s3:GetObject";
+
+/// The IAM action that LISTING a bucket's contents is authorized under, and the one that
+/// decides what a read of an address holding nothing is TOLD: "if the object that you
+/// request doesn't exist, the error that Amazon S3 returns depends on whether you also have
+/// the `s3:ListBucket` permission. If you have the `s3:ListBucket` permission on the bucket,
+/// Amazon S3 returns an HTTP status code 404 Not Found error. If you don't have the
+/// `s3:ListBucket` permission, Amazon S3 returns an HTTP status code 403 Access Denied
+/// error" (`GetObject`'s own documentation).
+pub const LIST_BUCKET_ACTION: &str = "s3:ListBucket";
+
+/// The condition key saying whether the request arrived over a secure transport: "whether
+/// the request was sent using SSL" (AWS General Reference, *Global condition context keys*).
+///
+/// This service ANSWERS it rather than leaving it open, because it knows: the emulator
+/// serves every endpoint over TLS, so every request it judges arrived that way. A bucket
+/// whose policy carries the guardrail clause AWS publishes for every bucket — a `Deny` of
+/// everything that did NOT arrive over a secure transport — therefore refuses nothing here,
+/// where a key with no value would leave that clause undecided and an undecided refusal
+/// still refuses.
+const SECURE_TRANSPORT_KEY: &str = "aws:SecureTransport";
+
+/// The value that key carries, as IAM's boolean literals spell it.
+const SECURE_TRANSPORT_VALUE: &str = "true";
+
+/// The condition keys a request judged here carries a value for, and so DECLARES it models
+/// — the keys whose absence from a policy's clause is decided rather than unknown. Every
+/// other key keeps the fail-closed reading ([`Bucket::caller_is_denied`]).
+const REQUEST_CONDITION_KEYS: &[&str] = &[SECURE_TRANSPORT_KEY];
 
 /// The `Payer` value under which the REQUESTER, rather than the bucket owner, pays for a
 /// download — one of the two values `Payer` takes (`PAYER_VALUES`), the other being

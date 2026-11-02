@@ -479,7 +479,11 @@ fn collapsed(value: &str) -> String {
 }
 
 /// `text` percent-decoded — a signed query carries encoded separators inside its values.
-fn percent_decoded(text: &str) -> String {
+///
+/// `pub(super)`: the wire layer decodes the path and the query of the address a request
+/// names through this one reader ([`super::wire::addressed_object`]), rather than keeping a
+/// second copy of the decode.
+pub(super) fn percent_decoded(text: &str) -> String {
     ::percent_encoding::percent_decode_str(text)
         .decode_utf8_lossy()
         .into_owned()
@@ -527,7 +531,10 @@ fn authorization_field(header: &str, name: &str) -> Option<String> {
 
 /// The value of the query parameter `name`, percent-decoded — a presigned URL encodes the
 /// separators of the values it carries.
-fn query_parameter(query: &str, name: &str) -> Option<String> {
+///
+/// `pub(super)`, like [`percent_decoded`]: the wire layer reads the `versionId` a request
+/// addresses through this one reader, so one query string is read one way.
+pub(super) fn query_parameter(query: &str, name: &str) -> Option<String> {
     query
         .split('&')
         .filter_map(|pair| pair.split_once('='))

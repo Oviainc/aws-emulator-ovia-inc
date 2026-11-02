@@ -416,13 +416,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service reads them by ([`crate::state::requested_object_lock`]). Half a retention
         // describes no period and a date outside the range this platform holds names no
         // instant: either is a parameter that is not valid for the request, which is what the
-        // modelled `InvalidRequest` reports.
-        let Ok(requested_lock) = crate::state::requested_object_lock(
+        // modelled `InvalidRequest` reports. A date that is not in the FUTURE is a bad VALUE
+        // in a named field instead, so it is refused as that field's `InvalidArgument`.
+        let requested_lock = match crate::state::requested_object_lock(
             input.object_lock_mode.as_deref(),
             input.object_lock_retain_until_date.as_ref(),
             input.object_lock_legal_hold_status.as_deref(),
-        ) else {
-            return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+            ::std::time::SystemTime::now(),
+        ) {
+            Ok(requested) => requested,
+            Err(crate::state::ObjectLockRequestRejection::RetainUntilDateNotInFuture) => {
+                return Err(crate::scaffolded::Scaffolded::retain_until_date_not_in_future(
+                    crate::state::header_text(
+                        ctx.parts(),
+                        crate::state::OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER,
+                    ),
+                    input.object_lock_retain_until_date.as_ref(),
+                ))
+            }
+            Err(_) => return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into()),
         };
 
         // The integrity values this write DECLARED, judged before anything is stored:

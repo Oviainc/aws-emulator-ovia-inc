@@ -352,7 +352,7 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
         ("the null version of an unversioned object", "versionId=null", 200, ""),
         (
             "a WELL-FORMED version id the bucket holds no version for",
-            "versionId=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "versionId=0123456789abcdef0123456789abcdef",
             404,
             "NoSuchVersion",
         ),

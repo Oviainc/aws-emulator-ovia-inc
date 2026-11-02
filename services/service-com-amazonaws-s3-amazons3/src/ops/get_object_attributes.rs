@@ -286,14 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `versionId` that is not SHAPED like one cannot name a version of anything, so
         // it is a malformed argument rather than an absent version, judged by the one rule
         // every operation that takes a `versionId` shares.
-        if version_id
-            .is_some_and(|version_id| !crate::state::version_id_is_well_formed(version_id))
+        if let Some(version_id) =
+            version_id.filter(|version_id| !crate::state::version_id_is_well_formed(version_id))
         {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::INVALID_ARGUMENT_CODE,
-                crate::state::INVALID_ARGUMENT_STATUS,
-                crate::state::INVALID_VERSION_ID_MESSAGE,
-            ));
+            return Err(crate::scaffolded::Scaffolded::invalid_version_id(version_id));
         }
         let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(

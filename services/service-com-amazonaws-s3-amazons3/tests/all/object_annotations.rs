@@ -290,8 +290,8 @@ async fn an_annotation_name_outside_its_published_rules_is_refused() {
 
     // The rows walk the published bound (the 512-byte maximum, and one byte past it, in
     // ASCII and in multi-byte UTF-8 where the two units differ) and the reserved prefixes,
-    // in both cases, at and past the prefix itself. `AnnotationNameTooLong` is "The
-    // annotation name exceeds 512 bytes" and `InvalidAnnotationName` is "The annotation
+    // in both cases, at and past the prefix itself. `AnnotationNameTooLong` is "Your
+    // annotation name is too long." and `InvalidAnnotationName` is "The annotation
     // name you provided is invalid", so each row names the one its own rule earns.
     let too_long_in_bytes = "é".repeat(MAX_ANNOTATION_NAME_BYTES / 2 + 1);
     assert_eq!(

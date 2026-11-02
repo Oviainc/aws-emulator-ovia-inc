@@ -535,6 +535,25 @@ fn addresses_s3_select(path: &str, query: &str) -> bool {
     query_carries(query, SELECT_SUBRESOURCE) && addresses_object(path)
 }
 
+/// The query parameter that addresses a DIRECTORY bucket's session.
+///
+/// `CreateSession` is bound at `GET /{Bucket}?session`
+/// (`smithy_query(query="operation",operation="CreateSession",
+/// model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`
+/// reports that `@http` uri), so the `session` SUBRESOURCE is what names the feature.
+const SESSION_SUBRESOURCE: &str = "session";
+
+/// The operation a `GET /{Bucket}?session` against a GENERAL PURPOSE bucket names.
+///
+/// A session is a DIRECTORY bucket's subresource: `CreateSession` "creates a session that
+/// establishes temporary security credentials to support fast authentication and
+/// authorization for the Zonal endpoint API operations on directory buckets" (its own
+/// documentation), and a general purpose bucket has no such subresource at all. S3 does not
+/// refuse a query parameter that names no subresource of the bucket it was addressed to — it
+/// ignores it — so what is left of the request is `GET /{Bucket}`, the bucket's own listing,
+/// which is the operation bound to that method and path with no subresource.
+const LISTING_WITHOUT_SUBRESOURCE: &str = "ListObjects";
+
 /// The `com-amazonaws-s3-amazons3` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -621,6 +640,34 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         }
         crate::state::service_state(&*self.engine)
             .is_some_and(|state| state.lock().holds_vended_session(access_key_id))
+    }
+
+    /// Whether `req` asks for the `session` subresource of a bucket that has none: a
+    /// GENERAL PURPOSE bucket this emulator holds, addressed in either form (the address is
+    /// read in the PATH-STYLE form every route of this service is bound in, so a
+    /// virtual-hosted-style request resolves the same way).
+    ///
+    /// Read-only: the guard is taken, the bucket's kind is read, and nothing is written. A
+    /// name this emulator holds no bucket for answers `false` — there is no bucket whose kind
+    /// says the subresource is not its, so the request keeps the route the model gives it and
+    /// is answered about the address it named.
+    fn addresses_session_of_general_purpose_bucket(&self, req: &RtRequest) -> bool {
+        if !query_carries(wire::request_query(req.uri()), SESSION_SUBRESOURCE) {
+            return false;
+        }
+        let path = self.path_style_path(req);
+        let Some(name) = first_path_segment(&path) else {
+            return false;
+        };
+        if addresses_object(&path) {
+            return false;
+        }
+        crate::state::service_state(&*self.engine).is_some_and(|state| {
+            state
+                .lock()
+                .bucket(name)
+                .is_some_and(|bucket| !bucket.is_directory())
+        })
     }
 
     /// How this service answers the AUTHENTICATION refusal of the request it is serving, or
@@ -807,6 +854,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // worded from that bucket's own configuration, and the seam that words it is handed
         // no request to read it from.
         sigv4::remember(req, first_path_segment(&self.path_style_path(req)));
+        // A `?session` request against a bucket that HAS no session subresource — a general
+        // purpose bucket — is the bucket's own listing and not `CreateSession`; see
+        // [`LISTING_WITHOUT_SUBRESOURCE`]. Resolved before the model's routing table, which
+        // matches the subresource whatever bucket it was addressed to, and from the request's
+        // PATH-STYLE address so the two address forms resolve alike.
+        if self.addresses_session_of_general_purpose_bucket(req) {
+            return self
+                .entry
+                .routing_table()
+                .get(LISTING_WITHOUT_SUBRESOURCE);
+        }
         // A VIRTUAL-HOSTED-STYLE request names its bucket in the host, so its path is the
         // key alone — `GET /key-name` — which the model's routing table cannot name: every
         // route of this service begins with the `{Bucket}` label, so the key would be read

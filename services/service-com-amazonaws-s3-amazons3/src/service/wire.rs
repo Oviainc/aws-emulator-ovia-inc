@@ -87,6 +87,15 @@
 //! every such operation answers the same way; an output with a payload member or a member
 //! written into the envelope keeps the document that IS its response.
 //!
+//! ## A BODY that is not XML: the media type it is described by
+//!
+//! One response of this service carries a document in another language. `GetBucketPolicy`'s
+//! payload is "the bucket policy as a JSON document" (`GetBucketPolicyOutput$Policy`), and a
+//! payload targeting a plain string gets Smithy's default `text/plain`, so a client or a
+//! proxy that dispatches on `content-type` will not parse the body it was handed.
+//! [`JSON_PAYLOAD_OUTPUT_OPERATIONS`] is the one place that fact lives, and
+//! [`with_json_payload_content_type`] is what applies it; nothing about the body changes.
+//!
 //! ## A HEADER the API reports and the model declares no member for
 //!
 //! The last thing this module carries is a response header an output shape has nowhere to
@@ -133,6 +142,23 @@ const NO_ERROR_WRAPPING: bool = true;
 /// `tests/all/bucket_location.rs` so a model update that marks another operation cannot
 /// quietly keep the envelope.
 pub const UNWRAPPED_XML_OUTPUT_OPERATIONS: &[&str] = &["GetBucketLocation"];
+
+/// The operations whose response body is a JSON DOCUMENT, and so is described as one.
+///
+/// An `@httpPayload` member IS the body, and Smithy's default media type for a payload
+/// targeting a plain string is `text/plain` — correct for a payload that is text, wrong for
+/// one that is a document in another language, which a client or a proxy dispatching on
+/// `content-type` will then not parse. S3 has exactly one such response: the bucket policy,
+/// "the bucket policy as a JSON document" (`GetBucketPolicyOutput$Policy`, the operation's
+/// only output member and its payload), which AWS serves as
+/// [`JSON_PAYLOAD_CONTENT_TYPE`]. The model carries no `@mediaType` for it
+/// (`smithy_query(query="shape",shape="Policy")` reports a bare string), so the fact lives
+/// here, keyed on the operation, beside the other thing the generic serializer cannot know.
+pub const JSON_PAYLOAD_OUTPUT_OPERATIONS: &[&str] = &["GetBucketPolicy"];
+
+/// The `content-type` a response whose body is a JSON document carries — see
+/// [`JSON_PAYLOAD_OUTPUT_OPERATIONS`].
+pub const JSON_PAYLOAD_CONTENT_TYPE: &str = "application/json";
 
 /// Whether a name is a bucket this emulator holds — the one question an ADDRESS cannot
 /// answer from its own shape (see [`super::addressed_in_host`]).
@@ -1157,8 +1183,104 @@ fn with_attribute_members(mut response: Response) -> Response {
     response
 }
 
-/// `response` with no body at all when the operation's output binds NOTHING to one.
+::std::thread_local! {
+    /// The XML DOCUMENT the request this thread is serving carried, for the length of that
+    /// one request — see [`spelled_in_request`].
+    static REQUEST_DOCUMENT: ::std::cell::RefCell<Option<Vec<u8>>> =
+        const { ::std::cell::RefCell::new(None) };
+}
+
+/// Record `document` as the XML document the request this thread is serving carried, `None`
+/// for a request whose body is not one.
 ///
+/// Called for EVERY request this service reads, under the same discipline as
+/// [`crate::state::addressed_bucket`]: a `None` overwrites whatever the previous request on
+/// this thread recorded, so no handler can read another request's document.
+fn remember_request_document(document: Option<&[u8]>) {
+    let recorded = document.map(<[u8]>::to_vec);
+    REQUEST_DOCUMENT.with(|note| {
+        *note.borrow_mut() = recorded;
+    });
+}
+
+/// The TEXT the request's own XML document spelled `element` in — the first element of that
+/// local name — or `None` for a request that carried no document or no such element.
+///
+/// What an `<ArgumentValue>` echoes for a value refused inside a request document: S3's
+/// `InvalidArgument` names the field it rejected and the value that field CARRIED, and the
+/// parsed value has lost its spelling (a timestamp parses to an instant, which can be
+/// rendered several ways and is no longer the text the caller sent). A client matching the
+/// envelope against what it sent reads the text, so the text is what goes out.
+///
+/// Read rather than taken: the handler that refuses the value runs in the same stretch of
+/// the one dispatch that deserialized the request (`vendor/smithy-server-runtime`'s request
+/// walk), and the note is replaced by the next request this thread reads.
+pub fn spelled_in_request(element: &str) -> Option<String> {
+    REQUEST_DOCUMENT.with(|note| {
+        let document = note.borrow();
+        element_text(document.as_deref()?, element)
+    })
+}
+
+/// The text of the first element of `document` whose name is `element`, read through the
+/// same XML reader this module normalizes documents with.
+fn element_text(document: &[u8], element: &str) -> Option<String> {
+    let mut reader = Reader::from_reader(document);
+    let mut inside = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) => {
+                inside = start.name().as_ref() == element.as_bytes();
+            }
+            Ok(Event::Text(text)) if inside => {
+                return text.xml10_content().ok().map(|text| text.into_owned())
+            }
+            Ok(Event::End(_)) => inside = false,
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+/// The OBJECT a request addresses, read off its PATH-STYLE path and its query string: the/// `{Key+}` label below the bucket segment, decoded the way the codec decodes a path label,
+/// and the `versionId` parameter when the request carries one. `None` for a path that
+/// addresses a bucket or the service root, which names no object at all.
+///
+/// What the `<Key>` / `<VersionId>` of an object-scoped error document is written from (see
+/// [`crate::scaffolded`]), so one request's address is read once, here, rather than per
+/// handler. The decode and the query read are the ones [`super::sigv4`] already owns, so a
+/// request's address is read one way wherever it is read.
+fn addressed_object(
+    path: &str,
+    query: &str,
+) -> Option<crate::state::addressed_bucket::AddressedObject> {
+    let (_, key) = path.trim_start_matches('/').split_once('/')?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(crate::state::addressed_bucket::AddressedObject {
+        key: super::sigv4::percent_decoded(key),
+        version_id: super::sigv4::query_parameter(query, VERSION_ID_PARAMETER),
+    })
+}
+
+/// The query parameter a request names one stored version of an object by — the
+/// `@httpQuery` every operation that takes a version binds it from
+/// (`smithy_query(query="operation",operation="GetObject")` reports
+/// `VersionId: {httpQuery: "versionId"}`).
+const VERSION_ID_PARAMETER: &str = "versionId";
+
+/// `response` describing its body as the JSON document it is — see
+/// [`JSON_PAYLOAD_OUTPUT_OPERATIONS`]. Only the header changes; the body the handler
+/// answered with is untouched.
+fn with_json_payload_content_type(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert("content-type", JSON_PAYLOAD_CONTENT_TYPE);
+    response
+}
+
+/// `response` with no body at all when the operation's output binds NOTHING to one.///
 /// An output every member of which goes out in a response HEADER (or as the response
 /// status) leaves no document to send, and S3 sends none: `PutObject` answers 200 with an
 /// empty payload and its result — the stored object's `ETag`, the `x-amz-version-id` of
@@ -1236,6 +1358,28 @@ impl ServerProtocol for UnwrappedXmlRestXml {
             })
             .filter(|name| name.chars().count() <= *super::BUCKET_NAME_CHARS.end());
         crate::state::addressed_bucket::remember(addressed_bucket.as_deref());
+        // And the OBJECT it addresses, for the `<Key>` and `<VersionId>` an object-scoped
+        // error document names it by — recorded under the same discipline, from the request's
+        // address in PATH-STYLE form, so a virtual-hosted-style request (whose path is the
+        // key alone) records the same key a path-style one does. A request that addresses a
+        // bucket or the service root records nothing.
+        let path_style = match self.addressed_in_host(request) {
+            Some(bucket) => super::path_with_bucket(&bucket, request_path(request.uri())),
+            None => request_path(request.uri()).to_string(),
+        };
+        crate::state::addressed_bucket::remember_object(addressed_object(
+            &path_style,
+            request_query(request.uri()),
+        ));
+        // And the DOCUMENT it carried, for a refusal that has to echo a value AS THE REQUEST
+        // SPELLED IT once the codec has parsed it ([`spelled_in_request`]). Only a request
+        // whose body IS an XML document carries one; every other request records nothing,
+        // which is what clears whatever the previous request on this thread recorded.
+        let document = match carries_xml_document_payload(input_schema) {
+            true => request.body().bytes(),
+            false => None,
+        };
+        remember_request_document(document);
         // A request whose body IS an XML document is refused here when that document
         // carries a character XML cannot hold, before any codec reads it. See
         // [`xml_charset_violation`].
@@ -1372,6 +1516,12 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         let response =
             self.inner
                 .serialize_output(output, output_schema, operation_name, success_status)?;
+        // A response whose body is a JSON document says so, whatever media type the generic
+        // serializer derived for its payload member.
+        let response = match JSON_PAYLOAD_OUTPUT_OPERATIONS.contains(&operation_name) {
+            true => with_json_payload_content_type(response),
+            false => response,
+        };
         // A member the model marks `@xmlAttribute` has been written as an element; it
         // belongs on its parent's start tag, where the API publishes it and where a
         // namespace-aware parser can read it. And a response that reports a

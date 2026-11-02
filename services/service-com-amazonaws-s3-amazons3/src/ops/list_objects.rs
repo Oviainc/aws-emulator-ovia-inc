@@ -408,8 +408,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     e_tag: Some(object.etag.clone()),
                     size: Some(i64::try_from(object.body.len()).unwrap_or(i64::MAX)),
                     storage_class: Some(object.storage_class.clone()),
-                    // `RestoreStatus` needs an archive tier this store does not model, and
-                    // the checksum members a checksum `PutObject` did not compute.
+                    // "The algorithm that was used to create a checksum of the object" and
+                    // "the checksum type that is used to calculate the object's checksum
+                    // value" (`Object$ChecksumAlgorithm` and `$ChecksumType`): what the write
+                    // that stored THIS object recorded, so a listing and a read report the
+                    // same checksum configuration. An object stored under no checksum
+                    // algorithm reports neither member.
+                    checksum_algorithm: object
+                        .checksum
+                        .as_ref()
+                        .map(|checksum| vec![checksum.algorithm.clone()]),
+                    checksum_type: object
+                        .checksum
+                        .as_ref()
+                        .map(|checksum| checksum.checksum_type.clone()),
+                    // `RestoreStatus` needs an archive tier this store does not model.
                     ..Object::default()
                 });
             }
@@ -436,18 +449,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Delimiter`, each entry's `Key`, the marker the request carried, the one it hands
         // back, and the rolled-up `CommonPrefixes`.
         let encode = |value: String| match input.encoding_type.as_deref() {
-            Some(crate::state::ENCODING_TYPE_URL) => crate::state::url_encoded_key(&value),
+            Some(crate::state::ENCODING_TYPE_URL) => crate::state::listing_encoded_key(&value),
             _ => value,
         };
 
         Ok(ListObjectsOutput {
             name: Some(input.bucket.clone()),
-            prefix: input.prefix.clone().map(&encode),
+            // "Keys that begin with the indicated prefix" (`ListObjectsOutput$Prefix`) and
+            // "indicates where in the bucket listing begins" (`$Marker`): both elements are
+            // part of every answer, each carrying the empty value — the prefix every key
+            // begins with, and the start of the listing — for a request that named none.
+            prefix: Some(encode(input.prefix.clone().unwrap_or_default())),
             delimiter: input.delimiter.clone().map(&encode),
             max_keys: Some(max_keys),
-            // "Indicates where in the bucket listing begins. Marker is included in the
-            // response if it was sent with the request."
-            marker: input.marker.clone().map(&encode),
+            marker: Some(encode(input.marker.clone().unwrap_or_default())),
             // Truncated exactly when an entry was left for the next page.
             is_truncated: Some(truncated),
             next_marker: next_marker.map(&encode),

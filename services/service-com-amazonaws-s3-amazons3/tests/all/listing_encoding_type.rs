@@ -11,8 +11,10 @@
 //! `CommonPrefixes` encoded with them. The encoding is per UTF-8 code value — "the object
 //! `test_file(3).png` will appear as `test_file%283%29.png`" (the `EncodingType` enum's own
 //! documentation) — so every character outside the unreserved set `A-Z a-z 0-9 - _ . ~` is
-//! written `%XX`. A listing that asks for no encoding type reports every one of those
-//! elements verbatim and echoes no `EncodingType`.
+//! written `%XX`, with the two exceptions the form S3 answers in carries: a SPACE is written
+//! `+`, and the `/` that separates the elements of a key prefix is left as it is. A listing
+//! that asks for no encoding type reports every one of those elements verbatim and echoes no
+//! `EncodingType`.
 //!
 //! `ListObjectVersions` carries the same member and is held to the same rule, over the
 //! same keys.
@@ -31,10 +33,9 @@ use std::time::SystemTime;
 use service_com_amazonaws_s3_amazons3::state::{
     ComAmazonawsS3Amazons3State, Object, ObjectEncryption, ObjectWrite, DEFAULT_STORAGE_CLASS,
 };
-use service_com_amazonaws_s3_amazons3::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{create_bucket, send};
+use super::bucket_lifecycle::{create_bucket, router_with_engine, send};
 use super::bucket_tagging::unescaped;
 use super::object_and_tagging_roundtrip::text;
 use super::object_storage::{list_objects_v2, listing_of};
@@ -42,39 +43,29 @@ use super::object_storage::{list_objects_v2, listing_of};
 /// The keys every case below holds, with the form each takes under `encoding-type=url`.
 ///
 /// The rows differ along WHICH characters a key name carries: only unreserved ones (which
-/// the encoding leaves alone), the `/` of a prefix, the parentheses of the documented
-/// example, a space, `+` and `=` and `&` (characters a query string would otherwise
-/// swallow), and non-ASCII UTF-8, whose two bytes become two escapes.
+/// the encoding leaves alone), the `/` of a prefix (left as it is), the parentheses of the
+/// documented example, a space (written `+`), `+` and `=` and `&` (characters a query string
+/// would otherwise swallow), and non-ASCII UTF-8, whose two bytes become two escapes.
 const KEYS: &[(&str, &str, &str)] = &[
     (
         "only unreserved characters",
         "train.csv-v1_0.final~2",
         "train.csv-v1_0.final~2",
     ),
-    ("a prefixed key", "train/train.csv", "train%2Ftrain.csv"),
+    ("a prefixed key", "train/train.csv", "train/train.csv"),
     (
         "the documented parentheses example",
         "test_file(3).png",
         "test_file%283%29.png",
     ),
-    ("a space", "model data.tar.gz", "model%20data.tar.gz"),
+    ("a space", "model data.tar.gz", "model+data.tar.gz"),
     ("query punctuation", "a+b=c&d", "a%2Bb%3Dc%26d"),
     (
         "non-ASCII UTF-8",
         "données/café.txt",
-        "donn%C3%A9es%2Fcaf%C3%A9.txt",
+        "donn%C3%A9es/caf%C3%A9.txt",
     ),
 ];
-
-/// A router over an engine this test also holds, so a key no request line can carry can be
-/// seeded into the same store the service reads.
-fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(Arc::clone(&engine)));
-    (router, engine)
-}
 
 /// A stored object of `body`, with every member a write that named nothing leaves at its
 /// empty value.
@@ -251,25 +242,25 @@ async fn the_other_key_name_elements_of_a_listing_are_encoded_too() {
     let listing = listing_of(&answer);
     assert_eq!(
         listing.field("Prefix"),
-        "donn%C3%A9es%2F",
+        "donn%C3%A9es/",
         "case \"prefix\": the echoed Prefix must be percent-encoded, got {:?}",
         listing.field("Prefix")
     );
     assert_eq!(
         listing.field("Delimiter"),
-        "%20",
-        "case \"delimiter\": the echoed Delimiter must be percent-encoded, got {:?}",
+        "+",
+        "case \"delimiter\": the echoed Delimiter must be encoded, got {:?}",
         listing.field("Delimiter")
     );
     assert_eq!(
         listing.keys(),
-        vec!["donn%C3%A9es%2Fcaf%C3%A9.txt".to_string()],
+        vec!["donn%C3%A9es/caf%C3%A9.txt".to_string()],
         "case \"prefix\": the key that does not roll up is reported encoded, got {:?}",
         listing.keys()
     );
     assert_eq!(
         listing.common_prefixes,
-        vec!["donn%C3%A9es%2Fmodel%20".to_string()],
+        vec!["donn%C3%A9es/model+".to_string()],
         "case \"delimiter\": a rolled-up common prefix is a key name, so it is encoded \
          too, got {:?}",
         listing.common_prefixes
@@ -285,14 +276,14 @@ async fn the_other_key_name_elements_of_a_listing_are_encoded_too() {
     let after = listing_of(&after);
     assert_eq!(
         after.field("StartAfter"),
-        "donn%C3%A9es%2Fcaf%C3%A9.txt",
+        "donn%C3%A9es/caf%C3%A9.txt",
         "case \"start-after\": the echoed StartAfter must be percent-encoded, got {:?}",
         after.field("StartAfter")
     );
     assert_eq!(
         after.keys(),
         vec![
-            "donn%C3%A9es%2Fmodel%20data.tar.gz".to_string(),
+            "donn%C3%A9es/model+data.tar.gz".to_string(),
             "test_file%283%29.png".to_string(),
         ],
         "case \"start-after\": the listing still starts after the key it names, got {:?}",

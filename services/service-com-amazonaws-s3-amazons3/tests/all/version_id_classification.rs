@@ -4,18 +4,23 @@
 //! something that could be a version id at all, judged before whether a version of that
 //! name exists.
 //!
-//! The rule under test: a `versionId` that is not shaped like a version id S3 issues cannot
-//! name a version of any object in any bucket, so it is a bad ARGUMENT — HTTP 400
-//! `InvalidArgument` with `Invalid version id specified`; one that IS shaped like one and
-//! names no stored version is HTTP 404 `NoSuchVersion` with `The specified version does not
-//! exist.` The shape is the published one: the literal `null`, or a token between
-//! `state::VERSION_ID_CHARS` and `state::MAX_VERSION_ID_CHARS` characters, each an ASCII
-//! alphanumeric or one of `-`, `_`, `.`.
+//! The rule under test: a `versionId` that is not shaped like a version id S3 issues — or
+//! that carries the one VALUE no issuer mints, the zero token — cannot name a version of any
+//! object in any bucket, so it is a bad ARGUMENT: HTTP 400 `InvalidArgument` with `Invalid
+//! version id specified`, naming the `versionId` parameter and echoing the token it
+//! rejected. One that IS shaped like one and names no stored version is HTTP 404
+//! `NoSuchVersion` with `The specified version does not exist.` The shape is the published
+//! one: the literal `null`, or a token between `state::VERSION_ID_CHARS` and
+//! `state::MAX_VERSION_ID_CHARS` characters, each an ASCII alphanumeric or one of `-`, `_`,
+//! `.`.
 //!
 //! The same classification is asserted on the single-object path (`GetObject`,
-//! `HeadObject`, `DeleteObject`) and per ENTRY of the `DeleteObjects` batch, where
-//! "DeleteObjects itself has no modeled top-level errors; each result entry carries Key,
-//! VersionId, Code, Message" — so one id is classified the same way wherever it arrives.
+//! `HeadObject`, `DeleteObject`), which is where the ARGUMENT is judged. The `DeleteObjects`
+//! batch is held to the other half of the rule: "DeleteObjects itself has no modeled
+//! top-level errors; each result entry carries Key, VersionId, Code, Message", and what an
+//! entry reports is what the batch could not do with that pair — a version id it cannot
+//! resolve names no version of the key, so the entry is the absent-version failure whatever
+//! the token's shape.
 
 use service_com_amazonaws_s3_amazons3::state::{MAX_VERSION_ID_CHARS, VERSION_ID_CHARS};
 use smithy_server_runtime::MultiServiceRouter;
@@ -92,7 +97,8 @@ fn entry_error(answer: &Answer) -> Option<(String, String)> {
 /// (one character, one short of the minimum, one past the maximum), the ALPHABET at a width
 /// inside the range (the alphanumerics and the `-`, `_`, `.` the shape holds, against the
 /// characters it does not — standard Base64's `+` and `/`, and an ASCII punctuation mark),
-/// and the CASE of the characters, which the shape does not restrict.
+/// the CASE of the characters, which the shape does not restrict, and the one token whose
+/// VALUE no issuer mints: the zero one, written as nothing but the alphabet's zero digit.
 fn rows() -> Vec<(String, String, Expected)> {
     let min = VERSION_ID_CHARS;
     let max = MAX_VERSION_ID_CHARS;
@@ -104,7 +110,7 @@ fn rows() -> Vec<(String, String, Expected)> {
         ("at the minimum width", "a".repeat(min)),
         ("between the published widths", "b".repeat(between)),
         ("at the maximum width", "c".repeat(max)),
-        ("upper case", "A".repeat(min)),
+        ("upper case", format!("B{}", "A".repeat(min - 1))),
         ("every character a digit", "0".repeat(min)),
         (
             "mixed case and digits",
@@ -119,6 +125,12 @@ fn rows() -> Vec<(String, String, Expected)> {
             "carrying each character the shape holds beside the alphanumerics",
             format!("{}-_.", "d".repeat(min - 3)),
         ),
+        (
+            // The published example of a version id, which is what a client that stored one
+            // against the real service hands back.
+            "the published example of an issued id",
+            "3HL4kqtJlcpXroDTDmJ_RGrmHJ1PyFCY".to_string(),
+        ),
     ] {
         let width = id.chars().count();
         assert!(
@@ -129,7 +141,8 @@ fn rows() -> Vec<(String, String, Expected)> {
         rows.push((format!("well formed, {case}"), id, ABSENT));
     }
 
-    // Not shaped like a version id: every one of these is a 400.
+    // Not shaped like a version id, or carrying the one value no issuer mints: every one of
+    // these is a 400.
     let padded = "a".repeat(min);
     for (case, id) in [
         ("a single character", "x".to_string()),
@@ -148,6 +161,8 @@ fn rows() -> Vec<(String, String, Expected)> {
             "an exclamation mark",
             format!("{}!", &padded[..min - 1]),
         ),
+        ("the zero token, at the minimum width", "A".repeat(min)),
+        ("the zero token, wider", "A".repeat(between)),
     ] {
         rows.push((format!("malformed, {case}"), id, MALFORMED));
     }
@@ -237,9 +252,9 @@ async fn a_version_id_is_classified_the_same_way_wherever_it_arrives() {
         let reported = entry_error(&batch);
         assert_eq!(
             reported,
-            Some((expected.code.to_string(), expected.message.to_string())),
-            "case {case:?}/DeleteObjects: the entry must carry the same classification as \
-             the single-object path, got {reported:?} in body {:?}",
+            Some((ABSENT.code.to_string(), ABSENT.message.to_string())),
+            "case {case:?}/DeleteObjects: the entry must report the version as absent, \
+             whatever the token's shape, got {reported:?} in body {:?}",
             text(&batch)
         );
     }

@@ -1020,7 +1020,7 @@ async fn a_copy_the_emulator_cannot_serve_is_refused_with_the_code_s3_answers() 
             destination_bucket: "copy-refusal-target",
             destination_key: "copies/absent-version.csv",
             copy_source:
-                "copy-refusal-origin/source.csv?versionId=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "copy-refusal-origin/source.csv?versionId=0123456789abcdef0123456789abcdef",
             headers: Vec::new(),
             status: 404,
             code: "NoSuchVersion",

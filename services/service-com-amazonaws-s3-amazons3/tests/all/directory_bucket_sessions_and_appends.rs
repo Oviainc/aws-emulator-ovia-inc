@@ -415,20 +415,37 @@ async fn a_session_vends_scoped_credentials_for_a_directory_bucket() {
         text(&zonal)
     );
 
-    let rows: [(&str, &str, u16, &str); 2] = [
-        (
-            "a bucket this emulator does not hold",
-            "absent--use1-az4--x-s3",
-            404,
-            "NoSuchBucket",
-        ),
-        (
-            "a general purpose bucket, which no Zonal endpoint addresses",
-            "session-general-purpose",
-            400,
-            "InvalidRequest",
-        ),
-    ];
+    // A `?session` request against a bucket that HAS no session subresource is not a refused
+    // session at all: S3 ignores a query parameter that names no subresource of the bucket it
+    // was addressed to, so what is left is `GET /{Bucket}` — the bucket's own listing.
+    let listed = create_session(&router, "session-general-purpose").await;
+    assert_eq!(
+        listed.status, 200,
+        "case \"a general purpose bucket, which has no session subresource\": expected the \
+         bucket's listing with HTTP 200, got {} with body {:?}",
+        listed.status,
+        text(&listed)
+    );
+    let body = text(&listed);
+    for element in ["Name", "Prefix", "Marker", "MaxKeys", "IsTruncated"] {
+        assert!(
+            body.contains(&format!("<{element}>")),
+            "case \"a general purpose bucket, which has no session subresource\": the listing \
+             must carry <{element}>, got {body}"
+        );
+    }
+    assert!(
+        !body.contains("<Credentials>"),
+        "case \"a general purpose bucket, which has no session subresource\": no session may \
+         be vended, got {body}"
+    );
+
+    let rows: [(&str, &str, u16, &str); 1] = [(
+        "a bucket this emulator does not hold",
+        "absent--use1-az4--x-s3",
+        404,
+        "NoSuchBucket",
+    )];
     for (case, bucket_name, status, code) in rows {
         let refused = create_session(&router, bucket_name).await;
         assert_eq!(

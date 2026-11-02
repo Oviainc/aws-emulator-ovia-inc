@@ -121,6 +121,8 @@ mod error_messages;
 mod general_purpose_bucket_names;
 #[path = "all/head_object_read_back.rs"]
 mod head_object_read_back;
+#[path = "all/json_payload_media_type.rs"]
+mod json_payload_media_type;
 #[path = "all/list_buckets.rs"]
 mod list_buckets;
 #[path = "all/listing_encoding_type.rs"]
@@ -195,6 +197,8 @@ mod object_lock_on_write;
 mod object_partial_reads;
 #[path = "all/object_plane_byte_budget.rs"]
 mod object_plane_byte_budget;
+#[path = "all/object_read_authorization.rs"]
+mod object_read_authorization;
 #[path = "all/object_replication.rs"]
 mod object_replication;
 #[path = "all/object_retention.rs"]
@@ -247,6 +251,8 @@ mod request_integrity_headers;
 mod refusal_messages_published;
 #[path = "all/refusal_resource_naming.rs"]
 mod refusal_resource_naming;
+#[path = "all/refused_argument_envelope.rs"]
+mod refused_argument_envelope;
 #[path = "all/reserved_tag_key_prefix.rs"]
 mod reserved_tag_key_prefix;
 #[path = "all/signature_refusal_wording.rs"]

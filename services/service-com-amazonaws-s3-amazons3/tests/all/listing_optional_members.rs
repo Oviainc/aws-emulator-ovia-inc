@@ -170,7 +170,7 @@ async fn every_optional_member_a_listing_models_is_served_not_refused() {
         );
 
         // `EncodingType` is echoed exactly when the request asked for one, and the key
-        // names are then genuinely written encoded — a verbatim `/` or `(` would mean the
+        // names are then genuinely written encoded — a verbatim `(` would mean the
         // response claimed an encoding it did not apply.
         assert_eq!(
             listing.field("EncodingType"),
@@ -181,13 +181,14 @@ async fn every_optional_member_a_listing_models_is_served_not_refused() {
         );
         for key in listing.keys() {
             if *encoded {
-                // Percent-encoding leaves only RFC 3986's unreserved set literal, plus the
-                // `%` of each escape it wrote: a `/` or a `(` left in a key name would mean
-                // the response claimed an encoding it did not apply.
+                // The encoding leaves literal only RFC 3986's unreserved set, the `/` that
+                // separates the elements of a key prefix, the `+` it writes a space as, and
+                // the `%` of each escape: a `(` left in a key name would mean the response
+                // claimed an encoding it did not apply.
                 let literal = key
                     .chars()
                     .find(|character| {
-                        !(character.is_ascii_alphanumeric() || "-_.~%".contains(*character))
+                        !(character.is_ascii_alphanumeric() || "-_.~%/+".contains(*character))
                     })
                     .map(String::from);
                 assert_eq!(

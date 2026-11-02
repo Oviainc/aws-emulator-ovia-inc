@@ -263,11 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the reader and the delete of this subresource answer the same argument.
         if let Some(version_id) = input.version_id.as_deref() {
             if !crate::state::version_id_is_well_formed(version_id) {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::INVALID_ARGUMENT_CODE,
-                    crate::state::INVALID_ARGUMENT_STATUS,
-                    crate::state::INVALID_VERSION_ID_MESSAGE,
-                ));
+                return Err(crate::scaffolded::Scaffolded::invalid_version_id(version_id));
             }
         }
 

@@ -524,7 +524,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entry is a key name too. An upload ID is NOT a key name, so it is reported as
         // minted.
         let encode = |value: String| match input.encoding_type.as_deref() {
-            Some(crate::state::ENCODING_TYPE_URL) => crate::state::url_encoded_key(&value),
+            Some(crate::state::ENCODING_TYPE_URL) => crate::state::listing_encoded_key(&value),
             _ => value,
         };
 

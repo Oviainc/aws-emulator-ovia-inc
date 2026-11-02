@@ -40,11 +40,11 @@ use service_com_amazonaws_s3_amazons3::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{put_bucket_policy, router, send, send_bytes, Answer};
+use super::bucket_lifecycle::{put_bucket_policy, router_with_engine, send, send_bytes, Answer};
 use super::object_and_tagging_roundtrip::{get_object, text};
 use super::object_legal_hold::{legal_hold_payload, lock_enabled_bucket, put_object_legal_hold};
 use super::object_retention::{
-    now_seconds, object, put_object_retention, retention_payload, ONE_HOUR,
+    given_lapsed_retention, now_seconds, object, put_object_retention, retention_payload, ONE_HOUR,
 };
 use super::object_versioning::head_object;
 
@@ -80,8 +80,13 @@ async fn delete_version(
 
 /// Write an object at `key` and place the lock `lock` names on the version it stored,
 /// failing the test when the service did not accept either. Reports that version's id.
+///
+/// A retention whose period has already LAPSED is seeded through the store rather than
+/// placed over the wire ([`given_lapsed_retention`] states why), which is why this takes the
+/// engine beside the router.
 async fn locked_version(
     router: &MultiServiceRouter,
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
     bucket: &str,
     key: &str,
     case: &str,
@@ -92,21 +97,26 @@ async fn locked_version(
         .unwrap_or_else(|| panic!("case {case:?}: the write into {bucket:?} must mint a version id"));
     let (retention, legal_hold) = lock;
     if let Some((mode, offset)) = retention {
-        let placed = put_object_retention(
-            router,
-            bucket,
-            key,
-            "",
-            &[],
-            &retention_payload(Some(mode), Some(now_seconds() + offset)),
-        )
-        .await;
-        assert_eq!(
-            placed.status, 200,
-            "case {case:?}: the setup retention must be placed, got {} with body {:?}",
-            placed.status,
-            text(&placed)
-        );
+        let until = now_seconds() + offset;
+        if offset < 0 {
+            given_lapsed_retention(engine, bucket, key, mode, until);
+        } else {
+            let placed = put_object_retention(
+                router,
+                bucket,
+                key,
+                "",
+                &[],
+                &retention_payload(Some(mode), Some(until)),
+            )
+            .await;
+            assert_eq!(
+                placed.status, 200,
+                "case {case:?}: the setup retention must be placed, got {} with body {:?}",
+                placed.status,
+                text(&placed)
+            );
+        }
     }
     if let Some(status) = legal_hold {
         let held =
@@ -246,11 +256,12 @@ fn delete_rows() -> Vec<DeleteRow> {
 
 #[tokio::test]
 async fn object_lock_bars_the_permanent_delete_of_a_protected_version() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     lock_enabled_bucket(&router, "object-lock-delete").await;
 
     for (case, key, lock, bypass, expected) in delete_rows() {
-        let version_id = locked_version(&router, "object-lock-delete", key, case, lock).await;
+        let version_id =
+            locked_version(&router, &engine, "object-lock-delete", key, case, lock).await;
 
         let deleted = delete_version(&router, "object-lock-delete", key, &version_id, bypass).await;
         assert_eq!(
@@ -296,7 +307,7 @@ async fn object_lock_bars_the_permanent_delete_of_a_protected_version() {
 
 #[tokio::test]
 async fn a_delete_marker_is_laid_over_a_locked_version_without_removing_it() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     lock_enabled_bucket(&router, "object-lock-marker").await;
 
     // A delete that names NO version takes nothing away on a versioning-enabled bucket —
@@ -315,7 +326,8 @@ async fn a_delete_marker_is_laid_over_a_locked_version_without_removing_it() {
             (None, Some(LEGAL_HOLD_ON_STATUS)),
         ),
     ] {
-        let version_id = locked_version(&router, "object-lock-marker", key, case, lock).await;
+        let version_id =
+            locked_version(&router, &engine, "object-lock-marker", key, case, lock).await;
 
         let deleted = send_bytes(
             &router,
@@ -429,7 +441,7 @@ fn bypass_rows() -> Vec<BypassRow> {
 
 #[tokio::test]
 async fn a_governance_bypass_is_refused_to_a_caller_denied_the_permission() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     lock_enabled_bucket(&router, "bypass-permission").await;
 
     for (case, key, document, expected) in bypass_rows() {
@@ -445,7 +457,8 @@ async fn a_governance_bypass_is_refused_to_a_caller_denied_the_permission() {
         }
 
         let lock = (Some((GOVERNANCE_RETENTION_MODE, ONE_HOUR)), None);
-        let version_id = locked_version(&router, "bypass-permission", key, case, lock).await;
+        let version_id =
+            locked_version(&router, &engine, "bypass-permission", key, case, lock).await;
 
         let deleted = delete_version(&router, "bypass-permission", key, &version_id, true).await;
         assert_eq!(
@@ -556,14 +569,15 @@ fn report_rows() -> Vec<ReportRow> {
 
 #[tokio::test]
 async fn a_read_reports_the_object_lock_state_of_the_version() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     lock_enabled_bucket(&router, "object-lock-reported").await;
 
     for (case, key, lock, mode, offset, hold) in report_rows() {
         // The instant the row's date is an offset from, taken before the setup so the
         // expected value is the one the setup placed.
         let placed_at = now_seconds();
-        let version_id = locked_version(&router, "object-lock-reported", key, case, lock).await;
+        let version_id =
+            locked_version(&router, &engine, "object-lock-reported", key, case, lock).await;
 
         for (reader, answer) in [
             (
@@ -675,13 +689,14 @@ fn element_of(chunk: &str, name: &str) -> Option<String> {
 
 #[tokio::test]
 async fn a_batch_delete_refuses_the_locked_identifiers_and_deletes_the_rest() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     lock_enabled_bucket(&router, "object-lock-batch").await;
 
     // Each identifier of a multi-object delete performs what a single delete of it would,
     // so the lock refuses THAT identifier and the keys beside it still delete.
     let retained = locked_version(
         &router,
+        &engine,
         "object-lock-batch",
         "batch-retained",
         "batch",
@@ -690,6 +705,7 @@ async fn a_batch_delete_refuses_the_locked_identifiers_and_deletes_the_rest() {
     .await;
     let held = locked_version(
         &router,
+        &engine,
         "object-lock-batch",
         "batch-held",
         "batch",
@@ -698,6 +714,7 @@ async fn a_batch_delete_refuses_the_locked_identifiers_and_deletes_the_rest() {
     .await;
     let unlocked = locked_version(
         &router,
+        &engine,
         "object-lock-batch",
         "batch-unlocked",
         "batch",

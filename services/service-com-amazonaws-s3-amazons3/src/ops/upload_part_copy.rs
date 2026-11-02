@@ -419,18 +419,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A `versionId` that is not SHAPED like one cannot name a version of
                 // anything, so it is a malformed argument rather than an absent version.
                 if !crate::state::version_id_is_well_formed(version_id) {
-                    return Err(crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::INVALID_ARGUMENT_CODE,
-                        crate::state::INVALID_ARGUMENT_STATUS,
-                        crate::state::INVALID_VERSION_ID_MESSAGE,
-                    ));
+                    return Err(crate::scaffolded::Scaffolded::invalid_version_id(version_id));
                 }
                 let Some(held) = source_bucket.stored_version(&source.key, version_id) else {
+                    // About the COPY SOURCE version, so it names that object itself rather
+                    // than leaving the envelope to be named by the request's address — which
+                    // is the DESTINATION key.
                     return Err(crate::scaffolded::Scaffolded::unmodeled(
                         crate::state::NO_SUCH_VERSION_CODE,
                         404,
                         crate::state::NO_SUCH_VERSION_MESSAGE,
-                    ));
+                    )
+                    .naming_object(&source.key, Some(version_id)));
                 };
                 // A delete marker holds no bytes for a copy to read, and naming one
                 // explicitly is not something this method can do — the same 405 a read of one
@@ -446,7 +446,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         let Some(source_object) = held else {
-            return Err(UploadPartCopyErrorModeled::NoSuchKey(NoSuchKey {}).into());
+            // About the COPY SOURCE key, named for the same reason the source bucket is.
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                UploadPartCopyErrorModeled::NoSuchKey(NoSuchKey {}),
+            )
+            .naming_object(&source.key, source.version_id.as_deref()));
         };
 
         // ONE instant for the whole call, so the state the source is judged in and the time

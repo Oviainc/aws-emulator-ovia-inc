@@ -86,6 +86,17 @@
 //! it out. An explicit name always wins, and is required where the refusal is about a
 //! bucket OTHER than the addressed one (a copy's source bucket) or is answered after an
 //! await — see [`Scaffolded::naming_bucket`].
+//!
+//! The OBJECT-scoped not-found codes ([`OBJECT_SCOPED_ERROR_CODES`]) are named the same way
+//! and from the same note: their document carries the `<Key>` the request addressed, and the
+//! `<VersionId>` for a request that named one.
+//!
+//! The same envelope rule covers a refusal that is about an ARGUMENT of the request rather
+//! than about a resource: S3's `InvalidArgument` document carries `<ArgumentName>` and
+//! `<ArgumentValue>`, the field it rejected and the value that field held, because its
+//! `<Message>` states the rule the value broke and not which value broke it. A handler
+//! refusing a field answers through [`Scaffolded::invalid_argument`], which attaches the
+//! pair the same way.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -332,7 +343,10 @@ pub const DOCUMENTED_ERROR_MESSAGES: &[(&str, &str)] = &[
         "AnnotationLimitExceeded",
         "The request would exceed the maximum number of annotations allowed per object.",
     ),
-    ("AnnotationNameTooLong", "The annotation name exceeds 512 bytes."),
+    // The sentence S3 answers this code with, as recorded behaviour words it: fixed text
+    // that states the rule rather than the bound (the model's own documentation of the shape
+    // states the bound, and is not what reaches the wire).
+    ("AnnotationNameTooLong", "Your annotation name is too long."),
     // [ErrorCodeList]
     (
         "BucketAlreadyExists",
@@ -457,7 +471,8 @@ pub fn documented_error_message(code: &str) -> Option<&'static str> {
 /// * the OBJECT-scoped not-found codes ([`crate::state::NO_SUCH_KEY_CODE`],
 ///   [`crate::state::NO_SUCH_VERSION_CODE`], `NoSuchUpload`,
 ///   [`crate::state::NO_SUCH_OBJECT_LOCK_CONFIGURATION_CODE`]), whose document names the
-///   key, the version or the upload that was not there;
+///   key, the version or the upload that was not there — the first two through
+///   [`OBJECT_SCOPED_ERROR_CODES`];
 /// * the AUTHENTICATION and AUTHORIZATION refusals
 ///   ([`crate::state::ACCESS_DENIED_CODE`], the SigV4 refusals `service::sigv4` words),
 ///   which state something about the CALLER and are answered identically whichever bucket
@@ -556,6 +571,90 @@ static TAG_KEY: Schema = Schema::new_member(
 )
 .with_xml_name("TagKey");
 
+/// The `<ArgumentName>` of an S3 error document: the request field an `InvalidArgument`
+/// refusal rejected a value in. See [`BUCKET_NAME`].
+static ARGUMENT_NAME: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedResource$argumentName",
+        "smithy.framework",
+        "argumentName",
+    ),
+    ShapeType::String,
+    "argumentName",
+    4,
+)
+.with_xml_name("ArgumentName");
+
+/// The `<ArgumentValue>` of an S3 error document: the value that field carried, written
+/// after [`ARGUMENT_NAME`], which is the order S3's document carries the pair in.
+static ARGUMENT_VALUE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedResource$argumentValue",
+        "smithy.framework",
+        "argumentValue",
+    ),
+    ShapeType::String,
+    "argumentValue",
+    5,
+)
+.with_xml_name("ArgumentValue");
+
+/// The `<Key>` of an S3 error document: the member an OBJECT-scoped refusal names the key it
+/// is about by. See [`BUCKET_NAME`] and [`OBJECT_SCOPED_ERROR_CODES`].
+static OBJECT_KEY: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#AddressedObject$key",
+        "smithy.framework",
+        "key",
+    ),
+    ShapeType::String,
+    "key",
+    6,
+)
+.with_xml_name("Key");
+
+/// The `<VersionId>` of an S3 error document: the version the request named, written after
+/// [`OBJECT_KEY`] for a refusal about one stored version.
+static OBJECT_VERSION_ID: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#AddressedObject$versionId",
+        "smithy.framework",
+        "versionId",
+    ),
+    ShapeType::String,
+    "versionId",
+    7,
+)
+.with_xml_name("VersionId");
+
+/// The wire error codes whose document is about one OBJECT, and so names the key the request
+/// addressed — and, when the request named one, the version it addressed.
+///
+/// Each states a condition of the address the request named and of nothing else: the key
+/// holds no current object ([`crate::state::NO_SUCH_KEY_CODE`]), or the bucket holds no such
+/// version of it ([`crate::state::NO_SUCH_VERSION_CODE`]). A client that fans one operation
+/// out over many keys reads which one failed from there, and an SDK error object surfaces it
+/// as `Key`.
+///
+/// Source: the elements S3's own error document carries for these conditions (Amazon S3 API
+/// Reference, *Error responses*, whose `<Error>` document is `Code`, `Message`, the
+/// condition's own contextual elements, `RequestId` and `HostId`). It cannot come from the
+/// model, for the same reason [`BUCKET_SCOPED_ERROR_CODES`] cannot: every error shape in
+/// `com.amazonaws.s3` declares no members at all. The name is therefore written from the
+/// request's own address ([`crate::state::addressed_bucket::addressed_object`]), which is
+/// what makes the rule hold for every operation that answers one of these codes rather than
+/// for the handlers that spell it out.
+pub const OBJECT_SCOPED_ERROR_CODES: &[&str] = &[
+    crate::state::NO_SUCH_KEY_CODE,
+    crate::state::NO_SUCH_VERSION_CODE,
+];
+
+/// Whether an error document carrying `code` is about the object the request addressed — see
+/// [`OBJECT_SCOPED_ERROR_CODES`].
+pub fn names_its_object(code: &str) -> bool {
+    OBJECT_SCOPED_ERROR_CODES.contains(&code)
+}
+
 /// The resource a refusal is ABOUT, and therefore which member of the error document names
 /// it.
 ///
@@ -579,22 +678,59 @@ pub enum RefusedResource {
     /// A refusal about one TAG of a tag set, named by `<TagKey>`: the key the request
     /// carried.
     TagKey(String),
+    /// A refusal about one OBJECT, named by `<Key>` and — for a refusal about one stored
+    /// version — `<VersionId>`: the object the refusal is ABOUT, which is NOT always the
+    /// one the request addressed. A copy's SOURCE is the case this exists for; every
+    /// other object-scoped refusal is about the addressed object and is named from the
+    /// request itself (see [`OBJECT_SCOPED_ERROR_CODES`]).
+    Object {
+        /// The key, as the request spelled it.
+        key: String,
+        /// The version the refusal is about, for one that names a version.
+        version_id: Option<String>,
+    },
+    /// A refusal about one ARGUMENT of the request, named by the `<ArgumentName>` /
+    /// `<ArgumentValue>` pair: the request field whose value was rejected, and the value it
+    /// carried. The two members travel together because either alone says only half of
+    /// which argument was refused — see [`Scaffolded::invalid_argument`].
+    Argument {
+        /// The request field, as the API publishes it (`versionId`, `RetainUntilDate`).
+        name: String,
+        /// The value that field carried, as the request spelled it.
+        value: String,
+    },
 }
 
 impl RefusedResource {
-    /// The member of the error document this resource is named by.
-    fn member(&self) -> &'static Schema {
+    /// Write the member — or, for an argument or a versioned object, the PAIR of members —
+    /// S3's error document names this resource by, in the order the document carries them in.
+    fn serialize_into(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         match self {
-            Self::Bucket(_) => &BUCKET_NAME,
-            Self::Annotation(_) => &ANNOTATION_NAME,
-            Self::TagKey(_) => &TAG_KEY,
+            Self::Bucket(name) => s.write_string(&BUCKET_NAME, name),
+            Self::Annotation(name) => s.write_string(&ANNOTATION_NAME, name),
+            Self::TagKey(key) => s.write_string(&TAG_KEY, key),
+            Self::Object { key, version_id } => {
+                s.write_string(&OBJECT_KEY, key)?;
+                match version_id.as_deref() {
+                    Some(version_id) => s.write_string(&OBJECT_VERSION_ID, version_id),
+                    None => Ok(()),
+                }
+            }
+            Self::Argument { name, value } => {
+                s.write_string(&ARGUMENT_NAME, name)?;
+                s.write_string(&ARGUMENT_VALUE, value)
+            }
         }
     }
 
     /// The name itself, exactly as the request spelled it.
     fn name(&self) -> &str {
         match self {
-            Self::Bucket(name) | Self::Annotation(name) | Self::TagKey(name) => name.as_str(),
+            Self::Bucket(name)
+            | Self::Annotation(name)
+            | Self::TagKey(name)
+            | Self::Object { key: name, .. }
+            | Self::Argument { name, .. } => name.as_str(),
         }
     }
 }
@@ -694,6 +830,73 @@ impl<E> Scaffolded<E> {
         self.naming(RefusedResource::Annotation(annotation.to_string()))
     }
 
+    /// [`Scaffolded::naming`] for the OBJECT an object-scoped refusal is about, where that is
+    /// not the object the request addressed: a copy's SOURCE, whose key the destination's
+    /// address would otherwise be written in place of.
+    pub fn naming_object(self, key: &str, version_id: Option<&str>) -> Self {
+        self.naming(RefusedResource::Object {
+            key: key.to_string(),
+            version_id: version_id.map(str::to_string),
+        })
+    }
+
+    /// The refusal S3 answers a request field carrying a value it cannot accept with:
+    /// `InvalidArgument` at [`crate::state::INVALID_ARGUMENT_STATUS`], plus the
+    /// `<ArgumentName>` / `<ArgumentValue>` pair naming WHICH field was rejected and what it
+    /// carried.
+    ///
+    /// S3's `InvalidArgument` document carries that pair beside its code and message (Amazon
+    /// S3 API Reference, *Error responses*), and an SDK error object surfaces it as
+    /// `ArgumentName` / `ArgumentValue`: the message states the RULE the value broke, which
+    /// is the same sentence for every value that breaks it, so the pair is the only part of
+    /// the refusal that says which argument the caller must change. `argument` is the field
+    /// as the API publishes it and `value` is what the request spelled, so neither is
+    /// invented here.
+    ///
+    /// The ONE place that pair is attached, so every field this service refuses a value in
+    /// names it the same way.
+    pub fn invalid_argument(argument: &str, value: &str, message: impl Into<String>) -> Self {
+        Self::unmodeled(
+            crate::state::INVALID_ARGUMENT_CODE,
+            crate::state::INVALID_ARGUMENT_STATUS,
+            message,
+        )
+        .naming(RefusedResource::Argument {
+            name: argument.to_string(),
+            value: value.to_string(),
+        })
+    }
+
+    /// The refusal every operation that takes a `versionId` answers one that is not shaped
+    /// like a version id with ([`crate::state::version_id_is_well_formed`] decides it): the
+    /// `InvalidArgument` above, naming the `versionId` parameter and echoing the token it
+    /// rejected.
+    ///
+    /// One place, so a malformed id is refused identically wherever it arrives.
+    pub fn invalid_version_id(version_id: &str) -> Self {
+        Self::invalid_argument(
+            crate::state::VERSION_ID_ARGUMENT,
+            version_id,
+            crate::state::INVALID_VERSION_ID_MESSAGE,
+        )
+    }
+
+    /// The refusal every WRITE that carries `x-amz-object-lock-retain-until-date` answers a
+    /// date that does not end in the future with: the `InvalidArgument` above, naming that
+    /// header and echoing the date it rejected as the request spelled it in that header
+    /// ([`crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE`] is the sentence, shared
+    /// with the retention write that is refused the same value in its document).
+    pub fn retain_until_date_not_in_future(
+        spelled: Option<&str>,
+        date: Option<&::aws_smithy_types::DateTime>,
+    ) -> Self {
+        Self::invalid_argument(
+            crate::state::OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER,
+            &crate::state::echoed_retain_until_date(spelled, date),
+            crate::state::RETAIN_UNTIL_DATE_NOT_IN_FUTURE_MESSAGE,
+        )
+    }
+
     /// The refusal S3 answers a tag set that breaks one of the published restrictions with:
     /// the rejection's own wire code and sentence at [`crate::state::TAG_REJECTION_STATUS`],
     /// plus the `<TagKey>` member when the refusal is about one tag's key.
@@ -776,13 +979,14 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
 /// It is also what names a resource that is not a bucket at all ([`RefusedResource`]).
 impl<E: OperationError> SerializableStruct for Scaffolded<E> {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
-        // The request-scoped note is spent HERE, at the top, whether or not this refusal
-        // ends up using it: a refusal that names its own resource, and one whose code is
-        // not bucket-scoped, must not leave a note behind for a later response on this
-        // thread to name itself by. Taking it first is also what keeps the `Naming` arm's
-        // recursive call from writing a second `<BucketName>` — the note is already gone by
-        // the time the wrapped refusal is serialized.
+        // The request-scoped notes are spent HERE, at the top, whether or not this refusal
+        // ends up using them: a refusal that names its own resource, and one whose code is
+        // not bucket- or object-scoped, must not leave a note behind for a later response on
+        // this thread to name itself by. Taking them first is also what keeps the `Naming`
+        // arm's recursive call from writing a second `<BucketName>` — the notes are already
+        // gone by the time the wrapped refusal is serialized.
         let addressed = crate::state::addressed_bucket::addressed();
+        let addressed_object = crate::state::addressed_bucket::addressed_object();
         match self {
             Self::NotImplemented(e) => e.serialize_members(s)?,
             Self::ValidationException(e) => e.serialize_members(s)?,
@@ -797,12 +1001,18 @@ impl<E: OperationError> SerializableStruct for Scaffolded<E> {
             }
             Self::Naming(refusal, resource) => {
                 refusal.serialize_members(s)?;
-                s.write_string(resource.member(), resource.name())?;
+                resource.serialize_into(s)?;
                 return Ok(());
             }
         }
         if let Some(bucket) = addressed.filter(|_| names_its_bucket(self.shape_name())) {
             s.write_string(&BUCKET_NAME, bucket.as_str())?;
+        }
+        if let Some(object) = addressed_object.filter(|_| names_its_object(self.shape_name())) {
+            s.write_string(&OBJECT_KEY, object.key.as_str())?;
+            if let Some(version_id) = object.version_id.as_deref() {
+                s.write_string(&OBJECT_VERSION_ID, version_id)?;
+            }
         }
         Ok(())
     }

@@ -45,7 +45,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use smithy_server_runtime::MultiServiceRouter;
@@ -53,6 +53,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::bucket_lifecycle::{router, send, Answer};
 use super::bucket_tagging::unescaped;
 use super::object_and_tagging_roundtrip::{bucket, text};
+use super::object_listing_encoding::decoded;
 
 /// The most uploads one page may carry: "The ListMultipartUploads operation returns a
 /// maximum of 1,000 multipart uploads in the response. The limit of 1,000 multipart
@@ -78,14 +79,6 @@ const PATH_LITERAL: &AsciiSet = &NON_ALPHANUMERIC
 /// `key` as a request path carries it.
 fn in_path(key: &str) -> String {
     utf8_percent_encode(key, PATH_LITERAL).to_string()
-}
-
-/// What a client does with every key-name element of an `encoding-type=url` page.
-fn decoded(written: &str) -> String {
-    percent_decode_str(written)
-        .decode_utf8()
-        .unwrap_or_else(|error| panic!("the response must carry valid UTF-8: {error}"))
-        .into_owned()
 }
 
 /// `POST /<bucket>/<key>?uploads` — `CreateMultipartUpload`, answering the upload id the

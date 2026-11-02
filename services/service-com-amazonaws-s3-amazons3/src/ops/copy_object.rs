@@ -566,13 +566,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // service reads them by ([`crate::state::requested_object_lock`]). Half a retention
         // describes no period and a date outside the range this platform holds names no
         // instant: either is a parameter that is not valid for the request, which is what the
-        // modelled `InvalidRequest` reports.
-        let Ok(requested_lock) = crate::state::requested_object_lock(
+        // modelled `InvalidRequest` reports. A date that is not in the FUTURE is a bad VALUE
+        // in a named field instead, so it is refused as that field's `InvalidArgument`.
+        let requested_lock = match crate::state::requested_object_lock(
             input.object_lock_mode.as_deref(),
             input.object_lock_retain_until_date.as_ref(),
             input.object_lock_legal_hold_status.as_deref(),
-        ) else {
-            return Err(CopyObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+            ::std::time::SystemTime::now(),
+        ) {
+            Ok(requested) => requested,
+            Err(crate::state::ObjectLockRequestRejection::RetainUntilDateNotInFuture) => {
+                return Err(crate::scaffolded::Scaffolded::retain_until_date_not_in_future(
+                    crate::state::header_text(
+                        ctx.parts(),
+                        crate::state::OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER,
+                    ),
+                    input.object_lock_retain_until_date.as_ref(),
+                ))
+            }
+            Err(_) => return Err(CopyObjectErrorModeled::InvalidRequest(InvalidRequest {}).into()),
         };
 
         let mut store = state.lock();
@@ -627,22 +639,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
                 // anything, so it is a malformed argument rather than an absent version —
                 // the way `GetObject` answers the same argument.
                 if !crate::state::version_id_is_well_formed(version_id) {
-                    return Err(crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::INVALID_ARGUMENT_CODE,
-                        crate::state::INVALID_ARGUMENT_STATUS,
-                        crate::state::INVALID_VERSION_ID_MESSAGE,
-                    ));
+                    return Err(crate::scaffolded::Scaffolded::invalid_version_id(version_id));
                 }
                 // A `versionId` naming no version the source bucket holds is
                 // `NoSuchVersion`, which this model carries no shape for, so it goes out
                 // through the unmodelled channel with the code and 404 S3 answers — the
                 // way `GetObject` answers the same request.
                 let Some(held) = source_bucket.stored_version(&source.key, version_id) else {
+                    // About the COPY SOURCE version, so it names that object itself rather
+                    // than leaving the envelope to be named by the request's address — which
+                    // is the DESTINATION key (see
+                    // [`crate::scaffolded::Scaffolded::naming_object`]).
                     return Err(crate::scaffolded::Scaffolded::unmodeled(
                         crate::state::NO_SUCH_VERSION_CODE,
                         404,
                         crate::state::NO_SUCH_VERSION_MESSAGE,
-                    ));
+                    )
+                    .naming_object(&source.key, Some(version_id)));
                 };
                 // A delete marker holds no bytes for a copy to read, and naming one
                 // explicitly is not something this method can do — the same 405
@@ -658,7 +671,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             }
         };
         let Some(source_object) = held else {
-            return Err(CopyObjectErrorModeled::NoSuchKey(NoSuchKey {}).into());
+            // About the COPY SOURCE key, named for the same reason the source bucket is.
+            return Err(
+                crate::scaffolded::Scaffolded::Modeled(CopyObjectErrorModeled::NoSuchKey(
+                    NoSuchKey {},
+                ))
+                .naming_object(&source.key, source.version_id.as_deref()),
+            );
         };
 
         // ONE instant for the whole call, so the state the source is judged in and the time

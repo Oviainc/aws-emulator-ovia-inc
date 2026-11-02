@@ -544,17 +544,19 @@ async fn a_version_id_the_bucket_holds_no_version_for_is_not_found() {
         .expect("an enabled bucket mints a version id");
 
     // Ids that are SHAPED like a version id and name no stored version, differing in how:
-    // one shaped like a minted id, one differing from the stored id in its last character,
-    // and `null` — which names the version a write makes while the bucket is NOT enabled,
-    // and this key has none, every write to it having been versioned. An id that is not
-    // shaped like one at all is a different answer; the table below this one covers it.
+    // one of the minted shape this store never minted, one differing from the stored id in
+    // its last character, and `null` — which names the version a write makes while the bucket
+    // is NOT enabled, and this key has none, every write to it having been versioned. An id
+    // that is not shaped like one at all is a different answer; the table below this one
+    // covers it.
     let mut almost = minted.clone();
-    almost.pop();
-    almost.push(if minted.ends_with('A') { 'B' } else { 'A' });
+    let last = almost.pop().expect("a minted version id is not empty");
+    // Another hexadecimal digit, so the id stays shaped like one the store could have minted.
+    almost.push(if last == '0' { '1' } else { '0' });
     let rows: [(&str, String); 3] = [
         (
-            "an id shaped like a minted one",
-            "QUJDREVGR0hJSktMTU5PUFFSU1RVVldY".to_string(),
+            "an id of the minted shape that was never minted",
+            "0123456789abcdef0123456789abcdef".to_string(),
         ),
         ("an id differing in one character", almost),
         ("the null version of a key that has none", "null".to_string()),

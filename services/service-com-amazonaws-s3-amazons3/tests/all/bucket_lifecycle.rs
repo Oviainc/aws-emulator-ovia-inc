@@ -45,16 +45,26 @@ fn authorization_for(region: &str) -> String {
 }
 
 /// One service mounted on its own engine, reached exactly the way the production router
+/// reaches it, together with the ENGINE it was mounted on — so a suite can seed the same
+/// store the service reads for a state no sequence of requests can reach.
+///
+/// `pub(crate)`, like the helpers below it: a suite that needs the store reaches it through
+/// this one harness instead of standing up a second one.
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
+/// One service mounted on its own engine, reached exactly the way the production router
 /// reaches it.
 ///
 /// `pub(crate)`, like the three helpers below it: the tagging suite in this same test
 /// crate drives its requests through the same harness instead of standing up a second one.
 pub(crate) fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router_with_engine().0
 }
 
 /// One row of the create-and-read-back table: the case name, the location constraint the

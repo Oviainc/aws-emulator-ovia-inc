@@ -39,11 +39,12 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use service_com_amazonaws_s3_amazons3::ops::types::OBJECT_LOCK_RETENTION_MODE_VALUES;
 use service_com_amazonaws_s3_amazons3::state::{
-    COMPLIANCE_RETENTION_MODE, GOVERNANCE_RETENTION_MODE, OBJECT_LOCK_ACCESS_DENIED_MESSAGE,
+    ComAmazonawsS3Amazons3State, ObjectRetention, ObjectRetentionWrite, COMPLIANCE_RETENTION_MODE,
+    GOVERNANCE_RETENTION_MODE, OBJECT_LOCK_ACCESS_DENIED_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{router, send, Answer};
+use super::bucket_lifecycle::{router, router_with_engine, send, Answer};
 use super::object_and_tagging_roundtrip::{get_object, put_object, text};
 use super::object_legal_hold::lock_enabled_bucket;
 
@@ -144,6 +145,50 @@ fn epoch_seconds(rendered: &str) -> i64 {
 /// Now, in epoch seconds: what every row's retention date is an offset from.
 pub(crate) fn now_seconds() -> i64 {
     DateTime::from(SystemTime::now()).secs()
+}
+
+/// Seed a retention whose period has ALREADY LAPSED onto the current version of
+/// `bucket`/`key`, through the same store the service reads.
+///
+/// Not over the wire, because no request can place one: a `RetainUntilDate` that is not in
+/// the future describes a period that protects nothing, and S3 refuses it as a bad argument
+/// — which is what the refusal table pins. The state it leaves behind is still reachable,
+/// because any retention lapses once its own date goes by, so it is seeded here the way the
+/// listing suites seed a key no request line can carry.
+///
+/// `pub(crate)`: the enforcement suite ([`super::object_lock_enforcement`]) needs the same
+/// lapsed state.
+pub(crate) fn given_lapsed_retention(
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    bucket: &str,
+    key: &str,
+    mode: &str,
+    retain_until_seconds: i64,
+) {
+    assert!(
+        retain_until_seconds < now_seconds(),
+        "a lapsed retention must run to an instant that has gone by, got \
+         {retain_until_seconds}"
+    );
+    let retain_until = SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(u64::try_from(retain_until_seconds).expect(
+            "the test's own lapsed instant must be after the epoch",
+        ));
+    let state = engine.state::<ComAmazonawsS3Amazons3State>();
+    let written = state.lock().replace_object_retention(
+        bucket,
+        key,
+        None,
+        Some(ObjectRetention {
+            mode: mode.to_string(),
+            retain_until,
+        }),
+    );
+    assert_eq!(
+        written,
+        Some(ObjectRetentionWrite::Applied),
+        "the lapsed retention on {bucket}/{key} must be recorded first"
+    );
 }
 
 /// What a `GetObjectRetention` reported: the `Mode` and the `RetainUntilDate` as epoch
@@ -509,13 +554,12 @@ async fn a_call_that_protects_a_version_less_needs_a_governance_bypass() {
 
 #[tokio::test]
 async fn a_retention_whose_date_has_passed_restricts_nothing() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     lock_enabled_bucket(&router, "expired-retention").await;
 
-    // A retention placed with a date that has already gone by is a period that is over, so
-    // it protects the version no longer — in either mode, and whether the call that
-    // replaces it asks for a shorter period or for none at all, with no bypass header
-    // anywhere.
+    // A retention whose date has already gone by is a period that is over, so it protects
+    // the version no longer — in either mode, and whether the call that replaces it asks for
+    // a shorter period or for none at all, with no bypass header anywhere.
     for mode in OBJECT_LOCK_RETENTION_MODE_VALUES {
         for (case, asked) in [
             ("replaced by a shorter period", Some(ONE_HOUR)),
@@ -524,7 +568,7 @@ async fn a_retention_whose_date_has_passed_restricts_nothing() {
             let key = format!("{mode}-{}", asked.unwrap_or_default()).to_lowercase();
             object(&router, "expired-retention", &key).await;
             let expired = now_seconds() - 24 * ONE_HOUR;
-            given_retention(&router, "expired-retention", &key, mode, expired).await;
+            given_lapsed_retention(&engine, "expired-retention", &key, mode, expired);
 
             let asked_until = asked.map(|offset| now_seconds() + offset);
             let answer = put_object_retention(

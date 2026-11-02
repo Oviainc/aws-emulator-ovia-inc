@@ -445,6 +445,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         e_tag: Some(object.etag.clone()),
                         size: Some(object.body.len() as i64),
                         storage_class: Some(object.storage_class.clone()),
+                        // "The algorithm that was used to create a checksum of the object"
+                        // and "the checksum type that is used to calculate the object's
+                        // checksum value" (`Object$ChecksumAlgorithm` and `$ChecksumType`):
+                        // what the write that stored THIS object recorded, read off the one
+                        // record `GetObject` and `HeadObject` report a checksum from, so a
+                        // listing and a read cannot disagree about it. An object stored
+                        // under no checksum algorithm reports neither member.
+                        checksum_algorithm: object
+                            .checksum
+                            .as_ref()
+                            .map(|checksum| vec![checksum.algorithm.clone()]),
+                        checksum_type: object
+                            .checksum
+                            .as_ref()
+                            .map(|checksum| checksum.checksum_type.clone()),
                         ..Object::default()
                     }),
                 }
@@ -461,13 +476,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with them; nothing else in the response is a key name. A request that asked for
         // no encoding type is answered verbatim, and reports no `EncodingType`.
         let encode = |value: String| match input.encoding_type.as_deref() {
-            Some(crate::state::ENCODING_TYPE_URL) => crate::state::url_encoded_key(&value),
+            Some(crate::state::ENCODING_TYPE_URL) => crate::state::listing_encoded_key(&value),
             _ => value,
         };
 
         Ok(ListObjectsV2Output {
             name: Some(input.bucket.clone()),
-            prefix: input.prefix.clone().map(&encode),
+            // "Keys that begin with the indicated prefix" (`ListObjectsV2Output$Prefix`) —
+            // the element is part of every answer and carries the empty prefix, which every
+            // key begins with, for a request that named none.
+            prefix: Some(encode(input.prefix.clone().unwrap_or_default())),
             delimiter: input.delimiter.clone().map(&encode),
             max_keys: Some(max_keys),
             // "KeyCount is the number of keys returned with this request" — the

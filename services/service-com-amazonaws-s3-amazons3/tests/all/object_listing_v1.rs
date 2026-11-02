@@ -573,7 +573,7 @@ async fn the_encoding_type_a_v1_listing_asks_for_is_what_its_key_names_carry() {
         page_of(&answer),
         (
             owned(&["test_file%283%29.png"]),
-            owned(&["sub%28x%29%2F"])
+            owned(&["sub%28x%29/"])
         ),
         "case \"encoding-type=url\": every key name is percent-encoded per UTF-8 code value, \
          got {:?}",
@@ -581,7 +581,7 @@ async fn the_encoding_type_a_v1_listing_asks_for_is_what_its_key_names_carry() {
     );
     for (element, expected) in [
         ("EncodingType", "url"),
-        ("Delimiter", "%2F"),
+        ("Delimiter", "/"),
         ("Marker", "sub%28x%29"),
     ] {
         assert_eq!(

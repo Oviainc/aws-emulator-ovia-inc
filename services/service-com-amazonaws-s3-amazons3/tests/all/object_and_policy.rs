@@ -115,9 +115,12 @@ async fn a_bucket_policy_and_objects_coexist_on_one_bucket_without_touching_each
         String::from_utf8_lossy(&read_policy.body)
     );
 
-    // Replacing the policy leaves the object alone...
+    // Replacing the policy leaves the object alone. The replacement is another `Allow`,
+    // deliberately not a `Deny`: a bucket policy is in force on every caller, so an explicit
+    // deny would refuse the reads below — which is authorization, not the independence of the
+    // two subresources this suite is about.
     let replacement =
-        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":"arn:aws:s3:::staging-bucket/*"}]}"#;
+        r#"{"Version":"2012-10-17","Statement":[{"Sid":"AllowDelivery","Effect":"Allow","Principal":{"Service":"logs.amazonaws.com"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::staging-bucket/*"}]}"#;
     let replaced = put_bucket_policy(&router, bucket, replacement).await;
     assert_eq!(
         replaced.status, 204,

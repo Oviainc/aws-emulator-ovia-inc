@@ -361,9 +361,11 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
     for (key, marker_id) in &marker_ids {
         named.push((key.clone(), Some(marker_id.clone())));
     }
-    // A WELL-FORMED id this store never minted: a token of the published shape, so it is
-    // shaped like a version id and names no stored version — which is `NoSuchVersion`,
-    // where an id that is not shaped like one at all is a malformed argument.
+    // A token this store never minted, in two shapes: one of the minted shape and one of
+    // no version id's shape at all. The BATCH path reports what it could not do with the
+    // pair rather than classifying the token, so each is that identifier's own
+    // absent-version error (the single-object path is where the argument itself is judged,
+    // see `version_id_classification`).
     named.push((
         "one".to_string(),
         Some("a".repeat(VERSION_ID_CHARS)),
@@ -393,10 +395,10 @@ async fn a_batch_delete_drains_a_versioned_bucket_and_reports_each_marker() {
         result.error_codes(),
         vec![
             ("one".to_string(), "NoSuchVersion".to_string()),
-            ("one".to_string(), "InvalidArgument".to_string())
+            ("one".to_string(), "NoSuchVersion".to_string())
         ],
-        "the identifier naming no stored version and the one naming a malformed id are \
-         each that identifier's own error, got {:?}",
+        "each identifier naming a version the bucket holds none of is that identifier's own \
+         error, got {:?}",
         result.error_codes()
     );
     let emptied = version_listing_of(&list_object_versions(&router, name, "").await);

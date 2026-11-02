@@ -455,8 +455,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             object.last_modified,
                         )),
                         // `Owner` needs an object owner this emulator does not record and
-                        // `RestoreStatus` an archive tier it does not model; the checksum
-                        // members need a checksum `PutObject` did not compute.
+                        // `RestoreStatus` an archive tier it does not model.
+                        //
+                        // "The algorithm that was used to create a checksum of the object"
+                        // and "the checksum type that is used to calculate the object's
+                        // checksum value" (`ObjectVersion$ChecksumAlgorithm` and
+                        // `$ChecksumType`): what the write that stored THIS version
+                        // recorded, so a version listing and a read of that version report
+                        // the same checksum configuration, and a version stored under no
+                        // checksum algorithm reports neither member.
+                        checksum_algorithm: object
+                            .checksum
+                            .as_ref()
+                            .map(|checksum| vec![checksum.algorithm.clone()]),
+                        checksum_type: object
+                            .checksum
+                            .as_ref()
+                            .map(|checksum| checksum.checksum_type.clone()),
                         ..ObjectVersion::default()
                     });
                 }
@@ -481,7 +496,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request carried, the two it hands back, and the rolled-up `CommonPrefixes`. A
         // version id is NOT a key name, so it is reported as minted.
         let encode = |value: String| match input.encoding_type.as_deref() {
-            Some(crate::state::ENCODING_TYPE_URL) => crate::state::url_encoded_key(&value),
+            Some(crate::state::ENCODING_TYPE_URL) => crate::state::listing_encoded_key(&value),
             _ => value,
         };
 

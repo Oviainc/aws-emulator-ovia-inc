@@ -483,16 +483,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `InvalidRequest` (400) with the sentence the modelled shape states for itself —
         // this operation declares no error shapes, so it goes out through the unmodelled
         // channel, and nothing is recorded.
-        let Ok(requested_lock) = crate::state::requested_object_lock(
+        let requested_lock = match crate::state::requested_object_lock(
             input.object_lock_mode.as_deref(),
             input.object_lock_retain_until_date.as_ref(),
             input.object_lock_legal_hold_status.as_deref(),
-        ) else {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::INVALID_REQUEST_CODE,
-                crate::state::INVALID_REQUEST_STATUS,
-                crate::state::INVALID_REQUEST_MESSAGE,
-            ));
+            ::std::time::SystemTime::now(),
+        ) {
+            Ok(requested) => requested,
+            // A date that is not in the FUTURE is a bad VALUE in a named field rather than a
+            // parameter that cannot be carried out, so it is refused as that field's
+            // `InvalidArgument`.
+            Err(crate::state::ObjectLockRequestRejection::RetainUntilDateNotInFuture) => {
+                return Err(crate::scaffolded::Scaffolded::retain_until_date_not_in_future(
+                    crate::state::header_text(
+                        ctx.parts(),
+                        crate::state::OBJECT_LOCK_RETAIN_UNTIL_DATE_HEADER,
+                    ),
+                    input.object_lock_retain_until_date.as_ref(),
+                ))
+            }
+            Err(_) => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_REQUEST_CODE,
+                    crate::state::INVALID_REQUEST_STATUS,
+                    crate::state::INVALID_REQUEST_MESSAGE,
+                ))
+            }
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

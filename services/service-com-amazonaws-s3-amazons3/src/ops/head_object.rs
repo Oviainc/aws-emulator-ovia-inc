@@ -390,16 +390,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it is a malformed argument rather than an absent version: `InvalidArgument` with
         // HTTP 400, which leaves `NoSuchVersion` for a well-formed id the bucket holds no
         // version for.
-        if input
+        if let Some(version_id) = input
             .version_id
             .as_deref()
-            .is_some_and(|version_id| !crate::state::version_id_is_well_formed(version_id))
+            .filter(|version_id| !crate::state::version_id_is_well_formed(version_id))
         {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::INVALID_ARGUMENT_CODE,
-                crate::state::INVALID_ARGUMENT_STATUS,
-                crate::state::INVALID_VERSION_ID_MESSAGE,
-            ));
+            return Err(crate::scaffolded::Scaffolded::invalid_version_id(version_id));
         }
         // "To retrieve a specific version, you must be the bucket owner and you must use
         // the versionId subresource" (`GetObject`, which `HeadObject` shares its read with
@@ -429,21 +425,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // WHO is asking comes before anything this read reports. A request presenting no
         // credential speaks for no principal, so it is served only what the bucket grants to
         // everyone ([`crate::state::Bucket::anonymous_object_read_refusal`] carries that
-        // rule, over the `s3:GetObject` permission a HEAD of an object needs too) and is
-        // otherwise refused with S3's authorization status — ahead of the 404 below, so a
-        // refusal says nothing about whether the key is there. A HEAD carries no body, so
-        // the status is the whole answer.
-        if crate::state::request_is_anonymous(ctx.parts()) {
-            let refused = store.bucket(&input.bucket).and_then(|bucket| {
-                bucket.anonymous_object_read_refusal(&input.bucket, &input.key, object)
-            });
-            if let Some(message) = refused {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::ACCESS_DENIED_CODE,
-                    crate::state::ACCESS_DENIED_STATUS,
-                    message,
-                ));
+        // rule, over the `s3:GetObject` permission a HEAD of an object needs too); one
+        // presenting a credential speaks for this account, and the bucket's own policy is in
+        // force on it too ([`crate::state::Bucket::caller_object_read_refusal`]), so an
+        // explicit deny refuses the HEAD whatever the store holds. Either way the refusal is
+        // answered with S3's authorization status — ahead of the 404 below, so it says
+        // nothing about whether the key is there. A HEAD carries no body, so the status is
+        // the whole answer.
+        let refused = store.bucket(&input.bucket).and_then(|bucket| {
+            match crate::state::request_is_anonymous(ctx.parts()) {
+                true => bucket
+                    .anonymous_object_read_refusal(&input.bucket, &input.key, object)
+                    .map(str::to_string),
+                false => bucket.caller_object_read_refusal(&input.bucket, &input.key, object),
             }
+        });
+        if let Some(message) = refused {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
         }
         // A missing bucket and a missing key are both a 404 on a HEAD, which carries no
         // body to tell them apart by an error document. The modelled `NotFound` cannot

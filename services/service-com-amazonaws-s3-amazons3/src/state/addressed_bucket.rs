@@ -6,6 +6,11 @@
 //! ([`crate::scaffolded::Scaffolded::naming_bucket`] is how a handler names it, and is what
 //! a refusal about a bucket OTHER than the one addressed must use).
 //!
+//! The same note carries the OBJECT the request addresses — its key, and the version id the
+//! request named — for the same reason: an object-scoped not-found document names the key
+//! (and the version) that was not there, and no error shape of this model declares a member
+//! to carry either.
+//!
 //! Not state: a request-scoped note, needed because a refusal and the REQUEST that provoked
 //! it are handed to two different seams. The serializer that writes the error document is
 //! handed the error value, the error code and the status — and S3's error shapes declare no
@@ -43,6 +48,33 @@ thread_local! {
     /// The bucket the request this thread is serving addresses, for the length of that one
     /// request.
     static ADDRESSED: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The OBJECT that same request addresses, for the length of that one request.
+    static ADDRESSED_OBJECT: RefCell<Option<AddressedObject>> = const { RefCell::new(None) };
+}
+
+/// The object a request addresses: the key, and the version id the request named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AddressedObject {
+    /// The key, as the request spelled it once its path was decoded.
+    pub(crate) key: String,
+    /// The `versionId` the request named, for a request that named one.
+    pub(crate) version_id: Option<String>,
+}
+
+/// Record the OBJECT the request this thread is serving addresses, `None` for a request that
+/// addresses a bucket or the service root rather than an object.
+///
+/// Called for EVERY request, under the same discipline as [`remember`].
+pub(crate) fn remember_object(object: Option<AddressedObject>) {
+    ADDRESSED_OBJECT.with(|note| {
+        *note.borrow_mut() = object;
+    });
+}
+
+/// The object recorded for the request now being answered, TAKEN rather than read — see
+/// [`addressed`].
+pub(crate) fn addressed_object() -> Option<AddressedObject> {
+    ADDRESSED_OBJECT.with(|note| note.borrow_mut().take())
 }
 
 /// Record `bucket` as the bucket the request this thread is serving addresses, `None` for a
@@ -94,6 +126,43 @@ mod tests {
             None,
             "a request addressing no bucket must not read the previous one's note, got {:?}",
             addressed()
+        );
+    }
+
+    #[test]
+    fn a_recorded_object_is_answered_once_and_then_gone() {
+        remember_object(Some(AddressedObject {
+            key: "note/key.txt".to_string(),
+            version_id: Some("note-version".to_string()),
+        }));
+        assert_eq!(
+            addressed_object(),
+            Some(AddressedObject {
+                key: "note/key.txt".to_string(),
+                version_id: Some("note-version".to_string()),
+            }),
+            "the recorded object must be the one answered"
+        );
+        assert_eq!(
+            addressed_object(),
+            None,
+            "a note is spent by the response it was recorded for, got {:?}",
+            addressed_object()
+        );
+    }
+
+    #[test]
+    fn a_request_that_addresses_no_object_clears_the_slot() {
+        remember_object(Some(AddressedObject {
+            key: "note/previous.txt".to_string(),
+            version_id: None,
+        }));
+        remember_object(None);
+        assert_eq!(
+            addressed_object(),
+            None,
+            "a request addressing no object must not read the previous one's note, got {:?}",
+            addressed_object()
         );
     }
 }
