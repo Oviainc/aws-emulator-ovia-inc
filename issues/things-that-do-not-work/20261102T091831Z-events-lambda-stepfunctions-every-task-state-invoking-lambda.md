@@ -1,0 +1,67 @@
+Issue-Severity: CRITICAL
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: events__lambda__stepfunctions.refarch-sfn-checkstatus-failed-routes-to-terminal-fail-state events__lambda__stepfunctions.refarch-sfn-checkstatus-retry-maxattempts-exhausts-then-catch events__lambda__stepfunctions.refarch-sfn-choice-default-branch-reenters-wait-three-times events__lambda__stepfunctions.refarch-sfn-choice-on-missing-status-path-rejected-at-runtime events__lambda__stepfunctions.refarch-sfn-duplicate-execution-name-after-terminal-rejected events__lambda__stepfunctions.refarch-sfn-duplicate-execution-name-identical-input-returns-same-arn events__lambda__stepfunctions.refarch-sfn-lambda-invoke-denied-rejected-as-awslambdaexception events__lambda__stepfunctions.refarch-sfn-poller-loop-pairs-entry-with-exit-on-every-revisit events__lambda__stepfunctions.refarch-sfn-state-machine-timeoutseconds-aborts-nonterminating-loop events__lambda__stepfunctions.refarch-sfn-poller-loop-without-a-terminal-state-rejected events__lambda__stepfunctions.refarch-sfn-e2e-job-poller-lifecycle events__lambda__stepfunctions.refarch-sfn-schedule-rule-target-omits-input-when-unset
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-checkstatus-failed-routes-to-terminal-fail-state|run#9|AssertionError|assert desc.get("error") == "DescribeJob returned FAILED", (
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-checkstatus-retry-maxattempts-exhausts-then-catch|run#12|AssertionError|assert desc.get("error") == "DescribeJob returned FAILED", (
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-choice-default-branch-reenters-wait-three-times|run#9|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-choice-on-missing-status-path-rejected-at-runtime|run#10|AssertionError|assert control["status"] == "SUCCEEDED", (
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-duplicate-execution-name-after-terminal-rejected|run#16|AssertionError|assert final["status"] == "SUCCEEDED", (
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-duplicate-execution-name-identical-input-returns-same-arn|run#19|AssertionError|assert final["status"] == "SUCCEEDED", (
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-lambda-invoke-denied-rejected-as-awslambdaexception|run#9|AssertionError|assert control["status"] == "SUCCEEDED", (
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-poller-loop-pairs-entry-with-exit-on-every-revisit|run#8|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-state-machine-timeoutseconds-aborts-nonterminating-loop|run#9|AssertionError|assert desc["status"] == "TIMED_OUT", (
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-poller-loop-without-a-terminal-state-rejected|_error#13|AssertionError|raise AssertionError(f"the loop-only definition was accepted as {arn}; real AWS rejects it")
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-e2e-job-poller-lifecycle|phase#4|AssertionError|raise AssertionError(f"[phase {i}/{len(self.phases)} {name}] {exc}") from exc
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-schedule-rule-target-omits-input-when-unset|run#18|Timeout|time.sleep(5)
+Issue-Commit: b1a4a993822b0574a1f24a3d622a9d42702ca481
+
+# events__lambda__stepfunctions: every Task state invoking Lambda fails States.Runtime with emulator wording, a loop-only definition is accepted, the poller stack rolls back, and a schedule rule never starts an execution (4 causes)
+
+> _Note: this issue was identified against the code base at commit `b1a4a993822b0574a1f24a3d622a9d42702ca481`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+StartExecution
+
+## Description
+Four net-new root causes in this service group.
+
+Cause 1 of 4: a Task state whose Resource invokes a Lambda function always fails the execution with error `States.Runtime` and an emulator-authored cause, so no Task-driven control flow (Choice, Retry, Catch, Fail, machine TimeoutSeconds, duplicate-name boundaries) can ever be exercised.
+Failing checks: events__lambda__stepfunctions.refarch-sfn-checkstatus-failed-routes-to-terminal-fail-state, events__lambda__stepfunctions.refarch-sfn-checkstatus-retry-maxattempts-exhausts-then-catch, events__lambda__stepfunctions.refarch-sfn-choice-default-branch-reenters-wait-three-times, events__lambda__stepfunctions.refarch-sfn-choice-on-missing-status-path-rejected-at-runtime, events__lambda__stepfunctions.refarch-sfn-duplicate-execution-name-after-terminal-rejected, events__lambda__stepfunctions.refarch-sfn-duplicate-execution-name-identical-input-returns-same-arn, events__lambda__stepfunctions.refarch-sfn-lambda-invoke-denied-rejected-as-awslambdaexception, events__lambda__stepfunctions.refarch-sfn-poller-loop-pairs-entry-with-exit-on-every-revisit, events__lambda__stepfunctions.refarch-sfn-state-machine-timeoutseconds-aborts-nonterminating-loop.
+AWS: a Task state invokes the function and either succeeds (the execution continues to its next state and, for these machines, reaches SUCCEEDED) or fails with a Step Functions error name that reflects the real cause: an unhandled Lambda-side failure surfaces as `Lambda.Unhandled`/`States.TaskFailed`, a denied lambda:InvokeFunction surfaces as the Lambda exception class (`Lambda.AWSLambdaException`) and a Fail state or a Catch that routes to one reports THAT state's own `Error` string (here `DescribeJob returned FAILED`). A machine-level `TimeoutSeconds` aborts a non-terminating loop as status `TIMED_OUT`, not FAILED. `States.Runtime` is reserved for interpreter-level faults such as an unresolvable InputPath/OutputPath. Smithy (sfn): DescribeExecution returns `status` plus `error`/`cause`, so these are the modeled carriers of the classification a client branches on.
+Emulator: every one of these executions ends `status='FAILED'`, `error='States.Runtime'` and `cause="the 'Invoke' operation of Lambda is not implemented by this emulator, so nothing was run for this task"`. Nothing is run for the task, so the execution never advances and each check fails on its first assertion about status or error (e.g. `the execution error must be the Fail state's own Error string; got 'States.Runtime'`; `a loop that never reaches a terminal status must be aborted by the machine-level TimeoutSeconds as TIMED_OUT; got 'FAILED'`).
+Why: every state machine that calls a function fails, with an error name no AWS client can match and a cause that names the emulator rather than the workload. Retry/Catch policies, Choice branching on a task result, Fail-state error propagation, duplicate-execution-name semantics and machine timeouts are all unreachable; a client's error handling takes the wrong branch (or none).
+Fix: the Lambda invoke path the Step Functions interpreter drives (lambda Invoke must execute the function), and the interpreter's task-failure classification in the sfn crate — map a task failure to the AWS error name for its cause and let a Fail state or a Catch target set the execution's `error`/`cause`; reserve States.Runtime for interpreter faults and implement the machine-level TimeoutSeconds abort as TIMED_OUT. Open issues 20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md, 20261023T114649Z-sfn-step-functions-never-executes-task-states-every-execution.md, 20261024T043150Z-sfn-5-of-the-6-interpreter-causes-remain-open.md and 20261029T065131Z-events-lambda-stepfunctions-a-task-state-with-resource.md own neighbouring checks; none carries these nine replay keys.
+
+Cause 2 of 4: CreateStateMachine accepts a definition whose states form a loop with no terminal state, where AWS refuses it.
+Failing check: events__lambda__stepfunctions.refarch-sfn-poller-loop-without-a-terminal-state-rejected.
+AWS: a state machine definition must be able to terminate — a definition in which every path cycles and no state is terminal (`End: true` or a Succeed/Fail state) is refused by CreateStateMachine with HTTP 400 and Error.Code `InvalidDefinition`, whose message names the structural problem; no state machine is created. Smithy (sfn): CreateStateMachine models `InvalidDefinition` (400) exactly for a definition that fails validation, so this refusal is the modeled path.
+Emulator: the definition is ACCEPTED — `AssertionError: the loop-only definition was accepted as arn:aws:states:<region>:<account>:stateMachine:<name>; real AWS rejects it` (a state-machine ARN is returned instead of a 400).
+Why: a definition that AWS will reject is promoted here and only fails in production; worse, the accepted machine can never terminate, so every execution against it hangs or has to be stopped.
+Fix: definition validation in CreateStateMachine (and UpdateStateMachine) — reachability/termination analysis of the states graph in the operation's validation layer, refusing with 400 InvalidDefinition before any state machine is stored.
+
+Cause 3 of 4: the CloudFormation stack that deploys the job-poller reference architecture rolls back instead of reaching CREATE_COMPLETE.
+Failing check: events__lambda__stepfunctions.refarch-sfn-e2e-job-poller-lifecycle.
+AWS: a stack declaring the poller's resources (function, role, state machine, schedule rule) reaches CREATE_COMPLETE and the lifecycle's later phases can drive it.
+Emulator: phase 1/4 (deploy) fails — `stack <name> reached 'ROLLBACK_IN_PROGRESS', not CREATE_COMPLETE -- read its stack events for the resource that failed` — so the whole four-phase lifecycle is unobservable.
+Why: the reference architecture cannot be deployed at all through CloudFormation, so nothing downstream of it can be validated.
+Fix: the CloudFormation resource providers for the stack's declared types (notably AWS::StepFunctions::StateMachine and the Lambda/IAM/Events resources it depends on) — the resource that fails must be identified from the stack's per-resource events and made to create successfully.
+
+Cause 4 of 4: a rate-schedule rule whose target is a state machine never starts an execution, so the scheduled-event envelope handed to StartExecution is never observable.
+Failing check: events__lambda__stepfunctions.refarch-sfn-schedule-rule-target-omits-input-when-unset.
+AWS: a rule with a `rate(...)` ScheduleExpression and a state-machine target that declares NO Input invokes the target on its own cadence, and each StartExecution receives EventBridge's own scheduled-event envelope — not a reshaped or empty payload — with a fresh envelope id on every firing. Recorded behavior only; Smithy (eventbridge) models Target.Input/InputPath/InputTransformer as the only input overrides, so omitting all three means the envelope is passed through.
+Emulator: `Check timed out after 60.0s` — no execution is started on any firing, so neither the cadence nor the passed-through envelope can be checked.
+Fix: the EventBridge scheduler and its Step Functions target dispatch in the events crate — fire schedule rules on their cadence and, when no input override is configured, call StartExecution with the full scheduled-event envelope (fresh id per firing).
+Traces: the twelve failing check ids listed above.
+
+## Evidence
+Cause 1 — Expected: these executions reach SUCCEEDED (or, for the negative cases, report the AWS error name — the Fail state's own `Error` such as `DescribeJob returned FAILED`, `Lambda.AWSLambdaException` for a denied invoke, `TIMED_OUT` status for the machine-level TimeoutSeconds). Actual on every one: status `FAILED`, error `States.Runtime`, cause "the 'Invoke' operation of Lambda is not implemented by this emulator, so nothing was run for this task".
+Cause 2 — Expected: CreateStateMachine refuses the loop-only definition with 400 InvalidDefinition and creates nothing. Actual: accepted, returning `arn:aws:states:us-west-2:000000000000:stateMachine:sim2real-poller-loop-<id>`.
+Cause 3 — Expected: the poller stack reaches CREATE_COMPLETE. Actual: `[phase 1/4 deploy] stack <name> reached 'ROLLBACK_IN_PROGRESS', not CREATE_COMPLETE`.
+Cause 4 — Expected: each firing of the rate-schedule rule starts an execution whose input is EventBridge's scheduled-event envelope with a fresh id. Actual: `Check timed out after 60.0s` — no execution is ever started.
+
+## Steps to Reproduce
+Cause 1: create a Lambda function and a state machine whose Task state invokes it (with Retry/Catch and a Fail state carrying Error "DescribeJob returned FAILED"), StartExecution and poll DescribeExecution — on AWS the execution advances and, on failure, reports the Fail state's Error; on the emulator it is immediately FAILED with error States.Runtime and the emulator cause. Repeat with a machine-level TimeoutSeconds around a non-terminating loop (AWS: TIMED_OUT).
+Cause 2: CreateStateMachine with a definition whose only states cycle (no End:true, no Succeed/Fail) — AWS answers 400 InvalidDefinition; the emulator returns a state-machine ARN.
+Cause 3: deploy the job-poller stack (function + role + state machine + schedule rule) and read its status and per-resource stack events.
+Cause 4: PutRule with ScheduleExpression rate(1 minute), PutTargets the state-machine ARN with a RoleArn allowing states:StartExecution and no Input/InputPath/InputTransformer, then poll ListExecutions/DescribeExecution for started executions and their input.
