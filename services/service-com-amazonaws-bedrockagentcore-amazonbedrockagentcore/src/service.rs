@@ -45,6 +45,9 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+use crate::ops::invoke_code_interpreter::InvokeCodeInterpreter;
+use service_common::event_stream::EventStreamRoute;
+
 /// The host-style endpoint this service is addressed by:
 /// `bedrock-agentcore.<region>.amazonaws.com`.
 ///
@@ -56,13 +59,33 @@ use std::sync::Arc;
 /// if either name ever does.
 const ENDPOINT_PREFIX: &str = "bedrock-agentcore";
 
+/// The segments of `InvokeCodeInterpreter`'s modelled URI,
+/// `/code-interpreters/{codeInterpreterIdentifier}/tools/invoke` (source:
+/// `smithy_query(query="operation", operation="InvokeCodeInterpreter")`), stated beside
+/// the one seam that reads them off a request line — the routing seam below, which runs
+/// before any input is deserialized.
+const CODE_INTERPRETERS_SEGMENT: &str = "code-interpreters";
+/// See [`CODE_INTERPRETERS_SEGMENT`].
+const TOOLS_SEGMENT: &str = "tools";
+/// See [`CODE_INTERPRETERS_SEGMENT`].
+const INVOKE_SEGMENT: &str = "invoke";
+
 /// The `com-amazonaws-bedrockagentcore-amazonbedrockagentcore` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
+///
+/// Besides the generated entry it holds this service's one event-stream operation,
+/// `InvokeCodeInterpreter`. It is NOT in the entry's routing table in a servable form:
+/// the generated `ErasedOperation` shim of an operation whose output is a `@streaming`
+/// union declines the request (it cannot drive `serialize_as_event_stream<P>` through
+/// an object-safe `run`), so it is held here behind an [`EventStreamRoute`] and routed
+/// by [`EmulatedService::override_operation`] — which the router consults FIRST, before
+/// the generated table.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    invoke_code_interpreter: EventStreamRoute<InvokeCodeInterpreter<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -71,7 +94,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            invoke_code_interpreter: EventStreamRoute(InvokeCodeInterpreter::new(engine)),
         }
     }
 }
@@ -118,12 +142,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // The one event-stream operation the generated routing table cannot serve: its
+        // output member targets a `@streaming` union, so the generated shim declines
+        // the request and this seam \u2014 which the router consults FIRST \u2014 hands it to the
+        // hand-authored operation instead.
+        //
+        // Routed by the method and the URI the model binds it to, `POST
+        // /code-interpreters/{codeInterpreterIdentifier}/tools/invoke`: the identifier
+        // is a label, so the match is on the method and on the two segments after it.
+        // Every other request, including this service's other `@streaming` operations,
+        // still resolves through the generated table and keeps answering the
+        // framework's "modeled but not served" response rather than being half-served
+        // here.
+        if req.method() != http::Method::POST.as_str() {
+            return None;
+        }
+        let path = service_common::request_path(req.uri());
+        let addressed = service_common::nth_path_segment(path, 0) == Some(CODE_INTERPRETERS_SEGMENT)
+            && service_common::nth_path_segment(path, 2) == Some(TOOLS_SEGMENT)
+            && service_common::nth_path_segment(path, 3) == Some(INVOKE_SEGMENT)
+            && service_common::nth_path_segment(path, 4).is_none();
+        addressed.then_some(&self.invoke_code_interpreter as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

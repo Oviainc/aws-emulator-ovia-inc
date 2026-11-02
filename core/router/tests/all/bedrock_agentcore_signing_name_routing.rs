@@ -282,12 +282,17 @@ fn exactly_one_service_sharing_the_agentcore_signing_name_claims_each_request() 
             OWNER_CONTROL,
         ),
         (
-            // Unwired for the same reason as `InvokeAgentRuntimeCommand` above.
-            "data InvokeCodeInterpreter, modelled but unwired",
+            // Hand-authored since the data plane's code interpreter tool surface was
+            // implemented: its `@streaming` union output keeps it out of the generated
+            // routing table, so `src/service.rs` routes it through
+            // `Service::override_operation` — and the data plane claims it, which is
+            // what puts this route in the data plane's own path space rather than in
+            // neither service's.
+            "data InvokeCodeInterpreter",
             "POST",
             "localhost:9297",
             "/code-interpreters/ci-1/tools/invoke",
-            OWNER_NEITHER,
+            OWNER_DATA,
         ),
         // One path space where both models bind the SAME depth with DIFFERENT literals,
         // and one where they bind the same shape under different methods.

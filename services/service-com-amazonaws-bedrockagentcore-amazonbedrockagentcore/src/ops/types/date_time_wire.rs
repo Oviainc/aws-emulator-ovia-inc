@@ -20,12 +20,13 @@
 //! `.with_timestamp_format(..)`, so a `DateTimestamp` member built by the derive went
 //! onto the wire as a bare epoch number — not even the modelled JSON type, so an SDK
 //! deserializing it rejects or mis-parses the response. `vendor/` is read-only from
-//! inside the emulator, so the shapes whose `createdAt` targets `DateTimestamp` declare
+//! inside the emulator, so the shapes whose `createdAt` or `lastUpdatedAt` targets
+//! `DateTimestamp` declare
 //! their schema and serializer here instead, with the one chain call the codegen omits.
 //! The sibling control-plane service compensates for the same gap in its own
 //! `src/ops/types/date_time_wire.rs`; when the vendored codegen learns
 //! `smithy.api#timestampFormat`, delete this module and put
-//! `#[smithy_macros::smithy(shape = ...)]` back on the two structures below.
+//! `#[smithy_macros::smithy(shape = ...)]` back on the structures below.
 //!
 //! WHAT IS DELIBERATELY ABSENT.
 //!
@@ -46,7 +47,10 @@ use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer
 use ::aws_smithy_schema::traits::TimestampFormat;
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType};
 
-use super::{GetCodeInterpreterSessionOutput, StartCodeInterpreterSessionOutput};
+use super::{
+    GetCodeInterpreterSessionOutput, StartCodeInterpreterSessionOutput,
+    StopCodeInterpreterSessionOutput,
+};
 
 /// The namespace every shape of this service lives in.
 const NS: &str = "com.amazonaws.bedrockagentcore";
@@ -113,6 +117,72 @@ impl SerializableStruct for StartCodeInterpreterSessionOutput {
         )?;
         s.write_string(&Self::M_SESSION_ID, self.session_id.as_str())?;
         s.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        Ok(())
+    }
+}
+
+impl StopCodeInterpreterSessionOutput {
+    pub const M_CODE_INTERPRETER_IDENTIFIER: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#StopCodeInterpreterSessionResponse$codeInterpreterIdentifier",
+            NS,
+            "codeInterpreterIdentifier",
+        ),
+        ShapeType::String,
+        "codeInterpreterIdentifier",
+        0,
+    );
+
+    pub const M_SESSION_ID: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#StopCodeInterpreterSessionResponse$sessionId",
+            NS,
+            "sessionId",
+        ),
+        ShapeType::String,
+        "sessionId",
+        1,
+    );
+
+    /// Targets `DateTimestamp`, hence the format the derive cannot attach.
+    pub const M_LAST_UPDATED_AT: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#StopCodeInterpreterSessionResponse$lastUpdatedAt",
+            NS,
+            "lastUpdatedAt",
+        ),
+        ShapeType::Timestamp,
+        "lastUpdatedAt",
+        2,
+    )
+    .with_timestamp_format(TimestampFormat::DateTime);
+
+    pub const SCHEMA: Schema = Schema::new_struct(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#StopCodeInterpreterSessionResponse",
+            NS,
+            "StopCodeInterpreterSessionResponse",
+        ),
+        ShapeType::Structure,
+        &[
+            &Self::M_CODE_INTERPRETER_IDENTIFIER,
+            &Self::M_SESSION_ID,
+            &Self::M_LAST_UPDATED_AT,
+        ],
+    );
+}
+
+pub static STOP_CODE_INTERPRETER_SESSION_OUTPUT_SCHEMA: &Schema =
+    &StopCodeInterpreterSessionOutput::SCHEMA;
+
+impl SerializableStruct for StopCodeInterpreterSessionOutput {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(
+            &Self::M_CODE_INTERPRETER_IDENTIFIER,
+            self.code_interpreter_identifier.as_str(),
+        )?;
+        s.write_string(&Self::M_SESSION_ID, self.session_id.as_str())?;
+        s.write_timestamp(&Self::M_LAST_UPDATED_AT, &self.last_updated_at)?;
         Ok(())
     }
 }

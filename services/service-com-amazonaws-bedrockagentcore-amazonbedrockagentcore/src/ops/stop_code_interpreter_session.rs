@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopCodeInterpreterSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopCodeInterpreterSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopCodeInterpreterSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Terminates the named code interpreter session: the stored session's status becomes
+//! `TERMINATED` from the instant of the stop, which is also the `lastUpdatedAt` this
+//! call reports and what [`crate::ops::get_code_interpreter_session`] reads back. A
+//! session that is already terminated — stopped, or past its time-to-live — conflicts
+//! with the stop, except where a `clientToken` replays the stop it already performed.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +179,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopCodeInterpreterSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopCodeInterpreterSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopCodeInterpreterSession"))
+        // Request metadata is not read by this operation: every member it needs is
+        // bound into `input` by the centralized request walk. `traceId` / `traceParent`
+        // are carried for distributed tracing and are part of no response.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopCodeInterpreterSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the shared engine does not carry this service's state".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let session = store
+            .code_interpreter_session_mut(&input.code_interpreter_identifier, &input.session_id)
+            .ok_or_else(|| {
+                StopCodeInterpreterSessionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "session {} not found for code interpreter {}",
+                            input.session_id, input.code_interpreter_identifier
+                        )),
+                    },
+                )
+            })?;
+
+        // `clientToken` is an `@idempotencyToken` on an `@idempotent` operation, and
+        // the model documents that a token matching an earlier request is ignored
+        // rather than refused: answer with the stop that token already performed, so a
+        // retried stop is not a conflict with itself.
+        if let Some(already) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| session.stop_replay(token))
+        {
+            return Ok(StopCodeInterpreterSessionOutput {
+                code_interpreter_identifier: session.code_interpreter_identifier.clone(),
+                session_id: session.session_id.clone(),
+                last_updated_at: ::aws_smithy_types::DateTime::from(already),
+            });
+        }
+
+        // A session that is no longer running cannot be stopped again:
+        // `CodeInterpreterSessionStatus` models READY and TERMINATED only, a stopped
+        // session is documented as not restartable, and `ConflictException` is the
+        // modelled answer for a request that conflicts with the current state of the
+        // resource.
+        let status = session.status_as_of(now);
+        if status == crate::state::CODE_INTERPRETER_SESSION_TERMINATED {
+            return Err(StopCodeInterpreterSessionErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::session_already_terminated(&input.session_id)),
+                },
+            )
+            .into());
+        }
+
+        session.stop(now, input.client_token.as_deref());
+        Ok(StopCodeInterpreterSessionOutput {
+            code_interpreter_identifier: session.code_interpreter_identifier.clone(),
+            session_id: session.session_id.clone(),
+            last_updated_at: ::aws_smithy_types::DateTime::from(session.last_updated_at),
+        })
     }
 }

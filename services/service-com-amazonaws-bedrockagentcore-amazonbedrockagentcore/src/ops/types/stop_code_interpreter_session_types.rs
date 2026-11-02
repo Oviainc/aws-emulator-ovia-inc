@@ -21,7 +21,11 @@ pub struct StopCodeInterpreterSessionInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcore#StopCodeInterpreterSessionResponse")]
+/// `StopCodeInterpreterSessionResponse`. Its schema and serializer come from
+/// [`super::date_time_wire`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `lastUpdatedAt` targets `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")`, and the derive does not put that trait on a member
+/// schema — see `types/date_time_wire.rs`.
 #[derive(Debug, Clone)]
 pub struct StopCodeInterpreterSessionOutput {
     pub code_interpreter_identifier: String,

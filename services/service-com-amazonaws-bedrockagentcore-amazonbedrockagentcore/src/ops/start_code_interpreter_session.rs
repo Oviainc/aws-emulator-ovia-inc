@@ -227,16 +227,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let seq = store.next_seq();
-        let session = crate::state::CodeInterpreterSessionRecord {
-            session_id: crate::state::mint_code_interpreter_session_id(seq),
-            code_interpreter_identifier: input.code_interpreter_identifier.clone(),
-            name: input.name.clone(),
-            created_at: ::std::time::SystemTime::now(),
-            session_timeout_seconds: input.session_timeout_seconds,
-            certificates: input.certificates.clone(),
-            filesystem_configurations: input.filesystem_configurations.clone(),
+        // The one constructor both calls that start a session go through (the other is
+        // the tool invocation that names none), so the record each writes is the same
+        // shape.
+        let session = crate::state::CodeInterpreterSessionRecord::started(
             seq,
-        };
+            input.code_interpreter_identifier.clone(),
+            input.name.clone(),
+            input.session_timeout_seconds,
+            input.certificates.clone(),
+            input.filesystem_configurations.clone(),
+            ::std::time::SystemTime::now(),
+        );
         // Built from what is about to be stored, so the response and the store cannot
         // disagree. `CodeInterpreterSessionStatus` models only READY and TERMINATED, so
         // a started session is usable at once — which is why this response models no

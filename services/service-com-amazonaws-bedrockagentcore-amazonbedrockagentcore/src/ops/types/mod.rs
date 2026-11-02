@@ -56,6 +56,7 @@ pub mod get_workload_access_token_types;
 pub mod ingest_data_types;
 pub mod invoke_agent_runtime_types;
 pub mod invoke_browser_types;
+pub mod invoke_code_interpreter_types;
 pub mod list_ab_tests_types;
 pub mod list_actors_types;
 pub mod list_batch_evaluations_types;
@@ -161,6 +162,8 @@ pub use ingest_data_types::*;
 pub use invoke_agent_runtime_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use invoke_browser_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use invoke_code_interpreter_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_ab_tests_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

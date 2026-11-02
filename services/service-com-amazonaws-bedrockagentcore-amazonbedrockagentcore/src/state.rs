@@ -15,7 +15,14 @@
 //! The AgentCore *tools* data plane keeps its own map: a code interpreter holds the
 //! sessions `StartCodeInterpreterSession` started on it, and
 //! `GetCodeInterpreterSession` reports one of them back — its status read off the
-//! clock against the time-to-live the request asked for.
+//! clock against the time-to-live the request asked for, or off the stop that already
+//! terminated it ([`CodeInterpreterSessionRecord::status_as_of`]).
+//!
+//! A session also owns the WORKSPACE its tools read and write: the files
+//! `InvokeCodeInterpreter`'s file tools put in it, kept in memory beside the session
+//! record and reachable from no other session. Nothing of it touches a host path: a
+//! tool addresses a file by a workspace-relative key ([`normalize_session_path`]), and
+//! the bytes live in [`SessionFile`].
 //!
 //! The AgentCore *identity* plane keeps a third: every workload access token this
 //! service issued, in [`IssuedWorkloadAccessTokens`]. A token is MINTED by the call that
@@ -50,8 +57,15 @@
 //! same way: [`MAX_CODE_INTERPRETERS`], [`MAX_CODE_INTERPRETER_SESSIONS`] and
 //! [`MAX_IDEMPOTENCY_RECORDS_PER_CODE_INTERPRETER`], each evicting its least recently
 //! written record.
+//!
+//! A session's workspace is a growth site too — `InvokeCodeInterpreter`'s `writeFiles`
+//! tool chooses both the paths and the bytes — so it is bounded on the WRITE path by
+//! [`MAX_SESSION_FILES`] and [`MAX_SESSION_FILE_BYTES`], and a write that would pass
+//! either is refused rather than evicting a file a caller still expects to read. Each
+//! stop a `clientToken` replays is recorded too, bounded by
+//! [`MAX_STOP_TOKENS_PER_SESSION`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -99,6 +113,46 @@ pub const MAX_CODE_INTERPRETER_SESSIONS: usize = 256;
 /// The most `clientToken` records this emulator retains for one code interpreter.
 pub const MAX_IDEMPOTENCY_RECORDS_PER_CODE_INTERPRETER: usize = 1_000;
 
+/// The most files one code interpreter session's workspace holds.
+///
+/// An EMULATOR ceiling, not an AWS quota: the workspace lives in this process's memory
+/// and a caller chooses every path it writes, so without a ceiling one session could
+/// grow the heap without end. A write past it is refused, which is what a workspace
+/// with no room left does — nothing already written is dropped.
+pub const MAX_SESSION_FILES: usize = 1_024;
+
+/// The most bytes one code interpreter session's workspace holds across every file in
+/// it. The same EMULATOR ceiling as [`MAX_SESSION_FILES`], over size rather than count:
+/// the modelled `content` member admits 100 MB per block, which no in-memory workspace
+/// can take per request.
+pub const MAX_SESSION_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most replayed-stop `clientToken` records one session keeps, so a caller looping
+/// on `StopCodeInterpreterSession` with a fresh token cannot grow the record.
+pub const MAX_STOP_TOKENS_PER_SESSION: usize = 256;
+
+/// The longest workspace-relative path this emulator addresses a session file by, and
+/// the most segments it admits. `MaxLenString` bounds a tool's `path` at 100 MB, which
+/// is no path, so these are the EMULATOR's own bounds on the key side of a write.
+pub const MAX_SESSION_PATH_BYTES: usize = 1_024;
+/// See [`MAX_SESSION_PATH_BYTES`].
+pub const MAX_SESSION_PATH_SEGMENTS: usize = 32;
+
+/// The most scripts one session's execution context keeps, and the most bytes across
+/// them. The EMULATOR's own ceilings, for the same reason the workspace has them: a
+/// caller chooses both how many scripts it runs in a session and how long each is, and
+/// the context is re-evaluated on each later run, so it bounds work as well as memory.
+/// The oldest script gives way first.
+pub const MAX_CONTEXT_SCRIPTS: usize = 16;
+/// See [`MAX_CONTEXT_SCRIPTS`].
+pub const MAX_CONTEXT_BYTES: usize = 256 * 1024;
+
+/// The time-to-live a code interpreter session takes when the call that starts it names
+/// none: `CodeInterpreterSessionTimeout`'s modelled `@default` (source: smithy_query
+/// query="operation" operation="StartCodeInterpreterSession", `sessionTimeoutSeconds`
+/// range 1..28800, default 900).
+pub const DEFAULT_CODE_INTERPRETER_SESSION_TIMEOUT_SECONDS: i32 = 900;
+
 /// The most workload access tokens this emulator holds issuances for at once.
 ///
 /// An EMULATOR ceiling, not an AWS quota: every call that asks for a token appends one
@@ -130,6 +184,17 @@ pub const CODE_INTERPRETER_SESSION_READY: &str = "READY";
 /// `CodeInterpreterSessionStatus` for a session whose time-to-live has run out, from
 /// the same enum.
 pub const CODE_INTERPRETER_SESSION_TERMINATED: &str = "TERMINATED";
+
+/// How this service words the `ConflictException` a call gets when the code
+/// interpreter session it names is no longer running: `Session already terminated:
+/// <sessionId>`, with the session taken from the request.
+///
+/// One sentence for both callers — the stop that cannot stop it again and the tool
+/// invocation that cannot run in it — so the two cannot word the same condition
+/// differently.
+pub fn session_already_terminated(session_id: &str) -> String {
+    format!("Session already terminated: {session_id}")
+}
 
 /// Per-service state for com-amazonaws-bedrockagentcore-amazonbedrockagentcore. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -458,6 +523,20 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
             .get(code_interpreter_identifier)?
             .sessions
             .get(session_id)
+    }
+
+    /// The stored code interpreter session addressed by (code interpreter, session),
+    /// for a caller that is about to CHANGE it — a stop, or a tool that writes the
+    /// session's workspace.
+    pub fn code_interpreter_session_mut(
+        &mut self,
+        code_interpreter_identifier: &str,
+        session_id: &str,
+    ) -> Option<&mut CodeInterpreterSessionRecord> {
+        self.code_interpreters
+            .get_mut(code_interpreter_identifier)?
+            .sessions
+            .get_mut(session_id)
     }
 
     /// The session a `clientToken` already started on this code interpreter, or `None`
@@ -841,8 +920,9 @@ pub struct SessionLocator {
     pub seq: u64,
 }
 
-/// One code interpreter session: exactly what `StartCodeInterpreterSession`
-/// persisted, which is what `GetCodeInterpreterSession` reports.
+/// One code interpreter session: what `StartCodeInterpreterSession` persisted, which
+/// is what `GetCodeInterpreterSession` reports, plus what the calls that act ON the
+/// session write — the stop that terminated it and the workspace its tools use.
 #[derive(Debug, Clone)]
 pub struct CodeInterpreterSessionRecord {
     /// Minted by [`mint_code_interpreter_session_id`]; never client-supplied.
@@ -855,13 +935,145 @@ pub struct CodeInterpreterSessionRecord {
     pub session_timeout_seconds: i32,
     pub certificates: Option<Vec<Certificate>>,
     pub filesystem_configurations: Option<Vec<ToolsFileSystemConfiguration>>,
+    /// When this session was last changed by a call: its creation instant until a call
+    /// changes it, and the instant of the stop that terminated it afterwards. This is
+    /// what `StopCodeInterpreterSession` reports as `lastUpdatedAt`.
+    pub last_updated_at: SystemTime,
+    /// When `StopCodeInterpreterSession` terminated this session, or `None` while no
+    /// stop has. A stopped session is `TERMINATED` from that instant on, whatever is
+    /// left of its time-to-live.
+    pub stopped_at: Option<SystemTime>,
+    /// The `clientToken` of each stop this session has already served, with the
+    /// `lastUpdatedAt` that stop answered: `StopCodeInterpreterSession` is
+    /// `@idempotent` and its `clientToken` an `@idempotencyToken`, so a replayed token
+    /// answers with the stop it already performed rather than conflicting with it.
+    /// Bounded by [`MAX_STOP_TOKENS_PER_SESSION`].
+    pub stop_tokens: BTreeMap<String, SystemTime>,
+    /// This session's workspace: the files its tools have written, keyed by the
+    /// workspace-relative path [`normalize_session_path`] spells. Bounded by
+    /// [`MAX_SESSION_FILES`] and [`MAX_SESSION_FILE_BYTES`].
+    pub files: BTreeMap<String, SessionFile>,
+    /// The scripts this session's `executeCode` tool has run to completion, oldest
+    /// first: the session's execution CONTEXT, which the next run is evaluated on top
+    /// of unless that run asked for the context to be cleared. A script that ended on
+    /// an exception is not kept, and neither is one whose run hit a bound. Bounded by
+    /// [`MAX_CONTEXT_SCRIPTS`] and [`MAX_CONTEXT_BYTES`], oldest first.
+    pub context_scripts: Vec<String>,
     /// The value [`ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState::next_seq`]
     /// handed this session: its eviction order, and what keeps two sessions started in
     /// the same millisecond apart.
     pub seq: u64,
 }
 
+/// One file in a session's workspace: the bytes a `writeFiles` tool put there and when
+/// it did. The bytes are held in this process's memory only — no host path is opened
+/// for them, and no other session reaches them.
+#[derive(Debug, Clone)]
+pub struct SessionFile {
+    pub bytes: Vec<u8>,
+    pub written_at: SystemTime,
+}
+
+/// Why a workspace write was refused: the ceiling it would have passed, and that
+/// ceiling's value, so a caller is told which limit it met.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceFull {
+    /// [`MAX_SESSION_FILES`] would have been passed.
+    Files(usize),
+    /// [`MAX_SESSION_FILE_BYTES`] would have been passed.
+    Bytes(usize),
+}
+
+/// Why a tool's `path` addresses no file in a workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathRejection {
+    /// The path names nothing once its separators are removed.
+    Empty,
+    /// The path is absolute: a workspace path is relative to the workspace root.
+    Absolute,
+    /// The path walks out of the workspace with a `..` segment.
+    Escapes,
+    /// The path is longer than [`MAX_SESSION_PATH_BYTES`] or has more than
+    /// [`MAX_SESSION_PATH_SEGMENTS`] segments.
+    TooLong,
+}
+
+/// The workspace key a tool's `path` addresses, or why it addresses none.
+///
+/// A workspace path is relative to the session's workspace root and is a KEY in
+/// [`CodeInterpreterSessionRecord::files`], never a host path: `.` segments are
+/// dropped, repeated separators collapse, and a `..` segment is refused rather than
+/// resolved, so no tool argument can name anything outside the session's own state.
+/// Both bounds are checked before anything is stored.
+pub fn normalize_session_path(path: &str) -> Result<String, PathRejection> {
+    if path.len() > MAX_SESSION_PATH_BYTES {
+        return Err(PathRejection::TooLong);
+    }
+    if path.starts_with('/') {
+        return Err(PathRejection::Absolute);
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => return Err(PathRejection::Escapes),
+            named => segments.push(named),
+        }
+    }
+    if segments.is_empty() {
+        return Err(PathRejection::Empty);
+    }
+    if segments.len() > MAX_SESSION_PATH_SEGMENTS {
+        return Err(PathRejection::TooLong);
+    }
+    Ok(segments.join("/"))
+}
+
+/// The workspace key a tool's `directoryPath` addresses: the same normalization as
+/// [`normalize_session_path`], except that the empty path is the workspace ROOT (which
+/// is how `listFiles` addresses the whole workspace) rather than a rejection.
+pub fn normalize_session_directory(path: &str) -> Result<String, PathRejection> {
+    match normalize_session_path(path) {
+        Ok(key) => Ok(key),
+        Err(PathRejection::Empty) => Ok(String::new()),
+        Err(other) => Err(other),
+    }
+}
+
 impl CodeInterpreterSessionRecord {
+    /// A session as the call that starts it leaves it: the configuration that call
+    /// asked for, created at `created_at`, with an empty workspace and an empty
+    /// execution context.
+    ///
+    /// Both callers go through this: `StartCodeInterpreterSession`, and the tool
+    /// invocation that names no session and therefore starts one.
+    pub fn started(
+        seq: u64,
+        code_interpreter_identifier: String,
+        name: Option<String>,
+        session_timeout_seconds: i32,
+        certificates: Option<Vec<Certificate>>,
+        filesystem_configurations: Option<Vec<ToolsFileSystemConfiguration>>,
+        created_at: SystemTime,
+    ) -> Self {
+        Self {
+            session_id: mint_code_interpreter_session_id(seq),
+            code_interpreter_identifier,
+            name,
+            created_at,
+            session_timeout_seconds,
+            certificates,
+            filesystem_configurations,
+            // Nothing has changed this session yet, so the last instant it changed is
+            // the instant it came into being.
+            last_updated_at: created_at,
+            stopped_at: None,
+            stop_tokens: BTreeMap::new(),
+            files: BTreeMap::new(),
+            context_scripts: Vec::new(),
+            seq,
+        }
+    }
     /// The instant this session's time-to-live runs out, or `None` when that instant
     /// is not representable (so nothing can be past it).
     ///
@@ -875,15 +1087,175 @@ impl CodeInterpreterSessionRecord {
         self.created_at.checked_add(ttl)
     }
 
-    /// This session's `CodeInterpreterSessionStatus` at `now`: `READY` until its
-    /// time-to-live has run out, `TERMINATED` from then on. The clock alone decides,
-    /// so a read reports the termination that was already due without writing
-    /// anything.
+    /// This session's `CodeInterpreterSessionStatus` at `now`: `TERMINATED` once a stop
+    /// has terminated it or its time-to-live has run out, `READY` until then. Both
+    /// readings come off stored state and the clock, so a read reports the termination
+    /// that was already due without writing anything.
     pub fn status_as_of(&self, now: SystemTime) -> &'static str {
+        if self.stopped_at.is_some() {
+            return CODE_INTERPRETER_SESSION_TERMINATED;
+        }
         match self.expires_at() {
             Some(expiry) if now >= expiry => CODE_INTERPRETER_SESSION_TERMINATED,
             _ => CODE_INTERPRETER_SESSION_READY,
         }
+    }
+
+    /// Terminate this session at `now`, as `StopCodeInterpreterSession` does: the
+    /// status every later read reports becomes `TERMINATED`, and `now` is the
+    /// `lastUpdatedAt` this stop and every replay of its `client_token` answer with.
+    ///
+    /// The workspace is dropped with the session's run, because the documented effect
+    /// of a stop is that the session "releases associated resources" and cannot be
+    /// restarted, so neither the files a tool wrote nor the execution context a run
+    /// built is reachable afterwards.
+    pub fn stop(&mut self, now: SystemTime, client_token: Option<&str>) {
+        self.stopped_at = Some(now);
+        self.last_updated_at = now;
+        self.files.clear();
+        self.context_scripts.clear();
+        if let Some(token) = client_token {
+            self.stop_tokens.insert(token.to_string(), now);
+            while self.stop_tokens.len() > MAX_STOP_TOKENS_PER_SESSION {
+                // The earliest-recorded token gives way first; the stop a caller just
+                // replayed is the one that stays answerable.
+                let Some(oldest) = self
+                    .stop_tokens
+                    .iter()
+                    .min_by_key(|(key, at)| (**at, (*key).clone()))
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                self.stop_tokens.remove(&oldest);
+            }
+        }
+    }
+
+    /// The `lastUpdatedAt` the stop this `client_token` already performed answered
+    /// with, or `None` when this token has performed none.
+    pub fn stop_replay(&self, client_token: &str) -> Option<SystemTime> {
+        self.stop_tokens.get(client_token).copied()
+    }
+
+    /// How many bytes this session's workspace holds across every file in it.
+    pub fn workspace_bytes(&self) -> usize {
+        self.files.values().map(|file| file.bytes.len()).sum()
+    }
+
+    /// Whether this session's workspace has room for `batch` — the (key, size) pairs
+    /// one call would store, each key at most once — or the ceiling the batch would
+    /// pass.
+    ///
+    /// The whole batch is weighed at once, with the bytes each key already holds
+    /// discounted, so a caller is told the workspace is full BEFORE any of its files is
+    /// stored rather than part-way through.
+    pub fn room_for(&self, batch: &[(String, usize)]) -> Result<(), WorkspaceFull> {
+        let mut added_keys = 0usize;
+        let mut bytes = self.workspace_bytes();
+        for (key, size) in batch {
+            match self.files.get(key) {
+                Some(held) => bytes = bytes.saturating_sub(held.bytes.len()),
+                None => added_keys = added_keys.saturating_add(1),
+            }
+            bytes = bytes.saturating_add(*size);
+        }
+        if self.files.len().saturating_add(added_keys) > MAX_SESSION_FILES {
+            return Err(WorkspaceFull::Files(MAX_SESSION_FILES));
+        }
+        if bytes > MAX_SESSION_FILE_BYTES {
+            return Err(WorkspaceFull::Bytes(MAX_SESSION_FILE_BYTES));
+        }
+        Ok(())
+    }
+
+    /// Write `bytes` to the workspace key `path` at `now`, replacing whatever that key
+    /// held, or refuse the write because the workspace has no room for it.
+    ///
+    /// Both ceilings are checked against what the workspace would hold AFTER this
+    /// write, with the replaced file's own bytes discounted, so rewriting a file never
+    /// fails on the size the previous version took.
+    pub fn write_file(
+        &mut self,
+        path: &str,
+        bytes: Vec<u8>,
+        now: SystemTime,
+    ) -> Result<(), WorkspaceFull> {
+        let replaced = self.files.get(path).map_or(0, |file| file.bytes.len());
+        if !self.files.contains_key(path) && self.files.len() >= MAX_SESSION_FILES {
+            return Err(WorkspaceFull::Files(MAX_SESSION_FILES));
+        }
+        let after = self
+            .workspace_bytes()
+            .saturating_sub(replaced)
+            .saturating_add(bytes.len());
+        if after > MAX_SESSION_FILE_BYTES {
+            return Err(WorkspaceFull::Bytes(MAX_SESSION_FILE_BYTES));
+        }
+        self.files.insert(
+            path.to_string(),
+            SessionFile {
+                bytes,
+                written_at: now,
+            },
+        );
+        Ok(())
+    }
+
+    /// Every workspace key directly under `directory` (the workspace root when it is
+    /// empty), in path order: a file as `(key, Some(size))` and an immediate
+    /// subdirectory as `(key, None)`, each named once.
+    pub fn list_directory(&self, directory: &str) -> Vec<(String, Option<usize>)> {
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let mut entries: BTreeMap<String, Option<usize>> = BTreeMap::new();
+        for (key, file) in &self.files {
+            let Some(relative) = key.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            match relative.split_once('/') {
+                // A deeper file names the subdirectory it is in, not itself.
+                Some((child, _)) => {
+                    entries.insert(format!("{prefix}{child}"), None);
+                }
+                None => {
+                    entries.insert(key.clone(), Some(file.bytes.len()));
+                }
+            }
+        }
+        entries.into_iter().collect()
+    }
+
+    /// Keep `script` as part of this session's execution context, so the next run of
+    /// its `executeCode` tool is evaluated on top of it.
+    ///
+    /// Called only for a script that ran to completion: one that ended on an exception
+    /// defined nothing a later run can rely on. The oldest script gives way once
+    /// either ceiling is passed, so the context a caller just built is the part that
+    /// survives.
+    pub fn keep_context_script(&mut self, script: String) {
+        if script.len() > MAX_CONTEXT_BYTES {
+            // One script larger than the whole context cannot be kept at all; the run
+            // itself already happened.
+            return;
+        }
+        self.context_scripts.push(script);
+        while self.context_scripts.len() > MAX_CONTEXT_SCRIPTS
+            || self.context_bytes() > MAX_CONTEXT_BYTES
+        {
+            if self.context_scripts.is_empty() {
+                break;
+            }
+            self.context_scripts.remove(0);
+        }
+    }
+
+    /// How many bytes this session's execution context holds across every script in it.
+    pub fn context_bytes(&self) -> usize {
+        self.context_scripts.iter().map(String::len).sum()
     }
 }
 

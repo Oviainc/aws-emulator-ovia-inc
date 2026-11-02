@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/code_interpreter_sessions.rs"]
 mod code_interpreter_sessions;
+#[path = "all/code_interpreter_tools.rs"]
+mod code_interpreter_tools;
 #[path = "all/memory_events.rs"]
 mod memory_events;
 #[path = "all/memory_ingestion.rs"]

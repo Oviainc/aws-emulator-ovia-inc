@@ -19,11 +19,29 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `tokio` beyond the workspace's own features: `InvokeCodeInterpreter` runs a script on
+# the blocking pool (`rt`), bounds how many run at once with a `sync` semaphore, and
+# bounds the wait for one of those slots with `time`.
+tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `rquickjs`: the QuickJS JavaScript engine, embedded in this process, which is what
+# actually RUNS the JavaScript a caller submits to `InvokeCodeInterpreter`'s
+# `executeCode` tool — nothing about a run is synthesised. Default features only: the
+# `loader` and `dyn-load` features (module resolution and native module loading) are
+# deliberately NOT enabled, so a submitted script can import nothing, and plain QuickJS
+# exposes no filesystem, process or socket API at all. Each run is bounded by a memory
+# limit, a stack limit, an interrupt deadline and an output cap, on a blocking thread —
+# see `src/ops/invoke_code_interpreter.rs`.
+#
+# It is also a NATIVE component: `rquickjs-sys` compiles the QuickJS C sources with
+# `cc` at build time, on the builder's machine and with the builder's authority, and
+# that C is outside this crate's `#![forbid(unsafe_code)]`. The version is pinned and
+# resolves with a checksum in Cargo.lock, so the engine every user runs is the one
+# reviewed here.
+rquickjs = "0.9"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -31,6 +49,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Decodes one `application/vnd.amazon.eventstream` frame, so a test reads
+# `InvokeCodeInterpreter`'s response the way an SDK's event-stream decoder does.
+aws-smithy-eventstream = "0.60"
 
 [lints]
 workspace = true
