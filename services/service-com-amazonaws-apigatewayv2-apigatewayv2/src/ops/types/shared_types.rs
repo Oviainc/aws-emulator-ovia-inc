@@ -334,13 +334,46 @@ pub struct RouteSettings {
     pub throttling_rate_limit: Option<f64>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#Preview")]
+/// `Preview$PreviewStatus` is `@required` in the model, yet the portal body AWS answers
+/// carries `preview` as the EMPTY object `{}` until something has built a preview — so this
+/// shape's schema and codec are written out with `apigwv2_schema_and_codec!` (see
+/// `types/date_time_wire.rs`) instead of derived: `#[smithy_macros::smithy(shape = ...)]`
+/// requires a `@required` member to be a bare field and writes it on every serialization,
+/// which would put a status on the wire for a preview that does not exist. The member is
+/// `@clientOptional`, so a client reads it as optional anyway. Member set, order, wire
+/// names from `smithy_query(query="shape", shape="Preview")`; `PreviewStatus` is an enum
+/// shape, which the generator writes as `ShapeType::String`.
 #[derive(Debug, Clone, Default)]
 pub struct Preview {
-    pub preview_status: String,
+    pub preview_status: Option<String>,
     pub preview_url: Option<String>,
     pub status_exception: Option<StatusException>,
 }
+
+apigwv2_schema_and_codec!(
+    Preview,
+    PREVIEW_SCHEMA,
+    "Preview",
+    (
+        M_PREVIEW_STATUS,
+        preview_status,
+        "PreviewStatus",
+        "previewStatus",
+        0,
+        opt,
+        string
+    ),
+    (M_PREVIEW_URL, preview_url, "PreviewUrl", "previewUrl", 1, opt, string),
+    (
+        M_STATUS_EXCEPTION,
+        status_exception,
+        "StatusException",
+        "statusException",
+        2,
+        opt,
+        struct_of(StatusException)
+    ),
+);
 
 /// The values `AuthorizationType` accepts on the wire.
 pub const AUTHORIZATION_TYPE_VALUES: &[&str] = &["AWS_IAM", "CUSTOM", "JWT", "NONE"];

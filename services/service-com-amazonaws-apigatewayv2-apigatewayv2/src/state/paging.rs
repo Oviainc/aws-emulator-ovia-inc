@@ -140,6 +140,15 @@ pub trait CreatedInOrder {
     fn creation_order(&self) -> u64;
 }
 
+/// A BORROWED record is ordered by the record itself, so a reader that pages over a
+/// FILTERED view of a collection — a map of references, which is the cheapest way to leave
+/// records out without copying them — reports the same order the whole collection has.
+impl<V: CreatedInOrder> CreatedInOrder for &V {
+    fn creation_order(&self) -> u64 {
+        (*self).creation_order()
+    }
+}
+
 /// The position in `scope` a caller-supplied `NextToken` resumes at, or the refusal of a
 /// token this service did not issue for that collection; `None` for a request carrying
 /// none, which starts at the beginning.

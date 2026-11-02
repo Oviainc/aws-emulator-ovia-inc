@@ -212,6 +212,10 @@ fn resolve<'s, 'r>(
 /// `DomainName` the account brought ("You can provide a custom domain to override this
 /// value"). The comparison is case-insensitive and ignores any `:port` and userinfo,
 /// because a host is not case-sensitive and the port is not part of the name.
+///
+/// Only a portal the account still HOLDS claims its domains: a portal `DeletePortal` has
+/// taken away serves nothing, so the host it recorded is a host this service answers for no
+/// longer, whatever tombstone of it the store keeps for `GetPortal` to report.
 fn portal_of_host<'s>(
     store: &'s ComAmazonawsApigatewayv2Apigatewayv2State,
     host: &str,
@@ -220,7 +224,7 @@ fn portal_of_host<'s>(
     if name.is_empty() {
         return None;
     }
-    store.portals.values().find(|portal| {
+    store.live_portals().find(|portal| {
         let endpoint = &portal.endpoint_configuration;
         endpoint.portal_default_domain_name.eq_ignore_ascii_case(name)
             || endpoint
@@ -257,7 +261,7 @@ fn local_endpoint_path<'s, 'r>(
         return None;
     }
     let (portal_id, rest) = split_first_segment(rest)?;
-    store.portals.get(portal_id).map(|portal| Resolved {
+    store.live_portal(portal_id).map(|portal| Resolved {
         portal,
         site_path: rest,
     })

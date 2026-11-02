@@ -15,10 +15,14 @@
 //!
 //! A disable takes a publication down rather than making one, so the portal keeps what
 //! it reports for `LastPublished` and `LastPublishedDescription`: those name the last
-//! publication there WAS. It needs nothing of the portal to be free — revoking what the
-//! portal serves supersedes a publish the service is still building (which then
-//! publishes nothing) rather than queueing behind it, and a preview being built does not
-//! hold it up (see [`crate::state::Portal::start_build`]).
+//! publication there WAS.
+//!
+//! It is accepted only from a `PublishStatus` a publication can be taken down FROM
+//! ([`crate::state::PORTAL_DISABLE_FROM_STATUSES`]) and refuses every other with 409
+//! `ConflictException`: there is nothing to take down on a portal that publishes nothing,
+//! and a portal the service is mid-build on has no settled publication to remove yet. A
+//! preview being built does not hold it up — a preview changes nothing about what the
+//! portal publishes (see [`crate::state::Portal::start_build`]).
 //!
 //! ## Shape of an operation
 //!
@@ -183,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        let Some(record) = store.portals.get_mut(&input.portal_id) else {
+        let Some(record) = store.live_portal_mut(&input.portal_id) else {
             // The message a portal reader answers for an id the account holds no portal
             // under; the same wording `get_portal` uses.
             return Err(DisablePortalErrorModeled::NotFoundException(NotFoundException {
@@ -193,20 +197,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
+
+        // There has to BE a publication to take down. A portal publishing nothing (one
+        // nothing has published, and one whose publication is already down) and a portal
+        // the service is mid-build on report a status that is none of the ones a
+        // publication can be taken down from, and the call is refused: accepting it would
+        // move the portal into a take-down of nothing and leave the caller with no signal
+        // that what it asked for could not be done.
+        //
+        // The status is read as of the clock, so a build the service already owed is
+        // counted as the status it settles in: the refusal lifts of its own accord once a
+        // publish comes due, with nothing but the clock having happened.
+        let reported = record.publish_status_at(now);
+        let conflict = || -> Self::Error {
+            DisablePortalErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::PORTAL_DISABLE_PRECONDITION_MESSAGE.to_string()),
+            })
+            .into()
+        };
+        if !crate::state::PORTAL_DISABLE_FROM_STATUSES.contains(&reported.as_str()) {
+            return Err(conflict());
+        }
+
         // Taking the publication down is the SERVICE's work, which is why the operation
         // answers 204 with no body and the portal reports `DISABLE_IN_PROGRESS` until
         // that work comes due. What the portal's domain SERVES does not wait for it: the
         // revocation applies from this instant (`Portal::live_site`).
-        let now = ::std::time::SystemTime::now();
-        if let Err(in_flight) = record.start_build(now, crate::state::PortalBuild::Disable) {
-            return Err(DisablePortalErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "The portal {} is {in_flight} and its publication cannot be removed \
-                     until that operation is complete.",
-                    input.portal_id
-                )),
-            })
-            .into());
+        if record
+            .start_build(now, crate::state::PortalBuild::Disable)
+            .is_err()
+        {
+            // Unreachable while the precondition above holds — a portal with a build in
+            // flight reports an `..._IN_PROGRESS` status, which is not one a publication
+            // can be taken down from — and answered as the same conflict if it ever is.
+            return Err(conflict());
         }
 
         Ok(DisablePortalOutput)

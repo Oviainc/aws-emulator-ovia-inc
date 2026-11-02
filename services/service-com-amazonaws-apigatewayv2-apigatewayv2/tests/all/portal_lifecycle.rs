@@ -404,10 +404,14 @@ async fn create_portal_persists_the_record_and_get_portal_reports_it_back() {
                 "case {case:?}: expected GetPortal to report no {member}, got {fetched}"
             );
         }
-        // Nothing has previewed this portal, so there is no preview to report.
-        assert!(
-            fetched.get("preview").is_none_or(Value::is_null),
-            "case {case:?}: expected no preview on a portal nothing previewed, got {fetched}"
+        // Nothing has previewed this portal, so the preview it reports carries nothing —
+        // the member itself is always there, as an empty structure, so a client reading
+        // `portal.preview` to decide whether a preview exists is never handed a null.
+        assert_eq!(
+            fetched.get("preview"),
+            Some(&json!({})),
+            "case {case:?}: expected the empty preview on a portal nothing previewed, got \
+             {fetched}"
         );
 
         // Reading the portal changed nothing a later caller sees.

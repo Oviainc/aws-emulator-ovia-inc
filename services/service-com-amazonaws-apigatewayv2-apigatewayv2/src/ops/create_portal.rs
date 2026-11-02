@@ -230,7 +230,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Bound the growth a caller drives: `TooManyRequestsException` is the modelled
         // error for "a limit has been exceeded", and it names the limit in `LimitType`.
-        if store.portals.len() >= crate::state::MAX_PORTALS {
+        // The quota counts the portals the account HOLDS, so a deleted portal occupies no
+        // slot however long its tombstone is kept for `GetPortal` to report.
+        if store.live_portals().count() >= crate::state::MAX_PORTALS {
             return Err(CreatePortalErrorModeled::TooManyRequestsException(
                 TooManyRequestsException {
                     limit_type: Some("Portal".to_string()),
@@ -302,6 +304,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // And nothing is live on its domain until a publish has built something.
             published_site: ::std::option::Option::None,
             preview_ready_at: ::std::option::Option::None,
+            // Created, so not deleted: the record is one the account holds.
+            deleted_at: ::std::option::Option::None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             portal_id: portal_id.clone(),
         };

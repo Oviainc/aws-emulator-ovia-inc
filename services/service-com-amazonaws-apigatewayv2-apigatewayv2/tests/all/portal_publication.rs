@@ -18,30 +18,30 @@
 //! * **A disable takes the publication down but not its history**: the portal reports
 //!   `DISABLE_IN_PROGRESS` while the service removes the publication and settles in
 //!   `DISABLED`, from where it serves nothing, and still reports the last publication
-//!   there WAS — a publish the disable superseded publishes nothing when its own span
-//!   passes. (That the portal's DOMAIN stops serving from the instant the disable is
+//!   there WAS. (That the portal's DOMAIN stops serving from the instant the disable is
 //!   accepted, rather than when that status settles, is asserted in
-//!   `portal_publication_revocation`.)
+//!   `portal_publication_revocation`; that a disable is accepted only from a status a
+//!   publication can be taken down from, in `portal_terminal_lifecycle`.)
 //! * **A preview changes nothing about what the portal publishes**: its `PublishStatus`
 //!   is left exactly as it was, and the portal reports a `Preview` whose status moves
-//!   from `PREVIEW_IN_PROGRESS` to `PREVIEW_READY` and whose URL names this portal.
-//! * **A build starts only when what it needs is free**: a publish needs the portal's
-//!   publication still AND its content build free, a preview needs the content build
-//!   free, and a disable needs nothing — revoking what the portal serves supersedes a
-//!   publication change still in flight (which then publishes nothing) rather than
-//!   queueing behind it. So a preview and a disable run side by side while a publish
-//!   runs alone. A build that cannot start is refused 409 `ConflictException` and writes
-//!   nothing, and the refusal lifts of its own accord once the build the service already
-//!   owes comes due.
+//!   from `PREVIEW_IN_PROGRESS` to `PREVIEW_READY` and whose URL names this portal —
+//!   while a portal nothing has previewed reports the EMPTY preview.
+//! * **A build starts only when what it needs is free**: a publish and a disable each
+//!   need the portal's publication still, a publish and a preview each need its content
+//!   build free, and a disable builds no content. So a preview and a disable run side by
+//!   side while a publish runs alone. A build that cannot start is refused 409
+//!   `ConflictException` and writes nothing, and the refusal lifts of its own accord once
+//!   the build the service already owes comes due — unless what the first build left is a
+//!   portal publishing nothing, which a second disable has nothing to take down from.
 //! * **A portal is built only through its own minted id**: an id nothing minted is 404
 //!   `NotFoundException` from all three calls.
 //!
 //! The rows vary what the rules generalise over: WHICH of the three builds runs first
-//! and which runs second (every ordered pair of them), the publication state the portal
-//! is in when a build starts (never published, published, a publish still in flight,
-//! disabled), how many times a disable is called, and the description a publish carries
-//! (none, the empty string, a typical one, the maximum 1024 characters the modelled
-//! `__stringMin0Max1024` allows, and one replacing an earlier one).
+//! and which runs second (every ordered pair of them), the publication the portal holds
+//! when a build starts (one publish settled, two settled, a build still in flight), and
+//! the description a publish carries (none, the empty string, a typical one, the maximum
+//! 1024 characters the modelled `__stringMin0Max1024` allows, and one replacing an
+//! earlier one).
 
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -122,9 +122,10 @@ impl Build {
         }
     }
 
-    /// Whether this build needs the portal's publication to be still.
+    /// Whether this build needs the portal's publication to be still: a publish and a
+    /// disable each move the publication, so neither starts while the other is moving it.
     fn needs_a_still_publication(self) -> bool {
-        matches!(self, Build::Publish)
+        matches!(self, Build::Publish | Build::Disable)
     }
 
     /// Whether this build builds the portal's CONTENT — which it both needs free and
@@ -398,18 +399,17 @@ async fn publish_portal_is_server_managed_and_settles_in_published() {
     }
 }
 
-/// One disable row: what the portal's publication was doing when the disable arrived,
-/// and how many times the disable was called.
+/// One disable row: the publication the portal holds when the disable arrives, named by
+/// the descriptions of the publishes that made it.
 struct DisableRow {
     case: &'static str,
-    /// The description of a publish SETTLED before the disable, if any.
-    published_description: Option<&'static str>,
-    /// Whether a further publish is started, and left in flight, when the disable
-    /// arrives: that publish is superseded and publishes nothing.
-    publish_in_flight: bool,
-    /// How many times the disable is called: a publication already taken down is taken
-    /// down again just the same.
-    disables: usize,
+    /// The description of the publish SETTLED before the disable: every row has one,
+    /// because a publication is what a disable takes down
+    /// (`PORTAL_DISABLE_FROM_STATUSES`).
+    published_description: &'static str,
+    /// The description of a second settled publish, when the row republishes before the
+    /// disable.
+    republished_description: Option<&'static str>,
 }
 
 #[tokio::test]
@@ -419,39 +419,24 @@ async fn disable_portal_takes_the_publication_down_and_keeps_its_history() {
     for row in [
         DisableRow {
             case: "a published portal is taken back down",
-            published_description: Some("the version being taken down"),
-            publish_in_flight: false,
-            disables: 1,
+            published_description: "the version being taken down",
+            republished_description: Option::None,
         },
         DisableRow {
-            case: "a portal nothing ever published is disabled too",
-            published_description: Option::None,
-            publish_in_flight: false,
-            disables: 1,
-        },
-        DisableRow {
-            case: "a disable arriving while the first publish is still being built",
-            published_description: Option::None,
-            publish_in_flight: true,
-            disables: 1,
-        },
-        DisableRow {
-            case: "a disable arriving while a republish is still being built",
-            published_description: Some("the version being taken down"),
-            publish_in_flight: true,
-            disables: 1,
-        },
-        DisableRow {
-            case: "a publication taken down twice",
-            published_description: Some("the version being taken down"),
-            publish_in_flight: false,
-            disables: 2,
+            case: "a republished portal is taken down, keeping the last version's \
+                   description",
+            published_description: "the first version",
+            republished_description: Some("the version being taken down"),
         },
     ] {
         let case = row.case;
         let (portal_id, _) = create_portal(&emulator, case, "Disabled Portal").await;
 
-        if let Some(description) = row.published_description {
+        let mut last_description = row.published_description;
+        for description in [Some(row.published_description), row.republished_description]
+            .into_iter()
+            .flatten()
+        {
             accepted(
                 &emulator,
                 case,
@@ -461,37 +446,25 @@ async fn disable_portal_takes_the_publication_down_and_keeps_its_history() {
             )
             .await;
             sleep(past_the_build());
-        }
-        if row.publish_in_flight {
-            accepted(
-                &emulator,
-                case,
-                Build::Publish,
-                &portal_id,
-                Some(json!({ "description": "superseded by the disable" })),
-            )
-            .await;
+            last_description = description;
         }
 
-        for call_number in 1..=row.disables {
-            accepted(&emulator, case, Build::Disable, &portal_id, Option::None).await;
+        accepted(&emulator, case, Build::Disable, &portal_id, Option::None).await;
 
-            // Removing the publication is the SERVICE's work, so the portal reports it
-            // in progress until the build this call started comes due. (That the
-            // portal's DOMAIN stops serving from the instant the disable is accepted,
-            // rather than when this status settles, is asserted in
-            // `portal_publication_revocation`.)
-            let building = get_portal(&emulator, case, &portal_id).await;
-            assert_eq!(
-                publish_status(case, &building),
-                PUBLISH_STATUS_DISABLE_IN_PROGRESS,
-                "case {case:?}: expected disable {call_number} to be in progress, got \
-                 {building}"
-            );
-        }
+        // Removing the publication is the SERVICE's work, so the portal reports it
+        // in progress until the build this call started comes due. (That the
+        // portal's DOMAIN stops serving from the instant the disable is accepted,
+        // rather than when this status settles, is asserted in
+        // `portal_publication_revocation`.)
+        let building = get_portal(&emulator, case, &portal_id).await;
+        assert_eq!(
+            publish_status(case, &building),
+            PUBLISH_STATUS_DISABLE_IN_PROGRESS,
+            "case {case:?}: expected the disable to be in progress, got {building}"
+        );
 
-        // The transition is owed by the CLOCK, and once it has passed nothing has put
-        // the publication back: a publish this disable superseded publishes nothing.
+        // The transition is owed by the CLOCK: the same read reports it settled with
+        // nothing having been called in between.
         sleep(past_the_build());
         let settled = get_portal(&emulator, case, &portal_id).await;
         assert_eq!(
@@ -501,24 +474,14 @@ async fn disable_portal_takes_the_publication_down_and_keeps_its_history() {
              {PUBLISH_STATUS_DISABLED}, got {settled}"
         );
 
-        // A disable removes the publication, not the record of the last one there was —
-        // and a publish it superseded made none, so it adds nothing to that record.
-        match row.published_description {
-            Some(description) => {
-                assert_eq!(
-                    as_str(&settled, "lastPublishedDescription"),
-                    description,
-                    "case {case:?}: expected the disabled portal to keep the description of \
-                     the publication it had, got {settled}"
-                );
-                assert_instant_now(case, &settled, "lastPublished");
-            }
-            Option::None => assert!(
-                carries_nothing(&settled, "lastPublished"),
-                "case {case:?}: expected a portal nothing published to report no \
-                 lastPublished once disabled, got {settled}"
-            ),
-        }
+        // A disable removes the publication, not the record of the last one there was.
+        assert_eq!(
+            as_str(&settled, "lastPublishedDescription"),
+            last_description,
+            "case {case:?}: expected the disabled portal to keep the description of \
+             the publication it had, got {settled}"
+        );
+        assert_instant_now(case, &settled, "lastPublished");
     }
 }
 
@@ -559,11 +522,14 @@ async fn preview_portal_builds_a_preview_without_changing_what_the_portal_publis
             sleep(past_the_build());
         }
 
-        // Nothing has been previewed, so there is no preview to report.
+        // Nothing has been previewed, so the preview the portal reports carries nothing:
+        // the member is always there, as the empty structure.
         let before = get_portal(&emulator, case, &portal_id).await;
-        assert!(
-            carries_nothing(&before, "preview"),
-            "case {case:?}: a portal nothing has previewed reports no preview, got {before}"
+        assert_eq!(
+            before.get("preview"),
+            Some(&json!({})),
+            "case {case:?}: a portal nothing has previewed reports the empty preview, got \
+             {before}"
         );
 
         accepted(&emulator, case, Build::Preview, &portal_id, Option::None).await;
@@ -625,6 +591,13 @@ async fn a_portal_refuses_only_a_build_that_needs_what_another_is_already_doing(
             let case = case.as_str();
             let (portal_id, _) = create_portal(&emulator, case, "Serial Portal").await;
 
+            // Every pair starts from a portal with a LIVE publication, because that is
+            // what a disable needs to have something to take down
+            // (`PORTAL_DISABLE_FROM_STATUSES`); so the only difference between the rows
+            // is the pair of builds.
+            accepted(&emulator, case, Build::Publish, &portal_id, Option::None).await;
+            sleep(past_the_build());
+
             accepted(&emulator, case, first, &portal_id, Option::None).await;
 
             if second.is_held_up_by(first) {
@@ -650,35 +623,29 @@ async fn a_portal_refuses_only_a_build_that_needs_what_another_is_already_doing(
                 );
 
                 // The refusal lifts of its own accord once the build the service owed
-                // comes due — nothing but the clock has to happen.
+                // comes due — nothing but the clock has to happen. The one pair it does
+                // not lift for is a disable behind a disable: the first one leaves the
+                // portal with no publication, and a portal publishing nothing is in no
+                // status a publication can be taken down from.
                 sleep(past_the_build());
-                accepted(&emulator, case, second, &portal_id, Option::None).await;
-            } else if second.changes_publication() && first.changes_publication() {
-                // The second does not wait on the publication: it SUPERSEDES the change
-                // the first one started, so the portal moves to the second's outcome and
-                // the first publishes nothing.
-                accepted(&emulator, case, second, &portal_id, Option::None).await;
-                let superseded = get_portal(&emulator, case, &portal_id).await;
-                assert_eq!(
-                    publish_status(case, &superseded),
-                    second.in_progress(),
-                    "case {case:?}: expected the second change to supersede the first, got \
-                     {superseded}"
-                );
-
-                sleep(past_the_build());
-                let settled = get_portal(&emulator, case, &portal_id).await;
-                assert_eq!(
-                    publish_status(case, &settled),
-                    PUBLISH_STATUS_DISABLED,
-                    "case {case:?}: expected the superseding disable to settle the portal \
-                     in {PUBLISH_STATUS_DISABLED}, got {settled}"
-                );
-                assert!(
-                    carries_nothing(&settled, "lastPublished"),
-                    "case {case:?}: expected the superseded publish to have published \
-                     nothing, got {settled}"
-                );
+                if first == Build::Disable && second == Build::Disable {
+                    let (status, refused) =
+                        start(&emulator, second, &portal_id, Option::None).await;
+                    assert_eq!(
+                        status, 409,
+                        "case {case:?}: expected the second disable to stay refused once the \
+                         first had come due, got {status} {refused}"
+                    );
+                    let settled = get_portal(&emulator, case, &portal_id).await;
+                    assert_eq!(
+                        publish_status(case, &settled),
+                        PUBLISH_STATUS_DISABLED,
+                        "case {case:?}: expected the refused second disable to leave the \
+                         portal as the first one left it, got {settled}"
+                    );
+                } else {
+                    accepted(&emulator, case, second, &portal_id, Option::None).await;
+                }
             } else {
                 // The two need different things, so they run side by side and the portal
                 // reports both of them in flight at once.

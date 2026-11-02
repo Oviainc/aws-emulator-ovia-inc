@@ -8,19 +8,24 @@
 //!
 //! The rules these cases assert:
 //!
-//! * **`DeletePortal` removes the portal its URI addresses and answers the modelled 204
-//!   with no body**, whatever publication state that portal was in: afterwards no reader
-//!   reports it (`GetPortal` is a 404, `ListPortals` no longer lists it), the store holds
-//!   it no more, and the domains it reported are served by this service no longer — a
-//!   deleted portal's endpoint is claimed by nothing.
+//! * **`DeletePortal` takes the portal its URI addresses away and answers the modelled 204
+//!   with no body**, whatever publication state that portal was in: afterwards
+//!   `ListPortals` no longer lists it, the account no longer holds it, every writer that
+//!   addresses it is a 404, and the domains it reported are served by this service no
+//!   longer — a deleted portal's endpoint is claimed by nothing.
+//! * **A deleted portal stays READABLE in its terminal status**: `GetPortal` answers 200
+//!   with the portal's body and `publishStatus` `DELETED`, which is how a client confirms
+//!   a deletion it asked for — and once the removal the service still owes comes due the id
+//!   names nothing at all, so a client polling the portal until it is gone converges.
+//! * **The delete is IDEMPOTENT**: a `PortalId` the account holds no portal under — one
+//!   nothing minted, and one an earlier delete already took away — is answered with the
+//!   same 204 and no body, and removes nothing else.
 //! * **Deleting one portal touches no other**: every sibling portal of the account is
 //!   still readable, listed and unchanged, and the slot the deleted portal occupied in the
 //!   account's portals quota is free as soon as it is gone.
-//! * **A `PortalId` the account holds no portal under is refused 404 `NotFoundException`
-//!   and removes nothing** — including the id of a portal an earlier delete already took
-//!   away, so the delete is not idempotent — and every operation addressed as
-//!   `/v2/portals/{PortalId}…` refuses an unresolved one with that same code and the one
-//!   sentence this API's portal plane names a missing portal with.
+//! * **Every other operation addressed as `/v2/portals/{PortalId}…` refuses an unresolved
+//!   id** with 404 `NotFoundException` and the one sentence this API's portal plane names a
+//!   missing portal with.
 //!
 //! The rows vary what the rules generalise over: which members the portal was created with
 //! (the required ones only, an empty inclusion list, one included product, and every
@@ -37,7 +42,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
-    MAX_PORTALS, PORTAL_BUILD, PORTAL_NOT_FOUND_MESSAGE,
+    MAX_PORTALS, MAX_PORTAL_TOMBSTONES, PORTAL_BUILD, PORTAL_DELETION, PORTAL_NOT_FOUND_MESSAGE,
+    PUBLISH_STATUS_DELETED,
 };
 use service_com_amazonaws_apigatewayv2_apigatewayv2::ComAmazonawsApigatewayv2Apigatewayv2State;
 
@@ -87,14 +93,14 @@ fn emulator_with_store() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     (router, engine)
 }
 
-/// The `PortalId`s the store itself holds.
+/// The `PortalId`s the store itself holds as portals of the account — the live records,
+/// not the tombstone a delete leaves behind for `GetPortal` to report.
 fn stored_portals(engine: &engine::InMemoryEngine) -> Vec<String> {
     engine
         .state::<ComAmazonawsApigatewayv2Apigatewayv2State>()
         .lock()
-        .portals
-        .keys()
-        .cloned()
+        .live_portals()
+        .map(|portal| portal.portal_id.clone())
         .collect()
 }
 
@@ -315,7 +321,7 @@ fn rows() -> Vec<Row> {
 }
 
 #[tokio::test]
-async fn delete_portal_removes_the_portal_and_no_reader_reports_it_afterwards() {
+async fn delete_portal_takes_the_portal_away_and_leaves_it_readable_as_deleted() {
     // The sentence the handlers answer with is built from the service's own constant, so
     // it is asserted to BE the literal this suite expects and cannot drift from it.
     assert_eq!(
@@ -371,23 +377,8 @@ async fn delete_portal_removes_the_portal_and_no_reader_reports_it_afterwards() 
             "case {case:?}: expected DeletePortal to report no members, got {body}"
         );
 
-        // No reader reports the portal any more, and the store holds it no more.
-        let (status, read) = call(&emulator, "GET", &uri, None).await;
-        assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404 from GetPortal after the delete, got {status} {read}"
-        );
-        assert_eq!(
-            error_code(&read),
-            "NotFoundException",
-            "case {case:?}: expected NotFoundException from GetPortal after the delete, got {read}"
-        );
-        assert_eq!(
-            as_str(&read, "message"),
-            PORTAL_NOT_FOUND_SENTENCE,
-            "case {case:?}: expected the sentence this API answers a missing portal with, \
-             got {read}"
-        );
+        // The portal is gone as a portal of the account: nothing lists it and no writer
+        // resolves it any more.
         let listed = listed_portals(&emulator, case).await;
         assert!(
             !listed.contains(&portal_id),
@@ -397,8 +388,71 @@ async fn delete_portal_removes_the_portal_and_no_reader_reports_it_afterwards() 
         let stored = stored_portals(&engine);
         assert!(
             !stored.contains(&portal_id),
-            "case {case:?}: expected the store not to hold the deleted {portal_id:?}, \
+            "case {case:?}: expected the account not to hold the deleted {portal_id:?}, \
              got {stored:?}"
+        );
+        for (operation, method, addressed, request) in [
+            (
+                "UpdatePortal",
+                "PATCH",
+                uri.clone(),
+                Some(json!({ "portalContent": portal_content("Renamed") })),
+            ),
+            (
+                "PublishPortal",
+                "POST",
+                format!("{uri}/publish"),
+                Some(json!({})),
+            ),
+            ("DisablePortal", "DELETE", format!("{uri}/publish"), None),
+            ("PreviewPortal", "POST", format!("{uri}/preview"), None),
+        ] {
+            let (status, answer) = call(&emulator, method, &addressed, request).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected 404 from {operation} on the deleted portal, got \
+                 {status} {answer}"
+            );
+            assert_eq!(
+                as_str(&answer, "message"),
+                PORTAL_NOT_FOUND_SENTENCE,
+                "case {case:?}: expected the sentence this API answers a missing portal with \
+                 from {operation}, got {answer}"
+            );
+        }
+
+        // But the portal is still READABLE, in the terminal status a deleted portal
+        // carries: that is how a client confirms the deletion it asked for. Its body is
+        // the one it had, and the preview a deleted portal has is none.
+        let (status, read) = call(&emulator, "GET", &uri, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetPortal after the delete, got {status} {read}"
+        );
+        assert_eq!(
+            as_str(&read, "publishStatus"),
+            PUBLISH_STATUS_DELETED,
+            "case {case:?}: expected the deleted portal to report {PUBLISH_STATUS_DELETED}, \
+             got {read}"
+        );
+        assert_eq!(
+            as_str(&read, "portalId"),
+            portal_id,
+            "case {case:?}: expected the deleted portal's own record, got {read}"
+        );
+        assert_eq!(
+            read.get("preview"),
+            Some(&json!({})),
+            "case {case:?}: expected a deleted portal to report the empty preview, got {read}"
+        );
+        // And reading it again answers the same: a deleted portal is a terminal state,
+        // not a countdown.
+        let (status, again) = call(&emulator, "GET", &uri, None).await;
+        assert_eq!(
+            (status, &again),
+            (200, &read),
+            "case {case:?}: expected a second read of the deleted portal to answer the \
+             same, got {status} {again}"
         );
 
         // The domains the portal reported are claimed by nothing now: the record that made
@@ -447,7 +501,7 @@ async fn delete_portal_removes_the_portal_and_no_reader_reports_it_afterwards() 
 }
 
 #[tokio::test]
-async fn an_id_the_account_holds_no_portal_under_cannot_be_deleted() {
+async fn deleting_a_portal_the_account_does_not_hold_is_the_same_204() {
     let (emulator, engine) = emulator_with_store();
 
     // One portal survives, so a miss is a miss on the identifier and not on an empty
@@ -457,8 +511,7 @@ async fn an_id_the_account_holds_no_portal_under_cannot_be_deleted() {
         .portal_id;
 
     // And one portal that has already been deleted: its id names nothing the account
-    // holds any more, so a second delete of it is a miss like any other — the delete is
-    // not idempotent.
+    // holds any more, so a second delete of it asks for the state that already holds.
     let gone = create_portal(&emulator, "the portal deleted first", minimal("Gone"))
         .await
         .portal_id;
@@ -489,6 +542,8 @@ async fn an_id_the_account_holds_no_portal_under_cannot_be_deleted() {
             ),
         ),
         ("the id of a portal already deleted", gone.clone()),
+        // And again: repeating the call cannot make it answer differently.
+        ("the id of a portal already deleted, once more", gone.clone()),
     ] {
         let (status, body) = call(
             &emulator,
@@ -498,28 +553,35 @@ async fn an_id_the_account_holds_no_portal_under_cannot_be_deleted() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404 from DeletePortal, got {status} {body}"
+            status, 204,
+            "case {case:?}: expected 204 from DeletePortal, got {status} {body}"
         );
-        assert_eq!(
-            error_code(&body),
-            "NotFoundException",
-            "case {case:?}: expected NotFoundException, got {body}"
+        assert!(
+            body.is_null() || body.as_object().is_some_and(serde_json::Map::is_empty),
+            "case {case:?}: expected DeletePortal to report no members, got {body}"
         );
-        assert_eq!(
-            as_str(&body, "message"),
-            PORTAL_NOT_FOUND_SENTENCE,
-            "case {case:?}: expected the sentence this API answers a missing portal with, \
-             got {body}"
-        );
-        // A refused delete removes nothing: the surviving portal is still the one portal
-        // the account holds.
+        // A delete of a portal the account does not hold removes nothing: the surviving
+        // portal is still the one portal the account holds.
         assert_eq!(
             stored_portals(&engine),
             vec![known.clone()],
-            "case {case:?}: a refused DeletePortal must remove nothing"
+            "case {case:?}: a DeletePortal answering for a portal the account does not \
+             hold must remove nothing"
         );
     }
+
+    // The portal deleted first is still readable in its terminal status, however many
+    // deletes were addressed at it.
+    let (status, read) = call(&emulator, "GET", &format!("{PORTALS}/{gone}"), None).await;
+    assert_eq!(
+        status, 200,
+        "expected the deleted portal to stay readable, got {status} {read}"
+    );
+    assert_eq!(
+        as_str(&read, "publishStatus"),
+        PUBLISH_STATUS_DELETED,
+        "expected the deleted portal to report {PUBLISH_STATUS_DELETED}, got {read}"
+    );
 }
 
 #[tokio::test]
@@ -532,7 +594,9 @@ async fn every_operation_addressing_a_portal_refuses_an_unresolved_id_the_same_w
         .portal_id;
 
     // Every operation that resolves a `PortalId` out of its URI: the reader, the patch,
-    // the delete, and the three calls that start a server-managed build.
+    // and the three calls that start a server-managed build. `DeletePortal` is not among
+    // them — it answers 204 for an id the account holds no portal under, which
+    // `deleting_a_portal_the_account_does_not_hold_is_the_same_204` asserts.
     for (operation, method, uri, body) in [
         ("GetPortal", "GET", format!("{PORTALS}/{{id}}"), None),
         (
@@ -541,7 +605,6 @@ async fn every_operation_addressing_a_portal_refuses_an_unresolved_id_the_same_w
             format!("{PORTALS}/{{id}}"),
             Some(json!({ "portalContent": portal_content("Renamed") })),
         ),
-        ("DeletePortal", "DELETE", format!("{PORTALS}/{{id}}"), None),
         (
             "PublishPortal",
             "POST",
@@ -669,7 +732,7 @@ async fn a_deleted_portals_quota_slot_is_free_at_once() {
     assert_eq!(
         stored.len(),
         MAX_PORTALS,
-        "case \"a create once the deleted portal has gone\": expected the store to hold \
+        "case \"a create once the deleted portal has gone\": expected the account to hold \
          {MAX_PORTALS} portals, got {}",
         stored.len()
     );
@@ -678,4 +741,115 @@ async fn a_deleted_portals_quota_slot_is_free_at_once() {
         "case \"a create once the deleted portal has gone\": expected the deleted \
          {deleted:?} to stay gone, got {stored:?}"
     );
+}
+
+/// The store keeps the tombstone of a deleted portal so `GetPortal` can report it, and it
+/// keeps at most [`MAX_PORTAL_TOMBSTONES`] of them: a loop of create-and-delete cannot grow
+/// the store without end, whatever the removals the clock has not finished yet.
+#[tokio::test]
+async fn the_store_keeps_a_bounded_number_of_deleted_portals() {
+    let (emulator, engine) = emulator_with_store();
+
+    // More create-and-delete pairs than the store keeps tombstones for, so the bound has
+    // to be enforced however fast the loop runs.
+    for index in 0..=MAX_PORTAL_TOMBSTONES {
+        let portal_id = create_portal(
+            &emulator,
+            "a portal created and deleted",
+            minimal(&format!("Portal {index}")),
+        )
+        .await
+        .portal_id;
+        accepted(
+            &emulator,
+            "a portal created and deleted",
+            "DELETE",
+            &format!("{PORTALS}/{portal_id}"),
+            Option::None,
+            204,
+        )
+        .await;
+        let held = engine
+            .state::<ComAmazonawsApigatewayv2Apigatewayv2State>()
+            .lock()
+            .portals
+            .len();
+        assert!(
+            held <= MAX_PORTAL_TOMBSTONES,
+            "case \"delete {index}\": expected the store to keep at most \
+             {MAX_PORTAL_TOMBSTONES} records, got {held}"
+        );
+    }
+
+    assert!(
+        stored_portals(&engine).is_empty(),
+        "expected the account to hold no portal at all, got {:?}",
+        stored_portals(&engine)
+    );
+}
+
+/// Removing a portal is work the SERVICE finishes after the delete has answered: the portal
+/// reads back in its terminal `DELETED` status until that removal comes due, and the id
+/// names nothing afterwards — so a client polling the portal until it is gone converges.
+///
+/// The rows vary the state the delete met the portal in, because the removal is owed
+/// whatever the portal was doing.
+#[tokio::test]
+async fn a_deleted_portal_stops_being_readable_once_its_removal_comes_due() {
+    for (case, at) in [
+        ("never published", At::NeverPublished),
+        ("published", At::Published),
+        ("a preview ready", At::PreviewReady),
+    ] {
+        let (emulator, engine) = emulator_with_store();
+        let portal_id = create_portal(&emulator, case, minimal("Removed Portal"))
+            .await
+            .portal_id;
+        at.reach(&emulator, case, &portal_id).await;
+        let uri = format!("{PORTALS}/{portal_id}");
+
+        accepted(&emulator, case, "DELETE", &uri, Option::None, 204).await;
+
+        // Straight after the delete the portal is readable in its terminal status: the
+        // removal is not finished yet.
+        let (status, read) = call(&emulator, "GET", &uri, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the deleted portal to still read back, got {status} \
+             {read}"
+        );
+        assert_eq!(
+            as_str(&read, "publishStatus"),
+            PUBLISH_STATUS_DELETED,
+            "case {case:?}: expected {PUBLISH_STATUS_DELETED}, got {read}"
+        );
+
+        // Once the removal has come due the id names nothing, with nothing but the clock
+        // having happened — and the record is not kept either.
+        sleep(PORTAL_DELETION + Duration::from_millis(400));
+        let (status, gone) = call(&emulator, "GET", &uri, None).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404 once the removal had come due, got {status} {gone}"
+        );
+        assert_eq!(
+            error_code(&gone),
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {gone}"
+        );
+        assert_eq!(
+            as_str(&gone, "message"),
+            PORTAL_NOT_FOUND_SENTENCE,
+            "case {case:?}: expected the sentence this API answers a missing portal with, \
+             got {gone}"
+        );
+
+        // And the delete still answers the same 204 for it.
+        accepted(&emulator, case, "DELETE", &uri, Option::None, 204).await;
+        assert!(
+            stored_portals(&engine).is_empty(),
+            "case {case:?}: expected the account to hold no portal, got {:?}",
+            stored_portals(&engine)
+        );
+    }
 }

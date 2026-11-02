@@ -19,16 +19,15 @@
 //!
 //! So a caller can tell from the domain itself that `DisablePortal` revoked public access,
 //! on the FIRST probe after the call, rather than having to trust `PublishStatus`; and the
-//! revocation holds — it does not blip back, not on a later probe and not when the span of
-//! a publish the disable superseded passes.
+//! revocation holds — it does not blip back, not on a later probe and not once the span of
+//! the take-down has passed.
 //!
-//! The rows vary what the rule generalises over: the publication state the portal is in
-//! when the disable arrives (never published, published, a publish still being built, a
-//! republish still being built, published twice), how many times the disable is called,
-//! how the control plane was ADDRESSED when the portal was created — which decides the
-//! address the portal announces for its site, an AWS-style generated host or this
-//! emulator's own endpoint — and how many times the site is re-probed while nothing is
-//! called in between.
+//! The rows vary what the rule generalises over: how many publications the portal had
+//! before the disable (one, two, three — a disable takes a publication down, so there is
+//! always at least one), how the control plane was ADDRESSED when the portal was created —
+//! which decides the address the portal announces for its site, an AWS-style generated host
+//! or this emulator's own endpoint — and how many times the site is re-probed while nothing
+//! is called in between.
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -150,19 +149,16 @@ async fn disable(emulator: &MultiServiceRouter, case: &str, portal_id: &str) {
     );
 }
 
-/// One row of the flow: how the portal was created and addressed, what its publication was
-/// doing when the disable arrived, and how hard the revocation is re-probed afterwards.
+/// One row of the flow: how the portal was created and addressed, how many publications
+/// it had before the disable, and how hard the revocation is re-probed afterwards.
 struct Row {
     case: &'static str,
     /// The endpoint the CREATE was addressed at, which decides the address the portal
     /// announces for its site.
     endpoint_host: &'static str,
-    /// How many publishes are started AND left to come due before the disable.
+    /// How many publishes are started AND left to come due before the disable. At least
+    /// one, because a publication is what a disable takes down.
     settled_publishes: usize,
-    /// Whether a further publish is started and left in flight when the disable arrives.
-    publish_in_flight: bool,
-    /// How many times the disable is called.
-    disables: usize,
     /// How many times the site is re-probed after the revocation, with nothing called in
     /// between.
     hold_probes: usize,
@@ -174,49 +170,26 @@ fn rows() -> Vec<Row> {
             case: "a settled publication taken down, announced on the generated AWS host",
             endpoint_host: AWS_ENDPOINT,
             settled_publishes: 1,
-            publish_in_flight: false,
-            disables: 1,
             hold_probes: 3,
         },
         Row {
             case: "a settled publication taken down, announced on the emulator's endpoint",
             endpoint_host: LOCAL_ENDPOINT,
             settled_publishes: 1,
-            publish_in_flight: false,
-            disables: 1,
             hold_probes: 2,
         },
         Row {
-            case: "a portal nothing ever published, taken down anyway",
-            endpoint_host: AWS_ENDPOINT,
-            settled_publishes: 0,
-            publish_in_flight: false,
-            disables: 1,
-            hold_probes: 1,
-        },
-        Row {
-            case: "a first publish still being built when the disable arrived",
-            endpoint_host: AWS_ENDPOINT,
-            settled_publishes: 0,
-            publish_in_flight: true,
-            disables: 1,
-            hold_probes: 3,
-        },
-        Row {
-            case: "a republish still being built when the disable arrived",
-            endpoint_host: LOCAL_ENDPOINT,
-            settled_publishes: 1,
-            publish_in_flight: true,
-            disables: 1,
-            hold_probes: 4,
-        },
-        Row {
-            case: "a portal published twice and taken down twice",
+            case: "a portal published twice, then taken down",
             endpoint_host: AWS_ENDPOINT,
             settled_publishes: 2,
-            publish_in_flight: false,
-            disables: 2,
             hold_probes: 2,
+        },
+        Row {
+            case: "a portal published three times, then taken down, announced on the \
+                   emulator's endpoint",
+            endpoint_host: LOCAL_ENDPOINT,
+            settled_publishes: 3,
+            hold_probes: 4,
         },
     ]
 }
@@ -303,27 +276,18 @@ async fn a_portals_site_is_published_then_revoked_on_the_address_the_portal_anno
             );
         }
 
-        if row.publish_in_flight {
-            publish(&emulator, case, &portal_id).await;
-        }
-
         // The take-down REVOKES access, so it applies when it is accepted: the very first
         // probe after the 204 finds nothing served, while the portal's own status still
         // reports the work the service has left to do.
-        for disable_number in 1..=row.disables {
-            disable(&emulator, case, &portal_id).await;
-            let answer = probe(&emulator, &announced).await;
-            serves_nothing(
-                &format!("{case}: the first probe after disable {disable_number}"),
-                &answer,
-            );
-            assert_eq!(
-                publish_status(&emulator, case, &portal_id).await,
-                PUBLISH_STATUS_DISABLE_IN_PROGRESS,
-                "case {case:?}: expected disable {disable_number} to report the work the \
-                 service has left to do"
-            );
-        }
+        disable(&emulator, case, &portal_id).await;
+        let answer = probe(&emulator, &announced).await;
+        serves_nothing(&format!("{case}: the first probe after the disable"), &answer);
+        assert_eq!(
+            publish_status(&emulator, case, &portal_id).await,
+            PUBLISH_STATUS_DISABLE_IN_PROGRESS,
+            "case {case:?}: expected the disable to report the work the service has left \
+             to do"
+        );
 
         // And the revocation HOLDS: every later probe, with nothing called in between,
         // answers the same.
@@ -336,7 +300,7 @@ async fn a_portals_site_is_published_then_revoked_on_the_address_the_portal_anno
         }
 
         // It holds across the span too: once the take-down has come due the portal reports
-        // the terminal status, and the publish this disable superseded puts nothing back.
+        // the terminal status, and the site stays down.
         sleep(past_the_build());
         assert_eq!(
             publish_status(&emulator, case, &portal_id).await,

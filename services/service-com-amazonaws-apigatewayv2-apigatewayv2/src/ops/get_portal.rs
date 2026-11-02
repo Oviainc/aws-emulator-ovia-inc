@@ -2,7 +2,11 @@
 
 //! @op GetPortal
 //! IMPLEMENTED: reports the persisted [`crate::state::Portal`] under the requested
-//! `PortalId`, or 404 `NotFoundException` when no portal carries that id.
+//! `PortalId`, or 404 `NotFoundException` when no portal carries that id. A portal
+//! `DeletePortal` has taken away is still reported, in its terminal
+//! [`crate::state::PUBLISH_STATUS_DELETED`], so a caller can confirm the deletion by
+//! reading the status back — until the removal the service owes comes due
+//! ([`crate::state::PORTAL_DELETION`]), after which the id names nothing.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -165,8 +169,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A reporting operation: it reads the store and writes nothing, so a later
         // caller sees exactly what this one saw.
+        //
+        // The portal is resolved through `readable_portal` rather than through the
+        // `live_portal` every other portal reader and writer resolves through: a portal
+        // `DeletePortal` has taken away keeps answering THIS reader with its body and the
+        // terminal `DELETED` status, which is how a client confirms the deletion, until the
+        // removal the service still owes comes due — after which the id names nothing, and
+        // a client polling the portal until it is gone converges.
         let store = state.lock();
-        let Some(record) = store.portals.get(&input.portal_id) else {
+        let now = ::std::time::SystemTime::now();
+        let Some(record) = store.readable_portal(&input.portal_id, now) else {
             return Err(GetPortalErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::PORTAL_NOT_FOUND_MESSAGE.to_string()),
                 resource_type: ::std::option::Option::None,
@@ -177,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Projected as of the clock: a publish, disable or preview build the service
         // already owes this portal is reported as settled, which is a change the CLOCK
         // made due rather than one this read makes — the stored record is untouched.
-        let stored = record.to_wire(::std::time::SystemTime::now());
+        let stored = record.to_wire(now);
         Ok(GetPortalOutput {
             authorization: Some(stored.authorization),
             endpoint_configuration: Some(stored.endpoint_configuration),

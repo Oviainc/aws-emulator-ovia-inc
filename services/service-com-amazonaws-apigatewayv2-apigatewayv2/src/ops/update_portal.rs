@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let now = ::std::time::SystemTime::now();
-        let Some(record) = store.portals.get_mut(&input.portal_id) else {
+        let Some(record) = store.live_portal_mut(&input.portal_id) else {
             // The message a portal reader answers for an id the account holds no portal
             // under; the same wording `get_portal` uses.
             return Err(UpdatePortalErrorModeled::NotFoundException(NotFoundException {

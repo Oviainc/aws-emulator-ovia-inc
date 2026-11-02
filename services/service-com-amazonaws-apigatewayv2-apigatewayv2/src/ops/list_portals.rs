@@ -165,12 +165,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
         // Oldest first: the account's portals are reported in the order it created them,
         // which a minted `PortalId` does not carry (see `crate::state::CreatedInOrder`).
-        let (page, next_token) = crate::state::page_in_creation_order(
-            &store.portals,
-            &scope,
-            position,
-            max_results,
-        );
+        // Only the portals the account still HOLDS are listed: a portal `DeletePortal` has
+        // taken away is gone from the collection, whatever tombstone of it the store keeps
+        // for `GetPortal` to report.
+        let live: ::std::collections::BTreeMap<String, &crate::state::Portal> = store
+            .live_portals()
+            .map(|portal| (portal.portal_id.clone(), portal))
+            .collect();
+        let (page, next_token) =
+            crate::state::page_in_creation_order(&live, &scope, position, max_results);
 
         // Projected as of the clock, exactly as the single-portal reader projects it: a
         // publish, disable or preview build the service already owes a portal is

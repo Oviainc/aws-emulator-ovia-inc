@@ -891,6 +891,12 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// Every persisted portal, keyed by `PortalId`. A portal is an account-level
     /// resource, not a child of an api, so it lives beside [`Self::apis`] rather than
     /// inside one; `BTreeMap` for the same stable key order `ListPortals` pages over.
+    ///
+    /// It also holds the TOMBSTONE of a portal `DeletePortal` has taken away, which
+    /// `GetPortal` still reports in its terminal [`PUBLISH_STATUS_DELETED`] while no other
+    /// reader or writer resolves it — so reach a portal through
+    /// [`Self::live_portal`]/[`Self::live_portal_mut`]/[`Self::live_portals`] rather than
+    /// through this map unless a deleted portal is meant to resolve.
     pub portals: BTreeMap<String, Portal>,
     /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_portal_id`]; see
     /// [`mint_id`] for how an id is derived from it.
@@ -968,6 +974,100 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
     /// a gone link no longer occupies.
     pub fn purge_deprovisioned_vpc_links(&mut self) {
         self.vpc_links.retain(|_, link| !link.is_deprovisioned());
+    }
+
+    /// The portal `portal_id` names while the account still HOLDS it, or `None` when no
+    /// portal of that id is held any more — an id nothing minted, and one a
+    /// `DeletePortal` has already taken away ([`Portal::is_deleted`]).
+    ///
+    /// Every portal reader and writer resolves its `PortalId` through this, so one deleted
+    /// portal is absent from all of them at once. The single exception is `GetPortal`,
+    /// which resolves through [`Self::readable_portal`]: a deleted portal stays READABLE in
+    /// its terminal status (see [`PUBLISH_STATUS_DELETED`]) until its removal comes due.
+    pub fn live_portal(&self, portal_id: &str) -> Option<&Portal> {
+        self.portals
+            .get(portal_id)
+            .filter(|portal| !portal.is_deleted())
+    }
+
+    /// [`Self::live_portal`] for a writer: the portal `portal_id` names while the account
+    /// still holds it.
+    pub fn live_portal_mut(&mut self, portal_id: &str) -> Option<&mut Portal> {
+        self.portals
+            .get_mut(portal_id)
+            .filter(|portal| !portal.is_deleted())
+    }
+
+    /// Every portal the account still holds, in the key order [`Self::portals`] is kept
+    /// in: the collection `ListPortals` pages over and the one the portal data plane
+    /// resolves a host against, neither of which reports a portal that is gone.
+    pub fn live_portals(&self) -> impl Iterator<Item = &Portal> {
+        self.portals
+            .values()
+            .filter(|portal| !portal.is_deleted())
+    }
+
+    /// The portal `portal_id` names as a READER of one portal sees it as of `now`: the
+    /// portal the account holds, or the tombstone of a deleted one whose removal has not
+    /// come due yet — which `GetPortal` reports in its terminal
+    /// [`PUBLISH_STATUS_DELETED`]. `None` once that removal is due, and for an id nothing
+    /// minted.
+    pub fn readable_portal(&self, portal_id: &str, now: SystemTime) -> Option<&Portal> {
+        self.portals
+            .get(portal_id)
+            .filter(|portal| !portal.is_gone(now))
+    }
+
+    /// Take the portal `portal_id` names away as of `now`, answering whether this call is
+    /// the one that took it (`false` for an id the account holds no live portal under, so
+    /// a repeated delete is not a second removal).
+    ///
+    /// The record is kept as a TOMBSTONE rather than dropped: AWS keeps answering
+    /// `GetPortal` for the portal it is removing with its body and the terminal
+    /// [`PUBLISH_STATUS_DELETED`], so the record a reader needs has to survive the delete
+    /// until the removal comes due ([`PORTAL_DELETION`]). Everything the portal was DOING
+    /// stops at once ([`Portal::delete`]), and the slot it occupied in the account's quota
+    /// is free, because a tombstone is not a portal the account holds.
+    pub fn delete_portal(&mut self, portal_id: &str, now: SystemTime) -> bool {
+        // Every removal the clock has already finished, materialised: it was owed at its
+        // due instant whether or not anybody called, and doing it here is what keeps the
+        // store from holding records no reader reports.
+        self.purge_gone_portals(now);
+        let Some(record) = self.live_portal_mut(portal_id) else {
+            return false;
+        };
+        record.delete(now);
+        self.evict_oldest_portal_tombstones();
+        true
+    }
+
+    /// Drop every portal whose removal the CLOCK has already finished
+    /// ([`Portal::is_gone`]).
+    pub fn purge_gone_portals(&mut self, now: SystemTime) {
+        self.portals.retain(|_, portal| !portal.is_gone(now));
+    }
+
+    /// Drop the longest-deleted tombstones once the store holds more than
+    /// [`MAX_PORTAL_TOMBSTONES`] of them, so a loop of create-and-delete cannot grow this
+    /// store without end. A tombstone this drops is a portal no reader reports at all any
+    /// more, exactly as if it had never been kept.
+    fn evict_oldest_portal_tombstones(&mut self) {
+        loop {
+            let mut tombstones: Vec<(&String, SystemTime)> = self
+                .portals
+                .iter()
+                .filter_map(|(id, portal)| portal.deleted_at.map(|at| (id, at)))
+                .collect();
+            if tombstones.len() <= MAX_PORTAL_TOMBSTONES {
+                return;
+            }
+            tombstones.sort_by_key(|(_, at)| *at);
+            let Some((oldest, _)) = tombstones.first() else {
+                return;
+            };
+            let oldest = (*oldest).clone();
+            self.portals.remove(&oldest);
+        }
     }
 
     /// Mint the id of the regional host a custom domain name is served on:
@@ -2797,6 +2897,17 @@ impl Deployment {
 /// operation refuses with. Do not cite this as a published portals quota.
 pub const MAX_PORTALS: usize = 100;
 
+/// The most tombstones of deleted portals this store keeps, after which the
+/// longest-deleted is dropped ([`ComAmazonawsApigatewayv2Apigatewayv2State::delete_portal`]).
+///
+/// A deleted portal stays READABLE in its terminal status ([`PUBLISH_STATUS_DELETED`]), so
+/// a delete keeps the record rather than dropping it — and a loop of create-and-delete
+/// would otherwise grow this store without end, which is the growth [`MAX_PORTALS`] bounds
+/// for live portals. An EMULATOR bound, not a retention AWS publishes: it is set to the
+/// number of portals the account can hold at all, so every portal of a full account can be
+/// deleted and still read back.
+pub const MAX_PORTAL_TOMBSTONES: usize = MAX_PORTALS;
+
 /// The most portal products one portal may INCLUDE, after which a write that would store
 /// more is refused.
 ///
@@ -2835,6 +2946,47 @@ pub fn validate_included_portal_product_count(arns: &[String]) -> Result<(), Str
 /// value, and `DISABLED` is its one terminal not-serving value, the status a portal also
 /// settles in once `DisablePortal` has run.
 pub const PUBLISH_STATUS_DISABLED: &str = "DISABLED";
+
+/// The `PublishStatus` a portal whose publish FAILED reports, out of
+/// `PUBLISH_STATUS_VALUES`. Nothing in this emulator fails a build, so no portal is ever
+/// left in it; it is named because it is one of the statuses a publication can be taken
+/// down from ([`PORTAL_DISABLE_FROM_STATUSES`]).
+pub const PUBLISH_STATUS_PUBLISH_FAILED: &str = "PUBLISH_FAILED";
+
+/// The `PublishStatus` a portal whose disable FAILED reports, out of
+/// `PUBLISH_STATUS_VALUES`. Named for the same reason as
+/// [`PUBLISH_STATUS_PUBLISH_FAILED`]: a failed take-down can be retried.
+pub const PUBLISH_STATUS_DISABLE_FAILED: &str = "DISABLE_FAILED";
+
+/// The `PublishStatus` a portal reports once `DeletePortal` has taken it away: the
+/// terminal status of a portal that no longer exists.
+///
+/// NOT one of `PUBLISH_STATUS_VALUES` — the modelled `PublishStatus` enum does not declare
+/// it — but the value AWS answers for a deleted portal, whose body it keeps serving so a
+/// caller can confirm the deletion by reading the terminal status. The model is taken as
+/// incomplete here rather than as a refutation: a reader that only accepts the modelled
+/// catalog would reject AWS's own answer.
+pub const PUBLISH_STATUS_DELETED: &str = "DELETED";
+
+/// The `PublishStatus` values a portal's publication can be taken DOWN from, in the order
+/// [`PORTAL_DISABLE_PRECONDITION_MESSAGE`] names them: there is a publication to remove
+/// ([`PUBLISH_STATUS_PUBLISHED`]), or a build that was trying to put one up or take one
+/// down ended in failure, which a retry may clear.
+///
+/// A status not in this set means the service is mid-build or the portal publishes nothing,
+/// so `DisablePortal` is refused `ConflictException` ("the requested operation would cause
+/// a conflict with the current state of a service resource associated with the request").
+pub const PORTAL_DISABLE_FROM_STATUSES: &[&str] = &[
+    PUBLISH_STATUS_PUBLISHED,
+    PUBLISH_STATUS_PUBLISH_FAILED,
+    PUBLISH_STATUS_DISABLE_FAILED,
+];
+
+/// The sentence `DisablePortal` refuses a portal that is in no status it can be disabled
+/// from with. FIXED text: it names the statuses of [`PORTAL_DISABLE_FROM_STATUSES`] and
+/// carries nothing of the request or of the portal's own state.
+pub const PORTAL_DISABLE_PRECONDITION_MESSAGE: &str =
+    "Portal must be PUBLISHED, PUBLISH_FAILED, or DISABLE_FAILED to disable";
 
 /// The `PublishStatus` of a portal that is serving its content, out of
 /// `PUBLISH_STATUS_VALUES`: the value a portal settles in once the publish
@@ -2876,6 +3028,19 @@ pub const PREVIEW_STATUS_PREVIEW_READY: &str = "PREVIEW_READY";
 /// nothing sleeps for it: the due instant is stored and the status derived from the
 /// clock on every read.
 pub const PORTAL_BUILD: Duration = Duration::from_millis(500);
+
+/// How long a portal `DeletePortal` has taken away keeps answering `GetPortal` in its
+/// terminal [`PUBLISH_STATUS_DELETED`], after which the record is gone for every reader
+/// and the id names nothing at all.
+///
+/// Removing a portal is work the SERVICE carries out once the delete has answered, so a
+/// client that reads the portal straight afterwards is told it is `DELETED` — which is how
+/// it confirms the deletion it asked for — and a client that polls the portal until it is
+/// gone converges on 404 instead of polling for ever. The span is one portal build
+/// ([`PORTAL_BUILD`]), CHOSEN like it: what matters is that it is never zero, so the
+/// terminal status is observable, and that nothing sleeps for it — the instant the record
+/// is due to be gone is stored and compared against the clock on every read.
+pub const PORTAL_DELETION: Duration = PORTAL_BUILD;
 
 /// A publish or a disable of a portal that the SERVICE carries out on its own once the
 /// call that asked for it has answered.
@@ -2965,7 +3130,8 @@ pub enum PortalBuild {
     /// description the request carried as the last published one.
     Publish { description: Option<String> },
     /// `DisablePortal`: take the publication down, after which the portal serves
-    /// nothing.
+    /// nothing. Started only from a status a publication can be taken down from
+    /// ([`PORTAL_DISABLE_FROM_STATUSES`]).
     Disable,
     /// `PreviewPortal`: build a preview of the portal's content, which changes nothing
     /// about what the portal publishes.
@@ -2974,14 +3140,19 @@ pub enum PortalBuild {
 
 impl PortalBuild {
     /// Whether this build needs the portal's publication to be STILL before it can
-    /// start: a publish does, since publishing on top of a publication change still in
-    /// flight would leave two answers for what the portal serves.
+    /// start: a publish and a disable both do, since moving a publication on top of a
+    /// change still in flight would leave two answers for what the portal serves. A
+    /// preview does not — it changes nothing about what the portal publishes.
     ///
-    /// A disable does not: taking the publication down is a revocation, which the
-    /// service applies at once and which supersedes a publish still in flight rather
-    /// than queueing behind it.
+    /// For a disable this is what the status precondition on `DisablePortal` already
+    /// implies ([`PORTAL_DISABLE_FROM_STATUSES`]): a portal with a publication change in
+    /// flight reports an `..._IN_PROGRESS` status, which is none of the statuses a
+    /// publication can be taken down from.
     pub fn needs_a_still_publication(&self) -> bool {
-        matches!(self, PortalBuild::Publish { .. })
+        matches!(
+            self,
+            PortalBuild::Publish { .. } | PortalBuild::Disable
+        )
     }
 
     /// Whether this build builds the portal's CONTENT, so it both occupies the content
@@ -3052,10 +3223,73 @@ pub struct Portal {
     /// preview. The `PreviewStatus` is derived from it on every read, so no stored copy
     /// of it can go stale.
     pub preview_ready_at: Option<SystemTime>,
+    /// When `DeletePortal` took this portal away, or `None` for a portal the account still
+    /// holds.
+    ///
+    /// A deleted portal is a TOMBSTONE: it is gone for every reader and writer that
+    /// resolves a `PortalId`
+    /// ([`ComAmazonawsApigatewayv2Apigatewayv2State::live_portal`]) and its domain serves
+    /// nothing, while `GetPortal` still reports its body with the terminal
+    /// [`PUBLISH_STATUS_DELETED`]. See [`Portal::delete`].
+    pub deleted_at: Option<SystemTime>,
     pub tags: BTreeMap<String, String>,
 }
 
 impl Portal {
+    /// Whether `DeletePortal` has taken this portal away: a tombstone no reader but
+    /// `GetPortal` resolves, and only until the removal comes due. See [`Portal::delete`]
+    /// and [`Portal::is_gone`].
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
+
+    /// Whether the removal this portal's `DeletePortal` started has come due as of `now`,
+    /// after which the record names nothing at all — not even for `GetPortal`.
+    ///
+    /// Derived from the stored instant on every read ([`PORTAL_DELETION`]), so nothing
+    /// sleeps for it and no reader has to write to make it true.
+    pub fn is_gone(&self, now: SystemTime) -> bool {
+        self.deleted_at
+            .is_some_and(|deleted_at| now >= deleted_at + PORTAL_DELETION)
+    }
+
+    /// Take this portal away as of `now`: everything it was DOING stops, and what is left
+    /// is the body `GetPortal` keeps reporting with the terminal
+    /// [`PUBLISH_STATUS_DELETED`] until the removal comes due ([`Portal::is_gone`]).
+    ///
+    /// Stopping means: the build the service still owed it is dropped (nothing is
+    /// published, disabled or previewed for a portal that is gone), its domain serves
+    /// nothing, and the preview it had is unreachable because that preview was served on
+    /// the same domain. Its configuration — the id and ARN, the endpoint configuration,
+    /// the content, the inclusions, the tags and the instant it was last modified — is
+    /// left exactly as it stood, because that is the body a reader confirming the deletion
+    /// reads.
+    pub fn delete(&mut self, now: SystemTime) {
+        self.deleted_at = Some(now);
+        self.transition = ::std::option::Option::None;
+        self.published_site = ::std::option::Option::None;
+        self.preview_ready_at = ::std::option::Option::None;
+    }
+
+    /// The `PublishStatus` this portal reports as of `now`.
+    ///
+    /// Derived rather than read off one field, so one read cannot leave a status behind for
+    /// the next caller: a portal that is gone reports [`PUBLISH_STATUS_DELETED`], one with
+    /// a build still in flight reports the status that build carries while it runs, one
+    /// whose build the CLOCK has already made due reports the status that build settles it
+    /// in, and otherwise the terminal status it is already in. Nothing is written — a
+    /// caller that wants the due change materialised calls [`Portal::settle`].
+    pub fn publish_status_at(&self, now: SystemTime) -> String {
+        if self.is_deleted() {
+            return PUBLISH_STATUS_DELETED.to_string();
+        }
+        match self.transition.as_ref() {
+            Some(transition) if now < transition.due_at => transition.in_progress.to_string(),
+            Some(transition) => transition.settled.to_string(),
+            ::std::option::Option::None => self.publish_status.clone(),
+        }
+    }
+
     /// The change to this portal's PUBLICATION that is still in flight as of `now`,
     /// named by the `PublishStatus` it reports while it runs, or `None` when the
     /// publication is not moving.
@@ -3120,11 +3354,10 @@ impl Portal {
 
     /// Start one server-managed build on this portal, due [`PORTAL_BUILD`] from `now`.
     ///
-    /// A build starts only when what it needs is free: a publish needs the publication
-    /// still AND the content build free, a preview needs the content build free, and a
-    /// disable needs nothing — it revokes what the portal serves, so it supersedes a
-    /// publish still in flight (which then publishes nothing) instead of queueing behind
-    /// it. So a preview and a disable run side by side, while a publish runs alone.
+    /// A build starts only when what it needs is free: a publish and a disable each need
+    /// the publication still, a publish and a preview each need the content build free,
+    /// and a disable builds no content — so a preview and a disable run side by side,
+    /// while a publish runs alone.
     ///
     /// `Err` carries the status of the build already in flight, for the caller's
     /// `ConflictException` — "the requested operation would cause a conflict with the
@@ -3172,8 +3405,7 @@ impl Portal {
                 // The take-down the service then carries out: the portal reports
                 // `DISABLE_IN_PROGRESS` until it comes due. What the portal's domain
                 // SERVES does not wait for that — see
-                // [`PortalTransition::revokes_publication`] — and a publish this disable
-                // superseded publishes nothing, because this transition replaces it.
+                // [`PortalTransition::revokes_publication`].
                 self.transition = Some(PortalTransition {
                     in_progress: PUBLISH_STATUS_DISABLE_IN_PROGRESS,
                     settled: PUBLISH_STATUS_DISABLED,
@@ -3198,21 +3430,28 @@ impl Portal {
         settled.settle(now);
         // Every build the clock owed is retired above, so a transition still held is one
         // still in flight and the portal reports the status it carries while it runs.
-        let publish_status = match &settled.transition {
-            Some(transition) => transition.in_progress.to_string(),
-            ::std::option::Option::None => settled.publish_status.clone(),
+        let publish_status = settled.publish_status_at(now);
+        // The portal body ALWAYS carries a `Preview`, and it carries NOTHING when no
+        // preview has been built: a reader that asks whether a preview exists is answered
+        // with the empty structure rather than with an absent member. `Preview$PreviewUrl`
+        // and `Preview$PreviewStatus` describe a preview that was built, so neither is
+        // reported until `PreviewPortal` has built one.
+        let preview = match settled.preview_ready_at {
+            Some(ready_at) => wire::Preview {
+                preview_status: Some(
+                    if now < ready_at {
+                        PREVIEW_STATUS_PREVIEW_IN_PROGRESS
+                    } else {
+                        PREVIEW_STATUS_PREVIEW_READY
+                    }
+                    .to_string(),
+                ),
+                preview_url: Some(portal_preview_url(&settled.endpoint_configuration)),
+                // Nothing failed, so there is no exception to explain.
+                status_exception: ::std::option::Option::None,
+            },
+            ::std::option::Option::None => wire::Preview::default(),
         };
-        let preview = settled.preview_ready_at.map(|ready_at| wire::Preview {
-            preview_status: if now < ready_at {
-                PREVIEW_STATUS_PREVIEW_IN_PROGRESS
-            } else {
-                PREVIEW_STATUS_PREVIEW_READY
-            }
-            .to_string(),
-            preview_url: Some(portal_preview_url(&settled.endpoint_configuration)),
-            // Nothing failed, so there is no exception to explain.
-            status_exception: ::std::option::Option::None,
-        });
         wire::PortalSummary {
             authorization: settled.authorization.clone(),
             endpoint_configuration: settled.endpoint_configuration.clone(),
@@ -3223,7 +3462,7 @@ impl Portal {
             portal_arn: settled.portal_arn.clone(),
             portal_content: settled.portal_content.clone(),
             portal_id: settled.portal_id.clone(),
-            preview,
+            preview: Some(preview),
             publish_status: Some(publish_status),
             rum_app_monitor_name: settled.rum_app_monitor_name.clone(),
             status_exception: settled.status_exception.clone(),
