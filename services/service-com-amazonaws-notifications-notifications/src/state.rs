@@ -650,13 +650,19 @@ struct PublishedManagedNotification {
 ///
 /// The set below spans the services AWS publishes managed notifications for,
 /// each with one entry per event-type category of that service: `AWS-Health`
-/// (whose sub-categories are AWS Health's own event type categories) and
+/// (whose sub-categories are AWS Health's own event type categories),
 /// `AWS-Partner-Central` (whose sub-categories are the AWS Marketplace seller
 /// notification categories — product listings, offers and agreements, payments
-/// and disbursements, and seller account management). A category is published
-/// for every account, since nothing a caller does creates or removes one — the
-/// catalog is the same fixed set for every account, so an entry's arn, name and
-/// description are published values rather than per-account or per-run ones.
+/// and disbursements, and seller account management) and `AWS-MP-Buyer` (whose
+/// sub-categories are the Marketplace BUYER notification categories — the
+/// products and solutions subscribed to, private offers extended to the
+/// account, pricing changes and agreements). Both sides of Marketplace are
+/// published, because a buyer account enumerates the catalog to subscribe to
+/// buyer notifications just as a seller account does to seller ones. A category
+/// is published for every account, since nothing a caller does creates or
+/// removes one — the catalog is the same fixed set for every account, so an
+/// entry's arn, name and description are published values rather than
+/// per-account or per-run ones.
 const MANAGED_NOTIFICATION_CATALOG: &[PublishedManagedNotification] = &[
     PublishedManagedNotification {
         category: "AWS-Health",
@@ -705,6 +711,36 @@ const MANAGED_NOTIFICATION_CATALOG: &[PublishedManagedNotification] = &[
         sub_category: "PCAccountManagement",
         name: "Account management",
         description: "Marketplace events related to seller account standing, including business and bank account verification status.",
+    },
+    PublishedManagedNotification {
+        category: "AWS-MP-Buyer",
+        sub_category: "MPBuyerProducts",
+        name: "Products and solutions",
+        description: "Notifications about changes to products you've subscribed to, including new versions, instance type updates, visibility changes, region restrictions, and security profile snapshots.",
+    },
+    PublishedManagedNotification {
+        category: "AWS-MP-Buyer",
+        sub_category: "MPBuyerPrivateOffers",
+        name: "Private offers",
+        description: "Notifications about private offers extended to you, including new offers, offer set availability, and channel partner offer lifecycle updates.",
+    },
+    PublishedManagedNotification {
+        category: "AWS-MP-Buyer",
+        sub_category: "MPBuyerPricing",
+        name: "Pricing changes",
+        description: "Notifications about price changes to products you're subscribed to, including hourly, monthly, and usage-based pricing updates.",
+    },
+    PublishedManagedNotification {
+        category: "AWS-MP-Buyer",
+        sub_category: "MPBuyerAgreements",
+        name: "Agreements",
+        // The published text of this one entry is known only as far as this
+        // sentence goes: the recording available here states it up to "new
+        // agreements" and no further. It stops at the last published word
+        // rather than continuing with prose nobody published, so the entry is
+        // part of the catalog a buyer account enumerates without carrying
+        // invented display text.
+        description: "Notifications about your agreements and subscriptions, including new agreements.",
     },
 ];
 

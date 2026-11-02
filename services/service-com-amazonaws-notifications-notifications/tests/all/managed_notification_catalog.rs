@@ -36,7 +36,8 @@ const DESCRIPTION_MAX: usize = 256;
 /// Catalog source: the service's own published set, `MANAGED_NOTIFICATION_CATALOG`
 /// in `src/state.rs` — the model enumerates no entries (only their shape, see
 /// the module header's `smithy_query`), so this table is the published behaviour
-/// and the rows span every category the service covers rather than one of them.
+/// and the rows span every category the service covers rather than one of them:
+/// the health side, the Marketplace SELLER side and the Marketplace BUYER side.
 const PUBLISHED: &[(&str, &str, &str, &str)] = &[
     (
         "AWS-Health",
@@ -86,7 +87,36 @@ const PUBLISHED: &[(&str, &str, &str, &str)] = &[
         "Account management",
         "Marketplace events related to seller account standing, including business and bank account verification status.",
     ),
+    (
+        "AWS-MP-Buyer",
+        "MPBuyerProducts",
+        "Products and solutions",
+        "Notifications about changes to products you've subscribed to, including new versions, instance type updates, visibility changes, region restrictions, and security profile snapshots.",
+    ),
+    (
+        "AWS-MP-Buyer",
+        "MPBuyerPrivateOffers",
+        "Private offers",
+        "Notifications about private offers extended to you, including new offers, offer set availability, and channel partner offer lifecycle updates.",
+    ),
+    (
+        "AWS-MP-Buyer",
+        "MPBuyerPricing",
+        "Pricing changes",
+        "Notifications about price changes to products you're subscribed to, including hourly, monthly, and usage-based pricing updates.",
+    ),
+    (
+        "AWS-MP-Buyer",
+        "MPBuyerAgreements",
+        "Agreements",
+        "Notifications about your agreements and subscriptions, including new agreements.",
+    ),
 ];
+
+/// The page size the listing uses when a request names none: "Defaults to 20",
+/// from the `maxResults` member's own documentation
+/// (`smithy_query(query="operation",operation="ListManagedNotificationConfigurations")`).
+const DEFAULT_PAGE_SIZE: usize = 20;
 
 /// Every entry the unpaged listing answers, as `(arn, name, description)`.
 async fn listed_catalog(emulator: &Emulator) -> Vec<(String, String, String)> {
@@ -237,6 +267,57 @@ async fn the_catalog_spans_every_published_category() {
             found_refs, expected,
             "case {category}: expected exactly the published event-type categories {expected:?}, got {found_refs:?}"
         );
+    }
+}
+
+/// RULE: the whole published catalog is answered to a caller that asks for no
+/// page size, since the catalog is smaller than the default page — so a client
+/// that enumerates the categories once, without paging, discovers every covered
+/// service rather than a prefix of them.
+#[tokio::test]
+async fn the_default_page_carries_the_whole_published_catalog() {
+    assert!(
+        PUBLISHED.len() <= DEFAULT_PAGE_SIZE,
+        "case catalog size: a catalog larger than the default page of \
+         {DEFAULT_PAGE_SIZE} must be enumerated with a token, got {} entries",
+        PUBLISHED.len()
+    );
+
+    let emulator = Emulator::new();
+    // Rows: the two ways a caller asks for no particular page size — no query
+    // string at all, and the default stated explicitly.
+    for (case, uri) in [
+        ("no maxResults", "/managed-notification-configurations"),
+        (
+            "maxResults at the documented default",
+            "/managed-notification-configurations?maxResults=20",
+        ),
+    ] {
+        let (status, response) = emulator.send("GET", uri, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200, got {status} {response:?}"
+        );
+        assert_eq!(
+            response["nextToken"],
+            Value::Null,
+            "case {case}: the whole catalog fits the default page, got {response:?}"
+        );
+        let listed: Vec<String> = response["managedNotificationConfigurations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case}: expected an array, got {response:?}"))
+            .iter()
+            .filter_map(|entry| entry["arn"].as_str())
+            .filter_map(managed_configuration_arn_segments)
+            .map(|(category, sub_category)| format!("{category}/{sub_category}"))
+            .collect();
+        for (category, sub_category, _, _) in PUBLISHED {
+            let wanted = format!("{category}/{sub_category}");
+            assert!(
+                listed.contains(&wanted),
+                "case {case}: the first page must publish {wanted}, got {listed:?}"
+            );
+        }
     }
 }
 

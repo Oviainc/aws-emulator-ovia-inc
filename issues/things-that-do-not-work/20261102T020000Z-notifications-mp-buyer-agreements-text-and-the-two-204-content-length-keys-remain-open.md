@@ -1,0 +1,50 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: notifications-catalog-list-managed-notification-configurations
+Issue-Step: task#1
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: notifications-catalog-list-managed-notification-configurations notifications-tag-resource-list-tags-untag-roundtrip
+Issue-Shape-Id: com.amazonaws.notifications#Notifications
+Issue-Key: notifications|ListManagedNotificationConfigurations|2xx->2xx|$.managedNotificationConfigurations[arn="arn
+Issue-Key: notifications|TagResource|2xx->2xx|$headers.content-length
+Issue-Key: notifications|UntagResource|2xx->2xx|$headers.content-length
+Issue-Commit: 2caf13721e4771825c4c675b3bbf8d48b6d4178e
+
+# notifications: the AWS-MP-Buyer `Agreements` description text and the two bodyless-204 `content-length` keys are still open
+
+> _Split out of `issues/things-that-now-work/20261101T031754Z-notifications-aws-mp-buyer-managed-catalog-absent-and.md`, whose cause 1 is fixed for the published SET — the whole `AWS-MP-Buyer` category now exists in the catalog seed. This report carries the replay keys that do NOT pass, re-filed here so they are not recorded as working. Everything below is what that fix established about them; a later fixer starts from here rather than from scratch._
+
+## Operation
+ListManagedNotificationConfigurations
+
+## Description
+Two remainders of a three-cause report. The parent fix published the `AWS-MP-Buyer` category — `MPBuyerProducts` ('Products and solutions'), `MPBuyerPrivateOffers` ('Private offers'), `MPBuyerPricing` ('Pricing changes') and `MPBuyerAgreements` ('Agreements') — in `MANAGED_NOTIFICATION_CATALOG` (services/service-com-amazonaws-notifications-notifications/src/state.rs), so every recorded Marketplace-buyer arn now exists to the emulator: the unpaged listing publishes all 12 entries on its default page of 20, `GetManagedNotificationConfiguration` reads each one, and the channel-association operations and the `channelIdentifier`-filtered managed listing reach them. Three of the four entries carry the published display text verbatim. What is still open is one entry's prose and the framing of the two bodyless tag answers.
+
+Cause 1 of 2: the `AWS-MP-Buyer/MPBuyerAgreements` entry's published `description` is a truncation of the recorded one (fixture notifications-catalog-list-managed-notification-configurations, step task#1).
+AWS: Smithy: `ManagedNotificationConfigurationStructure.description` (@required, `ManagedNotificationConfigurationDescription`, @length 0..256) is the entry's own published prose; the model enumerates no entry, so the text is recorded behavior and, because nothing a caller does creates or edits a managed configuration, it is the same fixed value for every account. The recorded description of this entry begins `Notifications about your agreements and subscriptions, including new agreements` and continues; the remainder was cut off by the reporting of the parent issue and a replay withholds recorded values, so neither the parent report nor the replay output states it.
+Emulator: the seed publishes `Notifications about your agreements and subscriptions, including new agreements.` — the recorded text up to its last known word and no invented prose past it. The three sibling entries match the recording exactly.
+Why: a client that renders the catalog shows a sentence that stops early for this one category, and the `$.managedNotificationConfigurations` replay key keeps reporting a `.description` divergence for it. The same gap covers any FURTHER `AWS-MP-Buyer` sub-category the truncated evidence never named: the parent report's evidence string ends inside this description, so whether the recorded cluster holds more than these four entries is not known from it either.
+Fix: read this entry's `description` (and the full `AWS-MP-Buyer` entry list) off the fixture recording itself and complete the seed row; do NOT guess the wording — publishing invented prose substitutes one fidelity defect for another. Code: services/service-com-amazonaws-notifications-notifications/src/state.rs, the `MPBuyerAgreements` entry of `MANAGED_NOTIFICATION_CATALOG`, and the matching row of the `PUBLISHED` table in tests/all/managed_notification_catalog.rs.
+Traces: notifications-catalog-list-managed-notification-configurations#task#1. Status 200 expected and 200 returned; only this entry's text (and any unnamed further entry of that cluster) diverges.
+
+Cause 2 of 2: TagResource's and UntagResource's `204` answers carry no `content-length` on a socket (fixture notifications-tag-resource-list-tags-untag-roundtrip, steps task#5 and task#7).
+AWS: Smithy: `TagResource` POST /tags/{arn} and `UntagResource` DELETE /tags/{arn}; both output structures declare NO members and both @http codes are defaulted, so the `204` is recorded behavior — and the recorded `204` still carries a `content-length` header (the fixture asserts its PRESENCE, which for an empty body is `0`), so a bodyless success is framed explicitly rather than left for the client to delimit.
+Emulator: the service crate already states it. `frame_empty_body` in src/service.rs — the one no-content seam every response of this service passes through, documented at the module header — empties the `{}` the serializer renders for a member-less output structure and states `content-length: 0`; the in-process front door, the inter-service callback path and the SDK connector all serve that unchanged, and tests/all/no_content_framing.rs pins it over a table of both operations, both methods and nine tag-mutation shapes. The header is removed AFTER that, outside this crate: the vendored listener hands the finished response to hyper's HTTP/1.1 server writer (vendor/server/src/lib.rs, the `http::Response` returned to the hyper service, around lines 810-865 for the ephemeral-port path and the same writer behind axum on the production path), and that writer strips `content-length` from a `204` because RFC 9110 §8.6 forbids it there. A raw socket probe of the current checkout answers exactly `HTTP/1.1 204 No Content` + `content-type`, `connection`, `date` — no `content-length`, and no chunked framing either.
+Why: with neither `Content-Length` nor `Transfer-Encoding`, message length is determined by connection behavior for some client/HTTP-version combinations, so a client or intermediary that frames a bodyless answer by its stated length can hold the connection open waiting for a body, lose keep-alive reuse, or report a truncated response — on a call that in fact succeeded.
+Fix: NOT reachable from a service crate, and not from `core/router/src` either — no seam a service owns runs after that writer (`override_protocol` runs before it). It needs the vendored bodyless-success response writer to preserve a handler-stated `content-length` on a `204` instead of dropping it: vendor/server/src/lib.rs, where the emulator's `http::Response<Bytes>` is handed to hyper (`serve_on_ephemeral_port`'s `service_fn`, and the production serve path's axum response). Both operations are one cause here because one writer serves both; a change that frames only POST /tags/{arn} leaves the DELETE step diverging.
+Traces: notifications-tag-resource-list-tags-untag-roundtrip#task#5 and #task#7. Status 204 expected and 204 returned in both; the absent `content-length` is the whole divergence.
+
+## Evidence
+Replay of the parent issue's 2 fixtures after its fix: 12 steps, 3 still mismatched, 0 errored, and all 3 of the parent's keys still open —
+* `notifications|ListManagedNotificationConfigurations|2xx->2xx|$.managedNotificationConfigurations[arn="arn`: `HTTP 200; differs at $.managedNotificationConfigurations[arn="arn; recorded values withheld`. The four recorded `AWS-MP-Buyer` arns are now all published with their names, and three of the four descriptions are the recorded text verbatim; what the key can still be reporting is the `MPBuyerAgreements` description's missing tail, plus any entry of that cluster the parent report's truncated evidence never named.
+* `notifications|TagResource|2xx->2xx|$headers.content-length` and `notifications|UntagResource|2xx->2xx|$headers.content-length`: `HTTP 204; differs at $headers.content-length`, unchanged by the parent fix, which deliberately touched nothing on this path rather than substituting another status or header to move the key.
+
+Corroborating source in the checkout: services/service-com-amazonaws-notifications-notifications/src/state.rs — `MANAGED_NOTIFICATION_CATALOG` now carries 12 entries across `AWS-Health`, `AWS-Partner-Central` and `AWS-MP-Buyer`, and the comment on the `MPBuyerAgreements` entry records that its text stops at the last published word available. src/service.rs documents the 204 framing seam and that the vendored writer drops the header; tests/all/no_content_framing.rs pins the in-process header and the socket's lack of it.
+
+## Steps to Reproduce
+1. Build and boot the emulator from this checkout; confirm /__admin/health answers 200 and the data listener accepts.
+2. Replay trace set simparity-wire-aws-v1 (replay_wire_corpus). Expect 12 steps with the 3 divergences above.
+3. Cause 1: `GET /managed-notification-configurations` with no channelIdentifier and no nextToken. All four `.../category/AWS-MP-Buyer/sub-category/*` entries are present; compare the `MPBuyerAgreements` entry's `description` with the recording and observe it ends at `including new agreements.` where the recorded one continues. Also confirm against the fixture whether that cluster holds entries beyond the four.
+4. Cause 2: replay fixture notifications-tag-resource-list-tags-untag-roundtrip. Step task#5 POSTs /tags/{arn} with a tag map for an existing notification-configuration arn; step task#7 DELETEs /tags/{arn}?tagKeys=... for the same arn. Both answer 204 with no body.
+5. Read the RAW response head of those two answers over a socket with a header-preserving client (`curl -i`, or the socket case in tests/all/no_content_framing.rs) and observe no `content-length` header, where the service's own in-process answer states `content-length: 0`.
