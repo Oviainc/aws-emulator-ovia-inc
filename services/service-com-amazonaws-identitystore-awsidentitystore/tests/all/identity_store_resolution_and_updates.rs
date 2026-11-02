@@ -6,7 +6,7 @@
 //! 1. every operation RESOLVES the `IdentityStoreId` it is given as the store the
 //!    CALLER names — any value the modelled pattern admits is served, holding whatever
 //!    has been written to it — and only an identifier naming a store of another account
-//!    is refused, with the modelled 404 `ResourceNotFoundException` having written
+//!    is refused, with the modelled `ResourceNotFoundException` having written
 //!    nothing;
 //! 2. a user this API creates reports a `UserStatus`, and it is `ENABLED`;
 //! 3. a resource created or updated through the API records the CALLING principal, so
@@ -24,7 +24,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, emulator, error_message, ok, ok_as, refused, refused_as, string, MISSING_STORE, STORE,
+    call, emulator, error_message, ok, ok_as, refused, refused_as, string, MISSING_STORE,
+    NOT_FOUND, STORE,
 };
 
 /// The emulator's account id, for the ARN forms the modelled `IdentityStoreId` pattern
@@ -114,7 +115,7 @@ enum Addressed {
 /// Rule 1: every operation resolves the `IdentityStoreId` it is given as the store the
 /// CALLER names — any value the modelled pattern admits names a store this emulator
 /// serves, holding whatever has been written to it — and only an identifier that names a
-/// store of another account is refused, with the modelled 404
+/// store of another account is refused, with the modelled
 /// `ResourceNotFoundException` naming `IDENTITY_STORE`.
 ///
 /// Rows span the forms the modelled pattern admits (`smithy_query(query="shape",
@@ -268,7 +269,7 @@ async fn every_well_formed_identity_store_id_is_served_and_only_another_accounts
                     &router,
                     operation,
                     request,
-                    404,
+                    NOT_FOUND,
                     "ResourceNotFoundException",
                     &case,
                 )
@@ -297,13 +298,13 @@ async fn every_well_formed_identity_store_id_is_served_and_only_another_accounts
                 ("CreateGroup" | "CreateUser", _) => &[200],
                 // The seed store holds the resources the other requests name: the
                 // membership create repeats a pair it already holds (409) and the delete
-                // names a membership nothing created (404).
-                ("DeleteGroupMembership", Addressed::SeedStore) => &[404],
+                // names a membership nothing created (the not-found).
+                ("DeleteGroupMembership", Addressed::SeedStore) => &[NOT_FOUND],
                 ("CreateGroupMembership", Addressed::SeedStore) => &[200, 409],
                 (_, Addressed::SeedStore) => &[200],
                 // Any other store is served and holds none of those resources, so each
                 // request is answered by what IT names being absent.
-                _ => &[404],
+                _ => &[NOT_FOUND],
             };
             assert!(
                 accepted.contains(&status),
@@ -320,7 +321,7 @@ async fn every_well_formed_identity_store_id_is_served_and_only_another_accounts
                 &router,
                 "CreateGroup",
                 json!({ "IdentityStoreId": identity_store_id, "DisplayName": format!("g-{slug}") }),
-                404,
+                NOT_FOUND,
                 "ResourceNotFoundException",
                 &case,
             )
@@ -1094,7 +1095,7 @@ async fn an_update_honours_the_revision_precondition_and_the_uniqueness_claim() 
             "UserId": MISSING_RESOURCE,
             "Operations": [{ "AttributePath": "userId", "AttributeValue": user }],
         }),
-        404,
+        NOT_FOUND,
         "ResourceNotFoundException",
         "an unknown user",
     )

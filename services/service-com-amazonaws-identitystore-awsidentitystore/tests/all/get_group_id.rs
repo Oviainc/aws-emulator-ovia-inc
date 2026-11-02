@@ -7,7 +7,7 @@
 //! `AlternateIdentifier` names — an `ExternalId` (issuer + id) stored on the group, or a
 //! `UniqueAttribute` naming the one unique attribute the operation supports,
 //! `displayName` — and reports that group's stored `IdentityStoreId`, `GroupId` and
-//! `GroupArn`; no group matching is HTTP 404 `ResourceNotFoundException`, an identifier
+//! `GroupArn`; no group matching is the not-found `ResourceNotFoundException`, an identifier
 //! the operation cannot interpret is HTTP 400 `ValidationException`, and the resolution
 //! writes nothing.
 //!
@@ -24,7 +24,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 use crate::identity_store_lifecycle::{assert_resource_arn, assert_uuid};
 
 /// The bounds of the modelled `GroupDisplayName` length
@@ -270,7 +270,7 @@ async fn a_display_name_resolves_only_within_the_store_that_holds_it() {
             &router,
             STORE,
             by_display_name(display_name),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )
@@ -293,7 +293,7 @@ async fn a_display_name_resolves_only_within_the_store_that_holds_it() {
             &router,
             &identifier,
             by_display_name("engineering"),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )
@@ -328,7 +328,7 @@ async fn an_external_id_resolves_only_a_group_that_carries_it() {
             &router,
             STORE,
             by_external_id(issuer, id),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )
@@ -473,7 +473,7 @@ async fn resolving_a_group_id_changes_nothing_a_later_caller_sees() {
                 &reader,
                 &store,
                 by_display_name("engineering"),
-                404,
+                NOT_FOUND,
                 "ResourceNotFoundException",
                 &case,
             )
@@ -503,7 +503,7 @@ async fn resolving_a_group_id_changes_nothing_a_later_caller_sees() {
             &reader,
             &unknown_store_id(index),
             by_display_name("engineering"),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             &case,
         )
@@ -515,7 +515,7 @@ async fn resolving_a_group_id_changes_nothing_a_later_caller_sees() {
                 "IdentityStoreId": unknown_store_id(index),
                 "DisplayName": "engineering",
             }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             &case,
         )

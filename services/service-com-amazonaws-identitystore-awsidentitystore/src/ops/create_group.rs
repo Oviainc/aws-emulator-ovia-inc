@@ -176,10 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // later `DescribeGroup` reports.
         let created_by = crate::state::caller_principal(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateGroupErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the identity store is unavailable".to_string()),
-                ..Default::default()
-            })
+            CreateGroupErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
         let mut state = state.lock();
         // `IdentityStoreId` is CALLER-CHOSEN and no modelled operation creates an

@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 use crate::identity_store_lifecycle::{
     assert_absent, assert_resource_arn, assert_round_tripped, assert_uuid, create_group,
     create_user, user_name, MAX_RESULTS_MAX, MAX_RESULTS_MIN,
@@ -461,7 +461,7 @@ async fn a_store_this_emulator_does_not_serve_is_not_found_and_an_unwritten_one_
             &router,
             "ListUsers",
             json!({ "IdentityStoreId": store }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             row_case,
         )

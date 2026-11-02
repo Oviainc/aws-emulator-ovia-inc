@@ -21,7 +21,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The wire harness is [`crate::harness`]'s and the resource-creation helpers are the
 /// lifecycle suite's; this suite reuses them rather than carrying a second copy that
 /// can drift.
-use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 use crate::identity_store_lifecycle::{
     assert_resource_arn, create_group, create_user, user_name, walk_memberships, MAX_RESULTS_MAX,
     MAX_RESULTS_MIN,
@@ -330,7 +330,7 @@ async fn a_member_this_identity_store_does_not_hold_is_reported_as_not_found() {
             &router,
             "ListGroupMembershipsForMember",
             json!({ "IdentityStoreId": store, "MemberId": member_id(&candidate) }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             row_case,
         )

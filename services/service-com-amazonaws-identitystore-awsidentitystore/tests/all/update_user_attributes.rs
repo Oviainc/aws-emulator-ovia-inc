@@ -25,7 +25,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 
 /// The emulator's account id, as it appears in an identity store's ARN — the other
 /// form the modelled `IdentityStoreId` pattern admits.
@@ -906,7 +906,7 @@ async fn an_update_of_a_user_that_does_not_exist_is_not_found() {
                 "UserId": identifier,
                 "Operations": [{ "AttributePath": "displayName", "AttributeValue": "Ada" }],
             }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             row,
         )
@@ -925,7 +925,7 @@ async fn an_update_of_a_user_that_does_not_exist_is_not_found() {
         &router,
         "DescribeUser",
         json!({ "IdentityStoreId": MISSING_STORE, "UserId": user }),
-        404,
+        NOT_FOUND,
         "ResourceNotFoundException",
         "the store is still not served",
     )

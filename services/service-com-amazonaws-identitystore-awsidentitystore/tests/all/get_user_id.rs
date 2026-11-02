@@ -12,7 +12,7 @@
 //! The suites are TABLES. The rule under test is: `GetUserId` reports the stored
 //! `UserId` / `UserArn` of the user whose attribute the request's `AlternateIdentifier`
 //! names, refuses an identifier the service resolves no user by with
-//! `ValidationException` (400), answers `ResourceNotFoundException` (404) when the
+//! `ValidationException` (400), answers `ResourceNotFoundException` when the
 //! identity store holds no such user, and persists nothing. The rows differ along what
 //! that rule generalises over: which identifier form is sent, how the `AttributePath`
 //! is spelled, the value's length and character class, the `AttributeValue`'s document
@@ -21,7 +21,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 use crate::identity_store_lifecycle::{assert_resource_arn, assert_uuid};
 
 /// Which stored attribute a row resolves its user by.
@@ -225,7 +225,7 @@ async fn resolution_is_stable_and_scoped_to_one_identity_store() {
             &router,
             "GetUserId",
             get_user_id(MISSING_STORE, unique_attribute("userName", json!(user_name))),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             &case,
         )
@@ -316,7 +316,7 @@ async fn an_identifier_no_user_carries_is_reported_as_not_found() {
             &router,
             "GetUserId",
             get_user_id(store, identifier),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )
@@ -335,7 +335,7 @@ async fn an_identifier_no_user_carries_is_reported_as_not_found() {
         &router,
         "GetUserId",
         get_user_id(MISSING_STORE, unique_attribute("userName", json!("present"))),
-        404,
+        NOT_FOUND,
         "ResourceNotFoundException",
         "another account's store",
     )
@@ -408,7 +408,7 @@ async fn resolving_a_user_id_persists_nothing() {
                 &router,
                 "GetUserId",
                 get_user_id(store, unique_attribute("userName", json!("nobody"))),
-                404,
+                NOT_FOUND,
                 "ResourceNotFoundException",
                 &case,
             )

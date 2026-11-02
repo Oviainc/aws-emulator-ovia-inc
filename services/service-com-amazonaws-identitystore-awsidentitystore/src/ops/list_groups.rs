@@ -163,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListGroupsErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the identity store is unavailable".to_string()),
-                ..Default::default()
-            })
+            ListGroupsErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
         // `@readonly`: the store is RESOLVED and nothing is written, so listing groups
         // can never change what a later caller sees — a store with no record yet reports
@@ -191,16 +188,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .eq_ignore_ascii_case(crate::state::GROUP_FILTER_ATTRIBUTE_PATH)
             {
                 return Err(ListGroupsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "AttributePath {:?} is not an attribute ListGroups can filter on; \
-                             the supported attribute path is {}",
-                            filter.attribute_path,
-                            crate::state::GROUP_FILTER_ATTRIBUTE_PATH
-                        )),
-                        request_id: None,
-                        reason: None,
-                    },
+                    crate::state::validation(format!(
+                        "AttributePath {:?} is not an attribute ListGroups can filter on; \
+                         the supported attribute path is {}",
+                        filter.attribute_path,
+                        crate::state::GROUP_FILTER_ATTRIBUTE_PATH
+                    )),
                 )
                 .into());
             }
@@ -226,14 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resized page if it ever is.
         let requested = input.max_results.unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
         if !(1..=crate::state::MAX_MAX_RESULTS).contains(&requested) {
-            return Err(ListGroupsErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
+            return Err(ListGroupsErrorModeled::ValidationException(
+                crate::state::validation(format!(
                     "MaxResults must be between 1 and {}, got {requested}",
                     crate::state::MAX_MAX_RESULTS
                 )),
-                request_id: None,
-                reason: None,
-            })
+            )
             .into());
         }
         let page_size = requested as usize;
@@ -249,14 +240,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     matching.iter().position(|group| group.group_id == group_id)
                 });
                 resume_at.ok_or_else(|| {
-                    ListGroupsErrorModeled::ValidationException(ValidationException {
-                        message: Some(
-                            "NextToken is not a cursor this service issued for this listing"
-                                .to_string(),
-                        ),
-                        request_id: None,
-                        reason: None,
-                    })
+                    ListGroupsErrorModeled::ValidationException(crate::state::validation(
+                        "NextToken is not a cursor this service issued for this listing",
+                    ))
                 })?
             }
         };

@@ -10,7 +10,7 @@
 //! The rule under test: `GetGroupMembershipId` reports the `MembershipId` and
 //! `MembershipArn` of the membership the identity store holds for the (group, member)
 //! pair the request names, and refuses with the modelled `ResourceNotFoundException`
-//! (HTTP 404) when it holds none. The suites are TABLES whose rows differ along what
+//! (the modelled not-found) when it holds none. The suites are TABLES whose rows differ along what
 //! that rule generalises over: how many memberships the group and the store hold,
 //! which member of which group is asked about, the FORM of each identifier (bare id,
 //! resource ARN, upper case, identity-store ARN), and which part of the pair is missing.
@@ -18,7 +18,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 
 /// A well-formed `ResourceId` of a resource nothing created, so a refusal comes from
 /// state rather than from the boundary validator.
@@ -336,7 +336,7 @@ async fn a_pair_with_no_membership_is_reported_as_not_found() {
             &router,
             "GetGroupMembershipId",
             request,
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             row_case,
         )
@@ -379,7 +379,7 @@ async fn a_pair_with_no_membership_is_reported_as_not_found() {
             "GroupId": group.clone(),
             "MemberId": { "UserId": user.clone() },
         }),
-        404,
+        NOT_FOUND,
         "ResourceNotFoundException",
         "after the membership is deleted",
     )

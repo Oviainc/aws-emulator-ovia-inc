@@ -178,10 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ListGroupMemberships` reports.
         let created_by = crate::state::caller_principal(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateGroupMembershipErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the identity store is unavailable".to_string()),
-                ..Default::default()
-            })
+            CreateGroupMembershipErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
         })?;
         let mut state = state.lock();
         // A well-formed `IdentityStoreId` of this account names the store the client has;

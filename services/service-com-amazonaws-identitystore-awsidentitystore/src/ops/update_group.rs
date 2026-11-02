@@ -302,18 +302,12 @@ impl GroupAttribute {
 /// select the access trail without reading the rest of the emulator's traces.
 const AUDIT_TARGET: &str = "emulator::audit";
 
-/// The modelled `ValidationException` (HTTP 400) for a request this operation cannot
-/// apply.
+/// The modelled `ValidationException` for a request this operation cannot apply.
 ///
-/// `reason` stays absent: `ValidationExceptionReason` models only the four KMS reasons
-/// (`VALIDATION_EXCEPTION_REASON_VALUES`), none of which describes an attribute
-/// operation.
+/// The members every exception of this service carries come from the one constructor
+/// ([`crate::state::validation`]).
 fn invalid(message: String) -> UpdateGroupErrorModeled {
-    UpdateGroupErrorModeled::ValidationException(ValidationException {
-        message: Some(message),
-        request_id: None,
-        reason: None,
-    })
+    UpdateGroupErrorModeled::ValidationException(crate::state::validation(message))
 }
 
 /// The value `operation` sets `attribute` to: `None` when the operation carries no
@@ -432,10 +426,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let changes = planned_changes(&input.operations)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            UpdateGroupErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the identity store is unavailable".to_string()),
-                ..Default::default()
-            })
+            UpdateGroupErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
         let mut state = state.lock();
         let group_not_found = || {

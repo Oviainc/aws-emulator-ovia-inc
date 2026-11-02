@@ -28,7 +28,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 use crate::identity_store_lifecycle::{
     assert_resource_arn, create_group, create_user, user_name, walk_memberships, MAX_RESULTS_MIN,
 };
@@ -124,7 +124,7 @@ async fn assert_gone(router: &MultiServiceRouter, store: &str, group: &str, case
         router,
         "DescribeGroup",
         json!({ "IdentityStoreId": store, "GroupId": group }),
-        404,
+        NOT_FOUND,
         "ResourceNotFoundException",
         case,
     )
@@ -133,7 +133,7 @@ async fn assert_gone(router: &MultiServiceRouter, store: &str, group: &str, case
         router,
         "ListGroupMemberships",
         json!({ "IdentityStoreId": store, "GroupId": group }),
-        404,
+        NOT_FOUND,
         "ResourceNotFoundException",
         case,
     )
@@ -201,7 +201,7 @@ async fn deleting_a_group_removes_it_with_its_memberships_and_frees_its_display_
                 &router,
                 "DeleteGroupMembership",
                 json!({ "IdentityStoreId": STORE, "MembershipId": membership }),
-                404,
+                NOT_FOUND,
                 "ResourceNotFoundException",
                 case,
             )
@@ -316,9 +316,9 @@ async fn deleting_a_group_that_was_never_created_is_a_success_that_removes_nothi
 }
 
 /// Idempotence covers the GROUP, not the identifier the call is addressed to: a delete
-/// addressed to a store of ANOTHER account is refused with the modelled 404 — the same
-/// refusal every other operation of this service answers one with — while a store of this
-/// account that holds no such group is the empty success idempotence promises.
+/// addressed to a store of ANOTHER account is refused with the modelled not-found — the
+/// same refusal every other operation of this service answers one with — while a store of
+/// this account that holds no such group is the empty success idempotence promises.
 #[tokio::test]
 async fn deleting_a_group_in_a_store_this_emulator_does_not_serve_is_refused() {
     // Rows differ along the form the other account's store id takes and whether the group
@@ -350,7 +350,7 @@ async fn deleting_a_group_in_a_store_this_emulator_does_not_serve_is_refused() {
             &router,
             "DeleteGroup",
             json!({ "IdentityStoreId": store, "GroupId": group_id }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )
@@ -366,7 +366,7 @@ async fn deleting_a_group_in_a_store_this_emulator_does_not_serve_is_refused() {
             &router,
             "DescribeGroup",
             json!({ "IdentityStoreId": MISSING_STORE, "GroupId": kept.clone() }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )

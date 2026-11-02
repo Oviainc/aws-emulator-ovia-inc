@@ -170,10 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListGroupMembershipsErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the identity store is unavailable".to_string()),
-                ..Default::default()
-            })
+            ListGroupMembershipsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
         })?;
         // A read: the store is RESOLVED and nothing is written, so listing a group's
         // memberships can never change what a later caller sees.
@@ -217,14 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .position(|membership| membership.membership_id == membership_id)
                 });
                 resume_at.ok_or_else(|| {
-                    ListGroupMembershipsErrorModeled::ValidationException(ValidationException {
-                        message: Some(
-                            "NextToken is not a cursor this service issued for this group"
-                                .to_string(),
+                    ListGroupMembershipsErrorModeled::ValidationException(
+                        crate::state::validation(
+                            "NextToken is not a cursor this service issued for this group",
                         ),
-                        request_id: None,
-                        reason: None,
-                    })
+                    )
                 })?
             }
         };

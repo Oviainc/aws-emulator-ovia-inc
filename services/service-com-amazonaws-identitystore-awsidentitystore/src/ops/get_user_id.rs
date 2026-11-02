@@ -168,10 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let selector = UserSelector::from_identifier(&input.alternate_identifier)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetUserIdErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the identity store is unavailable".to_string()),
-                ..Default::default()
-            })
+            GetUserIdErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
         // A read: the store is RESOLVED and nothing is written, so resolving a user id
         // can never change what a later caller sees.
@@ -305,18 +302,13 @@ impl UserSelector {
         )
     }
 
-    /// The modelled `ValidationException` (HTTP 400) for an identifier this service
-    /// resolves no user by. The model declares that shape on this operation, so the
-    /// modelled error is used rather than the scaffold's synthetic one. `Reason` is
-    /// left unset: every modelled `ValidationExceptionReason` value is about a KMS key
-    /// (`smithy_query(query="shape",shape="ValidationExceptionReason")`), none of which
-    /// is this.
+    /// The modelled `ValidationException` for an identifier this service resolves no
+    /// user by. The model declares that shape on this operation, so the modelled error
+    /// is used rather than the scaffold's synthetic one; the members every exception of
+    /// this service carries come from the one constructor
+    /// ([`crate::state::validation`]).
     fn validation(message: String) -> GetUserIdError {
-        GetUserIdErrorModeled::ValidationException(ValidationException {
-            message: Some(message),
-            ..Default::default()
-        })
-        .into()
+        GetUserIdErrorModeled::ValidationException(crate::state::validation(message)).into()
     }
 }
 

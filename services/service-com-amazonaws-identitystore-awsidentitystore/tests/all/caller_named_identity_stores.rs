@@ -7,10 +7,10 @@
 //! AWS one comes with an IAM Identity Center instance, and a client reads its id out of
 //! its own environment — so every operation serves whatever `IdentityStoreId` the
 //! modelled constraints admit, each store holding exactly what has been written to it,
-//! and the modelled 404 `ResourceNotFoundException` naming `IDENTITY_STORE` is reserved
+//! and the modelled `ResourceNotFoundException` naming `IDENTITY_STORE` is reserved
 //! for an identifier that names a store this emulator cannot serve at all (an ARN
-//! carrying another account). A value the modelled `@length`/`@pattern` refuse is a 400
-//! `ValidationException`, never a 404.
+//! carrying another account). A value the modelled `@length`/`@pattern` refuse is a
+//! `ValidationException`, never a not-found.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: the FORM
 //! of the identifier (`d-` + 10 hex or a UUID, bare or as the store's ARN, in either
@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_identitystore_awsidentitystore as identitystore;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 
 /// An account id that is NOT this emulator's, for the ARN form that names another
 /// account's store (the modelled pattern admits any 12-digit account).
@@ -248,7 +248,7 @@ async fn a_create_is_served_in_whatever_store_the_caller_names() {
             &router,
             "DescribeGroup",
             json!({ "IdentityStoreId": elsewhere.0.clone(), "GroupId": group_id.clone() }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             &case,
         )
@@ -365,7 +365,7 @@ async fn a_store_nothing_has_written_to_is_served_and_holds_nothing() {
                     "IdentityStoreId": identity_store_id,
                     "GroupId": "a1b2c3d4-5678-90ab-cdef-999999999999",
                 }),
-                404,
+                NOT_FOUND,
                 "ResourceNotFoundException",
                 &case,
             )
@@ -396,8 +396,9 @@ async fn a_store_nothing_has_written_to_is_served_and_holds_nothing() {
 }
 
 /// The rule's NEGATIVE side: an identifier that names a store this emulator cannot serve
-/// is the modelled 404, and one the modelled constraints refuse is a 400 — so a 404 is
-/// never the answer to a well-formed id of this account.
+/// is the modelled not-found, and one the modelled constraints refuse is a
+/// `ValidationException` — so a not-found is never the answer to a well-formed id of this
+/// account.
 #[tokio::test]
 async fn only_a_store_outside_this_account_is_not_found_and_a_bad_value_is_a_400() {
     let router = emulator();
@@ -441,7 +442,7 @@ async fn only_a_store_outside_this_account_is_not_found_and_a_bad_value_is_a_400
                 &router,
                 operation,
                 request,
-                404,
+                NOT_FOUND,
                 "ResourceNotFoundException",
                 &case,
             )
@@ -565,13 +566,13 @@ async fn a_write_that_stores_nothing_records_no_identity_store() {
         (
             "DeleteUser",
             json!({ "UserId": "a1b2c3d4-5678-90ab-cdef-999999999999" }),
-            404,
+            NOT_FOUND,
             "USER",
         ),
         (
             "DeleteGroupMembership",
             json!({ "MembershipId": "a1b2c3d4-5678-90ab-cdef-999999999999" }),
-            404,
+            NOT_FOUND,
             "GROUP_MEMBERSHIP",
         ),
         (
@@ -580,7 +581,7 @@ async fn a_write_that_stores_nothing_records_no_identity_store() {
                 "UserId": "a1b2c3d4-5678-90ab-cdef-999999999999",
                 "Operations": [{ "AttributePath": "displayName", "AttributeValue": "Ada" }],
             }),
-            404,
+            NOT_FOUND,
             "USER",
         ),
         (
@@ -589,7 +590,7 @@ async fn a_write_that_stores_nothing_records_no_identity_store() {
                 "GroupId": "a1b2c3d4-5678-90ab-cdef-999999999999",
                 "Operations": [{ "AttributePath": "description", "AttributeValue": "d" }],
             }),
-            404,
+            NOT_FOUND,
             "GROUP",
         ),
         (
@@ -598,7 +599,7 @@ async fn a_write_that_stores_nothing_records_no_identity_store() {
                 "GroupId": "a1b2c3d4-5678-90ab-cdef-999999999999",
                 "MemberId": { "UserId": "a1b2c3d4-5678-90ab-cdef-888888888888" },
             }),
-            404,
+            NOT_FOUND,
             "GROUP",
         ),
     ];

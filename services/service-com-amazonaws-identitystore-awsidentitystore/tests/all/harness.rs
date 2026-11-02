@@ -40,6 +40,14 @@ pub const MISSING_STORE: &str =
 /// makes it.
 pub const DEFAULT_AKID: &str = "AKIDIDENTITYSTORE";
 
+/// The HTTP status this service answers `ResourceNotFoundException` with.
+///
+/// Named once here because it is a property of the ERROR CLASS and not of any one
+/// operation: every suite that expects a resource this service does not hold expects
+/// this status beside the not-found error code
+/// (`identitystore::service::error_status`).
+pub const NOT_FOUND: u16 = 400;
+
 /// A router with just this service mounted on a fresh engine.
 pub fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());

@@ -49,6 +49,35 @@ use std::sync::Arc;
 /// else here is routing.
 pub mod validation;
 
+/// The wire error code of the one error class this service answers with a status its
+/// model's `@httpError` does not state. The code itself is unchanged on the wire: it is
+/// the STATUS beside it that this service decides here.
+const NOT_FOUND_ERROR_CODE: &str = "ResourceNotFoundException";
+
+/// The HTTP status this service answers its not-found class with.
+///
+/// This service's wire reports a resource it does not hold as a 4xx CLIENT fault with the
+/// not-found code in the body, at the status its other client faults use, and not at the
+/// separate 404 its published model's `@httpError` declares for the shape. A caller still
+/// branches on the error code, which is what names the failure.
+const NOT_FOUND_STATUS: u16 = 400;
+
+/// The HTTP status this service answers a modelled error with: the status the model
+/// declares for that error shape, except for the not-found class
+/// ([`NOT_FOUND_ERROR_CODE`]), which this service serves at [`NOT_FOUND_STATUS`].
+///
+/// Keyed on the WIRE ERROR CODE, so it holds for every operation that raises the class
+/// and for every resource kind it names — there is one status per error class, decided
+/// once, rather than one per handler. `modeled` is what the error shape's own
+/// `@httpError` states, and every other class keeps it.
+pub fn error_status(error_code: &str, modeled: u16) -> u16 {
+    if error_code == NOT_FOUND_ERROR_CODE {
+        NOT_FOUND_STATUS
+    } else {
+        modeled
+    }
+}
+
 /// The `com-amazonaws-identitystore-awsidentitystore` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///

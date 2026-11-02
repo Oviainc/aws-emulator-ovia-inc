@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_identitystore_awsidentitystore as identitystore;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, emulator, ok, string, MISSING_STORE, STORE};
+use crate::harness::{call, emulator, ok, string, MISSING_STORE, NOT_FOUND, STORE};
 use crate::identity_store_lifecycle::{create_group, create_user};
 
 /// A `ResourceId` the modelled pattern admits but that no create ever minted.
@@ -568,7 +568,7 @@ async fn a_resource_that_is_not_there_is_reported_with_its_classs_fixed_message(
             &router,
             operation,
             request,
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )

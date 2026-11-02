@@ -163,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetGroupIdErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the identity store is unavailable".to_string()),
-                ..Default::default()
-            })
+            GetGroupIdErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
 
         // Which group the alternate identifier names. Resolved BEFORE the store is
@@ -271,18 +268,12 @@ impl<'a> GroupLookup<'a> {
     }
 }
 
-/// The modelled `ValidationException` (HTTP 400) for an `AlternateIdentifier` this
-/// operation cannot interpret.
+/// The modelled `ValidationException` for an `AlternateIdentifier` this operation
+/// cannot interpret.
 ///
 /// The model's own shape rather than the scaffold's synthetic one, because this
-/// operation declares it. `Reason` is left unset: every modelled
-/// `ValidationExceptionReason` value is about a KMS key
-/// (`smithy_query(query="shape",shape="ValidationExceptionReason")`), none of which is
-/// this.
+/// operation declares it; the members every exception of this service carries come from
+/// the one constructor ([`crate::state::validation`]).
 fn invalid(message: String) -> GetGroupIdError {
-    GetGroupIdErrorModeled::ValidationException(ValidationException {
-        message: Some(message),
-        ..Default::default()
-    })
-    .into()
+    GetGroupIdErrorModeled::ValidationException(crate::state::validation(message)).into()
 }

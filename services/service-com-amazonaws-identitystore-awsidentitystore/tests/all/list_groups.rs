@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The HTTP harness, shared with this crate's other suites rather than restated here.
-use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 use crate::identity_store_lifecycle::{assert_resource_arn, assert_uuid};
 
 /// A well-formed `IdentityStoreId` in the UUID form the modelled pattern also admits,
@@ -396,7 +396,7 @@ async fn a_listing_covers_exactly_the_store_the_request_names() {
         &router,
         "ListGroups",
         list_request(MISSING_STORE, None, None),
-        404,
+        NOT_FOUND,
         "ResourceNotFoundException",
         case,
     )
@@ -465,7 +465,8 @@ async fn a_filter_selects_by_display_name() {
         }
     }
 
-    // ...a value no group carries selects nothing, and that is an empty list, not a 404.
+    // ...a value no group carries selects nothing, and that is an empty list, not a
+    // not-found.
     for missing in ["alph", "ALPHA", "gamma", "epsilon"] {
         let page = ok(
             &router,
@@ -624,7 +625,7 @@ async fn a_store_this_emulator_does_not_serve_is_not_found_and_an_unwritten_one_
             &router,
             "ListGroups",
             list_request(&store, None, None),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             &format!("{case}: {store}"),
         )

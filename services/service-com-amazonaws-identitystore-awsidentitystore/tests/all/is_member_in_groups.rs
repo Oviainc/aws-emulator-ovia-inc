@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 use crate::identity_store_lifecycle::{create_group, create_user};
 
 /// The bounds of the modelled `GroupIds` length (1..100, from
@@ -402,7 +402,7 @@ async fn a_store_or_member_the_check_cannot_resolve_is_refused() {
                 "MemberId": { "UserId": user },
                 "GroupIds": [groups[0]],
             }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             &row_case,
         )
@@ -429,7 +429,7 @@ async fn a_store_or_member_the_check_cannot_resolve_is_refused() {
                 "MemberId": { "UserId": member },
                 "GroupIds": [groups[0]],
             }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             &row_case,
         )

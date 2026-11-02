@@ -177,10 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            DeleteGroupErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the identity store is unavailable".to_string()),
-                ..Default::default()
-            })
+            DeleteGroupErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
         let mut state = state.lock();
         // The store is RESOLVED but never REGISTERED: a delete stores nothing. An

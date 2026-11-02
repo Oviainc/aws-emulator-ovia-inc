@@ -11,13 +11,15 @@
 //! is WORDED lives in `crate::service::validation`, beside the seam that answers it.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::Document;
 
 use crate::ops::types::{
-    Address, ConflictException, Email, ExternalId, GroupMembership, MemberId, Name, PhoneNumber,
-    Photo, ResourceNotFoundException, Role, ServiceQuotaExceededException,
+    Address, ConflictException, Email, ExternalId, GroupMembership, InternalServerException,
+    MemberId, Name, PhoneNumber, Photo, ResourceNotFoundException, Role,
+    ServiceQuotaExceededException, ValidationException,
 };
 
 /// The identity store this emulator ADVERTISES through IAM Identity Center: the store of
@@ -825,7 +827,7 @@ impl Default for ComAmazonawsIdentitystoreAwsidentitystoreState {
 /// The two refusals a CREATE can meet at the resolution seam, each the modelled error for
 /// its case: an identifier that names no store this emulator serves, and this emulator
 /// already recording [`MAX_IDENTITY_STORES`] stores. Every operation that registers a
-/// store models both (`ResourceNotFoundException` 404 and `ServiceQuotaExceededException`
+/// store models both (`ResourceNotFoundException` and `ServiceQuotaExceededException`
 /// 402), so the handler maps this onto its own error channel.
 #[derive(Debug)]
 pub enum StoreWriteRefusal {
@@ -879,8 +881,8 @@ impl ComAmazonawsIdentitystoreAwsidentitystoreState {
     /// serves however its id ends.
     ///
     /// A store with no record yet resolves to the empty [`ResolvedStore::Unwritten`], so
-    /// a read of it reports the nothing it holds — a listing with no entries, a 404 for
-    /// the RESOURCE a describe names — and writes nothing. This is the one place
+    /// a read of it reports the nothing it holds — a listing with no entries, the
+    /// not-found of the RESOURCE a describe names — and writes nothing. This is the one place
     /// resolution happens, so a read cannot gate differently from a write.
     pub fn resolve_store(
         &self,
@@ -986,7 +988,7 @@ pub fn identity_store_not_found(identifier: &str) -> ResourceNotFoundException {
         resource_id: identity_store_key(identifier),
         reason: None,
         message: Some(IDENTITY_STORE_NOT_FOUND_MESSAGE.to_string()),
-        request_id: None,
+        request_id: Some(new_request_id()),
     }
 }
 
@@ -1003,7 +1005,7 @@ pub fn not_found(kind: ResourceKind, resource_id: &str) -> ResourceNotFoundExcep
         resource_id: Some(resource_id.to_string()),
         reason: None,
         message: Some(kind.not_found_message().to_string()),
-        request_id: None,
+        request_id: Some(new_request_id()),
     }
 }
 
@@ -1021,7 +1023,7 @@ pub fn member_not_found(member_user_id: &str) -> ResourceNotFoundException {
         resource_id: Some(member_user_id.to_string()),
         reason: None,
         message: Some("User with provided member ID not found".to_string()),
-        request_id: None,
+        request_id: Some(new_request_id()),
     }
 }
 
@@ -1066,7 +1068,7 @@ pub fn not_found_by_alternate_identifier(kind: ResourceKind) -> ResourceNotFound
         resource_id: None,
         reason: None,
         message: Some(format!("{} not found.", kind.resource_type())),
-        request_id: None,
+        request_id: Some(new_request_id()),
     }
 }
 
@@ -1110,7 +1112,7 @@ impl UniquenessClaim {
 pub fn uniqueness_conflict(claim: UniquenessClaim) -> ConflictException {
     ConflictException {
         message: Some(claim.message().to_string()),
-        request_id: None,
+        request_id: Some(new_request_id()),
         reason: Some("UNIQUENESS_CONSTRAINT_VIOLATION".to_string()),
     }
 }
@@ -1123,7 +1125,7 @@ pub fn quota_exceeded(subject: String) -> ServiceQuotaExceededException {
         message: Some(format!(
             "the request would exceed the maximum this emulator holds: {subject}"
         )),
-        request_id: None,
+        request_id: Some(new_request_id()),
     }
 }
 
@@ -1140,9 +1142,64 @@ pub fn revision_conflict(expected: &str, stored: &str) -> ConflictException {
         message: Some(format!(
             "the request expected revision {expected} but the resource is at revision {stored}"
         )),
-        request_id: None,
+        request_id: Some(new_request_id()),
         reason: Some("CONCURRENT_MODIFICATION".to_string()),
     }
+}
+
+/// The modelled `ValidationException` for a request this service cannot accept, carrying
+/// `message` as its reason in words.
+///
+/// The one constructor every handler calls, so a refusal a HANDLER raises carries the
+/// same exception members as one the boundary validator raises: `reason` stays absent
+/// (every modelled `ValidationExceptionReason` value is about a customer-managed KMS key,
+/// `smithy_query(query="shape",shape="ValidationExceptionReason")`, and the member is "not
+/// included" for anything else) and `RequestId` is this call's
+/// ([`new_request_id`]).
+pub fn validation(message: impl Into<String>) -> ValidationException {
+    ValidationException {
+        message: Some(message.into()),
+        request_id: Some(new_request_id()),
+        reason: None,
+    }
+}
+
+/// The modelled `InternalServerException` a handler answers when it cannot reach this
+/// service's store at all.
+///
+/// One constructor rather than the same literal per operation file: the store is reached
+/// identically by every handler, so there is one sentence for failing to reach it, and
+/// `RequestId` is stamped here like on every other exception this service returns.
+pub fn store_unavailable() -> InternalServerException {
+    InternalServerException {
+        message: Some("the identity store is unavailable".to_string()),
+        request_id: Some(new_request_id()),
+        ..Default::default()
+    }
+}
+
+/// The counter behind [`new_request_id`]: process-wide, so two requests served
+/// concurrently never seed the same value.
+static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `RequestId` for an exception body.
+///
+/// Every exception this service models carries a `RequestId` member documented as the
+/// globally unique id the identity store generates FOR EACH REQUEST and returns inside
+/// the exception when that request fails
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so one is minted per
+/// failure rather than left absent. The modelled shape is a 36-character UUID (pattern
+/// `^[A-Fa-f0-9]{8}-…-[A-Fa-f0-9]{12}$`), which is what [`uuid_from_seed`] produces.
+///
+/// The VALUE identifies one call and nothing else: it is not derived from the request, it
+/// is never stored, and it is not reported twice. It needs no service state — the seed is
+/// this process-wide counter plus the clock — so an exception raised before the store is
+/// reached carries one too.
+pub fn new_request_id() -> String {
+    uuid_from_seed(
+        REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+        now_nanos(),
+    )
 }
 
 /// The principal that made this call, as the `CreatedBy` / `UpdatedBy` of what it

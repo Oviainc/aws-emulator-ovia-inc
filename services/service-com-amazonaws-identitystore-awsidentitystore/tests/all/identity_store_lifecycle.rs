@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Map, Value};
 
-use crate::harness::{emulator, error_message, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{emulator, error_message, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 /// The crate under test, aliased so a capacity bound can be named rather than restated.
 use service_com_amazonaws_identitystore_awsidentitystore as identitystore;
 use smithy_server_runtime::MultiServiceRouter;
@@ -451,7 +451,7 @@ async fn a_user_name_is_a_uniqueness_claim_and_a_store_that_does_not_exist_holds
             &router,
             "CreateUser",
             json!({ "IdentityStoreId": MISSING_STORE, "UserName": user_name }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )
@@ -650,7 +650,7 @@ async fn deleting_a_membership_removes_it_from_the_group_listing() {
             &router,
             "DeleteGroupMembership",
             json!({ "IdentityStoreId": STORE, "MembershipId": removed_id }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )
@@ -689,7 +689,7 @@ async fn a_membership_needs_both_of_its_ends_and_cannot_be_created_twice() {
                 "GroupId": missing,
                 "MemberId": { "UserId": user.clone() },
             }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
         ),
         (
@@ -699,7 +699,7 @@ async fn a_membership_needs_both_of_its_ends_and_cannot_be_created_twice() {
                 "GroupId": group.clone(),
                 "MemberId": { "UserId": missing },
             }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
         ),
         (
@@ -709,19 +709,19 @@ async fn a_membership_needs_both_of_its_ends_and_cannot_be_created_twice() {
                 "GroupId": group.clone(),
                 "MemberId": { "UserId": user.clone() },
             }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
         ),
         (
             "unknown group on a list",
             json!({ "IdentityStoreId": STORE, "GroupId": missing }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
         ),
         (
             "unknown membership on a delete",
             json!({ "IdentityStoreId": STORE, "MembershipId": missing }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
         ),
     ];
@@ -1113,7 +1113,7 @@ async fn an_unknown_user_or_group_is_reported_as_not_found() {
             &router,
             operation,
             request,
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )
@@ -1404,7 +1404,7 @@ async fn a_membership_the_store_does_not_hold_is_reported_as_not_found() {
             &router,
             "DescribeGroupMembership",
             json!({ "IdentityStoreId": store, "MembershipId": membership }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             row,
         )

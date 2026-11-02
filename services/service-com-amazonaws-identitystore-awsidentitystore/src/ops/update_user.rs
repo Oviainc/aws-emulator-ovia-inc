@@ -190,10 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Who is making the change: recorded as the user's `UpdatedBy`.
         let updated_by = crate::state::caller_principal(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            UpdateUserErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the identity store is unavailable".to_string()),
-                ..Default::default()
-            })
+            UpdateUserErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
         let mut state = state.lock();
         // The identity store the request names is the store the caller has (any
@@ -348,13 +345,7 @@ fn apply_attribute_operation(
     path: &str,
     value: Option<&::aws_smithy_types::Document>,
 ) -> Result<(), ValidationException> {
-    apply(user, path, value).map_err(|message| ValidationException {
-        message: Some(message),
-        request_id: None,
-        // The modelled `ValidationExceptionReason` carries only the KMS reasons, and
-        // the member is "not included" for anything else.
-        reason: None,
-    })
+    apply(user, path, value).map_err(crate::state::validation)
 }
 
 /// [`apply_attribute_operation`]'s body, whose `Err` is the message the caller gets.

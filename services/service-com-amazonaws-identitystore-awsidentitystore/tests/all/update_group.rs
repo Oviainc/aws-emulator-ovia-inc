@@ -20,7 +20,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 use crate::identity_store_lifecycle::assert_resource_arn;
 
 /// The upper bound of the `@length` both group text attributes carry: `DisplayName`
@@ -747,7 +747,7 @@ async fn the_group_an_update_names_must_exist_in_the_store_it_names() {
                     { "AttributePath": "description", "AttributeValue": "never applied" },
                 ],
             }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )

@@ -14,7 +14,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, NOT_FOUND, STORE};
 use crate::identity_store_lifecycle::{create_group, create_user, user_name};
 
 /// The upper bound of the modelled `ResourceRevision` length
@@ -120,7 +120,7 @@ async fn deleting_a_user_removes_that_user_and_nothing_else() {
             &router,
             "DeleteUser",
             json!({ "IdentityStoreId": STORE, "UserId": users[victim].clone() }),
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )
@@ -376,7 +376,7 @@ async fn a_delete_accepts_every_form_of_the_user_id_and_refuses_one_it_does_not_
             &router,
             "DeleteUser",
             request,
-            404,
+            NOT_FOUND,
             "ResourceNotFoundException",
             case,
         )
@@ -397,7 +397,7 @@ async fn a_delete_accepts_every_form_of_the_user_id_and_refuses_one_it_does_not_
         &router,
         "DescribeUser",
         json!({ "IdentityStoreId": MISSING_STORE, "UserId": known.clone() }),
-        404,
+        NOT_FOUND,
         "ResourceNotFoundException",
         "the store was not vivified",
     )
