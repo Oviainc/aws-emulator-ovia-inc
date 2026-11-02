@@ -157,13 +157,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
+        // The refusal for a `projectArn` that resolves to nothing is the service's
+        // FIXED sentence, single-homed in `crate::state`, with nothing taken from the
+        // request.
         let not_found = || {
             GetDataAutomationProjectErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no data automation project exists with ARN {}",
-                        input.project_arn
-                    )),
+                    message: Some(crate::state::PROJECT_ARN_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
         };

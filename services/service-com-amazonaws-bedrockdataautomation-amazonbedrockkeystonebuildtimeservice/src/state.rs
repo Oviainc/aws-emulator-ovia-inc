@@ -163,11 +163,62 @@ pub const OPTIMIZATION_JOB_QUOTA: usize = 1_000;
 pub const UNKNOWN_INVOCATION_MESSAGE: &str =
     "The requested operation is not recognized by the service.";
 
-/// What this service answers when a submission references a blueprint this store does
-/// not hold: the wording this service's blueprint reads use for a `blueprintArn` that
-/// resolves to nothing, for the resource a blueprint-optimization submission names by
-/// reference. Fixed text, with nothing taken from the request.
+/// What this service answers when an ARN it was handed names no BLUEPRINT this store
+/// holds — whichever operation was handed it, and whether it named the blueprint
+/// directly (`blueprintArn`) or by reference from a filter or a submission.
+///
+/// The text is FIXED: it names the resource kind and the member class that failed to
+/// resolve, and takes nothing from the request or from state, so the refusal a caller
+/// branches on is the same sentence however long the ARN it sent was. Single-homed here
+/// because every operation of this service that resolves a blueprint states the same
+/// refusal, and two copies of a fixed sentence are two sentences waiting to drift.
 pub const BLUEPRINT_ARN_NOT_FOUND_MESSAGE: &str = "Blueprint Arn not found.";
+
+/// What this service answers when the request SCOPED a blueprint lookup to a version and
+/// the ARN-and-version PAIR resolves to nothing — whether it is the ARN or the version
+/// that is not there.
+///
+/// A version-scoped lookup names two things, and the refusal speaks of both rather than
+/// of the ARN alone, because either half can be the one that does not resolve. Fixed
+/// text, like the unscoped sentence above, with nothing taken from the request.
+pub const BLUEPRINT_ARN_OR_VERSION_INVALID_MESSAGE: &str =
+    "Incorrect Blueprint Arn or Version provided in the request.";
+
+/// The sentence a blueprint lookup that resolved to nothing is refused with, chosen by
+/// whether the request scoped the lookup to a version (`blueprintVersion` present, at
+/// whatever value) rather than by which half of the pair was missing.
+///
+/// The ONE place that choice is made, so the operations that accept a `blueprintVersion`
+/// (`GetBlueprint`, `DeleteBlueprint`) and the ones that do not cannot drift into
+/// different sentences for the same refusal.
+#[must_use]
+pub fn blueprint_not_found_message(blueprint_version: Option<&str>) -> &'static str {
+    match blueprint_version {
+        Some(_) => BLUEPRINT_ARN_OR_VERSION_INVALID_MESSAGE,
+        None => BLUEPRINT_ARN_NOT_FOUND_MESSAGE,
+    }
+}
+
+/// [`BLUEPRINT_ARN_NOT_FOUND_MESSAGE`] for the other resource this store holds: what
+/// this service answers when an ARN names no DATA AUTOMATION PROJECT it holds. The
+/// resource kind is named the way this service names it in a refusal (`Project`), and
+/// nothing is taken from the request.
+pub const PROJECT_ARN_NOT_FOUND_MESSAGE: &str = "Project Arn not found.";
+
+/// What this service answers when `CreateBlueprint` is handed a `blueprintName` some
+/// live blueprint already holds.
+///
+/// Fixed text, naming the resource kind and the member whose value is taken, with the
+/// requested name NOT interpolated: `BlueprintName` is modelled `@sensitive`
+/// (`smithy_query(shape="BlueprintName")`), so echoing it would put a value the model
+/// says not to disclose into every client log the refusal reaches.
+pub const BLUEPRINT_NAME_CONFLICT_MESSAGE: &str = "Blueprint name already exists.";
+
+/// [`BLUEPRINT_NAME_CONFLICT_MESSAGE`] for a project: what
+/// `CreateDataAutomationProject` answers when some live project already holds the
+/// `projectName` it was handed. `DataAutomationProjectName` is `@sensitive` too, so the
+/// requested name is not echoed here either.
+pub const PROJECT_NAME_CONFLICT_MESSAGE: &str = "Project name already exists.";
 
 /// The ARN account field AWS's OWN resources carry, as the modelled `BlueprintArn`
 /// pattern admits beside a 12-digit account

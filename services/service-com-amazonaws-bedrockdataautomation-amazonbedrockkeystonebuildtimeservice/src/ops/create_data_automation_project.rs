@@ -195,14 +195,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `projectName` is the user-visible identity of a project, so a second
-        // project under a name already taken is a conflict.
+        // project under a name already taken is a conflict. The refusal is the
+        // service's FIXED sentence, single-homed in `crate::state`: it names the
+        // resource kind and the member whose value is taken and interpolates nothing,
+        // so the requested `@sensitive` name is not disclosed back to the caller.
         if store.project_names.contains_key(&input.project_name) {
             return Err(CreateDataAutomationProjectErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "a data automation project named {} already exists in this account",
-                        input.project_name
-                    )),
+                    message: Some(crate::state::PROJECT_NAME_CONFLICT_MESSAGE.to_string()),
                 },
             )
             .into());

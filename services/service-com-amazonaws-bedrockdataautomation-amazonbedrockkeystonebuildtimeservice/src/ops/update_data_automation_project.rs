@@ -187,10 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateDataAutomationProjectErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no data automation project exists with ARN {}",
-                            input.project_arn
-                        )),
+                        message: Some(crate::state::PROJECT_ARN_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into(),

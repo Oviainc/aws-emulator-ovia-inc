@@ -164,10 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = store.remove_project(&input.project_arn).ok_or_else(|| {
             DeleteDataAutomationProjectErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no data automation project exists with ARN {}",
-                        input.project_arn
-                    )),
+                    message: Some(crate::state::PROJECT_ARN_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
         })?;

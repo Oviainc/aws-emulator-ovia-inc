@@ -155,10 +155,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it only projects what is already stored.
         let store = state.lock();
 
+        // The refusal for a blueprint lookup that resolves to nothing is the service's
+        // FIXED sentence, single-homed in `crate::state`, with nothing taken from the
+        // request: the ARN one for an unscoped lookup, the ARN-or-version one when the
+        // request scoped the lookup to a version.
         let not_found = || {
             GetBlueprintError::Modeled(GetBlueprintErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("blueprint {} does not exist", input.blueprint_arn)),
+                    message: Some(
+                        crate::state::blueprint_not_found_message(
+                            input.blueprint_version.as_deref(),
+                        )
+                        .to_string(),
+                    ),
                 },
             ))
         };

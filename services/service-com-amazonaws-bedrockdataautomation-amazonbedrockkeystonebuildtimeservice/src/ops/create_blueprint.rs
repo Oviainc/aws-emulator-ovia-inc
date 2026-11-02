@@ -171,13 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `blueprintName` is the user-visible identity of a blueprint, so a
-        // second blueprint under a name already taken is a conflict.
+        // second blueprint under a name already taken is a conflict. The refusal is
+        // the service's FIXED sentence, single-homed in `crate::state`: it names the
+        // resource kind and the member whose value is taken and interpolates nothing,
+        // so neither the requested `@sensitive` name nor anything else about the
+        // request reaches a client log through it.
         if store.blueprint_names.contains_key(&input.blueprint_name) {
             return Err(CreateBlueprintErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "a blueprint named {} already exists in this account",
-                    input.blueprint_name
-                )),
+                message: Some(crate::state::BLUEPRINT_NAME_CONFLICT_MESSAGE.to_string()),
             })
             .into());
         }

@@ -184,10 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ListBlueprintsError::Modeled(
                             ListBlueprintsErrorModeled::ResourceNotFoundException(
                                 ResourceNotFoundException {
-                                    message: Some(format!(
-                                        "data automation project {} does not exist",
-                                        filter.project_arn
-                                    )),
+                                    message: Some(
+                                        crate::state::PROJECT_ARN_NOT_FOUND_MESSAGE.to_string(),
+                                    ),
                                 },
                             ),
                         )

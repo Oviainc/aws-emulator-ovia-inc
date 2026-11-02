@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.blueprints.get_mut(&input.blueprint_arn) else {
             return Err(UpdateBlueprintErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("blueprint {} does not exist", input.blueprint_arn)),
+                    message: Some(crate::state::BLUEPRINT_ARN_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

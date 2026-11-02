@@ -148,10 +148,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
+        // Single-homed with the blueprint reads: one FIXED sentence per refusal class —
+        // the ARN one for an unscoped delete, the ARN-or-version one when the request
+        // scoped the delete to a version — so a teardown that recognises either cannot
+        // be told something different by another operation.
         let not_found = || {
             DeleteBlueprintError::Modeled(DeleteBlueprintErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("blueprint {} does not exist", input.blueprint_arn)),
+                    message: Some(
+                        crate::state::blueprint_not_found_message(
+                            input.blueprint_version.as_deref(),
+                        )
+                        .to_string(),
+                    ),
                 },
             ))
         };
