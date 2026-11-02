@@ -309,20 +309,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
 
-        // "If the StartTime parameter specifies a time stamp that is greater than 3 hours ago,
-        // you must specify the period as follows or no data points in that time range is
-        // returned: Start time between 3 hours and 15 days ago - Use a multiple of 60 seconds
-        // (1 minute). Start time between 15 and 63 days ago - Use a multiple of 300 seconds (5
-        // minutes). Start time greater than 63 days ago - Use a multiple of 3600 seconds (1
-        // hour)." (`GetMetricStatisticsInput$Period`) — the granularity a RANGE can be read at
-        // is the one the tier of its start time still holds, and a read at a finer one answers
-        // with no data point for the range at all. The same rule, applied to each datapoint's
-        // own instant, is what ages a datapoint out of its tier ([`crate::state::windows_by_unit`]).
-        let series = if crate::state::retained_at_period(requested_start, input.period, now) {
-            store.metrics.get(&key).map_or(&[][..], Vec::as_slice)
-        } else {
-            &[][..]
-        };
+        // The granularity a RANGE can be read at is the one its start time's retention tier
+        // still holds — and a start reaching back before the horizon any tier ends at is read
+        // from that horizon ([`crate::state::granularity_available_from`]), so a wide window is
+        // answered with the history there is rather than with nothing. Which datapoints INSIDE
+        // the range a read then sees is decided per datapoint, by its own age, in the fold
+        // below ([`crate::state::retained_at_period`]).
+        let series =
+            if crate::state::granularity_available_from(requested_start, input.period, now) {
+                store.metrics.get(&key).map_or(&[][..], Vec::as_slice)
+            } else {
+                &[][..]
+            };
 
         // `StartTime` inclusive, `EndTime` exclusive; windows are `Period` seconds wide and
         // anchored at the ROUNDED start time, folded by the one shared helper every reader of

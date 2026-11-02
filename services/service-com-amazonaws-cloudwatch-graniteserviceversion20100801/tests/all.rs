@@ -121,12 +121,16 @@ mod managed_insight_rules;
 mod metric_data;
 #[path = "all/metric_data_plane_identity.rs"]
 mod metric_data_plane_identity;
+#[path = "all/metric_datum_rules.rs"]
+mod metric_datum_rules;
 #[path = "all/metric_math.rs"]
 mod metric_math;
 #[path = "all/metric_math_alarm_advances.rs"]
 mod metric_math_alarm_advances;
 #[path = "all/metric_math_alarms.rs"]
 mod metric_math_alarms;
+#[path = "all/metric_query_ids.rs"]
+mod metric_query_ids;
 #[path = "all/metric_read_identity.rs"]
 mod metric_read_identity;
 #[path = "all/metric_storage_resolution.rs"]
@@ -157,6 +161,8 @@ mod percentile_low_sample_alarms;
 mod period_refusal_message;
 #[path = "all/probe_counts.rs"]
 mod probe_counts;
+#[path = "all/published_data_is_queryable.rs"]
+mod published_data_is_queryable;
 #[path = "all/put_metric_data_validation.rs"]
 mod put_metric_data_validation;
 #[path = "all/query_compatible_error_envelope.rs"]

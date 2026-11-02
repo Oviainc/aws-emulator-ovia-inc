@@ -438,14 +438,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ..base
                 }]
             } else if let Some(set) = datum.statistic_values.as_ref() {
+                let sample_count = checked_value(
+                    set.sample_count,
+                    &format!("{path}.StatisticValues.SampleCount"),
+                )?;
+                let sum = checked_value(set.sum, &format!("{path}.StatisticValues.Sum"))?;
+                let minimum =
+                    checked_value(set.minimum, &format!("{path}.StatisticValues.Minimum"))?;
+                let maximum =
+                    checked_value(set.maximum, &format!("{path}.StatisticValues.Maximum"))?;
+                // "The number of samples used for the statistic set."
+                // (`StatisticSet$SampleCount`) — the three other members are statistics OF
+                // those samples, so a set that counts none of them states a sum, a smallest
+                // and a largest over nothing: there is no observation to store and no
+                // Average to fold out of it later.
+                if sample_count <= 0.0 {
+                    return Err(invalid_parameter_value(format!(
+                        "The parameter {path}.StatisticValues.SampleCount must be greater \
+                         than 0."
+                    )));
+                }
+                // "The minimum value of the sample set." / "The maximum value of the sample
+                // set." (`StatisticSet$Minimum`, `$Maximum`) — the two bound ONE span of
+                // observations, so a set whose largest observation is below its smallest
+                // describes no span at all and is refused rather than stored: every later
+                // Average, Minimum and Maximum read of the series would be folded out of it.
+                // The refusal names the two member paths the request put them on.
+                if maximum < minimum {
+                    return Err(invalid_parameter_value(format!(
+                        "The parameter {path}.StatisticValues.Maximum must be greater than \
+                         {path}.StatisticValues.Minimum."
+                    )));
+                }
                 vec![crate::state::StoredDatum {
-                    sample_count: checked_value(
-                        set.sample_count,
-                        &format!("{path}.StatisticValues.SampleCount"),
-                    )?,
-                    sum: checked_value(set.sum, &format!("{path}.StatisticValues.Sum"))?,
-                    minimum: checked_value(set.minimum, &format!("{path}.StatisticValues.Minimum"))?,
-                    maximum: checked_value(set.maximum, &format!("{path}.StatisticValues.Maximum"))?,
+                    sample_count,
+                    sum,
+                    minimum,
+                    maximum,
                     ..base
                 }]
             } else if let Some(values) = datum.values.as_ref() {
@@ -461,8 +490,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if let Some(counts) = datum.counts.as_ref() {
                     if counts.len() != values.len() {
                         return Err(invalid_parameter_value(format!(
-                            "The parameters {path}.Values and {path}.Counts must be the same \
-                             length."
+                            "The parameters {path}.Values and {path}.Counts must be of the same \
+                             size."
                         )));
                     }
                 }
@@ -640,6 +669,12 @@ fn mutually_exclusive(first: &str, second: &str) -> PutMetricDataError {
 
 /// A submitted number as the refusal that rejects it prints it, with the special values named
 /// the way the operation's own documentation names them ("NaN, +Infinity, -Infinity").
+///
+/// A finite value is written the way the service's own formatter prints a double — the shortest
+/// digits that round-trip it, in scientific notation outside the plain-decimal band
+/// (`service_common::validation_message::float_value_text`, the one rendering every service
+/// that quotes a submitted double back goes through) — so a magnitude refusal quotes the
+/// magnitude rather than expanding it into a hundred digits.
 fn printed(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
@@ -650,7 +685,7 @@ fn printed(value: f64) -> String {
     if value == f64::NEG_INFINITY {
         return "-Infinity".to_string();
     }
-    value.to_string()
+    ::service_common::validation_message::float_value_text(value)
 }
 
 /// Whether CloudWatch can hold `text` as a dimension name or value: "Dimension values must
@@ -711,8 +746,9 @@ fn storage_resolution(datum: &MetricDatum, path: &str) -> Result<i32, PutMetricD
 pub(crate) struct EntityFailure {
     /// The documented failure name (`InvalidKeyAttributes`, `InvalidTypeValue`, …).
     pub(crate) name: &'static str,
-    /// What that failure says about the entity.
-    detail: &'static str,
+    /// What that failure says about the entity. Owned, because a failure that can name WHICH
+    /// part of the entity it is about says so from the request rather than in fixed text.
+    detail: String,
 }
 
 impl EntityFailure {
@@ -741,15 +777,12 @@ pub(crate) fn entity_failure(
     /// The key attribute the others are required per.
     const TYPE: &str = "Type";
     /// What an entity whose identifying attributes are not a well-formed set is reported as.
-    const INVALID_KEY_ATTRIBUTES: EntityFailure = EntityFailure {
-        name: "InvalidKeyAttributes",
-        detail: "The provided KeyAttributes of an entity is invalid.",
-    };
-    /// What an entity identified by too few of the attributes its type needs is reported as.
-    const MISSING_REQUIRED_FIELDS: EntityFailure = EntityFailure {
-        name: "MissingRequiredFields",
-        detail: "There are missing required fields in the KeyAttributes for the provided Type.",
-    };
+    fn invalid_key_attributes() -> EntityFailure {
+        EntityFailure {
+            name: "InvalidKeyAttributes",
+            detail: "The provided KeyAttributes of an entity is invalid.".to_string(),
+        }
+    }
     /// What an entity whose `Type` is no entity type is reported as.
     ///
     /// The NAME is the model's ("InvalidTypeValue - The provided Type in the KeyAttributes of
@@ -758,13 +791,15 @@ pub(crate) fn entity_failure(
     /// answering with — see the Resolution notes in this issue's report. (The two sibling
     /// failures above have no such recorded answer, so their sentence is the model's own
     /// description of them.)
-    const INVALID_TYPE_VALUE: EntityFailure = EntityFailure {
-        name: "InvalidTypeValue",
-        detail: "Unknown entity type",
-    };
+    fn invalid_type_value() -> EntityFailure {
+        EntityFailure {
+            name: "InvalidTypeValue",
+            detail: "Unknown entity type".to_string(),
+        }
+    }
 
     if attributes.is_empty() || attributes.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
-        return Some(INVALID_KEY_ATTRIBUTES);
+        return Some(invalid_key_attributes());
     }
     // The attributes an entity of a given `Type` is identified BY: a service by its name, a
     // resource by what kind of resource it is and which one. The model names neither the
@@ -786,10 +821,23 @@ pub(crate) fn entity_failure(
         // was tried and diverges: the recorded strictly-validated call this fix closes
         // carries a non-empty type outside them and IS refused, so the groups have to be a
         // closed set to answer it. The Resolution notes in this issue's report say so.
-        _ => return Some(INVALID_TYPE_VALUE),
+        _ => return Some(invalid_type_value()),
     };
-    if required.iter().any(|field| !attributes.contains_key(*field)) {
-        return Some(MISSING_REQUIRED_FIELDS);
+    // A caller repairs the entity from the attribute it was not given, so the failure NAMES
+    // the attribute this type is identified by that the request left out, and the type it is
+    // required for — both read off the request. An entity missing more than one is reported
+    // for the first in the order its type needs them, which is the one a repair adds next.
+    if let Some(missing) = required
+        .iter()
+        .find(|field| !attributes.contains_key(**field))
+    {
+        let entity_type = attributes.get(TYPE).map_or("", String::as_str);
+        return Some(EntityFailure {
+            name: "MissingRequiredFields",
+            detail: format!(
+                "Missing required key attribute {missing} for entity of type {entity_type}"
+            ),
+        });
     }
     None
 }

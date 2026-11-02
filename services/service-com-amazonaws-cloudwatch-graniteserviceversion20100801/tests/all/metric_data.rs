@@ -719,13 +719,16 @@ async fn a_request_outside_the_contract_is_refused() {
             "InvalidParameterValueException",
         ),
         (
+            // The ids of a query array are the SHAPE of the request, so an array that uses one
+            // id twice is refused under the request-validation class rather than as a fault
+            // about a parameter value (`crate::metric_query_ids` tables that rule).
             "two queries sharing one Id",
             json!({
                 "MetricDataQueries": [query.clone(), query.clone()],
                 "StartTime": base,
                 "EndTime": base + MINUTE,
             }),
-            "InvalidParameterValueException",
+            "ValidationException",
         ),
         (
             "EndTime equal to StartTime",

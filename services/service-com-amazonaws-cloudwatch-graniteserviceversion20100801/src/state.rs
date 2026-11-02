@@ -458,6 +458,64 @@ pub fn parameter_required_message(parameter: &str) -> String {
     format!("The parameter {parameter} is required.")
 }
 
+/// How CloudWatch states a value that does not match the grammar its member accepts: the
+/// request member path and the expression the value had to match.
+///
+/// The expression is what a client re-validates against locally, which is why it is quoted
+/// rather than described.
+pub fn value_pattern_message(parameter: &str, pattern: &str) -> String {
+    request_validation_message(&format!(
+        "The value for parameter {parameter} is not matching the expected pattern {pattern}."
+    ))
+}
+
+/// How CloudWatch states a collection whose entries repeat a value that has to identify each
+/// of them: the member those values are of, and the collection they are in — the whole
+/// sentence, since neither the repeated value nor the positions carrying it are named.
+pub fn values_not_unique_message(member: &str, collection: &str) -> String {
+    request_validation_message(&format!(
+        "The values for parameter {member} in {collection} are not unique."
+    ))
+}
+
+/// One sentence as the REQUEST-VALIDATION layer in front of the service writes it: the
+/// sentence, then the terminator every message that layer renders ends with.
+///
+/// The layer that judges the SHAPE of a request — the grammar of a parameter, the uniqueness
+/// of the values that identify a collection's entries, two members of one object that exclude
+/// each other — ends its message with a newline, which a client reads back as part of the
+/// message. A refusal the SERVICE itself makes, about a precondition between the resources it
+/// holds, carries no terminator, so this is applied where that layer's own sentences are
+/// rendered rather than to every refusal of the class.
+pub fn request_validation_message(sentence: &str) -> String {
+    format!("{sentence}{MESSAGE_TERMINATOR}")
+}
+
+/// What the request-validation layer ends each of its messages with.
+const MESSAGE_TERMINATOR: &str = "\n";
+
+/// The grammar the id of a query inside a `MetricDataQuery` array must match.
+///
+/// "The valid characters are letters, numbers, and underscore. The first character must be a
+/// lowercase letter." (`MetricDataQuery$Id`) — the member carries no modelled `@pattern`, so
+/// no boundary validator refuses an id outside the grammar before a handler runs, and the
+/// expression is stated here once: it is both what [`is_metric_query_id`] judges and what the
+/// refusal publishes to a client.
+pub const METRIC_QUERY_ID_PATTERN: &str = "^[a-z][a-zA-Z0-9_]*$";
+
+/// Whether `id` is a query id the grammar [`METRIC_QUERY_ID_PATTERN`] admits: a lowercase
+/// letter, then letters, digits and underscores.
+pub fn is_metric_query_id(id: &str) -> bool {
+    let mut characters = id.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase())
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// The member of a query a refusal of its id names, as the sentence spells it.
+pub const QUERY_ID_MEMBER: &str = "id";
+
 /// The request member path a refusal NAMES, built from the path the validating walk spells.
 ///
 /// The walk spells a member in lowerCamel and an element of a list as `<position>.member`
@@ -567,6 +625,34 @@ pub fn retained_at_period(timestamp_secs: f64, period: i32, now: f64) -> bool {
     } else {
         false
     }
+}
+
+/// Whether a read of `period`-wide windows over a range beginning at `requested_start` asks for
+/// a granularity that range can be read at.
+///
+/// The rule is stated from the request's side on both readers' own `Period` member: "If the
+/// StartTime parameter specifies a time stamp that is greater than 3 hours ago, you must
+/// specify the period as follows or no data points in that time range is returned: Start time
+/// between 3 hours and 15 days ago - Use a multiple of 60 seconds (1 minute). Start time
+/// between 15 and 63 days ago - Use a multiple of 300 seconds (5 minutes). Start time greater
+/// than 63 days ago - Use a multiple of 3600 seconds (1 hour)."
+/// (`GetMetricStatisticsInput$Period`, in the same words on `MetricStat$Period`) — a request at
+/// a finer granularity than its start time's tier is stored at asks for a resolution nothing in
+/// that range is kept at, so the read answers with no data point for the range.
+///
+/// The start time is CLAMPED to the retention horizon first: "Data points with a period of 3600
+/// seconds (1 hour) are available for 455 days (15 months)" ([`ONE_HOUR_RETENTION_SECS`]) is as
+/// far back as a series is held at all, so the documented bands cover every start time that
+/// could select a tier and a range beginning before the horizon begins, for this rule, AT the
+/// horizon. What decides the granularity is the part of the range that can hold a datapoint —
+/// so a request for several years of history at an hourly granularity is answered with the
+/// history there is, rather than with nothing because its start reaches past where any tier
+/// ends.
+///
+/// Shared by both readers, so a range and a granularity mean the same thing to each of them.
+pub fn granularity_available_from(requested_start: f64, period: i32, now: f64) -> bool {
+    let horizon = now - ONE_HOUR_RETENTION_SECS;
+    retained_at_period(requested_start.max(horizon), period, now)
 }
 
 /// Fold one series' datapoints into the `period`-wide windows of `[start, end)`, keyed by the

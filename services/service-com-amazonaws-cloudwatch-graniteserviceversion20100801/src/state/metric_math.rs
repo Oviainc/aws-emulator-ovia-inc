@@ -1181,7 +1181,7 @@ impl<'a> Evaluation<'a> {
         // nothing here computes costs only the parse — not the evaluation of everything it
         // was passed.
         if !KNOWN_FUNCTIONS.contains(&upper.as_str()) {
-            return Err(MathError::new(format!("Unknown function {name}")));
+            return Err(MathError::new(unknown_function(name)));
         }
         // The functions that take a bare word or a STRING rather than a value are evaluated
         // from the argument expressions themselves.
@@ -1203,7 +1203,7 @@ impl<'a> Evaluation<'a> {
         match upper.as_str() {
             "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" => {
                 let aggregator = Aggregator::named(&upper)
-                    .ok_or_else(|| MathError::new(format!("Unknown function {name}")))?;
+                    .ok_or_else(|| MathError::new(unknown_function(name)))?;
                 self.aggregate(aggregator, &upper, values)
             }
             "ABS" => self.one_point_function(&upper, values, f64::abs),
@@ -1300,7 +1300,7 @@ impl<'a> Evaluation<'a> {
             "IF" => self.conditional(values),
             "SLICE" => Self::slice(values),
             "ANOMALY_DETECTION_BAND" => self.anomaly_detection_band(values),
-            _ => Err(MathError::new(format!("Unknown function {name}"))),
+            _ => Err(MathError::new(unknown_function(name))),
         }
     }
 
@@ -2001,6 +2001,15 @@ fn one_argument(name: &str, values: Vec<MathValue>) -> Result<MathValue, MathErr
         )));
     }
     Ok(values.remove(0))
+}
+
+/// What a call to a function nothing here computes is refused with: the name the expression
+/// called, quoted, and that no such function was found.
+///
+/// The same form the refusal of an id no query defines carries (`ID '<id>' not found`), which
+/// is how this service states a name an expression refers to that does not resolve.
+fn unknown_function(name: &str) -> String {
+    format!("Function '{name}' not found")
 }
 
 /// The refusal for a call whose operand is not a kind of value it takes.

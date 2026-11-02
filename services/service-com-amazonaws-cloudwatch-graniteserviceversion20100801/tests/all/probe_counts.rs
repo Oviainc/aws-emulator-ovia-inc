@@ -204,7 +204,7 @@ async fn arrays_that_disagree_in_length_are_refused_naming_the_pair() {
             error_message(&body),
             format!(
                 "The parameters MetricData.member.{position}.Values and \
-                 MetricData.member.{position}.Counts must be the same length."
+                 MetricData.member.{position}.Counts must be of the same size."
             ),
             "case {case:?}: expected the refusal to name the pair at position {position}, got \
              {body}"

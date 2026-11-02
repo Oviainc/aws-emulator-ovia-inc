@@ -145,8 +145,6 @@
 //!
 //! * `InvalidNextToken` (HTTP 400) — The next token specified is invalid.
 
-use std::collections::HashSet;
-
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::metric_math::{MathSeries, MathValue};
@@ -257,33 +255,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.metric_data_queries.len()
             )));
         }
-        // Every result is reported under the `Id` of the query it answers, so two queries
-        // sharing one id would make a result ambiguous.
-        let mut seen_ids: HashSet<&str> = HashSet::with_capacity(input.metric_data_queries.len());
-        for query in &input.metric_data_queries {
-            if !seen_ids.insert(query.id.as_str()) {
-                return Err(invalid_value(format!(
-                    "the Id {} is used by more than one query; each query carries its own Id",
-                    query.id
-                )));
-            }
+        // "A short name used to tie this object to the results in the response. This name must
+        // be unique within a single call to GetMetricData. […] The valid characters are
+        // letters, numbers, and underscore. The first character must be a lowercase letter."
+        // (`MetricDataQuery$Id`) — the SHAPE of the array is judged first, by the one rule
+        // every array of these queries is judged by
+        // ([`crate::state::metric_query::query_id_refusal`]), and an array that breaks it is a
+        // request-validation failure rather than a fault about a parameter of a query.
+        if let Some(message) =
+            crate::state::metric_query::query_id_refusal(&input.metric_data_queries, QUERIES)
+        {
+            return Err(GetMetricDataError::validation_error(message));
+        }
+        for (index, query) in input.metric_data_queries.iter().enumerate() {
             // "Within one MetricDataQuery object, you must specify either Expression or
-            // MetricStat but not both." (`MetricDataQuery$MetricStat`) — a query that names
-            // neither asks for nothing at all.
+            // MetricStat but not both." (`MetricDataQuery$MetricStat`) — a query carrying both
+            // states the series it answers two different ways, which is the SHAPE of the
+            // request again, so it is refused in the same request-validation class, in the one
+            // sentence this service states a pair of members that exclude each other in
+            // ([`crate::state::mutually_exclusive_message`]), naming the two member paths the
+            // request put them on.
+            let path = crate::state::list_element_path(QUERIES, index + 1);
             match (query.expression.is_some(), query.metric_stat.is_some()) {
                 (true, true) => {
-                    return Err(invalid_combination(format!(
-                        "the query {} names both Expression and MetricStat, and one query \
-                         carries one of them but not both",
-                        query.id
-                    )))
+                    return Err(GetMetricDataError::validation_error(
+                        crate::state::request_validation_message(
+                            &crate::state::mutually_exclusive_message(
+                                &format!("{path}.Expression"),
+                                &format!("{path}.MetricStat"),
+                            ),
+                        ),
+                    ))
                 }
+                // A query that names NEITHER asks for nothing at all: no series to retrieve
+                // and no expression to evaluate. The member the request-validation layer
+                // reports as missing is `MetricStat` — the member that names the series a
+                // query returns, which an `Expression` is the alternative to rather than a
+                // second way of satisfying.
                 (false, false) => {
-                    return Err(invalid_combination(format!(
-                        "the query {} names neither Expression nor MetricStat, and one query \
-                         carries one of them",
-                        query.id
-                    )))
+                    return Err(GetMetricDataError::validation_error(
+                        crate::state::request_validation_message(
+                            &crate::state::parameter_required_message(&format!(
+                                "{path}.MetricStat"
+                            )),
+                        ),
+                    ))
                 }
                 _ => {}
             }
@@ -528,6 +544,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The request member the queries arrive on, as a refusal of one of them names it
+/// (`GetMetricDataInput$MetricDataQueries`).
+const QUERIES: &str = "MetricDataQueries";
 
 /// "A single GetMetricData call can include up to 500 MetricDataQuery structures." — the same
 /// ceiling the shared resolution bounds itself by

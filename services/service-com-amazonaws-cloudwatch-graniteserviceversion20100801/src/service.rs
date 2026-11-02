@@ -29,8 +29,10 @@
 //!   ([`query_compatible_errors`]); `PutMetricData` is served through
 //!   [`ReportingDroppedEntities`], so an accepted call
 //!   whose entity this service could not hold says so in its response header, and
-//!   `GetMetricStatistics` through [`RefusingValuesOutsideAnEnum`], so a value outside an
-//!   enumerated type is refused as one of the parameter faults ITS model declares, and
+//!   `GetMetricStatistics` through [`JudgingTheValuesThisServiceEnforces`], so a value outside
+//!   an enumerated type is refused as one of the parameter faults ITS model declares and a
+//!   metric namespace the service accepts is served past the constraint walk — as it is for the
+//!   other three metric operations a namespace is submitted to — and
 //!   `PutMetricStream` through [`RefusingAValueFirst`], so the two members CloudWatch judges
 //!   as parameter VALUES are judged before the model's own shape checks.
 //! - `override_refusal` — how this service words a request the framework refused
@@ -86,11 +88,11 @@ pub(crate) fn off_the_async_worker<T>(work: impl FnOnce() -> T) -> T {
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// The operations whose ANSWER this file owns a part of — the one whose accepted response
-    /// carries something its body cannot ([`ReportingDroppedEntities`]), and the one metric
-    /// read whose model declares a parameter fault to refuse a value outside an enumerated
-    /// type with ([`RefusingValuesOutsideAnEnum`]), and the metric-stream writer whose own
-    /// parameter-value rules are judged ahead of the boundary walk ([`RefusingAValueFirst`]).
-    /// Each is built from the SAME shared engine
+    /// carries something its body cannot ([`ReportingDroppedEntities`]), the four metric
+    /// operations a namespace is submitted to, whose request values are judged by what this
+    /// service enforces ([`JudgingTheValuesThisServiceEnforces`]), and the metric-stream writer
+    /// whose own parameter-value rules are judged ahead of the boundary walk
+    /// ([`RefusingAValueFirst`]). Each is built from the SAME shared engine
     /// as the generated table's and keyed by the routing key the protocol resolves, so the
     /// operation served is the modelled one, and each is METERED ([`Metering`]) like every
     /// other operation of this service and answers a failure under the class this
@@ -111,29 +113,62 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         let mut overridden = OperationRoutingTable::new();
+        // `PutMetricData` is served through [`JudgingTheValuesThisServiceEnforces`] for both
+        // decisions that wrapper makes: a publish into a namespace the model's `@pattern` does
+        // not admit is one the service SERVES ([`is_unenforced_constraint`]), and a value
+        // outside an enumerated type is refused as one of the parameter faults its model
+        // declares. The entity header its accepted answer carries is added outside it
+        // ([`ReportingDroppedEntities`]), over whichever of the two layers answered.
         overridden.add_operation(
             "PutMetricData",
             Box::new(QueryCompatibleErrors::new(Metering::new(
                 Arc::clone(&engine),
-                ReportingDroppedEntities::new(crate::ops::put_metric_data::PutMetricData::new(
-                    Arc::clone(&engine),
+                ReportingDroppedEntities::new(JudgingTheValuesThisServiceEnforces::new(
+                    crate::ops::put_metric_data::PutMetricData::new(Arc::clone(&engine)),
+                    parameter_fault_for,
                 )),
             ))) as Box<dyn ErasedOperation>,
         );
         // `GetMetricStatistics` validates the SAME enumerated types as the retrieving read and
         // answers a value outside one as one of the parameter faults its model declares, which
         // the refusal seam cannot do because it cannot see which operation was called
-        // ([`RefusingValuesOutsideAnEnum`]); every other operation keeps this service's own
-        // validation code ([`scalar_enum_refusal`]).
+        // ([`JudgingTheValuesThisServiceEnforces`]); every other operation keeps this service's
+        // own validation code ([`scalar_enum_refusal`]).
         overridden.add_operation(
             "GetMetricStatistics",
             Box::new(QueryCompatibleErrors::new(Metering::new(
                 Arc::clone(&engine),
-                RefusingValuesOutsideAnEnum::new(
+                JudgingTheValuesThisServiceEnforces::new(
                     crate::ops::get_metric_statistics::GetMetricStatistics::new(Arc::clone(
                         &engine,
                     )),
                     parameter_fault_for,
+                ),
+            ))) as Box<dyn ErasedOperation>,
+        );
+        // The other two reads of the metric data plane take a namespace from the caller too —
+        // the one a query names and the one a catalogue listing filters by — so they are served
+        // through the same wrapper, with the service-wide wording for every refusal they do
+        // make ([`the_service_wide_refusal`]): what the wrapper adds for them is that a
+        // namespace the service accepts is READ BACK rather than refused, so a series published
+        // into one can be retrieved and listed.
+        overridden.add_operation(
+            "GetMetricData",
+            Box::new(QueryCompatibleErrors::new(Metering::new(
+                Arc::clone(&engine),
+                JudgingTheValuesThisServiceEnforces::new(
+                    crate::ops::get_metric_data::GetMetricData::new(Arc::clone(&engine)),
+                    the_service_wide_refusal,
+                ),
+            ))) as Box<dyn ErasedOperation>,
+        );
+        overridden.add_operation(
+            "ListMetrics",
+            Box::new(QueryCompatibleErrors::new(Metering::new(
+                Arc::clone(&engine),
+                JudgingTheValuesThisServiceEnforces::new(
+                    crate::ops::list_metrics::ListMetrics::new(Arc::clone(&engine)),
+                    the_service_wide_refusal,
                 ),
             ))) as Box<dyn ErasedOperation>,
         );
@@ -192,7 +227,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// This seam cannot see WHICH operation was called, and which validator answers a value
 /// outside an enumerated type is an operation's property: the read whose model declares the
 /// parameter faults answers one of THEM rather than the code above, so it is served through
-/// [`RefusingValuesOutsideAnEnum`] and never reaches here with such a violation.
+/// [`JudgingTheValuesThisServiceEnforces`] and never reaches here with such a violation.
 fn parameter_fault(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
@@ -433,30 +468,85 @@ fn parameter_fault_for(violations: &[aws_smithy_schema_server::Violation]) -> Op
         .or_else(|| violations.iter().find_map(enum_value_refusal))
 }
 
-/// One modelled operation, served so that a request value outside the enumerated type its
-/// member targets is refused by THIS operation's validator rather than by the framework's
-/// generic one.
+/// Whether `violation` broke a constraint this service does NOT enforce on the wire.
 ///
-/// Which code such a refusal carries is a property of the OPERATION — an operation that models
-/// this service's parameter faults answers one of them, where an operation that models none
-/// keeps this service's own validation code ([`scalar_enum_refusal`]) — and
-/// `Service::override_refusal` is handed the violations alone, with no way to tell which
-/// operation was called. So the choice is made here, where the operation is known, by the
-/// `refusal` policy this wrapper is mounted with ([`parameter_fault_for`]).
+/// A metric NAMESPACE is the one such member of this service: `Namespace` is modelled
+/// `@pattern "^[^:]"`, and the service accepts a namespace whatever character it begins with —
+/// the only namespace space it refuses a publish into is the one AWS reserves for its own
+/// services' metrics (`crate::ops::put_metric_data`'s own check, which no model constraint
+/// expresses). A client publishing into a leading-colon namespace is SERVED by AWS and can
+/// then read the series back, so refusing the request here would make the data plane unusable
+/// for a namespace AWS holds data in.
 ///
-/// Nothing else is re-implemented: a request this policy does not refuse is handed to the
-/// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
-/// serialize and every modelled error, and the violations the policy reads come from the
-/// framework's OWN deserializer and constraint walk over the same input schema, so this and
-/// the walk behind it cannot find a different refusal.
-struct RefusingValuesOutsideAnEnum<O> {
+/// It is keyed on the member and the CLASS of violation alone — a pattern broken by the
+/// namespace of a METRIC ([`is_metric_namespace`]) — so it holds for the namespace a query
+/// names inside a `MetricDataQuery` as well as for the one a publish states at the top of its
+/// request.
+fn is_unenforced_constraint(violation: &aws_smithy_schema_server::Violation) -> bool {
+    matches!(
+        violation.kind,
+        aws_smithy_schema_server::ViolationKind::Pattern(_)
+    ) && is_metric_namespace(&violation.path)
+}
+
+/// Whether `path` points at the namespace of a METRIC, which is the only member this service
+/// does not enforce a modelled constraint on.
+///
+/// The two paths such a member arrives on, in the spelling the validating walk reports: the
+/// namespace a request states for the metric it publishes or reads (`PutMetricDataInput`,
+/// `GetMetricStatisticsInput`, `ListMetricsInput`), and the one inside the `Metric` a query
+/// names (`GetMetricDataInput`'s `MetricStat.Metric.Namespace`, at whatever depth its array
+/// puts it). Matched as those two members rather than as any member whose name happens to end
+/// in `namespace`, so the exemption cannot widen to a member that is not a metric's namespace.
+fn is_metric_namespace(path: &str) -> bool {
+    path == "namespace" || path.ends_with(".metric.namespace")
+}
+
+/// What this wrapper decided about one request, before anything is awaited.
+///
+/// Its own type rather than an `Option`, because there are THREE outcomes and only one of them
+/// is an answer this wrapper built.
+enum Judgement {
+    /// Refused here, in the words this operation refuses it in. BOXED, because a response is
+    /// far larger than the two decisions that carry nothing at all.
+    Refused(Box<aws_smithy_runtime_api::http::Response>),
+    /// Left to the framework's own deserialize -> validate -> handle -> serialize sequence.
+    TheFrameworksSequence,
+    /// Served here, past the constraint walk: everything the walk found is a constraint this
+    /// service does not enforce ([`is_unenforced_constraint`]).
+    ServedPastTheWalk,
+}
+
+/// One modelled operation, served so that the values of a request are judged by what this
+/// service ENFORCES rather than only by what its model declares.
+///
+/// Two decisions the framework's model-driven walk cannot make on its own:
+///
+/// * A constraint this service does not enforce on the wire ([`is_unenforced_constraint`]) must
+///   not refuse the request: a request that breaks nothing else is SERVED — read, handled and
+///   serialized here, past the walk — because the service it emulates serves it. The walk is
+///   driven by the model alone and cannot know which of its constraints the service applies.
+/// * Which CODE a refusal carries is a property of the OPERATION — an operation that models
+///   this service's parameter faults answers one of them, where an operation that models none
+///   keeps this service's own validation code ([`scalar_enum_refusal`]) — and
+///   `Service::override_refusal` is handed the violations alone, with no way to tell which
+///   operation was called. So the choice is made here, where the operation is known, by the
+///   `refusal` policy this wrapper is mounted with ([`parameter_fault_for`], or
+///   [`the_service_wide_refusal`] for an operation that keeps the service-wide wording).
+///
+/// Nothing else is re-implemented: a request with nothing to decide is handed to the generated
+/// [`ErasedOperation::run`], which owns deserialize -> validate -> handle -> serialize and
+/// every modelled error, and the violations both decisions read come from the framework's OWN
+/// deserializer and constraint walk over the same input schema, so this and the walk behind it
+/// cannot find a different set.
+struct JudgingTheValuesThisServiceEnforces<O> {
     operation: O,
-    /// How this operation states the violations its validator found, or `None` to leave the
-    /// request to the operation itself.
+    /// How this operation states the violations this service enforces, or `None` to leave the
+    /// request to the service-wide wording behind it.
     refusal: fn(&[aws_smithy_schema_server::Violation]) -> Option<Refused>,
 }
 
-impl<O> RefusingValuesOutsideAnEnum<O> {
+impl<O> JudgingTheValuesThisServiceEnforces<O> {
     /// Wrap the operation, already constructed from the shared engine, with the policy that
     /// words its boundary refusal.
     fn new(
@@ -467,7 +557,50 @@ impl<O> RefusingValuesOutsideAnEnum<O> {
     }
 }
 
-impl<O> ErasedOperation for RefusingValuesOutsideAnEnum<O>
+impl<O> JudgingTheValuesThisServiceEnforces<O>
+where
+    O: Operation + ErasedOperation,
+{
+    /// Serve the request HERE, past the constraint walk that would have refused it for a
+    /// constraint this service does not enforce.
+    ///
+    /// The SAME sequence the framework's own runs — read the input through this service's
+    /// protocol, call the operation's `handle`, serialize its output or its modelled error —
+    /// and nothing else, so the behaviour is still the operation's own. A body no codec can
+    /// read names no values to judge and is left to the framework's own refusal. Unlike the
+    /// generated walk it records no per-operation telemetry; the CALL is still counted, by the
+    /// wrapper every operation of this service is served through ([`Metering`]).
+    async fn served_past_the_walk(
+        &self,
+        svc: &dyn Service,
+        req: &aws_smithy_runtime_api::http::Request,
+        ctx: &OperationContext<'_>,
+    ) -> aws_smithy_runtime_api::http::Response {
+        // The protocol is read, used and dropped inside each statement below:
+        // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await between
+        // them would make this future non-`Send`.
+        let read = {
+            let protocol = svc.definition().protocol();
+            read_input::<O>(protocol, req)
+        };
+        let Some(input) = read else {
+            return self.operation.run(svc, req, ctx).await;
+        };
+        let answered = self.operation.handle(input, ctx).await;
+        let protocol = svc.definition().protocol();
+        match answered {
+            Ok(output) => protocol
+                .serialize_output(&output, O::OUTPUT_SCHEMA, O::NAME, O::SUCCESS_STATUS)
+                .unwrap_or_else(|error| svc.definition().framework_error_response(error)),
+            // The modelled error as this service renders one, header and all
+            // ([`modelled_error_response`]), so a failure answered here and the same failure
+            // answered from the framework's sequence are one response.
+            Err(error) => modelled_error_response(protocol, req, &error),
+        }
+    }
+}
+
+impl<O> ErasedOperation for JudgingTheValuesThisServiceEnforces<O>
 where
     O: Operation + ErasedOperation,
 {
@@ -478,24 +611,25 @@ where
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
         Box::pin(async move {
-            // The protocol is read, used and dropped inside this one statement:
-            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
-            // below would make this future non-`Send`.
-            let refused = {
+            // The protocol is read, used and dropped inside this one statement, for the reason
+            // [`Self::served_past_the_walk`] states.
+            let judgement = {
                 let protocol = svc.definition().protocol();
                 // The violations come from the framework's OWN deserializer and constraint
                 // walk, collected by the one shared helper every service that words its own
                 // pre-handler refusal uses, so this and the walk that follows it cannot find
                 // a different set. A request the codec cannot read at all yields none, and so
-                // falls through to the framework's own refusal.
-                let violations =
-                    service_common::validation::refusing_violations::<O>(protocol, req);
-                (self.refusal)(&violations)
-                    .and_then(|refused| refusal_response(protocol, &refused))
+                // falls through to the framework's own sequence.
+                let (unenforced, enforced): (Vec<_>, Vec<_>) =
+                    service_common::validation::refusing_violations::<O>(protocol, req)
+                        .into_iter()
+                        .partition(is_unenforced_constraint);
+                judgement(protocol, &self.refusal, unenforced, enforced)
             };
-            match refused {
-                Some(response) => response,
-                None => self.operation.run(svc, req, ctx).await,
+            match judgement {
+                Judgement::Refused(response) => *response,
+                Judgement::TheFrameworksSequence => self.operation.run(svc, req, ctx).await,
+                Judgement::ServedPastTheWalk => self.served_past_the_walk(svc, req, ctx).await,
             }
         })
     }
@@ -505,6 +639,79 @@ where
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
         self.operation.auth_schemes()
     }
+}
+
+/// What to do with a request whose constraint walk found `enforced` violations this service
+/// enforces beside `unenforced` ones it does not.
+///
+/// A request with nothing enforceable broken is served past the walk when the walk DID find
+/// something — the walk would otherwise refuse it — and is left to the framework's sequence
+/// when it found nothing at all, which is every ordinary request.
+///
+/// Otherwise the request is refused, and the words are this operation's own `refusal` policy's.
+/// When that policy words none of the violations, a request the walk would have answered on
+/// its own is left to it — keeping the service-wide wording ([`parameter_fault`], reached
+/// through `Service::override_refusal`) — while one carrying an unenforced violation beside
+/// them is worded HERE over the enforced violations ALONE, so a refusal never states a
+/// requirement this service does not apply.
+fn judgement(
+    protocol: &dyn ServerHttpProtocol,
+    refusal: &fn(&[aws_smithy_schema_server::Violation]) -> Option<Refused>,
+    unenforced: Vec<aws_smithy_schema_server::Violation>,
+    enforced: Vec<aws_smithy_schema_server::Violation>,
+) -> Judgement {
+    if enforced.is_empty() {
+        // A walk that filled its collecting bound may have left a violation this service DOES
+        // enforce out of the set, so a request at the bound is not one this file can read as
+        // carrying nothing enforceable: it goes to the framework's sequence, which refuses it.
+        let at_the_collecting_bound =
+            unenforced.len() >= service_common::validation::MAX_VIOLATIONS;
+        return if unenforced.is_empty() || at_the_collecting_bound {
+            Judgement::TheFrameworksSequence
+        } else {
+            Judgement::ServedPastTheWalk
+        };
+    }
+    let stated = refusal(&enforced).or_else(|| {
+        if unenforced.is_empty() {
+            return None;
+        }
+        let refused = Refusal::Invalid(enforced);
+        // The one chain this service words a boundary refusal by, and then the shared
+        // renderer's own envelope: unlike the framework's sequence, this layer cannot hand the
+        // request back to the walk for the violations that remain — the walk would refuse it
+        // for the unenforced one as well — so it needs an answer for every class.
+        the_service_wide_wording(&refused)
+            .or_else(|| service_common::validation_message::aws_validation_refusal(&refused))
+    });
+    stated
+        .and_then(|refused| refusal_response(protocol, &refused))
+        .map_or(Judgement::TheFrameworksSequence, |response| {
+            Judgement::Refused(Box::new(response))
+        })
+}
+
+/// How this service words a boundary refusal when no OPERATION states one of its own: the two
+/// classes it restates, in order — the ones CloudWatch answers as one of its own PARAMETER
+/// faults ([`parameter_fault`]), then a value that broke a modelled `@pattern`, whose
+/// requirement AWS quotes without the anchors the model wraps it in
+/// ([`unanchored_pattern_refusal`], which keeps the framework's own class). Everything else
+/// keeps the framework's code and wording.
+///
+/// ONE chain, so the refusal `Service::override_refusal` answers with and the one a wrapper in
+/// this file words ahead of the framework's sequence cannot drift apart.
+fn the_service_wide_wording(refusal: &Refusal) -> Option<Refused> {
+    parameter_fault(refusal).or_else(|| unanchored_pattern_refusal(refusal))
+}
+
+/// The refusal policy of an operation that keeps this service's SERVICE-WIDE wording for a
+/// boundary refusal ([`the_service_wide_wording`]): it words nothing of its own.
+///
+/// Mounted on an operation that is served through [`JudgingTheValuesThisServiceEnforces`] for
+/// the other decision that wrapper makes — serving a request past a constraint this service
+/// does not enforce — so that wrapping it changes nothing about how its refusals read.
+fn the_service_wide_refusal(_: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
+    None
 }
 
 /// One modelled operation, served so that this service's own PARAMETER-VALUE rules are
@@ -693,7 +900,7 @@ impl<O> ReportingDroppedEntities<O> {
 
 impl<O> ErasedOperation for ReportingDroppedEntities<O>
 where
-    O: Operation + ErasedOperation,
+    O: ErasedOperation,
 {
     fn run<'r>(
         &'r self,
@@ -872,18 +1079,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // NOT a re-route: the key is the one the generated table's own protocol resolves, and
         // the operation it names is the one served — `PutMetricData` wrapped in
-        // [`ReportingDroppedEntities`] so an accepted call reports the entity it dropped, and
-        // `GetMetricStatistics` wrapped in [`RefusingValuesOutsideAnEnum`] so a value outside
-        // an enumerated type is refused as one of the parameter faults its model declares —
-        // where a refusal of such a value by any OTHER operation keeps this service's own
-        // validation code ([`scalar_enum_refusal`]), and `PutMetricStream` wrapped in
+        // [`ReportingDroppedEntities`] so an accepted call reports the entity it dropped, the
+        // four metric operations a namespace is submitted to wrapped in
+        // [`JudgingTheValuesThisServiceEnforces`] so a namespace this service accepts is served
+        // past the constraint walk and, for the two whose model declares the parameter faults,
+        // so a value outside an enumerated type is refused as one of THEM — where a refusal of
+        // such a value by any OTHER operation keeps this service's own validation code
+        // ([`scalar_enum_refusal`]) — and `PutMetricStream` wrapped in
         // [`RefusingAValueFirst`] so the values its model does not constrain to the form the
         // service requires are judged before the boundary walk.
         //
         // Every modelled key resolves here, because every call this service answers is counted
         // into the usage telemetry it publishes about its own API ([`Metering`]) and names the
         // class of whatever failure it answers in full ([`QueryCompatibleErrors`]): a key the
-        // three wrappers above do not claim is served by the generated table's own operation
+        // wrappers above do not claim is served by the generated table's own operation
         // ([`TheModelledOperation`]), metered. A key the table does not name at all resolves to
         // `None`, exactly as it would in an unedited service, and falls through to the
         // framework's routing failure.
@@ -900,12 +1109,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent required
         // member, or a value outside a declared bound) to let this service reword it. Two
-        // classes are restated: the ones CloudWatch answers as one of its own PARAMETER faults
-        // ([`parameter_fault`]), and a value that broke a modelled `@pattern`, whose
-        // requirement AWS quotes without the anchors the model wraps it in
-        // ([`unanchored_pattern_refusal`], which keeps the framework's own class). Everything
-        // else keeps the framework's code and wording.
-        parameter_fault(refusal).or_else(|| unanchored_pattern_refusal(refusal))
+        // classes are restated, by the one chain this service words such a refusal with
+        // ([`the_service_wide_wording`], which the wrapper that words a refusal ahead of the
+        // framework's sequence reaches too). Everything else keeps the framework's code and
+        // wording.
+        the_service_wide_wording(refusal)
     }
 
     fn override_routing_error(

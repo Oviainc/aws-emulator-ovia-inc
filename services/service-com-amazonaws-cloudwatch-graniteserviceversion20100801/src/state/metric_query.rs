@@ -51,6 +51,41 @@ pub enum QueryRefusal {
     MetricsInsights,
 }
 
+/// Why the ids of the query array `queries` are not a set of ids one array may carry, or
+/// `None` when they are.
+///
+/// Two rules, both the member's own, and both about the SHAPE of the request rather than about
+/// any value a query names — so both are judged before a query's parameters are looked at, by
+/// whichever operation the array arrived on:
+///
+/// * "The valid characters are letters, numbers, and underscore. The first character must be a
+///   lowercase letter." (`MetricDataQuery$Id`) — the grammar
+///   ([`super::METRIC_QUERY_ID_PATTERN`]), which no modelled constraint expresses, stated to a
+///   client as the expression it can re-validate against;
+/// * "This name must be unique within a single call" (`MetricDataQuery$Id`) — every result is
+///   reported under the id of the query it answers, so an array using one id twice reports
+///   nothing a caller can tie back to a query.
+///
+/// `array` is the request member the queries arrived on, which is what the refusal names: the
+/// same array shape is `GetMetricDataInput$MetricDataQueries` on a read and
+/// `PutMetricAlarmInput$Metrics` on an alarm.
+pub fn query_id_refusal(queries: &[MetricDataQuery], array: &str) -> Option<String> {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(queries.len());
+    let mut unique = true;
+    for (index, query) in queries.iter().enumerate() {
+        if !super::is_metric_query_id(&query.id) {
+            return Some(super::value_pattern_message(
+                &format!("{}.Id", super::list_element_path(array, index + 1)),
+                super::METRIC_QUERY_ID_PATTERN,
+            ));
+        }
+        unique &= seen.insert(query.id.as_str());
+    }
+    // The refusal names no position: it is the ARRAY's ids that are not unique, and either of
+    // the queries sharing one id may be the one the caller meant to change.
+    (!unique).then(|| super::values_not_unique_message(super::QUERY_ID_MEMBER, array))
+}
+
 /// The granularity an expression's constructed series takes when nothing names one: one
 /// minute, the cadence a regular-resolution metric is stored at ("a period can be as short as
 /// one minute (60 seconds)", `MetricDataQuery$Period`).
@@ -238,12 +273,13 @@ pub fn folded_series(
     now: f64,
 ) -> Vec<(f64, f64)> {
     let period = f64::from(period_secs);
-    // "If the StartTime parameter specifies a time stamp that is greater than 3 hours ago, you
-    // must specify the period as follows or no data points in that time range is returned"
-    // (`GetMetricDataInput$StartTime` / `MetricStat$Period`): the granularity a RANGE can be
-    // read at is the one the tier of its start time still holds, by the one shared rule
-    // ([`super::retained_at_period`]), so a query at a finer one retrieves nothing.
-    if !super::retained_at_period(requested_start, period_secs, now) {
+    // The granularity a RANGE can be read at is the one its start time's retention tier still
+    // holds — and a start reaching back before the horizon any tier ends at is read from that
+    // horizon ([`super::granularity_available_from`]), so a wide window is answered with the
+    // history there is rather than with nothing. Which datapoints INSIDE the range a read then
+    // sees is decided per datapoint, by its own age, in the fold below
+    // ([`super::retained_at_period`]).
+    if !super::granularity_available_from(requested_start, period_secs, now) {
         return Vec::new();
     }
     let start = super::rounded_start(requested_start, period_secs, now);

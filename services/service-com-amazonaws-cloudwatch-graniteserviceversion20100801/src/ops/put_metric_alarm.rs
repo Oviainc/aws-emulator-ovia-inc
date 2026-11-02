@@ -559,6 +559,10 @@ fn is_alarm_period(period: i32) -> bool {
         || (period >= REGULAR_PERIOD_SECS && period % REGULAR_PERIOD_SECS == 0)
 }
 
+/// The request member a `MetricDataQuery` array arrives on here, as a refusal of one of its
+/// entries names it (`PutMetricAlarmInput$Metrics`).
+const METRICS: &str = "Metrics";
+
 /// Why the request's `Metrics` array does not define the one time series an alarm watches, or
 /// `None` when it does.
 ///
@@ -584,6 +588,14 @@ fn is_alarm_period(period: i32) -> bool {
 /// multi-series expression by definition and the single-series rule does not speak about it.
 fn unresolvable_metrics(input: &PutMetricAlarmInput) -> Option<String> {
     let queries = input.metrics.as_deref()?;
+    // The SHAPE of the array first: the ids it carries have to be ids one array may carry at
+    // all — the grammar `MetricDataQuery$Id` documents, and unique within the call — before
+    // anything about the series they name is resolved. The same rule the read of such an array
+    // is judged by ([`crate::state::metric_query::query_id_refusal`]), naming THIS operation's
+    // member for the array.
+    if let Some(message) = crate::state::metric_query::query_id_refusal(queries, METRICS) {
+        return Some(message);
+    }
     // "One item in the Metrics array is the expression that the alarm watches. You designate
     // this expression by setting ReturnData to true for this object in the array."
     // (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Metrics")`) — an array

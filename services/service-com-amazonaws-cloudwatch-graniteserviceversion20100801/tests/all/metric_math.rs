@@ -557,15 +557,19 @@ async fn an_expression_the_service_cannot_evaluate_is_refused() {
         );
     }
 
-    // And a query that names both an expression and a metric, or neither, is refused as the
-    // combination it is.
-    for query in [
-        json!({"Id": "m1", "Expression": "1", "MetricStat": {
-            "Metric": {"Namespace": NAMESPACE, "MetricName": "Requests"},
-            "Period": 60,
-            "Stat": "Sum",
-        }}),
-        json!({"Id": "m1"}),
+    // And a query that names both an expression and a metric, or neither, is refused for the
+    // SHAPE of the request it is — the request-validation class, which
+    // `crate::metric_query_ids` tables for the ids of the same array.
+    for (query, expected) in [
+        (
+            json!({"Id": "m1", "Expression": "1", "MetricStat": {
+                "Metric": {"Namespace": NAMESPACE, "MetricName": "Requests"},
+                "Period": 60,
+                "Stat": "Sum",
+            }}),
+            "ValidationException",
+        ),
+        (json!({"Id": "m1"}), "ValidationException"),
     ] {
         let (status, body) = call(
             &router,
@@ -583,8 +587,8 @@ async fn an_expression_the_service_cannot_evaluate_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidParameterCombinationException",
-            "case {query}: expected InvalidParameterCombinationException, got {body}"
+            expected,
+            "case {query}: expected {expected}, got {body}"
         );
     }
 }
