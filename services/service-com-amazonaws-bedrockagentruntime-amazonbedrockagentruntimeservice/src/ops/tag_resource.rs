@@ -5,7 +5,8 @@
 //! session ARN is the only resource this service's `TaggableResourcesArn` admits
 //! (`smithy_query(query="operation",operation="TagResource")` -> `resourceArn`), so the
 //! ARN is resolved through [`crate::state::session_id_from_identifier`] and an ARN naming
-//! no stored session is the modelled 404 `ResourceNotFoundException`.
+//! no stored session is the modelled 404 `ResourceNotFoundException`, worded by the tag
+//! plane's one [`crate::state::taggable_resource_not_found`] constructor.
 //!
 //! ## Shape of an operation
 //!
@@ -166,13 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::session_id_from_identifier(&input.resource_arn);
         let Some(session) = guard.sessions.get_mut(key) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource {} was not found. Check the Amazon Resource Name (ARN) and \
-                         try your request again.",
-                        input.resource_arn
-                    )),
-                },
+                crate::state::taggable_resource_not_found(),
             )
             .into());
         };

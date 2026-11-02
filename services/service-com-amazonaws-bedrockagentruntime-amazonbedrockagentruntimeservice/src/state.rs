@@ -11,8 +11,8 @@
 //! a bare UUID and a session ARN mean.
 //!
 //! The refusals that lookup and the session state machine produce are worded here too —
-//! [`session_not_found`], [`session_in_terminal_state`] and
-//! [`active_session_not_deletable`] — for the same reason: the service states one
+//! [`session_not_found`], [`taggable_resource_not_found`], [`session_in_terminal_state`]
+//! and [`active_session_not_deletable`] — for the same reason: the service states one
 //! sentence per rule, not one per operation, so a client can match the rule. How a refusal
 //! the FRAMEWORK raises before a handler runs is worded (a value outside a `@pattern`, say)
 //! belongs to `crate::service`'s `override_refusal` instead.
@@ -226,6 +226,28 @@ pub fn session_id_from_identifier(identifier: &str) -> &str {
 pub fn session_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Session with ID {identifier} not found")),
+    }
+}
+
+/// The refusal the TAG plane answers when its `resourceArn` names no stored resource.
+///
+/// The tagging operations are addressed by a `TaggableResourcesArn`, whose pattern admits
+/// a session ARN and nothing else
+/// (`smithy_query(query="operation",operation="TagResource,UntagResource,ListTagsForResource")`
+/// -> `resourceArn`), so the refusal names that one resource KIND in words and carries no
+/// identifier at all: a CONSTANT sentence, trailing period included, interpolating neither
+/// the ARN nor any part of it. It is worded from the resource kind rather than from the
+/// request because the ARN was already resolved — what the caller is told is that no
+/// session answers to it, not which ARN was submitted.
+pub const TAGGABLE_RESOURCE_NOT_FOUND: &str = "Session resource not found.";
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) carrying
+/// [`TAGGABLE_RESOURCE_NOT_FOUND`]: ONE constructor for every tagging operation
+/// (`TagResource`, `UntagResource`, `ListTagsForResource`), so the tag plane states one
+/// sentence whichever of them did the lookup.
+pub fn taggable_resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(TAGGABLE_RESOURCE_NOT_FOUND.to_string()),
     }
 }
 

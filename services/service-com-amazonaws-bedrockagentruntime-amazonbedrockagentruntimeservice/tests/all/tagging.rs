@@ -332,6 +332,121 @@ async fn tagging_an_arn_that_names_no_session_is_not_found() {
     );
 }
 
+/// The ONE sentence the tag plane states when its `resourceArn` names no stored
+/// resource: entirely fixed, trailing period included, naming the resource kind in words
+/// and carrying no identifier. The only resource a `TaggableResourcesArn` admits is a
+/// session (`smithy_query(query="operation",operation="TagResource")` -> `resourceArn`).
+const TAG_NOT_FOUND_MESSAGE: &str = "Session resource not found.";
+
+/// The `message` member of an error body, or `""` when there is none.
+fn message(body: &Value) -> &str {
+    body.get("message").and_then(Value::as_str).unwrap_or("")
+}
+
+/// RULE: a tagging operation whose `resourceArn` resolves to no stored resource states
+/// ONE constant sentence — the resource kind in words, trailing period included — and
+/// interpolates nothing from the request: no ARN, and no segment of one.
+///
+/// The rows span the three tagging operations and what the rule generalises over in the
+/// ARN: which account, which partition, which region, which session uuid, and how the
+/// ARN came to name nothing (never minted, or minted and then deleted). The sentence is
+/// the same in every cell, which is the point — a client matches one rule.
+#[tokio::test]
+async fn a_tagging_arn_that_names_nothing_states_one_constant_sentence() {
+    let router = router();
+    // A session created and then deleted: its ARN is well-formed, this emulator minted
+    // it, and it now names nothing.
+    let (deleted_id, deleted_arn) = create_session(&router, json!({ "k": "v" })).await;
+    for (method, path) in [
+        ("PATCH", format!("/sessions/{deleted_id}")),
+        ("DELETE", format!("/sessions/{deleted_id}")),
+    ] {
+        let (status, out) = call(&router, method, &path, Value::Null).await;
+        assert_eq!(
+            status, 200,
+            "releasing the session: {method} {path} expected 200, got {status} {out:?}"
+        );
+    }
+
+    // (case, an ARN the model admits that names no stored session)
+    let arns: Vec<(&str, String)> = vec![
+        (
+            "a deleted session's own ARN",
+            deleted_arn,
+        ),
+        (
+            "an ARN this emulator could have minted, never minted",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:session/0cabde93-58b4-4d68-b230-90df328e1acb"),
+        ),
+        (
+            "a different unknown session uuid, same account and region",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:session/ffffffff-ffff-ffff-ffff-ffffffffffff"),
+        ),
+        (
+            "another region",
+            format!("arn:aws:bedrock:eu-central-1:{ACCOUNT}:session/11111111-2222-3333-4444-555555555555"),
+        ),
+        (
+            "another account",
+            "arn:aws:bedrock:us-east-1:210987654321:session/11111111-2222-3333-4444-555555555555"
+                .to_string(),
+        ),
+        (
+            "another partition",
+            format!("arn:aws-us-gov:bedrock:us-gov-west-1:{ACCOUNT}:session/7a9c0d11-2e3f-4a5b-8c7d-9e0f1a2b3c4d"),
+        ),
+    ];
+
+    // (operation, method, the path builder for one ARN, body)
+    type Operation = (&'static str, &'static str, fn(&str) -> String, Value);
+    let operations: Vec<Operation> = vec![
+        (
+            "TagResource",
+            "POST",
+            |arn| format!("/tags/{}", label(arn)),
+            json!({ "tags": { "k": "v" } }),
+        ),
+        (
+            "UntagResource",
+            "DELETE",
+            |arn| format!("/tags/{}?tagKeys=k", label(arn)),
+            Value::Null,
+        ),
+        (
+            "ListTagsForResource",
+            "GET",
+            |arn| format!("/tags/{}", label(arn)),
+            Value::Null,
+        ),
+    ];
+
+    for (operation, method, path_of, body) in &operations {
+        for (form, arn) in &arns {
+            let case = format!("{operation} addressed by {form}");
+            let (status, refused) = call(&router, method, &path_of(arn), body.clone()).await;
+            assert_eq!(
+                (status, error_code(&refused)),
+                (404, "ResourceNotFoundException"),
+                "case {case:?}: expected 404 ResourceNotFoundException, got {status} {refused:?}"
+            );
+            let stated = message(&refused);
+            assert_eq!(
+                stated, TAG_NOT_FOUND_MESSAGE,
+                "case {case:?}: expected message {TAG_NOT_FOUND_MESSAGE:?}, got {stated:?}"
+            );
+            // No identifier at all: neither the whole ARN nor any segment of it — the
+            // account, the region, the partition or the session uuid — appears.
+            for segment in arn.split([':', '/']).filter(|part| !part.is_empty()) {
+                assert!(
+                    !stated.contains(segment),
+                    "case {case:?}: the refusal must carry no part of the request ARN, but \
+                     {stated:?} contains {segment:?}"
+                );
+            }
+        }
+    }
+}
+
 /// RULE: the tags a session carries are ONE map, whichever operation wrote them —
 /// `CreateSession`'s `tags` member and `TagResource` write the same store, and
 /// `ListTagsForResource` reads it, addressed by the session ARN `CreateSession` minted.

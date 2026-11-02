@@ -4,7 +4,8 @@
 //! IMPLEMENTED: removes the named tag keys from the session the `resourceArn` names. A
 //! key the session does not carry is a no-op — the request asks for those keys to be
 //! absent, and they are — while an ARN naming no stored session is the modelled 404
-//! `ResourceNotFoundException`.
+//! `ResourceNotFoundException`, worded by the tag plane's one
+//! [`crate::state::taggable_resource_not_found`] constructor.
 //!
 //! ## Shape of an operation
 //!
@@ -162,13 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::session_id_from_identifier(&input.resource_arn);
         let Some(session) = guard.sessions.get_mut(key) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource {} was not found. Check the Amazon Resource Name (ARN) and \
-                         try your request again.",
-                        input.resource_arn
-                    )),
-                },
+                crate::state::taggable_resource_not_found(),
             )
             .into());
         };

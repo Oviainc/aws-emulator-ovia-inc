@@ -6,7 +6,8 @@
 //! `UntagResource` removed. A session carrying no tags reports the member as ABSENT
 //! rather than as an empty map: the model bounds `tags` at `length {min: 1}`
 //! (`smithy_query(query="operation",operation="ListTagsForResource")`). An ARN naming no
-//! stored session is the modelled 404 `ResourceNotFoundException`.
+//! stored session is the modelled 404 `ResourceNotFoundException`, worded by the tag
+//! plane's one [`crate::state::taggable_resource_not_found`] constructor.
 //!
 //! ## Shape of an operation
 //!
@@ -166,13 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::session_id_from_identifier(&input.resource_arn);
         let Some(session) = guard.sessions.get(key) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resource {} was not found. Check the Amazon Resource Name (ARN) and \
-                         try your request again.",
-                        input.resource_arn
-                    )),
-                },
+                crate::state::taggable_resource_not_found(),
             )
             .into());
         };
