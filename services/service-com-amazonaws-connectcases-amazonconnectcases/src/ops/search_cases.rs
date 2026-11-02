@@ -246,10 +246,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same reference rule the other case operations apply, in the same
         // order they apply it (the addressed resource first, then the body): an
-        // id the domain defines no field for cannot be projected, filtered on
-        // or sorted by, so it is refused in the service's own words for an
+        // id the domain holds no field RECORD for cannot be projected, filtered
+        // on or sorted by, so it is refused in the service's own words for an
         // unresolvable field reference. Each member is resolved separately, so
-        // the ids a refusal names are the ones a client has to fix.
+        // the ids a refusal names are the ones a client has to fix. A DELETED
+        // field still has a record and its values stay searchable — "Calling
+        // SearchCases with the deleted field ID as a filter returns any cases
+        // that have a value for the deleted field that matches the filter
+        // criteria" (`smithy_query(query="doc",shape="DeleteField")`) — so its
+        // id resolves here.
         for ids in [
             requested_fields
                 .iter()
@@ -262,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(filter_field_ids)
                 .unwrap_or_default(),
         ] {
-            let unknown = domain.unknown_field_ids(ids.iter().map(String::as_str));
+            let unknown = domain.unrecorded_field_ids(ids.iter().map(String::as_str));
             if !unknown.is_empty() {
                 return Err(SearchCasesErrorModeled::ValidationException(
                     crate::state::unknown_fields(&unknown),

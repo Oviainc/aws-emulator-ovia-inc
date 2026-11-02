@@ -200,10 +200,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same reference rule the write paths apply, in the same order they
         // apply it (the addressed resource first, then the body): an id the
-        // domain defines no field for cannot be answered at all, so it is
+        // domain holds no field RECORD for cannot be answered at all, so it is
         // refused before the case's values are read, in the service's own words
-        // for an unresolvable field reference.
-        let unknown = domain.unknown_field_ids(input.fields.iter().map(|f| f.id.as_str()));
+        // for an unresolvable field reference. A DELETED field still has a
+        // record, and "Calling GetCase with a deleted field identifier returns
+        // the deleted field's value if one exists"
+        // (`smithy_query(query="doc",shape="DeleteField")`), so its id resolves
+        // here and is answered below from the case's stored values.
+        let unknown = domain.unrecorded_field_ids(input.fields.iter().map(|f| f.id.as_str()));
         if !unknown.is_empty() {
             return Err(
                 GetCaseErrorModeled::ValidationException(crate::state::unknown_fields(&unknown))

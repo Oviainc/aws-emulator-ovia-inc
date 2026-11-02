@@ -47,9 +47,9 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    BasicLayout, ConflictException, EventBridgeConfiguration, FieldAttributes, FieldOption,
-    FieldValueUnion, InternalServerException, LayoutConfiguration, LayoutContent, LayoutSections,
-    RelatedItemInputContent, RequiredField, ResourceNotFoundException, Section,
+    BasicLayout, ConflictException, EventBridgeConfiguration, FieldAttributes, FieldGroup,
+    FieldOption, FieldValueUnion, InternalServerException, LayoutConfiguration, LayoutContent,
+    LayoutSections, RelatedItemInputContent, RequiredField, ResourceNotFoundException, Section,
     ServiceQuotaExceededException, TagPropagationConfiguration, UserUnion, ValidationException,
 };
 
@@ -620,6 +620,28 @@ impl Domain {
             .ok_or_else(|| not_found("Field", field_id))
     }
 
+    /// The RECORD this domain holds for `field_id`, live or deleted, or `None`
+    /// when it holds none at all.
+    ///
+    /// A field's delete is a SOFT delete, so a deleted field is a tombstone
+    /// rather than an absence: its id, its declared type and the case values
+    /// written against it are all still defined. The reads the service
+    /// documents as surviving a delete resolve a field through this, and
+    /// [`Field::deleted`] on what comes back says which of the two it is.
+    pub fn field_record(&self, field_id: &str) -> Option<&Field> {
+        self.fields.get(field_id)
+    }
+
+    /// Whether this domain holds `field_id` as a DELETED field: a record that
+    /// exists and is flagged.
+    ///
+    /// What the reports of a field list filter on: they drop an id whose field
+    /// was deleted, and leave every other id they stored exactly as stored.
+    pub fn is_deleted_field(&self, field_id: &str) -> bool {
+        self.fields.get(field_id).is_some_and(|field| field.deleted)
+    }
+
+    /// Every template this domain still holds, in creation order and each
     /// Every template this domain still holds, in creation order and each
     /// paired with the key [`order_key`] builds for it, with the deleted ones
     /// left out: what a listing of templates reports before the request's own
@@ -734,23 +756,62 @@ impl Domain {
     /// The ids among `ids` that this domain holds no live field for, in the
     /// order they were given and without repeats. Empty means every reference
     /// resolves. Linear in the number of ids: one hash lookup each.
+    ///
+    /// What a request that takes out a NEW reference to a field resolves
+    /// against: a deleted field is not part of the domain's live schema, so a
+    /// reference to one does not resolve here.
     pub fn unknown_field_ids<'a, I: IntoIterator<Item = &'a str>>(&self, ids: I) -> Vec<String> {
+        self.field_ids_matching(ids, |field| {
+            field.is_none_or(|field: &Field| field.deleted)
+        })
+    }
+
+    /// The ids among `ids` that this domain holds NO record for at all, live or
+    /// deleted, in the order they were given and without repeats.
+    ///
+    /// What an operation that reads or rewrites a value already written against
+    /// a field resolves against: a deleted field's record is still defined, so
+    /// its id resolves here while [`Self::unknown_field_ids`] rejects it.
+    pub fn unrecorded_field_ids<'a, I: IntoIterator<Item = &'a str>>(&self, ids: I) -> Vec<String> {
+        self.field_ids_matching(ids, |field| field.is_none())
+    }
+
+    /// The ids among `ids` whose record this domain holds as a DELETED field,
+    /// in the order they were given and without repeats: the ids a refusal has
+    /// to name as deleted rather than as unresolvable.
+    pub fn deleted_field_ids<'a, I: IntoIterator<Item = &'a str>>(&self, ids: I) -> Vec<String> {
+        self.field_ids_matching(ids, |field| {
+            field.is_some_and(|field: &Field| field.deleted)
+        })
+    }
+
+    /// The ids among `ids` whose record in this domain satisfies `matches`,
+    /// each reported once in first-seen order. One hash lookup per id, so it is
+    /// linear in the number of ids; the three classifications above are the one
+    /// loop, so they cannot drift apart.
+    fn field_ids_matching<'a, I, F>(&self, ids: I, matches: F) -> Vec<String>
+    where
+        I: IntoIterator<Item = &'a str>,
+        F: Fn(Option<&Field>) -> bool,
+    {
         let mut reported: HashSet<&str> = HashSet::new();
-        let mut unknown: Vec<String> = Vec::new();
+        let mut selected: Vec<String> = Vec::new();
         for id in ids {
-            let known = self.fields.get(id).is_some_and(|field| !field.deleted);
-            if !known && reported.insert(id) {
-                unknown.push(id.to_string());
+            if matches(self.fields.get(id)) && reported.insert(id) {
+                selected.push(id.to_string());
             }
         }
-        unknown
+        selected
     }
 
     /// The ids among `values` whose union variant is not a value of the
     /// declared `FieldType` of the field it is written against, each reported
     /// once in first-seen order with the type and the variant named. An id the
-    /// domain holds no live field for is left to [`Self::unknown_field_ids`].
-    /// Linear in the number of values.
+    /// domain holds no record for at all is left to
+    /// [`Self::unrecorded_field_ids`]. A DELETED field still declares its type,
+    /// and a value may still be written against it, so a value written against
+    /// a tombstone is type-checked like any other. Linear in the number of
+    /// values.
     pub fn mismatched_field_values<'a, I>(&self, values: I) -> Vec<String>
     where
         I: IntoIterator<Item = (&'a str, &'a FieldValueUnion)>,
@@ -758,7 +819,7 @@ impl Domain {
         let mut reported: HashSet<&str> = HashSet::new();
         let mut mismatched: Vec<String> = Vec::new();
         for (id, value) in values {
-            let Some(field) = self.fields.get(id).filter(|field| !field.deleted) else {
+            let Some(field) = self.field_record(id) else {
                 continue;
             };
             if !value_fits_field_type(&field.field_type, value) && reported.insert(id) {
@@ -1048,6 +1109,20 @@ pub fn list_too_long(member: &str, len: usize, cap: usize) -> Option<String> {
 pub fn unknown_fields(ids: &[String]) -> ValidationException {
     ValidationException {
         message: format!("Unknown field Ids: {}", name_ids(ids)),
+    }
+}
+
+/// The modelled 400 for a request a DELETED field id cannot be used in, as
+/// [`Domain::deleted_field_ids`] reports them.
+///
+/// The service's answer for such a request "denot[es] which field identifiers
+/// in the request have been deleted"
+/// (`smithy_query(query="doc",shape="DeleteField")`), so the ids come from the
+/// REQUEST, verbatim, after the service's own fixed text, and are rendered by
+/// [`name_ids`] so one request cannot make the refusal grow without bound.
+pub fn deleted_fields(ids: &[String]) -> ValidationException {
+    ValidationException {
+        message: format!("Deleted field Ids: {}", name_ids(ids)),
     }
 }
 
@@ -1446,6 +1521,60 @@ pub fn layout_field_ids(content: &LayoutContent) -> Vec<String> {
             group.fields.iter().map(|item| item.id.clone())
         })
         .collect()
+}
+
+/// A layout's `content` as a READ reports it: the stored record with every
+/// field item whose id `is_deleted` accepts left out, and every panel, section
+/// and field group otherwise exactly as stored, in the order stored.
+///
+/// A read of a layout "does not return field IDs for deleted fields"
+/// (`smithy_query(query="doc",shape="DeleteField")`), so a deleted field is
+/// filtered out on the read rather than edited out of the record: the write's
+/// content is what stays stored, and a field whose delete is the only change
+/// is the only difference a reader sees. One pass over the content, so it is
+/// linear in the number of field items, as [`layout_field_ids`] is.
+pub fn layout_content_without_deleted_fields(
+    content: &LayoutContent,
+    is_deleted: impl Fn(&str) -> bool,
+) -> LayoutContent {
+    let LayoutContent::Basic(basic) = content;
+    LayoutContent::Basic(BasicLayout {
+        top_panel: basic
+            .top_panel
+            .as_ref()
+            .map(|panel| layout_panel_without_deleted_fields(panel, &is_deleted)),
+        more_info: basic
+            .more_info
+            .as_ref()
+            .map(|panel| layout_panel_without_deleted_fields(panel, &is_deleted)),
+    })
+}
+
+/// One panel of [`layout_content_without_deleted_fields`]: its sections, each
+/// field group holding every field item `is_deleted` rejects.
+fn layout_panel_without_deleted_fields(
+    panel: &LayoutSections,
+    is_deleted: &impl Fn(&str) -> bool,
+) -> LayoutSections {
+    LayoutSections {
+        sections: panel.sections.as_ref().map(|sections| {
+            sections
+                .iter()
+                .map(|section| {
+                    let Section::fieldGroup(group) = section;
+                    Section::fieldGroup(FieldGroup {
+                        name: group.name.clone(),
+                        fields: group
+                            .fields
+                            .iter()
+                            .filter(|item| !is_deleted(&item.id))
+                            .cloned()
+                            .collect(),
+                    })
+                })
+                .collect()
+        }),
+    }
 }
 
 /// `Some(message)` when a layout's `content` carries more sections in one panel

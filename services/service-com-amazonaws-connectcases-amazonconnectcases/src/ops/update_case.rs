@@ -189,7 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolve every reference the body carries, and check every value
         // against its field's own declared type, before writing any of it, so a
         // rejected update leaves the case exactly as it was.
-        let unknown = domain.unknown_field_ids(input.fields.iter().map(|f| f.id.as_str()));
+        let unknown = domain.unrecorded_field_ids(input.fields.iter().map(|f| f.id.as_str()));
+        // A DELETED field is a tombstone, not an absence: "Calling UpdateCase
+        // with a deleted field ID throws a ValidationException if the case does
+        // not already contain a value for the deleted field. Otherwise it
+        // succeeds, allowing you to update or remove (using emptyValue: {}) the
+        // field's value from the case"
+        // (`smithy_query(query="doc",shape="DeleteField")`) — so the refusal
+        // depends on the CASE, and is made once the case is resolved below.
+        let deleted = domain.deleted_field_ids(input.fields.iter().map(|f| f.id.as_str()));
         let mismatched =
             domain.mismatched_field_values(input.fields.iter().map(|f| (f.id.as_str(), &f.value)));
         let Some(case) = domain.cases.get_mut(&input.case_id) else {
@@ -201,6 +209,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !unknown.is_empty() {
             return Err(UpdateCaseErrorModeled::ValidationException(
                 crate::state::unknown_fields(&unknown),
+            )
+            .into());
+        }
+        let deleted_without_a_value: Vec<String> = deleted
+            .into_iter()
+            .filter(|id| !case.field_values.contains_key(id))
+            .collect();
+        if !deleted_without_a_value.is_empty() {
+            return Err(UpdateCaseErrorModeled::ValidationException(
+                crate::state::deleted_fields(&deleted_without_a_value),
             )
             .into());
         }

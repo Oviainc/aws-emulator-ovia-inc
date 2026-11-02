@@ -21,6 +21,8 @@ mod case_lifecycle;
 mod case_search;
 #[path = "all/domain_listing.rs"]
 mod domain_listing;
+#[path = "all/field_deletion.rs"]
+mod field_deletion;
 #[path = "all/field_listing.rs"]
 mod field_listing;
 #[path = "all/field_options.rs"]

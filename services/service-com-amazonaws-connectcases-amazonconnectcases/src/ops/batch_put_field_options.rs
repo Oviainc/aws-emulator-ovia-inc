@@ -226,9 +226,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let field = store
+        let domain = store
             .domain_mut(&input.domain_id)
-            .map_err(BatchPutFieldOptionsErrorModeled::ResourceNotFoundException)?
+            .map_err(BatchPutFieldOptionsErrorModeled::ResourceNotFoundException)?;
+        // A field whose record is a tombstone is refused as a bad request
+        // rather than as a missing one: "Calling BatchPutFieldOptions with a
+        // deleted field ID throw[s] a ValidationException"
+        // (`smithy_query(query="doc",shape="DeleteField")`).
+        if domain
+            .field_record(&input.field_id)
+            .is_some_and(|field| field.deleted)
+        {
+            return Err(BatchPutFieldOptionsErrorModeled::ValidationException(
+                crate::state::deleted_fields(&[input.field_id]),
+            )
+            .into());
+        }
+        let field = domain
             .field_mut(&input.field_id)
             .map_err(BatchPutFieldOptionsErrorModeled::ResourceNotFoundException)?;
 

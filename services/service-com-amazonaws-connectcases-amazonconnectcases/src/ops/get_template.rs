@@ -183,6 +183,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let template = domain
             .template(&input.template_id)
             .map_err(GetTemplateErrorModeled::ResourceNotFoundException)?;
+        // The template's required fields, with any field that has since been
+        // deleted left out: a read of a template "does not return field IDs for
+        // deleted fields" (`smithy_query(query="doc",shape="DeleteField")`).
+        // The stored record keeps every id the write named, so the filter is on
+        // the read and a field's delete is the only difference a reader sees.
+        let required_fields: Vec<RequiredField> = template
+            .required_fields
+            .iter()
+            .filter(|required| !domain.is_deleted_field(&required.field_id))
+            .cloned()
+            .collect();
 
         Ok(GetTemplateOutput {
             template_id: template.template_id.clone(),
@@ -190,10 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: template.name.clone(),
             description: template.description.clone(),
             layout_configuration: template.layout_configuration.clone(),
-            required_fields: if template.required_fields.is_empty() {
+            required_fields: if required_fields.is_empty() {
                 None
             } else {
-                Some(template.required_fields.clone())
+                Some(required_fields)
             },
             tags: crate::state::tags_output(&template.tags),
             status: template.status.clone(),

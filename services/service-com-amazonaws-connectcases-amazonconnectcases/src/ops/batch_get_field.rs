@@ -181,11 +181,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut fields: Vec<GetFieldResponse> = Vec::with_capacity(input.fields.len());
         let mut errors: Vec<FieldError> = Vec::new();
         for requested in &input.fields {
-            match domain
-                .fields
-                .get(&requested.id)
-                .filter(|field| !field.deleted)
-            {
+            // A DELETED field is reported here like any other, with `deleted`
+            // saying so: a field's delete is a soft delete, and "After a field
+            // is deleted: You can still retrieve the field by calling
+            // BatchGetField" (`smithy_query(query="doc",shape="DeleteField")`).
+            // Only an id the domain holds no record for at all is a per-item
+            // failure.
+            match domain.field_record(&requested.id) {
                 Some(field) => fields.push(GetFieldResponse {
                     field_id: field.field_id.clone(),
                     name: field.name.clone(),

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteField
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteField`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteField::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A DELETE of one field of a domain's schema. The service's delete is a SOFT
+//! delete: the record is kept and flagged, because this operation's own
+//! documentation says what a deleted field is still good for — it stays
+//! retrievable through `BatchGetField`, the case values written against it stay
+//! readable through `GetCase` and searchable through `SearchCases`, and
+//! `UpdateCase` may still rewrite or clear them — while every view of the
+//! domain's LIVE schema leaves it out (`ListFields`, and the field ids a
+//! template, a layout or the case event configuration reports) and a new
+//! reference to it no longer resolves. So this handler flags the stored field
+//! rather than dropping it, and the operation is `@idempotent`
+//! (`smithy_query(query="operation",operation="DeleteField")`): deleting a
+//! field that is already deleted succeeds and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +173,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteField` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFieldErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteField"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFieldErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // Both ids are resolved against the store before anything is written: a
+        // field is scoped to its domain, so an unknown domain and a field the
+        // named domain holds no record for are both the modelled 404.
+        let domain = store
+            .domain_mut(&input.domain_id)
+            .map_err(DeleteFieldErrorModeled::ResourceNotFoundException)?;
+        // The RECORD, not the live field: an already deleted field still has
+        // one, and the repeat delete below has to succeed on it.
+        let Some(field) = domain.fields.get_mut(&input.field_id) else {
+            return Err(DeleteFieldErrorModeled::ResourceNotFoundException(
+                crate::state::not_found("Field", &input.field_id),
+            )
+            .into());
+        };
+
+        // A soft delete: the record is kept and flagged, because after a delete
+        // "You can still retrieve the field by calling BatchGetField" and the
+        // values cases hold for it stay readable, while `ListFields` and the
+        // other live-schema views must leave it out — all of them read this
+        // flag. The operation is `@idempotent`, so a repeat delete succeeds;
+        // `lastModifiedTime` is the instant the resource was created or last
+        // modified, so it moves only on the call that actually changed the
+        // record.
+        if !field.deleted {
+            field.deleted = true;
+            field.last_modified_time = now;
+        }
+
+        // The documented success: HTTP 200 with an empty body.
+        Ok(DeleteFieldOutput {})
     }
 }

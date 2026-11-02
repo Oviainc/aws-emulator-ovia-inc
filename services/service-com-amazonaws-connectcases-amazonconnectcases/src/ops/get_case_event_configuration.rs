@@ -163,10 +163,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(GetCaseEventConfigurationErrorModeled::ResourceNotFoundException)?;
 
         Ok(GetCaseEventConfigurationOutput {
-            event_bridge: domain
-                .event_bridge
-                .clone()
-                .unwrap_or_else(crate::state::event_bridge_disabled),
+            // The stored configuration, with any field that has since been
+            // deleted left out of the data it includes: this read "does not
+            // return field IDs for deleted fields"
+            // (`smithy_query(query="doc",shape="DeleteField")`), and the stored
+            // record keeps every id the write named, so the filter is on the
+            // read.
+            event_bridge: {
+                let mut event_bridge = domain
+                    .event_bridge
+                    .clone()
+                    .unwrap_or_else(crate::state::event_bridge_disabled);
+                if let Some(case_data) = event_bridge
+                    .included_data
+                    .as_mut()
+                    .and_then(|included| included.case_data.as_mut())
+                {
+                    case_data
+                        .fields
+                        .retain(|field| !domain.is_deleted_field(&field.id));
+                }
+                event_bridge
+            },
         })
     }
 }

@@ -186,8 +186,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             layout_arn: layout.layout_arn.clone(),
             name: layout.name.clone(),
             // The stored content, which the write normalised once, so this
-            // read reproduces the record rather than re-deriving it.
-            content: layout.content.clone(),
+            // read reproduces the record rather than re-deriving it — with any
+            // field that has since been deleted left out, because a read of a
+            // layout "does not return field IDs for deleted fields"
+            // (`smithy_query(query="doc",shape="DeleteField")`).
+            content: crate::state::layout_content_without_deleted_fields(
+                &layout.content,
+                |field_id| domain.is_deleted_field(field_id),
+            ),
             tags: crate::state::tags_output(&layout.tags),
             deleted: layout.deleted,
             created_time: Some(crate::state::timestamp(layout.created_time)),

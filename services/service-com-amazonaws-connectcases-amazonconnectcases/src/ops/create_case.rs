@@ -255,7 +255,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every field id the body writes against is resolved before anything is
         // stored, so a case never holds a value for a field the domain lacks,
         // and a value whose union variant is not a value of the field's own
-        // declared type is refused rather than stored under the wrong type.
+        // declared type is refused rather than stored under the wrong type. A
+        // CREATE takes out a new reference, so a deleted field is not one it can
+        // resolve: "Calling CreateCase with a deleted field throws a
+        // ValidationException denoting which field identifiers in the request
+        // have been deleted" (`smithy_query(query="doc",shape="DeleteField")`),
+        // so the ids whose field was deleted are named as deleted rather than
+        // as unresolvable.
+        let deleted = domain.deleted_field_ids(input.fields.iter().map(|f| f.id.as_str()));
+        if !deleted.is_empty() {
+            return Err(CreateCaseErrorModeled::ValidationException(
+                crate::state::deleted_fields(&deleted),
+            )
+            .into());
+        }
         let unknown = domain.unknown_field_ids(input.fields.iter().map(|f| f.id.as_str()));
         if !unknown.is_empty() {
             return Err(CreateCaseErrorModeled::ValidationException(
