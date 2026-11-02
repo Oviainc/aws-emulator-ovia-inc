@@ -42,9 +42,10 @@ struct ErrorCase<'a> {
 ///
 /// The rows span the layers that can refuse a request — a handler's modelled 4xx
 /// (both the `NotFound` and the `InvalidParameter` class), the boundary validator's
-/// refusal of a modelled constraint, an absent required member, an action this
-/// service does not model, and the scaffold's 501 — because the element belongs to
-/// the awsQuery error DOCUMENT, not to any one of them.
+/// refusal of a modelled constraint, an absent required member, and an action this
+/// service does not model — because the element belongs to the awsQuery error
+/// DOCUMENT, not to any one of them. No row asks for the scaffold's 501: every
+/// operation this service models is implemented, so nothing here answers one.
 #[tokio::test]
 async fn every_awsquery_error_document_carries_a_request_id() {
     let sns = Sns::new();
@@ -143,7 +144,7 @@ async fn every_awsquery_error_document_carries_a_request_id() {
             code: "InvalidAction",
         },
         ErrorCase {
-            case: "an operation that is still scaffolded",
+            case: "SetEndpointAttributes on an endpoint that does not exist",
             action: "SetEndpointAttributes",
             params: vec![
                 (
@@ -154,8 +155,8 @@ async fn every_awsquery_error_document_carries_a_request_id() {
                 ("Attributes.entry.1.key", "CustomUserData"),
                 ("Attributes.entry.1.value", "user-data"),
             ],
-            status: 501,
-            code: "NotImplemented",
+            status: 404,
+            code: "NotFound",
         },
     ];
 

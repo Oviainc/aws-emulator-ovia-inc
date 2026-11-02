@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetEndpointAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetEndpointAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetEndpointAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +68,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -163,23 +155,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = SET_ENDPOINT_ATTRIBUTES_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Apply the request's attribute map to the device endpoint `EndpointArn` names.
+    ///
+    /// A MUTATION the spec names: "Sets the attributes for an endpoint for a device on one
+    /// of the supported push notification services". The request carries a MAP, so the
+    /// entries it holds are applied OVER the ones the record already holds and every
+    /// attribute the request does not name is left as it was — a write of one attribute is
+    /// not an instruction to forget the rest. The record this writes is the one the
+    /// attribute read and the application's endpoint listing report, so the write reads
+    /// back through either of them.
+    ///
+    /// Every name this map defines is the caller's to write, the delivery flag included:
+    /// "Amazon SNS will set this to false when a notification service indicates to Amazon
+    /// SNS that the endpoint is invalid. Users can set it back to true, typically after
+    /// updating Token" (this operation's attribute-map doc). The device token is the
+    /// record's own field, which every report of an endpoint takes it from, so a written
+    /// `Token` moves THAT field rather than being stored beside it: one value keeps one
+    /// source whichever call wrote it.
+    ///
+    /// The argument rules are judged first, each answered with `InvalidParameterException`
+    /// (HTTP 400): the ARN has to be an ARN of the region this endpoint serves, and user
+    /// data has to fit the size its own doc publishes. An ARN-shaped value this account
+    /// holds no endpoint record for is a lookup miss instead — the modelled
+    /// `NotFoundException` (HTTP 404), the same split the endpoint's attribute read makes.
+    /// The map may carry only names SNS defines for an endpoint of the platform its
+    /// application targets, which is known only once that endpoint resolves, so that rule
+    /// is judged after the lookup: an endpoint that is not there is reported as missing
+    /// however the map beside it is spelled.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetEndpointAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetEndpointAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetEndpointAttributes"))
+        let refuse = |message: String| -> Self::Error {
+            SetEndpointAttributesErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+        let missing = || -> Self::Error {
+            SetEndpointAttributesErrorModeled::NotFoundException(NotFoundException {
+                message: Some(state::ENDPOINT_DOES_NOT_EXIST.to_string()),
+            })
+            .into()
+        };
+
+        let region = state::request_region(ctx.parts());
+        if let Some(message) =
+            state::regional_arn_refusal("EndpointArn", &input.endpoint_arn, &region)
+        {
+            return Err(refuse(message));
+        }
+        // The user data an endpoint may carry is the same size whichever call carried it,
+        // so the registration's rule is the write's rule too.
+        if let Some(message) = input
+            .attributes
+            .get(state::ENDPOINT_CUSTOM_USER_DATA_ATTRIBUTE)
+            .and_then(|data| state::custom_user_data_refusal(data))
+        {
+            return Err(refuse(message));
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(SetEndpointAttributesErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        // The map the record WOULD hold, and the token it would carry: what it holds now,
+        // with the request's entries applied over it. Every rule below is judged on THAT
+        // pair, so a write past the per-record ceiling is never stored and a half-applied
+        // write cannot be observed.
+        let Some(held) = store.platform_endpoints.get(&input.endpoint_arn) else {
+            return Err(missing());
+        };
+        let application_arn = held.platform_application_arn.clone();
+        let mut would_hold = held.attributes.clone();
+        let mut token = held.token.clone();
+
+        // Which names an endpoint takes depends on the push service its application
+        // targets, so the catalog comes off that application's record: the same catalog
+        // the registration admits. An endpoint record always names an application this
+        // store holds — the registration resolves it, and removing an application removes
+        // its endpoints — so a miss here is the store disagreeing with itself rather than
+        // anything the request did, which is what the modelled server error is for.
+        let Some(platform) = store
+            .platform_applications
+            .get(&application_arn)
+            .map(|application| application.platform.clone())
+        else {
+            return Err(SetEndpointAttributesErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        if let Some(unknown) = state::unknown_attribute_name(&input.attributes, |name| {
+            state::is_endpoint_attribute(&platform, name)
+        }) {
+            return Err(refuse(state::mobile_push_unknown_attribute_refusal(
+                state::ATTRIBUTES_MEMBER,
+                unknown,
+            )));
+        }
+
+        for (name, value) in &input.attributes {
+            if name == state::ENDPOINT_TOKEN_ATTRIBUTE {
+                token = value.clone();
+            } else {
+                would_hold.insert(name.clone(), value.clone());
+            }
+        }
+        // Measured on what the endpoint would REPORT, the token included, since a caller
+        // supplies that too: no sequence of writes grows one record past the ceiling.
+        let mut would_report = would_hold.clone();
+        would_report.insert(state::ENDPOINT_TOKEN_ATTRIBUTE.to_string(), token.clone());
+        if let Some(message) = state::attribute_bytes_refusal(state::ENDPOINT_RECORD, &would_report)
+        {
+            return Err(refuse(message));
+        }
+
+        // The write itself. The record was resolved above under this same lock, which is
+        // held across both lookups, so this one cannot miss where that one hit: the arm
+        // below is what the borrow checker needs to re-reach the record mutably, not a
+        // second lookup a request can fail.
+        let Some(endpoint) = store.platform_endpoints.get_mut(&input.endpoint_arn) else {
+            return Err(missing());
+        };
+        endpoint.attributes = would_hold;
+        endpoint.token = token;
+
+        Ok(SetEndpointAttributesOutput)
     }
 }
