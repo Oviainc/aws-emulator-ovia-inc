@@ -180,10 +180,21 @@ enum Expect {
     /// carrying the not-found failure code, with `successfulRequests` empty: the answer
     /// of a store that does not hold that id.
     BatchMissing(&'static str),
+    /// An onboarding job the claiming version's own store has only just started, so it
+    /// reports a job that has not finished yet. The V2 version onboarded `instance-1` in
+    /// ITS store before these rows ran and waited that job out, so a V2 answer to this
+    /// path would report a FINISHED job — only the v1 store, which holds no record of
+    /// the instance until this row's call writes one, can report one in progress.
+    JobJustStarted,
 }
 
 /// Neither routing refusal may ever be the answer to a legitimately signed request.
 const ROUTER_REFUSALS: [&str; 2] = ["AmbiguousService", "UnknownService"];
+
+/// The `InstanceOnboardingJobStatusCode` the v1 version reports for an onboarding job
+/// that has not finished, read from that crate rather than written out here.
+const V1_ONBOARDING_IN_PROGRESS: &str =
+    service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::state::ONBOARDING_STATUS_IN_PROGRESS;
 
 #[tokio::test]
 async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
@@ -304,12 +315,16 @@ async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
             Expect::BatchMissing("000000000000"),
         ),
         (
-            "v1 StartInstanceOnboardingJob (still a stub)",
+            // v1 implements this one too, and its answer comes from ITS own onboarding
+            // store: a job it has only just started, where the V2 version — whose own
+            // record for this instance settled before these rows ran — would report a
+            // finished one.
+            "v1 StartInstanceOnboardingJob",
             "PUT",
             "/connect-instance/instance-1/onboarding",
             r#"{"encryptionConfig":{"enabled":false}}"#,
-            501,
-            Expect::Error("NotImplemented"),
+            200,
+            Expect::JobJustStarted,
         ),
         (
             "v1 PutDialRequestBatch (still a stub)",
@@ -393,6 +408,21 @@ async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
                     0,
                     "case {case:?}: expected no state to be reported for an id that \
                      version's store does not hold, got {payload}"
+                );
+            }
+            Expect::JobJustStarted => {
+                assert_eq!(
+                    status, expected_status,
+                    "case {case:?}: expected HTTP {expected_status} from the one version \
+                     that owns {uri}, got {status} {payload}"
+                );
+                assert_eq!(
+                    payload
+                        .pointer("/connectInstanceOnboardingJobStatus/status")
+                        .and_then(Value::as_str),
+                    Some(V1_ONBOARDING_IN_PROGRESS),
+                    "case {case:?}: expected the claiming version's own store to report a \
+                     job it has only just started, got {payload}"
                 );
             }
         }

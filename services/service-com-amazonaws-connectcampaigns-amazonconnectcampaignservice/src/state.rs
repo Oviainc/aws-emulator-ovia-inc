@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use crate::ops::types::{DialerConfig, OutboundCallConfig};
+use crate::ops::types::{
+    DialerConfig, EncryptionConfig, InstanceOnboardingJobStatus, OutboundCallConfig,
+};
 
 /// This service's sigv4 signing name and ARN namespace (see `OPERATIONS.md`), used
 /// for every ARN the service mints.
@@ -96,6 +98,15 @@ pub struct StoredCampaign {
 pub struct ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
     /// Every campaign, keyed by its minted campaign id.
     pub campaigns: HashMap<String, StoredCampaign>,
+    /// The onboarding job of each Amazon Connect instance this service has onboarded to
+    /// Campaigns, keyed by that instance's id — one record per instance, written by
+    /// `StartInstanceOnboardingJob` and bounded at [`MAX_ONBOARDED_INSTANCES`] by
+    /// [`Self::start_instance_onboarding`].
+    ///
+    /// The one record of which instances are onboarded and of what their campaign data
+    /// is encrypted with, so `GetInstanceOnboardingJobStatus` and every later reader of
+    /// an instance's configuration cannot disagree about an instance.
+    pub instance_onboarding: HashMap<String, StoredInstanceOnboarding>,
     /// Campaign ARN -> campaign id, so an ARN-keyed lookup resolves without scanning
     /// `campaigns`. Maintained by [`Self::insert_campaign`] and [`Self::remove_campaign`]
     /// — the only two writers of `campaigns` — so it cannot drift from them; its first
@@ -158,6 +169,47 @@ impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
         Ok(to)
     }
 
+    /// Start the onboarding job of `connect_instance_id`, persisting `encryption_config`
+    /// as that instance's, or report why no job was started.
+    ///
+    /// The one place this store takes an onboarding record, so the two refusals an
+    /// onboarding call owes are decided once rather than per handler: an instance this
+    /// service already holds a job for is not onboarded a second time, and the store is
+    /// bounded. Nothing is written on either refusal.
+    pub fn start_instance_onboarding(
+        &mut self,
+        connect_instance_id: &str,
+        encryption_config: EncryptionConfig,
+        now: SystemTime,
+    ) -> Result<StoredInstanceOnboarding, OnboardingRefused> {
+        if self.instance_onboarding.contains_key(connect_instance_id) {
+            return Err(OnboardingRefused::AlreadyOnboarded);
+        }
+        if self.instance_onboarding.len() >= MAX_ONBOARDED_INSTANCES {
+            return Err(OnboardingRefused::StoreFull);
+        }
+        let record = StoredInstanceOnboarding::starting(
+            connect_instance_id.to_string(),
+            encryption_config,
+            now,
+        );
+        self.instance_onboarding
+            .insert(record.connect_instance_id.clone(), record.clone());
+        Ok(record)
+    }
+
+    /// The onboarding record this service holds for `connect_instance_id`, or `None`
+    /// when no call has onboarded that instance.
+    ///
+    /// The one lookup of that record, so a reporting operation reads what
+    /// [`Self::start_instance_onboarding`] wrote and nothing else.
+    pub fn instance_onboarding(
+        &self,
+        connect_instance_id: &str,
+    ) -> Option<&StoredInstanceOnboarding> {
+        self.instance_onboarding.get(connect_instance_id)
+    }
+
     /// Every campaign in creation order — the order `ListCampaigns` pages over.
     pub fn campaigns_in_creation_order(&self) -> Vec<&StoredCampaign> {
         let mut all: Vec<&StoredCampaign> = self.campaigns.values().collect();
@@ -176,6 +228,144 @@ pub enum TransitionRefused {
     /// The campaign is in a state this transition cannot be made from
     /// (`InvalidCampaignStateException`, HTTP 409), carrying the state it is in.
     InvalidState(CampaignState),
+}
+
+/// The `InstanceOnboardingJobStatusCode` value an onboarding job that has not finished
+/// yet reports, as the model's catalog declares it (see
+/// `INSTANCE_ONBOARDING_JOB_STATUS_CODE_VALUES` in [`crate::ops::types`]).
+pub const ONBOARDING_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `InstanceOnboardingJobStatusCode` value a finished onboarding job reports, from
+/// the same catalog.
+pub const ONBOARDING_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// How long after the `StartInstanceOnboardingJob` call that started it an onboarding
+/// job is due to report [`ONBOARDING_STATUS_SUCCEEDED`].
+///
+/// AWS documents no duration for the job, so this span is the emulator's own: long
+/// enough that a caller which polls straight after the start call still observes the
+/// transient status a real job has, short enough that a poller reaches the finished one
+/// without waiting on anything. Nothing sleeps for it — the record carries the instant
+/// the job is due and [`StoredInstanceOnboarding::status_at`] reads the status off the
+/// clock.
+pub const ONBOARDING_JOB_DURATION: ::std::time::Duration = ::std::time::Duration::from_secs(3);
+
+/// The most Amazon Connect instances this emulator's store holds onboarding records
+/// for, after which `StartInstanceOnboardingJob` refuses to take another.
+///
+/// The store grows one record per newly onboarded instance and the instance id is the
+/// caller's, so without a ceiling a caller could repeat the call under fresh ids until
+/// the process runs out of memory. AWS publishes no such limit, so this is the
+/// emulator's own, set far above any plausible workload.
+pub const MAX_ONBOARDED_INSTANCES: usize = 1_000;
+
+/// The onboarding job of one Amazon Connect instance: the encryption config the
+/// `StartInstanceOnboardingJob` call persisted for it, and the instant that job is due
+/// to have finished.
+#[derive(Debug, Clone)]
+pub struct StoredInstanceOnboarding {
+    pub connect_instance_id: String,
+    /// What this instance's campaign data is encrypted with, exactly as the call that
+    /// started the job supplied it.
+    pub encryption_config: EncryptionConfig,
+    /// The instant this job reaches [`ONBOARDING_STATUS_SUCCEEDED`]: the start instant
+    /// plus [`ONBOARDING_JOB_DURATION`]. Until then the job is still in progress.
+    pub succeeds_at: SystemTime,
+}
+
+impl StoredInstanceOnboarding {
+    /// A job just started for `connect_instance_id` at `now`, due to have finished one
+    /// [`ONBOARDING_JOB_DURATION`] later.
+    pub fn starting(
+        connect_instance_id: String,
+        encryption_config: EncryptionConfig,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            connect_instance_id,
+            encryption_config,
+            succeeds_at: now + ONBOARDING_JOB_DURATION,
+        }
+    }
+
+    /// The job's status at `now`: finished once the clock has passed the due instant,
+    /// in progress until then.
+    ///
+    /// A pure read of the stored instant, so reporting a job's status writes nothing and
+    /// two callers reading at the same moment see the same value.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        if now < self.succeeds_at {
+            ONBOARDING_STATUS_IN_PROGRESS
+        } else {
+            ONBOARDING_STATUS_SUCCEEDED
+        }
+    }
+
+    /// This record as the modelled `InstanceOnboardingJobStatus` the onboarding
+    /// operations report, so the start and the status read cannot word one job two ways.
+    ///
+    /// `failureCode` is absent: the onboarding this emulator performs is writing the
+    /// record, which either happened or was refused before any job started, so no
+    /// stored job is in the modelled failed state.
+    pub fn to_job_status(&self, now: SystemTime) -> InstanceOnboardingJobStatus {
+        InstanceOnboardingJobStatus {
+            connect_instance_id: self.connect_instance_id.clone(),
+            status: self.status_at(now).to_string(),
+            failure_code: None,
+        }
+    }
+}
+
+/// Why a requested onboarding job was not started, as
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::start_instance_onboarding`]
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingRefused {
+    /// The instance already holds an onboarding job, so there is no onboarding left to
+    /// start for it: the modelled `ConflictException` (HTTP 409).
+    AlreadyOnboarded,
+    /// This emulator's store already holds [`MAX_ONBOARDED_INSTANCES`] records, so it
+    /// takes no further instance.
+    StoreFull,
+}
+
+/// What this service answers when the Amazon Connect instance a request names is
+/// already onboarded to Campaigns, so its onboarding job cannot be started again.
+///
+/// The sentence the model documents for `ConflictException` — "The request could not be
+/// processed because of conflict in the current state of the resource" — which is what
+/// this refusal is: the state of the instance, and not the request, is what stops the
+/// call. A FIXED service string carrying nothing from the request, so every refusal of
+/// this class reads the same.
+pub const INSTANCE_ALREADY_ONBOARDED_MESSAGE: &str =
+    "The request could not be processed because of conflict in the current state of the resource.";
+
+/// What this service answers when the Amazon Connect instance a request asks it to
+/// onboard is not one the account holds: the id names no instance to onboard.
+///
+/// Composed from the request, so the refusal names the instance the caller asked about —
+/// the same shape as [`campaign_not_found_message`], which is how this service words a
+/// resource its request addresses by id. `CreateCampaign`, whose own resource is the
+/// campaign and which only REQUIRES a usable instance, carries
+/// [`INSTANCE_NOT_USABLE_MESSAGE`] for the same registry outcome, because each operation
+/// answers it in the words recorded for that operation.
+pub fn connect_instance_not_found_message(connect_instance_id: &str) -> String {
+    format!("ConnectInstanceId not found {connect_instance_id}.")
+}
+
+/// What this service answers when an Amazon Connect instance has no onboarding job to
+/// report on: it was never onboarded, or its job has since been deleted.
+///
+/// The onboarding RECORD is the resource that is missing here, not the instance, and the
+/// record is scoped to an account — so the sentence names the caller's account id and the
+/// instance the request named, and carries no trailing period. The one text the
+/// operations whose own resource IS that record share, so they cannot disagree about a
+/// request they both refuse.
+pub fn onboarding_record_absent_message(connect_instance_id: &str) -> String {
+    format!(
+        "Instance onboarding record does not exist for aws account id {} and instance id {connect_instance_id}",
+        ::emulator_server::emulator_account_id()
+    )
 }
 
 /// The region a request was signed for, which is the region of every ARN the
@@ -357,6 +547,31 @@ pub fn audit_campaign_change(
         caller_akid = %::engine::extract_akid(&parts.headers),
         campaign_id,
         "campaign changed"
+    );
+}
+
+/// Record one state-changing Connect-instance operation — starting an instance's
+/// onboarding job — with the same fields as [`audit_campaign_change`]: when, who asked,
+/// which instance and how the call ended.
+///
+/// Called on EVERY path such a call returns through, the accepted one and each refusal,
+/// named by the modelled error the refusal answers with — so an attempt to change what
+/// this service holds for an instance is as visible when it was refused as when it
+/// succeeded. Only wire metadata and the instance id go in: never an encryption key,
+/// an ARN a caller supplied or any credential material.
+pub fn audit_onboarding_change(
+    parts: &::http::request::Parts,
+    operation: &'static str,
+    connect_instance_id: &str,
+    outcome: &str,
+) {
+    ::tracing::info!(
+        audit = true,
+        operation,
+        outcome,
+        caller_akid = %::engine::extract_akid(&parts.headers),
+        connect_instance_id,
+        "connect instance onboarding changed"
     );
 }
 

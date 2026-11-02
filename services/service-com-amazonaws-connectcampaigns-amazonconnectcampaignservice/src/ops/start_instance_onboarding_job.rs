@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartInstanceOnboardingJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartInstanceOnboardingJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Onboards an Amazon Connect instance to Campaigns: persists the `encryptionConfig`
+//! the call carries as that instance's onboarding record and reports the record's job
+//! status, which starts in progress and which the clock moves to succeeded.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartInstanceOnboardingJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The onboarding is GATED on the Connect instance existing: Amazon Connect owns the
+//! instance registry (`crate::state::connect_instance_refusal` reads it), and a
+//! `connectInstanceId` the account holds no instance for is answered with the modelled
+//! `ResourceNotFoundException` (HTTP 404) with nothing persisted. An instance this
+//! service already holds a job for is answered with the modelled `ConflictException`
+//! (HTTP 409), also with nothing written.
+//!
+//! The record this call writes is what the reporting side reads:
+//! `GetInstanceOnboardingJobStatus` reports its job status.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +122,32 @@ impl From<StartInstanceOnboardingJobErrorModeled> for StartInstanceOnboardingJob
     }
 }
 
+/// Refuse an `encryptionConfig` whose members cannot hold together, with the modelled
+/// `ValidationException` (HTTP 400) naming the member at fault.
+///
+/// Only what `EncryptionConfig`'s own documentation states and its shape cannot express:
+/// "If disabled, service will perform encryption with its own key. If enabled, a KMS key
+/// id needs to be provided". The doc says nothing about a key sent with encryption
+/// disabled, so that combination is accepted and persisted as sent rather than refused
+/// on a rule the service is not known to enforce; `encryptionType` targets a modelled
+/// enum, so an off-catalog value is already refused before this handler runs.
+fn check_encryption_config(
+    config: &EncryptionConfig,
+) -> Result<(), StartInstanceOnboardingJobError> {
+    if config.enabled && config.key_arn.as_deref().unwrap_or_default().is_empty() {
+        return Err(StartInstanceOnboardingJobErrorModeled::ValidationException(
+            ValidationException {
+                message:
+                    "encryptionConfig.keyArn: a KMS key arn is required when encryption is enabled"
+                        .to_string(),
+                x_amz_error_type: None,
+            },
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// The `StartInstanceOnboardingJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -154,18 +184,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartInstanceOnboardingJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartInstanceOnboardingJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartInstanceOnboardingJob"))
+        // Every exit of this call leaves an audit record naming the instance and how the
+        // call ended — each refusal as well as the acceptance.
+        let audit = |outcome: &str| {
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                outcome,
+            );
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            audit("InternalServerException");
+            return Err(StartInstanceOnboardingJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the instance onboarding store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // The rule the `EncryptionConfig` shape cannot express, which its own
+        // documentation states.
+        if let Err(refusal) = check_encryption_config(&input.encryption_config) {
+            audit("ValidationException");
+            return Err(refusal);
+        }
+
+        // Onboarding configures an EXISTING Amazon Connect instance for Campaigns, so an
+        // id the account's Connect registry does not hold names nothing to onboard: the
+        // call is refused and no record is written, which is what keeps every reader of
+        // that record reporting only on instances the account really has. The registry is
+        // Amazon Connect's own, read through the shared engine by the one helper every
+        // operation of this class asks, and asked BEFORE this service's store is locked —
+        // the lock order that read requires. A registry that cannot be read answers the
+        // existence question not at all, which is a server error and never an absent
+        // instance. Each operation answers that outcome with the error ITS own model and
+        // recording name, which is why this one answers the not-found error where
+        // `CreateCampaign` answers a bad request.
+        match crate::state::connect_instance_refusal(&*self.engine, &input.connect_instance_id) {
+            None => {}
+            Some(crate::state::InstanceRefusal::NotUsable) => {
+                audit("ResourceNotFoundException");
+                return Err(StartInstanceOnboardingJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::connect_instance_not_found_message(
+                            &input.connect_instance_id,
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into());
+            }
+            Some(crate::state::InstanceRefusal::RegistryUnavailable) => {
+                audit("InternalServerException");
+                return Err(StartInstanceOnboardingJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE.to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Starting the job is what persists the instance's encryption config, so the
+        // write happens here and not in the operation that reports the job. The job
+        // itself is owed by the clock, which is why the record carries the instant it is
+        // due to have finished rather than a status nothing would ever move.
+        let now = ::std::time::SystemTime::now();
+        let started = state.lock().start_instance_onboarding(
+            &input.connect_instance_id,
+            input.encryption_config,
+            now,
+        );
+        let stored = match started {
+            Ok(stored) => stored,
+            Err(crate::state::OnboardingRefused::AlreadyOnboarded) => {
+                audit("ConflictException");
+                return Err(StartInstanceOnboardingJobErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::INSTANCE_ALREADY_ONBOARDED_MESSAGE.to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into());
+            }
+            Err(crate::state::OnboardingRefused::StoreFull) => {
+                // The store is bounded: past its ceiling the call is refused rather than
+                // growing the process without limit. Of the errors this operation models,
+                // the conflict is the one that fits — the service's own state, not the
+                // request, is what stops it.
+                audit("ConflictException");
+                return Err(StartInstanceOnboardingJobErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "this emulator's onboarding store already holds its limit of {} Connect instances",
+                            crate::state::MAX_ONBOARDED_INSTANCES
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into());
+            }
+        };
+
+        audit("accepted");
+
+        // Answered from what was stored, so a response that differs from the stored
+        // record cannot happen.
+        Ok(StartInstanceOnboardingJobOutput {
+            connect_instance_onboarding_job_status: Some(stored.to_job_status(now)),
+        })
     }
 }

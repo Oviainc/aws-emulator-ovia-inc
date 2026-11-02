@@ -69,6 +69,13 @@ impl Harness {
     pub fn deregister_connect_instance(&self, instance: &str) -> bool {
         deregister_connect_instance(&self.engine, instance)
     }
+
+    /// The engine this harness was built over, so a case can read the store a handler
+    /// wrote — the only way to see a persisted value no implemented operation reports
+    /// yet.
+    pub fn engine(&self) -> &engine::InMemoryEngine {
+        &self.engine
+    }
 }
 
 /// One answer from the emulator: its status, the media type it announces, the wire

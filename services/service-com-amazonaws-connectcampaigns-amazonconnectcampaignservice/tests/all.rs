@@ -21,6 +21,8 @@ mod campaign_state_batch;
 mod common;
 #[path = "all/input_constraint_refusals.rs"]
 mod input_constraint_refusals;
+#[path = "all/instance_onboarding.rs"]
+mod instance_onboarding;
 #[path = "all/signing_name_path_claim.rs"]
 mod signing_name_path_claim;
 #[path = "all/state_roundtrip.rs"]
