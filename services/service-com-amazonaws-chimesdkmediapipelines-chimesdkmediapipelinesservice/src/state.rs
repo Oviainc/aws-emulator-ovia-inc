@@ -463,6 +463,25 @@ pub enum InsightsConfigurationRefused {
     TooManyElements(usize),
 }
 
+/// Why the store refused to apply an UPDATE to a media insights pipeline
+/// configuration. An update reports each as the modelled error named here.
+///
+/// A separate enum from [`InsightsConfigurationRefused`] because the two refusals
+/// differ: an update never grows the collection and never changes a name, so neither
+/// the record quota nor a name clash can refuse it, while "nothing is stored under
+/// that identifier" can — and cannot refuse a create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsightsConfigurationUpdateRefused {
+    /// No configuration this store holds is named by the identifier — the modelled
+    /// `NotFoundException` (HTTP 404).
+    NoSuchConfiguration,
+    /// The settings carry more than [`MAX_INSIGHTS_CONFIGURATION_ELEMENTS`] elements;
+    /// the payload is how many they carried. The update writes the caller's element
+    /// list into the record the store keeps, so the same per-record bound a create is
+    /// admitted under applies here — the modelled `BadRequestException` (HTTP 400).
+    TooManyElements(usize),
+}
+
 /// Why the store refused to persist a Kinesis Video Stream pool. A create reports each as
 /// the modelled error named here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1374,6 +1393,57 @@ impl ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
     ) -> Option<&InsightsConfiguration> {
         let name = self.insights_configuration_tokens.get(token)?;
         self.insights_configuration(name)
+    }
+
+    /// Replace the SETTINGS of the configuration `identifier` names — the access role,
+    /// the processors and sinks and the alert rules — and hand back the STORED record so
+    /// an update renders its response from the store.
+    ///
+    /// The settings are everything a caller may change; the configuration's IDENTITY —
+    /// its name, ARN, id and creation timestamp — is minted once by the create and is
+    /// left alone here, so every identifier that resolved the record before still
+    /// resolves it. `updated_timestamp` moves to `now` because the record really did
+    /// change.
+    ///
+    /// `real_time_alert_configuration` is applied as given, absence included: the
+    /// settings are replaced wholesale, so an update that names no alert configuration
+    /// leaves the configuration with none.
+    pub fn update_insights_configuration(
+        &mut self,
+        identifier: &str,
+        resource_access_role_arn: String,
+        real_time_alert_configuration: Option<RealTimeAlertConfiguration>,
+        elements: Vec<MediaInsightsPipelineConfigurationElement>,
+        now: SystemTime,
+    ) -> Result<&InsightsConfiguration, InsightsConfigurationUpdateRefused> {
+        // The identifier is resolved FIRST: "nothing is stored under that identifier" is
+        // the modelled refusal, so it is authoritative over this store's own per-record
+        // admission bound below.
+        if !self
+            .insights_configurations
+            .iter()
+            .any(|configuration| configuration.is_named_by(identifier))
+        {
+            return Err(InsightsConfigurationUpdateRefused::NoSuchConfiguration);
+        }
+        // The record's own caller-chosen size, checked BEFORE any mutation and against
+        // the same bound a create is admitted under: an update replaces the element list,
+        // so it is the other way a record grows.
+        if elements.len() > MAX_INSIGHTS_CONFIGURATION_ELEMENTS {
+            return Err(InsightsConfigurationUpdateRefused::TooManyElements(
+                elements.len(),
+            ));
+        }
+        let configuration = self
+            .insights_configurations
+            .iter_mut()
+            .find(|configuration| configuration.is_named_by(identifier))
+            .expect("the identifier resolved a configuration just above");
+        configuration.resource_access_role_arn = resource_access_role_arn;
+        configuration.real_time_alert_configuration = real_time_alert_configuration;
+        configuration.elements = elements;
+        configuration.updated_timestamp = timestamp(now);
+        Ok(configuration)
     }
 
     /// Remove the configuration `identifier` names, with its idempotency record.

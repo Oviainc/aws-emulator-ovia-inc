@@ -462,7 +462,7 @@ async fn a_created_configuration_reads_back_by_name_and_arn_and_is_gone_after_de
 /// value — recursively, so a nested configuration is checked member by member while a
 /// member the response adds (a modelled boolean's `false` default) is tolerated. A
 /// scalar must be equal, and a list must have the same length, element for element.
-fn assert_submitted_members_are_reported(
+pub(crate) fn assert_submitted_members_are_reported(
     case: &str,
     submitted: Option<&Value>,
     reported: Option<&Value>,

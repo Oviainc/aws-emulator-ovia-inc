@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMediaInsightsPipelineConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMediaInsightsPipelineConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Replaces the SETTINGS of a stored media insights pipeline configuration — the
+//! access role, the processors and sinks (`Elements`) and the alert rules — and answers
+//! the stored record, so every later read renders the new settings.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMediaInsightsPipelineConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The configuration's IDENTITY is minted once by the create and left alone here: its
+//! name, ARN, `MediaInsightsPipelineConfigurationId` and `CreatedTimestamp` are
+//! unchanged, while `UpdatedTimestamp` moves because the record really did change. The
+//! `Identifier` label resolves the configuration's NAME or its ARN, exactly as the read
+//! and the delete resolve it, and an identifier naming nothing stored is the modelled
+//! 404 `NotFoundException`.
+//!
+//! A configuration carries no status member in the model, so nothing here is owed to
+//! the clock and the modelled `ConflictException` has no transient state to report: an
+//! update is applied and visible immediately.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +169,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMediaInsightsPipelineConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMediaInsightsPipelineConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMediaInsightsPipelineConfiguration"))
+        let _ = ctx;
+        // Modelled constraints — the `Identifier` label's `\S` and 0..1024, the role
+        // ARN's pattern and 1..1024, and the alert configuration's `Rules` 1..3 — are
+        // refused BEFORE this handler runs, and `service.rs` words that refusal as this
+        // service's 400 `BadRequestException`.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateMediaInsightsPipelineConfigurationErrorModeled::ServiceFailureException(
+                    crate::state::service_failure("The media pipeline store is unavailable."),
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let identifier = input.identifier;
+        let updated = state
+            .lock()
+            .update_insights_configuration(
+                &identifier,
+                input.resource_access_role_arn,
+                input.real_time_alert_configuration,
+                input.elements,
+                now,
+            )
+            .map(crate::state::InsightsConfiguration::as_modeled);
+
+        match updated {
+            Ok(configuration) => Ok(UpdateMediaInsightsPipelineConfigurationOutput {
+                media_insights_pipeline_configuration: Some(configuration),
+            }),
+            Err(crate::state::InsightsConfigurationUpdateRefused::NoSuchConfiguration) => Err(
+                UpdateMediaInsightsPipelineConfigurationErrorModeled::NotFoundException(
+                    crate::state::not_found(format!(
+                        "No media insights pipeline configuration identified by {identifier} exists."
+                    )),
+                )
+                .into(),
+            ),
+            // `Elements` carries no `@length` in the model, so nothing upstream bounds how
+            // many a request may write into the record this store keeps for the life of
+            // the process — the same refusal, worded by the one message a create's shares.
+            Err(crate::state::InsightsConfigurationUpdateRefused::TooManyElements(sent)) => Err(
+                UpdateMediaInsightsPipelineConfigurationErrorModeled::BadRequestException(
+                    crate::state::bad_request(crate::state::too_many_elements_message(sent)),
+                )
+                .into(),
+            ),
+        }
     }
 }
+
