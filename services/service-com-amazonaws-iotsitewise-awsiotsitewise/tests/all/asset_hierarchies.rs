@@ -28,6 +28,15 @@ use crate::hierarchies_etags_and_refusals::PAST_ACTIVATION;
 /// A UUID in the modelled `ID` form that names no stored resource.
 const ABSENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 
+/// The `InvalidRequestException` message `AssociateAssets` refuses a child that
+/// already has a parent with — the association repeated once it is established,
+/// and a child that hangs under any other parent or hierarchy, which are one
+/// fact about the child.
+///
+/// Entirely FIXED text: it carries no asset, hierarchy or model id, so no value
+/// of the request or of the store fills it.
+pub(crate) const CHILD_ALREADY_HAS_A_PARENT: &str = "Child asset already has a parent";
+
 /// Create an asset model from `body` and return its id. Unlike the harness's
 /// `create_model`, this takes the whole request body: these suites need
 /// `assetModelHierarchies` and `assetModelExternalId`.
@@ -405,6 +414,16 @@ async fn a_child_is_associated_to_one_parent_hierarchy_at_a_time() {
             *expected_code,
             "case {case:?}: unexpected error code in {body}"
         );
+        if *expected_status == 400 {
+            // The child already has a parent, whichever of the two ways this row
+            // collides with the first association, so both rows carry the one
+            // fixed sentence that states it.
+            assert_eq!(
+                body["message"].as_str(),
+                Some(CHILD_ALREADY_HAS_A_PARENT),
+                "case {case:?}: expected the message {CHILD_ALREADY_HAS_A_PARENT:?}, got {body}"
+            );
+        }
     }
 
     // The in-flight conflict names the resource the two operations collide on: the
@@ -435,6 +454,12 @@ async fn a_child_is_associated_to_one_parent_hierarchy_at_a_time() {
         error_code(&body),
         "InvalidRequestException",
         "a repeat of an established association: unexpected error code in {body}"
+    );
+    assert_eq!(
+        body["message"].as_str(),
+        Some(CHILD_ALREADY_HAS_A_PARENT),
+        "a repeat of an established association: expected the message \
+         {CHILD_ALREADY_HAS_A_PARENT:?}, got {body}"
     );
 
     // The first association survives every refusal above.

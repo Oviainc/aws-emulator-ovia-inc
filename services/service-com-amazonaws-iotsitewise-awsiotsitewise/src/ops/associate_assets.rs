@@ -324,10 +324,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than one operation on the same resource at the same time") and what a client's
         // retry handler reacts to. An association already established is a terminal
         // statement about the request — no retry of it can succeed — so it is
-        // `InvalidRequestException` (400). Neither is `ResourceAlreadyExistsException`,
-        // which this service uses for a resource-IDENTITY collision (two resources
-        // claiming one id or one external id), not for an association that is already
-        // in place.
+        // `InvalidRequestException` (400), carrying [`CHILD_ALREADY_HAS_A_PARENT`].
+        // Neither is `ResourceAlreadyExistsException`, which this service uses for a
+        // resource-IDENTITY collision (two resources claiming one id or one external
+        // id), not for an association that is already in place.
         match store.association_state(&parent_id, &hierarchy_id, &child_id, now) {
             Some(crate::state::AssociationState::InProgress) => {
                 let parent_arn = store.stored_asset_arn(&region, &parent_id);
@@ -342,23 +342,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
             Some(crate::state::AssociationState::Established) => {
-                return Err(invalid_request(format!(
-                    "The asset {child_id} is already associated with the asset \
-                     {parent_id} through the hierarchy {hierarchy_id}."
-                )))
+                return Err(invalid_request(CHILD_ALREADY_HAS_A_PARENT.to_string()))
             }
             None => {}
         }
 
         // Asset hierarchies form a tree: an asset has at most one parent, so a child
         // that is already associated somewhere has to be disassociated before it can
-        // be associated again.
-        if let Some((existing_parent, existing_hierarchy)) = store.hierarchy_parent(&child_id) {
-            return Err(invalid_request(format!(
-                "The asset {child_id} is already associated with the asset \
-                 {existing_parent} through the hierarchy {existing_hierarchy}. \
-                 Disassociate it before associating it with another parent asset."
-            )));
+        // be associated again — the same refusal as the settled repeat above, because
+        // it is the same fact about the child.
+        if store.hierarchy_parent(&child_id).is_some() {
+            return Err(invalid_request(CHILD_ALREADY_HAS_A_PARENT.to_string()));
         }
 
         // The other half of "the hierarchies form a tree": the child must not already
@@ -416,6 +410,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(AssociateAssetsOutput)
     }
 }
+
+/// The `InvalidRequestException` message for a child asset that already has a
+/// parent — a hierarchy holds each asset once and an asset sits under at most
+/// one parent, so the settled repeat of an association and an association of a
+/// child that hangs under some other parent are one refusal.
+///
+/// Entirely fixed text: it names no asset, hierarchy or model, so no id of the
+/// request or of the store fills it.
+const CHILD_ALREADY_HAS_A_PARENT: &str = "Child asset already has a parent";
 
 /// HTTP 500 `InternalFailureException`: the store this operation needs is not there.
 fn internal_failure(message: &str) -> AssociateAssetsError {

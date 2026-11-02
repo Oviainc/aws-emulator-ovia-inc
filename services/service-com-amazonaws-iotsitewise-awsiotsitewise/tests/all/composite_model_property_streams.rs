@@ -97,7 +97,7 @@ impl Row {
 }
 
 /// The `Variant` carrying `reading` for a property of `data_type`.
-fn variant(data_type: &str, reading: f64) -> Value {
+pub(crate) fn variant(data_type: &str, reading: f64) -> Value {
     match data_type {
         "INTEGER" => json!({"integerValue": reading as i64}),
         _ => json!({"doubleValue": reading}),

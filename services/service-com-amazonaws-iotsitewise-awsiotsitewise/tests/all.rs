@@ -140,6 +140,13 @@ mod composite_model_property_streams;
 #[path = "all/batch_latest_composite_entries.rs"]
 mod batch_latest_composite_entries;
 
+// `batch_history_composite_entries` is declared HERE, beside the suite whose
+// fixture it reuses, for the reason that suite's note gives: the sorted list and
+// the END of this file are both where every concurrent iotsitewise change puts a
+// declaration of its own. Fold it into the list once the churn settles.
+#[path = "all/batch_history_composite_entries.rs"]
+mod batch_history_composite_entries;
+
 // `composite_property_aggregate_windows` is declared HERE, beside the suite above
 // it carries to `GetAssetPropertyAggregates`, for the reason that suite's note
 // gives: the sorted list and the END of this file are both where every concurrent

@@ -42,7 +42,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_iotsitewise_awsiotsitewise::state::service_state;
 
-use crate::asset_hierarchies::{associate, create_asset, create_model, hierarchy_id};
+use crate::asset_hierarchies::{
+    associate, create_asset, create_model, hierarchy_id, CHILD_ALREADY_HAS_A_PARENT,
+};
 use crate::asset_lifecycle::{call, error_code, router_with_engine};
 use crate::hierarchies_etags_and_refusals::{call_with_headers, describe_e_tag, PAST_ACTIVATION};
 use crate::support::now_seconds;
@@ -235,6 +237,14 @@ async fn simultaneous_identical_associate_assets_record_the_child_exactly_once()
                 error_code(body),
                 "InvalidRequestException",
                 "case {case:?}: racer {index} refusal code, got {body}"
+            );
+            // Every loser of a race against an ESTABLISHED association is told
+            // the one fact that refuses it: the child already has a parent.
+            assert_eq!(
+                body["message"].as_str(),
+                Some(CHILD_ALREADY_HAS_A_PARENT),
+                "case {case:?}: racer {index} expected the message \
+                 {CHILD_ALREADY_HAS_A_PARENT:?}, got {body}"
             );
         }
         let children = stored_children(&engine, &parent, &hierarchy);

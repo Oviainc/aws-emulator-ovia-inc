@@ -59,12 +59,15 @@ const MAX_RESULTS: i64 = 20_000;
 const ROW_EPOCH: i64 = 0;
 
 /// A table second as the absolute `timeInSeconds` the wire carries.
-fn anchored(seconds: i64) -> i64 {
+///
+/// Shared with the sibling suite that reads this operation over a composite
+/// model's property, so the two cannot drift about where a table second lands.
+pub(crate) fn anchored(seconds: i64) -> i64 {
     super::support::anchored(ROW_EPOCH, seconds)
 }
 
-/// The inverse of [`anchored`].
-fn relative(seconds: i64) -> i64 {
+/// The inverse of [`anchored`], shared for the reason it gives.
+pub(crate) fn relative(seconds: i64) -> i64 {
     super::support::relative(ROW_EPOCH, seconds)
 }
 
@@ -159,7 +162,10 @@ fn find_entry<'a>(list: &'a Value, entry_id: &str) -> Option<&'a Value> {
 
 /// The `timeInSeconds` of every sample a success entry reports, as this suite's
 /// relative seconds, in the order reported.
-fn reported_seconds(case: &str, entry: &Value) -> Vec<i64> {
+///
+/// Shared with the sibling suite for the reason [`anchored`] gives: one reading
+/// of this operation's success-entry shape.
+pub(crate) fn reported_seconds(case: &str, entry: &Value) -> Vec<i64> {
     entry["assetPropertyValueHistory"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: no assetPropertyValueHistory in {entry}"))
