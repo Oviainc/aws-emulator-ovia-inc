@@ -25,6 +25,8 @@ mod constraint_refusal_messages;
 mod create_idempotency;
 #[path = "all/crl_bucket_resolution.rs"]
 mod crl_bucket_resolution;
+#[path = "all/crl_publication.rs"]
+mod crl_publication;
 #[path = "all/delete_certificate_authority.rs"]
 mod delete_certificate_authority;
 #[path = "all/enum_value_set_order.rs"]

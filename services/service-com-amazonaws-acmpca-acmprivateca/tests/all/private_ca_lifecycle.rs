@@ -202,7 +202,10 @@ pub(crate) fn certificate_pem(common_name: &str) -> String {
 
 /// A real PKCS#10 certification request for `common_name`, PEM-encoded, likewise from
 /// `rcgen`.
-fn csr_pem(common_name: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite feeds the service a leaf certification request built
+/// outside the code under test.
+pub(crate) fn csr_pem(common_name: &str) -> String {
     let key = rcgen::KeyPair::generate().expect("a key pair");
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("parameters");
     params.distinguished_name = rcgen_subject(common_name);
@@ -235,7 +238,7 @@ fn request_of(text: &str, case: &str) -> CertReq {
 }
 
 /// The CommonName (RFC 4519 section 2.3, OID 2.5.4.3) of a DER distinguished name.
-fn subject_common_name(name: &Name) -> String {
+pub(crate) fn subject_common_name(name: &Name) -> String {
     name.0
         .iter()
         .flat_map(|rdn| rdn.0.iter())

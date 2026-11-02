@@ -31,17 +31,22 @@ use crate::resource_policy::error_message;
 /// A SigV4 `Authorization` header in the `s3` scope — the routing signal that picks the S3
 /// service for a request to the bucket front door, in the same Region this suite's private
 /// CA calls are signed for.
-const S3_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-                                Credential=AKIDTESTTESTTEST/20260101/eu-west-1/s3/aws4_request, \
-                                SignedHeaders=host, Signature=deadbeef";
+pub(crate) const S3_AUTHORIZATION: &str =
+    "AWS4-HMAC-SHA256 \
+     Credential=AKIDTESTTESTTEST/20260101/eu-west-1/s3/aws4_request, \
+     SignedHeaders=host, Signature=deadbeef";
 
 /// An emulator holding this service AND S3 over one shared engine.
-struct Emulator {
+///
+/// `pub(crate)` so a sibling suite that needs BOTH services — the private CA and the object
+/// storage its CRLs are published to — drives the same two-service router rather than
+/// growing a second copy of it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -53,7 +58,7 @@ impl Emulator {
     }
 
     /// Call one private-CA operation over its awsJson1_1 wire.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://acm-pca.{REGION}.amazonaws.com/"))
@@ -75,7 +80,7 @@ impl Emulator {
         (status, parsed)
     }
 
-    async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -84,23 +89,57 @@ impl Emulator {
         parsed
     }
 
-    /// `PUT /<bucket>` against the emulator's S3 front door — `CreateBucket`, path-style,
-    /// because the emulator serves one endpoint per Region, with the location constraint a
-    /// bucket outside `us-east-1` is created under.
-    async fn create_bucket(&self, bucket: &str) -> u16 {
+    /// One request against the emulator's S3 front door, path-style (the emulator serves
+    /// one endpoint per Region, so the bucket travels in the path): `path` is everything
+    /// after the host, headers are `(name, value)` pairs, and the answer is the status with
+    /// the response body as it came.
+    pub(crate) async fn s3(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> (u16, Vec<u8>) {
+        let mut request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://s3.{REGION}.amazonaws.com/{path}"))
+            .header("host", format!("s3.{REGION}.amazonaws.com"))
+            .header("authorization", S3_AUTHORIZATION);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request
+            .body(bytes::Bytes::from(body))
+            .expect("the S3 request builds");
+        let response = self.router.dispatch(request).await;
+        (
+            response.status().as_u16(),
+            response.body().as_ref().to_vec(),
+        )
+    }
+
+    /// `PUT /<bucket>` against the emulator's S3 front door — `CreateBucket`, with the
+    /// location constraint a bucket outside `us-east-1` is created under, and the Object
+    /// Ownership setting the bucket comes into being with when one is named.
+    pub(crate) async fn create_bucket_owned(
+        &self,
+        bucket: &str,
+        object_ownership: Option<&str>,
+    ) -> u16 {
         let body = format!(
             "<CreateBucketConfiguration><LocationConstraint>{REGION}</LocationConstraint>\
              </CreateBucketConfiguration>"
         );
-        let request = http::Request::builder()
-            .method("PUT")
-            .uri(format!("https://s3.{REGION}.amazonaws.com/{bucket}"))
-            .header("host", format!("s3.{REGION}.amazonaws.com"))
-            .header("content-type", "application/xml")
-            .header("authorization", S3_AUTHORIZATION)
-            .body(bytes::Bytes::from(body))
-            .expect("the CreateBucket request builds");
-        self.router.dispatch(request).await.status().as_u16()
+        let mut headers: Vec<(&str, &str)> = vec![("content-type", "application/xml")];
+        if let Some(ownership) = object_ownership {
+            headers.push(("x-amz-object-ownership", ownership));
+        }
+        self.s3("PUT", bucket, &headers, body.into_bytes()).await.0
+    }
+
+    /// `CreateBucket` for a bucket with the settings S3 gives a new one.
+    pub(crate) async fn create_bucket(&self, bucket: &str) -> u16 {
+        self.create_bucket_owned(bucket, None).await
     }
 }
 

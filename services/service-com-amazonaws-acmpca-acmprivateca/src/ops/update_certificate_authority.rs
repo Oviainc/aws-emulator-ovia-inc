@@ -224,9 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // created: this call states the mechanisms the CA supports FROM NOW ON, so a
         // bucket nothing holds would leave the CA publishing no CRL. The lookup is an
         // in-process call to another service, so it is made before the store is locked.
+        let region = crate::state::request_region(&ctx.parts().headers);
         if crate::state::unresolvable_crl_bucket(
             ctx,
-            &crate::state::request_region(&ctx.parts().headers),
+            &region,
             input.revocation_configuration.as_ref(),
         )
         .await
@@ -236,53 +237,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(not_found(
-                "the private CA store is unavailable, so no certificate authority can be \
-                 updated",
-            ));
-        };
-        let mut state = state.lock();
+        // The store is read and written inside this block, so its guard is released at
+        // the block's end: what the block answers is the CRL the CA owes object storage
+        // under the configuration this call wrote, deposited below with no lock held.
         let now = ::std::time::SystemTime::now();
+        let publication = {
+            let Some(state) = crate::state::service_state(&*self.engine) else {
+                return Err(not_found(
+                    "the private CA store is unavailable, so no certificate authority can be \
+                     updated",
+                ));
+            };
+            let mut state = state.lock();
 
-        // `certificate_authority_mut` materialises the CREATING -> PENDING_CERTIFICATE
-        // change the clock already owed and drops a CA whose restoration window has
-        // closed: that CA was permanently deleted at the instant the window ended, so it
-        // names no resource at all.
-        let Some(record) = state.certificate_authority_mut(&arn, now) else {
-            return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
-        };
+            // `certificate_authority_mut` materialises the CREATING -> PENDING_CERTIFICATE
+            // change the clock already owed and drops a CA whose restoration window has
+            // closed: that CA was permanently deleted at the instant the window ended, so
+            // it names no resource at all.
+            let Some(record) = state.certificate_authority_mut(&arn, now) else {
+                return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
+            };
 
-        // "Your private CA must be in the ACTIVE or DISABLED state before you can update
-        // it." — the gate covers the whole call, so a revocation configuration cannot be
-        // written to a CA that is still waiting for its certificate, has expired, failed
-        // or been deleted either.
-        if !record.is_updatable() {
-            return Err(UpdateCertificateAuthorityErrorModeled::InvalidStateException(
-                InvalidStateException {
-                    message: Some(crate::state::UPDATE_INVALID_STATE_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
-
-        // The requested status takes effect at once — there is no transient status
-        // between ACTIVE and DISABLED, and the CA is reported in the requested one by the
-        // next read. A request for the status the CA already holds changes nothing, so the
-        // instant it last changed status stands still.
-        if let Some(requested) = input.status {
-            if record.status != requested {
-                record.status = requested;
-                record.last_state_change_at = now;
+            // "Your private CA must be in the ACTIVE or DISABLED state before you can
+            // update it." — the gate covers the whole call, so a revocation configuration
+            // cannot be written to a CA that is still waiting for its certificate, has
+            // expired, failed or been deleted either.
+            if !record.is_updatable() {
+                return Err(UpdateCertificateAuthorityErrorModeled::InvalidStateException(
+                    InvalidStateException {
+                        message: Some(crate::state::UPDATE_INVALID_STATE_MESSAGE.to_string()),
+                    },
+                )
+                .into());
             }
-        }
 
-        // "If you don't supply this parameter, existing capibilites remain unchanged": a
-        // supplied configuration states which mechanisms the CA supports from now on
-        // ("OCSP, CRL, both protocols, or neither"), so it REPLACES the one the CA held
-        // rather than being merged into it.
-        if let Some(revocation) = input.revocation_configuration {
-            record.revocation_configuration = Some(revocation);
+            // The requested status takes effect at once — there is no transient status
+            // between ACTIVE and DISABLED, and the CA is reported in the requested one by
+            // the next read. A request for the status the CA already holds changes nothing,
+            // so the instant it last changed status stands still.
+            if let Some(requested) = input.status {
+                if record.status != requested {
+                    record.status = requested;
+                    record.last_state_change_at = now;
+                }
+            }
+
+            // "If you don't supply this parameter, existing capibilites remain unchanged":
+            // a supplied configuration states which mechanisms the CA supports from now on
+            // ("OCSP, CRL, both protocols, or neither"), so it REPLACES the one the CA held
+            // rather than being merged into it.
+            if let Some(revocation) = input.revocation_configuration {
+                record.revocation_configuration = Some(revocation);
+            }
+
+            // A CA whose CRLs are enabled publishes them itself — no call of this service
+            // publishes one for a caller — so the configuration this call just stated takes
+            // effect by the CA writing the CRL it now owes to the bucket that configuration
+            // names.
+            crate::state::due_crl_publication(record, now)
+        };
+        if let Some(publication) = publication {
+            crate::state::publish_crl(ctx, &region, publication).await;
         }
 
         Ok(UpdateCertificateAuthorityOutput)

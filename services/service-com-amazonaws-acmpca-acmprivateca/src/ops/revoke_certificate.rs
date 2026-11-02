@@ -194,75 +194,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The certificate a revocation names is the one the request's own members
         // identify, under the CA that issued it; nothing is read off the request's
-        // metadata.
-        let _ = ctx;
+        // metadata apart from the Region the CA's CRL bucket is reached in.
+        let region = crate::state::request_region(&ctx.parts().headers);
         let ca_arn = input.certificate_authority_arn;
         if crate::state::parse_certificate_authority_arn(&ca_arn).is_none() {
             return Err(invalid_arn(crate::state::INVALID_ARN_MESSAGE.to_string()));
         }
-
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(RevokeCertificateErrorModeled::RequestFailedException(
-                RequestFailedException {
-                    message: Some("the private CA store is unavailable".to_string()),
-                },
-            )
-            .into());
-        };
-        let mut state = state.lock();
         let now = ::std::time::SystemTime::now();
 
-        // `certificate_authority_mut` materialises the status change the clock already
-        // owed, which came due at the same instant whether or not anybody called.
-        let Some(record) = state.certificate_authority_mut(&ca_arn, now) else {
-            return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
+        // The store is read and written inside this block, so its guard is released at
+        // the block's end: what the block answers is the CRL the CA owes object storage
+        // once the revocation is recorded, which is deposited below with no lock held.
+        let publication = {
+            let Some(state) = crate::state::service_state(&*self.engine) else {
+                return Err(RevokeCertificateErrorModeled::RequestFailedException(
+                    RequestFailedException {
+                        message: Some("the private CA store is unavailable".to_string()),
+                    },
+                )
+                .into());
+            };
+            let mut state = state.lock();
+
+            // `certificate_authority_mut` materialises the status change the clock already
+            // owed, which came due at the same instant whether or not anybody called.
+            let Some(record) = state.certificate_authority_mut(&ca_arn, now) else {
+                return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
+            };
+
+            // A revocation is signed with the CA's own private key and published in the
+            // CA's revocation information, so only a CA that holds its certificate and can
+            // still sign with it revokes one: in any other status the CA is not one that
+            // has issued the certificates a revocation could name, whatever serial the
+            // request carries.
+            if !crate::state::REVOCABLE_STATUSES.contains(&record.status.as_str()) {
+                return Err(invalid_state(
+                    crate::state::not_in_state_to_have_issued_message(&ca_arn),
+                ));
+            }
+
+            // "You cannot revoke a root CA self-signed certificate." (this operation's
+            // docs): the CA's own certificate is the one its revocation information is
+            // signed under, so it is refused before any certificate of the CA is looked
+            // up — the CA holds it whether or not it was issued through this emulator.
+            if record.is_own_self_signed_serial(&input.certificate_serial) {
+                return Err(invalid_request(
+                    crate::state::ROOT_SELF_SIGNED_REVOCATION_MESSAGE.to_string(),
+                ));
+            }
+
+            // The certificate is named by its serial, which identifies it among the ones
+            // THIS CA issued: a serial no certificate of the CA carries, in any spelling,
+            // names no certificate at all. A certificate whose issuance has not settled yet
+            // is one of them: the CA allocated its serial when it accepted the issuance,
+            // and revocation is about the certificate the CA has issued rather than about
+            // the body a caller can already fetch, so the window `GetCertificate` answers
+            // `RequestInProgressException` in is deliberately not a refusal here.
+            let Some(certificate) = record.certificate_with_serial_mut(&input.certificate_serial)
+            else {
+                return Err(not_found(
+                    crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
+                ));
+            };
+            // Revocation is terminal, so a second request for one certificate is a request
+            // this service has already completed rather than one it performs again: the
+            // reason and the instant the first call recorded stay as they are.
+            if certificate.is_revoked() {
+                return Err(already_processed(
+                    crate::state::CERTIFICATE_ALREADY_REVOKED_MESSAGE.to_string(),
+                ));
+            }
+            certificate.revocation = Some(crate::state::CertificateRevocation {
+                revoked_at: now,
+                reason: input.revocation_reason,
+            });
+
+            // "If you enable a certificate revocation list (CRL) when you create or update
+            // your private CA, information about the revoked certificates will be included
+            // in the CRL. Amazon Web Services Private CA writes the CRL to an S3 bucket
+            // that you specify." (this operation's own docs) — so the CA republishes its
+            // CRL with the revocation this call recorded.
+            crate::state::due_crl_publication(record, now)
         };
-
-        // A revocation is signed with the CA's own private key and published in the CA's
-        // revocation information, so only a CA that holds its certificate and can still
-        // sign with it revokes one: in any other status the CA is not one that has issued
-        // the certificates a revocation could name, whatever serial the request carries.
-        if !crate::state::REVOCABLE_STATUSES.contains(&record.status.as_str()) {
-            return Err(invalid_state(
-                crate::state::not_in_state_to_have_issued_message(&ca_arn),
-            ));
+        if let Some(publication) = publication {
+            crate::state::publish_crl(ctx, &region, publication).await;
         }
-
-        // "You cannot revoke a root CA self-signed certificate." (this operation's docs):
-        // the CA's own certificate is the one its revocation information is signed under,
-        // so it is refused before any certificate of the CA is looked up — the CA holds it
-        // whether or not it was issued through this emulator.
-        if record.is_own_self_signed_serial(&input.certificate_serial) {
-            return Err(invalid_request(
-                crate::state::ROOT_SELF_SIGNED_REVOCATION_MESSAGE.to_string(),
-            ));
-        }
-
-        // The certificate is named by its serial, which identifies it among the ones THIS
-        // CA issued: a serial no certificate of the CA carries, in any spelling, names no
-        // certificate at all. A certificate whose issuance has not settled yet is one of
-        // them: the CA allocated its serial when it accepted the issuance, and revocation
-        // is about the certificate the CA has issued rather than about the body a caller
-        // can already fetch, so the window `GetCertificate` answers
-        // `RequestInProgressException` in is deliberately not a refusal here.
-        let Some(certificate) = record.certificate_with_serial_mut(&input.certificate_serial)
-        else {
-            return Err(not_found(
-                crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
-            ));
-        };
-        // Revocation is terminal, so a second request for one certificate is a request
-        // this service has already completed rather than one it performs again: the
-        // reason and the instant the first call recorded stay as they are.
-        if certificate.is_revoked() {
-            return Err(already_processed(
-                crate::state::CERTIFICATE_ALREADY_REVOKED_MESSAGE.to_string(),
-            ));
-        }
-        certificate.revocation = Some(crate::state::CertificateRevocation {
-            revoked_at: now,
-            reason: input.revocation_reason,
-        });
 
         Ok(RevokeCertificateOutput)
     }

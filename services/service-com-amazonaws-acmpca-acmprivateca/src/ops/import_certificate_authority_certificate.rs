@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(&ctx.parts().headers);
         let arn = input.certificate_authority_arn;
         if crate::state::parse_certificate_authority_arn(&arn).is_none() {
             return Err(
@@ -232,37 +232,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(bytes) => Some(pem_certificate_chain(bytes)?),
         };
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(
-                ImportCertificateAuthorityCertificateErrorModeled::RequestFailedException(
-                    RequestFailedException {
-                        message: Some("the private CA store is unavailable".to_string()),
-                    },
-                )
-                .into(),
-            );
-        };
-        let mut state = state.lock();
+        // The store is read and written inside this block, so its guard is released at
+        // the block's end: what the block answers is the CRL the CA owes object storage
+        // once it holds its certificate, deposited below with no lock held.
         let now = ::std::time::SystemTime::now();
-
-        let Some(record) = state.certificate_authority_mut(&arn, now) else {
-            return Err(
-                ImportCertificateAuthorityCertificateErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::CA_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                )
-                .into(),
-            );
-        };
-
-        // A CA takes its certificate exactly once, while it waits for one. A CA whose
-        // creation has not settled yet is answered "already in progress"; any other
-        // status (it already holds a certificate, say) is a state error.
-        match record.status.as_str() {
-            crate::state::STATUS_PENDING_CERTIFICATE => {}
-            crate::state::STATUS_CREATING => {
+        let publication = {
+            let Some(state) = crate::state::service_state(&*self.engine) else {
                 return Err(
+                    ImportCertificateAuthorityCertificateErrorModeled::RequestFailedException(
+                        RequestFailedException {
+                            message: Some("the private CA store is unavailable".to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let mut state = state.lock();
+
+            let Some(record) = state.certificate_authority_mut(&arn, now) else {
+                return Err(
+                    ImportCertificateAuthorityCertificateErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::CA_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            };
+
+            // A CA takes its certificate exactly once, while it waits for one. A CA whose
+            // creation has not settled yet is answered "already in progress"; any other
+            // status (it already holds a certificate, say) is a state error.
+            match record.status.as_str() {
+                crate::state::STATUS_PENDING_CERTIFICATE => {}
+                crate::state::STATUS_CREATING => {
+                    return Err(
                     ImportCertificateAuthorityCertificateErrorModeled::RequestInProgressException(
                         RequestInProgressException {
                             message: Some(crate::state::CREATE_IN_PROGRESS_MESSAGE.to_string()),
@@ -270,31 +274,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into(),
                 )
-            }
-            status => {
-                return Err(
-                    ImportCertificateAuthorityCertificateErrorModeled::InvalidStateException(
-                        InvalidStateException {
-                            message: Some(format!(
-                                "the certificate authority {arn} is in state {status}, which \
-                                 cannot import a certificate authority certificate"
-                            )),
-                        },
+                }
+                status => {
+                    return Err(
+                        ImportCertificateAuthorityCertificateErrorModeled::InvalidStateException(
+                            InvalidStateException {
+                                message: Some(format!(
+                                    "the certificate authority {arn} is in state {status}, which \
+                                     cannot import a certificate authority certificate"
+                                )),
+                            },
+                        )
+                        .into(),
                     )
-                    .into(),
-                )
+                }
             }
-        }
 
-        record.ca_certificate_pem = Some(certificate);
-        record.ca_certificate_chain_pem = chain;
-        record.status = crate::state::STATUS_ACTIVE.to_string();
-        record.last_state_change_at = now;
-        record.not_before = Some(now);
-        record.not_after = crate::state::add_months(
-            now,
-            crate::state::IMPORTED_CA_CERTIFICATE_VALIDITY_MONTHS,
-        );
+            record.ca_certificate_pem = Some(certificate);
+            record.ca_certificate_chain_pem = chain;
+            record.status = crate::state::STATUS_ACTIVE.to_string();
+            record.last_state_change_at = now;
+            record.not_before = Some(now);
+            record.not_after = crate::state::add_months(
+                now,
+                crate::state::IMPORTED_CA_CERTIFICATE_VALIDITY_MONTHS,
+            );
+
+            // The certificate the CA has just taken is the one it signs its CRL under, so a
+            // CA whose CRLs were enabled before it held one publishes its CRL now.
+            crate::state::due_crl_publication(record, now)
+        };
+        if let Some(publication) = publication {
+            crate::state::publish_crl(ctx, &region, publication).await;
+        }
 
         Ok(ImportCertificateAuthorityCertificateOutput)
     }

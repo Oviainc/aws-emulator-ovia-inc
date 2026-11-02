@@ -218,7 +218,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(&ctx.parts().headers);
+        // The issuance itself holds the store, so it is performed by the method below and
+        // the guard is released with it; what comes back is the certificate's ARN and the
+        // CRL the CA owes object storage, which is deposited here with no lock held.
+        let (arn, publication) = self.issue(input)?;
+        if let Some(publication) = publication {
+            crate::state::publish_crl(ctx, &region, publication).await;
+        }
+
+        Ok(IssueCertificateOutput {
+            certificate_arn: Some(arn),
+        })
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> IssueCertificate<Eng> {
+    /// Issue the certificate this request asks the CA for, answering its ARN together with
+    /// the CRL the CA publishes because of it ([`crate::state::initial_crl_publication`]).
+    ///
+    /// Everything that reads or writes the store happens here, so this service's lock is
+    /// taken and released inside one synchronous call and no handler holds it while calling
+    /// another service.
+    fn issue(
+        &self,
+        input: IssueCertificateInput,
+    ) -> Result<(String, Option<crate::state::CrlPublication>), IssueCertificateError> {
         let ca_arn = input.certificate_authority_arn;
         if crate::state::parse_certificate_authority_arn(&ca_arn).is_none() {
             return Err(IssueCertificateErrorModeled::InvalidArnException(
@@ -307,9 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &(),
             now,
         ) {
-            return Ok(IssueCertificateOutput {
-                certificate_arn: Some(arn),
-            });
+            return Ok((arn, None));
         }
 
         // Every issued certificate lives in memory for the life of the process, so the
@@ -429,9 +452,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         record.certificates.insert(arn.clone(), certificate);
 
-        Ok(IssueCertificateOutput {
-            certificate_arn: Some(arn),
-        })
+        // A CA whose CRLs are enabled publishes the CRL a relying party checks its
+        // certificates against; the CRL exists from the first certificate the CA issues,
+        // and a later issuance leaves what it says unchanged (a CRL lists the certificates
+        // that were REVOKED).
+        let publication = crate::state::initial_crl_publication(record, now);
+
+        Ok((arn, publication))
     }
 }
 

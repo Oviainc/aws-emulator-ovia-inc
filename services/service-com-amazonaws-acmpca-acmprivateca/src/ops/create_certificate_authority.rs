@@ -317,6 +317,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new CA carries no resource-based policy until one is attached to it.
             resource_policy: None,
             next_serial: 1,
+            // Nothing is published until the CA holds its certificate and its CRLs are
+            // enabled; the first CRL that goes out carries number 1.
+            crl_number: 0,
+            crl_published_at: None,
             certificates: ::std::collections::HashMap::new(),
             permissions: ::std::vec::Vec::new(),
             issue_idempotency: crate::state::IdempotencyRecords::new(),

@@ -13,8 +13,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use x509_cert::attr::AttributeTypeAndValue;
-use x509_cert::der::asn1::{Any, BitString, SetOfVec};
+use x509_cert::crl::{CertificateList, RevokedCert, TbsCertList};
+use x509_cert::der::asn1::{Any, BitString, OctetString, SetOfVec};
 use x509_cert::der::{Decode, Encode, Tag as DerTag};
+use x509_cert::ext::{Extension, Extensions};
 use x509_cert::name::{Name, RdnSequence, RelativeDistinguishedName};
 use x509_cert::request::{CertReq, CertReqInfo};
 use x509_cert::serial_number::SerialNumber;
@@ -23,8 +25,8 @@ use x509_cert::time::{Time, Validity as CertificateValidity};
 use x509_cert::{Certificate, TbsCertificate, Version};
 
 use crate::ops::types::{
-    ASN1Subject, CertificateAuthority, CertificateAuthorityConfiguration, Permission,
-    RevocationConfiguration, Tag, Validity,
+    ASN1Subject, CertificateAuthority, CertificateAuthorityConfiguration, CrlConfiguration,
+    Permission, RevocationConfiguration, Tag, Validity,
 };
 
 /// A PKCS#10 certification request, as this service reads and writes one.
@@ -915,6 +917,16 @@ pub struct CertificateAuthorityRecord {
     pub resource_policy: Option<String>,
     /// Counter the next issued serial is minted from.
     pub next_serial: u64,
+    /// "X509v3 CRL Number: Decimal sequence number for the CRL" (`CrlConfiguration`
+    /// docs): the number the CRL this CA published last carries, so the next one it
+    /// publishes carries the number after it.
+    pub crl_number: u64,
+    /// When this CA last published its CRL, or `None` while it has published none.
+    ///
+    /// What tells a revoked certificate that has expired apart from one that expired
+    /// before the previous CRL went out, which is the difference between the one further
+    /// CRL it appears in and the ones it no longer does ([`listed_in_crl`]).
+    pub crl_published_at: Option<SystemTime>,
     /// Certificates issued by this CA, keyed by certificate ARN.
     pub certificates: HashMap<String, IssuedCertificate>,
     /// Permissions granted on this CA, one per (principal, source account) pair.
@@ -1366,6 +1378,378 @@ fn bucket_reported_absent(
     error
         .as_service_error()
         .is_some_and(::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found)
+}
+
+// ---------------------------------------------------------------------------
+// The CRLs a CA publishes
+// ---------------------------------------------------------------------------
+
+/// The folder a CA's CRL object is written under when its configuration names no custom
+/// path: "crl/<ca-id>.crl" under the configured bucket.
+///
+/// `CrlConfiguration$CustomPath` "designates a custom file path in S3 for CRL(s). For
+/// example, `http://<CustomName>/<CustomPath>/<CrlPartition_GUID>.crl`" — a custom path
+/// REPLACES this folder, and the object's own name is the CA's id either way.
+pub const DEFAULT_CRL_PATH: &str = "crl";
+
+/// The media type a DER-encoded CRL object is stored with: "application/pkix-crl" (RFC
+/// 2585 section 4.2, which registers that type for a DER CRL and the `.crl` extension
+/// this object's key carries).
+pub const CRL_CONTENT_TYPE: &str = "application/pkix-crl";
+
+/// The `S3ObjectAcl` a CRL object is written with when the configuration names none: "If
+/// no value is specified, the default is `PUBLIC_READ`." (`CrlConfiguration$S3ObjectAcl`).
+pub const DEFAULT_S3_OBJECT_ACL: &str = "PUBLIC_READ";
+
+/// The object-storage write a CA's CRL goes out as, built while this service's store is
+/// held and performed once it has been released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrlPublication {
+    /// The bucket `CrlConfiguration$S3BucketName` names.
+    pub bucket: String,
+    /// The object key the CRL is written at ([`crl_object_key`]).
+    pub key: String,
+    /// The canned object ACL the write carries ([`crl_object_canned_acl`]).
+    pub canned_acl: &'static str,
+    /// The DER-encoded RFC 5280 CRL itself.
+    pub body: Vec<u8>,
+}
+
+/// The key a CA's CRL object is written at: the CA's id under the configuration's path.
+///
+/// `<CustomPath>/<ca-id>.crl` when the configuration names a custom path, else
+/// `crl/<ca-id>.crl` ([`DEFAULT_CRL_PATH`]). A `CrlType` of `PARTITIONED` splits a CA's
+/// revocation information across partitions, each with a partition id of its own; this
+/// service keeps ONE partition per CA, so the object's name is the CA's id whichever type
+/// the configuration names, and the type stays readable on the configuration.
+pub fn crl_object_key(certificate_authority_id: &str, crl: &CrlConfiguration) -> String {
+    let path = crl
+        .custom_path
+        .as_deref()
+        .map(|path| path.trim_matches('/'))
+        .filter(|path| !path.is_empty())
+        .unwrap_or(DEFAULT_CRL_PATH);
+    format!("{path}/{certificate_authority_id}.crl")
+}
+
+/// The canned object ACL a CRL object is written with, for the `S3ObjectAcl` the
+/// configuration names (or does not: [`DEFAULT_S3_OBJECT_ACL`]).
+///
+/// "Determines whether the CRL will be publicly readable or privately held in the CRL
+/// Amazon S3 bucket. If you choose PUBLIC_READ, the CRL will be accessible over the public
+/// internet. If you choose BUCKET_OWNER_FULL_CONTROL, only the owner of the CRL S3 bucket
+/// can access the CRL" (`CrlConfiguration$S3ObjectAcl`) — which are the `public-read` and
+/// `bucket-owner-full-control` rows of the canned-ACL table S3 publishes.
+pub fn crl_object_canned_acl(s3_object_acl: Option<&str>) -> &'static str {
+    match s3_object_acl.unwrap_or(DEFAULT_S3_OBJECT_ACL) {
+        "BUCKET_OWNER_FULL_CONTROL" => "bucket-owner-full-control",
+        _ => "public-read",
+    }
+}
+
+/// The `CRLReason` code a modelled `RevocationReason` names, or `None` for a value the
+/// enum does not declare.
+///
+/// The two catalogs are one: `RevocationReason` publishes the reasons of the "X509v3 CRL
+/// Reason Code" a CRL entry carries (`CrlConfiguration` docs), whose values are the
+/// `CRLReason` enumeration of RFC 5280 section 5.3.1 — `unspecified(0)`,
+/// `keyCompromise(1)`, `cACompromise(2)`, `affiliationChanged(3)`, `superseded(4)`,
+/// `cessationOfOperation(5)`, `certificateHold(6)`, `removeFromCRL(8)`,
+/// `privilegeWithdrawn(9)`, `aACompromise(10)`. The two the model does not publish
+/// (`certificateHold`, `removeFromCRL`) belong to a suspension this service has no
+/// operation for, so no reason maps to them.
+pub fn crl_reason_code(revocation_reason: &str) -> Option<u8> {
+    Some(match revocation_reason {
+        "UNSPECIFIED" => 0,
+        "KEY_COMPROMISE" => 1,
+        "CERTIFICATE_AUTHORITY_COMPROMISE" => 2,
+        "AFFILIATION_CHANGED" => 3,
+        "SUPERSEDED" => 4,
+        "CESSATION_OF_OPERATION" => 5,
+        "PRIVILEGE_WITHDRAWN" => 9,
+        "A_A_COMPROMISE" => 10,
+        _ => return None,
+    })
+}
+
+/// The CRL this CA publishes as of `now`, when it publishes one at all.
+///
+/// "You can enable CRLs for your new or an existing private CA by setting the Enabled
+/// parameter to true. Your private CA writes CRLs to an S3 bucket that you specify in the
+/// S3BucketName parameter" (`CrlConfiguration`): publication is the CA's OWN effect of
+/// holding an enabled configuration — no operation publishes a CRL on a caller's behalf —
+/// so every call that changes what the CRL says, or which bucket it goes to, asks for the
+/// CRL it now owes here.
+///
+/// `None` when this CA publishes nothing: CRLs disabled or never configured, no bucket to
+/// write to, or a CA that does not hold the certificate it signs its CRL under yet. The
+/// CRL number is advanced and the publication instant recorded here, so each CRL that goes
+/// out carries the next number of the sequence.
+pub fn due_crl_publication(
+    record: &mut CertificateAuthorityRecord,
+    now: SystemTime,
+) -> Option<CrlPublication> {
+    let crl = record
+        .revocation_configuration
+        .as_ref()
+        .and_then(|revocation| revocation.crl_configuration.clone())
+        .filter(|crl| crl.enabled)?;
+    let bucket = crl.s3_bucket_name.clone()?;
+    // A CRL is signed by the CA under the certificate it holds, so a CA still waiting for
+    // one publishes nothing yet; its activation is what asks again.
+    record.ca_certificate_pem.as_ref()?;
+    let id = parse_certificate_authority_arn(&record.arn)?.id;
+    let number = record.crl_number.saturating_add(1);
+    let body = encode_crl(record, &crl, number, now)?;
+    record.crl_number = number;
+    record.crl_published_at = Some(now);
+    Some(CrlPublication {
+        bucket,
+        key: crl_object_key(&id, &crl),
+        canned_acl: crl_object_canned_acl(crl.s3_object_acl.as_deref()),
+        body,
+    })
+}
+
+/// The CA's FIRST CRL, when the call at hand is what brings it into being.
+///
+/// A CA that has already published one says nothing new when it merely issues another
+/// certificate — a CRL lists the certificates that were REVOKED — so an issuance refreshes
+/// nothing, while the first issuance of a CA whose CRLs are enabled is what the CRL a
+/// relying party fetches starts existing at.
+pub fn initial_crl_publication(
+    record: &mut CertificateAuthorityRecord,
+    now: SystemTime,
+) -> Option<CrlPublication> {
+    if record.crl_published_at.is_some() {
+        return None;
+    }
+    due_crl_publication(record, now)
+}
+
+/// Deposit a CA's CRL in object storage, through the same in-process S3 client the CRL
+/// bucket is resolved with ([`s3_client`]).
+///
+/// AWS Private CA takes minutes over this ("A CRL is typically updated approximately 30
+/// minutes after a certificate is revoked"); emulated, the object is there by the time the
+/// call that changed the CRL answers, so a client that reads the CRL next sees it.
+///
+/// A write object storage refuses is reported to the emulator's own log and nothing else:
+/// the CA keeps its configuration and reports it, exactly as a CA whose CRL bucket is
+/// misconfigured does, and the next change to its revocation information tries again.
+pub async fn publish_crl(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    publication: CrlPublication,
+) {
+    let answer = s3_client(ctx, region)
+        .put_object()
+        .bucket(&publication.bucket)
+        .key(&publication.key)
+        .content_type(CRL_CONTENT_TYPE)
+        .acl(::aws_sdk_s3::types::ObjectCannedAcl::from(
+            publication.canned_acl,
+        ))
+        .body(::aws_sdk_s3::primitives::ByteStream::from(
+            publication.body,
+        ))
+        .send()
+        .await;
+    if let Err(error) = answer {
+        ::tracing::warn!(
+            bucket = %publication.bucket,
+            key = %publication.key,
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "the certificate revocation list could not be written to object storage"
+        );
+    }
+}
+
+/// The DER-encoded CRL a CA publishes: the RFC 5280 section 5.1 `CertificateList` whose
+/// fields are the ones `CrlConfiguration` lists.
+///
+/// `Version` v2, the signature algorithm the CA was created with, the `Issuer` the CA's
+/// own X.500 distinguished name, `thisUpdate` the instant it is published at, `nextUpdate`
+/// that instant plus `ExpirationInDays` ("Your private CA uses the value in the
+/// ExpirationInDays parameter to calculate the nextUpdate field in the CRL"), the revoked
+/// certificates each with its serial, its revocation date and its reason code, and the
+/// CRL's own number.
+///
+/// As with the certificates this service writes there is no key to sign with, so the
+/// signature is the stand-in of the right ASN.1 shape ([`stand_in_signature`]).
+fn encode_crl(
+    ca: &CertificateAuthorityRecord,
+    crl: &CrlConfiguration,
+    number: u64,
+    now: SystemTime,
+) -> Option<Vec<u8>> {
+    let algorithm = signature_algorithm_identifier(&ca.configuration.signing_algorithm)?;
+    let revoked = revoked_certificates(ca, now)?;
+    let tbs_cert_list = TbsCertList {
+        // "Version: The current version number defined in RFC 5280 is V2. The integer
+        // value is 0x1." (`CrlConfiguration` docs.)
+        version: Version::V2,
+        signature: algorithm.clone(),
+        issuer: subject_name(&ca.configuration.subject)?,
+        this_update: certificate_time(now)?,
+        next_update: Some(certificate_time(crl_next_update(crl, now)?)?),
+        // RFC 5280 section 5.1.2.6: the field is absent when no certificate is revoked.
+        revoked_certificates: (!revoked.is_empty()).then_some(revoked),
+        crl_extensions: Some(crl_extensions(ca, number)?),
+    };
+    let signature = stand_in_signature(&tbs_cert_list.to_der().ok()?)?;
+    CertificateList {
+        tbs_cert_list,
+        signature_algorithm: algorithm,
+        signature,
+    }
+    .to_der()
+    .ok()
+}
+
+/// When the CRL published at `now` says the next one is due: `ExpirationInDays` days on,
+/// which is the "validity period of the CRL in days"
+/// (`CrlConfiguration$ExpirationInDays`).
+fn crl_next_update(crl: &CrlConfiguration, now: SystemTime) -> Option<SystemTime> {
+    let days = crl.expiration_in_days?;
+    now.checked_add(ONE_DAY * u32::try_from(days).ok()?)
+}
+
+/// The entries the CRL published at `now` lists, in the order they were revoked.
+fn revoked_certificates(
+    ca: &CertificateAuthorityRecord,
+    now: SystemTime,
+) -> Option<Vec<RevokedCert>> {
+    let mut revoked: Vec<(SystemTime, &str, RevokedCert)> = Vec::new();
+    for certificate in ca.certificates.values() {
+        let Some(revocation) = certificate.revocation.as_ref() else {
+            continue;
+        };
+        if !listed_in_crl(certificate, ca.crl_published_at, now) {
+            continue;
+        }
+        revoked.push((
+            revocation.revoked_at,
+            certificate.serial.as_str(),
+            RevokedCert {
+                serial_number: serial_number(&certificate.serial)?,
+                revocation_date: certificate_time(revocation.revoked_at)?,
+                crl_entry_extensions: Some(vec![crl_reason_extension(&revocation.reason)?]),
+            },
+        ));
+    }
+    // A total order over the revocation and the serial, so the same revocation information
+    // always encodes to the same list however the certificates are held.
+    revoked.sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+    Some(revoked.into_iter().map(|(_, _, entry)| entry).collect())
+}
+
+/// Whether a revoked certificate is listed in the CRL published at `now`.
+///
+/// "When a certificate is revoked, it appears in the CRL until the certificate expires,
+/// and then in one additional CRL after expiration" (`CrlConfiguration` docs): a
+/// certificate still inside its validity window is listed, and one that expired since the
+/// CRL that went out before this one is listed that once more.
+fn listed_in_crl(
+    certificate: &IssuedCertificate,
+    previous_publication: Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
+    certificate.not_after > now
+        || previous_publication.is_some_and(|previous| certificate.not_after > previous)
+}
+
+/// The CRL's own extensions: its number, and the key identifier of the CA that signed it
+/// when the CA's certificate publishes one.
+///
+/// "CRL Extensions: X509v3 Authority Key Identifier: Identifies the public key associated
+/// with the private key used to sign the certificate. X509v3 CRL Number: Decimal sequence
+/// number for the CRL." (`CrlConfiguration` docs.)
+fn crl_extensions(ca: &CertificateAuthorityRecord, number: u64) -> Option<Extensions> {
+    let mut extensions: Extensions = vec![crl_number_extension(number)?];
+    if let Some(identifier) = authority_key_identifier_extension(ca) {
+        extensions.push(identifier);
+    }
+    Some(extensions)
+}
+
+/// The `cRLNumber` extension (RFC 5280 section 5.2.3): a non-critical INTEGER that
+/// increases with every CRL the CA issues.
+fn crl_number_extension(number: u64) -> Option<Extension> {
+    Some(Extension {
+        extn_id: oid::CRL_NUMBER,
+        critical: false,
+        extn_value: OctetString::new(Encode::to_der(&number).ok()?).ok()?,
+    })
+}
+
+/// The `reasonCode` CRL entry extension (RFC 5280 section 5.3.1): the non-critical
+/// `CRLReason` ENUMERATED the revocation's reason names ([`crl_reason_code`]).
+fn crl_reason_extension(revocation_reason: &str) -> Option<Extension> {
+    let reason = Any::new(DerTag::Enumerated, [crl_reason_code(revocation_reason)?].as_slice())
+        .ok()?;
+    Some(Extension {
+        extn_id: oid::CRL_REASON,
+        critical: false,
+        extn_value: OctetString::new(reason.to_der().ok()?).ok()?,
+    })
+}
+
+/// The `authorityKeyIdentifier` extension (RFC 5280 section 5.2.1) of a CRL this CA signs:
+/// the identifier of the key the CRL was signed with, which is the key the CA's OWN
+/// certificate holds.
+///
+/// The identifier is the one that certificate publishes as its subject key identifier,
+/// since that is the value a relying party matches this extension against. A certificate
+/// that publishes none is identified by its key: the leftmost 160 bits of the SHA-256
+/// digest over its `subjectPublicKey` BIT STRING, which is method 1 of RFC 7093 section 2
+/// ("Other methods of generating unique numbers are also acceptable", RFC 5280 section
+/// 4.2.1.2).
+///
+/// `None` when the CA holds no certificate this service can read.
+fn authority_key_identifier_extension(ca: &CertificateAuthorityRecord) -> Option<Extension> {
+    let der = parse_pem_block(ca.ca_certificate_pem.as_deref()?, PEM_LABEL_CERTIFICATE)?;
+    let certificate = Certificate::from_der(&der).ok()?;
+    let key_identifier = match published_key_identifier(&certificate) {
+        Some(published) => published,
+        None => OctetString::new(
+            &Sha256::digest(
+                certificate
+                    .tbs_certificate
+                    .subject_public_key_info
+                    .subject_public_key
+                    .raw_bytes(),
+            )[..KEY_IDENTIFIER_BYTES],
+        )
+        .ok()?,
+    };
+    let identifier = ::x509_cert::ext::pkix::AuthorityKeyIdentifier {
+        key_identifier: Some(key_identifier),
+        authority_cert_issuer: None,
+        authority_cert_serial_number: None,
+    };
+    Some(Extension {
+        extn_id: oid::AUTHORITY_KEY_IDENTIFIER,
+        critical: false,
+        extn_value: OctetString::new(identifier.to_der().ok()?).ok()?,
+    })
+}
+
+/// How many bytes a derived key identifier carries: 160 bits, the length RFC 7093 section
+/// 2 derives from a SHA-256 digest and the length RFC 5280 section 4.2.1.2's own methods
+/// produce.
+const KEY_IDENTIFIER_BYTES: usize = 20;
+
+/// The key identifier `certificate` publishes as its subject key identifier (RFC 5280
+/// section 4.2.1.2), when it publishes one.
+fn published_key_identifier(certificate: &Certificate) -> Option<OctetString> {
+    let extension = certificate
+        .tbs_certificate
+        .extensions
+        .as_ref()?
+        .iter()
+        .find(|extension| extension.extn_id == oid::SUBJECT_KEY_IDENTIFIER)?;
+    OctetString::from_der(extension.extn_value.as_bytes()).ok()
 }
 
 /// Whether `document` is a resource-based policy this service will attach to a private CA.
@@ -1952,7 +2336,9 @@ fn parse_pem_blocks_as(text: &str, label: &str) -> Option<Vec<Vec<u8>>> {
 ///   and 2.1.1.1 and RFC 5758 section 3.2 (`1.2.840.10045.*`, `1.3.132.0.*`);
 /// * ML-DSA: the NIST CSOR arc for FIPS 204 (`2.16.840.1.101.3.4.3.17` ..
 ///   `2.16.840.1.101.3.4.3.19`);
-/// * SM2 keys and the SM3-with-SM2 signature: GM/T 0006 (`1.2.156.10197.1.*`).
+/// * SM2 keys and the SM3-with-SM2 signature: GM/T 0006 (`1.2.156.10197.1.*`);
+/// * the certificate and CRL extensions a published CRL names: RFC 5280 sections 4.2.1.2,
+///   5.2.1, 5.2.3 and 5.3.1 (`2.5.29.*`).
 mod oid {
     use super::ObjectIdentifier;
 
@@ -1997,6 +2383,13 @@ mod oid {
     pub const ECDSA_WITH_SHA512: ObjectIdentifier =
         ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.4");
     pub const SM3_WITH_SM2: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.156.10197.1.501");
+
+    // Certificate and CRL extensions: RFC 5280 sections 4.2.1, 5.2 and 5.3 (`2.5.29.*`).
+    pub const SUBJECT_KEY_IDENTIFIER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.14");
+    pub const CRL_NUMBER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.20");
+    pub const CRL_REASON: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.21");
+    pub const AUTHORITY_KEY_IDENTIFIER: ObjectIdentifier =
+        ObjectIdentifier::new_unwrap("2.5.29.35");
 
     // ML-DSA names one algorithm for the key and the signature alike.
     pub const ML_DSA_44: ObjectIdentifier =
