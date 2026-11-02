@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssetRevisions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssetRevisions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssetRevisions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the revisions of ONE stored asset, newest first: every revision `CreateAsset`
+//! and `CreateAssetRevision` recorded on that asset, each with the asset's own identity
+//! (`id`, `domainId`), the revision number, and the principal and instant that recorded
+//! it. A reporting call — it writes nothing of its own, so two reads in a row answer the
+//! same thing.
+//!
+//! The prerequisites the model documents are checked against the store: the domain must
+//! exist and not be on its way out (the rule `GetAsset` applies), and the asset must
+//! exist in it — each reported with this operation's `ResourceNotFoundException`. "There
+//! must be at least one revision of the asset (which happens automatically after
+//! creation)" holds by construction: a stored asset is its own first revision.
+//!
+//! The page is cut at `maxResults` (the modelled 1..50, defaulting to the top of that
+//! range) and resumed from the opaque `nextToken` the previous page ended on, the way
+//! every other listing in this service paginates.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +136,12 @@ impl From<ListAssetRevisionsErrorModeled> for ListAssetRevisionsError {
     }
 }
 
+/// The `maxResults` range the model declares for this operation (`@range` min 1, max 50
+/// on `MaxResults`). A request naming no `maxResults` gets the top of the range, and a
+/// value is clamped into it rather than trusted.
+const MIN_MAX_RESULTS: usize = 1;
+const MAX_MAX_RESULTS: usize = 50;
+
 /// The `ListAssetRevisions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,18 +178,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssetRevisions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetRevisionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssetRevisions"))
+        let _ = ctx;
+        use crate::state::{date_time, decode_page_token, encode_page_token, now_ms, ResourceKind};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssetRevisionsErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        // Resume strictly past the revision the previous page ended on. The listing runs
+        // from the newest revision down, so "past" is a LOWER number. A token this
+        // service never issued — anything that is not the hex of a revision number — is
+        // a bad request, not an empty page.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                decode_page_token(token)
+                    .and_then(|key| key.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        ListAssetRevisionsErrorModeled::ValidationException(ValidationException {
+                            message: "nextToken is not a token this service issued".to_string(),
+                        })
+                    })?,
+            ),
+            None => None,
+        };
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(MAX_MAX_RESULTS)
+            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+
+        let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+            ListAssetRevisionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::Domain.not_found_message(),
+            })
+        })?;
+        let asset = domain.assets.get(&input.identifier).ok_or_else(|| {
+            ListAssetRevisionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::Asset.not_found_message(),
+            })
+        })?;
+
+        // Newest revision first: the revisions are keyed by their number, so walking the
+        // map backwards is the asset's history in reverse chronological order.
+        let matching = asset
+            .revisions
+            .values()
+            .rev()
+            .filter(|revision| resume_after.is_none_or(|after| revision.revision < after));
+
+        let mut items: Vec<AssetRevision> = Vec::new();
+        let mut next_token = None;
+        for revision in matching {
+            if items.len() == page_size {
+                // One more revision exists: hand back the cursor the caller resumes from.
+                next_token = items
+                    .last()
+                    .and_then(|last| last.revision.as_deref())
+                    .map(encode_page_token);
+                break;
+            }
+            items.push(AssetRevision {
+                // A revision is addressed by the ASSET it belongs to plus its own
+                // number, so the identity members are read off the stored asset.
+                domain_id: Some(asset.domain_id.clone()),
+                id: Some(asset.id.clone()),
+                revision: Some(revision.revision_string()),
+                created_by: Some(revision.created_by.clone()),
+                created_at: Some(date_time(revision.created_at_ms)),
+            });
+        }
+
+        Ok(ListAssetRevisionsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

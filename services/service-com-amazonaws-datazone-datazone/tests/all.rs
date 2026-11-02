@@ -21,6 +21,8 @@ mod asset_deletion;
 mod asset_filters;
 #[path = "all/asset_lifecycle.rs"]
 mod asset_lifecycle;
+#[path = "all/asset_revision_listing.rs"]
+mod asset_revision_listing;
 #[path = "all/asset_revisions.rs"]
 mod asset_revisions;
 #[path = "all/asset_types.rs"]
