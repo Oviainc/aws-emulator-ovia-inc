@@ -59,6 +59,8 @@ mod harness_version_listing;
 mod memory_lifecycle;
 #[path = "all/memory_mutation.rs"]
 mod memory_mutation;
+#[path = "all/memory_namespace_key_reference_wording.rs"]
+mod memory_namespace_key_reference_wording;
 #[path = "all/memory_update_and_read_projection.rs"]
 mod memory_update_and_read_projection;
 #[path = "all/registry_lifecycle.rs"]

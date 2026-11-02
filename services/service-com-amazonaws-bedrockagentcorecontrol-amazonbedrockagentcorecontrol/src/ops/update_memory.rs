@@ -97,10 +97,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The `fieldList` member name a refused `namespaceKeys` replacement is reported
-/// under.
-const NAMESPACE_KEYS_MEMBER: &str = "namespaceKeys";
-
 /// The `fieldList` member name a refused `addIndexedKeys` merge is reported
 /// under.
 const ADD_INDEXED_KEYS_MEMBER: &str = "addIndexedKeys";
@@ -420,6 +416,38 @@ fn invalid(invalid: ValidationException) -> UpdateMemoryError {
     UpdateMemoryErrorModeled::ValidationException(invalid).into()
 }
 
+/// The modelled refusal of a `namespaceKeys` replacement that drops a key the
+/// memory defines and a live strategy's namespace template still resolves
+/// through, in the sentence the recorded service answers it with: the operation
+/// that failed validation, the keys still referenced, and what the caller must
+/// do first.
+///
+/// `still_referenced` is the whole set a client needs to learn from ONE
+/// response — every key the memory defines that a live strategy still
+/// references, not just the ones this request dropped — rendered as the
+/// bracketed, comma-separated list the sentence carries. No strategy is named:
+/// the sentence points at the strategies collectively, and a strategy's
+/// generated id is not disclosed by a failed update.
+///
+/// `reason` says a request member failed validation, which is what happened to
+/// `namespaceKeys`. No `fieldList` is carried: the sentence itself is the whole
+/// account of the refusal, and a per-member entry would have to be worded by
+/// this emulator.
+fn namespace_keys_still_referenced(
+    operation: &str,
+    still_referenced: &[String],
+) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Validation failed during {operation}: [{}] namespaceKeys are still in reference with \
+             existing strategies, please update the strategies before proceeding with this update",
+            still_referenced.join(", ")
+        ),
+        reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: None,
+    }
+}
+
 /// The modelled not-found refusal for a memory strategy this memory does not
 /// hold: a `memoryStrategyId` the request names is a resource reference, so an
 /// unknown one is reported in the one sentence this service gives a missing
@@ -663,18 +691,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removed. Any referenced namespaceKey omission will throw
         // ValidationException" — the namespace keys REPLACE, and a replacement
         // that drops a variable a strategy's namespace template still resolves
-        // through is refused.
+        // through is refused. The strategies this request modified are already
+        // applied above, so retargeting a template and dropping the key it used
+        // to resolve in ONE request is accepted.
         if let Some(namespace_keys) = input.namespace_keys {
-            for (variable, strategy_id) in record.referenced_namespace_variables() {
-                if namespace_keys.iter().any(|entry| entry.key == variable) {
-                    continue;
-                }
-                return Err(invalid(crate::state::field_validation_failed(
-                    NAMESPACE_KEYS_MEMBER,
-                    &format!(
-                        "the namespace variable {variable} is referenced by a namespaceTemplate \
-                         of memory strategy {strategy_id} and cannot be omitted"
-                    ),
+            let still_referenced = record.still_referenced_namespace_keys();
+            if still_referenced
+                .iter()
+                .any(|key| !namespace_keys.iter().any(|entry| &entry.key == key))
+            {
+                return Err(invalid(namespace_keys_still_referenced(
+                    Self::NAME,
+                    &still_referenced,
                 )));
             }
             record.namespace_keys = Some(namespace_keys);

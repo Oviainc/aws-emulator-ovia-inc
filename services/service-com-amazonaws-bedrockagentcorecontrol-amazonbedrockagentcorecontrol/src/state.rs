@@ -1431,14 +1431,14 @@ impl MemoryRecord {
 
     /// The namespace variable keys this memory's live strategies REFERENCE
     /// through their namespace templates, minus the three the service defines
-    /// itself ([`SERVICE_NAMESPACE_VARIABLES`]), each with the strategy that
-    /// references it.
+    /// itself ([`SERVICE_NAMESPACE_VARIABLES`]).
     ///
     /// What the caller must still define under `namespaceKeys`: a template's
     /// `{variable}` resolves either to a service-defined variable or to one of
-    /// those definitions.
-    pub fn referenced_namespace_variables(&self) -> BTreeMap<String, String> {
-        let mut referenced = BTreeMap::new();
+    /// those definitions. Which strategy references a variable is deliberately
+    /// NOT carried: no refusal of this service names a strategy.
+    pub fn referenced_namespace_variables(&self) -> BTreeSet<String> {
+        let mut referenced = BTreeSet::new();
         for strategy in self.live_strategies() {
             for template in strategy
                 .namespace_templates
@@ -1449,13 +1449,30 @@ impl MemoryRecord {
                     if SERVICE_NAMESPACE_VARIABLES.contains(&variable) {
                         continue;
                     }
-                    referenced
-                        .entry(variable.to_string())
-                        .or_insert_with(|| strategy.strategy_id.clone());
+                    referenced.insert(variable.to_string());
                 }
             }
         }
         referenced
+    }
+
+    /// The namespace variable keys this memory DEFINES and its live strategies
+    /// still reference: the stored `namespaceKeys`, in the order the memory
+    /// holds them, kept where a live strategy's namespace template resolves
+    /// through them ([`Self::referenced_namespace_variables`]).
+    ///
+    /// These are the keys a `namespaceKeys` replacement may not drop — a key
+    /// the memory does not define resolves through no definition whether the
+    /// replacement carries it or not — and the ones the refusal reports.
+    pub fn still_referenced_namespace_keys(&self) -> Vec<String> {
+        let referenced = self.referenced_namespace_variables();
+        let mut keys: Vec<String> = Vec::new();
+        for entry in self.namespace_keys.iter().flatten() {
+            if referenced.contains(&entry.key) && !keys.contains(&entry.key) {
+                keys.push(entry.key.clone());
+            }
+        }
+        keys
     }
 
     /// This memory as the `Memory` shape every operation that reports one
