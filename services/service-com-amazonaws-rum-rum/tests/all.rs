@@ -75,6 +75,8 @@ mod metrics_destination_pass_role;
 mod metrics_destination_removal;
 #[path = "all/metrics_destinations.rs"]
 mod metrics_destinations;
+#[path = "all/mixed_constraint_envelope.rs"]
+mod mixed_constraint_envelope;
 #[path = "all/nested_configuration_defaults.rs"]
 mod nested_configuration_defaults;
 #[path = "all/not_found_and_conflict_bodies.rs"]

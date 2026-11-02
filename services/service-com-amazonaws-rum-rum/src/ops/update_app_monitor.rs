@@ -135,6 +135,30 @@ impl From<UpdateAppMonitorErrorModeled> for UpdateAppMonitorError {
     }
 }
 
+/// Every constraint THIS service applies itself that `input` breaks
+/// (`crate::state::validation`), unworded.
+///
+/// The modelled `@pattern` of `AppMonitorDomain`, which `Domain` targets directly and
+/// `DomainList`'s member targets too: written with look-around, so the framework's boundary
+/// validator admits any value for it and this service is what applies it. `Name` is not
+/// judged: it is bound to the URI to resolve an EXISTING monitor, so a name outside the
+/// pattern names none and is answered with the modelled not-found.
+///
+/// Read by the handler below, before the stored record is touched, and by the gate in front
+/// of this operation (`crate::service`), which states these clauses in the SAME envelope as
+/// the ones the boundary walk found — the handler never runs for a request that walk
+/// refuses, so that gate is the only place a request breaking one of each can be stated in
+/// full.
+pub(crate) fn self_applied(
+    input: &UpdateAppMonitorInput,
+) -> crate::state::validation::SelfApplied {
+    crate::state::validation::app_monitor_self_applied(
+        None,
+        input.domain.as_deref(),
+        input.domain_list.as_deref(),
+    )
+}
+
 /// The `UpdateAppMonitor` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -181,18 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The modelled `@pattern` of `AppMonitorDomain`, which `Domain` targets directly
-        // and `DomainList`'s member targets too: written with look-around, so the boundary
-        // validator admits any value for it and this call is where it is applied — before
-        // the stored record is touched, so a refused update changes nothing
-        // (`crate::state::validation`). `Name` is not judged here: it is bound to the URI
-        // to resolve an EXISTING monitor, so a name outside the pattern names none and is
-        // answered with the modelled not-found.
-        if let Some(message) = crate::state::validation::app_monitor_refusal(
-            None,
-            input.domain.as_deref(),
-            input.domain_list.as_deref(),
-        ) {
+        // The constraints this service applies itself, over this request's own members
+        // ([`self_applied`]) — before the stored record is touched, so a refused update
+        // changes nothing.
+        if let Some(message) = self_applied(&input).refusal() {
             return Err(
                 UpdateAppMonitorErrorModeled::ValidationException(ValidationException { message })
                     .into(),

@@ -79,6 +79,17 @@
 //! ([`AnnouncedMediaType::stated_refusal`]), and [`Service::override_refusal`], for a
 //! refusal the centralized walk finds anyway and hands back as the violations alone.
 //!
+//! A refusal has TWO sources, and one request's clauses from both are stated in ONE
+//! envelope. The framework's boundary walk applies the constraints its regex engine can
+//! compile and runs BEFORE a handler; the rest — the look-around `@pattern`s and the
+//! constraints of a shape reached as a map KEY — are applied by this service itself
+//! ([`crate::state::validation`]). Those checks live with the operation that accepts the
+//! members (`crate::ops::<operation>::self_applied`), and the gate asks the operation the
+//! routing key names for them ([`collected_refusal`]) rather than leaving them to a handler
+//! the walk's refusal means never runs: one clause per failing (member, requirement),
+//! whichever layer applied it, in the order the input declares the members
+//! ([`in_declared_order`]).
+//!
 //! Two things the gate deliberately does not touch: authentication, which the router
 //! settles before any operation runs and reads off the MODELLED operation the routing
 //! key names (so a gate cannot weaken an operation's auth schemes), and the refusals
@@ -87,11 +98,12 @@
 //! service produced, so they keep the framework's protocol-correct rendering.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
-use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::constraints::{path, Violation, ViolationKind};
 use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused,
-    ServerHttpProtocol, Service,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
+    Refused, ServerHttpProtocol, Service,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -144,6 +156,12 @@ const TAGGING_MEMBER_PATHS: [&str; 2] = [RESOURCE_ARN_MEMBER_PATH, "tagKeys"];
 /// is the discriminator: a violation on one of [`TAGGING_MEMBER_PATHS`] can only have come
 /// from a tag call. A path is dotted, so a violation inside a member starts with that
 /// member's name followed by a `.`.
+///
+/// Asked only where the operation itself is not in hand ([`Service::override_refusal`]);
+/// the gate in front of every operation knows which operation the routing key named and
+/// reads it off [`TAGGING_OPERATIONS`] instead, which is what lets a refusal about the tag
+/// MAP — a member both frontends carry — still be worded by the frontend that answers the
+/// call.
 fn is_tagging_refusal(violations: &[Violation]) -> bool {
     violations.iter().any(|violation| {
         TAGGING_MEMBER_PATHS.iter().any(|member| {
@@ -151,6 +169,16 @@ fn is_tagging_refusal(violations: &[Violation]) -> bool {
         })
     })
 }
+
+/// The operations RUM's ARN-addressed TAGGING frontend answers, by their modelled names:
+/// every operation of this service that addresses its resource by `ResourceArn`.
+///
+/// Source: `smithy_query(query="operation",
+/// operation="TagResource,UntagResource,ListTagsForResource")` against this service's
+/// model — every other operation names its resource by `Name` or by `Id`. A refusal of one
+/// of these is worded in that frontend's error vocabulary ([`stated`]) whatever member it is
+/// about, which [`TAGGING_MEMBER_PATHS`] cannot say on its own for the tag map.
+const TAGGING_OPERATIONS: [&str; 3] = ["TagResource", "UntagResource", "ListTagsForResource"];
 
 /// Whether one of these violations says the `ResourceArn` is not an ARN: a `@pattern`
 /// violation on that member, which is the one refusal the tagging frontend has its own
@@ -323,13 +351,21 @@ struct AnnouncedMediaType<Eng> {
 /// that operation's own input schema. An operation added later is listed here too, or it
 /// answers a refusal with the value the framework elided rather than the one its caller
 /// sent.
+///
+/// Each line also names the checks THAT operation applies itself over its own input
+/// (`crate::ops::<module>::self_applied`), so the gate can state them beside the walk's own
+/// (see the module docs); [`no_self_applied`] is the line for an operation whose input
+/// carries no member of a shape this service applies constraints for.
 macro_rules! stated_refusal_for_key {
-    ($key:expr, $protocol:expr, $req:expr, $engine:ident, $($module:ident :: $operation:ident),+ $(,)?) => {
+    (
+        $key:expr, $protocol:expr, $req:expr, $engine:ident,
+        $($module:ident :: $operation:ident => $self_applied:expr),+ $(,)?
+    ) => {
         match $key {
             $(
                 stringify!($operation) => collected_refusal::<
                     crate::ops::$module::$operation<$engine>,
-                >($protocol, $req),
+                >($protocol, $req, $self_applied),
             )+
             _ => None,
         }
@@ -427,41 +463,167 @@ impl<Eng: Send + Sync + 'static> AnnouncedMediaType<Eng> {
             protocol,
             req,
             Eng,
-            batch_create_rum_metric_definitions::BatchCreateRumMetricDefinitions,
-            batch_delete_rum_metric_definitions::BatchDeleteRumMetricDefinitions,
-            batch_get_rum_metric_definitions::BatchGetRumMetricDefinitions,
-            create_app_monitor::CreateAppMonitor,
-            delete_app_monitor::DeleteAppMonitor,
-            delete_resource_policy::DeleteResourcePolicy,
-            delete_rum_metrics_destination::DeleteRumMetricsDestination,
-            get_app_monitor::GetAppMonitor,
-            get_app_monitor_data::GetAppMonitorData,
-            get_resource_policy::GetResourcePolicy,
-            list_app_monitors::ListAppMonitors,
-            list_rum_metrics_destinations::ListRumMetricsDestinations,
-            list_tags_for_resource::ListTagsForResource,
-            put_resource_policy::PutResourcePolicy,
-            put_rum_events::PutRumEvents,
-            put_rum_metrics_destination::PutRumMetricsDestination,
-            tag_resource::TagResource,
-            untag_resource::UntagResource,
-            update_app_monitor::UpdateAppMonitor,
-            update_rum_metric_definition::UpdateRumMetricDefinition,
+            batch_create_rum_metric_definitions::BatchCreateRumMetricDefinitions
+                => crate::ops::batch_create_rum_metric_definitions::self_applied,
+            batch_delete_rum_metric_definitions::BatchDeleteRumMetricDefinitions
+                => no_self_applied,
+            batch_get_rum_metric_definitions::BatchGetRumMetricDefinitions => no_self_applied,
+            create_app_monitor::CreateAppMonitor => crate::ops::create_app_monitor::self_applied,
+            delete_app_monitor::DeleteAppMonitor => no_self_applied,
+            delete_resource_policy::DeleteResourcePolicy => no_self_applied,
+            delete_rum_metrics_destination::DeleteRumMetricsDestination => no_self_applied,
+            get_app_monitor::GetAppMonitor => no_self_applied,
+            get_app_monitor_data::GetAppMonitorData => no_self_applied,
+            get_resource_policy::GetResourcePolicy => no_self_applied,
+            list_app_monitors::ListAppMonitors => no_self_applied,
+            list_rum_metrics_destinations::ListRumMetricsDestinations => no_self_applied,
+            list_tags_for_resource::ListTagsForResource => no_self_applied,
+            put_resource_policy::PutResourcePolicy => no_self_applied,
+            put_rum_events::PutRumEvents => no_self_applied,
+            put_rum_metrics_destination::PutRumMetricsDestination => no_self_applied,
+            tag_resource::TagResource => crate::ops::tag_resource::self_applied,
+            untag_resource::UntagResource => crate::ops::untag_resource::self_applied,
+            update_app_monitor::UpdateAppMonitor => crate::ops::update_app_monitor::self_applied,
+            update_rum_metric_definition::UpdateRumMetricDefinition
+                => crate::ops::update_rum_metric_definition::self_applied,
         )
     }
 }
 
 /// The violations `req` breaks against operation `O`'s own input schema, and the words this
-/// service states them in — the shared collection, and this service's one wording
-/// ([`stated`]).
+/// service states them in — the shared collection, this service's own checks over the same
+/// request, and this service's one wording ([`stated`]).
 fn collected_refusal<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
+    self_applied: fn(&O::Input) -> crate::state::validation::SelfApplied,
 ) -> Option<(Vec<Violation>, Refused)> {
     let (violations, lists) =
         service_common::validation::refusing_violations_with_lists::<O>(protocol, req);
-    let chosen = stated(&violations, &lists)?;
+    if violations.is_empty() {
+        // The framework's walk admits this request, so the operation runs and applies the
+        // constraints this service applies itself over its own members — the ONE check per
+        // request in the normal case. Nothing is read a second time for it.
+        return None;
+    }
+    let (violations, lists) =
+        with_self_applied::<O>(protocol, req, self_applied, violations, lists);
+    // WHICH frontend words the refusal is the operation's own answer here, because the
+    // operation the routing key named is in hand ([`TAGGING_OPERATIONS`]).
+    let chosen = stated_by(
+        &violations,
+        &lists,
+        TAGGING_OPERATIONS.contains(&<O as Operation>::NAME),
+    )?;
     Some((violations, chosen))
+}
+
+/// The checks line of an operation whose input carries no member of a shape this service
+/// applies constraints for itself (`crate::state::validation`), so there is nothing beside
+/// the boundary walk's violations to state for it.
+fn no_self_applied<I>(_input: &I) -> crate::state::validation::SelfApplied {
+    crate::state::validation::SelfApplied::default()
+}
+
+/// `violations` and `lists` with the constraints THIS service applies itself added: one set
+/// per request, so a request that breaks a boundary-applied constraint AND one of this
+/// service's own is answered with one clause per failing (member, requirement) instead of
+/// the boundary's half alone (`crate::state::validation`, rule 1) — a caller that fixes
+/// what it was told about is not refused again on what the first answer withheld.
+///
+/// Reached only for a request the boundary walk already refuses, which is exactly the case
+/// the operation's own checks cannot state themselves: that walk runs in front of the
+/// handler, so the handler never sees such a request. A request it admits is left alone
+/// here and judged by the handler, which is why this adds no check to the accepting path.
+///
+/// `self_applied` is the operation's own ([`stated_refusal_for_key`]), applied to the input
+/// read against `O`'s own input schema ([`read_input`]) — the same members, from the same
+/// schema, the handler would have judged. A body no codec can read builds no input, so the
+/// walk's own clauses stand alone.
+fn with_self_applied<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    self_applied: fn(&O::Input) -> crate::state::validation::SelfApplied,
+    violations: Vec<Violation>,
+    mut lists: HashMap<String, String>,
+) -> (Vec<Violation>, HashMap<String, String>) {
+    let Some(input) = read_input::<O>(protocol, req) else {
+        return (violations, lists);
+    };
+    let found = self_applied(&input);
+    if found.is_empty() {
+        return (violations, lists);
+    }
+    let mut both = violations;
+    for violation in found.violations {
+        // Rule 1 is one clause per failing (member, requirement), and the two layers OVERLAP
+        // on one position: a `@length` the walk applies to a member whose `@pattern` only
+        // this service can apply is found by both, so the pair the walk already stated is
+        // not stated twice.
+        let stated_already = both
+            .iter()
+            .any(|seen| seen.path == violation.path && seen.kind == violation.kind);
+        if !stated_already {
+            both.push(violation);
+        }
+    }
+    // The lists the checks have, for a clause this service states AT a list member (rule 4);
+    // a list the shared collector already rendered keeps that rendering, the two being the
+    // same list.
+    for (member, rendered) in found.lists {
+        lists.entry(member).or_insert(rendered);
+    }
+    (in_declared_order(O::INPUT_SCHEMA, both), lists)
+}
+
+/// `req`'s input as operation `O`'s own input shape, or `None` for a body no codec can read
+/// — which is a failure the framework's own walk words.
+///
+/// The read is the framework's own: the protocol's deserializer over `O::INPUT_SCHEMA`,
+/// which binds the URI and query members as well as the body, so the values judged here are
+/// the values the operation's sequence would have judged. It is a SECOND read of a request
+/// that is already being refused, because the shared collector drops the input it built
+/// (`services/common/src/validation.rs`, which records the core seam that would hand one
+/// out); no request this gate does not refuse pays for it.
+fn read_input<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Option<O::Input> {
+    let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
+    let read = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer);
+    drop(deserializer);
+    read.ok()
+}
+
+/// `violations` in the order the input DECLARES the members they are about.
+///
+/// Two walks found them — the framework's over the built input, and this service's own
+/// checks — and the rule is one envelope in the order the walk found them
+/// (`crate::state::validation`, rule 1), so the two sets are interleaved rather than
+/// concatenated: a clause about a member the input declares earlier is stated earlier,
+/// whichever layer applied the constraint. The order is the one the generated input schema
+/// lists its members in, which is the model's declaration order and the order the
+/// framework's own walk visits them in; the sort is STABLE, so several violations about one
+/// member keep the order the walk that found them produced, and one about a position the
+/// schema does not list keeps its place after the declared members.
+///
+/// Capped at the number of violations the framework's own walk collects to
+/// (`service_common::validation::MAX_VIOLATIONS`), so a message assembled from two sets is
+/// bounded by the same number as one.
+fn in_declared_order(schema: &Schema, violations: Vec<Violation>) -> Vec<Violation> {
+    let declared: Vec<String> = schema
+        .members()
+        .iter()
+        .filter_map(|member| member.member_name().map(path::member))
+        .collect();
+    let mut ordered = violations;
+    ordered.sort_by_key(|violation| {
+        // A violation path is dotted, so the member it is about is its first segment.
+        let member = violation.path.split('.').next().unwrap_or_default();
+        declared
+            .iter()
+            .position(|declared| declared == member)
+            .unwrap_or(usize::MAX)
+    });
+    ordered.truncate(service_common::validation::MAX_VIOLATIONS);
+    ordered
 }
 
 /// How this service words a constraint refusal, wherever it was collected: the ONE place
@@ -476,13 +638,35 @@ fn collected_refusal<O: Operation>(
 /// is reworded. Every other constraint refusal is an app-monitor call's, worded the way
 /// this service words one (`crate::state::validation`).
 ///
+/// WHICH call is a tag call is read off the violations, which is all this path knows: the
+/// refusal the centralized walk hands back names no operation
+/// ([`is_tagging_refusal`]). The gate in front of the operation knows the operation and
+/// states it through [`stated_by`], so a refusal about the tag MAP — a member both frontends
+/// carry — is worded by the frontend that answers the call rather than by the member.
+///
 /// `lists` holds the request's lists where the caller has them, keyed by the member path
 /// the walk reports that list at and already rendered.
 fn stated(violations: &[Violation], lists: &HashMap<String, String>) -> Option<Refused> {
+    stated_by(violations, lists, false)
+}
+
+/// [`stated`] for a caller that knows whether the operation refused is one the TAGGING
+/// frontend answers ([`TAGGING_OPERATIONS`]).
+///
+/// `tagging` only ADDS what the violations cannot say — an operation of that frontend
+/// refused on a member the app-monitor operations also declare — so a refusal the violations
+/// already place with that frontend is worded identically either way, and a tag key is
+/// stated in one dialect whether the call was refused in front of the operation or by the
+/// handler.
+fn stated_by(
+    violations: &[Violation],
+    lists: &HashMap<String, String>,
+    tagging: bool,
+) -> Option<Refused> {
     if violations.is_empty() {
         return None;
     }
-    if is_tagging_refusal(violations) {
+    if tagging || is_tagging_refusal(violations) {
         return Some(Refused {
             code: TAGGING_BAD_REQUEST_CODE.to_string(),
             message: if is_resource_arn_syntax_violation(violations) {

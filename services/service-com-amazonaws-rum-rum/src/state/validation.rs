@@ -34,12 +34,15 @@
 //! text one for one, so a refusal can never state a constraint this module does not apply.
 //! Every other constraint of every other member is the boundary walk's, unchanged.
 //!
-//! KNOWN LIMIT, documented rather than papered over: the boundary walk runs BEFORE a
-//! handler and `crate::service` states its violations in front of the operation, so a
-//! request that breaks a boundary-applied constraint AND one of the patterns here is stated
-//! with the boundary's clauses alone — the handler it would have been refused by never
-//! runs. Closing it needs the core seam that hands a handler the input the walk already
-//! built, which `services/common/src/validation.rs` records.
+//! BOTH KINDS IN ONE ENVELOPE: the boundary walk runs BEFORE a handler and
+//! `crate::service` states its violations in front of the operation, so the handler that
+//! applies the checks here never runs for a request that ALSO breaks a boundary-applied
+//! constraint. So the gate asks the operation the request names for the violations these
+//! checks find in its input ([`SelfApplied`], which each operation's own
+//! `self_applied` builds) and states both sets together: one clause per failing
+//! (member, requirement), whichever layer applied it, which is what rule 1 below promises.
+//! The one request still stated with the boundary's clauses alone is one that omits a
+//! `@required` member, where the codec builds no input for these checks to read at all.
 //!
 //! # How a refusal is stated
 //!
@@ -432,6 +435,50 @@ pub fn string_violation(shape: ConstrainedString, path: &str, value: &str) -> Op
     })
 }
 
+/// What one request breaks of the constraints this service applies ITSELF: the violations,
+/// and the request's own collections a clause about one of their ELEMENTS is stated over
+/// (rule 4).
+///
+/// Handed back structurally, unworded, because two callers state it and neither owns the
+/// words: the operation's own handler, which answers it as that operation's modelled
+/// refusal ([`SelfApplied::refusal`] for the frontend this module words), and the gate in
+/// front of every operation (`crate::service`), which states it in the SAME envelope as the
+/// violations the framework's boundary walk found — so one request's two kinds of
+/// constraint failure are one answer and not two round trips (rule 1).
+#[derive(Debug, Default)]
+pub struct SelfApplied {
+    /// The violations, in the order the checks that found them judged the members.
+    pub violations: Vec<Violation>,
+    /// The request's lists, keyed by the member path the walk reports that list at and
+    /// already rendered: the value a clause stated AT a list member quotes (rule 4).
+    pub lists: HashMap<String, String>,
+}
+
+impl SelfApplied {
+    /// Take `other`'s violations and lists onto these, for an operation whose input carries
+    /// members of SEVERAL of the shapes above — the create that both names a monitor's
+    /// domain authority and seeds its tag map — so one request is still one envelope.
+    pub fn extend(&mut self, other: Self) {
+        self.violations.extend(other.violations);
+        for (path, rendered) in other.lists {
+            self.lists.entry(path).or_insert(rendered);
+        }
+    }
+
+    /// Whether these checks found nothing to refuse.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.violations.is_empty()
+    }
+
+    /// Why these violations refuse the request, in the words this service states a
+    /// constraint refusal in ([`message`]) — `None` when there are none.
+    #[must_use]
+    pub fn refusal(&self) -> Option<String> {
+        message(&self.violations, &self.lists)
+    }
+}
+
 /// Why the members a create or an update names cannot be applied, or `None` when every one
 /// of them satisfies the constraints its shape declares.
 ///
@@ -451,14 +498,23 @@ pub fn string_violation(shape: ConstrainedString, path: &str, value: &str) -> Op
 /// Every member is judged, and the envelope states them TOGETHER in the order the input
 /// declares them, because a request that breaks two members is two validation errors and
 /// not one (rule 1 in the module docs). A `DomainList` violation is stated at the LIST
-/// member over the whole list the request sent (rule 4), which is why the list is passed
-/// through to [`message`] rather than only the element that offended.
+/// member over the whole list the request sent (rule 4), which is why the list is carried
+/// on the [`SelfApplied`] rather than only the element that offended.
+///
+/// Neither the work nor the message is sized by the request: the elements judged stop at the
+/// count the framework's own walk collects to
+/// (`service_common::validation::MAX_VIOLATIONS`), and the list a clause quotes is held to
+/// the ceiling that module states for one echoed value
+/// (`service_common::validation::quoted_echo`), which is the ceiling every other clause of
+/// this tree is quoted up to. Both matter because a caller can send a list far longer than
+/// `AppMonitorDomainList`'s `@length` admits: the framework's walk refuses it for the
+/// LENGTH, and these checks are run beside that refusal (`crate::service`).
 #[must_use]
-pub fn app_monitor_refusal(
+pub fn app_monitor_self_applied(
     name: Option<&str>,
     domain: Option<&str>,
     domain_list: Option<&[String]>,
-) -> Option<String> {
+) -> SelfApplied {
     let mut violations: Vec<Violation> = Vec::new();
     if let Some(name) = name {
         violations.extend(string_violation(
@@ -472,15 +528,27 @@ pub fn app_monitor_refusal(
         violations.extend(string_violation(shape, DOMAIN_PATH, domain));
     }
     let domains = domain_list.unwrap_or_default();
-    for (position, domain) in domains.iter().enumerate() {
-        let path = format!(
-            "{DOMAIN_LIST_PATH}.{}",
-            constraints::path::element(position + 1)
-        );
-        violations.extend(string_violation(shape, &path, domain));
+    violations.extend(
+        domains
+            .iter()
+            .enumerate()
+            .filter_map(|(position, domain)| {
+                let path = format!(
+                    "{DOMAIN_LIST_PATH}.{}",
+                    constraints::path::element(position + 1)
+                );
+                string_violation(shape, &path, domain)
+            })
+            .take(service_common::validation::MAX_VIOLATIONS),
+    );
+    let rendered = rendered_list(domains);
+    SelfApplied {
+        violations,
+        lists: HashMap::from([(
+            DOMAIN_LIST_PATH.to_string(),
+            service_common::validation::quoted_echo(&rendered).into_owned(),
+        )]),
     }
-    let lists = HashMap::from([(DOMAIN_LIST_PATH.to_string(), rendered_list(domains))]);
-    message(&violations, &lists)
 }
 
 /// The dotted member path a violation on `Name` is reported at.

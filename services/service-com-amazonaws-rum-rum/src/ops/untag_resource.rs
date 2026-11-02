@@ -217,6 +217,23 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
     }
 }
 
+/// Every constraint THIS service applies itself that `input` breaks
+/// (`crate::state::validation`), unworded: `TagKey`'s `@pattern`, the one constraint on the
+/// keys this request NAMES that the framework's boundary walk leaves unapplied (see
+/// [`UntagResourceWireInput`]), at the path that walk spells a list element as.
+///
+/// The same violations the handler below refuses the call on, at the same paths
+/// (`crate::state::tag_key_list_self_applied` is where both go through). This is for the
+/// gate in front of this operation (`crate::service`), which states them in the SAME
+/// envelope as the ones the boundary walk found, in this frontend's own words — the handler
+/// never runs for a request that walk refuses, so that gate is the only place a request
+/// breaking one of each can be stated in full.
+pub(crate) fn self_applied(
+    input: &UntagResourceWireInput,
+) -> crate::state::validation::SelfApplied {
+    crate::state::tag_key_list_self_applied(input.0.tag_keys.iter().map(String::as_str))
+}
+
 /// The same for a frontend refusal, so the handler writes `Err(TaggingRefusal::….into())`.
 impl From<TaggingRefusal> for UntagResourceError {
     fn from(refusal: TaggingRefusal) -> Self {

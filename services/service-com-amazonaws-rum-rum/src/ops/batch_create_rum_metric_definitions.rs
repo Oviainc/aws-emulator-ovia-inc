@@ -162,6 +162,22 @@ impl From<BatchCreateRumMetricDefinitionsErrorModeled> for BatchCreateRumMetricD
     }
 }
 
+/// Every constraint THIS service applies itself that `input` breaks
+/// (`crate::state::validation`), unworded: the constraints of `DimensionKeysMap`'s key and
+/// value shapes, for every definition the batch carries, which the framework's boundary walk
+/// leaves unapplied — it validates no map key at all, and the value's `@pattern` opens with
+/// a look-ahead its engine cannot compile.
+///
+/// Read by the handler below, before anything is written, and by the gate in front of this
+/// operation (`crate::service`), which states these clauses in the SAME envelope as the ones
+/// the boundary walk found — the handler never runs for a request that walk refuses, so that
+/// gate is the only place a request breaking one of each can be stated in full.
+pub(crate) fn self_applied(
+    input: &BatchCreateRumMetricDefinitionsInput,
+) -> crate::state::validation::SelfApplied {
+    crate::state::metric_definitions_dimension_keys_self_applied(&input.metric_definitions)
+}
+
 /// The `BatchCreateRumMetricDefinitions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -220,10 +236,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // map key, and the VALUE's look-around `@pattern`, which its engine cannot compile.
         // A modelled constraint is the REQUEST's to satisfy, so one broken anywhere in the
         // list refuses the whole call, exactly as the walk refuses it for a constraint it
-        // can apply.
-        if let Some(message) =
-            crate::state::metric_definitions_dimension_keys_refusal(&input.metric_definitions)
-        {
+        // can apply ([`self_applied`]).
+        if let Some(message) = self_applied(&input).refusal() {
             return Err(
                 BatchCreateRumMetricDefinitionsErrorModeled::ValidationException(
                     ValidationException { message },

@@ -168,6 +168,21 @@ impl From<TaggingRefusal> for TagResourceError {
     }
 }
 
+/// Every constraint THIS service applies itself that `input` breaks
+/// (`crate::state::validation`), unworded: the constraints `TagMap`'s key shape declares,
+/// which the framework's boundary walk leaves unapplied — it validates no map key at all,
+/// and `TagKey`'s `@pattern` opens with a look-ahead its engine cannot compile.
+///
+/// The same violations the handler below refuses the call on, at the same paths
+/// (`crate::state::tag_map_key_self_applied` is where both go through). This is for the gate
+/// in front of this operation (`crate::service`), which states them in the SAME envelope as
+/// the ones the boundary walk found, in this frontend's own words — the handler never runs
+/// for a request that walk refuses, so that gate is the only place a request breaking one of
+/// each can be stated in full.
+pub(crate) fn self_applied(input: &TagResourceInput) -> crate::state::validation::SelfApplied {
+    crate::state::tag_map_key_self_applied(input.tags.keys().map(String::as_str))
+}
+
 impl ::std::fmt::Display for TagResourceError {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         match self {

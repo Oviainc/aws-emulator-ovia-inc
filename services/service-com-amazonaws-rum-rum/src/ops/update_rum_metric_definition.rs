@@ -126,6 +126,21 @@ impl From<UpdateRumMetricDefinitionErrorModeled> for UpdateRumMetricDefinitionEr
     }
 }
 
+/// Every constraint THIS service applies itself that `input` breaks
+/// (`crate::state::validation`), unworded: the constraints of `DimensionKeysMap`'s key and
+/// value shapes, which the framework's boundary walk leaves unapplied — it validates no map
+/// key at all, and the value's `@pattern` opens with a look-ahead its engine cannot compile.
+///
+/// Read by the handler below, before anything is written, and by the gate in front of this
+/// operation (`crate::service`), which states these clauses in the SAME envelope as the ones
+/// the boundary walk found — the handler never runs for a request that walk refuses, so that
+/// gate is the only place a request breaking one of each can be stated in full.
+pub(crate) fn self_applied(
+    input: &UpdateRumMetricDefinitionInput,
+) -> crate::state::validation::SelfApplied {
+    crate::state::dimension_keys_self_applied(&input.metric_definition)
+}
+
 /// The `UpdateRumMetricDefinition` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -180,8 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modelled constraints of the definition's `DimensionKeys` that the boundary
         // walk leaves unapplied — the map KEY's `@length`, which it applies to no map key,
         // and the VALUE's look-around `@pattern`, which its engine cannot compile. Judged
-        // FIRST, because that walk runs in front of everything a handler judges.
-        if let Some(message) = crate::state::dimension_keys_refusal(&input.metric_definition) {
+        // FIRST, because that walk runs in front of everything a handler judges
+        // ([`self_applied`]).
+        if let Some(message) = self_applied(&input).refusal() {
             return Err(UpdateRumMetricDefinitionErrorModeled::ValidationException(
                 ValidationException { message },
             )

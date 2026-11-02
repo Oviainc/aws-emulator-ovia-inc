@@ -2111,10 +2111,18 @@ const DIMENSION_KEYS_MEMBER: &str = "dimensionKeys";
 /// the shape every `DimensionKeys` member targets.
 #[must_use]
 pub fn dimension_keys_refusal(definition: &MetricDefinitionRequest) -> Option<String> {
-    constraint_refusal(&dimension_keys_violations(
-        METRIC_DEFINITION_PATH,
-        definition,
-    ))
+    dimension_keys_self_applied(definition).refusal()
+}
+
+/// The same violations, unworded, for the gate in front of the operation
+/// ([`validation::SelfApplied`]): a request that breaks one of these AND a constraint the
+/// framework's boundary walk applies is stated in ONE envelope, which the operation it
+/// would have been refused by never gets to do.
+#[must_use]
+pub fn dimension_keys_self_applied(
+    definition: &MetricDefinitionRequest,
+) -> validation::SelfApplied {
+    self_applied(dimension_keys_violations(METRIC_DEFINITION_PATH, definition))
 }
 
 /// The same, for every definition of the `MetricDefinitions` LIST a batch request carries,
@@ -2131,6 +2139,15 @@ pub fn dimension_keys_refusal(definition: &MetricDefinitionRequest) -> Option<St
 pub fn metric_definitions_dimension_keys_refusal(
     definitions: &[MetricDefinitionRequest],
 ) -> Option<String> {
+    metric_definitions_dimension_keys_self_applied(definitions).refusal()
+}
+
+/// The same violations, unworded, for the gate in front of the operation
+/// ([`dimension_keys_self_applied`] states why).
+#[must_use]
+pub fn metric_definitions_dimension_keys_self_applied(
+    definitions: &[MetricDefinitionRequest],
+) -> validation::SelfApplied {
     let violations: Vec<::aws_smithy_schema_server::constraints::Violation> = definitions
         .iter()
         .enumerate()
@@ -2147,7 +2164,7 @@ pub fn metric_definitions_dimension_keys_refusal(
         // states is sized by how many definitions a caller sent.
         .take(service_common::validation::MAX_VIOLATIONS)
         .collect();
-    constraint_refusal(&violations)
+    self_applied(violations)
 }
 
 /// Every constraint the entries of `definition`'s `DimensionKeys` break, at the paths the
@@ -2201,16 +2218,22 @@ fn dimension_keys_violations(
         .collect()
 }
 
-/// The words this service states a constraint refusal in ([`validation::message`]), or `None`
-/// when `violations` is empty and there is nothing to state.
+/// The violations the checks in this module find, as the structure BOTH callers take them
+/// in ([`validation::SelfApplied`]): the handler that words them
+/// (`validation::SelfApplied::refusal`, the one place a constraint refusal of this service is
+/// worded), and the gate in front of the operation that states them beside the framework's
+/// own (`crate::service`).
 ///
-/// The checks here have the request's MAPS rather than its lists, and a clause is nested into
-/// a list member's own clause only for a violation on a LIST element, so no rendered list is
-/// passed through.
-fn constraint_refusal(
-    violations: &[::aws_smithy_schema_server::constraints::Violation],
-) -> Option<String> {
-    validation::message(violations, &HashMap::new())
+/// No rendered list travels with them: the checks that build them judge a MAP's entries or a
+/// list of keys, and a clause is nested into a list member's own clause only for a violation
+/// on an element of a list whose element shape declares constraints.
+fn self_applied(
+    violations: Vec<::aws_smithy_schema_server::constraints::Violation>,
+) -> validation::SelfApplied {
+    validation::SelfApplied {
+        violations,
+        lists: HashMap::new(),
+    }
 }
 
 /// Why this `MetricDefinitionRequest` is not a metric definition this service can store,
@@ -2952,8 +2975,8 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// which words state it is the answering frontend's choice and not this check's: an
 /// ARN-addressed tag call keeps the framework's own sentence under that frontend's error
 /// code ([`tag_key_refusal`]), and an app-monitor call states it in this service's one
-/// constraint wording ([`constraint_refusal`]). The key is echoed into its clause exactly
-/// as the caller sent it.
+/// constraint wording (`validation::SelfApplied::refusal`). The key is echoed into its
+/// clause exactly as the caller sent it.
 fn tag_key_violations<'a>(
     keyed: impl IntoIterator<Item = (String, &'a str)>,
 ) -> Vec<::aws_smithy_schema_server::constraints::Violation> {
@@ -3013,7 +3036,8 @@ fn tag_map_keyed<'a>(keys: impl IntoIterator<Item = &'a str>) -> Vec<(String, &'
 /// [`tag_key_violations`] every tag-key check of this service goes through — this is the
 /// half that chooses that frontend's WORDS for them. The app-monitor create that seeds a
 /// monitor's map applies the same constraints at the same paths and states them in this
-/// service's own constraint wording ([`tag_keys_constraint_refusal`]), because that call is
+/// service's own constraint wording ([`tag_map_key_self_applied`] carries the violations and
+/// `validation::SelfApplied::refusal` words them), because that call is
 /// answered by the app-monitor frontend. A tag key carried by a LIST rather than by the map
 /// — the keys a removal NAMES — is judged by [`tag_key_list_refusal`], which applies these
 /// same constraints at the path a list element is reported at.
@@ -3021,18 +3045,27 @@ pub fn tag_keys_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<S
     tag_key_refusal(tag_map_keyed(keys))
 }
 
-/// Why these tag keys cannot be written by a call the APP-MONITOR frontend answers, or
-/// `None` when every one of them satisfies the constraints the modelled `TagKey` declares.
+/// The violations these tag keys commit against the modelled `TagKey`, unworded, for the
+/// two callers that word them differently.
 ///
 /// Same constraints, same paths and same completeness as [`tag_keys_refusal`] — both go
-/// through [`tag_key_violations`] over [`tag_map_keyed`] — worded through
-/// [`constraint_refusal`], which is the ONE place a constraint refusal of this service is
-/// stated ([`validation`]). So a create refused on a tag key states its clause the way the
-/// same call's refusal on any other member of the same request does: the modelled
-/// `@pattern` without the `^`/`$` pair the model writes around it, under the modelled
-/// `ValidationException` an app-monitor call answers with.
-pub fn tag_keys_constraint_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
-    constraint_refusal(&tag_key_violations(tag_map_keyed(keys)))
+/// through [`tag_key_violations`] over [`tag_map_keyed`], the constraints being `TagMap`'s
+/// key shape's rather than an operation's. What differs is the WORDS: the app-monitor
+/// frontend states them through the one place a constraint refusal of this service is worded
+/// ([`validation`], reached by `validation::SelfApplied::refusal`), so a create refused on a
+/// tag key states its clause the way the same call's refusal on any other member does — the
+/// modelled `@pattern` without the `^`/`$` pair the model writes around it, under the
+/// modelled `ValidationException` an app-monitor call answers with.
+///
+/// Handed back unworded because the GATE in front of every operation reads it too
+/// (`crate::service`): a request whose tag map carries a key the modelled `TagKey` rejects
+/// AND breaks a constraint the framework's boundary walk applies is stated in ONE envelope,
+/// which the handler it would have been refused by never gets to do.
+#[must_use]
+pub fn tag_map_key_self_applied<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+) -> validation::SelfApplied {
+    self_applied(tag_key_violations(tag_map_keyed(keys)))
 }
 
 /// The dotted member path a violation on the tag-key LIST a request carries is reported
@@ -3058,13 +3091,33 @@ const TAG_KEY_LIST_PATH: &str = "tagKeys";
 /// fix. The removal is the ARN-addressed tagging frontend's own operation, so its clauses
 /// keep that frontend's words ([`tag_key_refusal`]).
 pub fn tag_key_list_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
-    tag_key_refusal(keys.into_iter().enumerate().map(|(position, key)| {
-        let path = format!(
-            "{TAG_KEY_LIST_PATH}.{}",
-            ::aws_smithy_schema_server::constraints::path::element(position + 1)
-        );
-        (path, key)
-    }))
+    tag_key_refusal(tag_key_list_keyed(keys))
+}
+
+/// The same violations, unworded, for the gate in front of the operation
+/// ([`tag_map_key_self_applied`] states why).
+#[must_use]
+pub fn tag_key_list_self_applied<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+) -> validation::SelfApplied {
+    self_applied(tag_key_violations(tag_key_list_keyed(keys)))
+}
+
+/// The tag keys a request NAMES in a list, each paired with the dotted member path a clause
+/// reports that key at: the path the framework's walk spells a list element as, over the
+/// keys in the order the request listed them. The sibling of [`tag_map_keyed`], so the two
+/// forms of one check differ in nothing but that path.
+fn tag_key_list_keyed<'a>(keys: impl IntoIterator<Item = &'a str>) -> Vec<(String, &'a str)> {
+    keys.into_iter()
+        .enumerate()
+        .map(|(position, key)| {
+            let path = format!(
+                "{TAG_KEY_LIST_PATH}.{}",
+                ::aws_smithy_schema_server::constraints::path::element(position + 1)
+            );
+            (path, key)
+        })
+        .collect()
 }
 
 /// Why a tag write that would leave `resulting` tags on the resource `resource` names

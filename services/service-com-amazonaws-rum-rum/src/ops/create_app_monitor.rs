@@ -153,6 +153,35 @@ impl From<CreateAppMonitorErrorModeled> for CreateAppMonitorError {
     }
 }
 
+/// Every constraint THIS service applies itself that `input` breaks
+/// (`crate::state::validation`), unworded.
+///
+/// Two shapes' worth, both left unapplied by the framework's boundary walk and both
+/// declared on a shape rather than on this operation: the look-around `@pattern` of
+/// `AppMonitorName` and `AppMonitorDomain`, which `Name`, `Domain` and `DomainList`'s member
+/// target, and the constraints of `TagMap`'s key shape, which the walk validates for no map
+/// key at all. They are collected TOGETHER because a request that breaks one of each is two
+/// validation errors and not one (rule 1 of `crate::state::validation`), and in the order
+/// the input declares the members.
+///
+/// Read by the handler below, before anything is written, and by the gate in front of this
+/// operation (`crate::service`), which states these clauses in the SAME envelope as the ones
+/// the boundary walk found — the handler never runs for a request that walk refuses, so that
+/// gate is the only place a request breaking one of each can be stated in full.
+pub(crate) fn self_applied(
+    input: &CreateAppMonitorInput,
+) -> crate::state::validation::SelfApplied {
+    let mut found = crate::state::validation::app_monitor_self_applied(
+        Some(&input.name),
+        input.domain.as_deref(),
+        input.domain_list.as_deref(),
+    );
+    found.extend(crate::state::tag_map_key_self_applied(
+        input.tags.iter().flatten().map(|(key, _)| key.as_str()),
+    ));
+    found
+}
+
 /// The `CreateAppMonitor` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -201,17 +230,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Most modelled constraints (the name's and the domain's length, the domain list's
         // 1..5 length, a tag VALUE's length) are refused before this handler runs. What is
-        // left are the rules the model states in prose only, the constraints on a tag KEY,
-        // and the `@pattern`s the boundary validator cannot apply at all because they are
-        // written with look-around (`crate::state::validation`) — `AppMonitorName` and
-        // `AppMonitorDomain`, which `Name`, `Domain` and `DomainList`'s member target.
-        // Every one of them is applied before anything is written, and all of them in ONE
-        // refusal: a request that breaks two members is two validation errors.
-        if let Some(message) = crate::state::validation::app_monitor_refusal(
-            Some(&input.name),
-            input.domain.as_deref(),
-            input.domain_list.as_deref(),
-        ) {
+        // left are the rules the model states in prose only and the constraints this service
+        // applies itself — the constraints of a tag KEY, and the `@pattern`s the boundary
+        // validator cannot apply at all because they are written with look-around
+        // ([`self_applied`]). Every one of the latter is applied before anything is written,
+        // and all of them in ONE refusal: a request that breaks two members is two
+        // validation errors.
+        if let Some(message) = self_applied(&input).refusal() {
             return Err(
                 CreateAppMonitorErrorModeled::ValidationException(ValidationException { message })
                     .into(),
@@ -276,21 +301,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Tags` targets the same `TagMap` the sibling `TagResource` merges onto, so a
         // create is subject to that map's two rules and not only to the modelled
         // constraints the boundary applies: every key satisfies the constraints `TagKey`
-        // declares (which the boundary validator leaves unapplied for a map key), and the
-        // map the write leaves behind stays inside the documented per-resource ceiling.
-        // Both are refused before anything is written, under the modelled
-        // `ValidationException` an app-monitor call answers with — and the key refusal is
-        // worded by the one place a constraint refusal of this service is worded
-        // (`crate::state::validation`), which is what every other constraint clause this
-        // operation states goes through.
-        if let Some(message) =
-            crate::state::tag_keys_constraint_refusal(tags.keys().map(String::as_str))
-        {
-            return Err(
-                CreateAppMonitorErrorModeled::ValidationException(ValidationException { message })
-                    .into(),
-            );
-        }
+        // declares (which the boundary validator leaves unapplied for a map key, so
+        // [`self_applied`] above is where this call applies them, in the same envelope as
+        // every other constraint clause this operation states), and the map the write leaves
+        // behind stays inside the documented per-resource ceiling — refused here, before
+        // anything is written, under the modelled `ValidationException` an app-monitor call
+        // answers with.
         if let Some(message) = crate::state::tag_count_refusal(tags.len(), &resource_arn) {
             return Err(
                 CreateAppMonitorErrorModeled::ValidationException(ValidationException { message })
