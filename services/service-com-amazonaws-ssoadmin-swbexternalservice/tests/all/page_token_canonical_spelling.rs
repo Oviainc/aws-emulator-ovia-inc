@@ -83,7 +83,11 @@ enum Which {
 }
 
 /// Every respelling of `token` the rows drive, labelled.
-fn respellings(token: &str) -> Vec<(String, String)> {
+///
+/// `pub(crate)` so another suite asserts the same rule over the enumerations it owns
+/// (`account_assignment_creation_status_token_spelling.rs`) rather than a second copy of
+/// the spellings.
+pub(crate) fn respellings(token: &str) -> Vec<(String, String)> {
     let mut rows = vec![(
         "every hex digit upper-cased".to_string(),
         token.to_ascii_uppercase(),

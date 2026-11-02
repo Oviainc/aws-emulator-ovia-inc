@@ -17,6 +17,8 @@ mod abac_attribute_configuration;
 mod account_assignment_creation_status;
 #[path = "all/account_assignment_creation_status_list.rs"]
 mod account_assignment_creation_status_list;
+#[path = "all/account_assignment_creation_status_token_spelling.rs"]
+mod account_assignment_creation_status_token_spelling;
 #[path = "all/account_assignment_delete.rs"]
 mod account_assignment_delete;
 #[path = "all/account_assignment_deletion_status.rs"]
