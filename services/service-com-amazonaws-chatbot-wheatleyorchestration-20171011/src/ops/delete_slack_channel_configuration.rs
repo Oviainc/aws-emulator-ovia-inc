@@ -159,9 +159,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteSlackChannelConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no chat configuration with ARN {}",
-                            input.chat_configuration_arn
+                        // AWS Chatbot words the delete's not-found around the Slack
+                        // destination behind the channel, which is not how the update words
+                        // its own: one sentence per error class, not one for the service.
+                        message: Some(crate::state::slack_destination_not_found_message(
+                            &input.chat_configuration_arn,
                         )),
                     },
                 )

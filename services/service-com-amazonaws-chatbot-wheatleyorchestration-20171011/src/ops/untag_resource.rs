@@ -7,9 +7,13 @@
 //! untag is a no-op — and the keys the request does not name stay attached.
 //!
 //! `ResourceARN` is any chatbot ARN, so the resource type in the ARN decides where the tags
-//! live and how an ARN the store does not hold is refused: a chat configuration (Slack
-//! channel or Chime webhook) answers the modelled 404 `ResourceNotFoundException`, a custom
-//! action the modelled 403 `UnauthorizedException` — see [`crate::state::ChatbotResourceKind`].
+//! live — see [`crate::state::ChatbotResourceKind`]. An ARN the store holds nothing under is
+//! refused with the modelled 404 `ResourceNotFoundException` carrying the message AWS
+//! Chatbot words for a tagging operation's missing resource
+//! ([`crate::state::resource_not_found_message`]), whichever kind of resource the ARN names;
+//! a custom-action ARN outside the form this account's actions are minted under
+//! ([`crate::state::is_mintable_custom_action_arn`]) is refused as unauthorized instead,
+//! before the store is consulted.
 //!
 //! `ListTagsForResource` then reports the remaining set.
 //!
@@ -74,7 +78,8 @@
 //!   because of a server issue. Try again later.
 //! * `UnauthorizedException` (HTTP 403) — The request was rejected because it doesn't have
 //!   valid credentials for the target resource. NOT listed on this operation by the model;
-//!   widened in below, because a custom-action ARN is authorized before it is looked up.
+//!   widened in below, because AWS Chatbot was recorded answering it for a custom-action ARN
+//!   outside the form this account's actions are minted under.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -92,8 +97,9 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chatbot-wheatleyorchest
 // to construct until the model says otherwise.
 // `UnauthorizedException` is widened in through `extra_errors`: this SERVICE models it
 // (`@error("client") @httpError(403)`, and the custom-action operations list it) while the
-// model's `errors` list for UntagResource does not, and it is what a custom-action ARN this
-// account holds no action for is refused with — see `crate::state::ChatbotResourceKind`.
+// model's `errors` list for UntagResource does not, and it is what a custom-action ARN
+// outside the form this account's actions are minted under is refused with — see
+// `crate::state::is_mintable_custom_action_arn`.
 #[smithy_macros::operation_error(
     "com.amazonaws.chatbot#UntagResource",
     extra_errors = ["UnauthorizedException"]
@@ -166,32 +172,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // The ARN names the resource and its type, so the type decides which store holds the
-        // tags and — when nothing is held under that ARN — how the request is refused. A
-        // custom action is authorized against the ARN before it is looked up, so an unknown
-        // one is 403 and never discloses non-existence; a chat configuration (of either
-        // chat client) answers the 404 the model documents for this operation.
+        // tags. An ARN nothing is held under is the modelled 404 this operation declares,
+        // worded around the ARN the request carried — one sentence for every kind of chatbot
+        // resource, because that is the error class the ARN-addressed tagging operations
+        // share.
+        let not_found = || {
+            UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::resource_not_found_message(
+                    &input.resource_arn,
+                )),
+            })
+        };
         let stored_tags = match crate::state::chatbot_resource_kind(&input.resource_arn) {
             crate::state::ChatbotResourceKind::CustomAction => {
+                // An ARN outside the form this account's custom actions are minted under
+                // names no action the account can hold, so it is refused as unauthorized
+                // without consulting the store.
+                if !crate::state::is_mintable_custom_action_arn(&input.resource_arn) {
+                    return Err(UntagResourceErrorModeled::UnauthorizedException(
+                        UnauthorizedException {
+                            message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                }
                 &mut store
                     .custom_actions
                     .get_mut(&input.resource_arn)
-                    .ok_or_else(|| {
-                        UntagResourceErrorModeled::UnauthorizedException(UnauthorizedException {
-                            message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
-                        })
-                    })?
+                    .ok_or_else(not_found)?
                     .tags
             }
             crate::state::ChatbotResourceKind::ChatConfiguration
             | crate::state::ChatbotResourceKind::Other => store
                 .chat_configuration_tags_mut(&input.resource_arn)
-                .ok_or_else(|| {
-                    UntagResourceErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(format!("no resource with ARN {}", input.resource_arn)),
-                        },
-                    )
-                })?,
+                .ok_or_else(not_found)?,
         };
 
         // Detaching is by key: a key the resource does not carry leaves the set as it is, so

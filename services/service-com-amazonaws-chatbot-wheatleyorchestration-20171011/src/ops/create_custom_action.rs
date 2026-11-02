@@ -8,7 +8,9 @@
 //!
 //! A custom action is ACCOUNT-scoped, so two creates cannot hold one name for one
 //! account whichever region they are signed for: a second create for a name the store
-//! already holds is a 409 `ConflictException`, UNLESS it carries the SAME `ClientToken`
+//! already holds is a 409 `ConflictException` naming the existing action's ARN
+//! ([`crate::state::resource_already_exists_message`]), UNLESS it carries the SAME
+//! `ClientToken`
 //! as the create that minted the action. `ClientToken` is the model's
 //! `@idempotencyToken`, so that retry answers the original successful create — the same
 //! ARN, with the stored action left exactly as it was.
@@ -199,9 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             return Err(
                 CreateCustomActionErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "a custom action named {} already exists",
-                        input.action_name
+                    // The conflict names the colliding resource by its ARN, which is what the
+                    // caller can address the existing action through.
+                    message: Some(crate::state::resource_already_exists_message(
+                        &existing.custom_action_arn,
                     )),
                 })
                 .into(),

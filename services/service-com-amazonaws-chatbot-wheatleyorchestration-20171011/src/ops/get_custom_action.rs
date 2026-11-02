@@ -5,11 +5,14 @@
 //! through [`crate::state::CustomActionRecord::view`], so it reports exactly what the
 //! create (or a later update) left in the store.
 //!
-//! An ARN the store does not hold is refused with the modelled 403 `UnauthorizedException`,
-//! NOT a 404: AWS Chatbot decides a custom-action request against the ARN it names BEFORE
-//! any existence lookup, so the answer discloses nothing about whether the action exists.
-//! See [`crate::state::ChatbotResourceKind::CustomAction`], which the tagging operations
-//! answer a custom-action ARN through for the same reason.
+//! An ARN of the form a custom action of this account is minted under
+//! ([`crate::state::is_mintable_custom_action_arn`]) that the store does not hold is refused
+//! with the modelled 404 `ResourceNotFoundException`, carrying the message AWS Chatbot words
+//! for a custom action it cannot find ([`crate::state::custom_action_not_found_message`]):
+//! the action name off the requested ARN and the account serving the request. An ARN of any
+//! OTHER form — a region segment filled in, another account's id — names no action this
+//! account could hold, and is refused with the modelled 403 `UnauthorizedException` before
+//! the store is consulted.
 //!
 //! `@readonly`: it reads the store and writes nothing. A custom action is account-scoped,
 //! so its ARN names it on its own and the signing region does not narrow the lookup.
@@ -73,7 +76,9 @@
 //! * `ResourceNotFoundException` (HTTP 404) — We were unable to find the resource for your
 //!   request
 //! * `UnauthorizedException` (HTTP 403) — The request was rejected because it doesn't have
-//!   valid credentials for the target resource.
+//!   valid credentials for the target resource. Raised for an ARN outside the form this
+//!   account's custom actions are minted under; the request's signature itself is verified
+//!   before a handler runs.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -156,18 +161,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // An ARN outside the form this account's custom actions are minted under names no
+        // action the account can hold at all, so the request is refused as unauthorized
+        // without consulting the store — the authorization decision is made against the ARN.
+        if !crate::state::is_mintable_custom_action_arn(&input.custom_action_arn) {
+            return Err(
+                GetCustomActionErrorModeled::UnauthorizedException(UnauthorizedException {
+                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
         let store = state.lock();
-        // Fail closed: the authorization decision is made against the requested ARN before
-        // the store is consulted, so an ARN this account holds no custom action for is an
-        // authorization failure and never a 404 — the answer must not disclose whether the
-        // action exists. A custom action is account-scoped, so its ARN names it on its own
-        // and the signing region is not part of the lookup.
+        // An ARN of the minted form this account holds no custom action under is the modelled
+        // 404 for this operation's error class, worded around the action the ARN names. A
+        // custom action is account-scoped, so its ARN names it on its own and the signing
+        // region is not part of the lookup.
         let record = store
             .custom_actions
             .get(&input.custom_action_arn)
             .ok_or_else(|| {
-                GetCustomActionErrorModeled::UnauthorizedException(UnauthorizedException {
-                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+                GetCustomActionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::custom_action_not_found_message(
+                        &input.custom_action_arn,
+                    )),
                 })
             })?;
 

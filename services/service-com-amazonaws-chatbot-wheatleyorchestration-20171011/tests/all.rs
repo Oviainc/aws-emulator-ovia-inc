@@ -21,6 +21,8 @@ mod custom_action;
 mod custom_action_fail_closed;
 #[path = "all/custom_action_update.rs"]
 mod custom_action_update;
+#[path = "all/error_response_contract.rs"]
+mod error_response_contract;
 #[path = "all/input_constraint_refusals.rs"]
 mod input_constraint_refusals;
 #[path = "all/microsoft_teams_configured_teams.rs"]

@@ -17,12 +17,12 @@
 //!   signed for — while the SAME `ClientToken` the action was minted under makes the retry
 //!   answer the original create's ARN instead (the model's `@idempotencyToken`);
 //! * a custom action is account-scoped, so its ARN carries no region and the same
-//!   `ActionName` names one action for the whole account, and an ARN this account holds no
-//!   action under is refused with the modelled 403 `UnauthorizedException`: AWS Chatbot
-//!   decides a custom-action request against the ARN before any existence lookup, so the
-//!   answer discloses nothing about whether the action exists (see
-//!   `tests/all/custom_action_fail_closed.rs`, which asserts that rule across every
-//!   operation addressed by a custom-action ARN).
+//!   `ActionName` names one action for the whole account; an ARN of that minted form holding
+//!   no action is refused with the modelled 404 `ResourceNotFoundException`, while an ARN no
+//!   create can mint for this account (a region segment filled in, another account's id) is
+//!   refused with the modelled 403 `UnauthorizedException` before any lookup (see
+//!   `tests/all/custom_action_fail_closed.rs`, which asserts both across every operation
+//!   addressed by a custom-action ARN).
 
 use std::sync::Arc;
 
@@ -46,7 +46,11 @@ const CLIENT_TOKEN: &str = "0123456789abcdef0123456789abcdef0";
 /// A second, different token of the same shape.
 const OTHER_CLIENT_TOKEN: &str = "fedcba9876543210fedcba9876543210f";
 
-/// The modelled error an ARN this account holds no custom action under is refused with.
+/// The modelled error an ARN of the minted form holding no custom action is refused with.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The modelled error an ARN no custom action of this account can be minted under is refused
+/// with.
 const UNAUTHORIZED_EXCEPTION: &str = "UnauthorizedException";
 
 /// A SigV4 credential scope naming this service and `region`; `MultiServiceRouter`
@@ -403,8 +407,9 @@ async fn an_action_name_is_account_scoped_so_the_same_name_is_one_action_in_ever
             );
         }
 
-        // The region-qualified spelling of the same name is a well-formed ARN this
-        // account holds no action under, so it is refused rather than served.
+        // The region-qualified spelling of the same name is an ARN no create can mint for
+        // this account, so it names no target in its namespace and is refused as an
+        // authorization failure rather than served.
         let regional = arn_in_region(REGION, &action_name);
         let (status, body) = call(
             &router,
@@ -415,6 +420,12 @@ async fn an_action_name_is_account_scoped_so_the_same_name_is_one_action_in_ever
         assert_eq!(
             status, 403,
             "case {:?}: {regional} names no action, got {status} with {body}",
+            case.label
+        );
+        assert_eq!(
+            error_code(&body),
+            UNAUTHORIZED_EXCEPTION,
+            "case {:?}: {regional} must answer the modelled {UNAUTHORIZED_EXCEPTION}, got {body}",
             case.label
         );
     }
@@ -546,25 +557,24 @@ async fn a_create_past_the_store_bound_is_refused_and_persists_nothing() {
         );
 
         // Nothing was persisted for the refused name: the read of it is refused the way
-        // any ARN this account holds no action under is — fail closed, 403, disclosing
-        // nothing about whether the action exists.
+        // any ARN this account holds no action under is — the modelled 404.
         let refused = json!({"CustomActionArn": expected_arn("one-too-many")});
         let (status, body) = call_in_region(&router, region, "/get-custom-action", &refused).await;
         assert_eq!(
-            status, 403,
+            status, 404,
             "the refused name must not be stored in {region}, got {status} with {body}"
         );
         assert_eq!(
             error_code(&body),
-            UNAUTHORIZED_EXCEPTION,
-            "the refused name must answer the modelled {UNAUTHORIZED_EXCEPTION} in {region}, \
-             got {body}"
+            RESOURCE_NOT_FOUND_EXCEPTION,
+            "the refused name must answer the modelled {RESOURCE_NOT_FOUND_EXCEPTION} in \
+             {region}, got {body}"
         );
     }
 }
 
 #[tokio::test]
-async fn getting_an_arn_the_store_does_not_hold_is_refused_as_unauthorized() {
+async fn getting_an_arn_the_store_does_not_hold_is_refused_as_its_arn_form_calls_for() {
     let router = router();
     let created = create_ok(
         &router,
@@ -575,33 +585,42 @@ async fn getting_an_arn_the_store_does_not_hold_is_refused_as_unauthorized() {
     )
     .await;
 
-    // Each row is a well-formed `CustomActionArn` this account holds no action under. AWS
-    // Chatbot decides a custom-action request against the ARN BEFORE any existence
-    // lookup, so every one of them is the modelled 403 and none of them says whether an
-    // action exists — not even the one that names another account.
+    // Each row is a well-formed `CustomActionArn` this account holds no action under, with
+    // the refusal its ARN form calls for: an ARN of the minted (region-less, this-account)
+    // form is the modelled 404, while one no create can mint for this account names no target
+    // in its namespace and is the modelled 403.
     let cases = [
-        ("a name nothing was created under", expected_arn("absent")),
+        (
+            "a name nothing was created under",
+            expected_arn("absent"),
+            404,
+            RESOURCE_NOT_FOUND_EXCEPTION,
+        ),
         (
             "the created name spelled with a region segment",
             arn_in_region(OTHER_REGION, "present"),
+            403,
+            UNAUTHORIZED_EXCEPTION,
         ),
         (
             "another account's ARN for the created name",
             "arn:aws:chatbot::999999999999:custom-action/present".to_string(),
+            403,
+            UNAUTHORIZED_EXCEPTION,
         ),
     ];
 
-    for (label, arn) in cases {
+    for (label, arn, expected_status, expected_code) in cases {
         let request = json!({"CustomActionArn": arn});
         let (status, body) = call(&router, "/get-custom-action", &request).await;
         assert_eq!(
-            status, 403,
-            "case {label:?} ({arn}): expected 403, got {status} with {body}"
+            status, expected_status,
+            "case {label:?} ({arn}): expected {expected_status}, got {status} with {body}"
         );
         assert_eq!(
             error_code(&body),
-            UNAUTHORIZED_EXCEPTION,
-            "case {label:?} ({arn}): expected {UNAUTHORIZED_EXCEPTION}, got {body}"
+            expected_code,
+            "case {label:?} ({arn}): expected {expected_code}, got {body}"
         );
     }
 

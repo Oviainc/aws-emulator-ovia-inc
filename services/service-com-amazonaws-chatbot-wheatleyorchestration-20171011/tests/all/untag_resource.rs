@@ -39,11 +39,12 @@ const UNTAG_PATH: &str = "/untag-resource";
 const TAG_PATH: &str = "/tag-resource";
 const LIST_TAGS_PATH: &str = "/list-tags-for-resource";
 
-/// The modelled 404 a chat-configuration ARN the store does not hold is refused with.
+/// The modelled 404 an ARN the store does not hold is refused with, for every kind of
+/// chatbot resource the ARN can name.
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
-/// The modelled 403 a custom-action ARN this account holds no action under is refused with
-/// (the decision is made against the ARN before any existence lookup).
+/// The modelled 403 a custom-action ARN no create can mint for this account is refused with,
+/// the ARN naming no target in this account's namespace.
 const UNAUTHORIZED_EXCEPTION: &str = "UnauthorizedException";
 
 /// This service mounted alone, with the Slack workspace the rows below configure channels
@@ -455,10 +456,12 @@ async fn a_detached_key_can_be_attached_again() {
 }
 
 #[tokio::test]
-async fn an_arn_the_store_does_not_hold_is_refused_the_way_its_resource_kind_is() {
+async fn an_arn_the_store_does_not_hold_is_refused_as_its_arn_form_calls_for() {
     let emulator = emulator();
-    // The resource type in the ARN decides the refusal: a chat configuration is a 404, a
-    // custom action is decided against the ARN before any lookup and so is a 403.
+    // Every chatbot ARN of a form this account's resources are minted under that the store
+    // holds nothing under is the modelled 404; only an ARN no create can mint for this
+    // account (a region segment on an account-scoped custom action) is the authorization
+    // failure.
     let held = create(
         &emulator,
         Kind::SlackChannel,
@@ -495,8 +498,8 @@ async fn an_arn_the_store_does_not_hold_is_refused_the_way_its_resource_kind_is(
         (
             "a custom action that was never created",
             custom_action_arn("never-created"),
-            403,
-            UNAUTHORIZED_EXCEPTION,
+            404,
+            RESOURCE_NOT_FOUND_EXCEPTION,
         ),
         (
             "a region-qualified ARN for a custom action",

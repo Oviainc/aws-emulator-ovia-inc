@@ -183,9 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 UpdateSlackChannelConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no chat configuration with ARN {}",
-                            input.chat_configuration_arn
+                        // AWS Chatbot words the update's not-found around the chat
+                        // configuration itself, which is not how the delete words its own:
+                        // one sentence per error class, not one for the service.
+                        message: Some(crate::state::chat_configuration_not_found_message(
+                            &input.chat_configuration_arn,
                         )),
                     },
                 )

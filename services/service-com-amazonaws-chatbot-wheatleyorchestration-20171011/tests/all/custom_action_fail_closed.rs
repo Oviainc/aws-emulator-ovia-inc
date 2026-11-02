@@ -4,14 +4,14 @@
 //! account holds no action under it, and how a custom action's tags behave — over the wire
 //! (restJson1) through the same `MultiServiceRouter` the production router serves with.
 //!
-//! The rule every assertion here is about: AWS Chatbot decides a custom-action request
-//! against the ARN it names BEFORE any existence lookup, so a well-formed `custom-action`
-//! ARN this account holds no action under is refused with the modelled
-//! `UnauthorizedException` (HTTP 403) — on every operation that addresses it, reading it or
-//! tagging it alike — and the answer discloses nothing about whether the action exists. The
-//! resource type in the ARN is what decides that: a `chat-configuration` ARN (Slack channel
-//! or Chime webhook) keeps the modelled `ResourceNotFoundException` (HTTP 404) that the
-//! tagging operations declare.
+//! The rule every assertion here is about: an operation addressed to a chatbot resource by
+//! ARN that this account's store holds nothing under is REFUSED rather than served, with the
+//! modelled `ResourceNotFoundException` (HTTP 404) — on every operation that addresses it,
+//! reading it or tagging it alike, and whichever kind of resource the ARN names (a
+//! `custom-action` ARN exactly as a `chat-configuration` one). An ARN outside the form this
+//! account's custom actions are minted under (a custom action is account-scoped, so the
+//! minted ARN carries no region) names no target in this account's namespace at all, and is
+//! refused as the modelled `UnauthorizedException` (HTTP 403) before any lookup.
 //!
 //! The tables span the class rather than one recorded request: the refused ARNs differ in
 //! the action name's length and charset and in whether the ARN carries a region segment at
@@ -26,12 +26,12 @@ use crate::wire::{Emulator, OTHER_REGION, REGION};
 /// here so the test pins the ARN a client actually sees.
 const ACCOUNT: &str = "000000000000";
 
-/// The modelled 403 a custom-action ARN this account holds nothing for is refused with.
-const UNAUTHORIZED_EXCEPTION: &str = "UnauthorizedException";
-
-/// The modelled 404 the tagging operations answer for a chat configuration they do not
-/// hold.
+/// The modelled 404 an ARN of the minted form the store holds nothing under is refused with.
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The modelled 403 an ARN no custom action of this account can be minted under is refused
+/// with.
+const UNAUTHORIZED_EXCEPTION: &str = "UnauthorizedException";
 
 /// A custom action is account-scoped, so the ARN a create mints carries an EMPTY region
 /// segment (`state::custom_action_arn`).
@@ -63,7 +63,7 @@ fn arn_request(member: &str, path: &str, arn: &str) -> Value {
 }
 
 #[tokio::test]
-async fn a_custom_action_arn_this_account_holds_no_action_for_is_unauthorized() {
+async fn a_custom_action_arn_this_account_holds_no_action_for_is_not_found() {
     let emulator = Emulator::new();
 
     // Well-formed `CustomActionArn`s (the modelled pattern
@@ -81,20 +81,21 @@ async fn a_custom_action_arn_this_account_holds_no_action_for_is_unauthorized() 
         for (member, path) in ARN_ADDRESSED {
             let answer = emulator.call(path, &arn_request(member, path, arn)).await;
             assert_eq!(
-                answer.status, 403,
-                "case {arn:?} on {path}: expected HTTP 403, got {} with {}",
+                answer.status, 404,
+                "case {arn:?} on {path}: expected HTTP 404, got {} with {}",
                 answer.status, answer.body
             );
             assert_eq!(
                 answer.code(),
-                UNAUTHORIZED_EXCEPTION,
-                "case {arn:?} on {path}: expected the modelled {UNAUTHORIZED_EXCEPTION}, got {}",
+                RESOURCE_NOT_FOUND_EXCEPTION,
+                "case {arn:?} on {path}: expected the modelled {RESOURCE_NOT_FOUND_EXCEPTION}, \
+                 got {}",
                 answer.body
             );
         }
     }
 
-    // The same ARNs, once the action exists, are served — so the 403 above came from the
+    // The same ARNs, once the action exists, are served — so the 404 above came from the
     // store and not from the ARN itself. The create is signed for each region in turn: a
     // custom action is account-scoped, so the region the create is signed for changes
     // neither the ARN it mints nor what the ARN then answers.
@@ -132,8 +133,9 @@ async fn a_custom_action_arn_this_account_holds_no_action_for_is_unauthorized() 
             );
         }
 
-        // The region-qualified spelling of the same name names no action, so it stays
-        // refused even now that the action exists.
+        // The region-qualified spelling of the same name is an ARN no create can mint for
+        // this account, so it names no target in its namespace and stays refused as an
+        // authorization failure even now that the action exists.
         let regional = custom_action_arn_in_region(region, action_name);
         for (member, path) in ARN_ADDRESSED {
             let answer = emulator
@@ -141,9 +143,16 @@ async fn a_custom_action_arn_this_account_holds_no_action_for_is_unauthorized() 
                 .await;
             assert_eq!(
                 answer.status, 403,
-                "case {regional:?} on {path}: a region-qualified ARN names no action, got {} \
+                "case {regional:?} on {path}: an unmintable ARN names no action, got {} \
                  with {}",
                 answer.status, answer.body
+            );
+            assert_eq!(
+                answer.code(),
+                UNAUTHORIZED_EXCEPTION,
+                "case {regional:?} on {path}: expected the modelled {UNAUTHORIZED_EXCEPTION}, \
+                 got {}",
+                answer.body
             );
         }
     }
@@ -152,9 +161,9 @@ async fn a_custom_action_arn_this_account_holds_no_action_for_is_unauthorized() 
 #[tokio::test]
 async fn a_chat_configuration_arn_no_configuration_exists_for_is_still_not_found() {
     let emulator = Emulator::new();
-    // Fail-closed is the CUSTOM ACTION's answer: a chat-configuration ARN keeps the
-    // modelled 404 the tagging operations declare, so the two resource kinds stay
-    // distinguishable. Both chat clients are covered, since each keeps its own store.
+    // A chat-configuration ARN the store holds nothing under is refused exactly as a
+    // custom-action one is: the modelled 404 the tagging operations declare. Both chat
+    // clients are covered, since each keeps its own store.
     let unknown = [
         format!("arn:aws:chatbot:{REGION}:{ACCOUNT}:chat-configuration/slack-channel/never-created"),
         format!("arn:aws:chatbot:{REGION}:{ACCOUNT}:chat-configuration/chime-webhook/never-created"),

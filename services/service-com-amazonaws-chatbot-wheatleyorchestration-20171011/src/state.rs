@@ -84,15 +84,6 @@ const _: () = assert!(MAX_SLACK_CHANNEL_CONFIGURATIONS <= MAX_PAGE_SIZE);
 const _: () = assert!(MAX_CHIME_WEBHOOK_CONFIGURATIONS <= MAX_PAGE_SIZE);
 const _: () = assert!(MAX_CUSTOM_ACTIONS <= MAX_PAGE_SIZE);
 
-/// The message a fail-closed authorization refusal carries (see
-/// [`ChatbotResourceKind::CustomAction`]).
-///
-/// The decision is made against the ARN before any lookup, so the answer can say nothing
-/// about the resource — not even whether it exists. The status (403) and the
-/// `UnauthorizedException` code are the contract; this sentence is the text AWS Chatbot was
-/// recorded answering, and not a value a client may rely on.
-pub const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
-
 /// The `custom-action` resource-type segment of a chatbot ARN
 /// (`CustomActionArn`'s modelled pattern: `…:custom-action/[a-zA-Z0-9_-]{1,64}`).
 const CUSTOM_ACTION_RESOURCE_TYPE: &str = "custom-action";
@@ -105,19 +96,14 @@ const CHAT_CONFIGURATION_RESOURCE_TYPE: &str = "chat-configuration";
 /// segment of the ARN itself.
 ///
 /// The tagging operations take any chatbot ARN (`AmazonResourceName`), so they have to tell
-/// the kinds apart before they can look anything up: the resources live in different maps
-/// and, per the recorded behaviour, AWS Chatbot answers an unknown ARN differently for each
-/// kind — see [`ChatbotResourceKind::CustomAction`].
+/// the kinds apart before they can look anything up: each kind of resource lives in its own
+/// map, and a custom-action ARN is additionally checked against the form a custom action of
+/// this account is minted under ([`is_mintable_custom_action_arn`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatbotResourceKind {
-    /// A chat configuration (`chat-configuration/…`). AWS Chatbot answers an ARN of this
-    /// kind that names no configuration with the modelled 404 `ResourceNotFoundException`,
-    /// which `Update`, `Delete` and the tagging operations all do.
+    /// A chat configuration (`chat-configuration/…`), of either chat client.
     ChatConfiguration,
-    /// A custom action (`custom-action/…`). AWS Chatbot decides a custom-action request
-    /// against the ARN BEFORE any existence lookup, so an ARN of this kind that names no
-    /// custom action is refused with the modelled 403 `UnauthorizedException` and the
-    /// answer discloses nothing about whether the action exists.
+    /// A custom action (`custom-action/…`).
     CustomAction,
     /// Any other chatbot resource. Nothing in this store holds one, so it is treated as the
     /// resource it is: not found.
@@ -136,6 +122,111 @@ pub fn chatbot_resource_kind(arn: &str) -> ChatbotResourceKind {
         CHAT_CONFIGURATION_RESOURCE_TYPE => ChatbotResourceKind::ChatConfiguration,
         _ => ChatbotResourceKind::Other,
     }
+}
+
+/// The action name a `CustomActionArn` carries: the segment after the resource type
+/// (`…:custom-action/{ActionName}`, from `CustomActionArn`'s modelled pattern).
+///
+/// The name is what a custom-action operation reports back to a caller that addressed an
+/// action this account does not hold, so it is read off the ARN the request carried and
+/// never off the store.
+pub fn custom_action_name_in_arn(custom_action_arn: &str) -> &str {
+    custom_action_arn.rsplit('/').next().unwrap_or_default()
+}
+
+/// Whether `arn` is an ARN a custom action of THIS account can be minted under.
+///
+/// A custom action is account-scoped, so [`custom_action_arn`] mints
+/// `arn:aws:chatbot::{account}:custom-action/{ActionName}` — an EMPTY region segment and this
+/// account's id. An ARN of any other shape (a region segment filled in, another account's
+/// id) therefore names no custom action this account could ever hold, however well it
+/// satisfies `CustomActionArn`'s modelled pattern, and AWS Chatbot answers it as an
+/// authorization failure (403 `UnauthorizedException`, [`UNAUTHORIZED_MESSAGE`]) rather than
+/// a not-found: the request's credentials are not valid for a target the account's namespace
+/// does not contain, and the decision is made before any existence lookup. An ARN of the
+/// minted form that simply holds no action is the not-found case instead.
+///
+/// The canonical ARN is rebuilt here from the name the ARN carries, so minting and
+/// recognising an ARN cannot disagree about its form.
+pub fn is_mintable_custom_action_arn(arn: &str) -> bool {
+    arn == custom_action_arn(custom_action_name_in_arn(arn))
+}
+
+/// The message an authorization refusal carries: AWS Chatbot's recorded text for this error
+/// class, which is fixed — it names neither the request's ARN nor the account, because the
+/// decision is made against the ARN before anything is looked up.
+pub const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
+
+/// The message a custom-action operation (`GetCustomAction`) refuses an ARN this account
+/// holds no action under with.
+///
+/// AWS Chatbot words this error class around the action, not the ARN: the action name comes
+/// from the requested `CustomActionArn` and the account from the account serving the
+/// request, so nothing here is carried over from any one response.
+///
+/// `UpdateCustomAction` words the same miss differently
+/// ([`custom_action_does_not_exist_message`]): one sentence per error class, not one for the
+/// resource.
+pub fn custom_action_not_found_message(custom_action_arn: &str) -> String {
+    format!(
+        "sdk action [{}] not found for account [{}]",
+        custom_action_name_in_arn(custom_action_arn),
+        ::emulator_server::emulator_account_id()
+    )
+}
+
+/// The message `UpdateCustomAction` refuses an ARN this account holds no action under with.
+///
+/// It names the same two values as the read's message
+/// ([`custom_action_not_found_message`]) — the action off the requested ARN and the account
+/// serving the request — in the words AWS Chatbot gives the write's own error class.
+pub fn custom_action_does_not_exist_message(custom_action_arn: &str) -> String {
+    format!(
+        "Sdk action with id [{}] does not exist in account [{}]",
+        custom_action_name_in_arn(custom_action_arn),
+        ::emulator_server::emulator_account_id()
+    )
+}
+
+/// The message an ARN-addressed TAGGING operation (`TagResource`, `UntagResource`,
+/// `ListTagsForResource`) refuses an `AmazonResourceName` the store holds nothing under
+/// with.
+///
+/// These operations take any chatbot ARN, and AWS Chatbot words their not-found error
+/// around that ARN alone — the same sentence whichever kind of resource the ARN names — so
+/// the only variable part is the `ResourceARN` the request carried.
+pub fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("Resource {resource_arn} does not exist!")
+}
+
+/// The message a create refuses with when this account already holds the resource the
+/// request would mint.
+///
+/// AWS Chatbot identifies the colliding resource by its ARN rather than by the name the
+/// request carried, so the caller is handed the ARN it can address the existing resource
+/// through; the ARN is the stored resource's own.
+pub fn resource_already_exists_message(arn: &str) -> String {
+    format!("Resource with arn {arn} already exists.")
+}
+
+/// The message `DeleteSlackChannelConfiguration` refuses a `ChatConfigurationArn` no Slack
+/// channel configuration is stored under with.
+///
+/// AWS Chatbot words each chat-configuration error class on its own — the delete speaks of
+/// the Slack destination behind the channel — so this sentence is the delete's and not
+/// shared with the update's; the ARN comes from the request.
+pub fn slack_destination_not_found_message(chat_configuration_arn: &str) -> String {
+    format!("No Slack Destination exists for Wheatley Channel: {chat_configuration_arn}.")
+}
+
+/// The message `UpdateSlackChannelConfiguration` refuses a `ChatConfigurationArn` no Slack
+/// channel configuration is stored under with.
+///
+/// The update speaks of the chat configuration itself, which is why it reads differently
+/// from the delete's ([`slack_destination_not_found_message`]); the ARN comes from the
+/// request.
+pub fn chat_configuration_not_found_message(chat_configuration_arn: &str) -> String {
+    format!("Chat Configuration with ARN {chat_configuration_arn} not found.")
 }
 
 /// Per-service state for com-amazonaws-chatbot-wheatleyorchestration-20171011. A handler reaches it through [`service_state`].

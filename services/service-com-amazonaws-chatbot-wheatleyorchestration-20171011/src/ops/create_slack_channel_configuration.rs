@@ -222,9 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 CreateSlackChannelConfigurationErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "a chat configuration named {} already exists",
-                        input.configuration_name
+                    // The conflict names the colliding resource by its ARN, which is what the
+                    // caller can address the existing configuration through.
+                    message: Some(crate::state::resource_already_exists_message(
+                        &chat_configuration_arn,
                     )),
                 })
                 .into(),

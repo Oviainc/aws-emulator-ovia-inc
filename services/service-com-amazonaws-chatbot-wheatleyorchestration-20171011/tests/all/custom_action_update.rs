@@ -9,11 +9,12 @@
 //! the stored action already has one — so the stored action's definition, alias and
 //! attachments afterwards are exactly the members the request carried, an omitted optional
 //! member being cleared; what the ARN fixes (the action's name) and the tags, which only
-//! the tagging operations write, are left alone; and an ARN this account holds no action
-//! under is refused with the modelled 403 `UnauthorizedException` before the store is
-//! consulted, so the refusal discloses nothing about whether the action exists (the same
-//! fail-closed answer `tests/all/custom_action_fail_closed.rs` asserts for the other
-//! custom-action-addressed operations).
+//! the tagging operations write, are left alone; an ARN of the form this account's actions
+//! are minted under that holds no action is refused with the modelled 404
+//! `ResourceNotFoundException`, and an ARN no create can mint for this account with the
+//! modelled 403 `UnauthorizedException` (the same pair
+//! `tests/all/custom_action_fail_closed.rs` asserts for the other custom-action-addressed
+//! operations).
 //!
 //! The tables span the class rather than one recorded request: the rows differ in which
 //! optional members the update carries, in how many attachments, criteria and variables
@@ -28,7 +29,11 @@ use crate::wire::{Emulator, OTHER_REGION, REGION};
 /// here so the test pins the ARN a client actually sees.
 const ACCOUNT: &str = "000000000000";
 
-/// The modelled error an ARN this account holds no custom action under is refused with.
+/// The modelled error an ARN of the minted form holding no custom action is refused with.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The modelled error an ARN no custom action of this account can be minted under is refused
+/// with.
 const UNAUTHORIZED_EXCEPTION: &str = "UnauthorizedException";
 
 /// A custom action is account-scoped, so the ARN a create mints carries an EMPTY region
@@ -403,36 +408,64 @@ async fn an_update_is_addressed_by_arn_alone_whatever_region_it_is_signed_for() 
 }
 
 #[tokio::test]
-async fn updating_an_arn_the_store_does_not_hold_is_refused_as_unauthorized() {
+async fn updating_an_arn_the_store_does_not_hold_is_refused_as_its_arn_form_calls_for() {
     let emulator = Emulator::new();
     let present = create_baseline(&emulator, "present").await;
     let before = get_ok(&emulator, &present).await;
 
     // Each row is a well-formed `CustomActionArn` (the modelled pattern
     // `^arn:aws:chatbot:…:custom-action/[a-zA-Z0-9_-]{1,64}$`) this account holds no action
-    // under: they differ in the action name's length and charset, in whether the ARN
-    // carries a region segment and in the account, so the refusal cannot follow from the
-    // spelling of the ARN.
+    // under, with the refusal its ARN form calls for: the rows of the minted (region-less,
+    // this-account) form differ in the action name's length and charset and are the modelled
+    // 404, while a region segment or another account's id puts the ARN outside this account's
+    // namespace, which is the modelled 403 — so neither refusal follows from the spelling of
+    // the name.
     let unknown = [
-        ("a name nothing was created under", custom_action_arn("absent")),
-        ("the shortest allowed name", custom_action_arn("a")),
-        ("the longest allowed name", custom_action_arn(&"z".repeat(64))),
-        ("a mixed-case name", custom_action_arn("Mixed_Case-9")),
+        (
+            "a name nothing was created under",
+            custom_action_arn("absent"),
+            404,
+            RESOURCE_NOT_FOUND_EXCEPTION,
+        ),
+        (
+            "the shortest allowed name",
+            custom_action_arn("a"),
+            404,
+            RESOURCE_NOT_FOUND_EXCEPTION,
+        ),
+        (
+            "the longest allowed name",
+            custom_action_arn(&"z".repeat(64)),
+            404,
+            RESOURCE_NOT_FOUND_EXCEPTION,
+        ),
+        (
+            "a mixed-case name",
+            custom_action_arn("Mixed_Case-9"),
+            404,
+            RESOURCE_NOT_FOUND_EXCEPTION,
+        ),
         (
             "the created name spelled with a region segment",
             custom_action_arn_in_region(REGION, "present"),
+            403,
+            UNAUTHORIZED_EXCEPTION,
         ),
         (
             "the created name spelled with another region segment",
             custom_action_arn_in_region(OTHER_REGION, "present"),
+            403,
+            UNAUTHORIZED_EXCEPTION,
         ),
         (
             "another account's ARN for the created name",
             "arn:aws:chatbot::999999999999:custom-action/present".to_string(),
+            403,
+            UNAUTHORIZED_EXCEPTION,
         ),
     ];
 
-    for (label, arn) in &unknown {
+    for (label, arn, expected_status, expected_code) in &unknown {
         let answer = emulator
             .call(
                 "/update-custom-action",
@@ -443,24 +476,24 @@ async fn updating_an_arn_the_store_does_not_hold_is_refused_as_unauthorized() {
             )
             .await;
         assert_eq!(
-            answer.status, 403,
-            "case {label:?} ({arn}): expected HTTP 403, got {} with {}",
+            answer.status, *expected_status,
+            "case {label:?} ({arn}): expected HTTP {expected_status}, got {} with {}",
             answer.status, answer.body
         );
         assert_eq!(
             answer.code(),
-            UNAUTHORIZED_EXCEPTION,
-            "case {label:?} ({arn}): expected the modelled {UNAUTHORIZED_EXCEPTION}, got {}",
+            *expected_code,
+            "case {label:?} ({arn}): expected the modelled {expected_code}, got {}",
             answer.body
         );
 
         // A refused update creates nothing: the ARN is still one this account holds no
-        // action under, and the read says so the same fail-closed way.
+        // action under, and the read refuses it the same way.
         let read = emulator
             .call("/get-custom-action", &json!({"CustomActionArn": arn}))
             .await;
         assert_eq!(
-            read.status, 403,
+            read.status, *expected_status,
             "case {label:?} ({arn}): a refused update must persist nothing, got {} with {}",
             read.status, read.body
         );

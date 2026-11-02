@@ -47,6 +47,20 @@ impl Answer {
             .to_string()
     }
 
+    /// The CAPITALISED `Message` member of an error body.
+    ///
+    /// Which spelling an error carries is the model's: `ResourceNotFoundException` declares
+    /// `Message` while `ConflictException` declares `message` (`smithy_query`
+    /// shape=ResourceNotFoundException,ConflictException), so a suite asks for the one its
+    /// error class declares.
+    pub fn message_capitalized(&self) -> String {
+        self.body
+            .get("Message")
+            .and_then(Value::as_str)
+            .unwrap_or("<no Message member>")
+            .to_string()
+    }
+
     /// The error code an error body names (`__type`, which is how restJson1 conveys the
     /// error shape in the body) — the counterpart of [`Answer::message`].
     pub fn code(&self) -> String {

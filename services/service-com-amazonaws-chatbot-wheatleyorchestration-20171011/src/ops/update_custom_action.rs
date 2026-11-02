@@ -11,14 +11,14 @@
 //! kept. What the ARN itself fixes — the action's name — and the tags, which
 //! only the tagging operations write, are untouched.
 //!
-//! An ARN this account holds no custom action under is refused with the modelled 403
-//! `UnauthorizedException`, the same fail-closed answer every custom-action-addressed
-//! operation gives: a lookup miss is answered as an authorization failure, so the answer
-//! discloses nothing about whether the action exists. See
-//! [`crate::state::ChatbotResourceKind::CustomAction`]. The modelled
-//! `ResourceNotFoundException` is therefore never the answer for a custom action, which is
-//! what keeps the refusal from disclosing one; a chat configuration, whose ARN names
-//! another kind of resource, is the kind that keeps it.
+//! An ARN of the form a custom action of this account is minted under
+//! ([`crate::state::is_mintable_custom_action_arn`]) that this account holds no action under
+//! is refused with the modelled 404 `ResourceNotFoundException`, carrying the message AWS
+//! Chatbot words for THIS operation's error class
+//! ([`crate::state::custom_action_does_not_exist_message`], which reads differently from the
+//! read's): the action name off the requested ARN and the account serving the request. An ARN
+//! of any other form is refused with the modelled 403 `UnauthorizedException` before the
+//! store is consulted, as the read refuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -169,19 +169,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // An ARN outside the form this account's custom actions are minted under names no
+        // action the account can hold at all, so the request is refused as unauthorized
+        // without consulting the store, exactly as the read refuses it.
+        if !crate::state::is_mintable_custom_action_arn(&input.custom_action_arn) {
+            return Err(
+                UpdateCustomActionErrorModeled::UnauthorizedException(UnauthorizedException {
+                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
-        // Fail closed, exactly as the read does: a lookup miss is answered as an
-        // authorization failure rather than a 404, so the answer says nothing about
-        // whether this account holds an action under the requested ARN. A custom action
-        // is account-scoped, so its ARN names it on its own and the signing region is not
-        // part of the lookup.
+        // An ARN of the minted form this account holds no custom action under is the modelled
+        // 404, worded around the action the ARN names as AWS words it for the WRITE's error
+        // class — which is not the read's sentence. A custom action is account-scoped, so its
+        // ARN names it on its own and the signing region is not part of the lookup.
         let record = store
             .custom_actions
             .get_mut(&input.custom_action_arn)
             .ok_or_else(|| {
-                UpdateCustomActionErrorModeled::UnauthorizedException(UnauthorizedException {
-                    message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
-                })
+                UpdateCustomActionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::custom_action_does_not_exist_message(
+                            &input.custom_action_arn,
+                        )),
+                    },
+                )
             })?;
 
         // The update carries the action's whole mutable state: `Definition` is required,
