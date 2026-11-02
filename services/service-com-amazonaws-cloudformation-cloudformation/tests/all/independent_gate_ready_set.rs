@@ -41,7 +41,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{resource_status
 use smithy_server_runtime::MultiServiceRouter;
 
 /// `SignalResource` for one resource of one stack.
-async fn signal(
+pub(crate) async fn signal(
     router: &MultiServiceRouter,
     stack: &str,
     logical_id: &str,
@@ -62,7 +62,7 @@ async fn signal(
 
 /// `DescribeStackResource` for one resource: the HTTP status and the body, so a case can
 /// assert either an answer or the refusal a resource the walk has not started gets.
-async fn describe_resource(
+pub(crate) async fn describe_resource(
     router: &MultiServiceRouter,
     stack: &str,
     logical_id: &str,
@@ -79,7 +79,7 @@ async fn describe_resource(
 }
 
 /// The `ResourceStatus` a stack reports for one of its resources right now.
-async fn resource_status_of(
+pub(crate) async fn resource_status_of(
     case: &str,
     router: &MultiServiceRouter,
     stack: &str,
@@ -94,7 +94,11 @@ async fn resource_status_of(
 }
 
 /// The `StackStatus` a stack reports right now.
-async fn stack_status_of(case: &str, router: &MultiServiceRouter, stack: &str) -> String {
+pub(crate) async fn stack_status_of(
+    case: &str,
+    router: &MultiServiceRouter,
+    stack: &str,
+) -> String {
     let (http_status, body) = call(router, "DescribeStacks", &[member("StackName", stack)]).await;
     assert_eq!(
         http_status, 200,
@@ -105,10 +109,13 @@ async fn stack_status_of(case: &str, router: &MultiServiceRouter, stack: &str) -
 
 /// One gate of a row: the resource that waits for signals, the `UniqueId` of each signal its
 /// `Count` asks for, and the resources whose creation waits behind it.
-struct Gate {
-    logical_id: &'static str,
-    signals: &'static [&'static str],
-    behind: &'static [&'static str],
+///
+/// Shared with `unsignalled_gate_hold.rs`, which reads the same gates over time and declares
+/// nothing behind them.
+pub(crate) struct Gate {
+    pub(crate) logical_id: &'static str,
+    pub(crate) signals: &'static [&'static str],
+    pub(crate) behind: &'static [&'static str],
 }
 
 /// One row: a template whose gates wait on nothing and on each other not at all.

@@ -35,7 +35,7 @@ use crate::stack_lifecycle::{
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::resource_status;
 use service_com_amazonaws_cloudformation_cloudformation::state::wait_conditions::{
-    DEFAULT_SIGNAL_COUNT, DEFAULT_TIMEOUT, MAX_HELD_TIMEOUT, MAX_TIMEOUT,
+    DEFAULT_SIGNAL_COUNT, DEFAULT_TIMEOUT, MAX_TIMEOUT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -432,10 +432,10 @@ struct PolicyCase {
 }
 
 impl PolicyCase {
-    /// How long the wait is really HELD for that attribute: what it asked for, bounded by
-    /// this emulator's ceiling on an open wait ([`MAX_HELD_TIMEOUT`]).
+    /// How long the wait is really HELD for that attribute: the span it asked for, which is
+    /// the span the gated resource stays in flight for.
     fn held(&self) -> Duration {
-        self.asked_for.min(MAX_HELD_TIMEOUT)
+        self.asked_for
     }
 }
 
@@ -445,11 +445,9 @@ impl PolicyCase {
 /// The published values are that attribute's own — `Timeout` is "in ISO8601 duration
 /// format", "Default: PT5M", "Maximum: PT12H", and `Count`'s "Default: 1" — so the rows
 /// include the maximum, one hour past it, a duration whose designators go beyond hours, the
-/// degenerate zero, a value that is no duration at all, and each member not stated. What the
-/// attribute asks for is one question and how long the wait is really held for it is
-/// another: nothing but a client's own signal ends this wait, so the hold is bounded by this
-/// emulator's ceiling on an open wait ([`MAX_HELD_TIMEOUT`]) whatever longer span the
-/// attribute asked for.
+/// degenerate zero, a value that is no duration at all, and each member not stated. Nothing
+/// but a client's own signal ends this wait before the span the attribute asked for is over,
+/// so what it asks for is also how long the wait is really held.
 fn policy_cases() -> Vec<PolicyCase> {
     vec![
         PolicyCase {
@@ -536,13 +534,8 @@ async fn a_resource_signal_waits_for_what_the_attribute_states() {
         "the default wait must be inside the published maximum, got {DEFAULT_TIMEOUT:?} \
          against {MAX_TIMEOUT:?}"
     );
-    // ...and this emulator's ceiling on an open wait is inside that default, which is what
-    // makes every row above it hold for the ceiling.
-    assert!(
-        MAX_HELD_TIMEOUT < DEFAULT_TIMEOUT,
-        "the ceiling on an open wait must be inside the published default, got \
-         {MAX_HELD_TIMEOUT:?} against {DEFAULT_TIMEOUT:?}"
-    );
+    // ...and every row is held for exactly the span it asked for, which is what the hold
+    // assertion below reads off each barrier.
 
     let (router, engine) = router_with_engine();
     for case in policy_cases() {

@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_cloudformation_cloudformation::state::wait_conditions::{
-    DEFAULT_TIMEOUT, MAX_HELD_TIMEOUT, MAX_TIMEOUT,
+    DEFAULT_TIMEOUT, MAX_TIMEOUT,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::{
     resource_status, status, CANNOT_CONTINUE_UPDATE_ROLLBACK,
@@ -840,24 +840,23 @@ struct HoldCase {
 }
 
 impl HoldCase {
-    /// How long the wait is really HELD for that declaration: what it asked for, bounded by
-    /// this emulator's ceiling on an open wait.
+    /// How long the wait is really HELD for that declaration: the span it asked for, which is
+    /// the span the gated resource stays in flight for.
     fn held(&self) -> Duration {
-        self.asked_for.min(MAX_HELD_TIMEOUT)
+        self.asked_for
     }
 }
 
 /// The class the bound covers: every `Timeout` a declaration can state.
 ///
-/// Two bounds apply to each row, and the rows span both. The span the declaration ASKS for
-/// is the type's own published one: "the maximum time that can be specified for this
-/// property is 12 hours (43200 seconds)" (`AWS::CloudFormation::WaitCondition`'s
-/// `Timeout`), with the documented default where it states none — so the rows include that
-/// maximum, one second past it, and a declaration that states nothing. How long the wait is
-/// really HELD is that span bounded by this emulator's ceiling on an open wait
-/// ([`MAX_HELD_TIMEOUT`]): nothing but a client's own signal ends this wait, so a
-/// declaration that asks to hold longer is held to the ceiling — hence the rows either side
-/// of it, and the degenerate zero.
+/// The span the declaration ASKS for is the type's own published one: "the maximum time that
+/// can be specified for this property is 12 hours (43200 seconds)"
+/// (`AWS::CloudFormation::WaitCondition`'s `Timeout`), with the documented default where it
+/// states none — so the rows include that maximum, one second past it, and a declaration
+/// that states nothing, either side of the published bound, plus the degenerate zero and
+/// spans a client's poll loop measures in seconds. Nothing but a client's own signal ends
+/// this wait before the span it asked for is over, so what a declaration asks for is also
+/// how long the wait is really held.
 fn hold_cases() -> Vec<HoldCase> {
     vec![
         HoldCase {
@@ -879,16 +878,16 @@ fn hold_cases() -> Vec<HoldCase> {
             asked_for: Duration::from_secs(14),
         },
         HoldCase {
-            case: "a wait of exactly the ceiling",
-            stack: "hold-at-ceiling",
+            case: "a wait of fifteen seconds",
+            stack: "hold-fifteen",
             declared: Some("15"),
-            asked_for: MAX_HELD_TIMEOUT,
+            asked_for: Duration::from_secs(15),
         },
         HoldCase {
-            case: "a wait one second past the ceiling",
-            stack: "hold-just-past-ceiling",
+            case: "a wait of sixteen seconds",
+            stack: "hold-sixteen",
             declared: Some("16"),
-            asked_for: MAX_HELD_TIMEOUT + Duration::from_secs(1),
+            asked_for: Duration::from_secs(16),
         },
         HoldCase {
             case: "a wait of a minute and a half",
@@ -924,20 +923,13 @@ fn hold_cases() -> Vec<HoldCase> {
 }
 
 #[tokio::test]
-async fn a_wait_is_held_for_what_it_asked_bounded_by_this_emulators_ceiling() {
+async fn a_wait_is_held_for_what_it_asked() {
     // The default a declaration that states nothing falls back to is inside the type's own
     // published ceiling, so no row can be held longer than the attribute permits.
     assert!(
         DEFAULT_TIMEOUT < MAX_TIMEOUT,
         "the default wait must be inside the documented Timeout maximum, got \
          {DEFAULT_TIMEOUT:?} against {MAX_TIMEOUT:?}"
-    );
-    // ...and this emulator's ceiling on an open wait is inside both, which is what makes
-    // every row above it hold for the ceiling.
-    assert!(
-        MAX_HELD_TIMEOUT < DEFAULT_TIMEOUT,
-        "the ceiling on an open wait must be inside the documented default, got \
-         {MAX_HELD_TIMEOUT:?} against {DEFAULT_TIMEOUT:?}"
     );
 
     let (router, engine) = router_with_engine();

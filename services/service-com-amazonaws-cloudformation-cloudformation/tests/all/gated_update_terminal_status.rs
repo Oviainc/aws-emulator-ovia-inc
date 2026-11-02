@@ -30,7 +30,7 @@
 //! resource the update changes (`DependsOn`) or independent of it, how many of the signals it
 //! waits for actually arrive (none, and one of the two it asks for), and what the rollback has
 //! to undo (a changed resource alone, and a changed one beside one the update added).
-//! Declarations asking to wait LONGER than this emulator holds any open wait are the table in
+//! Declarations asking to wait a span a test cannot sit out are the table in
 //! `held_signal_waits.rs`, and the span one is held for is the table in
 //! `update_rollback_recovery.rs`.
 

@@ -69,7 +69,10 @@ async fn resource_detail(
 }
 
 /// The `ResourceStatus` the whole-stack read reports for one resource.
-async fn resource_status_in_stack(
+///
+/// Shared with `unsignalled_gate_hold.rs`, which reads the same member through the same
+/// operation, so the two cannot drift about how the whole-stack read is taken.
+pub(crate) async fn resource_status_in_stack(
     case: &str,
     router: &MultiServiceRouter,
     stack: &str,

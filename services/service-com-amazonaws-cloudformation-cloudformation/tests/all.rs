@@ -355,6 +355,8 @@ mod unprovisioned_resources;
 mod unrecognized_resource_types;
 #[path = "all/unresolvable_imports.rs"]
 mod unresolvable_imports;
+#[path = "all/unsignalled_gate_hold.rs"]
+mod unsignalled_gate_hold;
 #[path = "all/update_after_a_refused_delete.rs"]
 mod update_after_a_refused_delete;
 #[path = "all/update_rollback_of_a_refused_update.rs"]

@@ -45,11 +45,10 @@
 //! ([`crate::state::MAX_SIGNALS_PER_STACK`]). The `Timeout` a template may declare is
 //! bounded by its own documented maximum ([`MAX_TIMEOUT`]), and a declaration that states
 //! none is held to the documented default ([`DEFAULT_TIMEOUT`]) rather than to no deadline,
-//! and the wait is HELD for no longer than this emulator holds any open wait
-//! ([`MAX_HELD_TIMEOUT`]), so every wait has an instant it gives up at and no declaration
-//! holds a stack in progress past a client's poll loop. Reading the waits out of a
-//! caller-supplied body is ONE pass over it whatever it declares ([`declared`]), charged to
-//! that deployment's evaluation budget.
+//! so every wait has an instant it gives up at and no declaration holds a stack in progress
+//! for longer than the published ceiling of the property that opened it. Reading the waits
+//! out of a caller-supplied body is ONE pass over it whatever it declares ([`declared`]),
+//! charged to that deployment's evaluation budget.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -88,21 +87,8 @@ pub const MAX_TIMEOUT: Duration = Duration::from_secs(43_200);
 /// progress for ever.
 ///
 /// A declaration that DOES state a timeout waits exactly as long as it asked, bounded by
-/// [`MAX_TIMEOUT`] and by this emulator's own ceiling on an open wait
-/// ([`WaitConditionBarrier::deadline`]).
+/// [`MAX_TIMEOUT`] ([`WaitConditionBarrier::deadline`]).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// The longest this emulator HOLDS an operation at a resource-signal wait, whatever longer
-/// `Timeout` the declaration asked for.
-///
-/// This emulator's ceiling on an open wait ([`super::MAX_HELD_WAIT`]), which bounds this
-/// wait for the same reason it bounds the wait for a resource an owning service has not
-/// reported ready ([`super::stabilising::CREATE_STABILISATION_WINDOW`]): nothing but a
-/// client's own `SignalResource` call ends this wait, so a wait no call is ever going to
-/// satisfy has to fail the operation inside a client's poll loop rather than hold the stack
-/// in progress for as long as the declaration asked. Every wait the declaration asks for
-/// that is SHORTER than this is held for exactly as long as it asked.
-pub const MAX_HELD_TIMEOUT: Duration = super::MAX_HELD_WAIT;
 
 /// Which declaration opened a wait, which is what decides the operations it applies to and
 /// how its expiry is worded.
@@ -340,11 +326,17 @@ impl WaitConditionBarrier {
 
     /// The instant the wait gives up.
     ///
-    /// The `Timeout` the declaration asked for — bounded by the documented maximum its own
-    /// attribute publishes ([`MAX_TIMEOUT`]), defaulted to [`DEFAULT_TIMEOUT`] where it
-    /// states none, and held no longer than this emulator holds any open wait
-    /// ([`MAX_HELD_TIMEOUT`]), so a declaration that asks to wait longer than that still
-    /// fails inside a client's poll loop and the stack still reaches a terminal status.
+    /// The wait is HELD for the span the declaration asked for, which is the span the
+    /// resource it gates stays `*_IN_PROGRESS` — and reportable — for: nothing but a client's
+    /// own `SignalResource` call ends it before then, and that is the point of it.
+    /// "CloudFormation doesn't proceed with a stack creation or update until resources receive
+    /// the required number of signals or the timeout period is exceeded" (`SignalResource`),
+    /// so the span a client has to poll the gate in and signal it is the span its own
+    /// declaration stated. That value is already held to the maximum its property publishes
+    /// ([`MAX_TIMEOUT`]) and to the documented default where it states none
+    /// ([`DEFAULT_TIMEOUT`]) where the declaration is read ([`declared`]), so the wait runs
+    /// for exactly what the caller asked for and still has an instant it gives up at, after
+    /// which the stack reaches a terminal status.
     ///
     /// Added without unwinding: `SystemTime`'s own addition panics past the clock's range,
     /// which no bounded span can reach from an instant the operation really started at, so
@@ -352,14 +344,8 @@ impl WaitConditionBarrier {
     /// failure of the read.
     pub fn deadline(&self) -> SystemTime {
         self.opened_at
-            .checked_add(self.held_for())
+            .checked_add(self.declared.timeout)
             .unwrap_or(self.opened_at)
-    }
-
-    /// How long this wait is HELD: what the declaration asked for, bounded by this
-    /// emulator's ceiling on an open wait ([`MAX_HELD_TIMEOUT`]).
-    pub fn held_for(&self) -> Duration {
-        self.declared.timeout.min(MAX_HELD_TIMEOUT)
     }
 
     /// Whether the wait has run out at `now` — which fails the operation for a wait that is

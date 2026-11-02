@@ -1,40 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The CEILING this emulator holds a stack operation at a resource-signal wait for, end to
-//! end over the awsQuery wire.
+//! The SPAN this emulator holds a stack operation at a resource-signal wait for, end to end
+//! over the awsQuery wire.
 //!
 //! The rule: nothing but a client's own `SignalResource` call satisfies the wait a
-//! resource's declaration asks for, so an operation held at one that is never signalled
-//! still reaches a TERMINAL status — this emulator holds the wait for what the declaration
-//! asked, bounded by its own ceiling on an open wait
-//! (`state::wait_conditions::MAX_HELD_TIMEOUT`), rather than for however long the
-//! declaration asked a real deployment to wait. A client polling `DescribeStacks` therefore
-//! always learns what happened, and the whole contract behind the failure is reachable: the
-//! rollback restores the resources the update had already changed in the services that own
-//! them, drops the ones it had added, records the stack's `UPDATE_ROLLBACK_IN_PROGRESS`
-//! event, and leaves the stack able to take a further update.
+//! resource's declaration asks for, so an operation held at one that is never signalled is
+//! held for exactly the span that declaration asked for and then reaches a TERMINAL status.
+//! A client polling `DescribeStacks` therefore always learns what happened, and the whole
+//! contract behind the failure is reachable: the rollback restores the resources the update
+//! had already changed in the services that own them, drops the ones it had added, records
+//! the stack's `UPDATE_ROLLBACK_IN_PROGRESS` event, and leaves the stack able to take a
+//! further update.
 //!
 //! The rows span the class the rule generalises over: a `Timeout` spelled as a string and as
 //! a number, the maximum the type publishes, and a declaration that states none at all (held
-//! to the documented default) — every one of them asking to wait longer than this emulator
-//! holds anything — crossed with the two directions a rollback runs in, a resource the
-//! update CHANGED and one it ADDED. How long a declaration's own span is, below, at and
-//! above the ceiling, is the table in `update_rollback_recovery.rs`
-//! (`a_wait_is_held_for_what_it_asked_bounded_by_this_emulators_ceiling`) and, for a
-//! `CreationPolicy`, in `resource_signal_waits.rs`.
+//! to the documented default) — crossed with the two directions a rollback runs in, a
+//! resource the update CHANGED and one it ADDED. How long a declaration's own span is, below,
+//! at and above the published maximum, is the table in `update_rollback_recovery.rs`
+//! (`a_wait_is_held_for_what_it_asked`) and, for a `CreationPolicy`, in
+//! `resource_signal_waits.rs`; that an unsignalled gate stays reported for the whole of that
+//! span is `unsignalled_gate_hold.rs`.
 //!
-//! No case here sleeps the ceiling out: a test must not wait on a wall-clock span measured
+//! No case here sleeps its span out: a test must not wait on a wall-clock span measured
 //! in seconds, so each one moves the barrier's own `opened_at` back, exactly as
 //! `core/router/tests/all/cloudformation_provisions_acm_certificates.rs` does for the
-//! stabilisation window — first to just INSIDE the ceiling, where the wait must still hold,
-//! and then past it, where the clock owes the failure. Because every row's declared
-//! `Timeout` is far longer than the ceiling, a failure at that instant is the ceiling's and
-//! could not be the declaration's.
+//! stabilisation window — first to just INSIDE the span the declaration asked for, where the
+//! wait must still hold, and then past it, where the clock owes the failure.
 
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_cloudformation_cloudformation::state::wait_conditions::MAX_HELD_TIMEOUT;
+use service_com_amazonaws_cloudformation_cloudformation::state::wait_conditions::DEFAULT_TIMEOUT;
 use service_com_amazonaws_cloudformation_cloudformation::state::status;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -52,8 +48,11 @@ struct HeldCase {
     case: &'static str,
     stack: &'static str,
     /// `Timeout` exactly as the declaration spells it, or `None` for one that states none —
-    /// every row asks for far longer than [`MAX_HELD_TIMEOUT`].
+    /// which is held to the documented default.
     timeout: Option<Value>,
+    /// The span that `Timeout` asks the wait to run for, which is the span the rows age the
+    /// barrier against.
+    asked_for: Duration,
     /// The parameter the stack is created with, and the value it holds then.
     created: (&'static str, &'static str),
     /// The value the update writes for that parameter (the same value where the update does
@@ -69,6 +68,7 @@ fn held_cases() -> Vec<HeldCase> {
             case: "a Timeout of a minute, spelled as a string, over a changed resource",
             stack: "held-minute",
             timeout: Some(json!("60")),
+            asked_for: Duration::from_secs(60),
             created: ("/held-minute/p", "v1"),
             updated: "v2",
             added: None,
@@ -77,6 +77,7 @@ fn held_cases() -> Vec<HeldCase> {
             case: "a Timeout spelled as a number, over a changed resource",
             stack: "held-number",
             timeout: Some(json!(90)),
+            asked_for: Duration::from_secs(90),
             created: ("/held-number/p", "before"),
             updated: "after",
             added: None,
@@ -85,6 +86,7 @@ fn held_cases() -> Vec<HeldCase> {
             case: "the Timeout maximum the type publishes, over a resource the update added",
             stack: "held-maximum",
             timeout: Some(json!("43200")),
+            asked_for: Duration::from_secs(43_200),
             created: ("/held-maximum/kept", "kept"),
             updated: "kept",
             added: Some(("/held-maximum/added", "added")),
@@ -93,6 +95,7 @@ fn held_cases() -> Vec<HeldCase> {
             case: "a declaration that states no Timeout, over a changed and an added resource",
             stack: "held-unstated",
             timeout: None,
+            asked_for: DEFAULT_TIMEOUT,
             created: ("/held-unstated/p", "one"),
             updated: "two",
             added: Some(("/held-unstated/added", "added")),
@@ -135,7 +138,7 @@ fn gated_template(case: &HeldCase) -> String {
 
 /// Move every wait this stack is held at `by` further into the past, which is how a case
 /// reaches an instant the wait was already over at without waiting for it.
-fn age_the_wait(
+pub(crate) fn age_the_wait(
     engine: &std::sync::Arc<engine::InMemoryEngine>,
     stack_name: &str,
     by: Duration,
@@ -171,16 +174,17 @@ pub(crate) async fn listed_resources(router: &MultiServiceRouter, stack_name: &s
 }
 
 #[tokio::test]
-async fn an_unsignalled_wait_fails_the_update_inside_this_emulators_ceiling() {
-    // The ceiling is a span, never zero: a client that means to signal has the whole of it
-    // to do so in, which is what the "still held" step of each row reads.
-    assert!(
-        MAX_HELD_TIMEOUT >= Duration::from_secs(2),
-        "the ceiling on an open wait must leave a client room to signal, got \
-         {MAX_HELD_TIMEOUT:?}"
-    );
-
+async fn an_unsignalled_wait_fails_the_update_once_the_span_it_asked_for_is_over() {
     for case in held_cases() {
+        // The span is never zero: a client that means to signal has the whole of it to do so
+        // in, which is what the "still held" step of each row reads.
+        assert!(
+            case.asked_for >= Duration::from_secs(2),
+            "case {:?}: the span a row's declaration asks for must leave a client room to \
+             signal, got {:?}",
+            case.case,
+            case.asked_for
+        );
         let (router, engine) = router_with_engine();
         let created = template(json!({"Param": parameter(case.created.0, case.created.1)}));
         let (http_status, body) = create_stack(&router, case.stack, &created, &[]).await;
@@ -214,15 +218,15 @@ async fn an_unsignalled_wait_fails_the_update_inside_this_emulators_ceiling() {
             case.case
         );
 
-        // Just INSIDE the ceiling the wait still holds: the update is in flight, and what it
-        // changed in the owning service is what that service holds.
-        age_the_wait(&engine, case.stack, MAX_HELD_TIMEOUT - Duration::from_secs(1));
+        // Just INSIDE the span the declaration asked for the wait still holds: the update is
+        // in flight, and what it changed in the owning service is what that service holds.
+        age_the_wait(&engine, case.stack, case.asked_for - Duration::from_secs(1));
         let in_flight = status_of(&router, case.stack).await;
         assert_eq!(
             in_flight,
             status::UPDATE_IN_PROGRESS,
-            "case {:?}: expected the update to still be held one second inside the ceiling, \
-             got {in_flight:?}",
+            "case {:?}: expected the update to still be held one second inside the span it \
+             asked for, got {in_flight:?}",
             case.case
         );
         let applied = parameter_value(&router, case.created.0).await;
@@ -235,14 +239,15 @@ async fn an_unsignalled_wait_fails_the_update_inside_this_emulators_ceiling() {
             case.created.0
         );
 
-        // Past the ceiling the failure is the clock's, however much longer the declaration
-        // asked for: the stack fails, rolls back, and settles.
+        // Past the span it asked for the failure is the clock's: the stack fails, rolls back,
+        // and settles.
         age_the_wait(&engine, case.stack, Duration::from_secs(2));
         let settling = status_of(&router, case.stack).await;
         assert!(
             settling == status::UPDATE_ROLLBACK_COMPLETE
                 || settling == status::UPDATE_ROLLBACK_IN_PROGRESS,
-            "case {:?}: expected the wait to have run out past the ceiling, got {settling:?}",
+            "case {:?}: expected the wait to have run out past the span it asked for, got \
+             {settling:?}",
             case.case
         );
         wait_for_the_transition().await;

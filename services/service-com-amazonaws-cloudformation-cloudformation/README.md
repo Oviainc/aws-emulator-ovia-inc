@@ -20,10 +20,11 @@ the awsQuery wire.
 
 A create or update whose template declares an `AWS::CloudFormation::WaitCondition` waits
 for the success signals its `Count` asks for (`SignalResource` delivers them) rather than
-for that clock. It is held for the `Timeout` the declaration states, bounded by
-`state::wait_conditions::MAX_HELD_OPEN` — this emulator holds ONE stack operation open for
-at most that long, so an operation nothing signals fails inside the poll loop of the
-client driving it instead of waiting out the hours a template may ask for. A failed
+for that clock. It is held for the `Timeout` the declaration states — the span the caller
+asked for, bounded by the maximum that property publishes (twelve hours) and defaulted to
+the documented `PT5M` where it states none — so a resource nothing has signalled stays
+`*_IN_PROGRESS`, and reportable, for the whole of that span and the operation then fails
+at its deadline. A failed
 update is then rolled back to the previous stack configuration in the services that own
 its resources, which is what `UPDATE_ROLLBACK_COMPLETE` / `UPDATE_ROLLBACK_FAILED` and
 `ContinueUpdateRollback` report on (`tests/all/update_rollback_recovery.rs`).
