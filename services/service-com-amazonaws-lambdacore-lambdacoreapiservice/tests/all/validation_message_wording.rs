@@ -145,9 +145,14 @@ async fn send(router: &MultiServiceRouter, row: &Row) -> Answer {
     }
 }
 
-/// A create request naming `name`, with the simplest configuration the model accepts.
+/// A create request naming `name`, with the simplest configuration the model accepts and
+/// the operator role the service requires for that connector type.
 fn create_body(name: &str) -> Value {
-    json!({ "Name": name, "Configuration": minimal_configuration() })
+    json!({
+        "Name": name,
+        "Configuration": minimal_configuration(),
+        "OperatorRole": VALID_ROLE,
+    })
 }
 
 /// Assert `answer` is the one-clause AWS envelope for `row`.
@@ -633,6 +638,7 @@ async fn a_list_the_model_admits_is_still_accepted() {
             json!({
                 "Name": format!("lnc-accepted-{index}"),
                 "Configuration": configuration,
+                "OperatorRole": VALID_ROLE,
             }),
         )
         .await;

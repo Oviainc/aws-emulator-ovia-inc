@@ -39,8 +39,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::network_connector_lifecycle::{
-    create, delete, emulator, expected_arn, get, list_versions, minimal_configuration, text,
-    update, wait_for_the_clock, Answer,
+    create, delete, emulator, expected_arn, get, list_versions, minimal_configuration,
+    minimal_create, text, update, wait_for_the_clock, Answer,
 };
 
 /// The error code every one of these refusals carries
@@ -199,11 +199,7 @@ async fn an_identifier_that_names_no_connector_is_refused_naming_it() {
 async fn a_deleted_connector_is_refused_naming_the_identifier_that_was_asked_for() {
     let router = emulator();
     let name = "deleted-connector";
-    let created = create(
-        &router,
-        json!({ "Name": name, "Configuration": minimal_configuration() }),
-    )
-    .await;
+    let created = create(&router, minimal_create(name)).await;
     assert_eq!(
         created.status, 202,
         "expected HTTP 202 from CreateNetworkConnector, got {} with {:?}",
@@ -278,11 +274,7 @@ async fn a_deleted_connector_is_refused_naming_the_identifier_that_was_asked_for
 async fn a_version_the_connector_does_not_hold_is_refused_naming_the_qualified_identifier() {
     let router = emulator();
     let name = "versioned-connector";
-    let created = create(
-        &router,
-        json!({ "Name": name, "Configuration": minimal_configuration() }),
-    )
-    .await;
+    let created = create(&router, minimal_create(name)).await;
     assert_eq!(
         created.status, 202,
         "expected HTTP 202 from CreateNetworkConnector, got {} with {:?}",

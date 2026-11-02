@@ -36,8 +36,8 @@ use service_com_amazonaws_lambdacore_lambdacoreapiservice::ops::types::{
 };
 
 use super::network_connector_lifecycle::{
-    at, create, delete, emulator, expected_arn, get, list, list_versions, minimal_configuration,
-    text, update, vpc_egress, wait_for_the_clock, Answer,
+    at, create, delete, emulator, expected_arn, get, list, list_versions, minimal_create, text,
+    update, vpc_egress, wait_for_the_clock, Answer,
 };
 
 /// Assert that the JSON value at `pointer` is the wire form a `date-time` member requires:
@@ -126,11 +126,7 @@ fn changed_configuration() -> Value {
 async fn every_date_time_member_is_an_iso8601_string_on_the_wire() {
     let router = emulator();
     let name = "wire-shaped";
-    let created = create(
-        &router,
-        json!({ "Name": name, "Configuration": minimal_configuration() }),
-    )
-    .await;
+    let created = create(&router, minimal_create(name)).await;
     assert_eq!(
         created.status, 202,
         "expected HTTP 202 from CreateNetworkConnector, got {} with {:?}",
@@ -271,11 +267,7 @@ fn every_date_time_member_schema_reports_the_modelled_format() {
 async fn a_reported_state_always_carries_the_reason_for_it() {
     let router = emulator();
     let name = "state-reasoned";
-    let created = create(
-        &router,
-        json!({ "Name": name, "Configuration": minimal_configuration() }),
-    )
-    .await;
+    let created = create(&router, minimal_create(name)).await;
     assert_eq!(
         created.status, 202,
         "expected HTTP 202 from CreateNetworkConnector, got {} with {:?}",

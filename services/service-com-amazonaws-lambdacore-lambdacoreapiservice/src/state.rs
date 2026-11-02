@@ -15,8 +15,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    NetworkConnectorConfiguration, NetworkConnectorSummary, NetworkConnectorVersionSummary,
-    ResourceConflictException, ResourceNotFoundException, ServiceException,
+    InvalidParameterValueException, NetworkConnectorConfiguration, NetworkConnectorSummary,
+    NetworkConnectorVersionSummary, ResourceConflictException, ResourceNotFoundException,
+    ServiceException,
 };
 
 /// The region an ARN is built for when the request carries no SigV4 credential
@@ -26,6 +27,20 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The only value `NetworkConnectorType` declares: "`VPC_EGRESS` provides VPC
 /// egress connectivity", which is what a `VpcEgressConfiguration` configures.
 pub const CONNECTOR_TYPE_VPC_EGRESS: &str = "VPC_EGRESS";
+
+/// The `NetworkConnectorType` values whose connector provisions elastic network
+/// interfaces in the caller's VPC, and so cannot be created without the
+/// `OperatorRole` Lambda assumes to manage them.
+///
+/// `NetworkConnectorType` declares exactly one value
+/// ([`CONNECTOR_TYPE_VPC_EGRESS`], "provides VPC egress connectivity"), and a
+/// connector of that type is the one that owns interfaces in a caller's VPC.
+pub const CONNECTOR_TYPES_REQUIRING_OPERATOR_ROLE: &[&str] = &[CONNECTOR_TYPE_VPC_EGRESS];
+
+/// Whether a connector of this type needs an `OperatorRole` to be created.
+pub fn operator_role_is_required(connector_type: &str) -> bool {
+    CONNECTOR_TYPES_REQUIRING_OPERATOR_ROLE.contains(&connector_type)
+}
 
 /// `NetworkConnectorState$PENDING` — "Being created, resources provisioning".
 pub const STATE_PENDING: &str = "PENDING";
@@ -409,14 +424,38 @@ pub struct ComAmazonawsLambdacoreLambdacoreapiserviceState {
 }
 
 /// What an already-seen `ClientToken` produced: the connector it named and the
-/// version that call created.
+/// version that call created, plus the parameters the call carried.
 #[derive(Debug, Clone)]
 pub struct TokenOutcome {
     pub name: String,
     pub version: i64,
+    /// The parameter set the call that first presented this token carried, so a
+    /// later call presenting it can be told apart from a retry of that one.
+    pub fingerprint: TokenFingerprint,
     /// The value of [`ComAmazonawsLambdacoreLambdacoreapiserviceState::token_seq`]
     /// when this token was first remembered: the smallest one is the oldest.
     pub remembered: u64,
+}
+
+/// The parameters a call presenting a `ClientToken` asked for.
+///
+/// `@idempotencyToken` holds for the retry of "a request that completed
+/// successfully using the same client token" — the token stands for THAT
+/// request, so the service can only replay it for a call asking for the same
+/// thing. Every member a caller can vary is recorded, so a call that changed
+/// any of them is not a retry; the token itself is the key, not part of the set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenFingerprint {
+    /// The connector the request named: the `Name` a create asked for, the
+    /// `Identifier` an update addressed.
+    pub target: String,
+    /// The `Configuration` the request carried, absent when it carried none.
+    pub configuration: Option<NetworkConnectorConfiguration>,
+    /// The `OperatorRole` the request carried, absent when it carried none.
+    pub operator_role: Option<String>,
+    /// The `Tags` the request carried, ordered so two equal tag sets compare
+    /// equal whatever order they arrived in.
+    pub tags: BTreeMap<String, String>,
 }
 
 impl ComAmazonawsLambdacoreLambdacoreapiserviceState {
@@ -500,10 +539,17 @@ impl ComAmazonawsLambdacoreLambdacoreapiserviceState {
     /// fresh token each time cannot grow this map without end — a request whose
     /// token was evicted is simply treated as a request the service has not seen
     /// before.
-    pub fn remember_token(&mut self, token: String, name: String, version: i64) {
+    pub fn remember_token(
+        &mut self,
+        token: String,
+        name: String,
+        version: i64,
+        fingerprint: TokenFingerprint,
+    ) {
         if let Some(existing) = self.idempotency.get_mut(&token) {
             existing.name = name;
             existing.version = version;
+            existing.fingerprint = fingerprint;
             return;
         }
         while self.idempotency.len() >= MAX_IDEMPOTENCY_TOKENS {
@@ -525,6 +571,7 @@ impl ComAmazonawsLambdacoreLambdacoreapiserviceState {
             TokenOutcome {
                 name,
                 version,
+                fingerprint,
                 remembered: self.token_seq,
             },
         );
@@ -621,6 +668,41 @@ pub fn connector_conflict(message: String) -> ResourceConflictException {
     ResourceConflictException {
         r#type: None,
         message: Some(message),
+    }
+}
+
+/// What a name already held in this account is refused with: the `Name` is "a
+/// unique name for the network connector within your account and Region", and
+/// the sentence names the colliding name in its quoted slot.
+pub fn duplicate_connector_name(name: &str) -> ResourceConflictException {
+    connector_conflict(format!(
+        "A network connector with name '{name}' already exists in this account"
+    ))
+}
+
+/// What a `ClientToken` presented again with a different parameter set is
+/// refused with — a fixed sentence, because the conflict is between the request
+/// and one the service no longer has to describe.
+pub const TOKEN_PARAMETER_MISMATCH: &str =
+    "A request with the same client token but different parameters was already submitted";
+
+/// The `ResourceConflictException` payload for a reused `ClientToken` whose
+/// parameters are not the ones it was first presented with.
+pub fn token_parameter_mismatch() -> ResourceConflictException {
+    connector_conflict(TOKEN_PARAMETER_MISMATCH.to_string())
+}
+
+/// What a request that omits the `OperatorRole` its connector type needs is
+/// refused with: the role is "the IAM role that Lambda assumes to manage elastic
+/// network interfaces in your VPC", so a connector of a type that provisions
+/// them cannot be created without one. `connector_type` is the
+/// `NetworkConnectorType` the request's `Configuration` selects.
+pub fn operator_role_required(connector_type: &str) -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        r#type: None,
+        message: Some(format!(
+            "NetworkConnectorOperatorRole is required for {connector_type} connector type"
+        )),
     }
 }
 

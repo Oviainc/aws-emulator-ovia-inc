@@ -219,6 +219,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+
+        // What this request asks for, which is what its `ClientToken` stands
+        // for: a later call presenting the same token is a retry only when it
+        // asks for the same thing.
+        let fingerprint = crate::state::TokenFingerprint {
+            target: input.identifier.clone(),
+            configuration: input.configuration.clone(),
+            operator_role: input.operator_role.clone(),
+            tags: ::std::collections::BTreeMap::new(),
+        };
+
         let mut store = state.lock();
 
         // An `@idempotencyToken` replay reports the version that token already
@@ -228,6 +239,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .and_then(|token| store.idempotency.get(token).cloned());
         if let Some(outcome) = replayed {
+            // A token already spent on a DIFFERENT request is not a retry of
+            // it, so the service refuses the call rather than answering with a
+            // version the caller did not ask for.
+            if outcome.fingerprint != fingerprint {
+                return Err(UpdateNetworkConnectorErrorModeled::ResourceConflictException(
+                    crate::state::token_parameter_mismatch(),
+                )
+                .into());
+            }
             if let Some((connector, _)) = store.settled_mut(&outcome.name, now) {
                 if let Some(version) = connector.version(Some(outcome.version)) {
                     return Ok(UpdateNetworkConnectorOutput {
@@ -310,7 +330,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             if let Some(token) = input.client_token {
                 let name = connector.name.clone();
-                store.remember_token(token, name, current.version);
+                store.remember_token(token, name, current.version, fingerprint);
             }
             return Ok(output);
         }
@@ -391,7 +411,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let name = connector.name.clone();
         if let Some(token) = input.client_token {
-            store.remember_token(token, name, version);
+            store.remember_token(token, name, version, fingerprint);
         }
 
         Ok(output)

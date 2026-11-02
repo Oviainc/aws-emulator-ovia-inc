@@ -198,6 +198,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+
+        // The type follows from the configuration the request carries:
+        // `VPC_EGRESS` is the connector type a `VpcEgressConfiguration`
+        // configures.
+        let connector_type = match &input.configuration {
+            NetworkConnectorConfiguration::VpcEgressConfiguration(_) => {
+                crate::state::CONNECTOR_TYPE_VPC_EGRESS.to_string()
+            }
+        };
+
+        // `OperatorRole` is "the IAM role that Lambda assumes to manage elastic
+        // network interfaces in your VPC": a connector whose type provisions
+        // those interfaces cannot exist without one, so the member the model
+        // leaves optional is required for such a request. The rule is settled
+        // from the request alone, before any state is read or written.
+        if crate::state::operator_role_is_required(&connector_type)
+            && input
+                .operator_role
+                .as_deref()
+                .is_none_or(|role| role.is_empty())
+        {
+            return Err(
+                CreateNetworkConnectorErrorModeled::InvalidParameterValueException(
+                    crate::state::operator_role_required(&connector_type),
+                )
+                .into(),
+            );
+        }
+
+        // What this request asks for, which is what its `ClientToken` stands
+        // for: a later call presenting the same token is a retry only when it
+        // asks for the same thing.
+        let fingerprint = crate::state::TokenFingerprint {
+            target: input.name.clone(),
+            configuration: Some(input.configuration.clone()),
+            operator_role: input.operator_role.clone(),
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        };
+
         let mut store = state.lock();
         // Every connector this call reads or conflicts with is reported as of
         // now, so the changes the clock already owes them are materialised
@@ -212,6 +256,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .and_then(|token| store.idempotency.get(token).cloned());
         if let Some(outcome) = replayed {
+            // A token already spent on a DIFFERENT request is not a retry of
+            // it, so the service refuses the call rather than answering with a
+            // resource the caller did not ask for.
+            if outcome.fingerprint != fingerprint {
+                return Err(CreateNetworkConnectorErrorModeled::ResourceConflictException(
+                    crate::state::token_parameter_mismatch(),
+                )
+                .into());
+            }
             if let Some(connector) = store.connectors.get(&outcome.name) {
                 if let Some(version) = connector.version(Some(outcome.version)) {
                     return Ok(CreateNetworkConnectorOutput {
@@ -233,10 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already in use.
         if store.connectors.contains_key(&input.name) {
             return Err(CreateNetworkConnectorErrorModeled::ResourceConflictException(
-                crate::state::connector_conflict(format!(
-                    "A network connector named {} already exists in this account and Region",
-                    input.name
-                )),
+                crate::state::duplicate_connector_name(&input.name),
             )
             .into());
         }
@@ -259,14 +309,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_connector_id();
         let arn = crate::state::connector_arn(&region, &input.name);
-        // The type follows from the configuration the request carries:
-        // `VPC_EGRESS` is the connector type a `VpcEgressConfiguration`
-        // configures.
-        let connector_type = match &input.configuration {
-            NetworkConnectorConfiguration::VpcEgressConfiguration(_) => {
-                crate::state::CONNECTOR_TYPE_VPC_EGRESS.to_string()
-            }
-        };
         // "A newly created connector starts at version 1."
         let version = 1_i64;
         // "The network connector starts in PENDING state while ENIs are
@@ -339,7 +381,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = connector.name.clone();
         store.connectors.insert(name.clone(), connector);
         if let Some(token) = input.client_token {
-            store.remember_token(token, name, version);
+            store.remember_token(token, name, version, fingerprint);
         }
 
         Ok(output)

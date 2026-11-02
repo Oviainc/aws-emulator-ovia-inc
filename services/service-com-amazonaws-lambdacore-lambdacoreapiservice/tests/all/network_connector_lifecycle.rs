@@ -223,6 +223,23 @@ pub(crate) fn minimal_configuration() -> Value {
     vpc_egress(&["subnet-0123456789abcdef0"], &[], None, None)
 }
 
+/// An `OperatorRole` `NetworkConnectorRoleArn`'s expression admits.
+///
+/// A create carries one because the service requires it for the connector type a
+/// `VpcEgressConfiguration` selects: the role is what "Lambda assumes to manage elastic
+/// network interfaces in your VPC".
+pub(crate) const OPERATOR_ROLE: &str = "arn:aws:iam::000000000000:role/LambdaNetworkConnectorOperator";
+
+/// The simplest create request the service accepts: a name, the minimal configuration and
+/// the operator role that connector type requires.
+pub(crate) fn minimal_create(name: &str) -> Value {
+    json!({
+        "Name": name,
+        "Configuration": minimal_configuration(),
+        "OperatorRole": OPERATOR_ROLE,
+    })
+}
+
 /// Assert that every member `expected` carries is reported identically under `pointer` of
 /// `observed` — a member the request left out is not asserted, because an absent optional
 /// member is not the same claim as a present one.
@@ -251,8 +268,12 @@ async fn a_created_connector_is_reported_from_what_was_stored() {
     let operator_role = "arn:aws:iam::000000000000:role/LambdaNetworkConnectorOperator";
     let cases = vec![
         (
-            "only the required members",
-            json!({ "Name": "minimal", "Configuration": minimal_configuration() }),
+            "only the members a create cannot omit",
+            json!({
+                "Name": "minimal",
+                "Configuration": minimal_configuration(),
+                "OperatorRole": operator_role,
+            }),
         ),
         (
             "several subnets and security groups, IPv4, MicroVm",
@@ -282,6 +303,7 @@ async fn a_created_connector_is_reported_from_what_was_stored() {
                     Some("WebFunction"),
                 ),
                 "Tags": { "env": "test", "team": "networking" },
+                "OperatorRole": operator_role,
             }),
         ),
         (
@@ -433,11 +455,7 @@ async fn a_created_connector_is_reported_from_what_was_stored() {
 async fn a_new_connector_is_pending_until_the_clock_owes_it_active() {
     let router = emulator();
     let started = Instant::now();
-    let created = create(
-        &router,
-        json!({ "Name": "provisioning", "Configuration": minimal_configuration() }),
-    )
-    .await;
+    let created = create(&router, minimal_create("provisioning")).await;
     assert_eq!(
         at(&created.body, "/State"),
         json!("PENDING"),
@@ -502,6 +520,7 @@ async fn a_replayed_client_token_returns_the_same_connector() {
     let request = json!({
         "Name": "idempotent",
         "Configuration": minimal_configuration(),
+        "OperatorRole": OPERATOR_ROLE,
         "ClientToken": "token-one",
     });
 
@@ -534,6 +553,7 @@ async fn a_replayed_client_token_returns_the_same_connector() {
         json!({
             "Name": "idempotent",
             "Configuration": minimal_configuration(),
+            "OperatorRole": OPERATOR_ROLE,
             "ClientToken": "token-two",
         }),
     )
@@ -786,11 +806,7 @@ async fn each_configuration_change_appends_a_version_and_a_no_op_does_not() {
 #[tokio::test]
 async fn an_identifier_resolves_by_name_id_and_arn() {
     let router = emulator();
-    let created = create(
-        &router,
-        json!({ "Name": "resolvable", "Configuration": minimal_configuration() }),
-    )
-    .await;
+    let created = create(&router, minimal_create("resolvable")).await;
     let id = text(&created.body, "/Id");
     let arn = expected_arn("resolvable");
 
@@ -866,11 +882,7 @@ async fn listing_pages_without_duplicates_and_filters_by_state() {
         "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
     ];
     for name in names {
-        let created = create(
-            &router,
-            json!({ "Name": name, "Configuration": minimal_configuration() }),
-        )
-        .await;
+        let created = create(&router, minimal_create(name)).await;
         assert_eq!(
             created.status, 202,
             "creating {name} must succeed, got {} with {:?}",
@@ -938,11 +950,7 @@ async fn listing_pages_without_duplicates_and_filters_by_state() {
 #[tokio::test]
 async fn deleting_removes_the_connector_and_its_versions() {
     let router = emulator();
-    let created = create(
-        &router,
-        json!({ "Name": "doomed", "Configuration": minimal_configuration() }),
-    )
-    .await;
+    let created = create(&router, minimal_create("doomed")).await;
     let id = text(&created.body, "/Id");
     let arn = expected_arn("doomed");
     wait_for_the_clock();
@@ -1078,11 +1086,7 @@ async fn deleting_removes_the_connector_and_its_versions() {
     );
 
     // And the name is free again, with a fresh identity.
-    let recreated = create(
-        &router,
-        json!({ "Name": "doomed", "Configuration": minimal_configuration() }),
-    )
-    .await;
+    let recreated = create(&router, minimal_create("doomed")).await;
     assert_eq!(
         recreated.status, 202,
         "the name a deleted connector held is free again, got {} with {:?}",
@@ -1101,11 +1105,7 @@ async fn deleting_removes_the_connector_and_its_versions() {
 #[tokio::test]
 async fn version_listing_pages_and_filters() {
     let router = emulator();
-    create(
-        &router,
-        json!({ "Name": "paged", "Configuration": minimal_configuration() }),
-    )
-    .await;
+    create(&router, minimal_create("paged")).await;
     wait_for_the_clock();
     for subnets in [
         vec!["subnet-0fedcba9876543210"],
@@ -1202,6 +1202,7 @@ async fn remembered_client_tokens_stay_bounded() {
         json!({
             "Name": "bounded",
             "Configuration": minimal_configuration(),
+            "OperatorRole": OPERATOR_ROLE,
             "ClientToken": "token-create",
         }),
     )
@@ -1249,12 +1250,13 @@ async fn remembered_client_tokens_stay_bounded() {
          most {MAX_IDEMPOTENCY_TOKENS} of them, got {remembered}"
     );
 
-    // The most recent token is one of those kept, and it still replays.
+    // The most recent token is one of those kept, and it still replays the request it was
+    // first presented with.
     let replay = update(
         &router,
         "bounded",
         json!({
-            "Configuration": vpc_egress(&["subnet-0fedcba9876543210"], &[], None, None),
+            "Configuration": minimal_configuration(),
             "ClientToken": last_token,
         }),
     )

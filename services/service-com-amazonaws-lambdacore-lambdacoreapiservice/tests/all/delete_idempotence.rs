@@ -33,8 +33,8 @@ use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::network_connector_lifecycle::{
-    at, create, delete, emulator, expected_arn, get, list, minimal_configuration, text, update,
-    vpc_egress, wait_for_the_clock, Answer,
+    at, create, delete, emulator, expected_arn, get, list, minimal_configuration, minimal_create,
+    text, update, vpc_egress, wait_for_the_clock, Answer, OPERATOR_ROLE,
 };
 
 /// The state `DeleteNetworkConnectorResponse$State` reports — "the State field is typically
@@ -47,7 +47,11 @@ const DELETING: &str = "DELETING";
 async fn active_connector(router: &MultiServiceRouter, name: &str, subnets: &[&str]) -> String {
     let created = create(
         router,
-        json!({ "Name": name, "Configuration": vpc_egress(subnets, &[], None, None) }),
+        json!({
+            "Name": name,
+            "Configuration": vpc_egress(subnets, &[], None, None),
+            "OperatorRole": OPERATOR_ROLE,
+        }),
     )
     .await;
     assert_eq!(
@@ -355,11 +359,7 @@ async fn a_freed_name_rebinds_while_the_old_id_answers_a_repeat_delete() {
     assert_accepted("the first delete", &accepted, &arn, name, &first_id);
     wait_for_the_clock();
 
-    let recreated = create(
-        &router,
-        json!({ "Name": name, "Configuration": minimal_configuration() }),
-    )
-    .await;
+    let recreated = create(&router, minimal_create(name)).await;
     assert_eq!(
         recreated.status, 202,
         "the name a deleted connector held is free again, got {} with {:?}",
@@ -416,11 +416,7 @@ async fn the_first_read_after_a_transition_falls_due_reports_the_reached_state()
     // Provisioning: the create answers PENDING, and the FIRST call after the span is the
     // one that reports ACTIVE.
     let router = emulator();
-    let created = create(
-        &router,
-        json!({ "Name": "settling", "Configuration": minimal_configuration() }),
-    )
-    .await;
+    let created = create(&router, minimal_create("settling")).await;
     assert_eq!(
         text(&created.body, "/State"),
         "PENDING",
@@ -446,11 +442,7 @@ async fn the_first_read_after_a_transition_falls_due_reports_the_reached_state()
     // The same, with NO read before the span elapses: the transition is not waiting for an
     // earlier call to materialise it.
     let router = emulator();
-    create(
-        &router,
-        json!({ "Name": "unread", "Configuration": minimal_configuration() }),
-    )
-    .await;
+    create(&router, minimal_create("unread")).await;
     wait_for_the_clock();
     let first_read = get(&router, "unread").await;
     assert_eq!(
