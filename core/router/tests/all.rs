@@ -20,6 +20,11 @@
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `c…` span (where every cloudformation suite lands) are both regions
+// concurrently landing suites add their line to.
+#[path = "all/cloudformation_deployed_domain_index_lifecycle.rs"]
+mod cloudformation_deployed_domain_index_lifecycle;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `g…` span (beside the other glue suites) are both regions concurrently landing
 // suites add their line to.
 #[path = "all/glue_studio_notebook_catalog_through_the_router.rs"]
