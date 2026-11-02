@@ -486,8 +486,10 @@ fn tag_cases() -> Vec<TagCase> {
         TagCase {
             // A removal naming only keys the resource does not carry, several
             // at once: nothing goes. (A request with NO `tagKeys` parameter at
-            // all is refused by the shared REST route lookup before any handler
-            // runs — its own issue — so the empty list is not a row here.)
+            // all names no removal at all: it leaves a `@required` member
+            // unbound and is the modelled `BadRequestException` naming it, which
+            // `absent_required_query_parameter.rs` pins, so the empty list is
+            // not a row in this table of writes that are applied.)
             name: "wc-tags-no-matching-keys-removed",
             created_with: &[("env", "probe")],
             writes: &[TagWrite::Remove(&["absent-one", "absent-two"])],

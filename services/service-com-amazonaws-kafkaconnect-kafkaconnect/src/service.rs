@@ -116,6 +116,15 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// (`service_common::addresses_modeled_http_route`) against the route its OWN input
     /// schema's `@http` binding gives it, so this seam cannot drift from the model, and an
     /// operation can only ever serve the route the model binds to it.
+    ///
+    /// What this list cannot read off the model is WHICH operations belong in it: the
+    /// framework's routing table is keyed by routing key and hands back erased operations
+    /// (`smithy_server_runtime::OperationRoutingTable`, whose surface is `new`/
+    /// `add_operation`/`get`, and `ErasedOperation`, which exposes no input schema), so the
+    /// candidates have to be named here. `tests/all/required_query_parameter_routes.rs`
+    /// walks the model for that class and drives every route it finds, so a model that
+    /// binds such a member on an operation this list does not hold fails that suite instead
+    /// of answering a client "not implemented".
     fn query_keyed_operation(
         &self,
         req: &aws_smithy_runtime_api::http::Request,

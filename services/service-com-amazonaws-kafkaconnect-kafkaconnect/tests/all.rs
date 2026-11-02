@@ -59,6 +59,8 @@ mod page_token_carries_the_filter_that_narrowed_it;
 mod region_scoping;
 #[path = "all/removal_start_is_one_rule.rs"]
 mod removal_start_is_one_rule;
+#[path = "all/required_query_parameter_routes.rs"]
+mod required_query_parameter_routes;
 #[path = "all/restart_connector_scope.rs"]
 mod restart_connector_scope;
 #[path = "all/state_roundtrip.rs"]

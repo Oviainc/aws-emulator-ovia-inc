@@ -19,14 +19,23 @@
 //!   — `UpdateConnector` (`currentVersion`, a string) and `UntagResource` (`tagKeys`, a
 //!   list), the two the model declares
 //!   (`smithy_query(query="operation", operation="UpdateConnector,UntagResource")`);
-//! * every way a request can leave that member unbound: no query string at all, a query
-//!   string carrying only other parameters, and one carrying the parameter's name in
-//!   another case (query names are matched literally);
+//! * every way a request can leave that member unbound: no query string at all, an empty
+//!   query string, a query string carrying only other parameters, one carrying the
+//!   parameter's name in another case (query names are matched literally), one carrying
+//!   only the parameter's bare name, and one carrying that name as another parameter's
+//!   VALUE;
 //! * each resource kind the shared `/v1/tags/{resourceArn}` route addresses;
+//! * every kind of value the other, PATH-bound `@required` member can carry — one naming
+//!   a stored resource, a well-formed ARN naming none, an ARN of another service and a
+//!   value that is no ARN at all — because the absent query member is refused at the
+//!   request boundary, so the answer is the same refusal whatever the rest of the request
+//!   names and whatever the handler would have made of it;
 //! * the contrast cases the rule turns on — the same routes WITH the member, which are
-//!   served; the member present but carrying a value the operation refuses, which is the
-//!   operation's own refusal and not this one; and a method and path the model binds no
-//!   route for at all, which keeps the framework's own answer.
+//!   served; the member present but carrying a value the operation refuses, and the same
+//!   resource kinds with the member bound, which are the operation's OWN refusals (its
+//!   404 for a resource that is absent, its 400 for a value that is no ARN) and not this
+//!   one; and a method and path the model binds no route for at all, which keeps the
+//!   framework's own answer.
 //!
 //! Every case drives the emulator the way a client does: a buffered `restJson1` request
 //! through the same router the production binary assembles, with the response read back
@@ -39,7 +48,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_kafkaconnect_kafkaconnect::state::TRANSITION_SPAN;
+use service_com_amazonaws_kafkaconnect_kafkaconnect::state::{
+    INVALID_ARN, RESOURCE_DOES_NOT_EXIST, TRANSITION_SPAN,
+};
 use service_com_amazonaws_kafkaconnect_kafkaconnect::EmulatedService;
 
 /// A SigV4 credential scope naming this service and the region every minted ARN carries.
@@ -296,9 +307,11 @@ async fn an_absent_required_query_member_is_the_modelled_bad_request_naming_it()
         });
     }
     for (shape, query) in [
+        ("nothing at all", ""),
         ("only another parameter", "maxResults=10"),
         ("the parameter's name in another case", "currentversion=1"),
         ("a parameter whose name only starts the same", "currentVersionX=1"),
+        ("the parameter's name as another parameter's value", "filter=currentVersion"),
     ] {
         rows.push(Unbound {
             case: format!("UpdateConnector with a query string carrying {shape}"),
@@ -322,13 +335,22 @@ async fn an_absent_required_query_member_is_the_modelled_bad_request_naming_it()
             body: Value::Null,
             member: "tagKeys",
         });
-        rows.push(Unbound {
-            case: format!("UntagResource on {kind} with the parameter's name in another case"),
-            method: "DELETE",
-            path: format!("/v1/tags/{}?tagkeys=env", label(arn)),
-            body: Value::Null,
-            member: "tagKeys",
-        });
+        for (shape, query) in [
+            ("nothing at all", ""),
+            ("the parameter's name in another case", "tagkeys=env"),
+            ("a parameter whose name only starts the same", "tagKeysToKeep=env"),
+            ("the parameter's name as another parameter's value", "filter=tagKeys"),
+        ] {
+            rows.push(Unbound {
+                case: format!(
+                    "UntagResource on {kind} with a query string carrying {shape}"
+                ),
+                method: "DELETE",
+                path: format!("/v1/tags/{}?{query}", label(arn)),
+                body: Value::Null,
+                member: "tagKeys",
+            });
+        }
     }
 
     for row in &rows {
@@ -437,6 +459,129 @@ async fn an_absent_required_query_member_is_the_modelled_bad_request_naming_it()
     assert_eq!(
         reported, expected,
         "the untag must remove exactly the key it named, got {reported:?}"
+    );
+}
+
+/// One value the PATH-bound `@required` member of either route can carry, and what the
+/// operation answers a request that carries it AND the query member the route needs.
+struct PathValue {
+    /// The case name, for the assertion messages.
+    case: &'static str,
+    /// The `@httpLabel` value, unencoded.
+    resource: String,
+    /// The status the operation's own answer carries once it is reached.
+    served_status: u16,
+    /// The reason that answer's message carries.
+    served_reason: &'static str,
+}
+
+#[tokio::test]
+async fn the_absent_query_member_is_refused_before_the_handler_judges_the_rest() {
+    let emulator = emulator();
+    let (connector, _) = held_resources(&emulator).await;
+
+    // The absent member is refused at the request BOUNDARY, so the answer cannot depend on
+    // what the rest of the request names: the same refusal is due for a path label naming a
+    // resource this emulator holds, a well-formed ARN of this service holding nothing, an
+    // ARN of another service, and a value that is no ARN at all — each of which the handler
+    // itself would have answered differently.
+    let rows = [
+        PathValue {
+            case: "a resource this emulator holds",
+            resource: connector.clone(),
+            served_status: 204,
+            served_reason: "",
+        },
+        PathValue {
+            case: "a well-formed ARN of this service holding nothing",
+            resource: format!(
+                "arn:aws:kafkaconnect:{REGION}:{ACCOUNT}:connector/absent-query-ghost/\
+                 11111111-2222-3333-4444-555555555555-1"
+            ),
+            served_status: 404,
+            served_reason: RESOURCE_DOES_NOT_EXIST,
+        },
+        PathValue {
+            case: "an ARN of another service",
+            resource: "arn:aws:s3:::absent-query-bucket".to_string(),
+            served_status: 400,
+            served_reason: INVALID_ARN,
+        },
+        PathValue {
+            case: "a value that is no ARN at all",
+            resource: "absent-query-not-an-arn".to_string(),
+            served_status: 400,
+            served_reason: INVALID_ARN,
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let (status, answered) = call(
+            &emulator,
+            "DELETE",
+            &format!("/v1/tags/{}", label(&row.resource)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: an absent tagKeys is the modelled 400 whatever the path names, \
+             got {status} {answered}"
+        );
+        assert!(
+            error_code(&answered).contains(BAD_REQUEST),
+            "case {case:?}: expected {BAD_REQUEST}, got {answered}"
+        );
+        let message = text(&answered, "message");
+        assert!(
+            message.contains("tagKeys"),
+            "case {case:?}: expected a message naming the absent member, got {message:?}"
+        );
+        // The refusal is the BOUNDARY's, so none of the handler's own reasons for this
+        // path value can be in it: the handler never ran.
+        for reason in [RESOURCE_DOES_NOT_EXIST, INVALID_ARN] {
+            assert!(
+                !message.contains(reason),
+                "case {case:?}: the absent member is refused before the handler judges \
+                 {reason:?}, got {message:?}"
+            );
+        }
+
+        // And the SAME path value WITH the member bound is the operation's own answer, so
+        // the route really is served and the precedence above is a precedence and not an
+        // operation that never runs.
+        let (status, answered) = call(
+            &emulator,
+            "DELETE",
+            &format!("/v1/tags/{}?tagKeys=env", label(&row.resource)),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            status, row.served_status,
+            "case {case:?}: with tagKeys bound, expected HTTP {}, got {status} {answered}",
+            row.served_status
+        );
+        let message = text(&answered, "message");
+        assert!(
+            message.contains(row.served_reason),
+            "case {case:?}: with tagKeys bound, expected a message carrying {:?}, got \
+             {message:?}",
+            row.served_reason
+        );
+    }
+
+    // The one row naming a resource this emulator holds removed exactly the key the served
+    // call named, and the refused call before it removed nothing.
+    let reported = tags_of(&emulator, &connector).await;
+    let expected: BTreeMap<String, String> = created_tag_map()
+        .into_iter()
+        .filter(|(key, _)| key != "env")
+        .collect();
+    assert_eq!(
+        reported, expected,
+        "only the served untag may change the stored tags, got {reported:?}"
     );
 }
 
