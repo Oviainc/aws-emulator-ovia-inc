@@ -69,6 +69,8 @@ mod minted_arn_region_is_bounded;
 mod minted_hypervisor_identity;
 #[path = "all/minted_identity_is_never_reused.rs"]
 mod minted_identity_is_never_reused;
+#[path = "all/minted_resource_id_form.rs"]
+mod minted_resource_id_form;
 #[path = "all/missing_resource_refusal_is_one_answer.rs"]
 mod missing_resource_refusal_is_one_answer;
 #[path = "all/negative_paths.rs"]

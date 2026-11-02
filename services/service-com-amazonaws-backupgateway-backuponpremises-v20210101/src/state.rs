@@ -195,6 +195,14 @@ pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
 /// ([`minted_resource_id`], [`minted_resource_sequence`]), so the two cannot drift.
 const GATEWAY_ID_PREFIX: &str = "bgw-";
 
+/// How many hex digits the body of a minted gateway id carries: the sixteen of
+/// `bgw-0000000000000000`.
+///
+/// Beside the prefix, because the prefix and the width are the two halves of ONE
+/// identifier form, and that form belongs to the resource kind — see
+/// [`MintedResource::id_body_digits`].
+const GATEWAY_ID_DIGITS: usize = 16;
+
 /// The ARN resource type of a hypervisor: `hypervisor/<id>`.
 ///
 /// The hypervisor is the second resource this service's ARNs name
@@ -204,8 +212,16 @@ const GATEWAY_ID_PREFIX: &str = "bgw-";
 pub const HYPERVISOR_RESOURCE_TYPE: &str = "hypervisor";
 
 /// The id prefix of a hypervisor this store minted, for the same reason as
-/// [`GATEWAY_ID_PREFIX`].
-const HYPERVISOR_ID_PREFIX: &str = "hv-";
+/// [`GATEWAY_ID_PREFIX`]: the `hype-` of `hypervisor/hype-1a2b3c4d`, which is the prefix
+/// a hypervisor identity of this service carries on the wire.
+const HYPERVISOR_ID_PREFIX: &str = "hype-";
+
+/// How many hex digits the body of a minted hypervisor id carries: the eight of
+/// `hype-1a2b3c4d`, the width a hypervisor identity of this service is served with.
+///
+/// Narrower than [`GATEWAY_ID_DIGITS`] because the width goes with the kind, not with the
+/// store — see [`MintedResource::id_body_digits`].
+const HYPERVISOR_ID_DIGITS: usize = 8;
 
 /// The ARN resource type of a virtual machine: `vm/<id>`.
 ///
@@ -218,6 +234,13 @@ pub const VIRTUAL_MACHINE_RESOURCE_TYPE: &str = "vm";
 /// The id prefix of a virtual machine this store minted, for the same reason as
 /// [`GATEWAY_ID_PREFIX`].
 const VIRTUAL_MACHINE_ID_PREFIX: &str = "vm-";
+
+/// How many hex digits the body of a minted virtual-machine id carries, for the same
+/// reason as [`GATEWAY_ID_DIGITS`]: sixteen, a body of the same order as the one the
+/// modelled `VirtualMachine$ResourceArn` doc illustrates (`vm/vm-0000ABCDEFGIJKL`,
+/// thirteen characters behind the prefix), which is the only thing said about a machine
+/// id's spelling anywhere.
+const VIRTUAL_MACHINE_ID_DIGITS: usize = 16;
 
 /// `ErrorCode` for a well-formed hypervisor ARN that names no hypervisor, and the
 /// sentence that states it. See [`MissingResource`].
@@ -1638,6 +1661,22 @@ impl MintedResource {
             Self::VirtualMachine => VIRTUAL_MACHINE_ID_PREFIX,
         }
     }
+
+    /// How many hex digits the BODY of an id of this kind carries — the eight of
+    /// `hype-1a2b3c4d`, the sixteen of `bgw-0000000000000000`.
+    ///
+    /// A property of the KIND, beside its prefix: each resource this service names has
+    /// its own identifier form on the wire, so a kind's width is asked of the kind rather
+    /// than being one number every mint of this store shares. A sequence too large for
+    /// that width simply renders wider, so the width pads an id, it never truncates one
+    /// and no two sequences of a kind can collide.
+    fn id_body_digits(self) -> usize {
+        match self {
+            Self::Gateway => GATEWAY_ID_DIGITS,
+            Self::Hypervisor => HYPERVISOR_ID_DIGITS,
+            Self::VirtualMachine => VIRTUAL_MACHINE_ID_DIGITS,
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-backupgateway-backuponpremises-v20210101. A handler reaches it through [`service_state`].
@@ -2612,8 +2651,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         if parts.resource_type != resource_type {
             return false;
         }
-        let Some(sequence) = minted_resource_sequence(parts.resource_id, resource.id_prefix())
-        else {
+        let Some(sequence) = minted_resource_sequence(parts.resource_id, resource) else {
             return false;
         };
         // Comparing against the ARN this store WOULD mint for that sequence in that region
@@ -2660,7 +2698,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             .next_resource_ids
             .entry((resource, region.clone()))
             .or_insert(floor);
-        let id = minted_resource_id(resource.id_prefix(), *sequence);
+        let id = minted_resource_id(resource, *sequence);
         let arn = minted_resource_arn(resource, &region, *sequence);
         *sequence += 1;
         (id, arn)
@@ -2987,14 +3025,24 @@ fn decode_page_token(
         .then(|| boundary.to_string())
 }
 
-/// One resource id as this store mints them: `prefix` followed by `sequence` in 16 hex
-/// digits, the `bgw-0000000000000000` of `gateway/bgw-0000000000000000`.
+/// One resource id as this store mints them: the `resource` kind's id prefix followed by
+/// `sequence` in that kind's hex width — the `hype-00000000` of
+/// `hypervisor/hype-00000000`, the `bgw-0000000000000000` of
+/// `gateway/bgw-0000000000000000`.
+///
+/// The prefix AND the width come from the kind ([`MintedResource::id_prefix`],
+/// [`MintedResource::id_body_digits`]), so each resource is minted in the identifier form
+/// that resource is served in rather than in one form shared across kinds.
 ///
 /// The ONE rendering of a minted id — every mint of this store goes through it, and
 /// [`minted_resource_sequence`] reads it back — so the form an id has and the form a
 /// resumed page boundary is checked against cannot drift apart.
-fn minted_resource_id(prefix: &str, sequence: u64) -> String {
-    format!("{prefix}{sequence:016x}")
+fn minted_resource_id(resource: MintedResource, sequence: u64) -> String {
+    format!(
+        "{}{sequence:0width$x}",
+        resource.id_prefix(),
+        width = resource.id_body_digits()
+    )
 }
 
 /// The ARN this store mints for the `sequence`-th `resource` of `region`.
@@ -3011,7 +3059,7 @@ fn minted_resource_arn(resource: MintedResource, region: &str, sequence: u64) ->
         &format!(
             "{}/{}",
             resource.resource_type(),
-            minted_resource_id(resource.id_prefix(), sequence)
+            minted_resource_id(resource, sequence)
         ),
     )
 }
@@ -3022,10 +3070,10 @@ fn minted_resource_arn(resource: MintedResource, region: &str, sequence: u64) ->
 /// The inverse of [`minted_resource_id`], and strict about the spelling: the id has to be
 /// EXACTLY what this store renders for that sequence, so an unpadded, over-padded or
 /// upper-case spelling of the same number is not an id this store minted.
-fn minted_resource_sequence(id: &str, prefix: &str) -> Option<u64> {
-    let digits = id.strip_prefix(prefix)?;
+fn minted_resource_sequence(id: &str, resource: MintedResource) -> Option<u64> {
+    let digits = id.strip_prefix(resource.id_prefix())?;
     let sequence = u64::from_str_radix(digits, 16).ok()?;
-    (minted_resource_id(prefix, sequence) == id).then_some(sequence)
+    (minted_resource_id(resource, sequence) == id).then_some(sequence)
 }
 
 /// The segments of an ARN of this service: `arn:(aws|aws-cn|aws-us-gov):backup-gateway:
@@ -3096,8 +3144,8 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
     arn_parts(arn).map(|parts| parts.resource_type)
 }
 
-/// The resource-id segment of a backup-gateway ARN — the `hv-0000…` of
-/// `arn:aws:backup-gateway:<region>:<account>:hypervisor/hv-0000…` — or `None` for
+/// The resource-id segment of a backup-gateway ARN — the `hype-…` of
+/// `arn:aws:backup-gateway:<region>:<account>:hypervisor/hype-…` — or `None` for
 /// anything that is not an ARN of this service at all.
 ///
 /// The counterpart of [`arn_resource_type`]: an operation that reports a resource's bare

@@ -58,6 +58,11 @@ struct Listing {
     /// it hands out: asserted against a minted ARN in every test below, so this table
     /// cannot drift from what the service mints.
     id_prefix: &'static str,
+    /// How many hex digits the minted id of that type carries behind its prefix — the
+    /// eight of `hypervisor/hype-00000000`, the sixteen of
+    /// `gateway/bgw-0000000000000000`. Part of the identifier form of the RESOURCE, so it
+    /// sits beside the prefix and is asserted against a minted ARN in every test below.
+    id_digits: usize,
 }
 
 const LISTINGS: [Listing; 3] = [
@@ -67,13 +72,15 @@ const LISTINGS: [Listing; 3] = [
         arn_member: "GatewayArn",
         resource_type: "gateway",
         id_prefix: "bgw-",
+        id_digits: 16,
     },
     Listing {
         operation: "ListHypervisors",
         list_member: "Hypervisors",
         arn_member: "HypervisorArn",
         resource_type: "hypervisor",
-        id_prefix: "hv-",
+        id_prefix: "hype-",
+        id_digits: 8,
     },
     Listing {
         operation: "ListVirtualMachines",
@@ -81,6 +88,7 @@ const LISTINGS: [Listing; 3] = [
         arn_member: "ResourceArn",
         resource_type: "vm",
         id_prefix: "vm-",
+        id_digits: 16,
     },
 ];
 
@@ -114,10 +122,14 @@ fn arn(partition: &str, region: &str, account: &str, resource_type: &str, id: &s
 }
 
 /// A minted id as this service renders one: the prefix of its resource type followed by a
-/// sequence in 16 hex digits, the form every ARN the service hands out carries (asserted
-/// below).
-fn minted_id(prefix: &str, sequence: u64) -> String {
-    format!("{prefix}{sequence:016x}")
+/// sequence in that resource's own hex width, the form every ARN the service hands out
+/// carries (asserted below).
+fn minted_id(listing: &Listing, sequence: u64) -> String {
+    format!(
+        "{}{sequence:0width$x}",
+        listing.id_prefix,
+        width = listing.id_digits
+    )
 }
 
 /// Seed `region` with `count` gateways, `count` hypervisors and `count` virtual machines
@@ -241,7 +253,7 @@ async fn list(
 }
 
 /// Assert that `listing` really mints ARNs of the form the forged tokens below are built
-/// from: `<resource_type>/<id_prefix><16 hex digits>`.
+/// from: `<resource_type>/<id_prefix><id_digits hex digits>`.
 fn assert_minted_form(listing: &Listing, region: &str, minted: &str) {
     let expected = format!(
         ":{region}:{}:{}/",
@@ -264,9 +276,10 @@ fn assert_minted_form(listing: &Listing, region: &str, minted: &str) {
         )
     });
     assert!(
-        digits.len() == 16 && digits.chars().all(|c| c.is_ascii_hexdigit()),
-        "case {}: a minted id must carry a 16-hex-digit sequence, got {id:?}",
-        listing.operation
+        digits.len() == listing.id_digits && digits.chars().all(|c| c.is_ascii_hexdigit()),
+        "case {}: a minted id must carry a {}-hex-digit sequence, got {id:?}",
+        listing.operation,
+        listing.id_digits
     );
 }
 
@@ -282,9 +295,9 @@ fn forged_tokens(listing: &Listing) -> Vec<(String, String)> {
     let resource_type = listing.resource_type;
     let prefix = listing.id_prefix;
     // A sequence no run of this test can reach, so the id is well formed and unminted.
-    let unminted = minted_id(prefix, u64::MAX);
+    let unminted = minted_id(listing, u64::MAX);
     // The first sequence this service mints, which the seed has reached, and its digits.
-    let minted = minted_id(prefix, 0);
+    let minted = minted_id(listing, 0);
     let digits = minted
         .strip_prefix(prefix)
         .expect("a minted id carries its resource type's prefix")
@@ -535,7 +548,7 @@ async fn which_sequences_resume_is_scoped_to_the_region_that_minted_them() {
                     region,
                     engine::EMULATOR_ACCOUNT_ID,
                     listing.resource_type,
-                    &minted_id(listing.id_prefix, sequence),
+                    &minted_id(&listing, sequence),
                 );
                 let reply = list(
                     &router,

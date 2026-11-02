@@ -68,3 +68,23 @@ First import of a run has sequence 0, hence the all-zero body `hv-00000000000000
 4. Repeat the import: the next ARN ends `:hypervisor/hv-0000000000000001`, confirming the form (prefix + 16-digit zero-padded sequence) rather than the particular zeros is what diverges.
 5. Call GetHypervisor/ListHypervisors with that ARN: the same id form is echoed back, and `ListVirtualMachines`/`GetGateway` report the bare id (`HypervisorId`) in the same form.
 6. Re-replay fixture `backup-gateway-import-hypervisor-password-validation`, step `task#2` to confirm: the step must pass with the member shape-asserted rather than reporting `$.HypervisorArn: value_mismatch`.
+
+## Resolution
+FIXED in the mint, as the report asks: the width of a minted id is now a property of the
+RESOURCE KIND beside its prefix (`MintedResource::id_body_digits` in `src/state.rs`), and
+the hypervisor kind's form is `hypervisor/hype-<8 lowercase hex>`. `minted_resource_id`
+and its strict inverse `minted_resource_sequence` both take the kind, so the mint and the
+page-token provenance check that recognises a minted id cannot drift apart, and the mint
+stays the deterministic per-(kind, region) sequence every suite rests on. No handler
+changed: the import already returns the ARN the store minted, so every surface that echoes
+the identity or the bare id inside it (`GetHypervisor`, `ListHypervisors`,
+`UpdateHypervisor`, `GatewayDetails$HypervisorId`, `VirtualMachine$HypervisorId`, the
+tagging `ResourceARN` and every listing's `NextToken`) carries the corrected form.
+
+The gateway (`gateway/bgw-<16 hex>`) and virtual-machine (`vm/vm-<16 hex>`) forms are
+unchanged: nothing published pins their width and no recorded response diverges on them.
+
+The rule is asserted in `tests/all/minted_resource_id_form.rs` over every kind this
+service mints, several successive mints of each, in two regions: each id is its kind's
+prefix and exactly its kind's width of lowercase hex digits, matches no other kind's form,
+is unique in its region, and is what every surface reports.
