@@ -294,6 +294,68 @@ fn refuse(message: impl Into<String>) -> CreateTrainingJobError {
     crate::scaffolded::Scaffolded::validation(message.into())
 }
 
+/// The `CompressionType` of a channel whose data is not compressed, as that modelled
+/// enum spells it: "If training data is compressed, the compression type. The default
+/// value is None." (`Channel$CompressionType`.)
+const NOT_COMPRESSED: &str = "None";
+
+/// The `S3DataDistribution` a channel's S3 source gets when the request states none: the
+/// whole dataset on each instance ("If you want SageMaker to replicate the entire dataset
+/// on each ML compute instance that is launched for model training, specify
+/// FullyReplicated" — `S3DataSource$S3DataDistributionType`).
+const FULLY_REPLICATED: &str = "FullyReplicated";
+
+/// The `OutputCompressionType` of a job's model output when the request states none:
+/// "Defaults to gzip" (`OutputDataConfig$CompressionType`), spelled as that enum spells
+/// it.
+const OUTPUT_COMPRESSED_WITH_GZIP: &str = "GZIP";
+
+/// Fill in what SageMaker itself supplies for an accepted training job, so the stored
+/// request IS the job every reader replays rather than only the members the client
+/// happened to send.
+///
+/// Each value below is the one the model documents for an absent member; a member the
+/// request carried is left exactly as it arrived.
+fn materialise_job(input: &mut CreateTrainingJobInput) {
+    if let Some(specification) = input.algorithm_specification.as_mut() {
+        // "To generate and save time-series metrics during training, set to true. The
+        // default is false." (`AlgorithmSpecification$EnableSageMakerMetricsTimeSeries`.)
+        specification.enable_sage_maker_metrics_time_series =
+            Some(specification.enable_sage_maker_metrics_time_series.unwrap_or(false));
+    }
+    for channel in input.input_data_config.iter_mut().flatten() {
+        // "If training data is compressed, the compression type. The default value is
+        // None." (`Channel$CompressionType`.)
+        if channel.compression_type.is_none() {
+            channel.compression_type = Some(NOT_COMPRESSED.to_string());
+        }
+        // `RecordWrapperType` is deliberately NOT defaulted: the model documents no
+        // service default for it ("In File mode, leave this field unset or set it to
+        // None" is advice to the caller), so a channel that states none is reported
+        // without one.
+        if let Some(source) = channel.data_source.s3_data_source.as_mut() {
+            if source.s3_data_distribution_type.is_none() {
+                source.s3_data_distribution_type = Some(FULLY_REPLICATED.to_string());
+            }
+        }
+    }
+    if input.output_data_config.compression_type.is_none() {
+        input.output_data_config.compression_type = Some(OUTPUT_COMPRESSED_WITH_GZIP.to_string());
+    }
+    // "If you don't provide a KMS key ID, SageMaker uses the default KMS key for Amazon S3
+    // for your role's account" (`OutputDataConfig$KmsKeyId`): the job names no key of its
+    // own, which the member reports as the empty id (`len 0..2048`).
+    if input.output_data_config.kms_key_id.is_none() {
+        input.output_data_config.kms_key_id = Some(String::new());
+    }
+    // The three switches a job that asked for none of them runs without: no network
+    // isolation, no inter-container traffic encryption, no managed spot training.
+    input.enable_network_isolation = Some(input.enable_network_isolation.unwrap_or(false));
+    input.enable_inter_container_traffic_encryption =
+        Some(input.enable_inter_container_traffic_encryption.unwrap_or(false));
+    input.enable_managed_spot_training = Some(input.enable_managed_spot_training.unwrap_or(false));
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateTrainingJob<Eng>
 {
@@ -405,6 +467,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entries a reader can tell from an absent key. See
         // `crate::state::retained_hyper_parameters`.
         input.hyper_parameters = crate::state::retained_hyper_parameters(input.hyper_parameters);
+        // The service's own defaulting step, applied ONCE here so the record is the
+        // materialised job rather than the bare request.
+        materialise_job(&mut input);
 
         store.training_jobs.insert(
             input.training_job_name.clone(),

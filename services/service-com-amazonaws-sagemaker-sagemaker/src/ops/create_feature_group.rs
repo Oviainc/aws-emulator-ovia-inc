@@ -284,7 +284,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 feature_definitions: input.feature_definitions,
                 online_store_config: input.online_store_config,
                 offline_store_config: input.offline_store_config,
-                throughput_config: input.throughput_config,
+                // The throughput mode the group runs under, which the service resolves
+                // for a create that stated none: on-demand needs no stated capacity, so
+                // it is the mode a group gets without asking
+                // (`crate::state::default_throughput_config`).
+                throughput_config: Some(
+                    input
+                        .throughput_config
+                        .unwrap_or_else(crate::state::default_throughput_config),
+                ),
                 role_arn: input.role_arn,
                 description: input.description,
                 tags: input.tags.unwrap_or_default(),

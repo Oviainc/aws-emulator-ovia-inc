@@ -491,7 +491,6 @@ async fn describe_replays_what_create_stored() {
                 "case {case} by {reference}: a created pipeline is Active, got {described:?}"
             );
             for (member, expected) in [
-                ("PipelineDisplayName", body.get("PipelineDisplayName")),
                 ("PipelineDescription", body.get("PipelineDescription")),
                 (
                     "ParallelismConfiguration",
@@ -505,6 +504,17 @@ async fn describe_replays_what_create_stored() {
                      carried, got {described:?}"
                 );
             }
+            // The display name is the one the create stated, or the pipeline's own name
+            // when it stated none (pinned in `service_resolved_members`).
+            assert_eq!(
+                described.get("PipelineDisplayName").and_then(Value::as_str),
+                Some(
+                    body.get("PipelineDisplayName")
+                        .and_then(Value::as_str)
+                        .unwrap_or(case)
+                ),
+                "case {case} by {reference}: PipelineDisplayName, got {described:?}"
+            );
             assert_eq!(
                 described.get("CreationTime"),
                 described.get("LastModifiedTime"),

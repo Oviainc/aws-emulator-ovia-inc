@@ -200,11 +200,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 settled.push(package.arn.clone());
             }
 
+            // What the summary reports, read off the record here so the algorithm registry
+            // can be consulted below without the package's borrow outliving it.
+            let group_name = package.group_name.clone();
+            let version = package.version;
+            let package_arn = package.arn.clone();
+            let description = package.description.clone();
+            let creation_time = package.creation_time;
+            let status = package.status.clone();
+            let model_approval_status = package.model_approval_status.clone();
+            let registration_type = package.registration_type.clone();
+            let own_specification = package.inference_specification.clone();
+            let source_algorithm = package
+                .source_algorithm_specification
+                .as_ref()
+                .and_then(|specification| specification.source_algorithms.first())
+                .map(|algorithm| algorithm.algorithm_name.clone());
+
             // A summary reports the group the version belongs to and the version number,
             // both of which only a VERSIONED package has — this operation "batch
             // describes a list of versioned model packages". An unversioned package
             // carries no group, so there is no summary to report for it.
-            let Some(model_package_group_name) = package.group_name.clone() else {
+            let Some(model_package_group_name) = group_name else {
                 errors.insert(
                     requested.clone(),
                     item_error(format!(
@@ -216,34 +233,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             };
 
-            // `InferenceSpecification` is required in a summary. A package registered
-            // from a `SourceAlgorithmSpecification` alone has none of its own, and this
-            // emulator holds no algorithm registry to derive one from — so the item is
-            // reported as an error rather than answered with an inference specification
-            // nothing produced.
-            let Some(inference_specification) = package.inference_specification.clone() else {
-                errors.insert(
-                    requested.clone(),
-                    item_error(format!(
-                        "Model package \"{requested}\" carries no InferenceSpecification, \
-                         which a model package summary reports."
-                    )),
-                );
-                continue;
-            };
+            // `InferenceSpecification` is required in a summary, and a package registered
+            // from a `SourceAlgorithmSpecification` declares no inference containers of
+            // its own: the specification that applies to such a package is the one of the
+            // algorithm it names, read from this account's algorithm registry when it
+            // holds that algorithm. A package with neither is summarised with no
+            // containers — a batch read reports the package it was asked about rather than
+            // withholding the whole summary over a member nothing produced.
+            let inference_specification = own_specification
+                .or_else(|| {
+                    let named = source_algorithm?;
+                    store
+                        .algorithms
+                        .get(crate::state::name_from_arn_or_name(&named))
+                        .and_then(|algorithm| algorithm.inference_specification.clone())
+                })
+                .unwrap_or_default();
 
             summaries.insert(
                 requested.clone(),
                 BatchDescribeModelPackageSummary {
                     model_package_group_name,
-                    model_package_version: package.version,
-                    model_package_arn: package.arn.clone(),
-                    model_package_description: package.description.clone(),
-                    creation_time: crate::state::timestamp(package.creation_time),
+                    model_package_version: version,
+                    model_package_arn: package_arn,
+                    model_package_description: description,
+                    creation_time: crate::state::timestamp(creation_time),
                     inference_specification,
-                    model_package_status: package.status.clone(),
-                    model_approval_status: package.model_approval_status.clone(),
-                    model_package_registration_type: package.registration_type.clone(),
+                    model_package_status: status,
+                    model_approval_status,
+                    model_package_registration_type: registration_type,
                 },
             );
         }

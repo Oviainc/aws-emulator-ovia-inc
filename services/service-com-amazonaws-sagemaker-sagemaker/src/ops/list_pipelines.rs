@@ -265,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // a summary and `DescribePipeline` report one ARN per pipeline.
                         pipeline_arn: Some(pipeline.arn.clone()),
                         pipeline_name: Some(pipeline.name.clone()),
-                        pipeline_display_name: pipeline.display_name.clone(),
+                        pipeline_display_name: Some(pipeline.display_name.clone()),
                         pipeline_description: pipeline.description.clone(),
                         role_arn: Some(pipeline.role_arn.clone()),
                         creation_time: Some(crate::state::timestamp(pipeline.creation_time)),

@@ -342,19 +342,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
             training_end_time: job.training_end_time.map(crate::state::timestamp),
             // Nothing started the algorithm image, so there is no instant the run began
-            // at, no time it spent, no metric it emitted and no transition it passed
-            // through. See `crate::state::NO_TRAINING_CONTAINER_RUNTIME_REASON`, which is
-            // the `FailureReason` above once the clock has settled the job.
+            // at, no time it spent and no metric it emitted. See
+            // `crate::state::NO_TRAINING_CONTAINER_RUNTIME_REASON`, which is the
+            // `FailureReason` above once the clock has settled the job.
             training_start_time: None,
             training_time_in_seconds: None,
             billable_time_in_seconds: None,
             billable_token_count: None,
-            secondary_status_transitions: None,
+            // "A history of all of the secondary statuses that the training job has
+            // transitioned through": the statuses this job has been in, with the instants
+            // the record holds — so it says exactly what the job's own status and
+            // `FailureReason` say.
+            secondary_status_transitions: Some(job.secondary_status_transitions()),
             final_metric_data_list: None,
             // A debugger or profiler rule is evaluated against a running job; none ran.
             debug_rule_evaluation_statuses: None,
             profiler_rule_evaluation_statuses: None,
-            profiling_status: None,
+            // Follows the job's profiler configuration, which is the job's own state.
+            profiling_status: Some(job.profiling_status()),
             mlflow_details: None,
             progress_info: None,
             // Written by a run that produced a model package; nothing ran.

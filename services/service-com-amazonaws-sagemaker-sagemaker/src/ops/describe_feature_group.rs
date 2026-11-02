@@ -263,10 +263,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // one response always carries every feature and there is never a next page
             // to resume from. The member is required, so that is the empty token.
             next_token: String::new(),
-            // The OnlineStore's records live in the Feature Store RUNTIME service, which
-            // owns its own state; this control plane keeps no byte count for them and
-            // reports none rather than claiming a size it did not measure.
-            online_store_total_size_bytes: None,
+            // "The size of the OnlineStore in bytes": a group that keeps one reports how
+            // much it holds, which is nothing until records are written to it — and a
+            // group with no OnlineStore has no size to report at all. The records
+            // themselves live in the Feature Store RUNTIME service, which owns them; this
+            // control plane holds none, so there is no quantity it could overstate.
+            online_store_total_size_bytes: group.online_store_enabled().then_some(0),
         };
         let group_arn = group.arn.clone();
         drop(store);

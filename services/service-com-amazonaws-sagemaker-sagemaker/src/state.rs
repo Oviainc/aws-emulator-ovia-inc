@@ -77,13 +77,16 @@ use crate::ops::types::{
     InferenceSpecification, JupyterLabAppImageConfig, KernelGatewayImageConfig,
     ManagedConfiguration, MetadataProperties, MetricsConfig, ModelCardExportOutputConfig,
     ModelCardSecurityConfig, ModelClientConfig, ModelDeployConfig, ModelLifeCycle, ModelMetrics,
-    ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageStatusDetails,
+    ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageContainerDefinition,
+    ModelPackageStatusDetails,
     ModelPackageStatusItem, ModelPackageValidationSpecification, NetworkConfig,
     ParallelismConfiguration, Parameter, ProcessingInput, ProcessingOutputConfig,
     ProcessingResources, ProcessingStoppingCondition, ProductionVariant, ProductionVariantSummary,
     RecommendationJobInputConfig, RecommendationJobOutputConfig,
-    RecommendationJobStoppingConditions, ResourceSpec, SelectiveExecutionConfig,
-    SourceAlgorithmSpecification, Tag, TransformInput, TransformOutput, TransformResources,
+    RecommendationJobStoppingConditions, ResourceSpec, SecondaryStatusTransition,
+    SelectiveExecutionConfig,
+    SourceAlgorithmSpecification, Tag, TrainingSpecification, TransformInput, TransformOutput,
+    TransformResources,
     UserContext, VpcConfig,
 };
 
@@ -863,6 +866,10 @@ pub const DETAILED_MODEL_PACKAGE_STATUS_COMPLETED: &str = "Completed";
 /// and `CreateModelPackage` documents the member as optional for versioned models.
 pub const MODEL_APPROVAL_PENDING_MANUAL: &str = "PendingManualApproval";
 
+/// The `ModelPackageRegistrationType` a package `CreateModelPackage` put in the registry
+/// carries: it was REGISTERED. The enum's other member, `Logged`, is what a run logs.
+pub const MODEL_PACKAGE_REGISTRATION_TYPE_REGISTERED: &str = "Registered";
+
 /// How many `UpdateModelPackage` idempotency tokens one model package remembers.
 ///
 /// `ClientToken` "guarantees that the call to this API is idempotent", so a retry must
@@ -1325,7 +1332,61 @@ impl TrainingJob {
             .trim_end_matches('/');
         format!("{base}/{}/output/model.tar.gz", self.name)
     }
+
+    /// "Profiling status of a training job" (`ProfilingStatus`), which follows the
+    /// profiler configuration the job was accepted with: a job is profiled only where a
+    /// `ProfilerConfig` asked for it and did not switch it off, so a job created with no
+    /// profiler configuration at all — which is then reported with none — is not being
+    /// profiled.
+    pub fn profiling_status(&self) -> String {
+        let profiled = self
+            .request
+            .profiler_config
+            .as_ref()
+            .is_some_and(|config| !config.disable_profiler.unwrap_or(false));
+        if profiled {
+            PROFILING_STATUS_ENABLED.to_string()
+        } else {
+            PROFILING_STATUS_DISABLED.to_string()
+        }
+    }
+
+    /// "A history of all of the secondary statuses that the training job has transitioned
+    /// through" (`SecondaryStatusTransitions`): one entry per secondary status this job
+    /// has actually been in, each starting when the job entered it and ending when it
+    /// left, built from the instants the record holds rather than from any history kept
+    /// beside them.
+    ///
+    /// A job still in its first secondary status reports that one entry, open-ended; the
+    /// terminal one carries the reason the job reports, so the history says the same thing
+    /// the job's own `FailureReason` does.
+    pub fn secondary_status_transitions(&self) -> Vec<SecondaryStatusTransition> {
+        let entered_terminal = self.training_end_time;
+        let mut transitions = vec![SecondaryStatusTransition {
+            status: TRAINING_SECONDARY_STATUS_STARTING.to_string(),
+            start_time: timestamp(self.creation_time),
+            end_time: entered_terminal.map(timestamp),
+            status_message: None,
+        }];
+        // The job left `Starting` only for the terminal status the clock owed it, so the
+        // second entry exists exactly when that transition has been materialised.
+        if let (Some(at), Some(status)) = (entered_terminal, self.secondary_status.as_ref()) {
+            transitions.push(SecondaryStatusTransition {
+                status: status.clone(),
+                start_time: timestamp(at),
+                end_time: Some(timestamp(at)),
+                status_message: self.failure_reason.clone(),
+            });
+        }
+        transitions
+    }
 }
+
+/// The two `ProfilingStatus` members: a training job is profiled only where a
+/// `ProfilerConfig` asked for it.
+pub const PROFILING_STATUS_ENABLED: &str = "Enabled";
+/// See [`PROFILING_STATUS_ENABLED`].
+pub const PROFILING_STATUS_DISABLED: &str = "Disabled";
 
 /// The hyperparameters a training job KEEPS, out of those its create supplied.
 ///
@@ -1969,13 +2030,21 @@ impl ComAmazonawsSagemakerSagemakerState {
 pub struct Pipeline {
     pub name: String,
     pub arn: String,
-    pub display_name: Option<String>,
+    /// The display name the pipeline is shown under. A create that names none leaves the
+    /// pipeline displayed under its `PipelineName`, so the member is resolved ONCE where
+    /// the record is written and every reader replays the resolved value.
+    pub display_name: String,
     pub definition: String,
     pub description: Option<String>,
     pub role_arn: String,
     pub status: String,
     pub parallelism_configuration: Option<ParallelismConfiguration>,
     pub tags: Vec<Tag>,
+    /// The identity that created the pipeline, and the identity of the last call that
+    /// modified it — recorded when each call happens, as [`caller_user_context`] builds
+    /// it, and replayed unchanged.
+    pub created_by: UserContext,
+    pub last_modified_by: UserContext,
     /// The `ClientRequestToken` the creating call presented, so a retry of that very
     /// call is completed "no more than one time" as the member documents.
     pub client_request_token: String,
@@ -2876,8 +2945,10 @@ impl ModelPackage {
     /// request's `ValidationSpecification` named (no profiles, no items), each reporting
     /// `NotStarted` while the package is `Pending` and `Completed` once it has settled.
     ///
-    /// `ImageScanStatuses` stays absent: this emulator scans no container image, so it
-    /// reports no scan it did not run.
+    /// `ImageScanStatuses` is reported EMPTY rather than absent, the way an algorithm's
+    /// [`Algorithm::status_details`] reports it: the member is how the package reports the
+    /// image scans it holds statuses for, and this emulator scans no container image, so
+    /// it holds none — which a caller cannot tell from a missing member.
     pub fn status_details(&self) -> ModelPackageStatusDetails {
         let item_status = if self.status == MODEL_PACKAGE_STATUS_COMPLETED {
             DETAILED_MODEL_PACKAGE_STATUS_COMPLETED
@@ -2900,7 +2971,7 @@ impl ModelPackage {
             .unwrap_or_default();
         ModelPackageStatusDetails {
             validation_statuses,
-            image_scan_statuses: None,
+            image_scan_statuses: Some(Vec::new()),
         }
     }
 }
@@ -4665,6 +4736,79 @@ pub fn mint_opaque_resource_id() -> String {
     ::hex::encode(&hashed[..16])
 }
 
+/// The digest this emulator reports for a container image, in the form `ImageDigest`
+/// carries (`len 0..72`, pattern `^[Ss][Hh][Aa]256:[0-9a-fA-F]{64}$`).
+///
+/// It is the emulator's OWN identifier for the image reference, not a digest any registry
+/// resolved: nothing here pulls an image, so there is no manifest to hash and the value
+/// cannot match what ECR would report for that reference. What it does keep is every
+/// property a caller can check without a registry — the modelled form, one digest per
+/// reference, the same digest on every read of it, and practically never a collision
+/// between two references — because it is a SHA-256 over the reference itself and over
+/// nothing else, so it depends on neither the clock nor the request that asked for it.
+pub fn derived_image_digest(image: &str) -> String {
+    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(image.as_bytes());
+    format!("sha256:{}", ::hex::encode(digest))
+}
+
+/// Fill in what SageMaker itself resolves for one container of an inference
+/// specification: the digest of the image the container names, and whether its model data
+/// is a training checkpoint — which a request that says nothing leaves `false`.
+///
+/// Called on the WRITE path, so the stored record is the materialised container every
+/// reader of it replays, rather than each reader defaulting again.
+fn materialise_container(container: &mut ModelPackageContainerDefinition) {
+    if container.image_digest.is_none() {
+        container.image_digest = container.image.as_deref().map(derived_image_digest);
+    }
+    container.is_checkpoint = Some(container.is_checkpoint.unwrap_or(false));
+}
+
+/// [`materialise_container`] for every container of an inference specification.
+pub fn materialise_inference_specification(specification: &mut InferenceSpecification) {
+    for container in &mut specification.containers {
+        materialise_container(container);
+    }
+}
+
+/// [`materialise_container`] for every container of an ADDITIONAL inference
+/// specification, whose containers are the same shape and are resolved the same way.
+pub fn materialise_additional_inference_specifications(
+    specifications: &mut [AdditionalInferenceSpecificationDefinition],
+) {
+    for specification in specifications {
+        for container in &mut specification.containers {
+            materialise_container(container);
+        }
+    }
+}
+
+/// The `ContainerMode` a model's container hosts its models in when the request named
+/// none: one model per container, as the model's `ContainerMode` enum spells it.
+pub const CONTAINER_MODE_SINGLE_MODEL: &str = "SingleModel";
+
+/// Fill in what SageMaker itself resolves for a model's container: whether it "hosts a
+/// single model or multiple models" (`ContainerDefinition$Mode`), which a request that
+/// says nothing leaves at one model per container.
+pub fn materialise_container_mode(container: &mut ContainerDefinition) {
+    if container.mode.is_none() {
+        container.mode = Some(CONTAINER_MODE_SINGLE_MODEL.to_string());
+    }
+}
+
+/// Fill in what SageMaker itself resolves for an algorithm's training specification: the
+/// digest of the training image, and each training channel's `IsRequired` — which a
+/// request that says nothing leaves `false`.
+pub fn materialise_training_specification(specification: &mut TrainingSpecification) {
+    if specification.training_image_digest.is_none() {
+        specification.training_image_digest =
+            Some(derived_image_digest(&specification.training_image));
+    }
+    for channel in &mut specification.training_channels {
+        channel.is_required = Some(channel.is_required.unwrap_or(false));
+    }
+}
+
 /// The resource NAME an `ArnOrName`-typed member addresses.
 ///
 /// Several SageMaker readers accept either a bare name or the resource's full ARN for the
@@ -4714,26 +4858,33 @@ fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String
 /// The emulator serves no Studio domain, so the Studio members (`UserProfileArn`,
 /// `UserProfileName`, `DomainId`) are ABSENT rather than empty: a caller cannot tell an
 /// empty profile name from a missing one. The IAM identity is the one the request signed
-/// with. `PrincipalId` and `SourceIdentity` stay absent — this emulator models no IAM
-/// principal ids, and inventing one would report an identity that does not exist.
+/// with, reported as both the ARN of that identity and the unique id AWS gives it — the id
+/// is a function of the ARN ([`service_common::caller_principal::aws_unique_id`]), so it is
+/// stable across reads and across restarts and two identities practically never share one.
+/// `SourceIdentity` stays absent: it is set only when a role session carries one, and no
+/// call here does.
 pub fn caller_user_context(ctx: &smithy_server_runtime::OperationContext<'_>) -> UserContext {
     let principal = caller_principal(ctx);
+    // IAM is global, so the region segment is empty.
+    let arn = ::emulator_server::emulator_arn("iam", "", &format!("user/{principal}"));
     UserContext {
         user_profile_arn: None,
         user_profile_name: None,
         domain_id: None,
         iam_identity: Some(IamIdentity {
-            // IAM is global, so the region segment is empty.
-            arn: Some(::emulator_server::emulator_arn(
-                "iam",
-                "",
-                &format!("user/{principal}"),
+            principal_id: Some(::service_common::caller_principal::aws_unique_id(
+                IAM_USER_ID_PREFIX,
+                &arn,
             )),
-            principal_id: None,
+            arn: Some(arn),
             source_identity: None,
         }),
     }
 }
+
+/// The type prefix an IAM USER's unique id carries, from IAM's "unique identifier
+/// prefixes" table — the identity kind this emulator's long-term credential speaks for.
+const IAM_USER_ID_PREFIX: &str = "AIDA";
 
 /// A stored `SystemTime` as the modelled `Timestamp` the wire carries.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
@@ -4821,6 +4972,24 @@ pub const FEATURE_GROUP_STATUS_DELETING: &str = "Deleting";
 /// replication it describes never fails here, so it is never `Blocked`.
 pub const OFFLINE_STORE_STATUS_ACTIVE: &str = "Active";
 
+/// The `ThroughputMode` a feature group runs under when its create stated no
+/// `ThroughputConfig`: the mode that bills per read and write and needs no stated
+/// capacity ("With on-demand mode, you are charged for data reads and writes that your
+/// application performs on your feature group. You do not need to specify read and write
+/// throughput" — `ThroughputConfig`), spelled as the model's `ThroughputMode` enum spells
+/// it.
+pub const THROUGHPUT_MODE_ON_DEMAND: &str = "OnDemand";
+
+/// The throughput configuration a feature group whose create stated none runs under.
+pub fn default_throughput_config() -> crate::ops::types::ThroughputConfig {
+    crate::ops::types::ThroughputConfig {
+        throughput_mode: THROUGHPUT_MODE_ON_DEMAND.to_string(),
+        // "This field is not applicable for on-demand feature groups."
+        provisioned_read_capacity_units: None,
+        provisioned_write_capacity_units: None,
+    }
+}
+
 /// How SageMaker words a feature group this account does not hold: the `Resource Not
 /// Found:` prefix, then the resource type and the name the request resolved to — a
 /// sentence that ends with NO period.
@@ -4830,6 +4999,17 @@ pub const OFFLINE_STORE_STATUS_ACTIVE: &str = "Active";
 /// ARN form where the member accepts one ([`name_from_arn_or_name`]).
 pub fn feature_group_not_found(name: &str) -> String {
     format!("Resource Not Found: Amazon SageMaker can't find a FeatureGroup with name {name}")
+}
+
+/// How SageMaker words a refusal to delete a feature group that is not provisioned yet:
+/// the `Validation Error:` prefix, the group's name, and the status that stands in the
+/// way — reported in the upper case this message spells a `FeatureGroupStatus` in.
+pub fn feature_group_not_deletable(name: &str, status: &str) -> String {
+    format!(
+        "Validation Error: FeatureGroup with name {name} cannot be deleted, because \
+         FeatureGroupStatus is '{}'.",
+        status.to_uppercase()
+    )
 }
 
 /// The feature names a `FeatureGroup` may not declare, from `FeatureDefinitions`' own
@@ -4921,8 +5101,9 @@ impl FeatureGroup {
     ///
     /// `ThroughputConfig` (what a create states) and `ThroughputConfigDescription`
     /// (what a describe reports) are two shapes with the same three members, so the
-    /// active configuration is the one the create stated, re-shaped. A group created
-    /// without one has no mode to report and reports none.
+    /// active configuration is the one stored for the group, re-shaped. Every group has
+    /// one: a create that stated none is stored with
+    /// [`default_throughput_config`], the mode the group then runs under.
     pub fn throughput_config_description(
         &self,
     ) -> Option<crate::ops::types::ThroughputConfigDescription> {
@@ -4933,6 +5114,16 @@ impl FeatureGroup {
                 provisioned_write_capacity_units: config.provisioned_write_capacity_units,
             }
         })
+    }
+
+    /// Whether this group keeps an `OnlineStore`: "Turn OnlineStore off by specifying
+    /// False for the EnableOnlineStore flag. … The default value is False."
+    /// (`OnlineStoreConfig$EnableOnlineStore`.)
+    pub fn online_store_enabled(&self) -> bool {
+        self.online_store_config
+            .as_ref()
+            .and_then(|config| config.enable_online_store)
+            .unwrap_or(false)
     }
 }
 

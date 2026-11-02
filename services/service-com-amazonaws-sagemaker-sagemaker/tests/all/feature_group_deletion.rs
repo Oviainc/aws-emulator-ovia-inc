@@ -177,35 +177,34 @@ async fn suggested_names(emulator: &Emulator) -> Vec<String> {
         .collect()
 }
 
-/// One row of the delete round trip: a case name, the group's name, the members laid over
-/// the default create body, and whether the group's provisioning is left to settle before
-/// the delete.
+/// One row of the delete round trip: a case name, the group's name and the members laid
+/// over the default create body.
+///
+/// Every row lets the group's provisioning settle before the delete, because a group is
+/// deletable only once it exists: the refusal while it is still `Creating` is pinned in
+/// `service_resolved_members`.
 struct DeleteCase {
     case: &'static str,
     name: String,
     extra: Value,
-    settled_first: bool,
 }
 
 #[tokio::test]
 async fn a_delete_moves_the_group_to_deleting_until_the_clock_removes_it() {
     // The rows differ along what the rule generalises over: the name's shape and length,
-    // which stores the group has, how many features it declares, whether it carries tags
-    // and a description, and whether its `Creating` -> `Created` transition had already
-    // fallen due when the delete arrived.
+    // which stores the group has, how many features it declares, and whether it carries
+    // tags and a description.
     let longest = format!("d{}", "x".repeat(63));
     let cases = [
         DeleteCase {
-            case: "an online store only, deleted while still provisioning",
+            case: "an online store only, deleted while nothing else changed",
             name: "online-only".to_string(),
             extra: json!({}),
-            settled_first: false,
         },
         DeleteCase {
             case: "an online store only, deleted once Created",
             name: "online_settled".to_string(),
             extra: json!({}),
-            settled_first: true,
         },
         DeleteCase {
             case: "an offline store only",
@@ -215,7 +214,6 @@ async fn a_delete_moves_the_group_to_deleting_until_the_clock_removes_it() {
                 "OfflineStoreConfig": { "S3StorageConfig": { "S3Uri": "s3://feature-store/offline/" } },
                 "RoleArn": ROLE_ARN,
             }),
-            settled_first: true,
         },
         DeleteCase {
             case: "both stores, provisioned throughput, tags and a description",
@@ -231,13 +229,11 @@ async fn a_delete_moves_the_group_to_deleting_until_the_clock_removes_it() {
                 "Description": "a group with every member set",
                 "Tags": [{ "Key": "Project", "Value": "retention" }],
             }),
-            settled_first: true,
         },
         DeleteCase {
             case: "the longest name the pattern admits",
             name: longest.clone(),
             extra: json!({}),
-            settled_first: false,
         },
         DeleteCase {
             case: "a digits-only name and a third feature",
@@ -249,17 +245,10 @@ async fn a_delete_moves_the_group_to_deleting_until_the_clock_removes_it() {
                     { "FeatureName": "balance", "FeatureType": "Fractional" },
                 ],
             }),
-            settled_first: false,
         },
     ];
 
-    for DeleteCase {
-        case,
-        name,
-        extra,
-        settled_first,
-    } in &cases
-    {
+    for DeleteCase { case, name, extra } in &cases {
         let emulator = Emulator::new();
         let created = create_feature_group(&emulator, &create_body(name, extra.clone())).await;
         assert_eq!(
@@ -267,14 +256,12 @@ async fn a_delete_moves_the_group_to_deleting_until_the_clock_removes_it() {
             format!("arn:aws:sagemaker:us-east-1:{ACCOUNT}:feature-group/{name}"),
             "case {case:?}: the create must mint the group's ARN from its own name"
         );
-        if *settled_first {
-            tokio::time::sleep(PAST_CREATED_DUE).await;
-            assert_eq!(
-                status_of(&emulator, case, name).await.as_deref(),
-                Some("Created"),
-                "case {case:?}: expected the clock to have provisioned the group"
-            );
-        }
+        tokio::time::sleep(PAST_CREATED_DUE).await;
+        assert_eq!(
+            status_of(&emulator, case, name).await.as_deref(),
+            Some("Created"),
+            "case {case:?}: expected the clock to have provisioned the group"
+        );
 
         delete_feature_group(&emulator, case, name).await;
 
@@ -358,10 +345,12 @@ async fn a_name_this_account_holds_no_group_under_is_refused_as_resource_not_fou
     let kept = create_feature_group(&emulator, &create_body("kept-group", json!({}))).await;
 
     // A group whose deletion was asked for, and one whose removal the clock completed:
-    // both are names this account no longer holds a deletable group under.
+    // both are names this account no longer holds a deletable group under. Each is left
+    // to finish provisioning first, because a group is deletable only once it exists.
     create_feature_group(&emulator, &create_body("deleting-group", json!({}))).await;
-    delete_feature_group(&emulator, "the group that is on its way out", "deleting-group").await;
     create_feature_group(&emulator, &create_body("gone-group", json!({}))).await;
+    tokio::time::sleep(PAST_CREATED_DUE).await;
+    delete_feature_group(&emulator, "the group that is on its way out", "deleting-group").await;
     delete_feature_group(&emulator, "the group whose removal completes", "gone-group").await;
     tokio::time::sleep(PAST_RELEASE_DUE).await;
 

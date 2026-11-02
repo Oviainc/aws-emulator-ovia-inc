@@ -39,15 +39,15 @@ const PAST_CREATED_DUE: Duration = Duration::from_millis(600);
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/FeatureStoreRole";
 
 /// The members `DescribeFeatureGroup` replays verbatim from the create: the whole input
-/// schema except the group's own name (asserted separately, beside its ARN) and `Tags`
-/// (which the describe response does not carry).
+/// schema except the group's own name (asserted separately, beside its ARN), `Tags`
+/// (which the describe response does not carry) and `ThroughputConfig` (which the service
+/// resolves for a create that stated none, asserted separately).
 const ECHOED_MEMBERS: &[&str] = &[
     "RecordIdentifierFeatureName",
     "EventTimeFeatureName",
     "FeatureDefinitions",
     "OnlineStoreConfig",
     "OfflineStoreConfig",
-    "ThroughputConfig",
     "RoleArn",
     "Description",
 ];
@@ -229,7 +229,31 @@ async fn describe_feature_group_replays_exactly_what_create_feature_group_stored
             "case {case}: OfflineStoreStatus follows whether the group has an offline \
              store, got {described:?}"
         );
-        for absent in ["LastUpdateStatus", "FailureReason", "OnlineStoreTotalSizeBytes"] {
+        // The throughput configuration the group RUNS under: the one the create stated,
+        // or the on-demand mode the service resolves for a create that stated none.
+        assert_eq!(
+            described.get("ThroughputConfig"),
+            Some(
+                request
+                    .get("ThroughputConfig")
+                    .unwrap_or(&json!({ "ThroughputMode": "OnDemand" }))
+            ),
+            "case {case}: ThroughputConfig, got {described:?}"
+        );
+        // "The size of the OnlineStore in bytes": reported, and zero, for a group that
+        // keeps an online store; absent for one that keeps none.
+        let online_store_enabled = request
+            .get("OnlineStoreConfig")
+            .and_then(|config| config.get("EnableOnlineStore"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        assert_eq!(
+            described.get("OnlineStoreTotalSizeBytes").and_then(Value::as_i64),
+            online_store_enabled.then_some(0),
+            "case {case}: OnlineStoreTotalSizeBytes follows whether the group keeps an \
+             online store, got {described:?}"
+        );
+        for absent in ["LastUpdateStatus", "FailureReason"] {
             assert_eq!(
                 described.get(absent),
                 None,

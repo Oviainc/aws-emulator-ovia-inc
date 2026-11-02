@@ -26,6 +26,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_sagemaker_sagemaker::state;
 
+use crate::service_resolved_members::{
+    materialised_additional_inference_specifications, materialised_inference_specification,
+};
+
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
@@ -435,11 +439,21 @@ async fn unversioned_create_describe_round_trip_over_optional_members_and_region
                 );
                 continue;
             }
+            // An inference specification comes back with the members the SERVICE resolves
+            // for its containers (their image digests, their checkpoint flag) laid over
+            // what the request sent; every other member is replayed byte-for-byte.
+            let expected = match member.as_str() {
+                "InferenceSpecification" => materialised_inference_specification(&sent),
+                "AdditionalInferenceSpecifications" => {
+                    materialised_additional_inference_specifications(&sent)
+                }
+                _ => sent.clone(),
+            };
             let replayed = described.get(&member);
             assert_eq!(
                 replayed,
-                Some(&sent),
-                "case {case:?}: expected {member} replayed as {sent}, got {replayed:?}"
+                Some(&expected),
+                "case {case:?}: expected {member} replayed as {expected}, got {replayed:?}"
             );
         }
 

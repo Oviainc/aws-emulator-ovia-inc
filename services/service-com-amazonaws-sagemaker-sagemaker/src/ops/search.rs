@@ -1005,7 +1005,7 @@ fn pipeline_entity(pipeline: &crate::state::Pipeline) -> Pipeline {
     Pipeline {
         pipeline_arn: Some(pipeline.arn.clone()),
         pipeline_name: Some(pipeline.name.clone()),
-        pipeline_display_name: pipeline.display_name.clone(),
+        pipeline_display_name: Some(pipeline.display_name.clone()),
         pipeline_description: pipeline.description.clone(),
         role_arn: Some(pipeline.role_arn.clone()),
         pipeline_status: Some(pipeline.status.clone()),
@@ -1014,9 +1014,10 @@ fn pipeline_entity(pipeline: &crate::state::Pipeline) -> Pipeline {
         last_run_time: pipeline.last_run_time.map(crate::state::timestamp),
         parallelism_configuration: pipeline.parallelism_configuration.clone(),
         tags: tag_list(&pipeline.tags),
-        // The identities behind the create and the last update, which this store keeps on
-        // the execution rather than on the pipeline.
-        ..Default::default()
+        // The identities behind the create and the last change to the pipeline, recorded
+        // when each call happened.
+        created_by: Some(pipeline.created_by.clone()),
+        last_modified_by: Some(pipeline.last_modified_by.clone()),
     }
 }
 

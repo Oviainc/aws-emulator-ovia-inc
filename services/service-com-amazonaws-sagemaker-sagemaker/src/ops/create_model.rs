@@ -2,8 +2,9 @@
 
 //! @op CreateModel
 //! IMPLEMENTED: registers a model in `crate::state` under its `ModelName`, minting the
-//! `ModelArn` from the request's region, and refuses a name already in use. This is the
-//! ONLY file to touch for this operation.
+//! `ModelArn` from the request's region, resolving the members the service itself
+//! supplies (each container's `Mode`, `EnableNetworkIsolation`), and refuses a name
+//! already in use. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -177,6 +178,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let arn = crate::state::resource_arn(&region, "model", &input.model_name);
 
+        // The service's own defaulting step, applied ONCE here so the stored model is the
+        // one every reader replays: how each container hosts its models, and whether the
+        // model container is cut off from the network.
+        let mut primary_container = input.primary_container;
+        if let Some(container) = primary_container.as_mut() {
+            crate::state::materialise_container_mode(container);
+        }
+        let mut containers = input.containers;
+        for container in containers.iter_mut().flatten() {
+            crate::state::materialise_container_mode(container);
+        }
+        // "If True, no inbound or outbound network calls can be made to or from the model
+        // container": a model nothing asked to isolate is not isolated.
+        let enable_network_isolation = Some(input.enable_network_isolation.unwrap_or(false));
+
         let mut store = state.lock();
         // The store is bounded, so a caller varying `ModelName` cannot grow it without
         // end. `ResourceLimitExceeded` is the limit failure this operation models.
@@ -204,12 +220,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::Model {
                 name: input.model_name.clone(),
                 arn: arn.clone(),
-                primary_container: input.primary_container,
-                containers: input.containers,
+                primary_container,
+                containers,
                 inference_execution_config: input.inference_execution_config,
                 execution_role_arn: input.execution_role_arn,
                 vpc_config: input.vpc_config,
-                enable_network_isolation: input.enable_network_isolation,
+                enable_network_isolation,
                 tags: input.tags.unwrap_or_default(),
                 creation_time: ::std::time::SystemTime::now(),
             },

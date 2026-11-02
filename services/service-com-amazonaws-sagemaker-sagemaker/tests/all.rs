@@ -189,6 +189,8 @@ mod search_resources;
 mod search_suggestions;
 #[path = "all/servicecatalog_portfolio_status.rs"]
 mod servicecatalog_portfolio_status;
+#[path = "all/service_resolved_members.rs"]
+mod service_resolved_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/studio_app_lifecycle.rs"]

@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DescribePipelineOutput {
             pipeline_arn: Some(pipeline.arn.clone()),
             pipeline_name: Some(pipeline.name.clone()),
-            pipeline_display_name: pipeline.display_name.clone(),
+            pipeline_display_name: Some(pipeline.display_name.clone()),
             pipeline_definition: Some(pipeline.definition.clone()),
             pipeline_description: pipeline.description.clone(),
             role_arn: Some(pipeline.role_arn.clone()),
@@ -214,11 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: Some(crate::state::timestamp(pipeline.creation_time)),
             last_modified_time: Some(crate::state::timestamp(pipeline.last_modified_time)),
             last_run_time: pipeline.last_run_time.map(crate::state::timestamp),
-            // SageMaker fills these from the Studio user context of the calling
-            // identity, which this emulator does not model; absent is what it reports
-            // for a pipeline created outside Studio.
-            created_by: None,
-            last_modified_by: None,
+            // The identity that created the pipeline, and the identity of the last call
+            // that changed it — each recorded when that call happened and replayed
+            // unchanged, never re-derived from the reading request.
+            created_by: Some(pipeline.created_by.clone()),
+            last_modified_by: Some(pipeline.last_modified_by.clone()),
             parallelism_configuration: pipeline.parallelism_configuration.clone(),
             // Set by the pipeline-version operations, none of which runs yet.
             pipeline_version_display_name: None,

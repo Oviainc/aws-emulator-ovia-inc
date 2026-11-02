@@ -2,7 +2,9 @@
 
 //! @op CreateAlgorithm
 //! IMPLEMENTED: registers an algorithm in `crate::state` under its `AlgorithmName`,
-//! minting the `AlgorithmArn` from the request's region, refusing a name already in use
+//! minting the `AlgorithmArn` from the request's region, resolving the members the
+//! service itself supplies (the training and inference image digests, the training
+//! channels' `IsRequired`, the certification flag) and refusing a name already in use
 //! and a store at its quota. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -168,6 +170,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::resource_arn(&region, "algorithm", &input.algorithm_name);
         let created_at = ::std::time::SystemTime::now();
 
+        // The service's own defaulting step, applied ONCE here so the stored algorithm is
+        // the one every reader replays: the digest SageMaker resolves for the training
+        // image, each training channel's `IsRequired` and the certification flag, none of
+        // which a request has to state, plus the same digest resolution over the
+        // inference containers.
+        let mut training_specification = input.training_specification;
+        crate::state::materialise_training_specification(&mut training_specification);
+        let mut inference_specification = input.inference_specification;
+        if let Some(specification) = inference_specification.as_mut() {
+            crate::state::materialise_inference_specification(specification);
+        }
+        // "Whether to certify the algorithm so that it can be listed in Amazon Web
+        // Services Marketplace": an algorithm nothing asked to certify is not certified.
+        let certify_for_marketplace = Some(input.certify_for_marketplace.unwrap_or(false));
+
         let mut store = state.lock();
         // A name already in use is refused, never overwritten: otherwise the caller
         // reads a 200 for an algorithm it did not create, and the one it did create is
@@ -205,10 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name: input.algorithm_name.clone(),
                 arn: arn.clone(),
                 description: input.algorithm_description,
-                training_specification: input.training_specification,
-                inference_specification: input.inference_specification,
+                training_specification,
+                inference_specification,
                 validation_specification: input.validation_specification,
-                certify_for_marketplace: input.certify_for_marketplace,
+                certify_for_marketplace,
                 // A new algorithm is not ready yet: SageMaker reports `Pending` and the
                 // clock owes the move to its terminal status, so a caller describing it
                 // straight after this call still observes the transient one.

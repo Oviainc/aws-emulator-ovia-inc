@@ -187,6 +187,16 @@ pub(crate) fn primary_container(image: &str) -> Value {
     json!({ "Image": image })
 }
 
+/// `member` as a list of container definitions: a `PrimaryContainer` is one container, a
+/// `Containers` member is already a list, and an absent member is no container at all.
+fn container_list(member: Option<&Value>) -> Vec<Value> {
+    match member {
+        None => Vec::new(),
+        Some(Value::Array(listed)) => listed.clone(),
+        Some(single) => vec![single.clone()],
+    }
+}
+
 /// A minimal one-variant configuration body naming `model`.
 pub(crate) fn one_variant_config(name: &str, model: &str) -> Value {
     json!({
@@ -387,15 +397,50 @@ async fn describe_model_replays_exactly_what_create_model_stored() {
         );
 
         // Every member the request carried must come back unchanged; `Tags` is stored
-        // but not part of DescribeModel's modelled output, so it is excluded here.
-        for member in ["PrimaryContainer", "Containers", "InferenceExecutionConfig",
-                       "ExecutionRoleArn", "VpcConfig", "EnableNetworkIsolation"] {
+        // but not part of DescribeModel's modelled output, so it is excluded here, and so
+        // are the members the SERVICE supplies (each container's `Mode`,
+        // `EnableNetworkIsolation`), which `service_resolved_members` pins.
+        for member in ["InferenceExecutionConfig", "ExecutionRoleArn", "VpcConfig"] {
             assert_eq!(
                 described.get(member),
                 body.get(member),
                 "case {case}: {member} must round-trip, got {described:?}"
             );
         }
+        for container in ["PrimaryContainer", "Containers"] {
+            let sent = body.get(container);
+            let reported = described.get(container);
+            assert_eq!(
+                sent.is_some(),
+                reported.is_some(),
+                "case {case}: {container} must round-trip, got {described:?}"
+            );
+            // Every member of a container the request carried is replayed; `Mode` is
+            // reported beside them whether or not the request stated it.
+            for (sent, reported) in container_list(sent).iter().zip(container_list(reported)) {
+                for (member, value) in sent.as_object().expect("a container is an object") {
+                    assert_eq!(
+                        reported.get(member),
+                        Some(value),
+                        "case {case}: {container}.{member} must round-trip, got {reported:?}"
+                    );
+                }
+                assert_eq!(
+                    reported.get("Mode").and_then(Value::as_str),
+                    Some("SingleModel"),
+                    "case {case}: {container}.Mode, got {reported:?}"
+                );
+            }
+        }
+        assert_eq!(
+            described.get("EnableNetworkIsolation").and_then(Value::as_bool),
+            Some(
+                body.get("EnableNetworkIsolation")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            ),
+            "case {case}: EnableNetworkIsolation, got {described:?}"
+        );
 
         // A second read sees the same values: a read changes nothing.
         let again = emulator

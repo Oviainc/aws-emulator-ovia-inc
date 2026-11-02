@@ -400,7 +400,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(registration_type) = input.model_package_registration_type {
             package.registration_type = Some(registration_type);
         }
-        if let Some(specification) = input.inference_specification {
+        if let Some(mut specification) = input.inference_specification {
+            // The same digests and checkpoint flags the create resolves: a specification
+            // this update puts on the package is materialised the way a created one is.
+            crate::state::materialise_inference_specification(&mut specification);
             package.inference_specification = Some(specification);
         }
         if let Some(source_uri) = input.source_uri {
@@ -416,6 +419,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with a minimum length of one, so a package whose last property was removed
         // carries no map at all.
         package.customer_metadata_properties = (!metadata.is_empty()).then_some(metadata);
+        // The same digests and checkpoint flags the create resolves, over the whole list
+        // the package ends up holding.
+        crate::state::materialise_additional_inference_specifications(&mut additional);
         package.additional_inference_specifications =
             (!additional.is_empty()).then_some(additional);
         package.last_modified_time = now;

@@ -107,13 +107,23 @@ async fn a_listing_projects_every_stored_pipeline() {
             ),
             "case {name}: the summary replays the stored ARN and role, got {summary}"
         );
-        for member in ["PipelineDisplayName", "PipelineDescription"] {
-            assert_eq!(
-                summary.get(member),
-                extra.get(member),
-                "case {name}: {member} must be what the create stored, got {summary}"
-            );
-        }
+        assert_eq!(
+            summary.get("PipelineDescription"),
+            extra.get("PipelineDescription"),
+            "case {name}: PipelineDescription must be what the create stored, got {summary}"
+        );
+        // The display name is the one the create stated, or the pipeline's own name when
+        // it stated none (pinned in `service_resolved_members`).
+        assert_eq!(
+            summary.get("PipelineDisplayName").and_then(Value::as_str),
+            Some(
+                extra
+                    .get("PipelineDisplayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or(name)
+            ),
+            "case {name}: PipelineDisplayName, got {summary}"
+        );
         assert_eq!(
             summary.get("CreationTime"),
             summary.get("LastModifiedTime"),

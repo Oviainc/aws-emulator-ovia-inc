@@ -176,9 +176,18 @@ async fn describe_experiment_replays_exactly_what_create_experiment_stored() {
         );
 
         // The identity the create was signed with, stored then and replayed now. The
-        // harness signs with `Credential=AKIDEXAMPLE/...`.
+        // harness signs with `Credential=AKIDEXAMPLE/...`, and the identity carries both
+        // its ARN and the unique id AWS gives that identity, which is a function of the
+        // ARN (`service_common::caller_principal::aws_unique_id`).
+        let identity_arn = format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE");
         let expected_identity = Some(json!({
-            "IamIdentity": { "Arn": format!("arn:aws:iam::{ACCOUNT}:user/AKIDEXAMPLE") },
+            "IamIdentity": {
+                "Arn": identity_arn,
+                "PrincipalId": service_common::caller_principal::aws_unique_id(
+                    "AIDA",
+                    &identity_arn,
+                ),
+            },
         }));
         assert_eq!(
             described.get("CreatedBy").cloned(),

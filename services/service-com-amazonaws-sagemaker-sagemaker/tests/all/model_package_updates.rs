@@ -37,6 +37,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_sagemaker_sagemaker::state;
 
+use crate::service_resolved_members::{
+    materialised_additional_inference_specifications, materialised_inference_specification,
+};
+
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
@@ -68,6 +72,13 @@ fn additional_spec(name: &str) -> Value {
         "Name": name,
         "Containers": [container("123.dkr.ecr.us-east-1.amazonaws.com/neo:1")],
     })
+}
+
+/// `additional_spec(name)` as the registry STORES it: the service resolves each
+/// container's image digest and checkpoint flag, so a read reports those beside the
+/// members the request sent.
+fn stored_spec(name: &str) -> Value {
+    materialised_inference_specification(&additional_spec(name))
 }
 
 /// One emulator: the shared engine plus the SageMaker service mounted on the router.
@@ -406,9 +417,18 @@ async fn an_update_applies_the_members_it_names_and_leaves_the_rest_alone() {
             .cloned()
             .expect("the row's expectations are an object");
         for (member, value) in &expected {
+            // An inference specification is reported with the members the SERVICE
+            // resolves for its containers laid over what the update sent.
+            let value = match member.as_str() {
+                "InferenceSpecification" => materialised_inference_specification(value),
+                "AdditionalInferenceSpecifications" => {
+                    materialised_additional_inference_specifications(value)
+                }
+                _ => value.clone(),
+            };
             assert_eq!(
                 after.get(member),
-                Some(value),
+                Some(&value),
                 "case {case:?}: expected {member} to be {value}, got {after}"
             );
         }
@@ -769,7 +789,7 @@ async fn adding_an_additional_inference_specification_name_twice_conflicts() {
         let described = emulator.describe(case, &arn).await;
         assert_eq!(
             described.get("AdditionalInferenceSpecifications"),
-            Some(&json!([additional_spec("neo")])),
+            Some(&json!([stored_spec("neo")])),
             "case {case:?}: a refused addition must leave the stored list untouched, \
              got {described}"
         );
@@ -873,7 +893,7 @@ async fn a_repeated_client_token_replays_instead_of_applying_the_update_twice() 
     let described = emulator.describe(case, &arn).await;
     assert_eq!(
         described.get("AdditionalInferenceSpecifications"),
-        Some(&json!([additional_spec("neo")])),
+        Some(&json!([stored_spec("neo")])),
         "case {case:?}: the retry must not append a second copy, got {described}"
     );
 
@@ -891,7 +911,7 @@ async fn a_repeated_client_token_replays_instead_of_applying_the_update_twice() 
     let described = emulator.describe(case, &arn).await;
     assert_eq!(
         described.get("AdditionalInferenceSpecifications"),
-        Some(&json!([additional_spec("neo"), additional_spec("graviton")])),
+        Some(&json!([stored_spec("neo"), stored_spec("graviton")])),
         "case {case:?}: a fresh token must apply its addition, got {described}"
     );
 
@@ -938,7 +958,7 @@ async fn a_repeated_client_token_replays_instead_of_applying_the_update_twice() 
     let described = emulator.describe(case, &arn).await;
     assert_eq!(
         described.get("AdditionalInferenceSpecifications"),
-        Some(&json!([additional_spec("neo"), additional_spec("graviton")])),
+        Some(&json!([stored_spec("neo"), stored_spec("graviton")])),
         "case {case:?}: a token already seen on a no-op call must still replay, \
          got {described}"
     );

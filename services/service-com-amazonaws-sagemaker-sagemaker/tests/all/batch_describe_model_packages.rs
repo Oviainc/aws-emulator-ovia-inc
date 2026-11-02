@@ -104,7 +104,8 @@ struct Row {
     /// The approval status the summary must report. `PendingManualApproval` is what a
     /// versioned registration that names none defaults to.
     approval: &'static str,
-    /// The registration type the summary must report, or `None` when the row names none.
+    /// The registration type the summary must report. `Registered` is what a package
+    /// `CreateModelPackage` put in the registry carries when the request names none.
     registration: Option<&'static str>,
     /// How many containers the row's `InferenceSpecification` carries.
     containers: usize,
@@ -131,7 +132,7 @@ async fn summaries_project_each_requested_version_as_described() {
             extras: json!({"InferenceSpecification": inference_specification(1)}),
             description: None,
             approval: "PendingManualApproval",
-            registration: None,
+            registration: Some("Registered"),
             containers: 1,
         },
         Row {
@@ -168,7 +169,7 @@ async fn summaries_project_each_requested_version_as_described() {
             }),
             description: Some(String::new()),
             approval: "PendingManualApproval",
-            registration: None,
+            registration: Some("Registered"),
             containers: 1,
         },
         Row {
@@ -179,7 +180,7 @@ async fn summaries_project_each_requested_version_as_described() {
             }),
             description: Some(longest_description.clone()),
             approval: "PendingManualApproval",
-            registration: None,
+            registration: Some("Registered"),
             containers: 1,
         },
     ];

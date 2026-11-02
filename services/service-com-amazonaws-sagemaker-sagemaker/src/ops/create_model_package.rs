@@ -362,6 +362,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let arn = crate::state::resource_arn(&region, crate::state::MODEL_PACKAGE_KIND, &key);
 
+        // The service's own defaulting step, applied ONCE here so the stored package is
+        // the one every reader replays: the digest SageMaker resolves for each inference
+        // container's image and whether that container's model data is a checkpoint.
+        let mut inference_specification = input.inference_specification;
+        if let Some(specification) = inference_specification.as_mut() {
+            crate::state::materialise_inference_specification(specification);
+        }
+        let mut additional_inference_specifications = input.additional_inference_specifications;
+        if let Some(specifications) = additional_inference_specifications.as_mut() {
+            crate::state::materialise_additional_inference_specifications(specifications);
+        }
+
         // Registration is asynchronous: the package is `Pending` until the instant the
         // clock owes it `Completed`, which a reporting call materialises.
         let model_approval_status = match version {
@@ -386,11 +398,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 version,
                 arn: arn.clone(),
                 description: input.model_package_description,
-                registration_type: input.model_package_registration_type,
-                inference_specification: input.inference_specification,
+                // "The package registration type of the model package": a package this
+                // operation registers into the registry is a REGISTERED one — the other
+                // member of the modelled enum, `Logged`, is what a run logs rather than
+                // what a caller registers.
+                registration_type: Some(input.model_package_registration_type.unwrap_or_else(
+                    || crate::state::MODEL_PACKAGE_REGISTRATION_TYPE_REGISTERED.to_string(),
+                )),
+                inference_specification,
                 validation_specification: input.validation_specification,
                 source_algorithm_specification: input.source_algorithm_specification,
-                certify_for_marketplace: input.certify_for_marketplace,
+                // "Whether to certify the model package for listing on Amazon Web
+                // Services Marketplace": a package nothing asked to certify is not
+                // certified.
+                certify_for_marketplace: Some(input.certify_for_marketplace.unwrap_or(false)),
                 model_approval_status,
                 // Set by `UpdateModelPackage` when an approval decision is recorded, so a
                 // freshly registered package carries none.
@@ -402,7 +423,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 sample_payload_url: input.sample_payload_url,
                 customer_metadata_properties: input.customer_metadata_properties,
                 drift_check_baselines: input.drift_check_baselines,
-                additional_inference_specifications: input.additional_inference_specifications,
+                additional_inference_specifications,
                 skip_model_validation: input.skip_model_validation,
                 source_uri: input.source_uri,
                 security_config: input.security_config,

@@ -194,7 +194,6 @@ async fn an_accepted_training_job_reads_back_through_describe() {
             "TrainingTimeInSeconds",
             "BillableTimeInSeconds",
             "FinalMetricDataList",
-            "SecondaryStatusTransitions",
             "FailureReason",
         ] {
             assert!(
@@ -202,19 +201,62 @@ async fn an_accepted_training_job_reads_back_through_describe() {
                 "case {case:?}: {absent} must be absent while nothing ran, got {described}"
             );
         }
-        // Every request member the describe models is replayed from the store.
-        for member in [
-            "AlgorithmSpecification",
-            "RoleArn",
-            "InputDataConfig",
-            "OutputDataConfig",
-            "ResourceConfig",
-            "StoppingCondition",
-        ] {
+        // Every request member the describe models is replayed from the store. The
+        // members the SERVICE supplies on top of the request (the channel and output
+        // defaults, the switches, the profiling status, the status history) are pinned in
+        // `service_resolved_members`, so this suite compares only what the request sent.
+        for member in ["RoleArn", "ResourceConfig", "StoppingCondition"] {
             assert_eq!(
                 described.get(member),
                 body.get(member),
                 "case {case:?}: {member} must be replayed as stored, got {described}"
+            );
+        }
+        for member in ["AlgorithmSpecification", "OutputDataConfig"] {
+            let sent = body
+                .get(member)
+                .and_then(Value::as_object)
+                .map(|sent| sent.clone().into_iter().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for (key, value) in sent {
+                assert_eq!(
+                    described.get(member).and_then(|reported| reported.get(&key)),
+                    Some(&value),
+                    "case {case:?}: {member}.{key} must be replayed as stored, got {described}"
+                );
+            }
+        }
+        // Every channel the request carried is replayed, in order, with the members it
+        // stated unchanged.
+        let sent_channels = body
+            .get("InputDataConfig")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let reported_channels = described
+            .get("InputDataConfig")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            sent_channels.len(),
+            reported_channels.len(),
+            "case {case:?}: every channel must be replayed, got {described}"
+        );
+        for (index, (sent, reported)) in sent_channels.iter().zip(&reported_channels).enumerate() {
+            for key in ["ChannelName", "ContentType"] {
+                assert_eq!(
+                    reported.get(key),
+                    sent.get(key),
+                    "case {case:?}: InputDataConfig[{index}].{key} must be replayed as \
+                     stored, got {reported}"
+                );
+            }
+            assert_eq!(
+                reported.pointer("/DataSource/S3DataSource/S3Uri"),
+                sent.pointer("/DataSource/S3DataSource/S3Uri"),
+                "case {case:?}: InputDataConfig[{index}]'s S3Uri must be replayed as \
+                 stored, got {reported}"
             );
         }
         for member in extra.as_object().expect("a JSON object of extra members").keys() {

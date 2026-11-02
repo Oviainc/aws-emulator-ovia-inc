@@ -250,7 +250,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::Pipeline {
                 name: input.pipeline_name.clone(),
                 arn: arn.clone(),
-                display_name: input.pipeline_display_name,
+                // "The display name of the pipeline": a create that names none leaves
+                // the pipeline displayed under the name it was created with, so the
+                // service's own value is resolved here, once, rather than left for each
+                // reader to decide again.
+                display_name: input
+                    .pipeline_display_name
+                    .unwrap_or_else(|| input.pipeline_name.clone()),
                 definition,
                 description: input.pipeline_description,
                 role_arn: input.role_arn,
@@ -261,6 +267,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 parallelism_configuration: input.parallelism_configuration,
                 tags: input.tags.unwrap_or_default(),
                 client_request_token: input.client_request_token,
+                // The identity this call signed with is the pipeline's creator, and —
+                // nothing having modified it yet — also the last identity to have
+                // changed it.
+                created_by: crate::state::caller_user_context(ctx),
+                last_modified_by: crate::state::caller_user_context(ctx),
                 creation_time: now,
                 last_modified_time: now,
                 last_run_time: None,

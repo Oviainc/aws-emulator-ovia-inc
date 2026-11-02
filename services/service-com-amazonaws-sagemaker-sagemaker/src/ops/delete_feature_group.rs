@@ -2,8 +2,10 @@
 
 //! @op DeleteFeatureGroup
 //! IMPLEMENTED: starts the deletion of the feature group `CreateFeatureGroup` registered
-//! under the requested `FeatureGroupName` and refuses a name this account holds no group
-//! under with the modelled `ResourceNotFound`. The group reports `FeatureGroupStatus`'s
+//! under the requested `FeatureGroupName`, refuses a name this account holds no group
+//! under with the modelled `ResourceNotFound` and refuses a group that is still being
+//! provisioned with the 400 `ValidationException` naming its `FeatureGroupStatus`. The
+//! group reports `FeatureGroupStatus`'s
 //! `Deleting` from this call until the clock completes its removal (see
 //! [`crate::state::FEATURE_GROUP_RELEASED_AFTER`]), past which every reader answers as if
 //! it were gone and the name and quota slot it held are free again. The registration in
@@ -186,6 +188,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+        // The provisioning the clock already owed is materialised before the deletion is
+        // weighed, so a group whose `Created` instant has passed is deletable here even
+        // though no read has reported it yet. It was due at that instant whether or not
+        // anybody called.
+        group.settle_status(now);
+        // A feature group is deleted once it EXISTS: while it is still being provisioned
+        // there is no store to tear down, so SageMaker refuses the delete and names the
+        // status that stands in the way rather than removing a group mid-creation. The
+        // status is observable (the span is never zero), so this refusal is reachable.
+        if group.status == crate::state::FEATURE_GROUP_STATUS_CREATING {
+            let refusal = crate::state::feature_group_not_deletable(&group.name, &group.status);
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
         // The record is kept until the clock completes the removal, so the `Deleting`
         // status a caller reads straight after this call is observable; past that instant
         // every lookup answers as if the group were gone.

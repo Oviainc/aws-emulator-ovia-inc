@@ -28,6 +28,11 @@ use crate::sagemaker_feature_store_control_plane_handoff::{
 /// owes a requested deletion its completion by the time the next call runs.
 const PAST_RELEASE_DUE: Duration = Duration::from_millis(600);
 
+/// Longer than the control plane's `FEATURE_GROUP_CREATED_AFTER` (300 ms), so the clock
+/// owes a created group its `Created` status — which a group must have reached before the
+/// control plane will delete it.
+const PAST_CREATED_DUE: Duration = Duration::from_millis(600);
+
 /// `DescribeFeatureGroup` on the control plane, in its awsJson1_1 RPC form.
 async fn describe_feature_group(
     router: &smithy_server_runtime::MultiServiceRouter,
@@ -99,6 +104,9 @@ async fn deleting_a_feature_group_withdraws_its_online_store_from_the_data_plane
         "case \"the created group\": expected DescribeFeatureGroup to report its ARN"
     );
 
+    // A feature group is deletable only once it EXISTS, so the provisioning the clock owes
+    // is left to fall due before the delete is asked for.
+    tokio::time::sleep(PAST_CREATED_DUE).await;
     let deleted = delete_feature_group(&router, "deleted-group").await;
     assert_eq!(
         deleted.status, 200,

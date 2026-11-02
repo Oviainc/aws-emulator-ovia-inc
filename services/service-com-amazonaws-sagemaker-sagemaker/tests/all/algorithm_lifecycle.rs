@@ -19,6 +19,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
+use crate::service_resolved_members::{
+    materialised_inference_specification, materialised_training_specification,
+};
 
 /// Long enough to pass `state::ALGORITHM_COMPLETED_AFTER` (300 ms).
 const PAST_COMPLETED_DUE: Duration = Duration::from_millis(600);
@@ -257,14 +260,10 @@ async fn describe_algorithm_replays_exactly_what_create_algorithm_stored() {
             str_field(&created, "AlgorithmArn"),
             "case {case}: AlgorithmArn, got {described:?}"
         );
-        // Every member the request carried comes back byte-for-byte; every member it
-        // omitted is absent rather than defaulted.
+        // Every member the request carried comes back byte-for-byte.
         for member in [
             "AlgorithmDescription",
-            "TrainingSpecification",
-            "InferenceSpecification",
             "ValidationSpecification",
-            "CertifyForMarketplace",
         ] {
             assert_eq!(
                 described.get(member),
@@ -272,6 +271,31 @@ async fn describe_algorithm_replays_exactly_what_create_algorithm_stored() {
                 "case {case}: {member} must replay what the create stored, got {described:?}"
             );
         }
+        // The members the SERVICE supplies come back too: the certification flag an
+        // uncertified algorithm carries, the digest it resolved for each image, and each
+        // training channel's `IsRequired`.
+        assert_eq!(
+            described.get("CertifyForMarketplace"),
+            Some(&json!(body
+                .get("CertifyForMarketplace")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))),
+            "case {case}: CertifyForMarketplace, got {described:?}"
+        );
+        assert_eq!(
+            described.get("TrainingSpecification"),
+            Some(&materialised_training_specification(
+                &body["TrainingSpecification"]
+            )),
+            "case {case}: TrainingSpecification, got {described:?}"
+        );
+        assert_eq!(
+            described.get("InferenceSpecification"),
+            body.get("InferenceSpecification")
+                .map(materialised_inference_specification)
+                .as_ref(),
+            "case {case}: InferenceSpecification, got {described:?}"
+        );
         // `Tags` is not a member of `DescribeAlgorithmOutput`, so it is never echoed
         // (smithy_query query="operation" operation="DescribeAlgorithm").
         assert!(
