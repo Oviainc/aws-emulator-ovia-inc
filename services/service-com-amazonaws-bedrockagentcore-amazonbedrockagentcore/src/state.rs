@@ -12,6 +12,12 @@
 //! so it is kept beside a session's events rather than among them, and a session that
 //! only ever received ingested content exists with no events of its own.
 //!
+//! A memory container also holds the LONG-TERM memory records a caller created with
+//! its own content (`BatchCreateMemoryRecords`), keyed by the `memoryRecordId` this
+//! emulator minted for each one. A record belongs to the container, not to an actor or
+//! a session, so it lives beside the actors rather than under one, and
+//! `GetMemoryRecord` / `DeleteMemoryRecord` address it by that id alone.
+//!
 //! The AgentCore *tools* data plane keeps its own map: a code interpreter holds the
 //! sessions `StartCodeInterpreterSession` started on it, and
 //! `GetCodeInterpreterSession` reports one of them back — its status read off the
@@ -69,8 +75,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Branch, Certificate, Event, ExtractionConfig, IngestPayloadType, MetadataValue, PayloadType,
-    SessionSummary, ToolsFileSystemConfiguration,
+    Branch, Certificate, Event, ExtractionConfig, IngestPayloadType, MemoryContent, MemoryRecord,
+    MemoryRecordMetadataValue, MemoryRecordOutput, MetadataValue, PayloadType, SessionSummary,
+    ToolsFileSystemConfiguration,
 };
 
 /// The most memory containers this emulator retains; the least recently written one
@@ -102,6 +109,14 @@ pub const MAX_STORED_INGESTIONS: usize = 10_000;
 
 /// The most `clientToken` records this emulator retains for one memory container.
 pub const MAX_IDEMPOTENCY_RECORDS_PER_MEMORY: usize = 1_000;
+
+/// The most long-term memory records this emulator retains in one memory container.
+pub const MAX_MEMORY_RECORDS_PER_MEMORY: usize = 1_000;
+
+/// The most long-term memory records this emulator retains across EVERY memory
+/// container, as a ring in insertion order: the oldest record (and the now-empty memory
+/// container it was the last of) is dropped once the store passes it.
+pub const MAX_STORED_MEMORY_RECORDS: usize = 10_000;
 
 /// The most code interpreters this emulator retains sessions for; the least recently
 /// used one is evicted once the store passes it.
@@ -185,6 +200,43 @@ pub const CODE_INTERPRETER_SESSION_READY: &str = "READY";
 /// the same enum.
 pub const CODE_INTERPRETER_SESSION_TERMINATED: &str = "TERMINATED";
 
+/// `MemoryRecordStatus` for a record a batch operation processed (source: smithy_query
+/// query="shape" shape="MemoryRecordStatus", values SUCCEEDED | FAILED).
+pub const MEMORY_RECORD_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// The message a memory-record read or delete is refused with when the record the
+/// request addresses is not one this memory container holds: AWS's wording for that
+/// `ResourceNotFoundException`, whose text names nothing from the request.
+pub const MEMORY_RECORD_NOT_FOUND_MESSAGE: &str = "MemoryItem does not exist";
+
+/// The `memoryStrategyId` reported for a record whose creating request named no
+/// strategy.
+///
+/// `MemoryRecordCreateInput$memoryStrategyId` is optional while
+/// `MemoryRecord$memoryStrategyId` is `@required`, so a record created with content of
+/// the caller's own and no strategy association still has to be reported under one.
+/// Memory strategies are owned by the CONTROL plane, a different service, so the only
+/// grouping this data plane can name for such a record is the one AgentCore uses for
+/// memory a caller fills itself.
+pub const CALLER_MANAGED_MEMORY_STRATEGY_ID: &str = "CUSTOM";
+
+/// Seconds in one day, the unit `recordExpiryDurationDays` states a record expiry in.
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+
+/// The instant a record created at `created_at` expires when the creating request asked
+/// for an expiry of `days` days ("The duration, in days, after which the records in this
+/// request expire"), as a duration from that instant.
+pub fn record_expires_at(
+    created_at: ::aws_smithy_types::DateTime,
+    days: i32,
+) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_secs(
+        created_at
+            .secs()
+            .saturating_add(i64::from(days).saturating_mul(SECONDS_PER_DAY)),
+    )
+}
+
 /// How this service words the `ConflictException` a call gets when the code
 /// interpreter session it names is no longer running: `Session already terminated:
 /// <sessionId>`, with the session taken from the request.
@@ -209,6 +261,9 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     /// Every stored ingestion, in insertion order, as a ring bounded by
     /// [`MAX_STORED_INGESTIONS`], read the same way as [`Self::order`].
     pub ingest_order: VecDeque<IngestKey>,
+    /// Every stored long-term memory record, in insertion order, as a ring bounded by
+    /// [`MAX_STORED_MEMORY_RECORDS`], read the same way as [`Self::order`].
+    pub record_order: VecDeque<MemoryRecordKey>,
     /// Monotonic counter feeding the hex suffix of every generated `eventId` and
     /// `sessionId`, so two records minted inside the same millisecond still get
     /// distinct ids, and ordering the records each bound evicts by.
@@ -377,9 +432,7 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
         memory
             .idempotency
             .retain(|_, locator| locator.event_id != key.event_id);
-        if memory.actors.is_empty() {
-            self.memories.remove(&key.memory_id);
-        }
+        self.prune_empty_memory(&key.memory_id);
     }
 
     /// The content a `clientToken` already ingested into this memory container, or
@@ -507,8 +560,175 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
         memory
             .ingest_idempotency
             .retain(|_, locator| locator.seq != key.seq);
-        if memory.actors.is_empty() {
-            self.memories.remove(&key.memory_id);
+        self.prune_empty_memory(&key.memory_id);
+    }
+
+    /// The long-term memory record addressed by (memory, record), or `None` when this
+    /// emulator holds no such record.
+    pub fn memory_record(
+        &self,
+        memory_id: &str,
+        memory_record_id: &str,
+    ) -> Option<&StoredMemoryRecord> {
+        self.memories.get(memory_id)?.records.get(memory_record_id)
+    }
+
+    /// The records a `clientToken` already created in this memory container, in the
+    /// order the request that minted them listed them — or `None` when that token
+    /// created none (or one of the records it created is no longer held, so the batch
+    /// can no longer be answered from what it wrote).
+    pub fn memory_records_for_token(
+        &self,
+        memory_id: &str,
+        client_token: &str,
+    ) -> Option<Vec<&StoredMemoryRecord>> {
+        let memory = self.memories.get(memory_id)?;
+        memory
+            .record_idempotency
+            .get(client_token)?
+            .memory_record_ids
+            .iter()
+            .map(|id| memory.records.get(id))
+            .collect()
+    }
+
+    /// Persist the records one `BatchCreateMemoryRecords` created — registering the
+    /// memory container on the way — and hold every bound in
+    /// [the module's ceiling](self#the-store-has-an-explicit-ceiling).
+    ///
+    /// The memory container is registered here for the same reason an event registers
+    /// one: the container itself is created through the CONTROL plane, a different
+    /// service.
+    pub fn insert_memory_records(
+        &mut self,
+        memory_id: &str,
+        records: Vec<StoredMemoryRecord>,
+        client_token: Option<String>,
+    ) {
+        let minted: Vec<String> = records
+            .iter()
+            .map(|record| record.memory_record_id.clone())
+            .collect();
+        let last_seq = records.iter().map(|record| record.seq).max().unwrap_or(0);
+
+        let memory = self.memories.entry(memory_id.to_string()).or_default();
+        memory.last_seq = memory.last_seq.max(last_seq);
+        for record in records {
+            memory
+                .records
+                .insert(record.memory_record_id.clone(), record);
+        }
+        if let Some(token) = client_token {
+            memory.record_idempotency.insert(
+                token,
+                MemoryRecordBatchLocator {
+                    memory_record_ids: minted.clone(),
+                    seq: last_seq,
+                },
+            );
+            while memory.record_idempotency.len() > MAX_IDEMPOTENCY_RECORDS_PER_MEMORY {
+                let Some(oldest) =
+                    least_recently_written(&memory.record_idempotency, |locator| locator.seq)
+                else {
+                    break;
+                };
+                memory.record_idempotency.remove(&oldest);
+            }
+        }
+
+        for memory_record_id in minted {
+            self.record_order.push_back(MemoryRecordKey {
+                memory_id: memory_id.to_string(),
+                memory_record_id,
+            });
+        }
+
+        // Both record bounds are held through the one removal path, so an evicted
+        // record never leaves its ring key or its `clientToken` record behind.
+        while let Some(oldest) = self
+            .memories
+            .get(memory_id)
+            .filter(|memory| memory.records.len() > MAX_MEMORY_RECORDS_PER_MEMORY)
+            .and_then(|memory| least_recently_written(&memory.records, |record| record.seq))
+        {
+            self.remove_memory_record(memory_id, &oldest);
+        }
+        while self.record_order.len() > MAX_STORED_MEMORY_RECORDS {
+            let Some(oldest) = self.record_order.pop_front() else {
+                break;
+            };
+            self.remove_memory_record(&oldest.memory_id, &oldest.memory_record_id);
+        }
+        while self.memories.len() > MAX_MEMORIES {
+            let Some(oldest) = least_recently_written(&self.memories, |memory| memory.last_seq)
+            else {
+                break;
+            };
+            self.memories.remove(&oldest);
+        }
+    }
+
+    /// Remove one long-term memory record and everything that pointed at it, answering
+    /// with the record that was removed (`None` when this emulator held no such record).
+    ///
+    /// This is `DeleteMemoryRecord`'s path and the eviction path both: in either case the
+    /// record is gone, so the whole-store ring drops its key rather than carrying a stale
+    /// one, and the `clientToken` record of the batch that created it goes too — that
+    /// batch can no longer be answered from what it wrote.
+    pub fn remove_memory_record(
+        &mut self,
+        memory_id: &str,
+        memory_record_id: &str,
+    ) -> Option<StoredMemoryRecord> {
+        let memory = self.memories.get_mut(memory_id)?;
+        let removed = memory.records.remove(memory_record_id)?;
+        memory.record_idempotency.retain(|_, locator| {
+            !locator
+                .memory_record_ids
+                .iter()
+                .any(|id| id == memory_record_id)
+        });
+        self.record_order
+            .retain(|key| key.memory_id != memory_id || key.memory_record_id != memory_record_id);
+        self.prune_empty_memory(memory_id);
+        Some(removed)
+    }
+
+    /// Drop every long-term memory record whose expiry the clock has already passed.
+    ///
+    /// A record expiry is a time-to-live: the record is gone at the instant it names,
+    /// whether or not anybody calls, so materialising it is what any operation that
+    /// reaches the records does first rather than reporting a record AWS would not.
+    pub fn expire_memory_records(&mut self, now: SystemTime) {
+        let expired: Vec<MemoryRecordKey> = self
+            .memories
+            .iter()
+            .flat_map(|(memory_id, memory)| {
+                memory
+                    .records
+                    .values()
+                    .filter(|record| record.has_expired(now))
+                    .map(|record| MemoryRecordKey {
+                        memory_id: memory_id.clone(),
+                        memory_record_id: record.memory_record_id.clone(),
+                    })
+            })
+            .collect();
+        for key in expired {
+            self.remove_memory_record(&key.memory_id, &key.memory_record_id);
+        }
+    }
+
+    /// Drop a memory container this data plane holds nothing for any more, so a
+    /// container cannot outlive the records that registered it. A container that still
+    /// holds actors OR long-term memory records is still a container this memory has.
+    fn prune_empty_memory(&mut self, memory_id: &str) {
+        if self
+            .memories
+            .get(memory_id)
+            .is_some_and(|memory| memory.actors.is_empty() && memory.records.is_empty())
+        {
+            self.memories.remove(memory_id);
         }
     }
 
@@ -730,6 +950,15 @@ pub struct IngestKey {
     pub seq: u64,
 }
 
+/// Where one stored long-term memory record lives, as the whole-store ring records it.
+/// A memory record belongs to its memory container directly, so the key names no actor
+/// and no session.
+#[derive(Debug, Clone)]
+pub struct MemoryRecordKey {
+    pub memory_id: String,
+    pub memory_record_id: String,
+}
+
 /// One AgentCore Memory container's data-plane contents.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
@@ -749,9 +978,94 @@ pub struct MemoryStore {
     /// [`MAX_IDEMPOTENCY_RECORDS_PER_MEMORY`], and a record is dropped with the
     /// ingestion it points at.
     pub ingest_idempotency: HashMap<String, IngestLocator>,
+    /// The long-term memory records this container holds, keyed by the
+    /// `memoryRecordId` this emulator minted for each one. Bounded by
+    /// [`MAX_MEMORY_RECORDS_PER_MEMORY`].
+    pub records: HashMap<String, StoredMemoryRecord>,
+    /// `clientToken` -> the records that token already created.
+    /// `BatchCreateMemoryRecords` is `@idempotent` and its `clientToken` is an
+    /// `@idempotencyToken`, so a replayed token answers with the records the first call
+    /// created rather than creating a second set. Bounded by
+    /// [`MAX_IDEMPOTENCY_RECORDS_PER_MEMORY`], and a record is dropped with any of the
+    /// memory records it points at.
+    pub record_idempotency: HashMap<String, MemoryRecordBatchLocator>,
     /// The sequence of the last event written into this container, which is what its
     /// eviction order is read from.
     pub last_seq: u64,
+}
+
+/// Which records one `clientToken` already created, so a replayed batch can answer with
+/// them.
+#[derive(Debug, Clone)]
+pub struct MemoryRecordBatchLocator {
+    /// The ids the batch minted, in the order its request listed the records.
+    pub memory_record_ids: Vec<String>,
+    /// The highest sequence the batch wrote: its eviction order.
+    pub seq: u64,
+}
+
+/// A stored long-term memory record: exactly what `BatchCreateMemoryRecords` persisted,
+/// which is what `GetMemoryRecord` hands back.
+#[derive(Debug, Clone)]
+pub struct StoredMemoryRecord {
+    /// `mem-<hex>`, minted by [`mint_memory_record_id`]; never client-supplied.
+    pub memory_record_id: String,
+    pub memory_id: String,
+    /// The `requestIdentifier` the creating batch entry carried, which is what the batch
+    /// response tracks each per-record outcome by.
+    pub request_identifier: String,
+    pub namespaces: Vec<String>,
+    pub content: MemoryContent,
+    /// The strategy this record is grouped under: the one the creating request named, or
+    /// [`CALLER_MANAGED_MEMORY_STRATEGY_ID`] when it named none.
+    pub memory_strategy_id: String,
+    /// The instant the remembered content occurred, as the creating request stated it.
+    pub timestamp: ::aws_smithy_types::DateTime,
+    /// The instant this record was created, which is when the batch that wrote it ran.
+    pub created_at: ::aws_smithy_types::DateTime,
+    /// When a record expiry applies, the instant this record expires; `None` for a
+    /// record created with no expiry, which does not expire.
+    pub expires_at: Option<::aws_smithy_types::DateTime>,
+    pub metadata: Option<HashMap<String, MemoryRecordMetadataValue>>,
+    /// The value [`ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState::next_seq`]
+    /// handed this record: its eviction order.
+    pub seq: u64,
+}
+
+impl StoredMemoryRecord {
+    /// This record as the modelled `MemoryRecord`, the shape `GetMemoryRecord` reports.
+    pub fn to_memory_record(&self) -> MemoryRecord {
+        MemoryRecord {
+            memory_record_id: self.memory_record_id.clone(),
+            content: self.content.clone(),
+            memory_strategy_id: self.memory_strategy_id.clone(),
+            namespaces: self.namespaces.clone(),
+            created_at: self.created_at,
+            timestamp: Some(self.timestamp),
+            metadata: self.metadata.clone(),
+            expires_at: self.expires_at,
+        }
+    }
+
+    /// This record as the per-record outcome a batch operation reports for a record it
+    /// processed, tracked by the `requestIdentifier` its input carried.
+    pub fn to_output(&self) -> MemoryRecordOutput {
+        MemoryRecordOutput {
+            memory_record_id: self.memory_record_id.clone(),
+            status: MEMORY_RECORD_STATUS_SUCCEEDED.to_string(),
+            request_identifier: Some(self.request_identifier.clone()),
+            error_code: None,
+            error_message: None,
+        }
+    }
+
+    /// Whether the record expiry this record carries has already run out at `now`.
+    pub fn has_expired(&self, now: SystemTime) -> bool {
+        let Some(expires_at) = self.expires_at else {
+            return false;
+        };
+        unix_seconds(now) >= expires_at.secs()
+    }
 }
 
 /// Where an already-created event lives, so a replayed `clientToken` can find it.
@@ -1288,6 +1602,21 @@ pub fn mint_event_id(seq: u64) -> String {
 /// `SessionId`'s pattern is `^[a-zA-Z0-9][a-zA-Z0-9-_]*$` with length 1..100.
 pub fn mint_session_id(seq: u64) -> String {
     format!("session-{seq:016x}")
+}
+
+/// Mint a `memoryRecordId` for a record created at `created_at`.
+///
+/// `MemoryRecordId`'s pattern is `^mem-[a-zA-Z0-9-_]*$` with length 40..50, so the id is
+/// the prefix the shape fixes followed by the record's creation instant in epoch
+/// milliseconds and the engine-wide sequence, both in lowercase hex (44 characters in
+/// all), which keeps two records minted inside the same millisecond apart. The instant
+/// comes from the batch that is writing the record, so an id cannot disagree with the
+/// `createdAt` reported beside it.
+pub fn mint_memory_record_id(created_at: ::aws_smithy_types::DateTime, seq: u64) -> String {
+    let millis = created_at
+        .to_millis()
+        .map_or(0, |millis| u64::try_from(millis).unwrap_or(0));
+    format!("mem-{millis:016x}{seq:024x}")
 }
 
 /// Mint a `CodeInterpreterSessionId`.

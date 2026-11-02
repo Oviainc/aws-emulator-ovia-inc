@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCreateMemoryRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchCreateMemoryRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates long-term memory records in a memory container from content the caller
+//! supplies, and reports one outcome per record the request listed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchCreateMemoryRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The records are stored in this service's state (`crate::state`), keyed by the
+//! `memoryRecordId` this emulator mints for each one, and are what `GetMemoryRecord`
+//! reports and `DeleteMemoryRecord` removes.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +167,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchCreateMemoryRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchCreateMemoryRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchCreateMemoryRecords"))
+        // Request metadata is not read by this operation: every member it needs is
+        // bound into `input` by the centralized request walk.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchCreateMemoryRecordsErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry this service's state".to_string(),
+            })
+        })?;
+
+        let memory_id = crate::state::normalize_memory_id(&input.memory_id);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A record expiry is a time-to-live, so records the clock has already run out on
+        // leave before this batch reads or writes anything.
+        store.expire_memory_records(now);
+
+        // `BatchCreateMemoryRecords` is `@idempotent` and its `clientToken` is an
+        // `@idempotencyToken`: a replayed token answers with the records that token
+        // already created, so no second set is stored.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(already) = store.memory_records_for_token(&memory_id, token) {
+                return Ok(BatchCreateMemoryRecordsOutput {
+                    successful_records: already
+                        .iter()
+                        .map(|record| record.to_output())
+                        .collect(),
+                    failed_records: Vec::new(),
+                });
+            }
+        }
+
+        let created_at = ::aws_smithy_types::DateTime::from(now);
+        // "Set `recordExpiryDurationDays` to configure or update the expiry, or set
+        // `action` to `REMOVE` to remove a previously configured expiry", and "The
+        // REMOVE action does not apply when creating records" — so a duration gives every
+        // record of this request that expiry, and anything else leaves the records
+        // without one, which is also what a request that carries no expiry at all does
+        // ("If you do not provide this value, the records do not expire").
+        let expires_at = match input.record_expiry_specification {
+            Some(RecordExpirySpecification::recordExpiryDurationDays(days)) => {
+                Some(crate::state::record_expires_at(created_at, days))
+            }
+            Some(RecordExpirySpecification::Action(_)) | None => None,
+        };
+
+        let mut stored = Vec::with_capacity(input.records.len());
+        for record in &input.records {
+            let seq = store.next_seq();
+            stored.push(crate::state::StoredMemoryRecord {
+                memory_record_id: crate::state::mint_memory_record_id(created_at, seq),
+                memory_id: memory_id.clone(),
+                request_identifier: record.request_identifier.clone(),
+                namespaces: record.namespaces.clone(),
+                content: record.content.clone(),
+                memory_strategy_id: record.memory_strategy_id.clone().unwrap_or_else(|| {
+                    crate::state::CALLER_MANAGED_MEMORY_STRATEGY_ID.to_string()
+                }),
+                timestamp: record.timestamp,
+                created_at,
+                expires_at,
+                metadata: record.metadata.clone(),
+                seq,
+            });
+        }
+
+        // Built from what is about to be stored, so the response and the store cannot
+        // disagree. Every record that reached this handler satisfied the modelled
+        // constraints the request walk enforces and is stored, so this emulator fails
+        // none of them: `failedRecords` is the channel for a record the service could
+        // not write, and nothing here could not be written.
+        let successful_records = stored.iter().map(|record| record.to_output()).collect();
+        // `insert_memory_records` registers the memory container — created through the
+        // CONTROL plane, a different service — and holds every bound the store declares,
+        // so no caller can grow it without limit.
+        store.insert_memory_records(&memory_id, stored, input.client_token);
+
+        Ok(BatchCreateMemoryRecordsOutput {
+            successful_records,
+            failed_records: Vec::new(),
+        })
     }
 }

@@ -19,6 +19,8 @@ mod code_interpreter_tools;
 mod memory_events;
 #[path = "all/memory_ingestion.rs"]
 mod memory_ingestion;
+#[path = "all/memory_records.rs"]
+mod memory_records;
 #[path = "all/on_demand_evaluation.rs"]
 mod on_demand_evaluation;
 #[path = "all/service_claim.rs"]
