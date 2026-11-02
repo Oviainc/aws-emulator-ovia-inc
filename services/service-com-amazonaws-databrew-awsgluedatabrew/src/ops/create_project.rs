@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +144,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProject"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateProjectErrorModeled::InternalServerException(InternalServerException {
+                message: Some("DataBrew is mounted on an engine that holds no state".to_string()),
+            })
+        })?;
+
+        // The modelled length bounds are already enforced; the documented character
+        // set for a project name is not.
+        if let Err(message) = crate::state::validate_resource_name("Name", &input.name) {
+            return Err(CreateProjectErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let principal = crate::state::request_principal();
+        let record = crate::state::ProjectRecord {
+            name: input.name.clone(),
+            dataset_name: input.dataset_name.clone(),
+            recipe_name: input.recipe_name.clone(),
+            role_arn: input.role_arn.clone(),
+            // Stored as the request carried it, so a project that asked for no sample
+            // keeps reading the documented default rather than a frozen copy of it.
+            sample: input.sample.clone(),
+            tags: crate::state::stored_tags(input.tags.as_ref()),
+            resource_arn: crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "project",
+                &input.name,
+            ),
+            // A project that has only been created has no modification to report, so
+            // the audit's last-modified pair stays unset until an update runs.
+            audit: crate::state::Audit::created(now, principal),
+            // Creating a project opens no interactive session for it; that is
+            // `StartProjectSession`'s doing, so the session members stay unset.
+            session_status: None,
+            opened_by: None,
+            open_date: None,
+        };
+
+        let mut store = state.lock();
+        // A project acts upon the dataset it names and develops the recipe it names, so
+        // both have to already exist (model: "The name of an existing dataset to
+        // associate this project with" / "The name of an existing recipe to associate
+        // with the project"). `ResourceNotFoundException` is not an error this
+        // operation models (model: `ConflictException`, `ServiceQuotaExceededException`,
+        // `ValidationException`), so a name that resolves to nothing is a bad input.
+        if !store.datasets.contains_key(&record.dataset_name) {
+            return Err(CreateProjectErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "DatasetName names a dataset that does not exist: {}",
+                    record.dataset_name
+                )),
+            })
+            .into());
+        }
+        if !store.recipes.contains_key(&record.recipe_name) {
+            return Err(CreateProjectErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "RecipeName names a recipe that does not exist: {}",
+                    record.recipe_name
+                )),
+            })
+            .into());
+        }
+        if store.projects.contains_key(&input.name) {
+            return Err(CreateProjectErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::already_exists_message("Project", &input.name)),
+            })
+            .into());
+        }
+        // A recipe is developed in ONE project (model: `Recipe$ProjectName` is a single
+        // name, "The name of the project that the recipe is associated with"), so a
+        // recipe another project already develops cannot be taken over by this one:
+        // re-pointing it would leave the first project naming a recipe that reports
+        // somebody else. That is the inconsistent state `ConflictException` is the
+        // modelled answer for.
+        if let Some(owner) = store
+            .recipes
+            .get(&record.recipe_name)
+            .and_then(|recipe| recipe.project_name.clone())
+        {
+            return Err(CreateProjectErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::in_use_message(
+                    "Recipe",
+                    &record.recipe_name,
+                    "projects",
+                    &[owner.as_str()],
+                )),
+            })
+            .into());
+        }
+        // A create is a growth site a caller drives, so the store has a ceiling and
+        // the create past it is refused rather than inserted.
+        if store.projects.len() >= crate::state::MAX_PROJECTS {
+            return Err(CreateProjectErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "A service quota is exceeded: this account already holds the maximum of {} projects.",
+                        crate::state::MAX_PROJECTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The recipe this project develops is attached to it, which is what makes a
+        // recipe report the project it belongs to (model: `Recipe$ProjectName` — "The
+        // name of the project that the recipe is associated with").
+        if let Some(recipe) = store.recipes.get_mut(&record.recipe_name) {
+            recipe.project_name = Some(input.name.clone());
+        }
+        store.projects.insert(input.name.clone(), record);
+
+        Ok(CreateProjectOutput { name: input.name })
     }
 }

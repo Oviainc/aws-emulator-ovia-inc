@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        if store.datasets.remove(&input.name).is_none() {
+        if !store.datasets.contains_key(&input.name) {
             return Err(DeleteDatasetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::not_found_message("Dataset", &input.name)),
@@ -157,6 +157,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A project acts upon the dataset it was created against for as long as it
+        // exists, so deleting that dataset would leave the project addressing nothing:
+        // the delete is refused with the modelled `ConflictException` (model: "Updating
+        // or deleting a resource can cause an inconsistent state") until every project
+        // that pins it is gone — which is why the message names them all. A JOB that
+        // names the dataset does not pin it: a job reads the dataset when it RUNS, so
+        // the reference is resolved per run.
+        let pinning: Vec<&str> = store
+            .projects
+            .values()
+            .filter(|project| project.dataset_name == input.name)
+            .map(|project| project.name.as_str())
+            .collect();
+        if !pinning.is_empty() {
+            return Err(DeleteDatasetErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::in_use_message(
+                    "Dataset",
+                    &input.name,
+                    "projects",
+                    &pinning,
+                )),
+            })
+            .into());
+        }
+        store.datasets.remove(&input.name);
 
         Ok(DeleteDatasetOutput { name: input.name })
     }

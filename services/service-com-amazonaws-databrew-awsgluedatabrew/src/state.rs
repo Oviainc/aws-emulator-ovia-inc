@@ -18,7 +18,7 @@ use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Dataset, FormatOptions, Input, JobRun, Output, PathOptions, RecipeReference, RecipeStep,
+    Dataset, FormatOptions, Input, JobRun, Output, PathOptions, RecipeReference, RecipeStep, Sample,
 };
 
 /// The message DataBrew answers a `ResourceNotFoundException` with: the kind of
@@ -65,6 +65,26 @@ pub fn already_exists_message(kind: &str, name: &str) -> String {
     format!("{kind} {name} already exists.")
 }
 
+/// The message DataBrew answers a `ConflictException` with when a delete is refused
+/// because other resources still depend on the one addressed: the kind and name of the
+/// resource the request addressed, and EVERY resource that still references it, so a
+/// client can tell exactly what to remove first.
+///
+/// The sentence the model documents on the error SHAPE ("Updating or deleting a
+/// resource can cause an inconsistent state.") describes the error class; the message
+/// a particular refusal answers with names the dependencies that would be left
+/// dangling — all of them, since removing only the one named would run into the same
+/// refusal again. `kind` is the addressed resource's kind as DataBrew opens a sentence
+/// with it, capitalised (`Dataset`, `Project`, `Job`, `Recipe`); `by_kind_plural` is the
+/// referencing resources' kind in prose mid-sentence, so lower case and plural
+/// (`projects`, `jobs`, `recipes`).
+pub fn in_use_message(kind: &str, name: &str, by_kind_plural: &str, by_names: &[&str]) -> String {
+    format!(
+        "{kind} {name} is currently in use by the following {by_kind_plural}: {}.",
+        by_names.join(", ")
+    )
+}
+
 /// The region an ARN carries when the request's SigV4 scope names none.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
@@ -89,6 +109,9 @@ pub const MAX_SCHEDULES: usize = 1_000;
 /// The most recipes this emulator retains, for the reason [`MAX_DATASETS`] gives.
 pub const MAX_RECIPES: usize = 1_000;
 
+/// The most projects this emulator retains, for the reason [`MAX_DATASETS`] gives.
+pub const MAX_PROJECTS: usize = 1_000;
+
 /// The most published versions this emulator retains for one recipe.
 ///
 /// Every publish freezes another version of the recipe, so it is a growth site a
@@ -96,6 +119,15 @@ pub const MAX_RECIPES: usize = 1_000;
 /// `ServiceQuotaExceededException` (the error AWS answers a quota with) rather than
 /// appending, for the reason [`MAX_DATASETS`] gives.
 pub const MAX_PUBLISHED_RECIPE_VERSIONS: usize = 1_000;
+
+/// The number of rows a project samples when the create named no `Sample`: "If this
+/// parameter isn't specified, then the sample consists of the first 500 rows from the
+/// dataset" (model: `Project$Sample`).
+pub const DEFAULT_SAMPLE_SIZE: i32 = 500;
+
+/// The sampling type that same sentence describes — the FIRST rows of the dataset
+/// (model: `SampleType` is one of `FIRST_N`, `LAST_N`, `RANDOM`).
+pub const DEFAULT_SAMPLE_TYPE: &str = "FIRST_N";
 
 /// The version identifier a recipe carries the moment `CreateRecipe` mints it.
 ///
@@ -292,6 +324,61 @@ pub struct RecipeRecord {
     pub published: Vec<RecipeVersionRecord>,
 }
 
+/// A stored DataBrew project: the dataset it acts upon, the recipe developed in it,
+/// the role DataBrew assumes for it and the sample it reads. The ARN and the [`Audit`]
+/// are server-derived, never client-supplied.
+///
+/// The session members are held apart from the definition because a session is opened
+/// by a LATER call rather than by the create: a project nobody has opened reports no
+/// `SessionStatus`, `OpenedBy` or `OpenDate` (model: all three optional on
+/// `DescribeProjectResponse`), which is what lets a client tell an idle project from
+/// one with an interactive session.
+#[derive(Debug, Clone)]
+pub struct ProjectRecord {
+    pub name: String,
+    pub dataset_name: String,
+    pub recipe_name: String,
+    pub role_arn: String,
+    /// The sample the create asked for, `None` when it asked for none — in which case
+    /// the project reads the documented default, which [`ProjectRecord::effective_sample`]
+    /// is.
+    pub sample: Option<Sample>,
+    pub tags: BTreeMap<String, String>,
+    pub resource_arn: String,
+    pub audit: Audit,
+    /// The state of this project's interactive session, `None` until a session is
+    /// opened for it (`StartProjectSession`, still its own stub issue, is what opens
+    /// one).
+    pub session_status: Option<String>,
+    pub opened_by: Option<String>,
+    pub open_date: Option<SystemTime>,
+}
+
+impl ProjectRecord {
+    /// The sample this project reads with: the one the create carried, with the
+    /// documented default size filled in for a half it left out, and the documented
+    /// default sample entirely when the create carried none.
+    ///
+    /// "If this parameter isn't specified, then the sample consists of the first 500
+    /// rows from the dataset" (model: `Project$Sample`) — so an omitted sample still
+    /// samples, and so does a sample that names only its type: the size it reads is
+    /// the documented one. `Sample$Type` is required, so a sample always carries it.
+    /// The default is a property of the project rather than of one read, which is why
+    /// it is derived here instead of being stored as if the caller had asked for it.
+    pub fn effective_sample(&self) -> Sample {
+        match &self.sample {
+            Some(sample) => Sample {
+                size: sample.size.or(Some(DEFAULT_SAMPLE_SIZE)),
+                r#type: sample.r#type.clone(),
+            },
+            None => Sample {
+                size: Some(DEFAULT_SAMPLE_SIZE),
+                r#type: DEFAULT_SAMPLE_TYPE.to_string(),
+            },
+        }
+    }
+}
+
 /// A stored run of a job: what `StartJobRun` minted plus the job's shape copied at
 /// start time, so the run still reports what it ran with after the job changes.
 #[derive(Debug, Clone)]
@@ -323,6 +410,8 @@ pub struct ComAmazonawsDatabrewAwsgluedatabrewState {
     pub schedules: BTreeMap<String, ScheduleRecord>,
     /// Recipes by `Name`, each holding its own versions.
     pub recipes: BTreeMap<String, RecipeRecord>,
+    /// Projects by `Name`.
+    pub projects: BTreeMap<String, ProjectRecord>,
     /// Job runs by `(JobName, RunId)`, so one job's runs are a contiguous range.
     pub job_runs: BTreeMap<(String, String), JobRunRecord>,
     /// Monotonic source of the `RunId` values stored in `job_runs`.
