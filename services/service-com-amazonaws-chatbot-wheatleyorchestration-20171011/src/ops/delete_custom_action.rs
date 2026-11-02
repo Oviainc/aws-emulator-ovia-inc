@@ -11,11 +11,12 @@
 //! delete responses carry; see `SUCCESS_STATUS` below). An ARN of the form a custom action
 //! of this account is minted under ([`crate::state::is_mintable_custom_action_arn`]) that
 //! holds no action is refused with the modelled 404 `ResourceNotFoundException` — the answer
-//! a chat configuration's delete is recorded giving for an ARN holding no resource — carrying
-//! the sentence AWS Chatbot words for a WRITE addressed to an absent custom action
-//! ([`crate::state::custom_action_does_not_exist_message`]). An ARN of any other form is
-//! refused with the modelled 403 `UnauthorizedException` before the store is consulted, as
-//! the read refuses it.
+//! a chat configuration's delete is recorded giving for an ARN holding no resource. That
+//! refusal carries NO `Message` member: this error class is one AWS Chatbot words nothing
+//! for, as the recorded delete of an action this account holds none of shows, so the error
+//! reports its code and status alone rather than borrowing the sentence another operation's
+//! error class carries. An ARN of any other form is refused with the modelled 403
+//! `UnauthorizedException` before the store is consulted, as the read refuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -158,7 +159,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let mut store = state.lock();
         // An ARN outside the form this account's custom actions are minted under names no
         // action the account can hold at all, so the request is refused as unauthorized
         // without consulting the store, exactly as the read refuses it — the authorization
@@ -172,22 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A custom action is account-scoped, so its ARN names it on its own and the
-        // signing region is not part of the lookup. The record owns its tags, so removing
-        // it removes them with it. An ARN of the minted form holding no action is the
-        // modelled 404, worded for a WRITE's error class as `UpdateCustomAction` words it.
-        if store
-            .custom_actions
-            .remove(&input.custom_action_arn)
-            .is_none()
-        {
+        // A custom action is account-scoped, so its ARN names it on its own and the signing
+        // region is not part of the lookup. The record owns its tags, so removing it removes
+        // them with it. An ARN of the minted form holding no action is the modelled 404, and
+        // AWS Chatbot words nothing for this operation's not-found: it answers the error code
+        // and status with no message member, so none is synthesised here.
+        let removed = state.lock().custom_actions.remove(&input.custom_action_arn);
+        if removed.is_none() {
             return Err(
                 DeleteCustomActionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::custom_action_does_not_exist_message(
-                            &input.custom_action_arn,
-                        )),
-                    },
+                    ResourceNotFoundException { message: None },
                 )
                 .into(),
             );

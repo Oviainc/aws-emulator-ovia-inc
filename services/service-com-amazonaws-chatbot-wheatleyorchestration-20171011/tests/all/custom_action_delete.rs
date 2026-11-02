@@ -8,13 +8,14 @@
 //! store, so every later call addressed to that ARN answers exactly as it does for an
 //! action that was never created — `GetCustomAction` with the modelled 404
 //! `ResourceNotFoundException` naming the action and the account, and the delete itself with
-//! the modelled 404 its own error class is worded for — the record's tags go with it, and the
-//! name is free for a new create again. The delete answers an empty result document, is
-//! addressed by ARN alone (a custom action being account-scoped), leaves every other action
-//! alone, and an ARN no create can mint for this account is refused with the modelled 403
-//! `UnauthorizedException` having removed nothing (the rule
-//! `tests/all/custom_action_fail_closed.rs` asserts across the operations addressed by a
-//! custom-action ARN).
+//! the modelled 404 its own error class carries, which is the error code and status ALONE:
+//! this is an error class AWS Chatbot words nothing for, so its answer has no message member
+//! at all. The record's tags go with it, and the name is free for a new create again. The
+//! delete answers an empty result document, is addressed by ARN alone (a custom action being
+//! account-scoped), leaves every other action alone, and an ARN no create can mint for this
+//! account is refused with the modelled 403 `UnauthorizedException` having removed nothing
+//! (the rule `tests/all/custom_action_fail_closed.rs` asserts across the operations addressed
+//! by a custom-action ARN).
 //!
 //! The table spans what the rule generalises over rather than one recorded request: the
 //! action names differ in length (each published bound included) and charset, the deleted
@@ -61,11 +62,33 @@ fn not_found_message(action_name: &str) -> String {
     format!("sdk action [{action_name}] not found for account [{ACCOUNT}]")
 }
 
-/// The `Message` AWS Chatbot answers a WRITE addressed to a custom action this account holds
-/// none of (`state::custom_action_does_not_exist_message`), with the action name taken from
-/// the requested ARN and the account id from the caller's account.
-fn does_not_exist_message(action_name: &str) -> String {
-    format!("Sdk action with id [{action_name}] does not exist in account [{ACCOUNT}]")
+/// Assert `answer` is the modelled 404 a delete addressed to one of this account's
+/// custom-action ARNs that holds no action carries: the error code and the status, and no
+/// message member of either spelling — AWS Chatbot words this error class nothing.
+fn assert_not_found_without_a_message(label: &str, arn: &str, answer: &crate::wire::Answer) {
+    assert_eq!(
+        answer.status, 404,
+        "case {label:?} ({arn}): expected HTTP 404, got {} with {}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.code(),
+        RESOURCE_NOT_FOUND_EXCEPTION,
+        "case {label:?} ({arn}): expected the modelled {RESOURCE_NOT_FOUND_EXCEPTION}, got {}",
+        answer.body
+    );
+    assert_eq!(
+        answer.body.get("Message"),
+        None,
+        "case {label:?} ({arn}): this error class carries no message, got {}",
+        answer.body
+    );
+    assert_eq!(
+        answer.body.get("message"),
+        None,
+        "case {label:?} ({arn}): this error class carries no message, got {}",
+        answer.body
+    );
 }
 
 /// Create the action `request` names and answer the ARN it was minted under.
@@ -273,33 +296,17 @@ async fn a_repeated_delete_is_not_found_and_the_name_is_free_with_none_of_its_ta
         );
 
         // The action is gone, so a repeat of the same delete has nothing to remove and
-        // reports the action absent with the modelled 404 the write's error class carries
-        // — the same answer for a name nothing was ever created under.
+        // reports the action absent with the modelled 404 — the error code and status alone,
+        // the answer AWS Chatbot gives this error class, which is also the answer for a name
+        // nothing was ever created under.
         for attempt in 2..=3 {
             let again = emulator
                 .call(DELETE_PATH, &json!({"CustomActionArn": arn}))
                 .await;
-            assert_eq!(
-                again.status, 404,
-                "case {:?}: delete attempt {attempt} must report the action absent, got {} \
-                 with {}",
-                case.label, again.status, again.body
-            );
-            assert_eq!(
-                again.code(),
-                RESOURCE_NOT_FOUND_EXCEPTION,
-                "case {:?}: delete attempt {attempt} expected the modelled \
-                 {RESOURCE_NOT_FOUND_EXCEPTION}, got {}",
-                case.label,
-                again.body
-            );
-            assert_eq!(
-                again.body.get("Message").and_then(Value::as_str),
-                Some(does_not_exist_message(&case.action_name).as_str()),
-                "case {:?}: delete attempt {attempt} must name the action and the account, \
-                 got {}",
-                case.label,
-                again.body
+            assert_not_found_without_a_message(
+                &format!("{} (delete attempt {attempt})", case.label),
+                &arn,
+                &again,
             );
             assert_absent(&emulator, case.label, &arn, &case.action_name).await;
         }
@@ -340,6 +347,57 @@ async fn a_repeated_delete_is_not_found_and_the_name_is_free_with_none_of_its_ta
             listed.body
         );
     }
+}
+
+#[tokio::test]
+async fn deleting_one_of_this_account_s_names_that_holds_no_action_is_not_found_with_no_message() {
+    let emulator = Emulator::new();
+    let present = create_ok(
+        &emulator,
+        &json!({
+            "ActionName": "present",
+            "Definition": {"CommandText": "s3 ls"},
+            "AliasName": "here",
+            "Tags": [{"TagKey": "keep", "TagValue": "me"}],
+        }),
+    )
+    .await;
+    let stored = get_ok(&emulator, &present).await;
+
+    // The store cannot tell a delete of an action removed a moment ago from a delete of a
+    // name nothing was ever created under, so both are the same modelled 404 carrying no
+    // message. The rows differ in the action name's length (`CustomActionName`, len 1..64 —
+    // both published bounds included) and charset, so the answer cannot follow from one
+    // spelling of the name.
+    for name in [
+        "never-created".to_string(),
+        "a".to_string(),
+        "z".repeat(64),
+        "Mixed_Case-9".to_string(),
+    ] {
+        let arn = custom_action_arn(&name);
+        let answer = emulator
+            .call(DELETE_PATH, &json!({"CustomActionArn": arn}))
+            .await;
+        assert_not_found_without_a_message(&name, &arn, &answer);
+        assert_absent(&emulator, &name, &arn, &name).await;
+    }
+
+    // None of those refusals touched the action that IS there.
+    let after = get_ok(&emulator, &present).await;
+    assert_eq!(
+        after, stored,
+        "the refused deletes must leave the stored action unchanged, got {after}"
+    );
+    let listed = emulator
+        .call(LIST_TAGS_PATH, &json!({"ResourceARN": present}))
+        .await;
+    assert_eq!(
+        listed.body.get("Tags"),
+        Some(&json!([{"TagKey": "keep", "TagValue": "me"}])),
+        "the refused deletes must leave the stored action's tags, got {}",
+        listed.body
+    );
 }
 
 #[tokio::test]
