@@ -201,13 +201,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(requested) => requested as usize,
             None => MAX_RESULTS as usize,
         };
+        // A `nextToken` is a POSITION in the entry list THIS operation was sent, so
+        // it only means something against the SAME list: the cursor is decoded
+        // against the entries that arrived, and a token this service never issued,
+        // one minted for another operation or another entry list, or one past the end
+        // of the list it is replayed against names no page.
         let cursor = match input.next_token.as_deref() {
-            Some(token) => crate::state::BatchCursor::decode(token).ok_or_else(invalid_token)?,
+            Some(token) => crate::state::BatchCursor::decode(token, Self::NAME, &input.entries)
+                .ok_or_else(invalid_token)?,
             None => crate::state::BatchCursor::START,
         };
-        if cursor.entry >= input.entries.len() {
-            return Err(invalid_token());
-        }
 
         let store = state.lock();
         let now = ::std::time::SystemTime::now();
@@ -285,11 +288,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         aggregated_values: aggregated[from..from + remaining].to_vec(),
                     });
                 }
-                next_token = Some(crate::state::BatchCursor {
-                    entry: at,
-                    value: from + remaining,
-                }
-                .encode());
+                next_token = Some(
+                    crate::state::BatchCursor {
+                        entry: at,
+                        value: from + remaining,
+                    }
+                    .encode(Self::NAME, &input.entries),
+                );
                 break;
             }
 
@@ -324,9 +329,9 @@ const MAX_RESULTS: i32 = 4_000;
 
 /// Where a page of a batch read resumes lives in `crate::state`
 /// ([`crate::state::BatchCursor`]), hoisted there once
-/// `BatchGetAssetPropertyValueHistory` became a second caller, so the two
-/// paginated batch readers cannot drift in token format or in what counts as a
-/// token this service never issued.
+/// `BatchGetAssetPropertyValueHistory` became a second caller, so the paginated
+/// batch readers cannot drift in token format, in what a token is bound to, or in
+/// what counts as a token this service never issued.
 ///
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued
 /// for these entries.

@@ -7957,11 +7957,9 @@ fn typed_variant(data_type: &str, text: &str) -> Option<Variant> {
 /// hold it. See [`pagination_scope`] for what that binding is for.
 pub fn encode_timestamp_token(resume: (i64, i32), scope: &str) -> String {
     let (seconds, nanos) = resume;
-    ::hex::encode(
-        format!(
-            "{seconds}{TIMESTAMP_TOKEN_SEPARATOR}{nanos}{TOKEN_SCOPE_SEPARATOR}{scope}"
-        )
-        .as_bytes(),
+    encode_scoped_token(
+        &format!("{seconds}{TIMESTAMP_TOKEN_SEPARATOR}{nanos}"),
+        scope,
     )
 }
 
@@ -7969,13 +7967,28 @@ pub fn encode_timestamp_token(resume: (i64, i32), scope: &str) -> String {
 /// or `None` for text this service never issued as a token OF THAT enumeration —
 /// which its caller answers as the modelled refusal for an invalid `nextToken`.
 pub fn decode_timestamp_token(token: &str, scope: &str) -> Option<(i64, i32)> {
-    let decoded = decode_token_text(token)?;
-    let (resume, carried) = decoded.rsplit_once(TOKEN_SCOPE_SEPARATOR)?;
-    if carried != scope {
-        return None;
-    }
+    let resume = decode_scoped_token(token, scope)?;
     let (seconds, nanos) = resume.split_once(TIMESTAMP_TOKEN_SEPARATOR)?;
     Some((token_number(seconds)?, token_number(nanos)?))
+}
+
+/// The opaque pagination token that resumes at `resume` within the enumeration
+/// `scope` identifies: the hex of the resume point beside that scope.
+///
+/// ONE recipe for binding a token to its enumeration, so every paginated read of
+/// this service that carries a resume point in its token binds that point the
+/// same way. See [`pagination_scope`] for what the binding is for.
+pub fn encode_scoped_token(resume: &str, scope: &str) -> String {
+    ::hex::encode(format!("{resume}{TOKEN_SCOPE_SEPARATOR}{scope}").as_bytes())
+}
+
+/// The resume point `token` names within the enumeration `scope` identifies, or
+/// `None` for text this service never issued as a token OF THAT enumeration —
+/// which its caller answers as the modelled refusal for an invalid `nextToken`.
+pub fn decode_scoped_token(token: &str, scope: &str) -> Option<String> {
+    let decoded = decode_token_text(token)?;
+    let (resume, carried) = decoded.rsplit_once(TOKEN_SCOPE_SEPARATOR)?;
+    (carried == scope).then(|| resume.to_string())
 }
 
 /// What joins the two halves of the resume point in a token
@@ -8019,9 +8032,18 @@ const PAGINATION_SCOPE_LENGTH: usize = 16;
 /// many of that entry's data points earlier pages already carried.
 ///
 /// ONE recipe for every batch read of this service that pages ACROSS its entries
-/// (`BatchGetAssetPropertyAggregates`, `BatchGetAssetPropertyValueHistory`), so
-/// the token format and what counts as a token this service never issued cannot
-/// drift between them.
+/// (`BatchGetAssetPropertyValue`, `BatchGetAssetPropertyAggregates`,
+/// `BatchGetAssetPropertyValueHistory`), so the token format and what counts as a
+/// token this service never issued cannot drift between them.
+///
+/// A cursor is a POSITION in the entry list ONE operation was sent, so the token
+/// carries the [`pagination_scope`] of that operation and that list beside the
+/// position: a position alone names something in every entry list long enough to
+/// hold it, and honouring it against another list would report that list's leading
+/// entries as "completely processed by previous paginated requests" and drop their
+/// data. Hence [`BatchCursor::encode`] and [`BatchCursor::decode`] both take the
+/// operation and the entries the token belongs to, and a token replayed against a
+/// different list, or against another operation, names no page at all.
 #[derive(Debug, Clone, Copy)]
 pub struct BatchCursor {
     /// Index into the request's `entries` of the first entry not yet finished.
@@ -8034,27 +8056,46 @@ impl BatchCursor {
     /// The cursor of a request that carries no `nextToken`.
     pub const START: Self = Self { entry: 0, value: 0 };
 
-    /// This cursor as a `nextToken`: hex, so the token stays opaque to the caller
-    /// and inside the `^[A-Za-z0-9+/=]+$` pattern the paging members of this
-    /// service carry.
-    pub fn encode(self) -> String {
-        ::hex::encode(format!(
-            "{}{BATCH_CURSOR_SEPARATOR}{}",
-            self.entry, self.value
-        ))
+    /// This cursor as a `nextToken` of the `operation` request whose entry list is
+    /// `entries`: hex, so the token stays opaque to the caller and inside the
+    /// `^[A-Za-z0-9+/=]+$` pattern the paging members of this service carry.
+    pub fn encode(self, operation: &str, entries: &[impl ::std::fmt::Debug]) -> String {
+        encode_scoped_token(
+            &format!("{}{BATCH_CURSOR_SEPARATOR}{}", self.entry, self.value),
+            &batch_entries_scope(operation, entries),
+        )
     }
 
-    /// The cursor `token` encodes, or `None` for text this service never issued as
-    /// one — which its caller answers as the modelled refusal for an invalid
+    /// The cursor `token` encodes for the `operation` request whose entry list is
+    /// `entries`, or `None` for text this service never issued as a token OF THAT
+    /// LIST — which its caller answers as the modelled refusal for an invalid
     /// `nextToken`.
-    pub fn decode(token: &str) -> Option<Self> {
-        let decoded = decode_token_text(token)?;
-        let (entry, value) = decoded.split_once(BATCH_CURSOR_SEPARATOR)?;
-        Some(Self {
+    ///
+    /// A cursor resuming at or past the END of `entries` is such text too: the list
+    /// it is replayed against has no entry there, so it names no page of it. That
+    /// check lives here rather than in each caller, so the readers cannot drift in
+    /// what they honour.
+    pub fn decode(
+        token: &str,
+        operation: &str,
+        entries: &[impl ::std::fmt::Debug],
+    ) -> Option<Self> {
+        let resume = decode_scoped_token(token, &batch_entries_scope(operation, entries))?;
+        let (entry, value) = resume.split_once(BATCH_CURSOR_SEPARATOR)?;
+        let cursor = Self {
             entry: token_number(entry)?,
             value: token_number(value)?,
-        })
+        };
+        (cursor.entry < entries.len()).then_some(cursor)
     }
+}
+
+/// The [`pagination_scope`] a batch read's page token is bound to: the operation it
+/// was sent to, because one text sent to two operations is two tokens, and the entry
+/// list of the request, in order and with every member of every entry, because those
+/// members decide which data points each entry enumerates and in what order.
+fn batch_entries_scope(operation: &str, entries: &[impl ::std::fmt::Debug]) -> String {
+    pagination_scope(&[&operation, &entries])
 }
 
 /// What joins the two halves of a token [`BatchCursor::encode`] builds.

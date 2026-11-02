@@ -199,13 +199,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(requested) => requested as usize,
             None => MAX_RESULTS as usize,
         };
+        // A `nextToken` is a POSITION in the entry list THIS operation was sent, so
+        // it only means something against the SAME list: the cursor is decoded
+        // against the entries that arrived, and a token this service never issued,
+        // one minted for another operation or another entry list, or one past the end
+        // of the list it is replayed against names no page.
         let cursor = match input.next_token.as_deref() {
-            Some(token) => crate::state::BatchCursor::decode(token).ok_or_else(invalid_token)?,
+            Some(token) => crate::state::BatchCursor::decode(token, Self::NAME, &input.entries)
+                .ok_or_else(invalid_token)?,
             None => crate::state::BatchCursor::START,
         };
-        if cursor.entry >= input.entries.len() {
-            return Err(invalid_token());
-        }
 
         let store = state.lock();
         let now = ::std::time::SystemTime::now();
@@ -291,7 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         entry: at,
                         value: from + remaining,
                     }
-                    .encode(),
+                    .encode(Self::NAME, &input.entries),
                 );
                 break;
             }

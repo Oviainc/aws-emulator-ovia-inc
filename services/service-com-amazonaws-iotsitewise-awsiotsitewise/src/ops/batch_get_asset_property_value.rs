@@ -177,14 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // list, or one past the end of the list it is replayed against names no page.
         let start = match input.next_token.as_deref() {
             None => 0,
-            Some(token) => decode_page_token(token, &input.entries)
-                .filter(|at| *at < input.entries.len())
-                .ok_or_else(|| {
-                    invalid_request(format!(
-                        "The nextToken {token} does not name a page of this request's {} entries.",
-                        input.entries.len()
-                    ))
-                })?,
+            Some(token) => decode_page_token(token, Self::NAME, &input.entries).ok_or_else(|| {
+                invalid_request(format!(
+                    "The nextToken {token} does not name a page of this request's {} entries.",
+                    input.entries.len()
+                ))
+            })?,
         };
 
         let store = state.lock();
@@ -192,9 +190,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Everything before `start` was "completely processed by previous paginated
         // requests", so it is reported as skipped rather than answered again, with
-        // the completion status the entry resolves to.
-        let mut skipped_entries = Vec::with_capacity(start);
-        for entry in &input.entries[..start] {
+        // the completion status the entry resolves to. `start` is a position in THIS
+        // list — the decoder above honours no other — and the walk below only ever
+        // reads positions the list holds, so neither the reservation nor the walk
+        // depends on a bound a caller could stretch.
+        let mut skipped_entries = Vec::with_capacity(start.min(input.entries.len()));
+        for entry in input.entries.iter().take(start) {
             let (completion_status, error_info) = match resolve_entry(&store, entry) {
                 Ok(_) => (COMPLETION_SUCCESS, None),
                 Err((error_code, _)) => (
@@ -252,7 +253,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             skipped_entries,
             // "The token for the next set of results, or null if there are no
             // additional results."
-            next_token: (at < input.entries.len()).then(|| encode_page_token(at, &input.entries)),
+            next_token: (at < input.entries.len())
+                .then(|| encode_page_token(at, Self::NAME, &input.entries)),
         })
     }
 }
@@ -378,45 +380,47 @@ fn entry_bytes(
     ENTRY_OVERHEAD_BYTES + entry.entry_id.len() + answer
 }
 
-/// The `nextToken` for a page of `entries` resuming at entry `at`, in the hex form
-/// this service's other paginated operations issue (and inside `NextToken`'s
-/// modelled `^[A-Za-z0-9+/=]+$` pattern).
+/// The `nextToken` for a page of `operation`'s `entries` resuming at entry `at`, in
+/// the hex form this service's other paginated operations issue (and inside
+/// `NextToken`'s modelled `^[A-Za-z0-9+/=]+$` pattern).
 ///
-/// The token carries the FINGERPRINT of the entry list beside the position, so a
-/// token is only honoured against the request that produced it: replayed against a
-/// different list it names no page, rather than silently re-paging that other list
-/// and reporting its leading entries as already processed.
-fn encode_page_token(at: usize, entries: &[BatchGetAssetPropertyValueEntry]) -> String {
-    ::hex::encode(format!("{at}|{}", entries_fingerprint(entries)))
-}
-
-/// The entry index a `nextToken` resumes `entries` at, or `None` when it is not a
-/// token this service issued for this entry list.
-fn decode_page_token(token: &str, entries: &[BatchGetAssetPropertyValueEntry]) -> Option<usize> {
-    let decoded = crate::state::decode_token_bytes(token)?;
-    let (at, fingerprint) = ::std::str::from_utf8(&decoded).ok()?.split_once('|')?;
-    (fingerprint == entries_fingerprint(entries)).then_some(())?;
-    crate::state::token_number(at)
-}
-
-/// A short digest of what the entries of one request identify, in order: the value
-/// a page token binds itself to.
-fn entries_fingerprint(entries: &[BatchGetAssetPropertyValueEntry]) -> String {
-    let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
-    for entry in entries {
-        for field in [
-            entry.entry_id.as_str(),
-            entry.asset_id.as_deref().unwrap_or(""),
-            entry.property_id.as_deref().unwrap_or(""),
-            entry.property_alias.as_deref().unwrap_or(""),
-        ] {
-            ::sha2::Digest::update(&mut digest, field.as_bytes());
-            ::sha2::Digest::update(&mut digest, b"\x1f");
-        }
-        ::sha2::Digest::update(&mut digest, b"\x1e");
+/// The token is minted by the shared recipe every batch read of this service pages
+/// with ([`crate::state::BatchCursor`]), which binds a position to the OPERATION and
+/// the ENTRY LIST it is a position in: replayed against a different list the token
+/// names no page, rather than silently re-paging that other list and reporting its
+/// leading entries as already processed. This operation answers one value per entry,
+/// so its cursor never resumes INSIDE an entry.
+fn encode_page_token(
+    at: usize,
+    operation: &str,
+    entries: &[BatchGetAssetPropertyValueEntry],
+) -> String {
+    crate::state::BatchCursor {
+        entry: at,
+        value: ENTRY_NOT_RESUMED,
     }
-    ::hex::encode(&<::sha2::Sha256 as ::sha2::Digest>::finalize(digest)[..8])
+    .encode(operation, entries)
 }
+
+/// The entry index a `nextToken` resumes `operation`'s `entries` at, or `None` when
+/// it is not a token this service issued for this operation and this entry list.
+///
+/// The index this answers is always a position `entries` HOLDS: the shared decoder
+/// refuses a cursor at or past the end of the list it is replayed against, and this
+/// states that bound here too, so the handler's answer cannot depend on a bound it
+/// does not see.
+fn decode_page_token(
+    token: &str,
+    operation: &str,
+    entries: &[BatchGetAssetPropertyValueEntry],
+) -> Option<usize> {
+    let cursor = crate::state::BatchCursor::decode(token, operation, entries)?;
+    (cursor.value == ENTRY_NOT_RESUMED && cursor.entry < entries.len()).then_some(cursor.entry)
+}
+
+/// The only within-entry resume point a token of this operation can carry: an
+/// entry's answer is one value, so a page never ends inside one.
+const ENTRY_NOT_RESUMED: usize = 0;
 
 /// HTTP 500 `InternalFailureException` carrying `message`.
 fn internal(message: &str) -> BatchGetAssetPropertyValueError {

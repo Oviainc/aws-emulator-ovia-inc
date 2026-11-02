@@ -4,10 +4,11 @@
 //!
 //! The rule these suites pin: a paginated read honours a `nextToken` only against a
 //! request asking for the same enumeration — the same stream or source, the same
-//! range, the same filters and the same ordering — and refuses a token minted by any
-//! other request with the modelled `InvalidRequestException` (HTTP 400), serving no
-//! page at all. A resume point on its own (an instant, a window start) names a
-//! position in every enumeration that happens to hold it, and the readings of several
+//! range, the same filters and the same ordering, and for a BATCH read the same list
+//! of entries — and refuses a token minted by any other request with the modelled
+//! `InvalidRequestException` (HTTP 400), serving no page at all. A resume point on
+//! its own (an instant, a window start, a position in a list) names a position in
+//! every enumeration that happens to hold it, and the readings of several
 //! properties are written at the SAME timestamps, so without that binding a token
 //! would silently serve a slice of another enumeration and drop everything before the
 //! point it resumed at.
@@ -17,7 +18,10 @@
 //!
 //! The rows span the readers of this service that page by the instant they stopped
 //! at — `GetAssetPropertyValueHistory`, `GetAssetPropertyAggregates` and
-//! `GetCaptureData` — and, for each, the request members the rule generalises over.
+//! `GetCaptureData` — and the BATCH readers that page by a POSITION in the entry
+//! list of the request (`BatchGetAssetPropertyAggregates`,
+//! `BatchGetAssetPropertyValueHistory`), and, for each, the request members the rule
+//! generalises over.
 //!
 //! The HTTP harness (`call`, `router_with_engine`, `error_code`, …) is the one the
 //! asset suite already has; this suite reuses it rather than growing a second.
@@ -596,5 +600,414 @@ async fn a_capture_data_token_is_honoured_only_by_the_request_that_minted_it() {
         body["nextToken"] = json!(token);
         let (status, refused) = call(&router, "POST", &uri, Some(body)).await;
         assert_token_refused(case, status, &refused);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The BATCH readers, which page by a POSITION in the entry list of the request.
+//
+// A position is meaningful only in the list it is a position in: honoured against
+// another list of at least that length, it reports that list's leading entries as
+// "completely processed by previous paginated requests" and drops their data from
+// this page and from every later one. So the token is bound to the entry list that
+// minted it, exactly as the readers above bind theirs to the enumeration they page.
+// ---------------------------------------------------------------------------
+
+/// Where `BatchGetAssetPropertyAggregates` is bound: `POST
+/// /properties/batch/aggregates`, from `smithy_query(query="operation",
+/// operation="BatchGetAssetPropertyAggregates")`.
+const BATCH_AGGREGATES: &str = "/properties/batch/aggregates";
+
+/// Where `BatchGetAssetPropertyValueHistory` is bound: `POST
+/// /properties/batch/history`.
+const BATCH_HISTORY: &str = "/properties/batch/history";
+
+/// The member a `BatchGetAssetPropertyAggregates` success entry carries its data
+/// points in.
+const AGGREGATED_VALUES: &str = "aggregatedValues";
+
+/// The member a `BatchGetAssetPropertyValueHistory` success entry carries its data
+/// points in.
+const VALUE_HISTORY: &str = "assetPropertyValueHistory";
+
+/// The table seconds this suite's batch tables write a sample at: far enough apart
+/// that each lands in its own `1m` window, whatever the anchor.
+const BATCH_SAMPLES: [(i64, Option<&str>); 3] = [(0, None), (120, None), (240, None)];
+
+/// One `BatchGetAssetPropertyAggregates` entry over the window the batch tables
+/// write in.
+fn aggregates_entry(entry_id: &str, asset_id: &str, property: &str) -> Value {
+    json!({
+        "entryId": entry_id,
+        "assetId": asset_id,
+        "propertyId": property,
+        "aggregateTypes": ["COUNT"],
+        "resolution": "1m",
+        "startDate": anchored(-60),
+        "endDate": anchored(300),
+    })
+}
+
+/// One `BatchGetAssetPropertyValueHistory` entry over the same window.
+fn history_entry(entry_id: &str, asset_id: &str, property: &str) -> Value {
+    json!({
+        "entryId": entry_id,
+        "assetId": asset_id,
+        "propertyId": property,
+        "startDate": anchored(-60),
+        "endDate": anchored(300),
+    })
+}
+
+/// The window start one aggregate reports, in epoch seconds (the grid is aligned to
+/// the Unix epoch, not to this suite's own anchor).
+fn aggregate_window(point: &Value) -> i64 {
+    point["timestamp"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("an aggregate carries its window start: {point}")) as i64
+}
+
+/// The instant one reported sample carries, as a table second.
+fn sample_instant(point: &Value) -> i64 {
+    relative(
+        point["timestamp"]["timeInSeconds"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("a sample carries its timestamp: {point}")),
+    )
+}
+
+/// Every `(entryId, data point instant)` a batch page reports, in the order it
+/// reports them.
+fn batch_points(
+    case: &str,
+    body: &Value,
+    member: &str,
+    instant: fn(&Value) -> i64,
+) -> Vec<(String, i64)> {
+    body["successEntries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: no successEntries in {body}"))
+        .iter()
+        .flat_map(|success| {
+            let entry_id = success["entryId"].as_str().unwrap_or_default().to_string();
+            success[member]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |point| (entry_id.clone(), instant(&point)))
+        })
+        .collect()
+}
+
+/// `entries` with the `member` of the entry at `at` replaced by `value`.
+fn with_member(entries: &[Value], at: usize, member: &str, value: Value) -> Vec<Value> {
+    let mut changed = entries.to_vec();
+    changed[at][member] = value;
+    changed
+}
+
+/// Drive one batch reader against the rule: a `nextToken` resumes the entry list
+/// that minted it — whatever page size the next request asks for — and is refused,
+/// with no page and no entry reported as already processed, against any other list.
+async fn assert_a_batch_token_binds_to_its_entry_list(
+    router: &MultiServiceRouter,
+    reader: &str,
+    uri: &str,
+    member: &'static str,
+    instant: fn(&Value) -> i64,
+    entries: &[Value],
+    other_lists: Vec<(String, Vec<Value>)>,
+) {
+    // The unpaginated answer is the oracle for what this entry list enumerates.
+    let (status, whole) = call(
+        router,
+        "POST",
+        uri,
+        Some(json!({"entries": entries.to_vec()})),
+    )
+    .await;
+    assert_eq!(status, 200, "case {reader:?}: got {status} {whole}");
+    let points = batch_points(reader, &whole, member, instant);
+    assert!(
+        points.len() >= 4,
+        "case {reader:?}: the table must enumerate several data points per entry, got {points:?}"
+    );
+
+    // One data point per page, so the first page mints a token resuming INSIDE the
+    // first entry.
+    let (status, first) = call(
+        router,
+        "POST",
+        uri,
+        Some(json!({"entries": entries.to_vec(), "maxResults": 1})),
+    )
+    .await;
+    assert_eq!(status, 200, "case {reader:?} first page: got {status} {first}");
+    assert_eq!(
+        batch_points(reader, &first, member, instant),
+        points[..1].to_vec(),
+        "case {reader:?} first page: expected the first data point only, got {first}"
+    );
+    let token = first["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {reader:?} first page: expected a nextToken, got {first}"))
+        .to_string();
+
+    // Honoured by the list that minted it, whatever the page size: the page SIZE
+    // decides where a page ends, not which entries are enumerated.
+    for size in [None, Some(1), Some(3), Some(99)] {
+        let case = format!("{reader}: resumed with maxResults={size:?}");
+        let mut request = json!({"entries": entries.to_vec(), "nextToken": token});
+        if let Some(size) = size {
+            request["maxResults"] = json!(size);
+        }
+        let (status, resumed) = call(router, "POST", uri, Some(request)).await;
+        assert_eq!(status, 200, "case {case:?}: got {status} {resumed}");
+        let reported = batch_points(&case, &resumed, member, instant);
+        assert_eq!(
+            reported.first(),
+            points.get(1),
+            "case {case:?}: expected the page to resume at the second data point, got {reported:?}"
+        );
+    }
+
+    // ... and the whole walk of that list still reports every data point exactly
+    // once, in order.
+    let mut collected: Vec<(String, i64)> = Vec::new();
+    let mut walking: Option<String> = None;
+    for page in 0..points.len() + 2 {
+        let case = format!("{reader}: walking page {page}");
+        let mut request = json!({"entries": entries.to_vec(), "maxResults": 1});
+        if let Some(token) = &walking {
+            request["nextToken"] = json!(token);
+        }
+        let (status, body) = call(router, "POST", uri, Some(request)).await;
+        assert_eq!(status, 200, "case {case:?}: got {status} {body}");
+        collected.extend(batch_points(&case, &body, member, instant));
+        walking = body["nextToken"].as_str().map(str::to_string);
+        if walking.is_none() {
+            break;
+        }
+    }
+    assert!(
+        walking.is_none(),
+        "case {reader:?}: the walk of one entry list must terminate"
+    );
+    assert_eq!(
+        collected, points,
+        "case {reader:?}: paging one entry list must deliver its unpaginated answer in order"
+    );
+
+    // Every other entry list is long enough to hold the position the token carries,
+    // and every stream it names holds a data point at that position, so each one
+    // would be served from it — dropping the entries before it — were the token not
+    // bound to the list that minted it.
+    for (row, list) in other_lists {
+        let case = format!("{reader}: token replayed against {row}");
+        let (status, refused) = call(
+            router,
+            "POST",
+            uri,
+            Some(json!({"entries": list, "nextToken": token})),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400 for a token minted against another entry list, \
+             got {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "InvalidRequestException",
+            "case {case:?}: expected InvalidRequestException, got {refused}"
+        );
+        assert!(
+            refused.get("successEntries").is_none() && refused.get("skippedEntries").is_none(),
+            "case {case:?}: a refused token must serve no page and report no entry as already \
+             processed, got {refused}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_batch_token_is_honoured_only_by_the_entry_list_that_minted_it() {
+    let router = crate::asset_lifecycle::router();
+    let (asset_id, speed, torque) =
+        asset_with_two_properties(&router, "Fan1", "Speed", "Torque").await;
+    let (other_asset, other_speed, other_torque) =
+        asset_with_two_properties(&router, "Fan2", "Speed", "Torque").await;
+
+    // The same instants in every stream, so every entry list below enumerates the
+    // same number of data points at the same positions: nothing but the binding can
+    // tell one list's token from another's.
+    write_to_each(
+        &router,
+        &[
+            (&asset_id, &speed),
+            (&asset_id, &torque),
+            (&other_asset, &other_speed),
+            (&other_asset, &other_torque),
+        ],
+        &BATCH_SAMPLES,
+    )
+    .await;
+
+    // Rows differ along what the rule generalises over: the ORDER of the entries,
+    // the entry ids, the streams they name, the length of the list, and the members
+    // that decide what one entry enumerates (its window, its ordering, its quality
+    // filter and — for the aggregate reader — its resolution and aggregate types).
+    for (reader, uri, member, instant, build) in [
+        (
+            "BatchGetAssetPropertyAggregates",
+            BATCH_AGGREGATES,
+            AGGREGATED_VALUES,
+            aggregate_window as fn(&Value) -> i64,
+            aggregates_entry as fn(&str, &str, &str) -> Value,
+        ),
+        (
+            "BatchGetAssetPropertyValueHistory",
+            BATCH_HISTORY,
+            VALUE_HISTORY,
+            sample_instant as fn(&Value) -> i64,
+            history_entry as fn(&str, &str, &str) -> Value,
+        ),
+    ] {
+        let entries = vec![
+            build("first", &asset_id, &speed),
+            build("second", &asset_id, &torque),
+        ];
+        let mut reversed = entries.clone();
+        reversed.reverse();
+        let mut other_lists: Vec<(String, Vec<Value>)> = vec![
+            ("the same entries in the other order".to_string(), reversed),
+            (
+                "the same streams under other entry ids".to_string(),
+                with_member(&entries, 0, "entryId", json!("renamed")),
+            ),
+            (
+                "an entry naming another property of the same asset".to_string(),
+                with_member(&entries, 0, "propertyId", json!(torque)),
+            ),
+            (
+                "a completely different list of entries".to_string(),
+                vec![
+                    build("third", &other_asset, &other_speed),
+                    build("fourth", &other_asset, &other_torque),
+                ],
+            ),
+            (
+                "a shorter list".to_string(),
+                entries[..1].to_vec(),
+            ),
+            (
+                "a longer list".to_string(),
+                entries
+                    .iter()
+                    .cloned()
+                    .chain([build("third", &other_asset, &other_speed)])
+                    .collect(),
+            ),
+            (
+                "an entry over a narrower window".to_string(),
+                with_member(&entries, 0, "startDate", json!(anchored(60))),
+            ),
+            (
+                "an entry with the ordering flipped".to_string(),
+                with_member(&entries, 1, "timeOrdering", json!("DESCENDING")),
+            ),
+            (
+                "an entry carrying a quality filter".to_string(),
+                with_member(&entries, 1, "qualities", json!(["GOOD"])),
+            ),
+        ];
+        if uri == BATCH_AGGREGATES {
+            // Members only the aggregate entry carries, each of which changes how
+            // many data points its entry enumerates or what they reduce to.
+            other_lists.push((
+                "an entry at a coarser resolution".to_string(),
+                with_member(&entries, 0, "resolution", json!("1h")),
+            ));
+            other_lists.push((
+                "an entry asking for another aggregate type".to_string(),
+                with_member(&entries, 0, "aggregateTypes", json!(["SUM"])),
+            ));
+        }
+
+        assert_a_batch_token_binds_to_its_entry_list(
+            &router, reader, uri, member, instant, &entries, other_lists,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_batch_token_is_not_a_token_of_the_other_batch_reader() {
+    let router = crate::asset_lifecycle::router();
+    let (asset_id, speed, torque) =
+        asset_with_two_properties(&router, "Hoist1", "Speed", "Torque").await;
+    write_to_each(
+        &router,
+        &[(&asset_id, &speed), (&asset_id, &torque)],
+        &BATCH_SAMPLES,
+    )
+    .await;
+
+    // The two readers page the same two streams over the same window, so a position
+    // in one enumeration exists in the other. A token carries the OPERATION it was
+    // sent to beside the entry list, so it is only a token of that operation.
+    let aggregates = vec![
+        aggregates_entry("first", &asset_id, &speed),
+        aggregates_entry("second", &asset_id, &torque),
+    ];
+    let history = vec![
+        history_entry("first", &asset_id, &speed),
+        history_entry("second", &asset_id, &torque),
+    ];
+    for (case, minting_uri, minting_entries, replayed_uri, replayed_entries) in [
+        (
+            "an aggregates token replayed against the history reader",
+            BATCH_AGGREGATES,
+            &aggregates,
+            BATCH_HISTORY,
+            &history,
+        ),
+        (
+            "a history token replayed against the aggregates reader",
+            BATCH_HISTORY,
+            &history,
+            BATCH_AGGREGATES,
+            &aggregates,
+        ),
+    ] {
+        let (status, first) = call(
+            &router,
+            "POST",
+            minting_uri,
+            Some(json!({"entries": minting_entries.clone(), "maxResults": 1})),
+        )
+        .await;
+        assert_eq!(status, 200, "minting {case:?}: got {status} {first}");
+        let token = first["nextToken"]
+            .as_str()
+            .unwrap_or_else(|| panic!("minting {case:?}: expected a nextToken, got {first}"))
+            .to_string();
+
+        let (status, refused) = call(
+            &router,
+            "POST",
+            replayed_uri,
+            Some(json!({"entries": replayed_entries.clone(), "nextToken": token})),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "InvalidRequestException",
+            "case {case:?}: expected InvalidRequestException, got {refused}"
+        );
     }
 }
