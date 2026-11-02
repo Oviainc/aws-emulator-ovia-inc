@@ -69,6 +69,8 @@ mod evaluation_jobs;
 mod foundation_model_agreement_offers;
 #[path = "all/foundation_model_capability_projection.rs"]
 mod foundation_model_capability_projection;
+#[path = "all/foundation_model_capability_records.rs"]
+mod foundation_model_capability_records;
 #[path = "all/foundation_model_catalogue_resolution.rs"]
 mod foundation_model_catalogue_resolution;
 #[path = "all/foundation_models.rs"]

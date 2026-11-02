@@ -44,12 +44,12 @@ pub struct FoundationModelDetails {
     pub model_lifecycle: Option<FoundationModelLifecycle>,
     pub model_family: Option<String>,
     pub inference_apis_supported: Option<Vec<String>>,
-    pub features_supported: Option<Vec<String>>,
+    pub features_supported: Option<FeaturesSupport>,
     pub guardrails_supported: Option<bool>,
-    pub explicit_prompt_caching: Option<bool>,
-    pub intelligent_prompt_routing: Option<bool>,
+    pub explicit_prompt_caching: Option<CapabilitySupport>,
+    pub intelligent_prompt_routing: Option<CapabilitySupport>,
     pub latency_optimization_supported: Option<bool>,
-    pub batch_supported: Option<bool>,
+    pub batch_supported: Option<BatchSupport>,
     pub converse: Option<ConverseSupport>,
 }
 
@@ -133,7 +133,7 @@ bedrock_schema_and_codec!(
         "featuresSupported",
         12,
         opt,
-        list_of_string
+        struct_of(FeaturesSupport)
     ),
     (
         M_GUARDRAILS_SUPPORTED,
@@ -149,7 +149,7 @@ bedrock_schema_and_codec!(
         "explicitPromptCaching",
         14,
         opt,
-        boolean
+        struct_of(CapabilitySupport)
     ),
     (
         M_INTELLIGENT_PROMPT_ROUTING,
@@ -157,7 +157,7 @@ bedrock_schema_and_codec!(
         "intelligentPromptRouting",
         15,
         opt,
-        boolean
+        struct_of(CapabilitySupport)
     ),
     (
         M_LATENCY_OPTIMIZATION_SUPPORTED,
@@ -173,7 +173,7 @@ bedrock_schema_and_codec!(
         "batchSupported",
         17,
         opt,
-        boolean
+        struct_of(BatchSupport)
     ),
     (
         M_CONVERSE,

@@ -400,13 +400,33 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
             "case {name:?}: expected inferenceAPIsSupported {:?}, got {apis:?}",
             case.inference_apis
         );
-        // `featuresSupported` is the row's published set, and the four members below report
-        // membership in it one feature at a time.
+        // `featuresSupported` names each published feature, and the capability members
+        // below report one feature at a time, so the record and those members agree.
         let features = bedrock::state::model_features_supported(model);
         assert_eq!(
-            features, model.features_supported,
-            "case {name:?}: expected featuresSupported {:?}, got {features:?}",
-            model.features_supported
+            features.batch_inference,
+            Some(case.batch),
+            "case {name:?}: expected featuresSupported.batchInference {:?}, got {features:?}",
+            case.batch
+        );
+        assert_eq!(
+            features.intelligent_prompt_routing,
+            Some(case.routing),
+            "case {name:?}: expected featuresSupported.intelligentPromptRouting {:?}, got \
+             {features:?}",
+            case.routing
+        );
+        assert_eq!(
+            features.latency_optimization,
+            Some(case.latency),
+            "case {name:?}: expected featuresSupported.latencyOptimization {:?}, got {features:?}",
+            case.latency
+        );
+        assert_eq!(
+            features.prompt_caching,
+            Some(case.caching),
+            "case {name:?}: expected featuresSupported.promptCaching {:?}, got {features:?}",
+            case.caching
         );
         let guardrails = bedrock::state::model_guardrails_supported(model);
         assert_eq!(
@@ -432,22 +452,26 @@ async fn a_capability_holds_of_exactly_the_models_whose_attributes_establish_it(
             "case {name:?}: expected latencyOptimizationSupported {}, got {latency}",
             case.latency
         );
-        let batch = bedrock::state::model_batch_supported(model);
+        let batch = bedrock::state::model_batch_support(model);
         assert_eq!(
-            batch, case.batch,
-            "case {name:?}: expected batchSupported {}, got {batch}",
+            batch.base_model_supported,
+            Some(case.batch),
+            "case {name:?}: expected batchSupported.baseModelSupported {:?}, got {batch:?}",
             case.batch
         );
         let converse = bedrock::state::model_converse_support(model);
         assert_eq!(
-            converse.supported,
-            Some(case.converse),
-            "case {name:?}: expected converse.supported {:?}, got {converse:?}",
+            converse.is_some(),
+            case.converse,
+            "case {name:?}: expected a converse record to be reported: {:?}, got {converse:?}",
             case.converse
         );
+        let streaming = converse
+            .as_ref()
+            .and_then(|converse| converse.streaming_supported);
         assert_eq!(
-            converse.streaming_supported,
-            Some(case.converse_streaming),
+            streaming,
+            case.converse.then_some(case.converse_streaming),
             "case {name:?}: expected converse.streamingSupported {:?}, got {converse:?}",
             case.converse_streaming
         );

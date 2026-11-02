@@ -1483,12 +1483,27 @@ bedrock_schema_and_codec!(
 /// codec therefore come from [`bedrock_schema_and_codec!`], like every other structure in
 /// this service whose wire form the derive cannot emit — see `types/date_time_wire.rs`.
 ///
-/// Both members are optional, because neither is `@required` anywhere: nothing in the
-/// model constrains a shape the model does not declare.
+/// Every member is optional, because none is `@required` anywhere: nothing in the model
+/// constrains a shape the model does not declare. A conversation is driven through this
+/// API, so the record carries what a client has to know before it starts one: whether the
+/// API reaches the model at all and whether the answer streams, the ceiling and default the
+/// model's own `maxTokens` has, whether it takes a system role or extended reasoning, the
+/// stop sequences it starts with, the schema of the provider-specific fields it accepts,
+/// and the document, image and video formats a turn may carry to it. A member the catalog
+/// publishes nothing for is absent rather than reported as a value this emulator invented.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConverseSupport {
     pub supported: Option<bool>,
     pub streaming_supported: Option<bool>,
+    pub additional_request_fields_schema: Option<String>,
+    pub max_tokens_default: Option<i32>,
+    pub max_tokens_maximum: Option<i32>,
+    pub reasoning_supported: Option<CapabilitySupport>,
+    pub stop_sequences_default: Option<Vec<String>>,
+    pub system_role_supported: Option<bool>,
+    pub user_document_types_supported: Option<Vec<String>>,
+    pub user_image_types_supported: Option<Vec<String>>,
+    pub user_video_types_supported: Option<Vec<String>>,
 }
 
 bedrock_schema_and_codec!(
@@ -1503,6 +1518,211 @@ bedrock_schema_and_codec!(
         streaming_supported,
         "streamingSupported",
         1,
+        opt,
+        boolean
+    ),
+    (
+        M_ADDITIONAL_REQUEST_FIELDS_SCHEMA,
+        additional_request_fields_schema,
+        "additionalRequestFieldsSchema",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_MAX_TOKENS_DEFAULT,
+        max_tokens_default,
+        "maxTokensDefault",
+        3,
+        opt,
+        integer
+    ),
+    (
+        M_MAX_TOKENS_MAXIMUM,
+        max_tokens_maximum,
+        "maxTokensMaximum",
+        4,
+        opt,
+        integer
+    ),
+    (
+        M_REASONING_SUPPORTED,
+        reasoning_supported,
+        "reasoningSupported",
+        5,
+        opt,
+        struct_of(CapabilitySupport)
+    ),
+    (
+        M_STOP_SEQUENCES_DEFAULT,
+        stop_sequences_default,
+        "stopSequencesDefault",
+        6,
+        opt,
+        list_of_string
+    ),
+    (
+        M_SYSTEM_ROLE_SUPPORTED,
+        system_role_supported,
+        "systemRoleSupported",
+        7,
+        opt,
+        boolean
+    ),
+    (
+        M_USER_DOCUMENT_TYPES_SUPPORTED,
+        user_document_types_supported,
+        "userDocumentTypesSupported",
+        8,
+        opt,
+        list_of_string
+    ),
+    (
+        M_USER_IMAGE_TYPES_SUPPORTED,
+        user_image_types_supported,
+        "userImageTypesSupported",
+        9,
+        opt,
+        list_of_string
+    ),
+    (
+        M_USER_VIDEO_TYPES_SUPPORTED,
+        user_video_types_supported,
+        "userVideoTypesSupported",
+        10,
+        opt,
+        list_of_string
+    ),
+);
+
+/// Whether ONE capability may be used with a published foundation model, as the
+/// `explicitPromptCaching` and `intelligentPromptRouting` members of a
+/// `FoundationModelSummary` / `FoundationModelDetails` carry it, and as the
+/// `reasoningSupported` member of the Converse record does.
+///
+/// RECORDED behaviour, not modelled, like [`ConverseSupport`]: a feature is reported as a
+/// RECORD naming whether it is supported rather than as a bare boolean, so a later
+/// per-feature fact (a limit, a window) has a member to live in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapabilitySupport {
+    pub is_supported: Option<bool>,
+}
+
+bedrock_schema_and_codec!(
+    CapabilitySupport,
+    FOUNDATION_MODEL_CAPABILITY_SUPPORT_SCHEMA,
+    "com.amazonaws.bedrock#FoundationModelCapabilitySupport",
+    "com.amazonaws.bedrock",
+    "FoundationModelCapabilitySupport",
+    (M_IS_SUPPORTED, is_supported, "isSupported", 0, opt, boolean),
+);
+
+/// Whether a model invocation job may run a model over a dataset, as the `batchSupported`
+/// member of a `FoundationModelSummary` / `FoundationModelDetails` carries it.
+///
+/// RECORDED behaviour, not modelled: batch inference is reported as a RECORD naming the
+/// three ways a job may run the model — against the base model itself, against it from
+/// another region, and against a customization of it — rather than as one boolean.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchSupport {
+    pub base_model_supported: Option<bool>,
+    pub cross_region_supported: Option<bool>,
+    pub custom_model_supported: Option<bool>,
+}
+
+bedrock_schema_and_codec!(
+    BatchSupport,
+    FOUNDATION_MODEL_BATCH_SUPPORT_SCHEMA,
+    "com.amazonaws.bedrock#FoundationModelBatchSupport",
+    "com.amazonaws.bedrock",
+    "FoundationModelBatchSupport",
+    (
+        M_BASE_MODEL_SUPPORTED,
+        base_model_supported,
+        "baseModelSupported",
+        0,
+        opt,
+        boolean
+    ),
+    (
+        M_CROSS_REGION_SUPPORTED,
+        cross_region_supported,
+        "crossRegionSupported",
+        1,
+        opt,
+        boolean
+    ),
+    (
+        M_CUSTOM_MODEL_SUPPORTED,
+        custom_model_supported,
+        "customModelSupported",
+        2,
+        opt,
+        boolean
+    ),
+);
+
+/// The Amazon Bedrock features published for one foundation model, as the
+/// `featuresSupported` member of a `FoundationModelSummary` / `FoundationModelDetails`
+/// carries it: a RECORD whose members are the features themselves, so a client tests one
+/// feature by name instead of searching a list.
+///
+/// A feature the catalog does not publish for the model answers NO rather than being left
+/// out, so a client that tests one feature by name always gets an answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeaturesSupport {
+    pub batch_inference: Option<bool>,
+    pub count_tokens: Option<bool>,
+    pub intelligent_prompt_routing: Option<bool>,
+    pub latency_optimization: Option<bool>,
+    pub prompt_caching: Option<bool>,
+    pub prompt_optimization: Option<bool>,
+}
+
+bedrock_schema_and_codec!(
+    FeaturesSupport,
+    FOUNDATION_MODEL_FEATURES_SUPPORT_SCHEMA,
+    "com.amazonaws.bedrock#FoundationModelFeaturesSupport",
+    "com.amazonaws.bedrock",
+    "FoundationModelFeaturesSupport",
+    (
+        M_BATCH_INFERENCE,
+        batch_inference,
+        "batchInference",
+        0,
+        opt,
+        boolean
+    ),
+    (M_COUNT_TOKENS, count_tokens, "countTokens", 1, opt, boolean),
+    (
+        M_INTELLIGENT_PROMPT_ROUTING,
+        intelligent_prompt_routing,
+        "intelligentPromptRouting",
+        2,
+        opt,
+        boolean
+    ),
+    (
+        M_LATENCY_OPTIMIZATION,
+        latency_optimization,
+        "latencyOptimization",
+        3,
+        opt,
+        boolean
+    ),
+    (
+        M_PROMPT_CACHING,
+        prompt_caching,
+        "promptCaching",
+        4,
+        opt,
+        boolean
+    ),
+    (
+        M_PROMPT_OPTIMIZATION,
+        prompt_optimization,
+        "promptOptimization",
+        5,
         opt,
         boolean
     ),

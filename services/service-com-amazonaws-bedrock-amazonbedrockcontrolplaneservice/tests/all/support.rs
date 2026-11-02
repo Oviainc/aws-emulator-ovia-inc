@@ -133,12 +133,18 @@ pub fn foundation_model_arn(region: &str, model_id: &str) -> String {
 /// The WHOLE projection of the published catalog row `model` that a listing
 /// (`ListFoundationModels`) and a read (`GetFoundationModel`) must both report for it in
 /// `region`: the ten members `FoundationModelSummary`/`FoundationModelDetails` declare
-/// (`smithy_query(query="shape",shape="FoundationModelSummary")`) and the nine capability
+/// (`smithy_query(query="shape",shape="FoundationModelSummary")`) and the capability
 /// members a catalog listing reports beside them.
 ///
 /// Computed HERE from the row's own published attributes rather than by asking the service
 /// for them, so it is an independent statement of the rule a summary must satisfy:
 ///
+/// * The capability metadata is published for a model that TAKES PART IN A CONVERSATION —
+///   one that produces TEXT — and for no other: the summary of a model that answers with a
+///   vector or an image carries the ten modelled members and `guardrailsSupported`, and
+///   none of `modelFamily`, `inferenceAPIsSupported`, `featuresSupported`,
+///   `explicitPromptCaching`, `intelligentPromptRouting`, `latencyOptimizationSupported`,
+///   `batchSupported` or `converse`.
 /// * `modelFamily` is the row's family.
 /// * `inferenceAPIsSupported` carries `invokeModel` for every offered model, `converse` for
 ///   one that produces TEXT, and the two OpenAI-compatible endpoints for a model that
@@ -146,12 +152,15 @@ pub fn foundation_model_arn(region: &str, model_id: &str) -> String {
 /// * `guardrailsSupported` holds of a model that produces TEXT — a guardrail decides about
 ///   text and about nothing else, and is applied beside the invocation rather than built
 ///   into the model's integration, so nothing else is needed of the model.
-/// * `featuresSupported` is the set of Amazon Bedrock features the row publishes support
-///   for, and `explicitPromptCaching`, `intelligentPromptRouting`,
-///   `latencyOptimizationSupported` and `batchSupported` each report whether that one
-///   feature is in it — each is a published per-model fact, so a model no feature's
-///   supported-models table lists supports none of them.
-/// * `converse` reports Converse support and whether it can be streamed.
+/// * `featuresSupported` names each Amazon Bedrock feature the row publishes support for,
+///   beside `countTokens`, which is published for the family a token count is served for;
+///   `explicitPromptCaching`, `intelligentPromptRouting`, `latencyOptimizationSupported`
+///   and `batchSupported` each report that one feature — each is a published per-model
+///   fact, so a model no feature's supported-models table lists supports none of them. A
+///   capability is reported as the RECORD naming what is supported, and batch inference's
+///   record answers for the base model, for another region and for a customization of the
+///   model, that last one only where the model accepts a customization at all.
+/// * `converse` reports what a conversation may carry to the model and ask of it.
 ///
 /// Here rather than in one suite because the listing suite, the read suite and the
 /// capability suite all compare a response against it, and the projection they compare
@@ -162,6 +171,7 @@ pub fn expected_foundation_model_projection(
 ) -> Value {
     let conversational = model.output_modalities.contains(&"TEXT");
     let published = |feature: &str| model.features_supported.contains(&feature);
+    let takes = |modality: &str| model.input_modalities.contains(&modality);
 
     let mut apis: Vec<&str> = Vec::new();
     if conversational {
@@ -185,7 +195,7 @@ pub fn expected_foundation_model_projection(
         lifecycle["endOfLifeTime"] = json!(window.end_of_life_at);
     }
 
-    json!({
+    let mut projection = json!({
         "modelArn": foundation_model_arn(region, model.model_id),
         "modelId": model.model_id,
         "modelName": model.model_name,
@@ -196,19 +206,147 @@ pub fn expected_foundation_model_projection(
         "customizationsSupported": model.customizations_supported,
         "inferenceTypesSupported": model.inference_types_supported,
         "modelLifecycle": lifecycle,
-        "modelFamily": model.model_family,
-        "inferenceAPIsSupported": apis,
-        "featuresSupported": model.features_supported,
         "guardrailsSupported": conversational,
-        "explicitPromptCaching": published("PROMPT_CACHING"),
+    });
+    if !conversational {
+        return projection;
+    }
+
+    // The formats a turn may carry TO the model: one modality's format set when the model
+    // takes that modality, and empty when it does not.
+    let formats = |carried: bool, values: &'static [&'static str]| {
+        if carried {
+            values.to_vec()
+        } else {
+            Vec::new()
+        }
+    };
+    let mut converse = json!({
+        "supported": true,
+        "streamingSupported": model.response_streaming_supported,
+        "systemRoleSupported": true,
+        "reasoningSupported": { "isSupported": expected_reasoning_supported(model) },
+        "stopSequencesDefault": Vec::<&str>::new(),
+        "userDocumentTypesSupported": formats(takes("TEXT"), DOCUMENT_FORMATS),
+        "userImageTypesSupported": formats(takes("IMAGE"), IMAGE_FORMATS),
+        // No modality the model declares is video, so no row takes one.
+        "userVideoTypesSupported": Vec::<&str>::new(),
+    });
+    if let Some(ceiling) = expected_max_output_tokens(model) {
+        converse["maxTokensMaximum"] = json!(ceiling);
+    }
+
+    projection["modelFamily"] = json!(model.model_family);
+    projection["inferenceAPIsSupported"] = json!(apis);
+    projection["featuresSupported"] = json!({
+        "batchInference": published("BATCH_INFERENCE"),
+        "countTokens": expected_count_tokens_supported(model),
         "intelligentPromptRouting": published("INTELLIGENT_PROMPT_ROUTING"),
-        "latencyOptimizationSupported": published("LATENCY_OPTIMIZATION"),
-        "batchSupported": published("BATCH_INFERENCE"),
-        "converse": {
-            "supported": conversational,
-            "streamingSupported": conversational && model.response_streaming_supported,
-        },
-    })
+        "latencyOptimization": published("LATENCY_OPTIMIZATION"),
+        "promptCaching": published("PROMPT_CACHING"),
+        // A prompt optimization job rewrites a prompt template for the models it targets,
+        // so it needs of a model only that a prompt is what the model is given.
+        "promptOptimization": conversational,
+    });
+    projection["explicitPromptCaching"] = json!({ "isSupported": published("PROMPT_CACHING") });
+    projection["intelligentPromptRouting"] =
+        json!({ "isSupported": published("INTELLIGENT_PROMPT_ROUTING") });
+    projection["latencyOptimizationSupported"] = json!(published("LATENCY_OPTIMIZATION"));
+    projection["batchSupported"] = json!({
+        "baseModelSupported": published("BATCH_INFERENCE"),
+        "crossRegionSupported": published("BATCH_INFERENCE"),
+        "customModelSupported":
+            published("BATCH_INFERENCE") && !model.customizations_supported.is_empty(),
+    });
+    projection["converse"] = converse;
+    projection
+}
+
+/// The document formats a turn of a conversation may carry to a model that takes TEXT
+/// (`DocumentFormat` in the Amazon Bedrock Runtime model).
+const DOCUMENT_FORMATS: &[&str] = &[
+    "pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md",
+];
+
+/// The image formats a turn may carry to a model that takes IMAGE (`ImageFormat`).
+const IMAGE_FORMATS: &[&str] = &["png", "jpeg", "gif", "webp"];
+
+/// Whether the provider publishes extended reasoning for the row, stated HERE rather than
+/// read off the service: the suites assert that the summary reports what the catalogue
+/// publishes, so the published set has to be stated independently of the one the handler
+/// reads, or a wrong row in it is never caught.
+///
+/// The reasoning lines of each provider the catalogue carries: the Anthropic Claude lines
+/// from Claude 4 on, which publish extended thinking, and the line each other provider
+/// publishes as its reasoning model.
+pub fn expected_reasoning_supported(model: &bedrock::state::FoundationModel) -> bool {
+    const PUBLISHED_REASONING_MODELS: &[&str] = &[
+        "anthropic.claude-fable-5",
+        "anthropic.claude-fable-5-1",
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+        "anthropic.claude-opus-4-1-20250805-v1:0",
+        "anthropic.claude-opus-4-5-20251101-v1:0",
+        "anthropic.claude-opus-4-6-v1",
+        "anthropic.claude-opus-4-7",
+        "anthropic.claude-opus-4-8",
+        "anthropic.claude-opus-5",
+        "anthropic.claude-opus-5-5",
+        "anthropic.claude-sonnet-4-20250514-v1:0",
+        "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "anthropic.claude-sonnet-4-6",
+        "anthropic.claude-sonnet-5",
+        "anthropic.claude-sonnet-5-5",
+        "deepseek.r1-v1:0",
+        "mistral.magistral-small-2509",
+        "moonshot.kimi-k2-thinking",
+        "nvidia.nemotron-super-3-120b",
+        "qwen.qwen3-235b-a22b-2507-v1:0",
+        "qwen.qwen3-32b-v1:0",
+        "qwen.qwen3-next-80b-a3b",
+    ];
+    PUBLISHED_REASONING_MODELS.contains(&model.model_id)
+}
+
+/// The ceiling on generated tokens the catalogue publishes for the row, if it publishes one
+/// — stated HERE for the same reason as the reasoning set above.
+///
+/// The figures each provider publishes for the model ("Inference parameters for foundation
+/// models" in the Amazon Bedrock User Guide), which are the figures this emulator's
+/// inference plane caps a generated answer at for the same model; a model whose provider
+/// publishes no ceiling is in no row, and no ceiling is reported for it.
+pub fn expected_max_output_tokens(model: &bedrock::state::FoundationModel) -> Option<i32> {
+    const PUBLISHED_MAX_OUTPUT_TOKENS: &[(&str, i32)] = &[
+        ("amazon.nova-lite-v1:0", 5120),
+        ("amazon.nova-micro-v1:0", 5120),
+        ("amazon.nova-pro-v1:0", 5120),
+        ("amazon.titan-text-lite-v1", 4096),
+        ("amazon.titan-text-premier-v1:0", 3072),
+        ("anthropic.claude-3-5-sonnet-20241022-v2:0", 8192),
+        ("anthropic.claude-3-haiku-20240307-v1:0", 4096),
+        ("anthropic.claude-3-sonnet-20240229-v1:0", 4096),
+        ("cohere.command-light-text-v14", 4096),
+        ("cohere.command-text-v14", 4096),
+        ("meta.llama3-1-70b-instruct-v1:0", 2048),
+        ("meta.llama3-1-8b-instruct-v1:0", 2048),
+        ("meta.llama3-3-70b-instruct-v1:0", 2048),
+        ("meta.llama3-70b-instruct-v1:0", 2048),
+        ("meta.llama3-8b-instruct-v1:0", 2048),
+        ("mistral.mistral-7b-instruct-v0:2", 8192),
+        ("mistral.mistral-large-2402-v1:0", 8192),
+        ("mistral.mistral-large-2407-v1:0", 8192),
+        ("mistral.mixtral-8x7b-instruct-v0:1", 4096),
+    ];
+    PUBLISHED_MAX_OUTPUT_TOKENS
+        .iter()
+        .find(|(model_id, _)| *model_id == model.model_id)
+        .map(|(_, ceiling)| *ceiling)
+}
+
+/// Whether a token count is served for the row: a count is the MODEL's own tokenizer's, so
+/// it is served for the one provider's family this emulator's inference plane carries a
+/// tokenizer for.
+pub fn expected_count_tokens_supported(model: &bedrock::state::FoundationModel) -> bool {
+    model.provider_name == "Anthropic"
 }
 
 /// The bare error code out of an `__type` / `x-amzn-errortype` value, which may carry a

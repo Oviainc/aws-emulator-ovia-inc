@@ -776,11 +776,14 @@ async fn an_identifier_no_stored_job_answers_to_is_refused() {
 
 #[tokio::test]
 async fn the_model_is_resolved_against_the_published_catalog() {
-    let emu = emulator();
-
     // EVERY row the catalog publishes is accepted, by both spellings its `modelId` admits —
     // so the suite follows the published catalog rather than the one model a recording used.
+    //
+    // Each row is submitted against a FRESH account, because the catalog publishes more
+    // models than an account may hold batch jobs for, and a quota refusal would say nothing
+    // about whether the model resolved.
     for (index, model) in CATALOG.iter().enumerate() {
+        let emu = emulator();
         for (spelling, model_id) in [
             ("the bare model id", model.model_id.to_string()),
             (
@@ -799,6 +802,7 @@ async fn the_model_is_resolved_against_the_published_catalog() {
         }
     }
 
+    let emu = emulator();
     // And an identifier naming no model of this account is reported absent.
     let unknown = [
         ("a bare id no catalog row carries", "nosuchmodel".to_string()),

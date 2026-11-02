@@ -179,8 +179,10 @@ use crate::ops::types::{
     AutomatedReasoningPolicyDefinition, AutomatedReasoningPolicyTestCase,
     AutomatedReasoningPolicyTestResult, CustomModelDataSource,
     CustomModelDeploymentSummary,
+    CapabilitySupport,
+    BatchSupport,
     CustomModelSummary, CustomizationConfig, EndpointConfig, EvaluationConfig,
-    ConverseSupport,
+    ConverseSupport, FeaturesSupport,
     ModelInvocationJobInputDataConfig, ModelInvocationJobOutputDataConfig,
     ModelInvocationJobSummary,
     EvaluationInferenceConfig, EvaluationOutputDataConfig, FoundationModelDetails,
@@ -7239,6 +7241,10 @@ const NO_FEATURES: &[&str] = &[];
 const BATCH_ONLY: &[&str] = &[FEATURE_BATCH_INFERENCE];
 /// `featuresSupported` — a model batch inference runs and a prompt router routes to.
 const BATCH_AND_ROUTING: &[&str] = &[FEATURE_BATCH_INFERENCE, FEATURE_INTELLIGENT_PROMPT_ROUTING];
+/// `featuresSupported` — a model batch inference runs and a prompt prefix may be cached for.
+const BATCH_AND_CACHING: &[&str] = &[FEATURE_BATCH_INFERENCE, FEATURE_PROMPT_CACHING];
+/// `featuresSupported` — a model only prompt caching's table lists.
+const CACHING_ONLY: &[&str] = &[FEATURE_PROMPT_CACHING];
 /// `featuresSupported` — a model every one of these four features lists.
 const EVERY_PUBLISHED_FEATURE: &[&str] = PUBLISHED_FEATURE_VALUES;
 /// `FoundationModelLifecycleStatus` — the model is available.
@@ -7249,6 +7255,103 @@ const LIFECYCLE_ACTIVE: &str = "ACTIVE";
 /// past its end of life is no longer offered, so it is absent from this catalog rather
 /// than carried in it under a status (see [`FOUNDATION_MODELS`]).
 const LIFECYCLE_LEGACY: &str = "LEGACY";
+
+/// A catalog row for a model that GENERATES TEXT: it answers with a turn of a conversation
+/// and streams that answer, it is available, no customization job accepts it, and it is
+/// offered on demand — which is what the catalog publishes for most of the models a client
+/// converses with. A row AWS also sells reserved capacity for is wrapped in
+/// [`also_provisioned`].
+const fn text_model(
+    model_id: &'static str,
+    model_name: &'static str,
+    provider_name: &'static str,
+    model_family: &'static str,
+    input_modalities: &'static [&'static str],
+    features_supported: &'static [&'static str],
+    start_of_life_time: &'static str,
+) -> FoundationModel {
+    FoundationModel {
+        model_id,
+        model_name,
+        provider_name,
+        model_family,
+        input_modalities,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND,
+        features_supported,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time,
+        legacy_window: None,
+    }
+}
+
+/// A catalog row for a model that produces an EMBEDDING vector: a vector is no turn of a
+/// conversation, so nothing it answers is streamed.
+const fn embedding_model(
+    model_id: &'static str,
+    model_name: &'static str,
+    provider_name: &'static str,
+    model_family: &'static str,
+    input_modalities: &'static [&'static str],
+    features_supported: &'static [&'static str],
+    start_of_life_time: &'static str,
+) -> FoundationModel {
+    FoundationModel {
+        model_id,
+        model_name,
+        provider_name,
+        model_family,
+        input_modalities,
+        output_modalities: OUT_EMBEDDING,
+        response_streaming_supported: false,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND,
+        features_supported,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time,
+        legacy_window: None,
+    }
+}
+
+/// A catalog row for a model that produces an IMAGE: an image is answered in one piece, so
+/// nothing it answers is streamed.
+const fn image_model(
+    model_id: &'static str,
+    model_name: &'static str,
+    provider_name: &'static str,
+    model_family: &'static str,
+    input_modalities: &'static [&'static str],
+    features_supported: &'static [&'static str],
+    start_of_life_time: &'static str,
+) -> FoundationModel {
+    FoundationModel {
+        model_id,
+        model_name,
+        provider_name,
+        model_family,
+        input_modalities,
+        output_modalities: OUT_IMAGE,
+        response_streaming_supported: false,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND,
+        features_supported,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+        start_of_life_time,
+        legacy_window: None,
+    }
+}
+
+/// The same row, offered WITH PROVISIONED THROUGHPUT beside on demand: a model AWS also
+/// sells reserved capacity for ("Supported Regions and models for Provisioned Throughput"),
+/// which is what `byInferenceType=PROVISIONED` narrows a listing to.
+const fn also_provisioned(model: FoundationModel) -> FoundationModel {
+    FoundationModel {
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        ..model
+    }
+}
 
 /// Every foundation model this emulator's Amazon Bedrock offers, in `modelId` order.
 ///
@@ -7276,9 +7379,14 @@ const LIFECYCLE_LEGACY: &str = "LEGACY";
 /// page publishes is left out of the row rather than invented (`publicExtendedAccessTime`
 /// is such an instant, so no row carries one).
 ///
-/// It is a SUBSET of what AWS offers, spanning every value of each member a caller can
-/// filter on, because the filter rule — not the catalog's size — is what this emulator
-/// has to get right.
+/// Every value of each member a caller can filter on is carried by a row, so a filter on
+/// any of them narrows the catalog rather than emptying it.
+///
+/// A row whose published attributes differ from the three kinds below — a model a
+/// customization job accepts, or a deprecated one — is written out member by member; every
+/// other row is built by [`text_model`], [`embedding_model`] or [`image_model`], which are
+/// those three kinds, wrapped in [`also_provisioned`] where AWS sells reserved capacity for
+/// the model too.
 pub const FOUNDATION_MODELS: &[FoundationModel] = &[
     FoundationModel {
         model_id: "ai21.jamba-1-5-mini-v1:0",
@@ -7295,6 +7403,34 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         start_of_life_time: "2024-08-22T00:00:00Z",
         legacy_window: None,
     },
+    // Amazon Nova — the Nova 2 generation, offered on demand.
+    text_model(
+        "amazon.nova-2-5-sonic",
+        "Nova 2.5 Sonic",
+        "Amazon",
+        "Nova 2",
+        IN_TEXT,
+        CACHING_ONLY,
+        "2026-03-10T00:00:00Z",
+    ),
+    text_model(
+        "amazon.nova-2-lite-v1:0",
+        "Nova 2 Lite",
+        "Amazon",
+        "Nova 2",
+        IN_TEXT_AND_IMAGE,
+        BATCH_AND_CACHING,
+        "2025-12-03T00:00:00Z",
+    ),
+    text_model(
+        "amazon.nova-2-sonic-v1:0",
+        "Nova 2 Sonic",
+        "Amazon",
+        "Nova 2",
+        IN_TEXT,
+        CACHING_ONLY,
+        "2025-12-03T00:00:00Z",
+    ),
     FoundationModel {
         model_id: "amazon.nova-canvas-v1:0",
         model_name: "Nova Canvas",
@@ -7355,6 +7491,26 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         start_of_life_time: "2024-12-03T00:00:00Z",
         legacy_window: None,
     },
+    // A reranking model scores passages against a query, so what it answers is no turn of a
+    // conversation either.
+    embedding_model(
+        "amazon.rerank-v1:0",
+        "Rerank",
+        "Amazon",
+        "Rerank",
+        IN_TEXT,
+        NO_FEATURES,
+        "2024-12-01T00:00:00Z",
+    ),
+    also_provisioned(embedding_model(
+        "amazon.titan-embed-g1-text-02",
+        "Titan Embed G1 Text",
+        "Amazon",
+        "Titan",
+        IN_TEXT,
+        BATCH_ONLY,
+        "2023-09-28T00:00:00Z",
+    )),
     FoundationModel {
         model_id: "amazon.titan-embed-image-v1",
         model_name: "Titan Embed Image",
@@ -7370,6 +7526,35 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         start_of_life_time: "2023-11-29T00:00:00Z",
         legacy_window: None,
     },
+    // The same two Titan embedding models under the VERSION-QUALIFIED ids the catalog also
+    // publishes them under: one published model, two ids a client may address it by.
+    also_provisioned(embedding_model(
+        "amazon.titan-embed-image-v1:0",
+        "Titan Embed Image",
+        "Amazon",
+        "Titan",
+        IN_TEXT_AND_IMAGE,
+        BATCH_ONLY,
+        "2023-11-29T00:00:00Z",
+    )),
+    also_provisioned(embedding_model(
+        "amazon.titan-embed-text-v1",
+        "Titan Embed Text",
+        "Amazon",
+        "Titan",
+        IN_TEXT,
+        BATCH_ONLY,
+        "2023-09-28T00:00:00Z",
+    )),
+    also_provisioned(embedding_model(
+        "amazon.titan-embed-text-v1:2:8k",
+        "Titan Embed Text",
+        "Amazon",
+        "Titan",
+        IN_TEXT,
+        BATCH_ONLY,
+        "2023-09-28T00:00:00Z",
+    )),
     FoundationModel {
         model_id: "amazon.titan-embed-text-v2:0",
         model_name: "Titan Embed Text V2",
@@ -7478,6 +7663,143 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         start_of_life_time: "2024-03-04T00:00:00Z",
         legacy_window: None,
     },
+    // Anthropic Claude — the Claude 4 and Claude 5 generations, each row under the line
+    // ("family") its provider publishes it in.
+    text_model(
+        "anthropic.claude-fable-5",
+        "Claude Fable 5",
+        "Anthropic",
+        "Claude Fable 5",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-05-05T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-fable-5-1",
+        "Claude Fable 5.1",
+        "Anthropic",
+        "Claude Fable 5",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-08-11T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+        "Claude Haiku 4.5",
+        "Anthropic",
+        "Claude Haiku 4.5",
+        IN_TEXT_AND_IMAGE,
+        EVERY_PUBLISHED_FEATURE,
+        "2025-10-01T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-opus-4-1-20250805-v1:0",
+        "Claude Opus 4.1",
+        "Anthropic",
+        "Claude Opus 4",
+        IN_TEXT_AND_IMAGE,
+        BATCH_AND_CACHING,
+        "2025-08-05T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-opus-4-5-20251101-v1:0",
+        "Claude Opus 4.5",
+        "Anthropic",
+        "Claude Opus 4",
+        IN_TEXT_AND_IMAGE,
+        BATCH_AND_CACHING,
+        "2025-11-01T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-opus-4-6-v1",
+        "Claude Opus 4.6",
+        "Anthropic",
+        "Claude Opus 4",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-02-05T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-opus-4-7",
+        "Claude Opus 4.7",
+        "Anthropic",
+        "Claude Opus 4",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-04-14T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-opus-4-8",
+        "Claude Opus 4.8",
+        "Anthropic",
+        "Claude Opus 4",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-06-16T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-opus-5",
+        "Claude Opus 5",
+        "Anthropic",
+        "Claude Opus 5",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-08-25T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-opus-5-5",
+        "Claude Opus 5.5",
+        "Anthropic",
+        "Claude Opus 5",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-10-20T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-sonnet-4-20250514-v1:0",
+        "Claude Sonnet 4",
+        "Anthropic",
+        "Claude Sonnet 4",
+        IN_TEXT_AND_IMAGE,
+        BATCH_AND_CACHING,
+        "2025-05-14T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "Claude Sonnet 4.5",
+        "Anthropic",
+        "Claude Sonnet 4",
+        IN_TEXT_AND_IMAGE,
+        BATCH_AND_CACHING,
+        "2025-09-29T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-sonnet-4-6",
+        "Claude Sonnet 4.6",
+        "Anthropic",
+        "Claude Sonnet 4",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-02-24T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-sonnet-5",
+        "Claude Sonnet 5",
+        "Anthropic",
+        "Claude Sonnet 5",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-07-14T00:00:00Z",
+    ),
+    text_model(
+        "anthropic.claude-sonnet-5-5",
+        "Claude Sonnet 5.5",
+        "Anthropic",
+        "Claude Sonnet 5",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-09-29T00:00:00Z",
+    ),
     FoundationModel {
         model_id: "cohere.command-light-text-v14",
         model_name: "Command Light",
@@ -7529,6 +7851,130 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         start_of_life_time: "2023-11-29T00:00:00Z",
         legacy_window: None,
     },
+    // Cohere — the Embed and Rerank lines, each embedding model also under the
+    // version-qualified id the catalog publishes it under.
+    also_provisioned(embedding_model(
+        "cohere.embed-english-v3:0",
+        "Embed English",
+        "Cohere",
+        "Embed",
+        IN_TEXT,
+        BATCH_ONLY,
+        "2023-11-29T00:00:00Z",
+    )),
+    also_provisioned(embedding_model(
+        "cohere.embed-multilingual-v3",
+        "Embed Multilingual",
+        "Cohere",
+        "Embed",
+        IN_TEXT,
+        BATCH_ONLY,
+        "2023-11-29T00:00:00Z",
+    )),
+    also_provisioned(embedding_model(
+        "cohere.embed-multilingual-v3:0",
+        "Embed Multilingual",
+        "Cohere",
+        "Embed",
+        IN_TEXT,
+        BATCH_ONLY,
+        "2023-11-29T00:00:00Z",
+    )),
+    embedding_model(
+        "cohere.embed-v4:0",
+        "Embed 4",
+        "Cohere",
+        "Embed",
+        IN_TEXT_AND_IMAGE,
+        BATCH_ONLY,
+        "2025-04-15T00:00:00Z",
+    ),
+    embedding_model(
+        "cohere.rerank-v3-5:0",
+        "Rerank 3.5",
+        "Cohere",
+        "Rerank",
+        IN_TEXT,
+        NO_FEATURES,
+        "2024-12-02T00:00:00Z",
+    ),
+    // DeepSeek.
+    text_model(
+        "deepseek.r1-v1:0",
+        "DeepSeek-R1",
+        "DeepSeek",
+        "DeepSeek R1",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-03-10T00:00:00Z",
+    ),
+    text_model(
+        "deepseek.v3-v1:0",
+        "DeepSeek-V3",
+        "DeepSeek",
+        "DeepSeek V3",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-09-30T00:00:00Z",
+    ),
+    text_model(
+        "deepseek.v3.2",
+        "DeepSeek-V3.2",
+        "DeepSeek",
+        "DeepSeek V3",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-12-01T00:00:00Z",
+    ),
+    // Google Gemma.
+    text_model(
+        "google.gemma-3-12b-it",
+        "Gemma 3 12B",
+        "Google",
+        "Gemma 3",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-01-20T00:00:00Z",
+    ),
+    text_model(
+        "google.gemma-3-27b-it",
+        "Gemma 3 27B",
+        "Google",
+        "Gemma 3",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-01-20T00:00:00Z",
+    ),
+    text_model(
+        "google.gemma-3-4b-it",
+        "Gemma 3 4B",
+        "Google",
+        "Gemma 3",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-01-20T00:00:00Z",
+    ),
+    // Luma AI generates a clip rather than a conversation, so what it answers is an IMAGE
+    // sequence and nothing it answers is streamed.
+    image_model(
+        "luma.ray-v2:0",
+        "Ray 2",
+        "Luma AI",
+        "Ray",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-02-20T00:00:00Z",
+    ),
+    // Meta Llama.
+    also_provisioned(text_model(
+        "meta.llama3-1-70b-instruct-v1:0",
+        "Llama 3.1 70B",
+        "Meta",
+        "Llama 3.1",
+        IN_TEXT,
+        BATCH_ONLY,
+        "2024-07-23T00:00:00Z",
+    )),
     FoundationModel {
         model_id: "meta.llama3-1-8b-instruct-v1:0",
         model_name: "Llama 3.1 8B",
@@ -7544,6 +7990,15 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         start_of_life_time: "2024-07-23T00:00:00Z",
         legacy_window: None,
     },
+    text_model(
+        "meta.llama3-3-70b-instruct-v1:0",
+        "Llama 3.3 70B",
+        "Meta",
+        "Llama 3.3",
+        IN_TEXT,
+        BATCH_ONLY,
+        "2024-12-06T00:00:00Z",
+    ),
     FoundationModel {
         model_id: "meta.llama3-70b-instruct-v1:0",
         model_name: "Llama 3 70B Instruct",
@@ -7559,6 +8014,116 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         start_of_life_time: "2024-04-18T00:00:00Z",
         legacy_window: None,
     },
+    also_provisioned(text_model(
+        "meta.llama3-8b-instruct-v1:0",
+        "Llama 3 8B Instruct",
+        "Meta",
+        "Llama 3",
+        IN_TEXT,
+        BATCH_ONLY,
+        "2024-04-18T00:00:00Z",
+    )),
+    text_model(
+        "meta.llama4-maverick-17b-instruct-v1:0",
+        "Llama 4 Maverick",
+        "Meta",
+        "Llama 4",
+        IN_TEXT_AND_IMAGE,
+        BATCH_ONLY,
+        "2025-04-29T00:00:00Z",
+    ),
+    text_model(
+        "meta.llama4-scout-17b-instruct-v1:0",
+        "Llama 4 Scout",
+        "Meta",
+        "Llama 4",
+        IN_TEXT_AND_IMAGE,
+        BATCH_ONLY,
+        "2025-04-29T00:00:00Z",
+    ),
+    // MiniMax.
+    text_model(
+        "minimax.minimax-m2",
+        "MiniMax M2",
+        "MiniMax",
+        "MiniMax M2",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-11-11T00:00:00Z",
+    ),
+    text_model(
+        "minimax.minimax-m2.1",
+        "MiniMax M2.1",
+        "MiniMax",
+        "MiniMax M2",
+        IN_TEXT,
+        NO_FEATURES,
+        "2026-01-13T00:00:00Z",
+    ),
+    text_model(
+        "minimax.minimax-m2.5",
+        "MiniMax M2.5",
+        "MiniMax",
+        "MiniMax M2",
+        IN_TEXT,
+        NO_FEATURES,
+        "2026-04-07T00:00:00Z",
+    ),
+    // Mistral AI.
+    text_model(
+        "mistral.devstral-2-123b",
+        "Devstral 2 123B",
+        "Mistral AI",
+        "Devstral 2",
+        IN_TEXT,
+        NO_FEATURES,
+        "2026-01-27T00:00:00Z",
+    ),
+    text_model(
+        "mistral.magistral-small-2509",
+        "Magistral Small",
+        "Mistral AI",
+        "Magistral",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-09-18T00:00:00Z",
+    ),
+    text_model(
+        "mistral.ministral-3-14b-instruct",
+        "Ministral 3 14B",
+        "Mistral AI",
+        "Ministral 3",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-10-16T00:00:00Z",
+    ),
+    text_model(
+        "mistral.ministral-3-3b-instruct",
+        "Ministral 3 3B",
+        "Mistral AI",
+        "Ministral 3",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-10-16T00:00:00Z",
+    ),
+    text_model(
+        "mistral.ministral-3-8b-instruct",
+        "Ministral 3 8B",
+        "Mistral AI",
+        "Ministral 3",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-10-16T00:00:00Z",
+    ),
+    also_provisioned(text_model(
+        "mistral.mistral-7b-instruct-v0:2",
+        "Mistral 7B Instruct",
+        "Mistral AI",
+        "Mistral",
+        IN_TEXT,
+        BATCH_ONLY,
+        "2023-11-29T00:00:00Z",
+    )),
     FoundationModel {
         model_id: "mistral.mistral-large-2402-v1:0",
         model_name: "Mistral Large",
@@ -7574,6 +8139,24 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         start_of_life_time: "2024-04-02T00:00:00Z",
         legacy_window: None,
     },
+    text_model(
+        "mistral.mistral-large-2407-v1:0",
+        "Mistral Large 2",
+        "Mistral AI",
+        "Mistral Large",
+        IN_TEXT,
+        BATCH_ONLY,
+        "2024-07-24T00:00:00Z",
+    ),
+    text_model(
+        "mistral.mistral-large-3-675b-instruct",
+        "Mistral Large 3",
+        "Mistral AI",
+        "Mistral Large",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-12-02T00:00:00Z",
+    ),
     FoundationModel {
         model_id: "mistral.mixtral-8x7b-instruct-v0:1",
         model_name: "Mixtral 8x7B",
@@ -7589,6 +8172,43 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         start_of_life_time: "2024-03-01T00:00:00Z",
         legacy_window: None,
     },
+    text_model(
+        "mistral.pixtral-large-2502-v1:0",
+        "Pixtral Large",
+        "Mistral AI",
+        "Pixtral",
+        IN_TEXT_AND_IMAGE,
+        BATCH_ONLY,
+        "2025-02-24T00:00:00Z",
+    ),
+    text_model(
+        "mistral.voxtral-mini-3b-2507",
+        "Voxtral Mini 3B",
+        "Mistral AI",
+        "Voxtral",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    text_model(
+        "mistral.voxtral-small-24b-2507",
+        "Voxtral Small 24B",
+        "Mistral AI",
+        "Voxtral",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    // Moonshot AI.
+    text_model(
+        "moonshot.kimi-k2-thinking",
+        "Kimi K2 Thinking",
+        "Moonshot AI",
+        "Kimi K2",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-11-06T00:00:00Z",
+    ),
     FoundationModel {
         model_id: "moonshotai.kimi-k2.5",
         model_name: "Kimi K2.5",
@@ -7601,9 +8221,258 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         inference_types_supported: ON_DEMAND,
         features_supported: NO_FEATURES,
         lifecycle_status: LIFECYCLE_ACTIVE,
-        start_of_life_time: "2025-12-09T00:00:00Z",
+        start_of_life_time: "2025-12-09T17:00:00Z",
         legacy_window: None,
     },
+    text_model(
+        "moonshotai.kimi-k3",
+        "Kimi K3",
+        "Moonshot AI",
+        "Kimi K3",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-04-21T00:00:00Z",
+    ),
+    // NVIDIA Nemotron.
+    text_model(
+        "nvidia.nemotron-nano-12b-v2",
+        "Nemotron Nano 12B",
+        "NVIDIA",
+        "Nemotron Nano",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-09-15T00:00:00Z",
+    ),
+    text_model(
+        "nvidia.nemotron-nano-3-30b",
+        "Nemotron Nano 3 30B",
+        "NVIDIA",
+        "Nemotron Nano 3",
+        IN_TEXT,
+        NO_FEATURES,
+        "2026-02-09T00:00:00Z",
+    ),
+    text_model(
+        "nvidia.nemotron-nano-9b-v2",
+        "Nemotron Nano 9B",
+        "NVIDIA",
+        "Nemotron Nano",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-08-18T00:00:00Z",
+    ),
+    text_model(
+        "nvidia.nemotron-super-3-120b",
+        "Nemotron Super 3",
+        "NVIDIA",
+        "Nemotron Super 3",
+        IN_TEXT,
+        NO_FEATURES,
+        "2026-03-16T00:00:00Z",
+    ),
+    // OpenAI — the models whose own OpenAI-compatible endpoints Amazon Bedrock serves
+    // beside its own invocation APIs.
+    text_model(
+        "openai.gpt-5.4",
+        "GPT-5.4",
+        "OpenAI",
+        "GPT-5",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-01-15T00:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-5.5",
+        "GPT-5.5",
+        "OpenAI",
+        "GPT-5",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-03-03T00:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-5.6-luna",
+        "GPT-5.6 Luna",
+        "OpenAI",
+        "GPT-5",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-05-19T00:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-5.6-sol",
+        "GPT-5.6 Sol",
+        "OpenAI",
+        "GPT-5",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-05-19T00:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-5.6-terra",
+        "GPT-5.6 Terra",
+        "OpenAI",
+        "GPT-5",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-05-19T00:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-6-astra",
+        "GPT-6 Astra",
+        "OpenAI",
+        "GPT-6",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-09-08T17:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-6-luna",
+        "GPT-6 Luna",
+        "OpenAI",
+        "GPT-6",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-09-08T17:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-6-sol",
+        "GPT-6 Sol",
+        "OpenAI",
+        "GPT-6",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-09-08T17:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-6.1-sol",
+        "GPT-6.1 Sol",
+        "OpenAI",
+        "GPT-6",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-11-10T00:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-oss-120b-1:0",
+        "GPT-OSS 120B",
+        "OpenAI",
+        "GPT-OSS",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-08-05T00:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-oss-20b-1:0",
+        "GPT-OSS 20B",
+        "OpenAI",
+        "GPT-OSS",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-08-05T00:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-oss-safeguard-120b",
+        "Safeguard 120B",
+        "OpenAI",
+        "GPT-OSS",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-10-29T00:00:00Z",
+    ),
+    text_model(
+        "openai.gpt-oss-safeguard-20b",
+        "Safeguard 20B",
+        "OpenAI",
+        "GPT-OSS",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-10-29T00:00:00Z",
+    ),
+    // Qwen.
+    text_model(
+        "qwen.qwen3-235b-a22b-2507-v1:0",
+        "Qwen3 235B A22B",
+        "Qwen",
+        "Qwen3",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-07-29T00:00:00Z",
+    ),
+    text_model(
+        "qwen.qwen3-32b-v1:0",
+        "Qwen3 32B",
+        "Qwen",
+        "Qwen3",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-07-29T00:00:00Z",
+    ),
+    text_model(
+        "qwen.qwen3-coder-30b-a3b-v1:0",
+        "Qwen3 Coder 30B",
+        "Qwen",
+        "Qwen3 Coder",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-07-29T00:00:00Z",
+    ),
+    text_model(
+        "qwen.qwen3-coder-480b-a35b-v1:0",
+        "Qwen3 Coder 480B",
+        "Qwen",
+        "Qwen3 Coder",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-07-29T00:00:00Z",
+    ),
+    text_model(
+        "qwen.qwen3-next-80b-a3b",
+        "Qwen3 Next 80B",
+        "Qwen",
+        "Qwen3 Next",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-10-14T00:00:00Z",
+    ),
+    text_model(
+        "qwen.qwen3-vl-235b-a22b",
+        "Qwen3 VL 235B",
+        "Qwen",
+        "Qwen3 VL",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-11-18T00:00:00Z",
+    ),
+    // Stability AI — image generation and the image-editing models beside it, each of which
+    // takes an image and a prompt and answers with an image.
+    image_model(
+        "stability.sd3-5-large-v1:0",
+        "SD3.5 Large",
+        "Stability AI",
+        "Stable Diffusion 3",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2024-12-03T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-conservative-upscale-v1:0",
+        "Conservative Upscale",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-creative-upscale-v1:0",
+        "Creative Upscale",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
     FoundationModel {
         model_id: "stability.stable-diffusion-xl-v1",
         model_name: "SDXL 1.0",
@@ -7619,6 +8488,217 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         start_of_life_time: "2023-11-29T00:00:00Z",
         legacy_window: None,
     },
+    image_model(
+        "stability.stable-fast-upscale-v1:0",
+        "Fast Upscale",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-image-control-sketch-v1:0",
+        "Control Sketch",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-image-control-structure-v1:0",
+        "Control Structure",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-image-core-v1:1",
+        "Stable Image Core",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2024-09-05T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-image-erase-object-v1:0",
+        "Erase Object",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-image-inpaint-v1:0",
+        "Inpaint",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-image-remove-background-v1:0",
+        "Remove Background",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-image-search-recolor-v1:0",
+        "Search and Recolor",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-image-search-replace-v1:0",
+        "Search and Replace",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-image-style-guide-v1:0",
+        "Style Guide",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-image-ultra-v1:1",
+        "Stable Image Ultra",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2024-09-05T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-outpaint-v1:0",
+        "Outpaint",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    image_model(
+        "stability.stable-style-transfer-v1:0",
+        "Style Transfer",
+        "Stability AI",
+        "Stable Image",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-07-15T00:00:00Z",
+    ),
+    // TwelveLabs reads a clip and answers about it in text.
+    text_model(
+        "twelvelabs.pegasus-1-2-v1:0",
+        "Pegasus 1.2",
+        "TwelveLabs",
+        "Pegasus",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2025-06-17T00:00:00Z",
+    ),
+    // Writer.
+    text_model(
+        "writer.palmyra-vision-7b",
+        "Palmyra Vision 7B",
+        "Writer",
+        "Palmyra Vision",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-02-17T00:00:00Z",
+    ),
+    text_model(
+        "writer.palmyra-x4-v1:0",
+        "Palmyra X4",
+        "Writer",
+        "Palmyra X",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-04-30T00:00:00Z",
+    ),
+    text_model(
+        "writer.palmyra-x5-v1:0",
+        "Palmyra X5",
+        "Writer",
+        "Palmyra X",
+        IN_TEXT,
+        NO_FEATURES,
+        "2025-04-30T00:00:00Z",
+    ),
+    // xAI.
+    text_model(
+        "xai.grok-4.6",
+        "Grok 4.6",
+        "xAI",
+        "Grok 4",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-01-08T00:00:00Z",
+    ),
+    text_model(
+        "xai.grok-4.7",
+        "Grok 4.7",
+        "xAI",
+        "Grok 4",
+        IN_TEXT_AND_IMAGE,
+        NO_FEATURES,
+        "2026-03-24T00:00:00Z",
+    ),
+    // Z AI.
+    text_model(
+        "zai.glm-4.7",
+        "GLM-4.7",
+        "Z AI",
+        "GLM-4",
+        IN_TEXT,
+        NO_FEATURES,
+        "2026-01-06T00:00:00Z",
+    ),
+    text_model(
+        "zai.glm-4.7-flash",
+        "GLM-4.7 Flash",
+        "Z AI",
+        "GLM-4",
+        IN_TEXT,
+        NO_FEATURES,
+        "2026-01-06T00:00:00Z",
+    ),
+    text_model(
+        "zai.glm-5",
+        "GLM-5",
+        "Z AI",
+        "GLM-5",
+        IN_TEXT,
+        NO_FEATURES,
+        "2026-05-12T00:00:00Z",
+    ),
+    text_model(
+        "zai.glm-5.3",
+        "GLM-5.3",
+        "Z AI",
+        "GLM-5",
+        IN_TEXT,
+        NO_FEATURES,
+        "2026-09-22T00:00:00Z",
+    ),
 ];
 
 /// The catalog as the per-service store holds it: one entry per `modelId`, keyed by it, so
@@ -7826,6 +8906,18 @@ pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
 // already carries, so they are computed rather than stored a second time. Nothing here is
 // invented for a model: a feature no table lists the model in is simply not supported for
 // it, which is where a freshly offered model starts.
+//
+// A capability is reported as a RECORD naming what is supported
+// ([`CapabilitySupport`], [`BatchSupport`], [`FeaturesSupport`], [`ConverseSupport`])
+// rather than as a bare boolean, because what one of them says about a model is more than
+// one bit: batch inference, for instance, runs the base model, runs it from another region
+// and runs a customization of it, and each of those is its own answer.
+//
+// And the capability metadata is published for a model that TAKES PART IN A CONVERSATION
+// and for no other: a model that answers with a vector or an image carries the ten members
+// the shape declares plus `guardrailsSupported`, and the catalog publishes it no family, no
+// invocation APIs, no feature record and no Converse record, so the summary reports none of
+// them for it rather than reporting one it made up.
 
 /// `ModelModality` — the modality a model that takes part in a conversation produces
 /// (`crate::ops::types::MODEL_MODALITY_VALUES`).
@@ -7893,6 +8985,16 @@ pub fn model_explicit_prompt_caching(model: &FoundationModel) -> bool {
     model_publishes_feature(model, FEATURE_PROMPT_CACHING)
 }
 
+/// One capability of a model as a summary reports it: the RECORD naming whether that
+/// capability may be used with the model, which is the form each capability member of a
+/// summary carries rather than a bare boolean.
+#[must_use]
+pub fn capability_support(is_supported: bool) -> CapabilitySupport {
+    CapabilitySupport {
+        is_supported: Some(is_supported),
+    }
+}
+
 /// Whether a prompt router may route a prompt to `model`.
 #[must_use]
 pub fn model_intelligent_prompt_routing(model: &FoundationModel) -> bool {
@@ -7903,6 +9005,21 @@ pub fn model_intelligent_prompt_routing(model: &FoundationModel) -> bool {
 #[must_use]
 pub fn model_latency_optimization_supported(model: &FoundationModel) -> bool {
     model_publishes_feature(model, FEATURE_LATENCY_OPTIMIZATION)
+}
+
+/// Whether a model invocation job may run `model` over a dataset, as the record a summary
+/// reports it: a job runs the base model itself, runs it from another region, and runs a
+/// CUSTOMIZATION of it — the last of which needs the model to accept a customization at
+/// all, so it holds of a model whose `customizationsSupported` is not empty and of no
+/// other.
+#[must_use]
+pub fn model_batch_support(model: &FoundationModel) -> BatchSupport {
+    let supported = model_batch_supported(model);
+    BatchSupport {
+        base_model_supported: Some(supported),
+        cross_region_supported: Some(supported),
+        custom_model_supported: Some(supported && !model.customizations_supported.is_empty()),
+    }
 }
 
 /// Whether a model invocation job may run `model` over a dataset.
@@ -7932,35 +9049,214 @@ pub fn model_inference_apis_supported(model: &FoundationModel) -> Vec<String> {
     apis
 }
 
-/// The features published for `model` ([`FoundationModel::features_supported`]), as the one
-/// list a client can test membership in.
+/// The features published for `model` ([`FoundationModel::features_supported`]), as the
+/// record a summary reports them in: one member per feature of
+/// [`PUBLISHED_FEATURE_VALUES`], naming whether the catalog publishes that feature for the
+/// model, beside the two features that follow from what the model IS rather than from a
+/// supported-models table — a token count ([`model_count_tokens_supported`]) and prompt
+/// optimization ([`model_prompt_optimization_supported`]) — so a client tests one feature by
+/// name.
 ///
-/// The same set the four feature members beside it report one by one, so the list and those
-/// members cannot disagree: a feature is listed exactly while the row publishes it.
+/// The same set the capability members beside it report one by one, so the record and those
+/// members cannot disagree: a feature is named supported here exactly while the row
+/// publishes it — and a model no feature's supported-models table lists, where a freshly
+/// offered model starts, has every member of the record answer no.
 #[must_use]
-pub fn model_features_supported(model: &FoundationModel) -> Vec<String> {
-    model
-        .features_supported
-        .iter()
-        .map(|feature| (*feature).to_string())
-        .collect()
-}
-
-/// What the Converse API supports for `model`.
-///
-/// Reported beside `inferenceAPIsSupported` because Converse is the API a conversational
-/// client drives the model through, and the two things it has to know before it does are
-/// whether the model is reachable that way at all and whether the answer can be streamed —
-/// the model's own `responseStreamingSupported`, which it only means anything to stream
-/// through Converse when the model is conversational.
-#[must_use]
-pub fn model_converse_support(model: &FoundationModel) -> ConverseSupport {
-    let supported = model_is_conversational(model);
-    ConverseSupport {
-        supported: Some(supported),
-        streaming_supported: Some(supported && model.response_streaming_supported),
+pub fn model_features_supported(model: &FoundationModel) -> FeaturesSupport {
+    let published = |feature: &str| Some(model_publishes_feature(model, feature));
+    FeaturesSupport {
+        batch_inference: published(FEATURE_BATCH_INFERENCE),
+        count_tokens: Some(model_count_tokens_supported(model)),
+        intelligent_prompt_routing: published(FEATURE_INTELLIGENT_PROMPT_ROUTING),
+        latency_optimization: published(FEATURE_LATENCY_OPTIMIZATION),
+        prompt_caching: published(FEATURE_PROMPT_CACHING),
+        prompt_optimization: Some(model_prompt_optimization_supported(model)),
     }
 }
+
+/// Whether a prompt may be OPTIMIZED for `model`.
+///
+/// An advanced prompt optimization job rewrites a prompt TEMPLATE for the models it is told
+/// to target (`modelConfigurations` of
+/// `smithy_query(query="operation",operation="CreateAdvancedPromptOptimizationJob")`), so
+/// what it needs of a model is that a prompt is what the model is given — it takes part in
+/// a conversation — and nothing else.
+#[must_use]
+pub fn model_prompt_optimization_supported(model: &FoundationModel) -> bool {
+    model_is_conversational(model)
+}
+
+/// Whether the tokens of a conversation may be COUNTED for `model`.
+///
+/// A count is the MODEL's own tokenizer's, so the operation that answers one is published
+/// per model family rather than per model, and this emulator's inference plane counts for
+/// the one family it carries a tokenizer for — the family published by
+/// [`COUNT_TOKENS_MODEL_PROVIDER`] — and refuses a model outside it. Reported here so a
+/// client reads the same answer out of the catalog that the count itself gives.
+#[must_use]
+pub fn model_count_tokens_supported(model: &FoundationModel) -> bool {
+    model.provider_name == COUNT_TOKENS_MODEL_PROVIDER
+}
+
+/// The `providerName` whose models a token count is served for.
+const COUNT_TOKENS_MODEL_PROVIDER: &str = "Anthropic";
+
+/// What the Converse API supports for `model`, or `None` for a model Converse does not
+/// reach at all ([`model_is_conversational`]) — nothing it answers is a turn of a
+/// conversation, so the catalog publishes no Converse record for it.
+///
+/// Reported beside `inferenceAPIsSupported` because Converse is the API a conversational
+/// client drives the model through, and every member of the record is something that client
+/// has to know before it starts a conversation. Each one is read off the row or off what
+/// this emulator's inference plane serves, and a member nothing publishes for a model is
+/// left absent rather than filled with a value invented for it:
+///
+/// * `streamingSupported` is the model's own `responseStreamingSupported`.
+/// * `maxTokensMaximum` is the ceiling the provider publishes for the model
+///   ([`CONVERSE_MAX_OUTPUT_TOKENS`]), which is the ceiling the inference plane caps a
+///   generated answer at; `maxTokensDefault` is absent, because a default for it is
+///   published nowhere.
+/// * `systemRoleSupported` holds of a model Converse reaches: a system role is part of the
+///   conversation the API carries rather than of any one model's integration.
+/// * `reasoningSupported` is published per model ([`REASONING_MODELS`]).
+/// * `stopSequencesDefault` is empty: a conversation halts at the stop sequences the
+///   REQUEST carries, and no model publishes one of its own.
+/// * `userDocumentTypesSupported`, `userImageTypesSupported` and
+///   `userVideoTypesSupported` are the formats a turn may carry TO the model, so each one
+///   is the format set of a modality the model takes ([`FoundationModel::input_modalities`])
+///   and empty for a modality it does not.
+/// * `additionalRequestFieldsSchema` is absent: the schema of a model's provider-specific
+///   request fields is published per model, and this catalog publishes one for no row.
+#[must_use]
+pub fn model_converse_support(model: &FoundationModel) -> Option<ConverseSupport> {
+    if !model_is_conversational(model) {
+        return None;
+    }
+    let takes = |modality: &str| model.input_modalities.contains(&modality);
+    let formats = |carried: bool, values: &[&str]| {
+        if carried {
+            values.iter().map(|value| (*value).to_string()).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    Some(ConverseSupport {
+        supported: Some(true),
+        streaming_supported: Some(model.response_streaming_supported),
+        additional_request_fields_schema: None,
+        max_tokens_default: None,
+        max_tokens_maximum: model_max_output_tokens(model),
+        reasoning_supported: Some(capability_support(model_reasoning_supported(model))),
+        stop_sequences_default: Some(Vec::new()),
+        system_role_supported: Some(true),
+        user_document_types_supported: Some(formats(takes(MODALITY_TEXT), CONVERSE_DOCUMENT_FORMATS)),
+        user_image_types_supported: Some(formats(takes(MODALITY_IMAGE), CONVERSE_IMAGE_FORMATS)),
+        user_video_types_supported: Some(formats(takes(MODALITY_VIDEO), CONVERSE_VIDEO_FORMATS)),
+    })
+}
+
+/// The ceiling on generated tokens the provider publishes for `model` ("Inference parameters
+/// for foundation models" in the Amazon Bedrock User Guide), or `None` for a model it
+/// publishes none for.
+#[must_use]
+pub fn model_max_output_tokens(model: &FoundationModel) -> Option<i32> {
+    CONVERSE_MAX_OUTPUT_TOKENS
+        .iter()
+        .find(|(model_id, _)| *model_id == model.model_id)
+        .map(|(_, ceiling)| *ceiling)
+}
+
+/// Whether the provider publishes EXTENDED REASONING for `model`: the model answers with a
+/// reasoning block beside its text, which a client has to ask for and account tokens for.
+#[must_use]
+pub fn model_reasoning_supported(model: &FoundationModel) -> bool {
+    REASONING_MODELS.contains(&model.model_id)
+}
+
+/// The ceiling on generated tokens each model's provider publishes for it, by `modelId`:
+/// the largest `maxTokens` a Converse request may ask of the model.
+///
+/// The same ceiling this emulator's inference plane caps a generated answer at (the
+/// `max_output_tokens` of its own model inventory), so a client that reads the ceiling here
+/// and then asks for it is served rather than refused. A model whose provider publishes no
+/// ceiling is in no row, and its Converse record reports none.
+const CONVERSE_MAX_OUTPUT_TOKENS: &[(&str, i32)] = &[
+    ("amazon.nova-lite-v1:0", 5120),
+    ("amazon.nova-micro-v1:0", 5120),
+    ("amazon.nova-pro-v1:0", 5120),
+    ("amazon.titan-text-lite-v1", 4096),
+    ("amazon.titan-text-premier-v1:0", 3072),
+    ("anthropic.claude-3-5-sonnet-20241022-v2:0", 8192),
+    ("anthropic.claude-3-haiku-20240307-v1:0", 4096),
+    ("anthropic.claude-3-sonnet-20240229-v1:0", 4096),
+    ("cohere.command-light-text-v14", 4096),
+    ("cohere.command-text-v14", 4096),
+    ("meta.llama3-1-70b-instruct-v1:0", 2048),
+    ("meta.llama3-1-8b-instruct-v1:0", 2048),
+    ("meta.llama3-3-70b-instruct-v1:0", 2048),
+    ("meta.llama3-70b-instruct-v1:0", 2048),
+    ("meta.llama3-8b-instruct-v1:0", 2048),
+    ("mistral.mistral-7b-instruct-v0:2", 8192),
+    ("mistral.mistral-large-2402-v1:0", 8192),
+    ("mistral.mistral-large-2407-v1:0", 8192),
+    ("mistral.mixtral-8x7b-instruct-v0:1", 4096),
+];
+
+/// The models whose provider publishes EXTENDED REASONING for them, by `modelId`: the
+/// reasoning lines of each provider — the Anthropic Claude lines from Claude 4 on, which
+/// publish extended thinking, and the lines each other provider publishes as its reasoning
+/// model.
+const REASONING_MODELS: &[&str] = &[
+    "anthropic.claude-fable-5",
+    "anthropic.claude-fable-5-1",
+    "anthropic.claude-haiku-4-5-20251001-v1:0",
+    "anthropic.claude-opus-4-1-20250805-v1:0",
+    "anthropic.claude-opus-4-5-20251101-v1:0",
+    "anthropic.claude-opus-4-6-v1",
+    "anthropic.claude-opus-4-7",
+    "anthropic.claude-opus-4-8",
+    "anthropic.claude-opus-5",
+    "anthropic.claude-opus-5-5",
+    "anthropic.claude-sonnet-4-20250514-v1:0",
+    "anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "anthropic.claude-sonnet-4-6",
+    "anthropic.claude-sonnet-5",
+    "anthropic.claude-sonnet-5-5",
+    "deepseek.r1-v1:0",
+    "mistral.magistral-small-2509",
+    "moonshot.kimi-k2-thinking",
+    "nvidia.nemotron-super-3-120b",
+    "qwen.qwen3-235b-a22b-2507-v1:0",
+    "qwen.qwen3-32b-v1:0",
+    "qwen.qwen3-next-80b-a3b",
+];
+
+/// The document formats a turn of a conversation may carry to a model that takes TEXT
+/// (`DocumentFormat` in the Amazon Bedrock Runtime model, which is what `Converse` accepts
+/// a document block in).
+const CONVERSE_DOCUMENT_FORMATS: &[&str] = &[
+    "pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md",
+];
+
+/// The image formats a turn may carry to a model that takes IMAGE (`ImageFormat`).
+const CONVERSE_IMAGE_FORMATS: &[&str] = &["png", "jpeg", "gif", "webp"];
+
+/// The video formats a turn may carry to a model that takes video (`VideoFormat`). The
+/// modality is written as the rule the other two are — the formats of a modality the model
+/// takes — and no value `ModelModality` declares
+/// (`crate::ops::types::MODEL_MODALITY_VALUES`) is video, so no row of this catalog takes
+/// one and the member is empty for every model today.
+const CONVERSE_VIDEO_FORMATS: &[&str] = &[
+    "mkv", "mov", "mp4", "webm", "flv", "mpeg", "mpg", "wmv", "three_gp",
+];
+
+/// `ModelModality` — the modality of a model that takes an image.
+const MODALITY_IMAGE: &str = "IMAGE";
+
+/// The modality of a model that takes a video clip. `ModelModality` declares no such value
+/// in this model copy, so the catalog carries it on no row; it is named so the Converse
+/// record states the same RULE for all three format sets.
+const MODALITY_VIDEO: &str = "VIDEO";
 
 /// One catalog row as the `FoundationModelSummary` a `ListFoundationModels` response for
 /// `region` carries.
@@ -7978,10 +9274,12 @@ pub fn model_converse_support(model: &FoundationModel) -> ConverseSupport {
 /// model: it is part of a legacy window AWS states no instant for.
 ///
 /// The members after `modelLifecycle` are the model's CAPABILITIES, each computed from this
-/// row — see the capability section above for what each one takes of a model.
+/// row — see the capability section above for what each one takes of a model, and why only
+/// a model that takes part in a conversation carries them.
 #[must_use]
 pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> FoundationModelSummary {
     let list = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect();
+    let conversational = model_is_conversational(model);
     FoundationModelSummary {
         model_arn: foundation_model_arn(region, model.model_id),
         model_id: model.model_id.to_string(),
@@ -8003,15 +9301,18 @@ pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> Founda
                 .and_then(|window| published_instant(window.entered_at)),
             public_extended_access_time: None,
         }),
-        model_family: Some(model.model_family.to_string()),
-        inference_apis_supported: Some(model_inference_apis_supported(model)),
-        features_supported: Some(model_features_supported(model)),
+        model_family: conversational.then(|| model.model_family.to_string()),
+        inference_apis_supported: conversational.then(|| model_inference_apis_supported(model)),
+        features_supported: conversational.then(|| model_features_supported(model)),
         guardrails_supported: Some(model_guardrails_supported(model)),
-        explicit_prompt_caching: Some(model_explicit_prompt_caching(model)),
-        intelligent_prompt_routing: Some(model_intelligent_prompt_routing(model)),
-        latency_optimization_supported: Some(model_latency_optimization_supported(model)),
-        batch_supported: Some(model_batch_supported(model)),
-        converse: Some(model_converse_support(model)),
+        explicit_prompt_caching: conversational
+            .then(|| capability_support(model_explicit_prompt_caching(model))),
+        intelligent_prompt_routing: conversational
+            .then(|| capability_support(model_intelligent_prompt_routing(model))),
+        latency_optimization_supported: conversational
+            .then(|| model_latency_optimization_supported(model)),
+        batch_supported: conversational.then(|| model_batch_support(model)),
+        converse: model_converse_support(model),
     }
 }
 
