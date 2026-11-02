@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWebhook
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWebhook`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWebhook::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## The rule this handler is
+//!
+//! "Deletes a previously created webhook by name": the account stops holding the
+//! webhook stored under that name, so a later `ListWebhooks` no longer reports it and
+//! its ARN addresses no resource. The operation "returns successfully when trying to
+//! delete a webhook that is already deleted", so a name no stored webhook carries is
+//! a success that removes nothing rather than a refusal — the call states the state it
+//! wants, and that state already holds.
+//!
+//! Everything the service held FOR the webhook goes with it, its tags included: they
+//! were the tags of that resource, and "if a deleted webhook is re-created by calling
+//! PutWebhook with the same name, it will have a different URL", so nothing of the
+//! deleted one survives for the re-created one to inherit.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +143,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWebhook` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWebhookErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWebhook"))
+        let _ = ctx;
+        let state = crate::state::require_state(&*self.engine)?;
+        let mut state = state.lock();
+
+        // Idempotent: removing a name the store does not hold leaves the store as it
+        // is and answers the same success, which is what the operation documents for
+        // a webhook that is already deleted.
+        state.webhooks.remove(&input.name);
+
+        Ok(DeleteWebhookOutput {})
     }
 }

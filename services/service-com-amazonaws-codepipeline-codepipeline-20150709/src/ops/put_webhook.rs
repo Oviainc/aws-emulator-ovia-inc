@@ -9,6 +9,14 @@
 //! name already exists REPLACES its definition in place, keeping the URL and the ARN
 //! the first definition minted.
 //!
+//! A definition names its pipeline by NAME (`WebhookDefinition$targetPipeline` is "the
+//! name of the pipeline you want to connect to the webhook") and nothing about it is
+//! resolved here: the webhook is stored whether or not the account holds that pipeline,
+//! so one defined before its pipeline exists, or outliving it, is stored and reported
+//! like any other. The reference is resolved by the operations that act THROUGH the
+//! webhook — `RegisterWebhookWithThirdParty` and `DeregisterWebhookWithThirdParty`,
+//! which refuse a dangling one.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -216,25 +224,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = input.webhook.name.clone();
         let mut state = state.lock();
 
-        // A webhook starts the pipeline named by `targetPipeline`, so that pipeline
-        // has to exist — the condition `PipelineNotFoundException` states ("The
-        // pipeline was specified in an invalid format or cannot be found").
-        if !state.pipelines.contains_key(&input.webhook.target_pipeline) {
-            return Err(PutWebhookErrorModeled::PipelineNotFoundException(
-                PipelineNotFoundException {
-                    message: Some(crate::state::pipeline_not_found_message(
-                        &input.webhook.target_pipeline,
-                    )),
-                },
-            )
-            .into());
-        }
+        // `WebhookDefinition$targetPipeline` is NOT resolved here: a webhook is
+        // defined over a pipeline NAME, and the definition is accepted and stored
+        // whether or not the account holds that pipeline yet — the reference is
+        // resolved when something acts through the webhook (the third-party
+        // operations), not when it is defined.
 
         let webhook = match state.webhooks.get(&name).cloned() {
             // Defining a webhook whose name already exists replaces its definition.
             // The URL and the ARN were minted once and already identify this webhook
-            // to whoever holds them, so they are kept; the tags are left as they are
-            // unless this request states a set.
+            // to whoever holds them, so they are kept; everything the request states
+            // is what the webhook then carries, tags included — a redefinition
+            // stating no tags leaves the webhook with none, the same set a first
+            // definition stating none gives it.
             //
             // The definition is stored exactly as sent, including
             // `authenticationConfiguration.SecretToken`: the service cannot tell a
@@ -243,9 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // sends the secret again, as it does against AWS.
             Some(mut stored) => {
                 stored.definition = input.webhook;
-                if let Some(tags) = input.tags {
-                    stored.tags = tags;
-                }
+                stored.tags = input.tags.unwrap_or_default();
                 stored
             }
             None => {

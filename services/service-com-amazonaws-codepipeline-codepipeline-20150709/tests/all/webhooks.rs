@@ -288,9 +288,11 @@ async fn every_webhook_definition_round_trips_through_list_webhooks() {
             url.starts_with("https://us-east-1.webhooks.aws/trigger?t=") && url.ends_with("&v=1"),
             "case {case:?}: expected a generated trigger URL, got {url:?}"
         );
+        // The tags member is always reported — an empty list for a definition that
+        // applied none.
         assert_eq!(
             item.get("tags").cloned(),
-            tags,
+            Some(tags.clone().unwrap_or_else(|| json!([]))),
             "case {case:?}: PutWebhook reports the tags applied, got {put}"
         );
         // Nothing has triggered a freshly defined webhook, and no trigger has
@@ -605,46 +607,37 @@ async fn authentication_parameters_must_match_the_authentication_type() {
     }
 }
 
-/// A webhook starts the pipeline it targets, so `targetPipeline` has to name a stored
-/// pipeline: otherwise the request is refused with `PipelineNotFoundException` and
-/// nothing is stored.
+/// A webhook is defined over a pipeline NAME: `PutWebhook` stores the definition it is
+/// sent whether or not the account holds that pipeline, so a webhook defined before its
+/// pipeline exists — or outliving it — is stored and reported like any other. The rows
+/// differ in how the name relates to a held pipeline: absent, differing only in letter
+/// case, and held.
 #[tokio::test]
-async fn a_webhook_needs_an_existing_target_pipeline() {
+async fn a_webhook_is_stored_whatever_its_target_pipeline_names() {
     let emulator = Emulator::new();
     emulator.create_pipeline("demo").await;
 
-    for target in ["missing", "Demo", "demo2"] {
-        let (status, code) = emulator
-            .expect_error(
+    for target in ["missing", "Demo", "demo"] {
+        let put = emulator
+            .ok(
                 "PutWebhook",
                 &json!({"webhook": github_definition("hook", target)}),
             )
             .await;
         assert_eq!(
-            (status, code.as_str()),
-            (400, "PipelineNotFoundException"),
-            "target pipeline {target:?} does not exist"
+            put["webhook"]["definition"]["targetPipeline"],
+            json!(target),
+            "target pipeline {target:?}: the definition is stored as sent, got {put}"
+        );
+        // And it is the webhook the store holds: the read path reports the same one.
+        let listed = emulator.list_webhooks().await;
+        assert_eq!(
+            listed,
+            vec![put["webhook"].clone()],
+            "target pipeline {target:?}: ListWebhooks reports the stored webhook, got \
+             {listed:?}"
         );
     }
-    let listed = emulator.list_webhooks().await;
-    assert!(
-        listed.is_empty(),
-        "a refused PutWebhook must store no webhook, got {listed:?}"
-    );
-
-    // The same request succeeds once the pipeline it targets exists.
-    emulator.create_pipeline("demo2").await;
-    let put = emulator
-        .ok(
-            "PutWebhook",
-            &json!({"webhook": github_definition("hook", "demo2")}),
-        )
-        .await;
-    assert_eq!(
-        put["webhook"]["definition"]["targetPipeline"],
-        json!("demo2"),
-        "the webhook targets the pipeline that now exists, got {put}"
-    );
 }
 
 /// Defining a webhook whose name already exists replaces its definition in place: the
@@ -709,8 +702,9 @@ async fn redefining_a_webhook_keeps_its_url_and_arn() {
             put["webhook"]["definition"], webhook,
             "case {case:?}: the new definition replaces the old one, got {put}"
         );
-        // Tags the request does not state are left as they were.
-        let expected_tags = tags.unwrap_or_else(|| json!([{"key": "team", "value": "build"}]));
+        // A redefinition states the whole webhook, tags included: the webhook carries
+        // exactly the tags THIS request applied, and none when it applies none.
+        let expected_tags = tags.unwrap_or_else(|| json!([]));
         assert_eq!(
             put["webhook"]["tags"], expected_tags,
             "case {case:?}: unexpected tags, got {put}"
@@ -774,11 +768,9 @@ async fn a_tag_set_no_resource_can_carry_is_refused() {
         match expected_error {
             None => {
                 let put = emulator.ok("PutWebhook", &request).await;
-                let expected = (!tags.as_array().expect("a tag list").is_empty())
-                    .then(|| tags.clone());
                 assert_eq!(
                     put["webhook"].get("tags").cloned(),
-                    expected,
+                    Some(tags.clone()),
                     "case {case:?}: an accepted tag set is reported as applied, got {put}"
                 );
             }

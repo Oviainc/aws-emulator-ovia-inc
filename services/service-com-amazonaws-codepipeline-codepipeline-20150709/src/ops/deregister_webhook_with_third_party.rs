@@ -169,48 +169,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Resolved against the stored webhooks under ONE guard, so the name and the
-        // webhook's authentication are read from one snapshot of the store: a
-        // well-formed name the account holds no webhook for is a terminal, handleable
-        // condition the model has an error for. `WebhookNotFoundException` models no
-        // `message` member, so the code is the whole refusal.
+        // Resolved against the stored webhooks under ONE guard, so the name, the
+        // webhook's authentication and the pipeline it targets are read from one
+        // snapshot of the store: a well-formed name the account holds no webhook for
+        // is a terminal, handleable condition the model has an error for.
+        // `WebhookNotFoundException` models no `message` member, so the code is the
+        // whole refusal.
         //
-        // The connection this operation removes is the GitHub HMAC one the webhook's
-        // shared secret authenticates, so what decides whether there is such a
-        // connection at all is the authentication the webhook was configured with —
-        // the one rule both third-party webhook operations ask the store with. Any
-        // other `WebhookAuthenticationType` is a request this operation does not
-        // serve, which is the condition its `ValidationException` states, and the
-        // refusal reports the type that blocked it.
-        let authentication = {
+        // What this operation drops is a connection that would start the webhook's
+        // target pipeline, authenticated by the shared secret of its GitHub HMAC
+        // configuration — so a webhook whose `targetPipeline` the account no longer
+        // holds, and one configured with any other `WebhookAuthenticationType`, are
+        // both requests it does not serve. Those are the condition its
+        // `ValidationException` states, and each refusal reports what blocked it: the
+        // dangling pipeline reference, or the authentication type the webhook carries.
+        let connection = {
             let store = state.lock();
-            store.webhook_authentication(name).map(str::to_string)
+            store.webhook_connection(name)
         };
-        match authentication.as_deref() {
-            None => {
-                return Err(
-                    DeregisterWebhookWithThirdPartyErrorModeled::WebhookNotFoundException(
-                        WebhookNotFoundException {},
-                    )
-                    .into(),
+        let Some(connection) = connection else {
+            return Err(
+                DeregisterWebhookWithThirdPartyErrorModeled::WebhookNotFoundException(
+                    WebhookNotFoundException {},
                 )
-            }
-            Some(crate::state::AUTHENTICATION_GITHUB_HMAC) => {}
-            Some(authentication) => {
-                return Err(
-                    DeregisterWebhookWithThirdPartyErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(
-                                crate::state::webhook_authentication_unsupported_message(
-                                    name,
-                                    authentication,
-                                ),
+                .into(),
+            );
+        };
+        if let Some(target_pipeline) = &connection.dangling_target_pipeline {
+            return Err(
+                DeregisterWebhookWithThirdPartyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::webhook_dangling_target_pipeline_message(
+                                name,
+                                target_pipeline,
                             ),
-                        },
-                    )
-                    .into(),
+                        ),
+                    },
                 )
-            }
+                .into(),
+            );
+        }
+        if connection.authentication != crate::state::AUTHENTICATION_GITHUB_HMAC {
+            return Err(
+                DeregisterWebhookWithThirdPartyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::webhook_authentication_unsupported_message(
+                                name,
+                                &connection.authentication,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
         }
 
         Ok(DeregisterWebhookWithThirdPartyOutput {})

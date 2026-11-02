@@ -442,6 +442,15 @@ pub const AUTHENTICATION_IP: &str = "IP";
 /// regardless of origin", so its configuration carries neither property.
 pub const AUTHENTICATION_UNAUTHENTICATED: &str = "UNAUTHENTICATED";
 
+/// The `WebhookAuthConfiguration` property a `GITHUB_HMAC` webhook is configured
+/// with, named as the shape declares it (`WebhookAuthConfiguration$SecretToken`).
+pub const AUTH_PROPERTY_SECRET_TOKEN: &str = "SecretToken";
+
+/// The `WebhookAuthConfiguration` property an `IP` webhook is configured with
+/// (`WebhookAuthConfiguration$AllowedIPRange`).
+pub const AUTH_PROPERTY_ALLOWED_IP_RANGE: &str = "AllowedIPRange";
+
+
 /// The `ActionOwner` a custom action type carries, from the model's enum
 /// (`smithy_query query="shape" shape="ActionOwner"` -> `AWS`, `ThirdParty`,
 /// `Custom`). `ActionTypeId$owner` documents the three values and
@@ -1056,19 +1065,26 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         ExecutionAdmission::Queued
     }
 
-    /// The `WebhookDefinition$authentication` the webhook stored under `name` carries,
-    /// or `None` when the account holds no webhook of that name.
+    /// What the third-party webhook operations resolve a webhook name to, or `None`
+    /// when the account holds no webhook of that name.
     ///
-    /// The one question both third-party webhook operations put to the store: the
-    /// connection they make and break is a GitHub HMAC one, so what decides whether
-    /// either serves a webhook is the authentication it was configured with
-    /// ([`webhook_authentication_unsupported_message`]), and the name resolution and
-    /// that authentication are read from ONE snapshot of the store.
-    pub fn webhook_authentication(&self, name: &str) -> Option<&str> {
-        self.webhooks
-            .get(name)
-            .map(|webhook| webhook.definition.authentication.as_str())
+    /// The one question both of them put to the store, answered from ONE snapshot of
+    /// it: the connection they make and break is a GitHub HMAC one that starts the
+    /// webhook's target pipeline, so what decides whether either serves a webhook is
+    /// the authentication it was configured with
+    /// ([`webhook_authentication_unsupported_message`]) and whether the pipeline it
+    /// targets is still held ([`webhook_dangling_target_pipeline_message`]) — and the
+    /// name resolution, that authentication and that pipeline are all read together.
+    pub fn webhook_connection(&self, name: &str) -> Option<WebhookConnection> {
+        let webhook = self.webhooks.get(name)?;
+        let target_pipeline = webhook.definition.target_pipeline.as_str();
+        Some(WebhookConnection {
+            authentication: webhook.definition.authentication.clone(),
+            dangling_target_pipeline: (!self.pipelines.contains_key(target_pipeline))
+                .then(|| target_pipeline.to_string()),
+        })
     }
+
 
     /// Record one evaluation of one stage condition's rule against `pipeline_name`.
     ///
@@ -1459,6 +1475,18 @@ fn webhook_url(region: &str, token: &str) -> String {
     format!("https://{region}.webhooks.aws/trigger?t={token}&v=1")
 }
 
+/// What a webhook name resolves to for the operations that connect it to the external
+/// tool, as [`ComAmazonawsCodepipelineCodepipeline20150709State::webhook_connection`]
+/// answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookConnection {
+    /// The `WebhookDefinition$authentication` the stored webhook carries.
+    pub authentication: String,
+    /// `Some(targetPipeline)` when the pipeline the webhook targets is not held by
+    /// the account — the reference is dangling — and `None` while it is held.
+    pub dangling_target_pipeline: Option<String>,
+}
+
 /// One stored webhook: the definition exactly as the caller sent it, plus the
 /// service-owned members `PutWebhook` and `ListWebhooks` report.
 #[derive(Debug, Clone)]
@@ -1522,7 +1550,11 @@ impl Webhook {
             error_code: None,
             last_triggered: self.last_triggered.map(to_date_time),
             arn: Some(self.arn.clone()),
-            tags: optional_list(self.tags.clone()),
+            // Always reported, as an EMPTY list for a webhook carrying no tag: the
+            // tags of a webhook are a set the service holds for it, so "this webhook
+            // has no tags" is an answer rather than a question left open, and a
+            // caller reading the member gets a list either way.
+            tags: Some(self.tags.clone()),
         }
     }
 }
@@ -1790,8 +1822,11 @@ fn is_region_token(region: &str) -> bool {
 /// * `WebhookAuthConfiguration` documents which property each authentication type
 ///   uses: "For `GITHUB_HMAC`, only the `SecretToken` property must be set", "For
 ///   `IP`, only the `AllowedIPRange` property must be set. This property must be set
-///   to a valid CIDR range", and `UNAUTHENTICATED` "accepts all webhook trigger
-///   requests regardless of origin", so it uses neither.
+///   to a valid CIDR range", and "For UNAUTHENTICATED, no properties can be set"
+///   (`WebhookDefinition$authenticationConfiguration`) — so a configuration is
+///   admissible only when it is EXACTLY the set of properties its type uses, and the
+///   refusal names the permitted property rather than the one the request got wrong
+///   ([`authentication_configuration_single_property_message`]).
 pub fn validate_webhook_definition(
     definition: &WebhookDefinition,
 ) -> Result<(), WebhookProblem> {
@@ -1820,10 +1855,10 @@ pub fn validate_webhook_definition(
         .as_deref()
         .filter(|range| !range.is_empty());
     let authentication = definition.authentication.as_str();
-    let (wants_secret_token, wants_allowed_ip_range) = match authentication {
-        AUTHENTICATION_GITHUB_HMAC => (true, false),
-        AUTHENTICATION_IP => (false, true),
-        AUTHENTICATION_UNAUTHENTICATED => (false, false),
+    let permitted = match authentication {
+        AUTHENTICATION_GITHUB_HMAC => Some(AUTH_PROPERTY_SECRET_TOKEN),
+        AUTHENTICATION_IP => Some(AUTH_PROPERTY_ALLOWED_IP_RANGE),
+        AUTHENTICATION_UNAUTHENTICATED => None,
         // `WebhookAuthenticationType` is a modelled enum, so the boundary validator
         // refuses any other value before this runs; a value that reaches here is one
         // no authentication configuration can be checked against.
@@ -1834,19 +1869,34 @@ pub fn validate_webhook_definition(
         }
     };
 
-    for (member, supplied, wanted) in [
-        ("SecretToken", secret_token.is_some(), wants_secret_token),
-        (
-            "AllowedIPRange",
-            allowed_ip_range.is_some(),
-            wants_allowed_ip_range,
-        ),
-    ] {
-        if supplied != wanted {
-            let requirement = if wanted { "requires" } else { "does not use" };
-            return Err(WebhookProblem::Authentication(format!(
-                "authentication {authentication} {requirement} authenticationConfiguration.{member}"
-            )));
+    // The properties the request actually set, in the order the configuration shape
+    // declares them.
+    let supplied: Vec<&str> = [
+        (AUTH_PROPERTY_SECRET_TOKEN, secret_token.is_some()),
+        (AUTH_PROPERTY_ALLOWED_IP_RANGE, allowed_ip_range.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(property, set)| set.then_some(property))
+    .collect();
+    match permitted {
+        // The type uses exactly one property, so the configuration has to be exactly
+        // that one: a missing one and an extra one are the same defect, stated by the
+        // same sentence.
+        Some(property) => {
+            if supplied != [property] {
+                return Err(WebhookProblem::Authentication(
+                    authentication_configuration_single_property_message(property),
+                ));
+            }
+        }
+        // A type that uses no property at all: anything set is a property the
+        // configuration may not contain.
+        None => {
+            if !supplied.is_empty() {
+                return Err(WebhookProblem::Authentication(
+                    AUTHENTICATION_CONFIGURATION_NO_PROPERTY_MESSAGE.to_string(),
+                ));
+            }
         }
     }
 
@@ -4334,6 +4384,39 @@ pub fn webhook_authentication_unsupported_message(name: &str, authentication: &s
          type. Type is {authentication}."
     )
 }
+
+/// The message `ValidationException` carries for a webhook whose
+/// `WebhookDefinition$targetPipeline` names a pipeline the account does not hold.
+///
+/// A webhook is defined over a pipeline name, not over the pipeline itself, so the
+/// reference can be dangling — the webhook was defined before the pipeline, or the
+/// pipeline was deleted while the webhook stayed. The third-party operations connect
+/// and disconnect a webhook that must be able to START that pipeline, so a dangling
+/// reference is a request they cannot serve, and the refusal states both ends of the
+/// reference: the webhook the request named, and the `targetPipeline` the store holds
+/// for it.
+pub fn webhook_dangling_target_pipeline_message(name: &str, target_pipeline: &str) -> String {
+    format!("Webhook {name} references a pipeline {target_pipeline} which does not exist")
+}
+
+/// The message `InvalidWebhookAuthenticationParametersException` carries when the
+/// `authenticationConfiguration` is not exactly the ONE property the authentication
+/// type uses — `SecretToken` for `GITHUB_HMAC`, `AllowedIPRange` for `IP`
+/// (`WebhookAuthConfiguration`: "For GITHUB_HMAC, only the SecretToken property must
+/// be set", "For IP, only the AllowedIPRange property must be set").
+///
+/// One sentence for the whole defect: a configuration missing that property and one
+/// carrying another property beside it both fail the same requirement, so both are
+/// stated by naming the single permitted property.
+pub fn authentication_configuration_single_property_message(property: &str) -> String {
+    format!("Optional['authenticationConfig' should contain only one property: '{property}']")
+}
+
+/// The same requirement for the authentication type that uses NO property:
+/// `UNAUTHENTICATED` "accepts all webhook trigger requests regardless of origin", so
+/// its configuration may contain nothing at all.
+pub const AUTHENTICATION_CONFIGURATION_NO_PROPERTY_MESSAGE: &str =
+    "Optional['authenticationConfig' should contain no properties]";
 
 /// The message `InvalidNextTokenException` carries, for every paginated operation of
 /// this service.

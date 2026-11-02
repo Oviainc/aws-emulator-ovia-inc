@@ -441,6 +441,8 @@ async fn every_paginated_listing_words_an_invalid_next_token_the_same_way() {
 ///
 /// The sibling suite pins the five readers; these are the remaining raisers, each with
 /// whatever else its input requires, over absent names differing in alphabet and length.
+/// `PutWebhook` is NOT one of them: it stores a definition over a pipeline NAME and
+/// resolves nothing, so it has no lookup to word (see `webhooks.rs`).
 #[tokio::test]
 async fn every_operation_that_cannot_find_a_pipeline_words_it_the_same_way() {
     let emulator = Emulator::new();
@@ -519,16 +521,6 @@ async fn every_operation_that_cannot_find_a_pipeline_words_it_the_same_way() {
                 "pipelineName": name,
                 "pipelineExecutionId": "11111111-2222-4333-8444-555555555555",
             })
-        }),
-        ("PutWebhook", |name| {
-            json!({"webhook": {
-                "name": "hook",
-                "targetPipeline": name,
-                "targetAction": "Src",
-                "filters": [{"jsonPath": "$.ref"}],
-                "authentication": "UNAUTHENTICATED",
-                "authenticationConfiguration": {},
-            }})
         }),
     ];
 

@@ -16,6 +16,9 @@
 //!   `WebhookDefinition$authentication` is any other `WebhookAuthenticationType` is
 //!   refused with `ValidationException` stating the requirement and the authentication
 //!   type the store holds for that webhook;
+//! * that connection starts the webhook's `targetPipeline`, so a webhook whose target
+//!   pipeline the account does not hold is refused with `ValidationException` naming the
+//!   webhook and the pipeline its definition references;
 //! * the webhook itself is left where it is: deregistering is not deleting.
 //!
 //! The rows span what the rules generalise over: the operation, names at both ends of
@@ -29,8 +32,8 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_codepipeline_codepipeline_20150709::state::{
-    webhook_authentication_unsupported_message, AUTHENTICATION_GITHUB_HMAC, AUTHENTICATION_IP,
-    AUTHENTICATION_UNAUTHENTICATED,
+    webhook_authentication_unsupported_message, webhook_dangling_target_pipeline_message,
+    AUTHENTICATION_GITHUB_HMAC, AUTHENTICATION_IP, AUTHENTICATION_UNAUTHENTICATED,
 };
 
 use crate::pipeline_lifecycle::{build_stage, Emulator, ROLE_ARN};
@@ -270,23 +273,62 @@ async fn a_webhook_not_configured_with_github_hmac_is_not_supported() {
         }
     }
 
-    // A webhook whose target pipeline is gone is served all the same: what the
-    // connection needs is the webhook's authentication, which deleting a pipeline does
-    // not change.
+    // A webhook whose target pipeline is GONE is a request neither operation serves:
+    // the connection they make and break starts that pipeline, so the dangling
+    // reference is refused with `ValidationException` naming both ends of it.
+    let github_hook = format!("hook-github-{AUTHENTICATION_GITHUB_HMAC}");
     emulator
         .ok("DeletePipeline", &json!({"name": pipeline_name("GitHub")}))
         .await;
     for operation in [REGISTER, DEREGISTER] {
+        let (status, response) = emulator
+            .call(operation, &json!({"webhookName": github_hook}))
+            .await;
+        assert_eq!(
+            (
+                status,
+                response["__type"].as_str().unwrap_or_default().to_string()
+            ),
+            (REFUSAL_STATUS, "ValidationException".to_string()),
+            "{operation}: a webhook referencing a pipeline the account no longer holds is \
+             refused, got {status} with {response}"
+        );
+        let expected =
+            webhook_dangling_target_pipeline_message(&github_hook, &pipeline_name("GitHub"));
+        assert_eq!(
+            response["message"].as_str(),
+            Some(expected.as_str()),
+            "{operation}: expected {expected:?}, got {response}"
+        );
+        // The wording itself, written out here so a reword of the handler's text fails
+        // this suite rather than following it.
+        assert_eq!(
+            expected,
+            format!(
+                "Webhook {github_hook} references a pipeline {} which does not exist",
+                pipeline_name("GitHub")
+            ),
+            "{operation}: the refusal states the reference that could not be resolved"
+        );
+    }
+
+    // The webhook itself is untouched by either refusal, and the same calls are served
+    // again once a pipeline of that name is held: what blocked them was the reference,
+    // not the webhook.
+    emulator
+        .ok(
+            "CreatePipeline",
+            &json!({"pipeline": pipeline("GitHub", "ThirdParty")}),
+        )
+        .await;
+    for operation in [REGISTER, DEREGISTER] {
         let (status, answer) = emulator
-            .call(
-                operation,
-                &json!({"webhookName": format!("hook-github-{AUTHENTICATION_GITHUB_HMAC}")}),
-            )
+            .call(operation, &json!({"webhookName": github_hook}))
             .await;
         assert_eq!(
             status, 200,
-            "{operation}: a stored GITHUB_HMAC webhook is served whatever became of its \
-             target pipeline, got {status} with {answer}"
+            "{operation}: a stored GITHUB_HMAC webhook whose target pipeline is held is \
+             served, got {status} with {answer}"
         );
     }
 }

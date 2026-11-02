@@ -87,5 +87,7 @@ mod third_party_webhooks;
 mod update_pipeline;
 #[path = "all/validation_and_messages.rs"]
 mod validation_and_messages;
+#[path = "all/webhook_definition_rules.rs"]
+mod webhook_definition_rules;
 #[path = "all/webhooks.rs"]
 mod webhooks;
