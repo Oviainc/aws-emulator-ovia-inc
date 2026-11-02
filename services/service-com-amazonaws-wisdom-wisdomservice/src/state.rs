@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AssistantAssociationData, AssistantAssociationOutputData, AssistantData, AssistantSummary,
+    AssistantAssociationData, AssistantAssociationOutputData, AssistantAssociationSummary,
+    AssistantData, AssistantSummary,
     ContentData, ContentSummary,
     GroupingConfiguration, KnowledgeBaseAssociationData, KnowledgeBaseData,
     QuickResponseContentProvider, QuickResponseContents, QuickResponseData, QuickResponseSummary,
@@ -677,6 +678,26 @@ impl AssistantAssociation {
                 },
             ),
             tags: wire_tags(&self.tags),
+        }
+    }
+
+    /// This association as the `AssistantAssociationSummary` shape
+    /// `ListAssistantAssociations` reports.
+    ///
+    /// The model gives the summary the same members as the data shape
+    /// (`smithy_query(query="shape",shape="AssistantAssociationSummary")`), so a listed
+    /// association and the one a read of the same record answers with cannot disagree:
+    /// both are this one stored record.
+    pub fn to_summary(&self) -> AssistantAssociationSummary {
+        let data = self.to_data();
+        AssistantAssociationSummary {
+            assistant_association_id: data.assistant_association_id,
+            assistant_association_arn: data.assistant_association_arn,
+            assistant_id: data.assistant_id,
+            assistant_arn: data.assistant_arn,
+            association_type: data.association_type,
+            association_data: data.association_data,
+            tags: data.tags,
         }
     }
 }

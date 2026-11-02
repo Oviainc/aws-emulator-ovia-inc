@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op QueryAssistant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `QueryAssistant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: SEARCHES the contents of the knowledge bases the named assistant is
+//! associated with for the query's terms, and REPORTS one ranked result per matching
+//! content — the content's own reference, title and an excerpt of the text the query
+//! matched in, with the matched spans highlighted. The operation is `@readonly`, so it
+//! writes nothing: two queries of an unchanged store answer alike.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`QueryAssistant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What is searched is what a previous call persisted: a content is a candidate only once
+//! its ingestion has finished (`ContentStatus` `ACTIVE`, the status
+//! `CreateContent`/`GetContent` report), and only while one of this assistant's
+//! `KNOWLEDGE_BASE` associations names the knowledge base holding it. A content's
+//! searchable text is its own `name` and `title` plus its stored asset, the latter only
+//! when the asset IS text (`text/…` and `application/x.wisdom-json;…` of the modelled
+//! `ContentType` catalog, decoded as UTF-8); this emulator extracts no text from the
+//! binary document types that catalog also admits, so such a content is matched on its
+//! name and title alone.
+//!
+//! A label this account holds no ASSISTANT under is the operation's modelled
+//! `ResourceNotFoundException` — the assistant is the resource the route addresses. An
+//! assistant that is associated with nothing, or whose contents match no term, has nothing
+//! to answer with: that is a successful EMPTY list, not a refusal. A query whose own size
+//! is past what this endpoint searches over — too many characters, too many distinct terms,
+//! or more comparison than one request spends — is the modelled `ValidationException`,
+//! refused before the work it asks for runs.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +100,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The ONE free-text search over a stored document's text, shared with the other service
+// that serves this same endpoint's query surface.
+use ::service_common::document_text_search::{
+    match_document, query_terms, DocumentFields, TextWindow, WindowBounds,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +177,325 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `QueryAssistant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(QueryAssistantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("QueryAssistant"))
+        // `assistantId`'s `UuidOrArn` pattern, `maxResults`' `range 1..100` and
+        // `nextToken`'s `len 1..2048` are refused before this handler runs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: there is nothing to search, and
+            // this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("QueryAssistant"));
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // The query is the caller's, and every character of it is read against every
+        // searched character of every candidate content, so its size is bounded BEFORE any
+        // work proportional to it runs — and before the store is even reached.
+        let characters = input.query_text.chars().count();
+        if characters > MAX_QUERY_TEXT_CHARS {
+            return Err(QueryAssistantErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "queryText must be at most {MAX_QUERY_TEXT_CHARS} characters; got \
+                         {characters}"
+                    )),
+                },
+            )
+            .into());
+        }
+        let terms = query_terms(&input.query_text);
+        if terms.len() > MAX_QUERY_TERMS {
+            return Err(QueryAssistantErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "queryText must name at most {MAX_QUERY_TERMS} distinct terms; got {}",
+                        terms.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // What this assistant can answer out of: the contents of every knowledge base one
+        // of its associations names, taken as a list of ids while the lock is held so the
+        // SCAN below runs without it. The assistant the route names is resolved first: a
+        // label this account holds none under is the modelled not-found, not an empty page
+        // of results.
+        let (page_size, candidates) = {
+            let store = state.lock();
+            let Some(assistant_id) = store.resolve_assistant_id(&input.assistant_id) else {
+                return Err(QueryAssistantErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("No assistant {} found.", input.assistant_id)),
+                        resource_name: Some(input.assistant_id.clone()),
+                    },
+                )
+                .into());
+            };
+            // `maxResults` is modelled `range 1..100`, which the boundary validator has
+            // already enforced; a call that names none gets the modelled maximum.
+            let page_size = input
+                .max_results
+                .and_then(|requested| usize::try_from(requested).ok())
+                .unwrap_or(crate::state::MAX_PAGE_SIZE as usize)
+                .clamp(1, crate::state::MAX_PAGE_SIZE as usize);
+            let mut candidates: Vec<(String, String)> = Vec::new();
+            for association in store.assistant_associations_of(&assistant_id) {
+                if association.association_type != crate::state::ASSOCIATION_TYPE_KNOWLEDGE_BASE {
+                    continue;
+                }
+                candidates.extend(
+                    store
+                        .contents_of(&association.knowledge_base_id)
+                        .iter()
+                        .map(|content| {
+                            (
+                                content.knowledge_base_id.clone(),
+                                content.content_id.clone(),
+                            )
+                        }),
+                );
+            }
+            (page_size, candidates)
+        };
+
+        // The scan. The lock is taken for ONE content at a time and released between them,
+        // and the walk yields to the runtime every `SCAN_YIELD_INTERVAL` contents, so a
+        // long search neither blocks another caller for its whole duration nor leaves a
+        // cancelled request without a point to land on. Keyed by `contentId`, so a
+        // knowledge base reachable through more than one association still contributes each
+        // content once.
+        let mut matched: ::std::collections::BTreeMap<String, Matched> =
+            ::std::collections::BTreeMap::new();
+        let mut spent = 0usize;
+        for (walked, (knowledge_base_id, content_id)) in candidates.into_iter().enumerate() {
+            if walked > 0 && walked.is_multiple_of(SCAN_YIELD_INTERVAL) {
+                ::tokio::task::yield_now().await;
+            }
+            let store = state.lock();
+            // A content the store no longer holds is simply not searched: a query reads the
+            // store as it is while the read runs.
+            let Some(content) = store.content(&knowledge_base_id, &content_id) else {
+                continue;
+            };
+            // Only an ingested content is searchable: one whose ingestion the clock has not
+            // finished yet is still `CREATE_IN_PROGRESS`, and a document the service has not
+            // taken in cannot be found by a query.
+            if content.status(now) != crate::state::CONTENT_STATUS_ACTIVE {
+                continue;
+            }
+            // The work this content costs, charged against the budget BEFORE it is spent:
+            // the terms are bounded above and the store bounds its own side, but their
+            // PRODUCT is what a scan actually costs.
+            spent = spent.saturating_add(searched_bytes(content).saturating_mul(terms.len()));
+            if spent > MAX_QUERY_STEPS {
+                return Err(QueryAssistantErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "The query needs more than {MAX_QUERY_STEPS} bytes of comparison \
+                             over this assistant's content; narrow the query."
+                        )),
+                    },
+                )
+                .into());
+            }
+            if let Some(hit) = match_content(content, &terms) {
+                matched.insert(content_id, hit);
+            }
+        }
+
+        // Ranked: the better match first, and `contentId` breaks a tie so two contents
+        // scoring alike are reported in one stable order rather than the store's.
+        let mut ranked: Vec<Matched> = matched.into_values().collect();
+        ranked.sort_by(|left, right| {
+            right
+                .relevance_score
+                .total_cmp(&left.relevance_score)
+                .then_with(|| left.content_id.cmp(&right.content_id))
+        });
+
+        // `nextToken` names the content the NEXT page opens at. A token naming a content
+        // this query no longer matches — its content deleted, its asset changed, its
+        // knowledge base no longer associated — opens an EMPTY last page: the matches it
+        // named are gone, and there is nothing after them to resume at.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => ranked
+                .iter()
+                .position(|hit| hit.content_id == token)
+                .unwrap_or(ranked.len()),
+        };
+        let next_token = ranked
+            .get(start + page_size)
+            .map(|hit| hit.content_id.clone());
+        let results: Vec<ResultData> = ranked
+            .into_iter()
+            .skip(start)
+            .take(page_size)
+            .map(Matched::into_result)
+            .collect();
+
+        Ok(QueryAssistantOutput {
+            results,
+            next_token,
+        })
     }
+}
+
+/// The most characters a `queryText` this operation searches for may carry.
+///
+/// This model's `QueryText` declares no length, so nothing in the request bounds the work
+/// the search does on the caller's behalf. The Amazon Q in Connect view of this SAME
+/// endpoint states the ceiling in its model — `QueryText` is `len ..512` there — so that is
+/// the ceiling applied here, and a longer query is refused with the modelled
+/// `ValidationException` before any work proportional to it runs.
+const MAX_QUERY_TEXT_CHARS: usize = 512;
+
+/// The most distinct terms one query searches for.
+///
+/// Each term reads every searched character of every candidate content, so the scan costs
+/// the PRODUCT of the terms and the store's own side; bounding the query's length alone
+/// does not bound it as tightly as it can be. No query a client writes by hand comes close.
+const MAX_QUERY_TERMS: usize = 64;
+
+/// The most text one query compares, in bytes of searched text.
+///
+/// The unit the work is actually made of: comparing a term against a content costs that
+/// content's searched bytes, and a query of `t` terms costs `t` times that. The scale
+/// follows from the other bounds — the largest query this endpoint accepts names
+/// [`MAX_QUERY_TERMS`] terms, and one knowledge base holds up to
+/// `crate::state::MAX_CONTENTS_PER_KNOWLEDGE_BASE` contents whose assets together are
+/// capped at `crate::state::MAX_STORED_CONTENT_BYTES` — so a worst-case legitimate query
+/// over a knowledge base of a few thousand bytes per content costs on the order of
+/// 64 x 1_000 x 4_000. This budget leaves that room and refuses anything past it with the
+/// modelled `ValidationException`, so one request cannot pin a worker on a scan whose cost
+/// nothing bounds.
+const MAX_QUERY_STEPS: usize = 512_000_000;
+
+/// How many contents the scan reads between yields to the runtime.
+///
+/// Matching is synchronous, so without a yield point a cancelled or timed-out request has
+/// nowhere to land while a long scan runs, and the lock the scan takes per content is never
+/// free for another caller.
+const SCAN_YIELD_INTERVAL: usize = 16;
+
+/// The window of the matched text one excerpt reports: its size, how much of the text it
+/// opens ahead of the first match, and the most highlights it states.
+///
+/// Bounds this emulator owns — nothing AWS publishes — so one answer cannot carry a whole
+/// uploaded asset back: an excerpt is a window onto the matched text, and a content's asset
+/// may be as large as `crate::state::MAX_CONTENT_UPLOAD_BYTES`.
+const EXCERPT_WINDOW: WindowBounds = WindowBounds {
+    max_chars: 500,
+    lead_chars: 100,
+    max_spans: 100,
+};
+
+/// One content the query matched, with everything the result reports about it already
+/// computed from the stored record.
+struct Matched {
+    /// Kept for the ranking tie-break and for the page token, which names a content.
+    content_id: String,
+    relevance_score: f64,
+    content_reference: ContentReference,
+    title: DocumentText,
+    excerpt: DocumentText,
+}
+
+impl Matched {
+    /// This match as one `ResultData` of the answer.
+    fn into_result(self) -> ResultData {
+        ResultData {
+            // `ResultData$resultId` is modelled `Uuid` and identifies THIS result of THIS
+            // query — not the content, which the document's own reference names.
+            result_id: crate::state::new_resource_id(),
+            document: Document {
+                content_reference: self.content_reference,
+                title: Some(self.title),
+                excerpt: Some(self.excerpt),
+            },
+            relevance_score: self.relevance_score,
+        }
+    }
+}
+
+/// One window of a document's text as the `DocumentText` this model carries: the text
+/// itself, and the matches inside it as `Highlight`s whose offsets are into THAT text —
+/// which is what a client rendering the excerpt it was handed can use.
+fn document_text(window: TextWindow) -> DocumentText {
+    DocumentText {
+        highlights: Some(
+            window
+                .spans
+                .iter()
+                .map(|span| Highlight {
+                    begin_offset_inclusive: i32::try_from(span.begin).unwrap_or(i32::MAX),
+                    end_offset_exclusive: i32::try_from(span.end).unwrap_or(i32::MAX),
+                })
+                .collect(),
+        ),
+        text: Some(window.text),
+    }
+}
+
+/// Whether a content of this media type carries TEXT this emulator can search.
+///
+/// The modelled `ContentType` catalog
+/// (`smithy_query(query="shape",shape="ContentType")`) admits text media types, two
+/// JSON-source types, and the binary document types `application/pdf` and
+/// `application/vnd.openxmlformats-officedocument.wordprocessingml.document`. The first
+/// two kinds ARE text; extracting text from the binary two is not something this
+/// emulator does, so their assets are not searched at all rather than searched as if
+/// their bytes were prose.
+fn carries_searchable_text(content_type: &str) -> bool {
+    content_type.starts_with("text/") || content_type.starts_with("application/x.wisdom-json")
+}
+
+/// The stored asset of `content` as text, when it is text.
+fn asset_text(content: &crate::state::Content) -> Option<&str> {
+    if !carries_searchable_text(&content.content_type) {
+        return None;
+    }
+    ::std::str::from_utf8(&content.body).ok()
+}
+
+/// How many bytes of text one content is searched over: what [`match_content`] reads of it,
+/// and so what one term costs to compare against it.
+fn searched_bytes(content: &crate::state::Content) -> usize {
+    content
+        .name
+        .len()
+        .saturating_add(content.title.len())
+        .saturating_add(asset_text(content).map_or(0, str::len))
+}
+
+/// What `content` answers for a query naming `terms`, or `None` when it carries none of
+/// them.
+///
+/// The matching, the score and the choice of which text to excerpt are the shared rule
+/// ([`match_document`]); what belongs to this operation is which of the content's fields
+/// are searchable text and how the answer is shaped.
+fn match_content(content: &crate::state::Content, terms: &[String]) -> Option<Matched> {
+    let matched = match_document(
+        DocumentFields {
+            name: &content.name,
+            title: &content.title,
+            body: asset_text(content),
+        },
+        terms,
+        EXCERPT_WINDOW,
+    )?;
+    Some(Matched {
+        content_id: content.content_id.clone(),
+        // The score is the share of the query's distinct terms this content carries, so it
+        // is in `0..=1` — inside `RelevanceScore`'s modelled `range min 0`.
+        relevance_score: matched.score,
+        content_reference: ContentReference {
+            knowledge_base_arn: Some(content.knowledge_base_arn.clone()),
+            knowledge_base_id: Some(content.knowledge_base_id.clone()),
+            content_arn: Some(content.content_arn.clone()),
+            content_id: Some(content.content_id.clone()),
+        },
+        title: document_text(matched.title),
+        excerpt: document_text(matched.excerpt),
+    })
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssistantAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssistantAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: REPORTS a page of the associations one assistant holds, in
+//! `assistantAssociationId` order, out of the records `CreateAssistantAssociation`
+//! persisted. The operation is `@readonly`, so it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssistantAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A label this account holds no ASSISTANT under is the operation's modelled
+//! `ResourceNotFoundException`: the assistant is the resource the route addresses, and an
+//! association is reachable only through it.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +149,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssistantAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssistantAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssistantAssociations"))
+        // `assistantId`'s `UuidOrArn` pattern, `maxResults`' `range 1..100` and
+        // `nextToken`'s `len 1..2048` are refused before this handler runs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: there is nothing to report, and
+            // this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListAssistantAssociations",
+            ));
+        };
+        let state = state.lock();
+
+        // The parent is resolved first, as every other read of this nested collection
+        // does: an association is reachable only through the assistant that holds it, so
+        // a label this account holds no assistant under is the modelled not-found rather
+        // than an empty page.
+        let Some(assistant_id) = state.resolve_assistant_id(&input.assistant_id) else {
+            return Err(
+                ListAssistantAssociationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("No assistant {} found.", input.assistant_id)),
+                        resource_name: Some(input.assistant_id.clone()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `maxResults` is modelled `range 1..100`, which the boundary validator has
+        // already enforced; a call that names none gets the modelled maximum.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE as usize)
+            .clamp(1, crate::state::MAX_PAGE_SIZE as usize);
+
+        // The listing is ordered by `assistantAssociationId` and `nextToken` names the
+        // first association of the NEXT page, exactly as the other nested listings of this
+        // service order and continue: an association deleted between two pages therefore
+        // cannot invalidate a token already handed out, because the continuation resumes
+        // at the first surviving id at or after it.
+        let associations = state.assistant_associations_of(&assistant_id);
+        let mut remaining = associations.iter().filter(|association| {
+            input
+                .next_token
+                .as_deref()
+                .is_none_or(|from| association.assistant_association_id.as_str() >= from)
+        });
+        let assistant_association_summaries: Vec<AssistantAssociationSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|association| association.to_summary())
+            .collect();
+        let next_token = remaining
+            .next()
+            .map(|association| association.assistant_association_id.clone());
+
+        Ok(ListAssistantAssociationsOutput {
+            assistant_association_summaries,
+            next_token,
+        })
     }
 }

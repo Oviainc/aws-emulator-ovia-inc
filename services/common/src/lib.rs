@@ -263,6 +263,12 @@ pub mod db_data_sources;
 /// a host names a service at all — for every service that serves one, so the planes cannot
 /// drift on which requests they claim.
 pub mod data_plane_addressing;
+/// The ONE free-text search over a stored document's text — the terms a query names, which
+/// of them a text carries, the window of that text to report with the matches inside it, and
+/// the match of one whole document — for every service whose API answers a caller's query
+/// with the documents its own records hold, so two services asked the same question of the
+/// same text cannot answer differently.
+pub mod document_text_search;
 /// The ONE reading of a caller-supplied EMAIL ADDRESS, for every service whose model
 /// documents a member as one and targets it at a bare string — so two services asked
 /// whether a value is an address cannot answer differently.

@@ -13,11 +13,21 @@
 //! query that selects nothing reports an empty list, which is what the required output
 //! member says.
 //!
-//! A result is a document of the content an assistant's knowledge bases hold, and content
-//! is minted only by `CreateContent`/`StartImportJob`, which are still scaffolded in this
-//! crate, so no assistant this emulator holds has a document to answer with yet and every
-//! query of one that exists reports the empty page its state has. Nothing here invents a
-//! hit or scores one.
+//! A result is a document of the content an assistant's knowledge bases hold: every
+//! INGESTED content (`ContentStatus` `ACTIVE`) of a knowledge base one of this assistant's
+//! `KNOWLEDGE_BASE` associations names, that carries at least one term of the query,
+//! ranked by how much of the query it carries and reported with the content's own
+//! reference, its title and a window of the text the query matched in — all out of the
+//! record `CreateContent` persisted. A content's searchable text is its own `name` and
+//! `title` plus its stored asset, the latter only when the asset IS text (`text/…` and
+//! `application/x.wisdom-json;…` of the modelled `ContentType` catalog, decoded as UTF-8);
+//! this emulator extracts no text from the binary document types that catalog also admits,
+//! so such a content is matched on its name and title alone. An association naming data
+//! outside this service (a Bedrock knowledge base) holds nothing this store can search.
+//! Nothing here invents a hit, and no score is reported for a document nothing matched. A
+//! query whose own size is past what this endpoint searches over — too many distinct terms,
+//! or more comparison than one request spends — is the modelled `ValidationException`,
+//! refused before the work it asks for runs.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +118,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The ONE free-text search over a stored document's text, shared with the other service
+// that serves this same endpoint's query surface.
+use ::service_common::document_text_search::{
+    match_document, query_terms, DocumentFields, TextWindow, WindowBounds,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -189,56 +205,419 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // hands it to every service.
             crate::scaffolded::Scaffolded::not_implemented("QueryAssistant")
         })?;
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
 
-        let Some(assistant) = store.assistant(&input.assistant_id) else {
-            return Err(QueryAssistantErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
-                    resource_name: Some(input.assistant_id.clone()),
+        // The query is the caller's, and every character of it is read against every
+        // searched character of every candidate content, so its size is bounded BEFORE any
+        // work proportional to it runs — and before the store is even reached. The
+        // character ceiling is the model's own (`QueryText` is `len ..512`, which the
+        // boundary validator has already enforced); the TERM ceiling is this operation's,
+        // because the scan costs the product of the terms and the store's own side.
+        let terms = query_terms(&query_text(&input));
+        if terms.len() > MAX_QUERY_TERMS {
+            return Err(QueryAssistantErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "queryText must name at most {MAX_QUERY_TERMS} distinct terms; got {}",
+                        terms.len()
+                    )),
                 },
             )
             .into());
-        };
+        }
 
-        // A session is reachable only through its own assistant, so one this assistant
-        // does not hold names nothing here — the same lookup `GetSession` makes.
-        if let Some(session_label) = input.session_id.as_deref() {
-            if !assistant
-                .sessions
-                .contains_key(crate::state::resolve_id(session_label))
-            {
+        // What this assistant can answer out of: the contents of every knowledge base one
+        // of its associations names, taken as a list of ids while the lock is held so the
+        // SCAN below runs without it.
+        let (page_size, start_at, candidates) = {
+            let store = state.lock();
+
+            let Some(assistant) = store.assistant(&input.assistant_id) else {
                 return Err(QueryAssistantErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::MESSAGE_SESSION_NOT_FOUND.to_string()),
-                        resource_name: Some(session_label.to_string()),
+                        message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
+                        resource_name: Some(input.assistant_id.clone()),
+                    },
+                )
+                .into());
+            };
+
+            // A session is reachable only through its own assistant, so one this assistant
+            // does not hold names nothing here — the same lookup `GetSession` makes.
+            if let Some(session_label) = input.session_id.as_deref() {
+                if !assistant
+                    .sessions
+                    .contains_key(crate::state::resolve_id(session_label))
+                {
+                    return Err(QueryAssistantErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::MESSAGE_SESSION_NOT_FOUND.to_string()),
+                            resource_name: Some(session_label.to_string()),
+                        },
+                    )
+                    .into());
+                }
+            }
+
+            // A token this service did not mint names no position, so it is refused rather
+            // than silently read as "from the beginning".
+            let start_at = match input.next_token.as_deref() {
+                None => None,
+                Some(token) => Some(crate::state::decode_cursor(token).ok_or_else(|| {
+                    QueryAssistantErrorModeled::ValidationException(ValidationException {
+                        message: Some("nextToken: the specified token is not valid.".to_string()),
+                    })
+                })?),
+            };
+
+            // `maxResults` is modelled `range 1..100`, which the boundary validator has
+            // already enforced; a call that names none gets the modelled maximum.
+            let page_size = input
+                .max_results
+                .and_then(|requested| usize::try_from(requested).ok())
+                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS)
+                .clamp(1, crate::state::DEFAULT_MAX_RESULTS);
+
+            let assistant_id = assistant.assistant_id.clone();
+            let mut candidates: Vec<(String, String)> = Vec::new();
+            for association in store.assistant_associations_of(&assistant_id) {
+                let crate::state::AssociationTarget::KnowledgeBase {
+                    knowledge_base_id, ..
+                } = &association.target
+                else {
+                    // An association naming data OUTSIDE this service (a Bedrock knowledge
+                    // base) holds no content this emulator can search: it is not a document
+                    // this store has, and nothing here invents one for it.
+                    continue;
+                };
+                candidates.extend(store.contents_of(knowledge_base_id).iter().map(|content| {
+                    (
+                        content.knowledge_base_id.clone(),
+                        content.content_id.clone(),
+                    )
+                }));
+            }
+            (page_size, start_at, candidates)
+        };
+
+        // The scan. The lock is taken for ONE content at a time and released between them,
+        // and the walk yields to the runtime every `SCAN_YIELD_INTERVAL` contents, so a
+        // long search neither blocks another caller for its whole duration nor leaves a
+        // cancelled request without a point to land on. Keyed by `contentId`, so a
+        // knowledge base reachable through more than one association still contributes each
+        // content once.
+        let mut matched: ::std::collections::BTreeMap<String, Matched> =
+            ::std::collections::BTreeMap::new();
+        let mut spent = 0usize;
+        for (walked, (knowledge_base_id, content_id)) in candidates.into_iter().enumerate() {
+            if walked > 0 && walked.is_multiple_of(SCAN_YIELD_INTERVAL) {
+                ::tokio::task::yield_now().await;
+            }
+            let store = state.lock();
+            // A content the store no longer holds is simply not searched: a query reads the
+            // store as it is while the read runs.
+            let Some(content) = store.content(&knowledge_base_id, &content_id) else {
+                continue;
+            };
+            // Only an ingested content is searchable: one whose ingestion the clock has not
+            // finished yet is still `CREATE_IN_PROGRESS`, and a document the service has not
+            // taken in cannot be found by a query.
+            if content.status(now) != crate::state::CONTENT_STATUS_ACTIVE {
+                continue;
+            }
+            // The work this content costs, charged against the budget BEFORE it is spent:
+            // the terms are bounded above and the store bounds its own side, but their
+            // PRODUCT is what a scan actually costs.
+            spent = spent.saturating_add(searched_bytes(content).saturating_mul(terms.len()));
+            if spent > MAX_QUERY_STEPS {
+                return Err(QueryAssistantErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "The query needs more than {MAX_QUERY_STEPS} bytes of comparison \
+                             over this assistant's content; narrow the query."
+                        )),
                     },
                 )
                 .into());
             }
+            if let Some(hit) = match_content(content, &terms) {
+                matched.insert(content_id, hit);
+            }
         }
 
-        // A token this service did not mint names no position, so it is refused rather
-        // than silently read as "from the beginning".
-        if let Some(token) = input.next_token.as_deref() {
-            crate::state::decode_cursor(token).ok_or_else(|| {
-                QueryAssistantErrorModeled::ValidationException(ValidationException {
-                    message: Some("nextToken: the specified token is not valid.".to_string()),
-                })
-            })?;
-        }
+        // A `queryCondition` selects on the result TYPE, the one field the model's
+        // `QueryConditionFieldName` catalog carries, under its one comparator: a condition
+        // naming any other type selects none of these results, because every result here
+        // is a piece of knowledge-base content.
+        let conditions_met = input
+            .query_condition
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .all(|condition| {
+                let QueryCondition::Single(item) = condition;
+                item.field != QUERY_CONDITION_FIELD_RESULT_TYPE
+                    || item.comparator != QUERY_CONDITION_COMPARATOR_EQUALS
+                    || item.value == RESULT_TYPE_KNOWLEDGE_CONTENT
+            });
 
-        // The documents this assistant's content answers the query with. The page is
-        // EMPTY because the store is: content is minted only by
-        // `CreateContent`/`StartImportJob`, both still scaffolded in this crate, so no
-        // assistant this emulator holds has a document. What this answers is the
-        // assistant's own (empty) content, never an invented or scored hit.
-        let results: Vec<ResultData> = Vec::new();
+        // Ranked: the better match first, and `contentId` breaks a tie so two contents
+        // scoring alike are reported in one stable order rather than the store's.
+        let mut ranked: Vec<Matched> = if conditions_met {
+            matched.into_values().collect()
+        } else {
+            Vec::new()
+        };
+        ranked.sort_by(|left, right| {
+            right
+                .relevance_score
+                .total_cmp(&left.relevance_score)
+                .then_with(|| left.content_id.cmp(&right.content_id))
+        });
+
+        // The cursor names the content the NEXT page opens at. One naming a content this
+        // query no longer matches — its content deleted, its asset changed, its knowledge
+        // base no longer associated — opens an EMPTY last page: the matches it named are
+        // gone, and there is nothing after them to resume at.
+        let start = match start_at.as_deref() {
+            None => 0,
+            Some(content_id) => ranked
+                .iter()
+                .position(|hit| hit.content_id == content_id)
+                .unwrap_or(ranked.len()),
+        };
+        let next_token = ranked
+            .get(start + page_size)
+            .map(|hit| crate::state::encode_cursor(&hit.content_id));
+        let results: Vec<ResultData> = ranked
+            .into_iter()
+            .skip(start)
+            .take(page_size)
+            .map(Matched::into_result)
+            .collect();
 
         Ok(QueryAssistantOutput {
             results,
-            // Nothing follows an empty page, so there is no position to continue from.
-            next_token: None,
+            next_token,
         })
     }
+}
+
+/// The most distinct terms one query searches for.
+///
+/// The model bounds the query's TEXT (`QueryText` is `len ..512`), which the boundary
+/// validator enforces before this handler runs; this bounds its TERMS, because each term
+/// reads every searched character of every candidate content and the scan therefore costs
+/// the PRODUCT of the terms and the store's own side. No query a client writes by hand comes
+/// close.
+const MAX_QUERY_TERMS: usize = 64;
+
+/// The most text one query compares, in bytes of searched text.
+///
+/// The unit the work is actually made of: comparing a term against a content costs that
+/// content's searched bytes, and a query of `t` terms costs `t` times that. The scale
+/// follows from the other bounds — the largest query this endpoint accepts names
+/// [`MAX_QUERY_TERMS`] terms, and one knowledge base holds up to
+/// `crate::state::MAX_CONTENTS_PER_KNOWLEDGE_BASE` contents whose assets together are
+/// capped at `crate::state::MAX_STORED_CONTENT_BYTES` — so a worst-case legitimate query
+/// over a knowledge base of a few thousand bytes per content costs on the order of
+/// 64 x 1_000 x 4_000. This budget leaves that room and refuses anything past it with the
+/// modelled `ValidationException`, so one request cannot pin a worker on a scan whose cost
+/// nothing bounds.
+const MAX_QUERY_STEPS: usize = 512_000_000;
+
+/// How many contents the scan reads between yields to the runtime.
+///
+/// Matching is synchronous, so without a yield point a cancelled or timed-out request has
+/// nowhere to land while a long scan runs, and the lock the scan takes per content is never
+/// free for another caller.
+const SCAN_YIELD_INTERVAL: usize = 16;
+
+/// The window of the matched text one excerpt reports: its size, how much of the text it
+/// opens ahead of the first match, and the most highlights it states.
+///
+/// Bounds this emulator owns — nothing AWS publishes — so one answer cannot carry a whole
+/// uploaded asset back: an excerpt is a window onto the matched text, and a content's asset
+/// may be as large as `crate::state::MAX_CONTENT_UPLOAD_BYTES`.
+const EXCERPT_WINDOW: WindowBounds = WindowBounds {
+    max_chars: 500,
+    lead_chars: 100,
+    max_spans: 100,
+};
+
+/// The `ReferenceType` a reference to a knowledge base of THIS service carries, from the
+/// model's own catalog (`smithy_query(query="shape",shape="ReferenceType")`, whose other
+/// values name Bedrock and web-crawler sources).
+const REFERENCE_TYPE_KNOWLEDGE_BASE: &str = "KNOWLEDGE_BASE";
+
+/// The `QueryResultType` a result that IS a piece of knowledge-base content carries, from
+/// the model's own catalog (`smithy_query(query="shape",shape="QueryResultType")`, which
+/// also declares the generative, intent, email, notes and case-summarization types this
+/// emulator produces no result of).
+const RESULT_TYPE_KNOWLEDGE_CONTENT: &str = "KNOWLEDGE_CONTENT";
+
+/// The one field a `queryCondition` selects on, and the one comparator it selects under,
+/// from the model's own catalogs (`QueryConditionFieldName`,
+/// `QueryConditionComparisonOperator`).
+const QUERY_CONDITION_FIELD_RESULT_TYPE: &str = QUERY_CONDITION_FIELD_NAME_VALUES[0];
+const QUERY_CONDITION_COMPARATOR_EQUALS: &str = QUERY_CONDITION_COMPARISON_OPERATOR_VALUES[0];
+
+/// The text this query searches for: `queryText`, or the text its `queryInputData` names
+/// when the request states the query that way instead.
+///
+/// The other two `queryInputData` members name an intent and a case, neither of which is
+/// text and neither of which this emulator holds, so a request stating one of those names
+/// no text to search for.
+fn query_text(input: &QueryAssistantInput) -> String {
+    if let Some(text) = input.query_text.as_deref() {
+        return text.to_string();
+    }
+    match &input.query_input_data {
+        Some(QueryInputData::queryTextInputData(data)) => data.text.clone(),
+        _ => String::new(),
+    }
+}
+
+/// One content the query matched, with everything the result reports about it already
+/// computed from the stored record.
+struct Matched {
+    /// Kept for the ranking tie-break and for the page cursor, which names a content.
+    content_id: String,
+    relevance_score: f64,
+    content_reference: ContentReference,
+    title: DocumentText,
+    excerpt: DocumentText,
+}
+
+impl Matched {
+    /// This match as one `ResultData` of the answer: the legacy `document` members and the
+    /// `data`/`type` members the current API reports the same hit under, both out of the
+    /// one stored content.
+    fn into_result(self) -> ResultData {
+        ResultData {
+            // `ResultData$resultId` is modelled `Uuid` and identifies THIS result of THIS
+            // query — not the content, which the document's own reference names.
+            result_id: new_result_id(),
+            document: Some(Document {
+                content_reference: self.content_reference.clone(),
+                title: Some(self.title.clone()),
+                excerpt: Some(self.excerpt.clone()),
+            }),
+            relevance_score: self.relevance_score,
+            data: Some(DataSummary {
+                reference: DataReference::contentReference(self.content_reference),
+                details: DataDetails::contentData(ContentDataDetails {
+                    text_data: TextData {
+                        title: Some(self.title),
+                        excerpt: Some(self.excerpt),
+                    },
+                    ranking_data: RankingData {
+                        relevance_score: self.relevance_score,
+                        // `relevanceLevel` is a band of the score this endpoint publishes
+                        // no thresholds for, so nothing is reported where nothing is
+                        // known.
+                        relevance_level: None,
+                    },
+                }),
+            }),
+            r#type: Some(RESULT_TYPE_KNOWLEDGE_CONTENT.to_string()),
+        }
+    }
+}
+
+/// A fresh `Uuid` for one result of one query.
+///
+/// Minted by the framework's own v4 generator, `emulator_telemetry`'s `random()` id
+/// constructor ("A fresh random (v4) identifier"), which this crate already depends on —
+/// so this operation declares no id generator and no RNG dependency of its own. It names
+/// nothing stored: the result is not a resource, and nothing is written for it.
+fn new_result_id() -> String {
+    ::emulator_telemetry::SessionId::random().as_str().to_string()
+}
+
+/// One window of a document's text as the `DocumentText` this model carries: the text
+/// itself, and the matches inside it as `Highlight`s whose offsets are into THAT text —
+/// which is what a client rendering the excerpt it was handed can use.
+fn document_text(window: TextWindow) -> DocumentText {
+    DocumentText {
+        highlights: Some(
+            window
+                .spans
+                .iter()
+                .map(|span| Highlight {
+                    begin_offset_inclusive: i32::try_from(span.begin).unwrap_or(i32::MAX),
+                    end_offset_exclusive: i32::try_from(span.end).unwrap_or(i32::MAX),
+                })
+                .collect(),
+        ),
+        text: Some(window.text),
+    }
+}
+
+/// Whether a content of this media type carries TEXT this emulator can search.
+///
+/// The modelled `ContentType` catalog
+/// (`smithy_query(query="shape",shape="ContentType")`) admits text media types, two
+/// JSON-source types, and the binary document types `application/pdf` and
+/// `application/vnd.openxmlformats-officedocument.wordprocessingml.document`. The first
+/// two kinds ARE text; extracting text from the binary two is not something this emulator
+/// does, so their assets are not searched at all rather than searched as if their bytes
+/// were prose.
+fn carries_searchable_text(content_type: &str) -> bool {
+    content_type.starts_with("text/") || content_type.starts_with("application/x.wisdom-json")
+}
+
+/// The stored asset of `content` as text, when it is text.
+fn asset_text(content: &crate::state::Content) -> Option<&str> {
+    if !carries_searchable_text(&content.content_type) {
+        return None;
+    }
+    ::std::str::from_utf8(&content.body).ok()
+}
+
+/// How many bytes of text one content is searched over: what [`match_content`] reads of it,
+/// and so what one term costs to compare against it.
+fn searched_bytes(content: &crate::state::Content) -> usize {
+    content
+        .name
+        .len()
+        .saturating_add(content.title.len())
+        .saturating_add(asset_text(content).map_or(0, str::len))
+}
+
+/// What `content` answers for a query naming `terms`, or `None` when it carries none of
+/// them.
+///
+/// The matching, the score and the choice of which text to excerpt are the shared rule
+/// ([`match_document`]); what belongs to this operation is which of the content's fields
+/// are searchable text and how the answer is shaped.
+fn match_content(content: &crate::state::Content, terms: &[String]) -> Option<Matched> {
+    let matched = match_document(
+        DocumentFields {
+            name: &content.name,
+            title: &content.title,
+            body: asset_text(content),
+        },
+        terms,
+        EXCERPT_WINDOW,
+    )?;
+    Some(Matched {
+        content_id: content.content_id.clone(),
+        // The score is the share of the query's distinct terms this content carries, so it
+        // is in `0..=1` — inside `RelevanceScore`'s modelled `range min 0`.
+        relevance_score: matched.score,
+        content_reference: ContentReference {
+            knowledge_base_arn: Some(content.knowledge_base_arn.clone()),
+            knowledge_base_id: Some(content.knowledge_base_id.clone()),
+            content_arn: Some(content.content_arn.clone()),
+            content_id: Some(content.content_id.clone()),
+            // `sourceURL` is where the article itself is reached, which is the content's
+            // own link-out URI when the create named one and nothing otherwise; the
+            // reference is to a knowledge base of this service.
+            source_url: content.link_out_uri.clone(),
+            reference_type: Some(REFERENCE_TYPE_KNOWLEDGE_BASE.to_string()),
+        },
+        title: document_text(matched.title),
+        excerpt: document_text(matched.excerpt),
+    })
 }
