@@ -45,6 +45,13 @@
 //!   pay-as-you-go plan is the one an untouched account is on, which carries no
 //!   bundle at all.
 //!
+//! One further refusal is a QUOTA refusal rather than a bad request: a plan
+//! change is, beside the creates, a call that gives a Region its FIRST record,
+//! so it answers the Region ceiling ([`crate::state::MAX_REGIONS`]) the sibling
+//! creates answer — with the same `ServiceQuotaExceededException` (HTTP 402)
+//! they do, since what was reached is a ceiling on how many Regions this store
+//! holds records for and no amount of waiting or retrying clears it.
+//!
 //! A refused request changes nothing: every check runs before the store is
 //! written.
 //!
@@ -109,6 +116,9 @@
 //! * `InternalServerException` (HTTP 500) — An unexpected error has occurred.
 //! * `ThrottlingException` (HTTP 429) — The rate exceeds the limit.
 //! * `ValidationException` (HTTP 400) — Failed
+//! * `ServiceQuotaExceededException` (HTTP 402) — The service quota was exceeded. Widened
+//!   in through `extra_errors` (see below): this operation's own error list omits the
+//!   shape, which the SERVICE models and every create of it declares.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -124,11 +134,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iottwinmaker-awsiottwin
 // here — hence the `UpdatePricingPlanError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iottwinmaker#UpdatePricingPlan")]
+// `ServiceQuotaExceededException` is widened in with `extra_errors`: this SERVICE models
+// the shape (HTTP 402, declared by every create of it) but `UpdatePricingPlan`'s own error
+// list omits it, and the Region ceiling this handler enforces is a quota breach that no
+// retry clears, so that refusal has to be sayable here rather than sent as the rate error
+// `ThrottlingException` an SDK retries.
+#[smithy_macros::operation_error(
+    "com.amazonaws.iottwinmaker#UpdatePricingPlan",
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum UpdatePricingPlanErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -245,15 +264,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record, so it answers the Region ceiling too: the Region is the
         // caller's own credential scope, and without a ceiling a caller could
         // repeat this call under fresh Region names until the process ran out
-        // of memory. The operation models no quota error, so the refusal goes
-        // out as the limit error it does model.
+        // of memory. What was reached is a ceiling on how many Regions this
+        // store holds records for, not a rate, so the refusal is the quota
+        // breach the sibling creates answer it as.
         if state.region_ceiling_reached(&region) {
-            return Err(UpdatePricingPlanErrorModeled::ThrottlingException(
-                ThrottlingException {
-                    message: Some(crate::state::region_ceiling_message()),
-                },
-            )
-            .into());
+            return Err(
+                UpdatePricingPlanErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::region_ceiling_message()),
+                    },
+                )
+                .into(),
+            );
         }
         let state = state.region_mut(&region);
 

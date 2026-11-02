@@ -191,6 +191,9 @@ mod refusal_classes_and_wording;
 #[path = "all/refusal_constructions.rs"]
 mod refusal_constructions;
 
+#[path = "all/region_ceiling_refusal_class.rs"]
+mod region_ceiling_refusal_class;
+
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
 
