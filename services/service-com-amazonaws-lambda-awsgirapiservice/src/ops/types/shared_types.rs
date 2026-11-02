@@ -929,6 +929,13 @@ pub struct GetLayerVersionOutput {
 #[smithy_macros::smithy(shape = "com.amazonaws.lambda#LayerVersionContentOutput")]
 #[derive(Debug, Clone, Default)]
 pub struct LayerVersionContentOutput {
+    /// The size of the layer archive's contents once expanded. The member was added to
+    /// this service's on-disk model from the recorded AWS responses — the shipped model
+    /// snapshot declares no such member on this shape, while AWS carries it on every
+    /// layer version it reports — and its value is projected by
+    /// [`crate::state::LayerVersionRecord::content`], the one place a stored archive
+    /// becomes this shape.
+    pub uncompressed_code_size: i64,
     pub location: Option<String>,
     pub code_sha256: Option<String>,
     pub code_size: i64,

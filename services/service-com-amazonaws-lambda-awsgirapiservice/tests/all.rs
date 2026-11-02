@@ -163,8 +163,12 @@ mod function_versions_by_capacity_provider;
 mod functions_by_code_signing_config;
 #[path = "all/kinesis_event_source_delivery.rs"]
 mod kinesis_event_source_delivery;
+#[path = "all/layer_archive_unzipped_size.rs"]
+mod layer_archive_unzipped_size;
 #[path = "all/layer_listing.rs"]
 mod layer_listing;
+#[path = "all/layer_listing_entry_members.rs"]
+mod layer_listing_entry_members;
 #[path = "all/layer_version_by_arn.rs"]
 mod layer_version_by_arn;
 #[path = "all/layer_version_listing.rs"]

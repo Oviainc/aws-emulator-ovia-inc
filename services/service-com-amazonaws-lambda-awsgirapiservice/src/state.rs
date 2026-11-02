@@ -3473,6 +3473,12 @@ impl LayerVersionRecord {
             location: Some(location),
             code_sha256: self.code_sha256.clone(),
             code_size: self.code_size,
+            // `UncompressedCodeSize` is the size of the archive's contents as Lambda has
+            // EXPANDED them, and a layer archive is stored exactly as it was uploaded —
+            // neither storage mode unpacks it — so no expanded copy of it exists to
+            // measure and the member carries its own default. RECORDED: AWS carries the
+            // member on every layer version it reports, with the value 0.
+            uncompressed_code_size: 0,
             // "The resolved Amazon S3 object that contains the layer archive" — in
             // `REFERENCE` mode that object is the caller's, because "Lambda references
             // the layer archive from the specified Amazon S3 bucket". In the default
