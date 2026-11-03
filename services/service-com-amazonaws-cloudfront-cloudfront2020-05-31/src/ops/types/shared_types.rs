@@ -1674,7 +1674,12 @@ pub struct ResponseHeadersPolicyConfig {
     pub comment: Option<String>,
     pub name: String,
     pub cors_config: Option<ResponseHeadersPolicyCorsConfig>,
-    pub security_headers_config: Option<ResponseHeadersPolicySecurityHeadersConfig>,
+    // Held as `SecurityHeadersConfigProjection` — the modelled
+    // `ResponseHeadersPolicySecurityHeadersConfig` plus the way CloudFront writes it, so
+    // every operation that serializes a policy serializes the whole structure (see
+    // `super::security_headers_wire`). The projection derefs to the modelled shape, so a
+    // reader of one header is unaffected.
+    pub security_headers_config: Option<SecurityHeadersConfigProjection>,
     pub server_timing_headers_config: Option<ResponseHeadersPolicyServerTimingHeadersConfig>,
     pub custom_headers_config: Option<ResponseHeadersPolicyCustomHeadersConfig>,
     pub remove_headers_config: Option<ResponseHeadersPolicyRemoveHeadersConfig>,

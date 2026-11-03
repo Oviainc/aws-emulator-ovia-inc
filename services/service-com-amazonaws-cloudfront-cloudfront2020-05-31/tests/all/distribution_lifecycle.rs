@@ -114,6 +114,12 @@ impl Node {
         self.text.as_str()
     }
 
+    /// This element's local name, so a suite can assert the ORDER of an element's
+    /// children and not only their presence.
+    pub(crate) fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
     /// Every child element called `name`.
     pub(crate) fn children_named(&self, name: &str) -> Vec<&Node> {
         self.children

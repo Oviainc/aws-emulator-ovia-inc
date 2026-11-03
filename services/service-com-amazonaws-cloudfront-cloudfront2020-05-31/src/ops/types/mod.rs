@@ -153,6 +153,7 @@ pub mod list_vpc_origins_types;
 pub mod publish_connection_function_types;
 pub mod publish_function_types;
 pub mod put_resource_policy_types;
+pub mod security_headers_wire;
 pub mod shared_types;
 pub mod tag_resource_types;
 pub mod test_connection_function_types;
@@ -461,6 +462,8 @@ pub use publish_connection_function_types::*;
 pub use publish_function_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use put_resource_policy_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use security_headers_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

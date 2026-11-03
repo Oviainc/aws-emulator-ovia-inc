@@ -3684,7 +3684,7 @@ impl ManagedResponseHeadersPolicy {
                 }
             }),
             security_headers_config: if self.security_headers {
-                Some(managed_security_headers_config())
+                Some(managed_security_headers_config().into())
             } else {
                 None
             },

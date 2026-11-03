@@ -42,7 +42,10 @@ use crate::response_headers_policy_lifecycle::{
 
 /// `GET /2020-05-31/response-headers-policy`, with `query` appended verbatim — the route and
 /// the `Marker`/`MaxItems` query binding the model gives `ListResponseHeadersPolicies`.
-async fn list_policies(router: &MultiServiceRouter, query: &str) -> Answer {
+///
+/// `pub(crate)` so the sibling suite that reads a listed policy back drives the listing
+/// over this one wire path rather than growing a copy of it.
+pub(crate) async fn list_policies(router: &MultiServiceRouter, query: &str) -> Answer {
     call(
         router,
         "GET",

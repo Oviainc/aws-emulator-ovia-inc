@@ -18,7 +18,11 @@
 //!   whose `Quantity` disagrees with its `Items` is refused with `InconsistentQuantities`
 //!   and stores nothing;
 //! * an id no policy holds is `NoSuchResponseHeadersPolicy`, whatever shape the id takes;
-//! * a value outside a member's modelled constraint is refused before anything is stored.
+//! * a value outside a member's modelled constraint is refused before anything is stored;
+//! * every member of `SecurityHeadersConfig` occupies an element of a serialized policy,
+//!   and a security header the configuration does not set is the member's EMPTY element —
+//!   the rule `crate::response_headers_policy_security_headers` asserts over the whole
+//!   class, and which this suite reads back for every row of its own table.
 //!
 //! The table rows differ along everything these rules generalise over: which optional
 //! configurations the policy carries at all, each list's length (none, one, many), the
@@ -559,6 +563,22 @@ pub(crate) fn assert_absent(node: &Node, path: &str, case: &str, context: &str) 
     );
 }
 
+/// Assert the element at `path` is PRESENT and carries nothing: the empty element a
+/// serialized `SecurityHeadersConfig` member occupies when the configuration set no such
+/// security header.
+///
+/// `pub(crate)` so the suite that asserts that rule across every response path reads an
+/// empty element the same way.
+pub(crate) fn assert_empty_element(node: &Node, path: &str, case: &str, context: &str) {
+    let element = node.at(path).unwrap_or_else(|| {
+        panic!("case {case} ({context}): the answer carries no {path} element")
+    });
+    assert!(
+        element.text().is_empty() && element.children.is_empty(),
+        "case {case} ({context}): expected {path} to be the empty element, got {element:?}"
+    );
+}
+
 /// Assert one list wrapper reports `values` in order, beside a `Quantity` that states
 /// their number.
 fn assert_wrapper(
@@ -765,7 +785,12 @@ pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: 
                         ),
                     }
                 }
-                None => assert_absent(config, "SecurityHeadersConfig/XSSProtection", case, context),
+                None => assert_empty_element(
+                    config,
+                    "SecurityHeadersConfig/XSSProtection",
+                    case,
+                    context,
+                ),
             }
             match &security.frame {
                 Some((overridden, option)) => {
@@ -789,7 +814,12 @@ pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: 
                         "case {case} ({context}): expected FrameOption {option}, got {actual:?}"
                     );
                 }
-                None => assert_absent(config, "SecurityHeadersConfig/FrameOptions", case, context),
+                None => assert_empty_element(
+                    config,
+                    "SecurityHeadersConfig/FrameOptions",
+                    case,
+                    context,
+                ),
             }
             match &security.referrer {
                 Some((overridden, referrer)) => {
@@ -814,9 +844,12 @@ pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: 
                          {actual:?}"
                     );
                 }
-                None => {
-                    assert_absent(config, "SecurityHeadersConfig/ReferrerPolicy", case, context)
-                }
+                None => assert_empty_element(
+                    config,
+                    "SecurityHeadersConfig/ReferrerPolicy",
+                    case,
+                    context,
+                ),
             }
             match &security.csp {
                 Some((overridden, csp)) => {
@@ -841,7 +874,7 @@ pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: 
                          ContentSecurityPolicy, got {actual:?}"
                     );
                 }
-                None => assert_absent(
+                None => assert_empty_element(
                     config,
                     "SecurityHeadersConfig/ContentSecurityPolicy",
                     case,
@@ -857,7 +890,7 @@ pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: 
                     context,
                     raw,
                 ),
-                None => assert_absent(
+                None => assert_empty_element(
                     config,
                     "SecurityHeadersConfig/ContentTypeOptions",
                     case,
@@ -921,7 +954,7 @@ pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: 
                         ),
                     }
                 }
-                None => assert_absent(
+                None => assert_empty_element(
                     config,
                     "SecurityHeadersConfig/StrictTransportSecurity",
                     case,
