@@ -1402,6 +1402,23 @@ impl ComAmazonawsNotificationsNotificationsState {
         Some(rule)
     }
 
+    /// Remove the `EventRule` `arn` names and report the record that was
+    /// removed, or `None` when the store holds no rule under that arn.
+    ///
+    /// The arn is a rule's only key, so this is the whole of what deleting one
+    /// rule does to the store; the configuration's `event_rule_sources` index is
+    /// a view of the rules the store holds for it, so it is recomputed here
+    /// rather than left naming a source no surviving rule has. The room the rule
+    /// held under [`MAX_EVENT_RULES_PER_CONFIGURATION`] and the
+    /// `(source, eventType)` pair it covered
+    /// ([`Self::event_rule_covering`]) are freed by the removal itself, since
+    /// both are computed from the rules the store holds.
+    pub fn remove_event_rule(&mut self, arn: &str) -> Option<EventRuleRecord> {
+        let record = self.event_rules.remove(arn)?;
+        self.refresh_event_rule_sources(&record.notification_configuration_arn);
+        Some(record)
+    }
+
     /// Drop every `EventRule` of `configuration_arn` — what deleting the
     /// configuration does to the rules associated with it, so a later create
     /// cannot reach a rule whose configuration is gone.
@@ -1767,8 +1784,23 @@ pub const HUB_IDENTIFIER_LABEL: &str = "region";
 /// `NotificationConfiguration` by.
 pub const CONFIGURATION_RESOURCE_LABEL: &str = "notification configuration";
 
-/// `event rule`, the resource label [`not_found_message`] names an `EventRule` by.
+/// `event rule`, the resource label [`not_found_message`] names an `EventRule`
+/// by when a READ looked it up (`GetEventRule`).
+///
+/// This family states the resource as the service itself words it in that
+/// path's refusal, and that wording is not one spelling for every path: the
+/// recorded refusal of a read naming an `EventRule` no account holds reads
+/// `event rule with arn <arn> not found`, while a MUTATION of the same absent
+/// rule names it [`EVENT_RULE_MUTATION_RESOURCE_LABEL`]. The template and the
+/// variable parts are shared either way — see [`not_found_message`].
 pub const EVENT_RULE_RESOURCE_LABEL: &str = "event rule";
+
+/// `EventRule`, the resource label [`not_found_message`] names an `EventRule`
+/// by when a MUTATION looked it up (`UpdateEventRule`, `DeleteEventRule`): the
+/// recorded refusal of a mutation naming an `EventRule` no account holds reads
+/// `EventRule with arn <arn> not found`. See [`EVENT_RULE_RESOURCE_LABEL`] for
+/// the read path's wording.
+pub const EVENT_RULE_MUTATION_RESOURCE_LABEL: &str = "EventRule";
 
 /// `channel`, the resource label [`not_found_message`] names a `Channel` by —
 /// the resource a channel operation looks up in the configuration it names.

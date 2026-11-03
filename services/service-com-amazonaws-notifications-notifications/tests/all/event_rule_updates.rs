@@ -28,8 +28,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_notifications_notifications::ops::types::EVENT_RULE_STATUS_VALUES;
 use service_com_amazonaws_notifications_notifications::state::{
-    EVENT_RULE_REASON_ACTIVE, EVENT_RULE_REASON_UPDATING, EVENT_RULE_STATUS_ACTIVE,
-    EVENT_RULE_STATUS_UPDATING, EVENT_RULE_TRANSITION_SPAN, MAX_REGIONS_PER_EVENT_RULE,
+    EVENT_RULE_MUTATION_RESOURCE_LABEL, EVENT_RULE_REASON_ACTIVE, EVENT_RULE_REASON_UPDATING,
+    EVENT_RULE_STATUS_ACTIVE, EVENT_RULE_STATUS_UPDATING, EVENT_RULE_TRANSITION_SPAN,
+    MAX_REGIONS_PER_EVENT_RULE,
 };
 
 // The HTTP harness this suite drives the service through, shared with every
@@ -534,7 +535,7 @@ async fn updating_a_rule_that_does_not_exist_is_not_found() {
             "case {label:?}: that refusal is a ResourceNotFoundException, got {refused:?}"
         );
         let stated = refused["message"].as_str().unwrap_or_default();
-        let expected = format!("event rule with arn {arn} not found");
+        let expected = format!("{EVENT_RULE_MUTATION_RESOURCE_LABEL} with arn {arn} not found");
         assert_eq!(
             stated, expected,
             "case {label:?}: expected message {expected:?}, got {stated:?}"

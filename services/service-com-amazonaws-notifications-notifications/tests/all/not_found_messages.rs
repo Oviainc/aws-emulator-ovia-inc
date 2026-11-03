@@ -8,7 +8,8 @@
 //! request — the kind of resource that was looked up, the member that identified it, and
 //! the value the request carried there — as
 //! `<resource> with <identifier> <value> not found`. One template for every not-found
-//! path of the service, so the wording does not vary per handler.
+//! path of the service, so only the RESOURCE each path names varies — the service names
+//! an `EventRule` one way when a read looks it up and another when a mutation does.
 //!
 //! The table rows vary along what the rule generalises over: which resource is looked up
 //! (a NotificationHub keyed by Region, a NotificationConfiguration keyed by ARN, an
@@ -53,7 +54,12 @@ const UNREGISTERED_REGIONS: &[&str] = &["eu-west-1", "us-gov-east-1", "a-b-1"];
 const HUB: &str = "notification hub";
 /// `notification configuration`, how the same family names a NotificationConfiguration.
 const CONFIGURATION: &str = "notification configuration";
-/// `event rule`, how the same family names an EventRule.
+/// `EventRule`, how the refusal of a MUTATION of an EventRule names the
+/// resource: not every path of this family names a resource the same way (see
+/// [`EVENT_RULE`]).
+const EVENT_RULE_MUTATED: &str = "EventRule";
+
+/// `event rule`, how the refusal of a READ of an EventRule names the resource.
 const EVENT_RULE: &str = "event rule";
 
 /// One lookup of a resource that does not exist.
@@ -194,6 +200,27 @@ fn lookups() -> Vec<Lookup> {
         uri: format!("/event-rules/{}", encode_path_label(UNMINTED_EVENT_RULE_ARN)),
         body: None,
         resource: EVENT_RULE,
+        identifier: "arn",
+        value: UNMINTED_EVENT_RULE_ARN,
+    });
+
+    // The mutations of the same resource, which name it the way the service's
+    // own refusal of a mutation names it.
+    rows.push(Lookup {
+        case: "DeleteEventRule on an unminted rule arn",
+        method: "DELETE",
+        uri: format!("/event-rules/{}", encode_path_label(UNMINTED_EVENT_RULE_ARN)),
+        body: None,
+        resource: EVENT_RULE_MUTATED,
+        identifier: "arn",
+        value: UNMINTED_EVENT_RULE_ARN,
+    });
+    rows.push(Lookup {
+        case: "UpdateEventRule on an unminted rule arn",
+        method: "PUT",
+        uri: format!("/event-rules/{}", encode_path_label(UNMINTED_EVENT_RULE_ARN)),
+        body: Some(json!({ "regions": ["us-east-1"] })),
+        resource: EVENT_RULE_MUTATED,
         identifier: "arn",
         value: UNMINTED_EVENT_RULE_ARN,
     });

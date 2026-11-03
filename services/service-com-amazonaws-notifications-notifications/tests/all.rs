@@ -17,6 +17,8 @@ mod channel_associations;
 mod channel_not_found_message;
 #[path = "all/configuration_status.rs"]
 mod configuration_status;
+#[path = "all/event_rule_deletes.rs"]
+mod event_rule_deletes;
 #[path = "all/event_rule_pair_uniqueness.rs"]
 mod event_rule_pair_uniqueness;
 #[path = "all/event_rule_updates.rs"]

@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 UpdateEventRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: crate::state::not_found_message(
-                        crate::state::EVENT_RULE_RESOURCE_LABEL,
+                        crate::state::EVENT_RULE_MUTATION_RESOURCE_LABEL,
                         crate::state::ARN_IDENTIFIER_LABEL,
                         &input.arn,
                     ),
