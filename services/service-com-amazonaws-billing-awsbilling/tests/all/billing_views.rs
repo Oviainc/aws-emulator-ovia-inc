@@ -484,9 +484,12 @@ async fn the_list_honours_each_filter() {
             vec![],
         ),
         (
-            "activeTimeRange ending before every view was created",
+            // The modeled `activeTimeRange` doc: the account's PRIMARY view "is
+            // always listed", so a window ending before any view existed still
+            // lists it and nothing else.
+            "activeTimeRange ending before every created view",
             json!({ "activeTimeRange": { "activeAfterInclusive": 0, "activeBeforeInclusive": 1 } }),
-            vec![],
+            vec![PRIMARY_ARN.to_string()],
         ),
     ];
 

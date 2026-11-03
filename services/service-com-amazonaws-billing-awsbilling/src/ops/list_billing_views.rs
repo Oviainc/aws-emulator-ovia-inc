@@ -5,6 +5,9 @@
 //! `billingViewTypes`, `names`, `ownerAccountId`, `sourceAccountId` and
 //! `activeTimeRange`, ordered by ARN, and paginated with `maxResults` and an
 //! opaque `nextToken` that resumes after the last ARN the previous page returned.
+//! The `activeTimeRange` filter selects views by the period the resource behind
+//! them was active, so the account's default view — which has no such resource —
+//! is listed whatever range the caller asks about.
 //! The `arns` filter names resources, so each entry is resolved first: one
 //! outside the caller's account is an `AccessDeniedException` (403) and one this
 //! account stores no view under is a `ValidationException` (400).
@@ -260,10 +263,13 @@ fn matches_filters(
         }
     }
     if let Some(range) = &input.active_time_range {
-        // A view is active over a period once it exists: one created after the
-        // period ended was not available during it.
-        if crate::state::epoch_secs(view.created_at)
-            > crate::state::date_time_secs(&range.active_before_inclusive)
+        // A view that names a resource with a lifetime is active over a period
+        // once it exists: one created after the period ended was not available
+        // during it. The account's default view names no such resource — it is
+        // active for as long as the account is — so every time range lists it.
+        if !view.is_always_active()
+            && crate::state::epoch_secs(view.created_at)
+                > crate::state::date_time_secs(&range.active_before_inclusive)
         {
             return Ok(false);
         }

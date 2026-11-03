@@ -385,6 +385,20 @@ impl BillingView {
     pub fn is_managed(&self) -> bool {
         self.billing_view_type != BILLING_VIEW_TYPE_CUSTOM
     }
+
+    /// Whether this view is active for as long as the account is, so no time
+    /// window a caller asks about can exclude it.
+    ///
+    /// Only the account's default [`BILLING_VIEW_TYPE_PRIMARY`] view is: the
+    /// `ListBillingViews` `activeTimeRange` doc says it "is always listed",
+    /// because it is not a resource that came into existence at an instant — it
+    /// represents the account's own billing data. Every other type names a
+    /// resource with a lifetime (a Billing Conductor billing group, a view a
+    /// caller created), and is active only from the instant that resource
+    /// appeared.
+    pub fn is_always_active(&self) -> bool {
+        self.billing_view_type == BILLING_VIEW_TYPE_PRIMARY
+    }
 }
 
 /// A monetary amount, as the modeled `Amount` shape carries it: an ISO-4217

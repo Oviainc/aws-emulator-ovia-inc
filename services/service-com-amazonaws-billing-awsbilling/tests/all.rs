@@ -17,6 +17,8 @@ mod billing_feature_access;
 mod billing_preference_pagination;
 #[path = "all/billing_preferences.rs"]
 mod billing_preferences;
+#[path = "all/billing_view_active_time_range.rs"]
+mod billing_view_active_time_range;
 #[path = "all/billing_view_wire_fidelity.rs"]
 mod billing_view_wire_fidelity;
 #[path = "all/billing_views.rs"]
