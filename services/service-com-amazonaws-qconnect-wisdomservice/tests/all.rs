@@ -49,6 +49,8 @@ mod knowledge_base_listing_and_queries;
 mod modelled_refusals;
 #[path = "all/quick_response.rs"]
 mod quick_response;
+#[path = "all/quick_response_delete_reach.rs"]
+mod quick_response_delete_reach;
 #[path = "all/quick_response_mutations.rs"]
 mod quick_response_mutations;
 #[path = "all/quick_response_plane_gate.rs"]

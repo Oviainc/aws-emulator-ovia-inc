@@ -34,7 +34,7 @@ use super::resource_tags::{label, Emulator, Reply, ABSENT_UUID, REGION};
 /// Both values the modelled `QuickResponseType` pattern admits
 /// (`smithy_query(query="operation",operation="UpdateQuickResponse")`: `contentType`
 /// matches `^(application/x\.quickresponse;format=(plain|markdown))$`).
-const CONTENT_TYPE_PLAIN: &str = "application/x.quickresponse;format=plain";
+pub(crate) const CONTENT_TYPE_PLAIN: &str = "application/x.quickresponse;format=plain";
 const CONTENT_TYPE_MARKDOWN: &str = "application/x.quickresponse;format=markdown";
 
 /// The `QuickResponseStatus` a stored quick response reports, which an accepted update
@@ -45,7 +45,7 @@ const STATUS_CREATED: &str = "CREATED";
 /// The fixed sentences this endpoint answers a resource it does not hold with, written out
 /// here rather than imported from the implementation: the one naming the quick response and
 /// the one naming its parent knowledge base.
-const MESSAGE_QUICK_RESPONSE_NOT_FOUND: &str = "QuickResponse does not exist.";
+pub(crate) const MESSAGE_QUICK_RESPONSE_NOT_FOUND: &str = "QuickResponse does not exist.";
 const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
 
 /// The ARN `lastModifiedBy` carries: "The Amazon Resource Name (ARN) of the user who last
@@ -62,7 +62,7 @@ fn caller_principal_arn() -> String {
 }
 
 /// A knowledge base to hold quick responses, answering the id its create minted.
-async fn knowledge_base(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn knowledge_base(emulator: &Emulator, name: &str) -> String {
     let reply = emulator
         .send(
             "POST",
@@ -79,7 +79,11 @@ async fn knowledge_base(emulator: &Emulator, name: &str) -> String {
     reply.string("/knowledgeBase/knowledgeBaseId")
 }
 
-async fn create_quick_response(emulator: &Emulator, knowledge_base: &str, body: Value) -> Reply {
+pub(crate) async fn create_quick_response(
+    emulator: &Emulator,
+    knowledge_base: &str,
+    body: Value,
+) -> Reply {
     emulator
         .send(
             "POST",
@@ -89,7 +93,7 @@ async fn create_quick_response(emulator: &Emulator, knowledge_base: &str, body: 
         .await
 }
 
-async fn get_quick_response(
+pub(crate) async fn get_quick_response(
     emulator: &Emulator,
     knowledge_base: &str,
     quick_response: &str,
@@ -126,7 +130,7 @@ async fn update_quick_response(
         .await
 }
 
-async fn delete_quick_response(
+pub(crate) async fn delete_quick_response(
     emulator: &Emulator,
     knowledge_base: &str,
     quick_response: &str,
@@ -144,7 +148,7 @@ async fn delete_quick_response(
         .await
 }
 
-async fn list_quick_responses(emulator: &Emulator, knowledge_base: &str) -> Reply {
+pub(crate) async fn list_quick_responses(emulator: &Emulator, knowledge_base: &str) -> Reply {
     emulator
         .send(
             "GET",
