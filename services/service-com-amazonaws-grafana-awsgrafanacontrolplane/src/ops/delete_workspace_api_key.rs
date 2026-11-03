@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if workspace.api_keys.remove(&input.key_name).is_none() {
             return Err(DeleteWorkspaceApiKeyErrorModeled::ResourceNotFoundException(
-                crate::state::api_key_not_found(&input.workspace_id, &input.key_name),
+                crate::state::api_key_not_found(&input.key_name),
             )
             .into());
         }

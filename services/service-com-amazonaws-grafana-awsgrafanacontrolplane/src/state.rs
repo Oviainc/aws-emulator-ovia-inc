@@ -925,12 +925,16 @@ pub fn workspace_not_found(id: &str) -> ResourceNotFoundException {
 }
 
 /// The `ResourceNotFoundException` payload for an id that names no service
-/// account of `workspace_id` — one never created, or already deleted.
-pub fn service_account_not_found(workspace_id: &str, account_id: &str) -> ResourceNotFoundException {
+/// account of the workspace the request named — one never created, or already
+/// deleted.
+///
+/// The message names the service account id the request asked about, the one part
+/// of the request that tells two refused calls apart, as a finished sentence; the
+/// workspace is already named by the path the caller sent, so it is not repeated
+/// here.
+pub fn service_account_not_found(account_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!(
-            "Service account {account_id} not found in workspace {workspace_id}"
-        ),
+        message: format!("Service account {account_id} not found."),
         resource_id: account_id.to_string(),
         resource_type: SERVICE_ACCOUNT_RESOURCE_TYPE.to_string(),
     }
@@ -978,10 +982,16 @@ pub fn service_accounts_unsupported(
 }
 
 /// The `ResourceNotFoundException` payload for a key name that names no API key
-/// of `workspace_id` — one never created, already deleted, or expired.
-pub fn api_key_not_found(workspace_id: &str, key_name: &str) -> ResourceNotFoundException {
+/// of the workspace the request named — one never created, already deleted, or
+/// expired.
+///
+/// The message names the key name the request asked about, the one part of the
+/// request that tells two refused deletes apart, as a finished sentence; the
+/// workspace is already named by the path the caller sent, so it is not repeated
+/// here.
+pub fn api_key_not_found(key_name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("API key {key_name} not found in workspace {workspace_id}"),
+        message: format!("API key {key_name} not found."),
         resource_id: key_name.to_string(),
         resource_type: API_KEY_RESOURCE_TYPE.to_string(),
     }

@@ -198,10 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(account) = workspace.service_account_mut(&input.service_account_id) else {
             return Err(
                 DeleteWorkspaceServiceAccountTokenErrorModeled::ResourceNotFoundException(
-                    crate::state::service_account_not_found(
-                        &workspace_id,
-                        &input.service_account_id,
-                    ),
+                    crate::state::service_account_not_found(&input.service_account_id),
                 )
                 .into(),
             );

@@ -20,6 +20,9 @@ mod list_versions;
 #[path = "all/list_workspace_service_accounts.rs"]
 mod list_workspace_service_accounts;
 
+#[path = "all/not_found_messages.rs"]
+mod not_found_messages;
+
 #[path = "all/request_body_refusals.rs"]
 mod request_body_refusals;
 

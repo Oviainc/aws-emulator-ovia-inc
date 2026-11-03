@@ -224,10 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if workspace.service_account(&input.service_account_id).is_none() {
             return Err(
                 CreateWorkspaceServiceAccountTokenErrorModeled::ResourceNotFoundException(
-                    crate::state::service_account_not_found(
-                        &workspace_id,
-                        &input.service_account_id,
-                    ),
+                    crate::state::service_account_not_found(&input.service_account_id),
                 )
                 .into(),
             );
