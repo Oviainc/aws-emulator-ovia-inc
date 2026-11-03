@@ -178,6 +178,49 @@ pub(crate) fn create_body(name: &str) -> Value {
     })
 }
 
+/// The `@pattern` the model declares for `shape`, read out of the model this crate ships.
+///
+/// `pub(crate)` for the same reason as the harness above: every suite that asserts on a
+/// constraint refusal needs the model's own expression, and reading it here is what keeps a
+/// suite from writing a re-spelled copy of it. What a refusal QUOTES is this expression put
+/// through `service_common::validation::unanchored`, the tree's one rendering of that rule,
+/// which each suite calls directly.
+pub(crate) fn declared_pattern(shape: &str) -> String {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-synthetics-synthetics.json"
+    );
+    let text = std::fs::read_to_string(path).expect("this crate ships its Smithy model");
+    let model: Value = serde_json::from_str(&text).expect("the Smithy model is JSON");
+    let id = format!("com.amazonaws.synthetics#{shape}");
+    model["shapes"][&id]["traits"]["smithy.api#pattern"]
+        .as_str()
+        .unwrap_or_else(|| panic!("shape {shape} declares no @pattern in the shipped model"))
+        .to_string()
+}
+
+/// The whole `Message` a refusal with ONE constraint violation carries: the envelope AWS
+/// wraps a single clause in, over the echoed value, the member path and the requirement.
+///
+/// `pub(crate)` for the same reason as the harness above — every suite that asserts on a
+/// constraint refusal states this one sentence.
+pub(crate) fn one_violation(value: &str, member_path: &str, requirement: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at '{member_path}' failed to satisfy \
+         constraint: {requirement}"
+    )
+}
+
+/// The requirement clause a `@pattern` violation states, over the expression the refusing
+/// operation's dialect quotes.
+///
+/// `pub(crate)` beside [`one_violation`] and [`declared_pattern`] for the same reason: the
+/// suites that assert on a pattern refusal state this one clause, and which EXPRESSION goes
+/// in it is the thing they differ on.
+pub(crate) fn pattern_requirement(expression: &str) -> String {
+    format!("Member must satisfy regular expression pattern: {expression}")
+}
+
 /// The whole slice over one canary: every response is read back out of the store, and the
 /// record a create wrote is the record every later read reports.
 #[tokio::test]

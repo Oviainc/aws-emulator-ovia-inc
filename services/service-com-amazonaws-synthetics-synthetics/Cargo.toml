@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `validation::unanchored`: this tree's ONE rendering of a `@pattern` as the expression a
+# service publishes (the whole-value `^`/`$` pair a model writes around it dropped), which
+# `src/service.rs` states every constraint refusal's pattern clause through.
+service-common = { path = "../common" }
 # `Canary$Id` and `CanaryRun$Id` are modelled as UUIDs. The hash and the hex codec the
 # id minting in `src/state.rs` needs, rather than hand-written ones; both are already
 # locked for this package, so no entry is added to Cargo.lock.

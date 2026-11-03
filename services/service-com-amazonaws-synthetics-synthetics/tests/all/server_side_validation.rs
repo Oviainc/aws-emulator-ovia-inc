@@ -15,19 +15,27 @@
 //!    modelled maximum are served, and only a value past the service's own ceiling of 1000
 //!    is refused — naming the member `maxResults` and that ceiling.
 //!
-//! 3. **A `@pattern` as the model declares it.** A pattern-constrained member is reported
-//!    against the EXPRESSION the model declares, character for character — the `^` / `$`
-//!    pair a model writes to make the match total included, because those characters are
-//!    part of the expression the service evaluated. The rule belongs to the service's
-//!    refusal wording, not to one operation, so the rows below span body, URI-label and
-//!    query-string members of several operations — implemented and still scaffolded.
+//! 3. **A `@pattern` requirement, in the dialect its OPERATION is recorded using.** The
+//!    recorded service words this one clause two ways, and the model says which an
+//!    operation takes: an operation that declares `ValidationException` in its own error set
+//!    quotes the expression as the model declares it, the whole-value `^` / `$` pair
+//!    included, while the three tagging operations — whose error set declares the
+//!    `BadRequestException` family and no `ValidationException`, yet which are recorded
+//!    answering `ValidationException` for a constraint failure, i.e. from the generic
+//!    request validator ahead of them — quote the expression that validator publishes, with
+//!    the pair dropped. What the service ACCEPTS is the same either way: the total match is
+//!    still enforced. The rule belongs to the service's refusal wording, not to one
+//!    operation, so the rows below span both families, several operations, and body,
+//!    URI-label and query-string members — with a URI label on each side of the split.
 //!
 //! Every modelled constraint quoted here is read with
 //! `smithy_query(query="operation",operation="…",model_path="services/service-com-amazonaws-synthetics-synthetics/smithy-model/com-amazonaws-synthetics-synthetics.json")`.
 
 use serde_json::{json, Value};
 
-use super::canary_lifecycle::{create_body, Synthetics};
+use super::canary_lifecycle::{
+    create_body, declared_pattern, one_violation, pattern_requirement, Synthetics,
+};
 
 /// Runtime versions the service publishes, taken from the catalogue in `src/state.rs`
 /// (`RUNTIME_VERSION_CATALOG`, written from the CloudWatch Synthetics "Canary Runtime
@@ -75,15 +83,6 @@ const MAX_RESULTS_CEILING: i32 = 1000;
 
 /// The page-size floor, which the model and the service agree on.
 const MAX_RESULTS_FLOOR: i32 = 1;
-
-/// One clause of the constraint envelope, wrapped in the single-violation envelope AWS
-/// returns: `1 validation error detected: Value '<value>' at '<path>' …`.
-fn one_violation(value: &str, path: &str, requirement: &str) -> String {
-    format!(
-        "1 validation error detected: Value '{value}' at '{path}' failed to satisfy \
-         constraint: {requirement}"
-    )
-}
 
 /// A `CreateCanary` body that satisfies every modelled constraint, with `member` replaced
 /// by `value`.
@@ -250,35 +249,24 @@ struct PatternCase {
     /// The shape the member targets. Its `@pattern` is READ FROM the shipped model rather
     /// than written out here, so a row cannot pass against a re-spelled expression.
     shape: &'static str,
+    /// Whether the operation this row calls declares `ValidationException` in its own
+    /// modelled error set — which is what decides the dialect, see this suite's module doc.
+    declares_validation_exception: bool,
 }
 
-/// The `@pattern` the model declares for `shape`, read from the model this crate ships —
-/// the one source for the expression the service must quote back.
-fn declared_pattern(shape: &str) -> String {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/smithy-model/com-amazonaws-synthetics-synthetics.json"
-    );
-    let text = std::fs::read_to_string(path).expect("this crate ships its Smithy model");
-    let model: Value = serde_json::from_str(&text).expect("the Smithy model is JSON");
-    let id = format!("com.amazonaws.synthetics#{shape}");
-    model["shapes"][&id]["traits"]["smithy.api#pattern"]
-        .as_str()
-        .unwrap_or_else(|| panic!("shape {shape} declares no @pattern in the shipped model"))
-        .to_string()
-}
-
-/// A `@pattern` requirement is reported as the expression the model declares, anchors
-/// included — for every pattern-constrained member, whatever the operation and whatever
-/// the member's binding.
+/// A `@pattern` requirement names the expression the OPERATION's dialect states: the
+/// declared one for an operation whose error set carries `ValidationException`, and the one
+/// the generic validator publishes ([`service_common::validation::unanchored`]) for an
+/// operation whose error set does not. The rows span both families, several operations and
+/// every binding — including a URI label on each side, so the dialect is not the binding's.
 #[tokio::test]
-async fn a_reported_pattern_is_the_declared_expression() {
+async fn a_reported_pattern_is_the_expression_its_operations_dialect_states() {
     let aws = Synthetics::new("us-east-1");
 
     let cases = vec![
-        // The recorded instance: an httpLabel member of a still-scaffolded operation. A
-        // constraint belongs to the INPUT SHAPE, so the refusal does not wait for a
-        // handler to exist.
+        // The recorded instance: an httpLabel member of `TagResource`, whose error set
+        // declares no `ValidationException`. A constraint belongs to the INPUT SHAPE, so
+        // the refusal comes before the handler and before any lookup.
         PatternCase {
             case: "tag-resource-arn",
             method: "POST",
@@ -287,6 +275,41 @@ async fn a_reported_pattern_is_the_declared_expression() {
             member_path: "resourceArn",
             value: "not-an-arn",
             shape: "ResourceArn",
+            declares_validation_exception: false,
+        },
+        // The same member on the other two operations of that family, one of them a read.
+        PatternCase {
+            case: "untag-resource-arn",
+            method: "DELETE",
+            path: "/tags/not-an-arn?tagKeys=env".to_string(),
+            body: None,
+            member_path: "resourceArn",
+            value: "not-an-arn",
+            shape: "ResourceArn",
+            declares_validation_exception: false,
+        },
+        PatternCase {
+            case: "list-tags-for-resource-arn",
+            method: "GET",
+            path: "/tags/not-an-arn".to_string(),
+            body: None,
+            member_path: "resourceArn",
+            value: "not-an-arn",
+            shape: "ResourceArn",
+            declares_validation_exception: false,
+        },
+        // A URI label bound the same way on an operation of the OTHER family: the member
+        // targets `CanaryArn`, the canary-only ARN shape, and the dialect differs even
+        // though the binding does not.
+        PatternCase {
+            case: "list-associated-groups-arn",
+            method: "POST",
+            path: "/resource/not-an-arn/groups".to_string(),
+            body: None,
+            member_path: "resourceArn",
+            value: "not-an-arn",
+            shape: "CanaryArn",
+            declares_validation_exception: true,
         },
         // A BODY member of an implemented operation.
         PatternCase {
@@ -297,6 +320,7 @@ async fn a_reported_pattern_is_the_declared_expression() {
             member_path: "name",
             value: "Bad Name!",
             shape: "CanaryName",
+            declares_validation_exception: true,
         },
         // A second body member, with a different expression.
         PatternCase {
@@ -311,6 +335,7 @@ async fn a_reported_pattern_is_the_declared_expression() {
             member_path: "executionRoleArn",
             value: "role/CanaryRole",
             shape: "RoleArn",
+            declares_validation_exception: true,
         },
         // A third, whose expression carries escapes and a character class.
         PatternCase {
@@ -325,6 +350,7 @@ async fn a_reported_pattern_is_the_declared_expression() {
             member_path: "kmsKeyArn",
             value: "arn:aws:kms:us-east-1:123456789012:alias/synthetics",
             shape: "KmsKeyArn",
+            declares_validation_exception: true,
         },
         // A body member of ANOTHER operation, targeting the canary-only ARN shape.
         PatternCase {
@@ -335,6 +361,7 @@ async fn a_reported_pattern_is_the_declared_expression() {
             member_path: "resourceArn",
             value: "not-an-arn",
             shape: "CanaryArn",
+            declares_validation_exception: true,
         },
         // A URI-LABEL member on a read operation.
         PatternCase {
@@ -345,6 +372,7 @@ async fn a_reported_pattern_is_the_declared_expression() {
             member_path: "name",
             value: "BADNAME",
             shape: "CanaryName",
+            declares_validation_exception: true,
         },
         // A QUERY-STRING member.
         PatternCase {
@@ -355,6 +383,7 @@ async fn a_reported_pattern_is_the_declared_expression() {
             member_path: "dryRunId",
             value: "not-a-uuid",
             shape: "UUID",
+            declares_validation_exception: true,
         },
     ];
 
@@ -366,16 +395,22 @@ async fn a_reported_pattern_is_the_declared_expression() {
         member_path,
         value,
         shape,
+        declares_validation_exception,
     } in cases
     {
         let declared = declared_pattern(shape);
-        // The row proves something only if the model's own expression IS anchored: that is
-        // what the emulator used to strip.
+        // The row proves something only if the model's own expression CARRIES the
+        // whole-value pair: that pair is the only difference between the two dialects.
         assert!(
             declared.starts_with('^') && declared.ends_with('$'),
             "case {case}: the modelled pattern {declared:?} is not anchored, so this row \
              asserts nothing"
         );
+        let stated = if declares_validation_exception {
+            declared.clone()
+        } else {
+            service_common::validation::unanchored(&declared)
+        };
 
         let answer = aws.call(method, &path, body).await;
         assert_eq!(
@@ -389,11 +424,7 @@ async fn a_reported_pattern_is_the_declared_expression() {
             "case {case}: expected x-amzn-errortype: ValidationException, got {:?}",
             answer.error_code
         );
-        let expected = one_violation(
-            value,
-            member_path,
-            &format!("Member must satisfy regular expression pattern: {declared}"),
-        );
+        let expected = one_violation(value, member_path, &pattern_requirement(&stated));
         assert_eq!(
             answer.at("Message").as_str(),
             Some(expected.as_str()),

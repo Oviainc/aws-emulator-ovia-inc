@@ -31,6 +31,8 @@ mod group_membership;
 mod input_validation;
 #[path = "all/missing_resource_errors.rs"]
 mod missing_resource_errors;
+#[path = "all/pattern_requirement_wording.rs"]
+mod pattern_requirement_wording;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/runtime_catalog.rs"]

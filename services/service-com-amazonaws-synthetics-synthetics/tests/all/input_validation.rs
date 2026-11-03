@@ -26,11 +26,12 @@
 
 use serde_json::{json, Value};
 
-use super::canary_lifecycle::{create_body, Synthetics};
+use super::canary_lifecycle::{create_body, pattern_requirement as pattern_clause, Synthetics};
 
 /// `CanaryName`'s `@pattern` (`CreateCanary$Name`, `GetCanary$Name`), as the model
-/// DECLARES it: the expression a value has to satisfy, anchors included, which is what the
-/// service quotes. See `tests/all/server_side_validation.rs` for that rule itself.
+/// DECLARES it — the whole-value `^` / `$` pair included, which is what the operations that
+/// declare `ValidationException` quote. See `tests/all/server_side_validation.rs` for the
+/// two dialects and which operation takes which.
 const CANARY_NAME_PATTERN: &str = r"^[0-9a-z_\-]+$";
 
 /// `RoleArn`'s `@pattern` (`CreateCanary$ExecutionRoleArn`), likewise as declared.
@@ -65,8 +66,18 @@ fn envelope(clauses: &[String]) -> String {
     }
 }
 
-fn pattern_requirement(pattern: &str) -> String {
-    format!("Member must satisfy regular expression pattern: {pattern}")
+/// The requirement clause an operation that declares `ValidationException` states: the
+/// expression as the model declares it, character for character.
+fn pattern_requirement(declared: &str) -> String {
+    pattern_clause(declared)
+}
+
+/// The requirement clause an operation whose error set declares NO `ValidationException`
+/// states — the three tagging operations, refused by the generic request validator ahead of
+/// them, which publishes the expression without the model's whole-value pair
+/// (`service_common::validation::unanchored`, the tree's one reading of that rule).
+fn published_pattern_requirement(declared: &str) -> String {
+    pattern_clause(&service_common::validation::unanchored(declared))
 }
 
 fn min_length_requirement(min: u32) -> String {
@@ -257,7 +268,9 @@ async fn a_refused_request_carries_the_modelled_validation_exception_message() {
             )]),
         },
         // A tag operation's ARN: a constraint belongs to the INPUT SHAPE, so the refusal
-        // comes before the handler and before any lookup in the store.
+        // comes before the handler and before any lookup in the store. `TagResource`'s own
+        // error set declares no `ValidationException`, so the refusal is the generic
+        // validator's and quotes the expression WITHOUT the model's whole-value pair.
         Refused {
             case: "tag-resource-arn-pattern",
             method: "POST",
@@ -266,7 +279,7 @@ async fn a_refused_request_carries_the_modelled_validation_exception_message() {
             message: envelope(&[clause(
                 Some("not-an-arn"),
                 "resourceArn",
-                &pattern_requirement(RESOURCE_ARN_PATTERN),
+                &published_pattern_requirement(RESOURCE_ARN_PATTERN),
             )]),
         },
     ];
