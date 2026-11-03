@@ -303,14 +303,9 @@ fn summary_of(
         environment_variables: crate::state::wire_map(&version.environment_variables),
         created_at: version.created_at,
         updated_at: version.updated_at,
-        // "The reason for the current state. For example, one or more builds failed":
-        // a version's state is the settlement of its per-target builds, so the reason it
-        // reports is the reason one of those builds recorded, and a version none of
-        // whose builds recorded one has nothing to report.
-        state_reason: version
-            .builds
-            .values()
-            .find_map(|build| build.state_reason.clone()),
+        // The stored reason, through the record's own one projection of it
+        // (`crate::state::MicrovmImageVersion::reported_state_reason`).
+        state_reason: version.reported_state_reason(),
         tags: crate::state::wire_map(&version.tags),
     }
 }

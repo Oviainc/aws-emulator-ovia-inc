@@ -861,6 +861,21 @@ pub struct MicrovmImageVersion {
     pub builds: BTreeMap<String, MicrovmImageBuild>,
 }
 
+impl MicrovmImageVersion {
+    /// The `stateReason` every response reporting this version answers with.
+    ///
+    /// "The reason for the current state. For example, one or more builds failed": a
+    /// version's state is the settlement of its per-target builds, so the reason it
+    /// reports is the reason one of those builds recorded, and a version none of whose
+    /// builds recorded one has nothing to report. The ONE projection of the stored
+    /// reason, so the read of a version and a listing row for it cannot disagree.
+    pub fn reported_state_reason(&self) -> Option<String> {
+        self.builds
+            .values()
+            .find_map(|build| build.state_reason.clone())
+    }
+}
+
 /// A MicroVM image, keyed in [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::images`] by its name.
 #[derive(Debug)]
 pub struct MicrovmImage {

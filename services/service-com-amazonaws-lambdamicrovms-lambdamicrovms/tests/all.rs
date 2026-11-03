@@ -31,6 +31,8 @@ mod image_read_authorization;
 mod image_request_validation;
 #[path = "all/image_version_listing.rs"]
 mod image_version_listing;
+#[path = "all/image_version_read_path.rs"]
+mod image_version_read_path;
 #[path = "all/list_tags_read_path.rs"]
 mod list_tags_read_path;
 #[path = "all/managed_base_image_catalogue.rs"]
