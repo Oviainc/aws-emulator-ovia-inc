@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetView
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetView`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reads the stored views the caller's `ViewArns` name out of
+//! `crate::state`, in the order the request named them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetView::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every ARN in the batch is AUTHORIZED before any detail is reported: a caller is
+//! permitted to read a view per that view's own ARN, so an ARN this account holds no
+//! view for — one outside this service's ARN namespace, one that is not an ARN at all,
+//! or a well-formed view ARN that names nothing — cannot be authorized, and the WHOLE
+//! call is refused with the modelled `UnauthorizedException` (HTTP 401). The batch is
+//! therefore all-or-nothing: it never answers partial results, and never discloses
+//! which of the ARNs the account does not hold.
+//!
+//! `Errors` reports an ARN the caller IS authorized for whose details could not be
+//! retrieved. Resolving an authorized ARN here is a lookup in the same store the view
+//! lives in, so it cannot resolve and then fail: the list is empty on every answer
+//! this emulator gives.
+//!
+//! Like `GetView`, a view is resolved from the ARN the caller names and NOT from the
+//! Region the request was signed for: a view ARN carries its own Region, so it
+//! identifies exactly one view wherever it is read from.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +125,19 @@ impl From<BatchGetViewErrorModeled> for BatchGetViewError {
     }
 }
 
+/// Refuse the whole batch because one of its ARNs names no view this account holds:
+/// the modelled `UnauthorizedException`, HTTP 401.
+///
+/// The refusal carries nothing from the request — not the ARN at fault, not how many
+/// of them failed — because which ARNs an account holds is exactly what a principal
+/// that is not permitted to read them may not learn.
+fn unauthorized() -> BatchGetViewError {
+    BatchGetViewErrorModeled::UnauthorizedException(UnauthorizedException {
+        message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
+}
+
 /// The `BatchGetView` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,20 +172,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetView` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetViewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetView"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetViewErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Resource Explorer store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut guard = store.lock();
+        // A read, so the only write is the index lifecycle the clock already owed at
+        // `now` — a deleted index takes its Region's views with it.
+        guard.settle(now);
+
+        // `ViewArns` is not `@required`: a request that names no view asks for no
+        // details, so the batch is empty rather than refused. For a list that IS
+        // present, the modelled length bounds are enforced before this handler runs,
+        // so the work below is capped at the modelled maximum batch size.
+        let requested = input.view_arns.unwrap_or_default();
+        let mut views = Vec::new();
+        for arn in &requested {
+            // Authorize first, report after: one unheld ARN fails the whole batch, so
+            // no detail of the views that DID resolve reaches an answer.
+            let Some(view) = guard.views.get(arn) else {
+                return Err(unauthorized());
+            };
+            views.push(view.to_wire());
+        }
+        Ok(BatchGetViewOutput {
+            views: Some(views),
+            // Every authorized ARN resolved, which is the only outcome this store can
+            // produce; the member is present and empty rather than absent, so a caller
+            // reads "no ARN failed" instead of "nothing was said about failures".
+            errors: Some(Vec::new()),
+        })
     }
 }
