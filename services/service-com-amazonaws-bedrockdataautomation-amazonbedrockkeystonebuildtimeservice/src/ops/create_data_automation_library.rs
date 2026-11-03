@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataAutomationLibrary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataAutomationLibrary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataAutomationLibrary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataAutomationLibrary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataAutomationLibraryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataAutomationLibrary"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDataAutomationLibraryError::Modeled(
+                CreateDataAutomationLibraryErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An `@idempotencyToken` replay returns the library the first call created
+        // rather than creating a second one, and answers about the record that is
+        // STORED — which is what a second call reports.
+        let created_at = crate::state::now();
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(arn) = store.library_create_idempotency.get(token).cloned() {
+                if let Some(record) = store.libraries.get(&arn) {
+                    return Ok(CreateDataAutomationLibraryOutput {
+                        library_arn: Some(record.library_arn.clone()),
+                        status: Some(record.to_library().status),
+                    });
+                }
+            }
+        }
+
+        // `libraryName` is the user-visible identity of a library, so a second
+        // library under a name already taken is a conflict. The refusal is the
+        // service's FIXED sentence for this resource, single-homed in `crate::state`:
+        // it interpolates nothing, so the requested `@sensitive` name is not disclosed
+        // back to the caller.
+        if store.library_names.contains_key(&input.library_name) {
+            return Err(CreateDataAutomationLibraryErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::LIBRARY_NAME_CONFLICT_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: past the quota a create is refused rather than
+        // allowed to grow the state without end. Checked BEFORE any insert, so a
+        // refused call leaves nothing behind.
+        if store.libraries.len() >= crate::state::LIBRARY_QUOTA {
+            return Err(
+                CreateDataAutomationLibraryErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the quota of {} data automation libraries per account has been \
+                             reached; delete a library before creating another",
+                            crate::state::LIBRARY_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let (kms_key_id, kms_encryption_context) = match input.encryption_configuration {
+            Some(config) => (Some(config.kms_key_id), config.kms_encryption_context),
+            None => (None, None),
+        };
+        let sequence = store.take_arn_sequence();
+        let record = crate::state::DataAutomationLibraryRecord {
+            library_arn: crate::state::mint_data_automation_library_arn(
+                &crate::state::request_region(ctx),
+                created_at,
+                sequence,
+            ),
+            library_name: input.library_name.clone(),
+            library_description: input.library_description,
+            creation_time: created_at,
+            // A create stands the library up with no entity types in it; they arrive
+            // through an ingestion job, never through the create.
+            entity_types: Vec::new(),
+            kms_key_id,
+            kms_encryption_context,
+            tags: input.tags.unwrap_or_default(),
+        };
+        let arn = record.library_arn.clone();
+
+        store.library_names.insert(input.library_name, arn.clone());
+        if let Some(token) = input.client_token {
+            store.library_create_idempotency.insert(token, arn.clone());
+        }
+        store.libraries.insert(arn.clone(), record);
+
+        // Build the response from the record that is now PERSISTED, not from the
+        // request: a later GetDataAutomationLibrary must answer with exactly these
+        // values.
+        let stored = store.libraries.get(&arn).ok_or_else(|| {
+            CreateDataAutomationLibraryError::Modeled(
+                CreateDataAutomationLibraryErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the data automation library could not be read back after it was \
+                             stored"
+                                .to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        Ok(CreateDataAutomationLibraryOutput {
+            library_arn: Some(stored.library_arn.clone()),
+            status: Some(stored.to_library().status),
+        })
     }
 }

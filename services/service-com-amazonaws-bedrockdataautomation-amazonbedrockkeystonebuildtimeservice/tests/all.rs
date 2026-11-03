@@ -15,6 +15,8 @@
 mod blueprint_lifecycle;
 #[path = "all/blueprint_optimization.rs"]
 mod blueprint_optimization;
+#[path = "all/data_automation_library_lifecycle.rs"]
+mod data_automation_library_lifecycle;
 #[path = "all/data_automation_project_lifecycle.rs"]
 mod data_automation_project_lifecycle;
 #[path = "all/data_automation_project_listing.rs"]

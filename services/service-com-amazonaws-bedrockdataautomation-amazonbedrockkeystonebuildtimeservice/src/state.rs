@@ -6,7 +6,9 @@
 //! (`CreateBlueprint`, `GetBlueprint`, `ListBlueprints`, `UpdateBlueprint`,
 //! `DeleteBlueprint`, `CreateBlueprintVersion`) share and the DataAutomationProject
 //! record `CreateDataAutomationProject`, `GetDataAutomationProject` and
-//! `UpdateDataAutomationProject` share, and the blueprint-optimization job record
+//! `UpdateDataAutomationProject` share, the DataAutomationLibrary record
+//! `CreateDataAutomationLibrary` mints and `GetDataAutomationLibrary` reports,
+//! and the blueprint-optimization job record
 //! `InvokeBlueprintOptimizationAsync` mints and `GetBlueprintOptimizationStatus`
 //! reports, plus
 //! the few helpers more than one of those handlers needs: minting a resource ARN,
@@ -21,8 +23,9 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Blueprint, BlueprintItem, BlueprintOptimizationOutputConfiguration,
     BlueprintOptimizationSample, BlueprintSummary, CustomOutputConfiguration,
-    DataAutomationLibraryConfiguration, DataAutomationLibraryItem, DataAutomationProject,
-    DataAutomationProjectSummary, OverrideConfiguration, StandardOutputConfiguration, Tag,
+    DataAutomationLibrary, DataAutomationLibraryConfiguration, DataAutomationLibraryItem,
+    DataAutomationProject, DataAutomationProjectSummary, EntityTypeInfo, OverrideConfiguration,
+    StandardOutputConfiguration, Tag,
 };
 
 /// How a project's STORED configuration becomes the EFFECTIVE configuration a read
@@ -581,6 +584,84 @@ impl BlueprintRecord {
     }
 }
 
+/// The status a DataAutomationLibrary carries from the moment its create returns.
+///
+/// Source: `smithy_query(shape="DataAutomationLibraryStatus")` -> `["ACTIVE",
+/// "DELETING"]`. A library is a container the service stands up with nothing to
+/// provision, so the create answers the ready status and every later read of that
+/// library answers the same: there is no non-terminal status for the clock to move
+/// it out of. `DELETING` is the other half of the pair and belongs to the teardown
+/// path, not to a create.
+pub const LIBRARY_ACTIVE: &str = "ACTIVE";
+
+/// How many DataAutomationLibraries the store holds before
+/// `CreateDataAutomationLibrary` refuses with the modelled
+/// `ServiceQuotaExceededException` (HTTP 402). Same reasoning as
+/// [`BLUEPRINT_QUOTA`]: Bedrock Data Automation publishes an adjustable quota on
+/// libraries per account per Region and this emulator models neither Service Quotas
+/// nor an account's adjustments, so this is the emulator's OWN bound on the store.
+pub const LIBRARY_QUOTA: usize = 1_000;
+
+/// What `CreateDataAutomationLibrary` answers when some live library already holds
+/// the `libraryName` it was handed.
+///
+/// AWS words this conflict as a full sentence pair telling the caller what to do
+/// next, rather than in the terse form the blueprint and project conflicts take
+/// ([`BLUEPRINT_NAME_CONFLICT_MESSAGE`], [`PROJECT_NAME_CONFLICT_MESSAGE`]) — so it
+/// is its own sentence here, not a reuse of theirs. The text is FIXED and
+/// interpolates nothing: `DataAutomationLibraryName` is `@sensitive`
+/// (`smithy_query(shape="DataAutomationLibraryName")`), so the requested name is not
+/// handed back to the caller.
+pub const LIBRARY_NAME_CONFLICT_MESSAGE: &str =
+    "A library with this name already exists. Please choose a different name.";
+
+/// [`BLUEPRINT_ARN_NOT_FOUND_MESSAGE`] for a library: what this service answers when
+/// a `libraryArn` it was handed names no DataAutomationLibrary this store holds. The
+/// resource kind is named the way this service names it in a refusal (`Library`), and
+/// nothing is taken from the request.
+pub const LIBRARY_ARN_NOT_FOUND_MESSAGE: &str = "Library Arn not found.";
+
+/// A stored DataAutomationLibrary: exactly the members the modeled
+/// `DataAutomationLibrary` shape carries, plus the tag list the create accepted.
+///
+/// No status member: the only status a stored library has is [`LIBRARY_ACTIVE`]
+/// (see that constant), so there is nothing per-record to keep.
+#[derive(Debug, Clone)]
+pub struct DataAutomationLibraryRecord {
+    pub library_arn: String,
+    pub library_name: String,
+    pub library_description: Option<String>,
+    pub creation_time: ::aws_smithy_types::DateTime,
+    /// The entity types this library HOLDS, which is what a read reports. A create
+    /// stands the library up empty; entities arrive through an ingestion job.
+    pub entity_types: Vec<EntityTypeInfo>,
+    pub kms_key_id: Option<String>,
+    pub kms_encryption_context: Option<HashMap<String, String>>,
+    pub tags: Vec<Tag>,
+}
+
+impl DataAutomationLibraryRecord {
+    /// Project the record onto the modeled `DataAutomationLibrary` shape a read
+    /// serves.
+    ///
+    /// INFALLIBLE: every member of the projection is a member of the record, so no
+    /// request can make this fail and no handler needs an unwrap for it.
+    pub fn to_library(&self) -> DataAutomationLibrary {
+        DataAutomationLibrary {
+            library_arn: self.library_arn.clone(),
+            creation_time: self.creation_time,
+            library_name: self.library_name.clone(),
+            library_description: self.library_description.clone(),
+            status: LIBRARY_ACTIVE.to_string(),
+            // What the record HOLDS, so a library standing up empty reports an empty
+            // list rather than inventing an entity type it was never given.
+            entity_types: Some(self.entity_types.clone()),
+            kms_key_id: self.kms_key_id.clone(),
+            kms_encryption_context: self.kms_encryption_context.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-bedrockdataautomation-amazonbedrockkeystonebuildtimeservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState {
@@ -602,6 +683,14 @@ pub struct ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeservic
     /// `CreateDataAutomationProject` `clientToken` -> the ARN that call created, so
     /// an `@idempotencyToken` replay returns the original project.
     pub project_create_idempotency: HashMap<String, String>,
+    /// Every stored DataAutomationLibrary, keyed by its ARN.
+    pub libraries: HashMap<String, DataAutomationLibraryRecord>,
+    /// `libraryName` -> `libraryArn`; the uniqueness index behind
+    /// `CreateDataAutomationLibrary`'s `ConflictException`.
+    pub library_names: HashMap<String, String>,
+    /// `CreateDataAutomationLibrary` `clientToken` -> the ARN that call created, so
+    /// an `@idempotencyToken` replay returns the original library.
+    pub library_create_idempotency: HashMap<String, String>,
     /// Every blueprint-optimization job `InvokeBlueprintOptimizationAsync` has
     /// accepted, keyed by the `invocationArn` it minted for it, and read back by
     /// `GetBlueprintOptimizationStatus`. Bounded at [`OPTIMIZATION_JOB_QUOTA`] by the
@@ -740,6 +829,32 @@ pub fn mint_project_arn(
 ) -> String {
     let id = format!("{:08x}-{:016x}", created_at.subsec_nanos(), sequence);
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("data-automation-project/{id}"))
+}
+
+/// Mint a fresh DataAutomationLibrary ARN for `region`.
+///
+/// `smithy_query(shape="DataAutomationLibrary")` constrains `libraryArn` to
+/// `^arn:aws(|-cn|-iso|-iso-[a-z]|-us-gov):bedrock:[a-zA-Z0-9-]*:[0-9]{12}:data-automation-library/[a-zA-Z0-9-]{12,36}$`
+/// with `@length(..128)`, so the resource id is 12..36 characters of
+/// `[a-zA-Z0-9-]` — the same id space [`mint_blueprint_arn`] mints into, under this
+/// service's library resource type, so the three share one id format and one
+/// uniqueness argument (the store's sequence number, never rolled back and never
+/// truncated). Unlike the project pattern this one admits no `aws` account field, and
+/// `region` is reduced to a region label through the shared
+/// `service_common::arn::region_label` grammar — non-empty, at most 20 characters,
+/// only `[a-z0-9-]` — so the whole value stays inside the pattern and well under 128
+/// characters whatever a caller signs for.
+pub fn mint_data_automation_library_arn(
+    region: &str,
+    created_at: ::aws_smithy_types::DateTime,
+    sequence: u64,
+) -> String {
+    let id = format!("{:08x}-{:016x}", created_at.subsec_nanos(), sequence);
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION),
+        &format!("data-automation-library/{id}"),
+    )
 }
 
 /// Mint a fresh blueprint-optimization invocation ARN for `region`.
