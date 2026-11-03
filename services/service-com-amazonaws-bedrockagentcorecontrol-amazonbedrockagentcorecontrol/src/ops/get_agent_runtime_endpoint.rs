@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAgentRuntimeEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAgentRuntimeEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAgentRuntimeEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one endpoint of an agent runtime from the record
+//! `CreateAgentRuntimeEndpoint` persisted in [`crate::state`]: its own id and name, the
+//! runtime version it is pinned to, the version it is actually serving, the status the
+//! clock resolves and the instants it was created and last updated. A reporting
+//! operation, so it writes nothing.
+//!
+//! The endpoint is addressed only THROUGH its runtime: a runtime this account does not
+//! hold is the modelled 404 for the agent, and an endpoint that runtime does not hold
+//! is the modelled 404 for the endpoint.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +176,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAgentRuntimeEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAgentRuntimeEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAgentRuntimeEndpoint"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAgentRuntimeEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent runtime store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // An endpoint is addressed only THROUGH its runtime, so an unknown runtime is
+        // reported as the agent it is, and an endpoint the runtime does not hold as
+        // the endpoint.
+        let runtime = store.agent_runtimes.get(&input.agent_runtime_id).ok_or_else(|| {
+            GetAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::agent_not_found_for_endpoint(&input.agent_runtime_id),
+            )
+        })?;
+        let endpoint = runtime.endpoints.get(&input.endpoint_name).ok_or_else(|| {
+            GetAgentRuntimeEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::agent_runtime_endpoint_not_found(&input.endpoint_name),
+            )
+        })?;
+
+        Ok(GetAgentRuntimeEndpointOutput {
+            // The version the endpoint is SERVING: the one it pins once the
+            // clock-owed transition onto it is due, and until then whatever it served
+            // before — nothing at all for an endpoint that was only just created.
+            live_version: endpoint.live_version_at(now),
+            target_version: Some(endpoint.target_version_string()),
+            agent_runtime_endpoint_arn: endpoint.endpoint_arn.clone(),
+            agent_runtime_arn: runtime.agent_runtime_arn.clone(),
+            description: endpoint.description.clone(),
+            status: endpoint.status_at(now).to_string(),
+            created_at: crate::state::timestamp(endpoint.created_at),
+            last_updated_at: crate::state::timestamp(endpoint.last_updated_at),
+            failure_reason: endpoint.failure_reason.clone(),
+            name: endpoint.endpoint_name.clone(),
+            id: endpoint.endpoint_id.clone(),
+        })
     }
 }

@@ -6,8 +6,10 @@
 //!
 //! * the agent runtime (`/runtimes/`): one [`AgentRuntimeRecord`] per
 //!   `agentRuntimeId`, each holding every version that has ever been published
-//!   for it, so `GetAgentRuntime?version=`, `ListAgentRuntimes` and
-//!   `ListAgentRuntimeVersions` all read one store;
+//!   for it and the endpoints created on it ([`AgentRuntimeEndpointRecord`],
+//!   each pinned to one version), so `GetAgentRuntime?version=`,
+//!   `ListAgentRuntimes`, `ListAgentRuntimeVersions` and every read of an
+//!   endpoint all read one store;
 //! * the gateway (`/gateways/`): one [`GatewayRecord`] per `gatewayId`, each
 //!   holding the targets configured on it ([`GatewayTargetRecord`]), because a
 //!   target is addressed only through its gateway;
@@ -539,6 +541,12 @@ pub struct AgentRuntimeRecord {
     /// number for different configuration.
     pub highest_version_published: u32,
     pub versions: BTreeMap<u32, AgentRuntimeVersionRecord>,
+    /// The endpoints created on this runtime, keyed by `name` — the one
+    /// identifier every runtime-endpoint route addresses an endpoint by, and
+    /// what its ARN ends in. An endpoint is reached only THROUGH its runtime, so
+    /// it is held here rather than in a map of its own: a runtime and its
+    /// endpoints cannot drift apart, and the endpoints go when the runtime does.
+    pub endpoints: BTreeMap<String, AgentRuntimeEndpointRecord>,
     pub tags: BTreeMap<String, String>,
     pub workload_identity_details: Option<WorkloadIdentityDetails>,
 }
@@ -581,6 +589,142 @@ impl AgentRuntimeRecord {
             last_updated_at: timestamp(version.last_updated_at),
             status: version.status_at(now).to_string(),
         })
+    }
+}
+
+/// How many endpoints ONE agent runtime will hold.
+///
+/// `CreateAgentRuntimeEndpoint` models `ServiceQuotaExceededException` (HTTP
+/// 402) for exceeding a quota, and the real service caps endpoints per runtime
+/// with one. The number is NOT a fidelity claim about the published quota: it is
+/// the emulator's own ceiling, set generously so no realistic workflow meets it,
+/// so that a caller looping on create cannot grow this process's memory without
+/// bound.
+pub const MAX_ENDPOINTS_PER_AGENT_RUNTIME: usize = 1_000;
+
+/// How long a freshly created agent runtime endpoint stays `CREATING` before
+/// the clock owes it `READY`, counted from the instant the runtime version it
+/// fronts is itself ready.
+///
+/// AWS documents no duration for this transition, so the span is chosen: long
+/// enough that a caller acting straight after the create still observes the
+/// transient status, short enough to keep a client script quick.
+pub const AGENT_RUNTIME_ENDPOINT_SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// The modelled not-found error for an agent runtime — or for a VERSION of one —
+/// that an ENDPOINT operation could not resolve: the id the lookup ran for
+/// ("Agent with agentId: <id> not found").
+///
+/// The endpoint family words a runtime it cannot resolve in this shorter
+/// sentence than the runtime family's own [`agent_runtime_not_found`], and
+/// reports the agent rather than the version even when it is a version that is
+/// missing: an endpoint names a version only to pin one, so there is one
+/// sentence for "no such agent to put an endpoint on".
+pub fn agent_not_found_for_endpoint(agent_runtime_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Agent with agentId: {agent_runtime_id} not found")),
+    }
+}
+
+/// The modelled not-found error for an endpoint the named agent runtime does
+/// not hold.
+///
+/// The runtime's own absence is reported by [`agent_runtime_not_found`]; this is
+/// for a runtime that IS held and an endpoint name it does not carry, so the
+/// sentence names the endpoint rather than the agent. Shared by the handlers
+/// rather than written per operation, so one endpoint cannot be reported missing
+/// in two different sentences.
+pub fn agent_runtime_endpoint_not_found(endpoint_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Agent endpoint with name {endpoint_name} not found.")),
+    }
+}
+
+/// How this service words the conflict a SECOND endpoint under one name on one
+/// agent runtime is.
+///
+/// The name is what an endpoint's route and its ARN address it by, so one
+/// runtime holds one endpoint per name: a repeat is a conflict rather than a
+/// second endpoint later reads cannot tell apart. The sentence names no
+/// endpoint: this service reports the clash by class, and the name the caller
+/// asked for is its own request's.
+pub const AGENT_RUNTIME_ENDPOINT_NAME_TAKEN: &str =
+    "An endpoint with the specified name already exists. Check the request and try again.";
+
+/// How this service words the endpoint ceiling of one agent runtime, in the
+/// modelled `ServiceQuotaExceededException`.
+pub fn agent_runtime_endpoint_quota_met(agent_runtime_id: &str) -> String {
+    format!(
+        "agent runtime {agent_runtime_id} already holds the maximum of \
+         {MAX_ENDPOINTS_PER_AGENT_RUNTIME} endpoints"
+    )
+}
+
+/// One endpoint of an agent runtime: the stable name callers invoke, the runtime
+/// version it points to, the version it is actually serving, and the status the
+/// clock drives.
+///
+/// The endpoint PINS a version: the runtime publishing another version does not
+/// move an endpoint onto it, so the version lives here rather than being read
+/// off the runtime at reporting time. The runtime's own id, name and ARN are NOT
+/// copied in — they are read from the runtime that holds the record, so one
+/// resource is never spelled two ways.
+#[derive(Debug, Clone)]
+pub struct AgentRuntimeEndpointRecord {
+    /// The endpoint's own identifier (`AgentRuntimeEndpointId`), minted at
+    /// create and stable for the endpoint's life.
+    pub endpoint_id: String,
+    pub endpoint_name: String,
+    pub endpoint_arn: String,
+    pub description: Option<String>,
+    /// The runtime version this endpoint points at, as a number; rendered like
+    /// [`AgentRuntimeVersionRecord::version_string`] does.
+    pub target_version: u32,
+    /// The version the endpoint is serving UNTIL
+    /// [`settles_at`](Self::settles_at) passes — `None` for an endpoint that has
+    /// never finished a transition, which serves nothing yet.
+    pub live_version: Option<u32>,
+    pub created_at: SystemTime,
+    pub last_updated_at: SystemTime,
+    /// The status until [`settles_at`](Self::settles_at) passes.
+    pub transient_status: String,
+    /// The status from [`settles_at`](Self::settles_at) onwards.
+    pub settled_status: String,
+    /// The instant the transient status is owed its transition. Stored, never
+    /// slept on: a read materialises the transition the clock already made due.
+    pub settles_at: SystemTime,
+    pub tags: BTreeMap<String, String>,
+    pub failure_reason: Option<String>,
+}
+
+impl AgentRuntimeEndpointRecord {
+    /// The status this endpoint reports at `now`: the transient one until the
+    /// transition the clock owes comes due, the settled one afterwards.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        if now < self.settles_at {
+            &self.transient_status
+        } else {
+            &self.settled_status
+        }
+    }
+
+    /// The version this endpoint points at, as the wire renders it
+    /// (`AgentRuntimeVersion`, pattern `^([1-9][0-9]{0,4})$`).
+    pub fn target_version_string(&self) -> String {
+        self.target_version.to_string()
+    }
+
+    /// The version this endpoint is SERVING at `now`.
+    ///
+    /// An endpoint serves the version it points to only once the transition onto
+    /// it has come due; until then it serves whatever it served before, which is
+    /// nothing at all for an endpoint that was only just created.
+    pub fn live_version_at(&self, now: SystemTime) -> Option<String> {
+        if now < self.settles_at {
+            self.live_version.map(|version| version.to_string())
+        } else {
+            Some(self.target_version_string())
+        }
     }
 }
 
@@ -3038,6 +3182,7 @@ impl ConfigurationBundleRecord {
 /// Every map here is caller-driven growth, so every one is bounded:
 /// [`MAX_AGENT_RUNTIMES`] caps the runtimes (and with them the 1:1 name index),
 /// [`MAX_VERSIONS_PER_RUNTIME`] caps the versions one runtime accumulates,
+/// [`MAX_ENDPOINTS_PER_AGENT_RUNTIME`] the endpoints one runtime holds,
 /// [`MAX_GATEWAYS`] caps the gateways (and with them their 1:1 name index),
 /// [`MAX_TARGETS_PER_GATEWAY`] the targets one gateway holds, [`MAX_MEMORIES`]
 /// the memories (and with them their 1:1 name index),
@@ -3109,6 +3254,16 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::idempotency`] in the order they were first recorded,
     /// so the oldest record is the one evicted at the ceiling.
     idempotency_order: VecDeque<String>,
+    /// `<operation>/<clientToken>` -> the (runtime, endpoint name) that token
+    /// first produced, so a replayed `CreateAgentRuntimeEndpoint` answers with
+    /// its first result instead of adding a second endpoint. Separate from
+    /// [`Self::idempotency`] because the record is validated against the
+    /// endpoints of a runtime rather than against its versions; the key carries
+    /// the operation for the same reason as there.
+    runtime_endpoint_idempotency: BTreeMap<String, (String, String)>,
+    /// The keys of [`Self::runtime_endpoint_idempotency`] in the order they were
+    /// first recorded, so the oldest record is the one evicted at the ceiling.
+    runtime_endpoint_idempotency_order: VecDeque<String>,
     /// `<operation>/<clientToken>` -> the (gateway, target) that token first
     /// produced — `None` for a gateway create, which produced no target — so a
     /// replayed `CreateGateway` / `CreateGatewayTarget` answers with its first
@@ -3297,11 +3452,90 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
     /// Drop the idempotency records naming a runtime that no longer exists.
     ///
     /// Called from the delete path: such a record can never replay anything
-    /// again, and nothing else would ever reclaim it.
+    /// again, and nothing else would ever reclaim it. The endpoint records
+    /// naming it go with them: the endpoints were held on the runtime, so they
+    /// are gone too.
     pub fn forget_client_tokens_for(&mut self, agent_runtime_id: &str) {
         self.idempotency.retain(|_, (id, _)| id != agent_runtime_id);
         let live = &self.idempotency;
         self.idempotency_order.retain(|token| live.contains_key(token));
+        self.runtime_endpoint_idempotency
+            .retain(|_, (id, _)| id != agent_runtime_id);
+        let live = &self.runtime_endpoint_idempotency;
+        self.runtime_endpoint_idempotency_order
+            .retain(|token| live.contains_key(token));
+    }
+
+    /// Mint an `agentRuntimeEndpointId` for `endpoint_name` that no endpoint of
+    /// `agent_runtime_id` holds: the endpoint's name + `-` + 10 alphanumerics,
+    /// per `AgentRuntimeEndpointId`'s pattern
+    /// `^[a-zA-Z][a-zA-Z0-9_]{0,99}-[a-zA-Z0-9]{10}$`.
+    pub fn mint_runtime_endpoint_id(
+        &mut self,
+        agent_runtime_id: &str,
+        endpoint_name: &str,
+        at: SystemTime,
+    ) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = format!(
+                "{endpoint_name}-{}",
+                suffix_for(
+                    &format!("{agent_runtime_id}/{endpoint_name}"),
+                    self.mint_counter,
+                    at
+                )
+            );
+            let taken = self.agent_runtimes.get(agent_runtime_id).is_some_and(|runtime| {
+                runtime
+                    .endpoints
+                    .values()
+                    .any(|endpoint| endpoint.endpoint_id == candidate)
+            });
+            if !taken {
+                return candidate;
+            }
+        }
+    }
+
+    /// The (runtime, endpoint name) a previous request to `operation` carrying
+    /// this `clientToken` produced, if the record is still held and the endpoint
+    /// still exists.
+    pub fn replayed_runtime_endpoint_result(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<(String, String)> {
+        let (agent_runtime_id, endpoint_name) = self
+            .runtime_endpoint_idempotency
+            .get(&token_key(operation, client_token?))?;
+        self.agent_runtimes
+            .get(agent_runtime_id)?
+            .endpoints
+            .contains_key(endpoint_name)
+            .then(|| (agent_runtime_id.clone(), endpoint_name.clone()))
+    }
+
+    /// Record what a `clientToken` produced for `operation`, evicting the oldest
+    /// record once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held. An evicted token is
+    /// indistinguishable from one whose idempotency window has passed: the next
+    /// request carrying it is served as a fresh one.
+    pub fn remember_runtime_endpoint_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        agent_runtime_id: &str,
+        endpoint_name: &str,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        remember_token(
+            &mut self.runtime_endpoint_idempotency,
+            &mut self.runtime_endpoint_idempotency_order,
+            token_key(operation, &token),
+            (agent_runtime_id.to_string(), endpoint_name.to_string()),
+        );
     }
 
     /// Mint a `gatewayId` for `name` that no stored gateway holds: the name,
@@ -4265,6 +4499,17 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// `AgentRuntimeArn`'s pattern.
 pub fn runtime_arn(region: &str, agent_runtime_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("runtime/{agent_runtime_id}"))
+}
+
+/// `arn:aws:bedrock-agentcore:{region}:{account}:runtime/{agentRuntimeId}/runtime-endpoint/{name}`
+/// — `AgentRuntimeEndpointArn`'s pattern, which nests the endpoint under the
+/// runtime that holds it and ends in the endpoint's name.
+pub fn runtime_endpoint_arn(region: &str, agent_runtime_id: &str, endpoint_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("runtime/{agent_runtime_id}/runtime-endpoint/{endpoint_name}"),
+    )
 }
 
 /// The workload identity minted alongside a runtime, in the token vault's

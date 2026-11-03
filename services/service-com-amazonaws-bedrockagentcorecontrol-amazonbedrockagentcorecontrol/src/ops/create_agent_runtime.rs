@@ -326,6 +326,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             latest_version: version.version,
             highest_version_published: version.version,
             versions: [(version.version, version)].into_iter().collect(),
+            // A runtime is created with no endpoints: each one is its own
+            // `CreateAgentRuntimeEndpoint` call.
+            endpoints: Default::default(),
             tags: crate::state::sorted_map(input.tags),
             workload_identity_details: output.workload_identity_details.clone(),
         };
