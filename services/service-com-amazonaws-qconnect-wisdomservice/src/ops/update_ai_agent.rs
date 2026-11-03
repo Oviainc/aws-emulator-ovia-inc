@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAIAgent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAIAgent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAIAgent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the WORKING COPY of the AI agent the route names: the required
+//! `visibilityStatus` and any optional member the request carries replace the stored
+//! values, a member it carries none of keeps the value it had, and the members the SERVICE
+//! owns — the id, the ARN, the name, the type, the origin, the status, the tags and the
+//! version the agent has published — are not this request's to change. The answer is
+//! rendered out of the written record, so what this call reports is what every later
+//! `GetAIAgent` reports.
+//!
+//! An `assistantId` or an `aiAgentId` naming nothing this account holds — including a
+//! numbered version qualifier, which names a published snapshot rather than the working
+//! copy — is the modelled `ResourceNotFoundException` (HTTP 404); a `configuration` that
+//! is not the union member the STORED agent's `type` is configured through is refused with
+//! the modelled `ValidationException`, as is a write to one of the built-in agents the
+//! service provisions with the assistant; and a replayed `clientToken` answers with the
+//! agent's record as it then stands, writing nothing a second time.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +99,32 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> UpdateAIAgentError {
+    UpdateAIAgentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400).
+fn validation(message: String) -> UpdateAIAgentError {
+    UpdateAIAgentErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled `ConflictException` (HTTP 409).
+fn conflict(message: &str) -> UpdateAIAgentError {
+    UpdateAIAgentErrorModeled::ConflictException(ConflictException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,18 +198,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAIAgent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAIAgentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAIAgent"))
+        // Modeled constraints (`description`'s length and pattern, the `visibilityStatus`
+        // enumeration and both label patterns) are already refused BEFORE this handler
+        // runs, so reaching here means the input satisfies every one of them. Nothing in
+        // this operation mints an ARN, so the request's region is not read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("UpdateAIAgent")
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An AI agent exists only inside an assistant, so the parent is resolved first: an
+        // update naming an assistant this account does not hold is not found, whatever
+        // else the request carries.
+        let Some(assistant) = store.assistant(&input.assistant_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_ASSISTANT_NOT_FOUND,
+                &input.assistant_id,
+            ));
+        };
+        let assistant_id = assistant.assistant_id.clone();
+
+        // The record this update writes: the agent's working copy. A label naming a
+        // numbered VERSION names a published snapshot rather than the working copy, and no
+        // snapshot is what an update changes, so such a label names nothing to write.
+        let Some(agent) = store.ai_agent(&assistant_id, &input.ai_agent_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_AI_AGENT_NOT_FOUND,
+                &input.ai_agent_id,
+            ));
+        };
+        let ai_agent_id = agent.ai_agent_id.clone();
+        // An agent's `type` is fixed at create and this request carries none, so the
+        // configuration below is held to the type the STORED record was created with.
+        let agent_type = agent.r#type.clone();
+        let origin = agent.origin.clone();
+
+        // The built-in agents the service provisions with the assistant are the SERVICE's
+        // records, not the caller's, so they are not writable through this API.
+        if origin == crate::state::AI_AGENT_ORIGIN_SYSTEM {
+            return Err(validation(
+                crate::state::message_system_ai_agent_not_modifiable(),
+            ));
+        }
+
+        if let Some(configuration) = input.configuration.as_ref() {
+            // `configuration` is a union whose member says which AI agent type it
+            // configures, so a configuration for another type than the stored agent's is a
+            // configuration that agent cannot run — the rule a create holds the pair it
+            // carries to, applied to the type this agent already has.
+            if crate::state::ai_agent_configuration_type(configuration) != agent_type {
+                return Err(validation(crate::state::message_configuration_type_mismatch(
+                    &agent_type,
+                )));
+            }
+            // The resulting configuration is bounded exactly as a created one is: the
+            // model puts no maximum on the lists a configuration carries, so without a
+            // ceiling one caller could leave an arbitrarily long configuration in this
+            // process's heap.
+            if crate::state::ai_agent_configuration_entries(configuration)
+                > crate::state::MAX_AI_AGENT_CONFIGURATION_ENTRIES
+            {
+                return Err(validation(
+                    crate::state::message_too_many_configuration_entries(),
+                ));
+            }
+        }
+
+        // What this update's `@idempotencyToken` identifies: every member the write below
+        // applies. The configuration is fingerprinted through its `Debug` rendering, which
+        // is stable for one request.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.visibility_status.clone(),
+            input.description.clone().unwrap_or_default(),
+            format!("{:?}", input.configuration),
+        ]);
+
+        // A replayed `@idempotencyToken` answers with the agent's record as it now stands,
+        // writing nothing a second time, while the same token carrying a DIFFERENT request
+        // is the modelled idempotency conflict — the one rule this service decides
+        // retry-or-conflict by. The token is scoped to this operation and this agent, so
+        // the same token on another call is another request. A token the store has
+        // forgotten (its bound keeps the most recent ones) replays as the fresh request it
+        // then is.
+        let token_scope = format!("{}/{assistant_id}/{ai_agent_id}", Self::NAME);
+        match store.replayed_create(&token_scope, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Conflict => {
+                return Err(conflict(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT))
+            }
+            crate::state::Replay::Retry(_) => {
+                if let Some(agent) = store.ai_agent(&assistant_id, &ai_agent_id) {
+                    return Ok(UpdateAIAgentOutput {
+                        ai_agent: Some(agent.to_ai_agent_data()),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
+        }
+
+        // Nothing is refused past this point, so the record is written once: the member
+        // this request requires replaces the stored one, an optional member the request
+        // supplied replaces the stored one, and a member it carries none of keeps the value
+        // it had. The agent's identity, its type, its origin, its status, its tags and the
+        // version it has published are not this request's to change.
+        let Some(agent) = store.ai_agent_mut(&assistant_id, &ai_agent_id) else {
+            // Unreachable: the record was resolved above under the same lock.
+            return Err(not_found(
+                crate::state::MESSAGE_AI_AGENT_NOT_FOUND,
+                &input.ai_agent_id,
+            ));
+        };
+        agent.visibility_status = input.visibility_status.clone();
+        if let Some(configuration) = input.configuration.clone() {
+            agent.configuration = configuration;
+        }
+        if let Some(description) = input.description.clone() {
+            agent.description = Some(description);
+        }
+        // The write is what `modifiedTime` reports: when this record last changed.
+        agent.modified_at = now;
+        // Answer out of what was just persisted, so this response and a later `GetAIAgent`
+        // cannot disagree.
+        let data = agent.to_ai_agent_data();
+
+        store.remember_create(
+            &token_scope,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &ai_agent_id,
+        );
+
+        Ok(UpdateAIAgentOutput {
+            ai_agent: Some(data),
+        })
     }
 }

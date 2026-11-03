@@ -47,7 +47,7 @@ use super::resource_tags::{
 /// Agents of type `<TYPE>`" (`smithy_query(query="shape",shape="AIAgentType")` and
 /// `…shape="AIAgentConfiguration"`), written out here rather than imported from the
 /// implementation so the table spans the whole catalog.
-const TYPE_CONFIGURATIONS: [(&str, &str); 9] = [
+pub(crate) const TYPE_CONFIGURATIONS: [(&str, &str); 9] = [
     ("MANUAL_SEARCH", "manualSearchAIAgentConfiguration"),
     (
         "ANSWER_RECOMMENDATION",
@@ -67,65 +67,65 @@ const TYPE_CONFIGURATIONS: [(&str, &str); 9] = [
 
 /// Both values the modelled `VisibilityStatus` declares
 /// (`smithy_query(query="shape",shape="VisibilityStatus")`).
-const VISIBILITY_SAVED: &str = "SAVED";
-const VISIBILITY_PUBLISHED: &str = "PUBLISHED";
+pub(crate) const VISIBILITY_SAVED: &str = "SAVED";
+pub(crate) const VISIBILITY_PUBLISHED: &str = "PUBLISHED";
 
 /// Both values the modelled `Origin` declares
 /// (`smithy_query(query="shape",shape="Origin")`): what the service provisioned, and what
 /// a caller created.
 const ORIGIN_SYSTEM: &str = "SYSTEM";
-const ORIGIN_CUSTOMER: &str = "CUSTOMER";
+pub(crate) const ORIGIN_CUSTOMER: &str = "CUSTOMER";
 
 /// The `Status` an AI agent this service holds reports
 /// (`smithy_query(query="shape",shape="Status")` declares it beside the transient
 /// `CREATE_IN_PROGRESS`, `DELETE_IN_PROGRESS` and the rest).
-const STATUS_ACTIVE: &str = "ACTIVE";
+pub(crate) const STATUS_ACTIVE: &str = "ACTIVE";
 
 /// The published bounds of the members this suite varies in length
 /// (`smithy_query(query="operation",operation="CreateAIAgent")`: `name` and `description`
 /// are both `len 1..255`).
 const NAME_MIN: usize = 1;
 const NAME_MAX: usize = 255;
-const DESCRIPTION_MIN: usize = 1;
-const DESCRIPTION_MAX: usize = 255;
+pub(crate) const DESCRIPTION_MIN: usize = 1;
+pub(crate) const DESCRIPTION_MAX: usize = 255;
 
 /// The only value the modelled `AIAgentAssociationConfigurationType` declares, and both
 /// values of `KnowledgeBaseSearchType`
 /// (`smithy_query(query="shape",shape="AIAgentAssociationConfigurationType")`,
 /// `…shape="KnowledgeBaseSearchType"`).
 const ASSOCIATION_TYPE_KNOWLEDGE_BASE: &str = "KNOWLEDGE_BASE";
-const SEARCH_TYPES: [&str; 2] = ["HYBRID", "SEMANTIC"];
+pub(crate) const SEARCH_TYPES: [&str; 2] = ["HYBRID", "SEMANTIC"];
 
 /// The published maximum of `KnowledgeBaseAssociationConfigurationData$maxResults`
 /// (`smithy_query(query="shape",shape="KnowledgeBaseAssociationConfigurationData")`:
 /// `range 1..100`), and its minimum.
-const MAX_RESULTS_MIN: i64 = 1;
+pub(crate) const MAX_RESULTS_MIN: i64 = 1;
 const MAX_RESULTS_MAX: i64 = 100;
 
 /// The qualifier AWS addresses the unversioned WORKING COPY of a versioned resource by,
 /// which the modelled label pattern admits
 /// (`smithy_query(query="shape",shape="UuidOrArnOrEitherWithQualifier")`: a uuid or an
 /// ARN, each optionally followed by `:[A-Z0-9_$]+`).
-const QUALIFIER_LATEST: &str = "$LATEST";
+pub(crate) const QUALIFIER_LATEST: &str = "$LATEST";
 
 /// The fixed sentences this endpoint answers a resource it does not hold with, and the one
 /// it refuses a replayed token carrying a different request with. Written out here rather
 /// than imported from the implementation, so the assertions pin the answer a client sees.
-const MESSAGE_AI_AGENT_NOT_FOUND: &str = "AI Agent does not exist.";
-const MESSAGE_ASSISTANT_NOT_FOUND: &str = "Assistant does not exist.";
-const MESSAGE_IDEMPOTENCY_CONFLICT: &str = "Idempotency conflict";
+pub(crate) const MESSAGE_AI_AGENT_NOT_FOUND: &str = "AI Agent does not exist.";
+pub(crate) const MESSAGE_ASSISTANT_NOT_FOUND: &str = "Assistant does not exist.";
+pub(crate) const MESSAGE_IDEMPOTENCY_CONFLICT: &str = "Idempotency conflict";
 
 /// A `UuidWithQualifier`-shaped id for a configuration member to name, built from `seed`
 /// so two members of one row never name the same resource
 /// (`smithy_query(query="shape",shape="UuidWithQualifier")`: a lowercase-hex uuid plus an
 /// optional `:<QUALIFIER>`).
-fn configured_id(seed: usize) -> String {
+pub(crate) fn configured_id(seed: usize) -> String {
     format!("{seed:08x}-1a2b-3c4d-5e6f-0123456789ab")
 }
 
 /// `CreateAIAgent` on one assistant, as the model's URI binds it
 /// (`POST /assistants/{assistantId}/aiagents`).
-async fn create_agent(emulator: &Emulator, assistant: &str, body: Value) -> Reply {
+pub(crate) async fn create_agent(emulator: &Emulator, assistant: &str, body: Value) -> Reply {
     emulator
         .send(
             "POST",
@@ -136,7 +136,7 @@ async fn create_agent(emulator: &Emulator, assistant: &str, body: Value) -> Repl
 }
 
 /// `GetAIAgent` (`GET /assistants/{assistantId}/aiagents/{aiAgentId}`).
-async fn get_agent(emulator: &Emulator, assistant: &str, agent: &str) -> Reply {
+pub(crate) async fn get_agent(emulator: &Emulator, assistant: &str, agent: &str) -> Reply {
     emulator
         .send(
             "GET",
@@ -151,7 +151,7 @@ async fn get_agent(emulator: &Emulator, assistant: &str, agent: &str) -> Reply {
 }
 
 /// A fresh assistant to nest agents in, answering with the id its create minted.
-async fn assistant_id(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn assistant_id(emulator: &Emulator, name: &str) -> String {
     let reply = emulator.create_assistant(name, &tag_map(0)).await;
     assert_eq!(
         reply.status, 200,
@@ -171,7 +171,7 @@ async fn assistant_id(emulator: &Emulator, name: &str) -> String {
 /// One association configuration a row's configuration carries, with the `TagFilter` form
 /// `filter` selects: the union's three members
 /// (`smithy_query(query="shape",shape="TagFilter")`) spread across the rows that use one.
-fn association_configuration(
+pub(crate) fn association_configuration(
     seed: usize,
     search_type: &str,
     max_results: i64,
@@ -193,7 +193,7 @@ fn association_configuration(
 /// The configuration body each `AIAgentType` is created with, one per entry of
 /// [`TYPE_CONFIGURATIONS`]: every member of that type's configuration shape, so the row
 /// spans the shape rather than the one member a single recording used.
-fn full_configuration(agent_type: &str) -> Value {
+pub(crate) fn full_configuration(agent_type: &str) -> Value {
     match agent_type {
         "MANUAL_SEARCH" => json!({ "manualSearchAIAgentConfiguration": {
             "answerGenerationAIPromptId": configured_id(1),
@@ -513,7 +513,7 @@ fn is_uuid_shaped(value: &str) -> bool {
 /// The ARN AWS documents for an AI agent of this service, written out here rather than
 /// taken from the handler's helper so the test pins the format the modelled `Arn` pattern
 /// describes: the agent's own id LAST, behind its parent assistant's.
-fn expected_agent_arn(assistant_id: &str, agent_id: &str) -> String {
+pub(crate) fn expected_agent_arn(assistant_id: &str, agent_id: &str) -> String {
     wisdom_arn(
         "aws",
         REGION,
@@ -540,7 +540,7 @@ fn assert_reads_the_create(case: &str, what: &str, created: &Value, reply: &Repl
 
 /// A reply refusing a resource this account does not hold: HTTP 404, the modelled error
 /// and the sentence this endpoint words that class with, naming the resource addressed.
-fn assert_not_found(case: &str, message: &str, resource: &str, reply: &Reply) {
+pub(crate) fn assert_not_found(case: &str, message: &str, resource: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 404,
         "case {case:?}: expected HTTP 404, got {} with body {}",

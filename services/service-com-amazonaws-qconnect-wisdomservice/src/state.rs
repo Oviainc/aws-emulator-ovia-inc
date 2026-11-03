@@ -389,6 +389,22 @@ pub fn message_configuration_type_mismatch(agent_type: &str) -> String {
     format!("The configuration must be the AI Agent configuration for type {agent_type}.")
 }
 
+/// The sentence an update addressed to a built-in ([`AI_AGENT_ORIGIN_SYSTEM`]-origin) AI
+/// agent is refused with: those records are the ones Amazon Q in Connect provisions with
+/// the assistant (see [`default_ai_agents`]), so they are not a caller's to write — an
+/// account's own configuration goes on an agent that account created.
+///
+/// CHOSEN WORDING: AWS states the rule (a default AI agent cannot be edited; make one of
+/// your own instead) but publishes no sentence for this refusal, so this one states that
+/// rule and carries nothing from the request. The class is the modelled
+/// `ValidationException` (HTTP 400), which the model declares for a request the service's
+/// own constraints refuse.
+pub fn message_system_ai_agent_not_modifiable() -> String {
+    "A default AI Agent created by Amazon Q in Connect cannot be modified. Create an AI \
+     Agent of your own to carry this configuration."
+        .to_string()
+}
+
 /// The `AIAgentType` one `AIAgentConfiguration` configures.
 ///
 /// The model declares that union as "a typed union that specifies the configuration based
@@ -1886,6 +1902,21 @@ impl Assistant {
         }
     }
 
+    /// The same AI agent as [`Self::ai_agent`], for a caller that WRITES to it: the seam
+    /// `UpdateAIAgent` applies its change through, so an update and a read reach one
+    /// record rather than two copies.
+    ///
+    /// A label resolves here exactly as it does for a read, so a qualifier naming a
+    /// numbered VERSION of the agent names nothing to write either: a version is a
+    /// snapshot of the agent, not the working copy an update changes.
+    pub fn ai_agent_mut(&mut self, label: &str) -> Option<&mut AiAgent> {
+        let (id, qualifier) = resolve_qualified_id(label);
+        match qualifier {
+            Some(qualifier) if qualifier != VERSION_QUALIFIER_LATEST => None,
+            _ => self.ai_agents.get_mut(id),
+        }
+    }
+
     /// How many AI agents a CALLER has created under this assistant, which is what
     /// [`MAX_AI_AGENTS_PER_ASSISTANT`] bounds: the agents the SERVICE provisioned with the
     /// assistant (see [`default_ai_agents`]) are not ones a caller asked for, so they do
@@ -2299,6 +2330,24 @@ pub fn tags_fingerprint(tags: &HashMap<String, String>) -> String {
     request_fingerprint(&flattened)
 }
 
+/// The most `clientToken` entries the store remembers at a time.
+///
+/// A remembered token exists only so that a RETRY of the call that used it can be
+/// answered with the resource that call created, and a retry follows its call within
+/// moments, so a few hundred of the most recent tokens is far more than the purpose needs.
+/// The ceiling is what keeps the map finite: a caller varying the token sends an entry per
+/// request, and an entry is otherwise released only when the resource it names is deleted,
+/// so without it one caller could grow this process's heap through the map alone — the
+/// same heap guard [`MAX_AI_AGENT_CONFIGURATION_ENTRIES`] is for the lists one request
+/// carries. Past the ceiling the LEAST RECENTLY remembered entry is evicted (see
+/// [`ComAmazonawsQconnectWisdomserviceState::remember_create`]), so a token's retry window
+/// is the last [`MAX_IDEMPOTENCY_TOKENS`] tokens rather than forever, and a replay of a
+/// token evicted long ago is answered as the fresh request it now is.
+///
+/// CHOSEN: AWS states no retention for an idempotency token's record; the figure is this
+/// emulator's own, and nothing but the retry window depends on it.
+pub const MAX_IDEMPOTENCY_TOKENS: usize = 256;
+
 /// What a `clientToken` a create used names: the resource that call created, and the
 /// [`request_fingerprint`] of the request it created it from.
 #[derive(Debug, Clone)]
@@ -2307,6 +2356,10 @@ pub struct IdempotentCreate {
     pub resource_id: String,
     /// The fingerprint of that call's idempotency-relevant members.
     pub fingerprint: String,
+    /// When this entry was remembered, on the store's own sequence: the order
+    /// [`MAX_IDEMPOTENCY_TOKENS`] evicts in, so the entries the ceiling keeps are the most
+    /// recent ones.
+    pub remembered_seq: u64,
 }
 
 /// What a create's `@idempotencyToken` says about THIS request — see
@@ -2746,6 +2799,11 @@ impl ComAmazonawsQconnectWisdomserviceState {
 
     /// Remember which resource this create made, and the request it made it from, so a
     /// later call carrying the same token is answered by [`Self::replayed_create`].
+    ///
+    /// The map is bounded by [`MAX_IDEMPOTENCY_TOKENS`]: remembering a token the map does
+    /// not already hold, while it is full, first forgets the least recently remembered
+    /// entry, so the entries kept are the most recent ones and the map's size does not
+    /// depend on how many tokens a caller sends.
     pub fn remember_create(
         &mut self,
         scope: &str,
@@ -2756,11 +2814,24 @@ impl ComAmazonawsQconnectWisdomserviceState {
         let Some(token) = client_token else {
             return;
         };
+        let key = idempotency_key(scope, token);
+        let remembered_seq = self.next_seq();
+        if !self.idempotency.contains_key(&key) && self.idempotency.len() >= MAX_IDEMPOTENCY_TOKENS {
+            let oldest = self
+                .idempotency
+                .iter()
+                .min_by_key(|(_, remembered)| remembered.remembered_seq)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.idempotency.remove(&oldest);
+            }
+        }
         self.idempotency.insert(
-            idempotency_key(scope, token),
+            key,
             IdempotentCreate {
                 resource_id: resource_id.to_string(),
                 fingerprint: fingerprint.to_string(),
+                remembered_seq,
             },
         );
     }
@@ -3336,6 +3407,17 @@ impl ComAmazonawsQconnectWisdomserviceState {
     /// assistant, so an agent of ANOTHER assistant is not found under this one.
     pub fn ai_agent(&self, assistant_label: &str, agent_label: &str) -> Option<&AiAgent> {
         self.assistant(assistant_label)?.ai_agent(agent_label)
+    }
+
+    /// The same AI agent as [`Self::ai_agent`], for a caller that WRITES to it — the seam
+    /// [`Assistant::ai_agent_mut`] describes, reached through the assistant the route
+    /// named.
+    pub fn ai_agent_mut(
+        &mut self,
+        assistant_label: &str,
+        agent_label: &str,
+    ) -> Option<&mut AiAgent> {
+        self.assistant_mut(assistant_label)?.ai_agent_mut(agent_label)
     }
 
     /// Store an AI agent inside the assistant it names. `false` — nothing stored — when
