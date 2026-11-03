@@ -81,7 +81,7 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_found, invalid_next_token, negative_max_results, service_state,
+    application_not_found_named, invalid_next_token, negative_max_results, service_state,
     state_unavailable, DataSourceAttachment, ATTACHMENT_PAGE,
 };
 
@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // empty page.
         let application = store.applications.get(&input.id).ok_or_else(|| {
             ListDataSourceAttachmentsErrorModeled::ResourceNotFoundException(
-                application_not_found(),
+                application_not_found_named(&input.id),
             )
         })?;
 

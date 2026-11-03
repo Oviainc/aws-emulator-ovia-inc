@@ -171,11 +171,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting progress materialises only what the clock already owed at `now`:
         // a change whose provisioning span has passed has completed whether or not
         // anybody asked. Nothing else about the record changes on a read.
+        //
+        // A name this account holds no domain under resolves no progress to report, and
+        // is refused with the GENERIC envelope this operation models beside its
+        // not-found error, carrying the sentence recorded for it
+        // ([`crate::state::no_progress_information`]).
         let domain = store
             .settled_mut(&input.domain_name, now)
             .ok_or_else(|| {
-                DescribeDomainChangeProgressErrorModeled::ResourceNotFoundException(
-                    crate::state::domain_not_found(&input.domain_name),
+                DescribeDomainChangeProgressErrorModeled::BaseException(
+                    crate::state::no_progress_information(),
                 )
             })?;
 

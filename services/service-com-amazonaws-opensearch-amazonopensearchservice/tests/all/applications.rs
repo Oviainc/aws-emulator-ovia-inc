@@ -488,7 +488,7 @@ async fn a_name_the_account_already_uses_is_refused_and_creates_nothing() {
         );
         assert_eq!(
             again.body["message"],
-            json!(format!("Application with name {name} already exists.")),
+            json!(format!("Application name {name} already exists")),
             "case {name}: the refusal names the application that already exists, got {:?}",
             again.body
         );

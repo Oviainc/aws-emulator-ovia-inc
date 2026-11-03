@@ -378,10 +378,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting the nodes materialises only the configuration change the clock
         // already owed this domain at `now` — it would have fallen due whether or not
         // anybody called. Nothing else about the record changes on a read.
+        //
+        // A name this account holds no domain under is refused with the GENERIC envelope
+        // this operation models beside its not-found error, which is the one recorded
+        // for the observability reads of an absent domain.
         let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
-            DescribeDomainNodesErrorModeled::ResourceNotFoundException(
-                crate::state::domain_not_found(&input.domain_name),
-            )
+            DescribeDomainNodesErrorModeled::BaseException(crate::state::domain_not_found_base(
+                &input.domain_name,
+            ))
         })?;
 
         // A domain with work in flight has no node census to read: the nodes of a

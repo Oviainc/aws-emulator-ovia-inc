@@ -105,7 +105,7 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_found, attachment_client_token_taken, attachment_outcome,
+    application_not_found_for_account, attachment_client_token_taken, attachment_outcome,
     attachment_quota_exceeded, internal_failure, is_arn, malformed_arn, service_state,
     state_unavailable, workspace_selection_conflict, DataSourceActivation, DataSourceAttachment,
     ATTACHMENT_QUOTA, ATTACHMENT_STATUS_FAILED, PROVISIONING,
@@ -232,9 +232,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_for_attachments(now);
 
         // The attachment belongs to the application, so an id naming none has nothing
-        // to attach a data source to.
+        // to attach a data source to. This path's refusal names the account the id was
+        // resolved in beside the id itself
+        // ([`crate::state::application_not_found_for_account`]).
         let application = store.applications.get(&input.id).ok_or_else(|| {
-            AttachDataSourceErrorModeled::ResourceNotFoundException(application_not_found())
+            AttachDataSourceErrorModeled::ResourceNotFoundException(
+                application_not_found_for_account(&input.id),
+            )
         })?;
 
         // "A unique, case-sensitive identifier to ensure idempotency of the request. If

@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // client-input error it does model.
         if !store.applications.contains_key(&input.application_id) {
             return Err(ListMigrationsErrorModeled::ValidationException(
-                unknown_application_id(),
+                unknown_application_id(&input.application_id),
             )
             .into());
         }

@@ -799,7 +799,7 @@ async fn the_nodes_and_the_health_of_one_domain_agree_on_its_zones() {
 }
 
 #[tokio::test]
-async fn a_name_that_names_no_domain_is_not_found() {
+async fn a_name_that_names_no_domain_is_the_generic_envelope() {
     let emulator = Emulator::new();
     let domain = "nodes-deleted";
     let answer = emulator
@@ -832,14 +832,14 @@ async fn a_name_that_names_no_domain_is_not_found() {
     ] {
         let answer = describe_nodes(&emulator, name).await;
         assert_eq!(
-            answer.status, 409,
-            "case {case}: expected DescribeDomainNodes({name:?}) to answer 409, got {} with {:?}",
+            answer.status, 400,
+            "case {case}: expected DescribeDomainNodes({name:?}) to answer 400, got {} with {:?}",
             answer.status, answer.body
         );
         let code = error_code(&answer);
         assert_eq!(
-            code, "ResourceNotFoundException",
-            "case {case}: expected ResourceNotFoundException, got {code:?} with {:?}",
+            code, "BaseException",
+            "case {case}: expected BaseException, got {code:?} with {:?}",
             answer.body
         );
     }

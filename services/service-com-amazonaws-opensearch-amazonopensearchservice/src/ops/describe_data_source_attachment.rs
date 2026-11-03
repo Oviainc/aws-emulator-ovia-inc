@@ -88,7 +88,7 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_found, attachment_not_found, service_state, state_unavailable,
+    application_not_found_named, attachment_not_found, service_state, state_unavailable,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // attachment to report.
         let application = store.applications.get(&input.id).ok_or_else(|| {
             DescribeDataSourceAttachmentErrorModeled::ResourceNotFoundException(
-                application_not_found(),
+                application_not_found_named(&input.id),
             )
         })?;
 

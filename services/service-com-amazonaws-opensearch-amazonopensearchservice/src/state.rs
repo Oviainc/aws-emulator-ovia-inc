@@ -1693,21 +1693,64 @@ pub fn application_endpoint(id: &str, region: &str) -> String {
 /// refused rather than minting one.
 pub fn application_name_taken(name: &str) -> ConflictException {
     ConflictException {
-        message: Some(format!("Application with name {name} already exists.")),
+        message: Some(format!("Application name {name} already exists")),
     }
 }
 
-/// What this service states about an id that names no application of this account.
+/// What the application CRUD surface states about an id that names no application of
+/// this account.
 ///
-/// The statement names no id: the request carries the one it could not resolve, so the
-/// answer states only that the account holds no such application.
+/// The statement names no id: `GetApplication`, `UpdateApplication` and
+/// `DeleteApplication` address ONE application, so the id the refusal could not resolve
+/// is the one the request is about and the answer states only that the account holds no
+/// such application.
 pub const APPLICATION_DOES_NOT_EXIST: &str = "Application does not exist";
 
-/// The `ResourceNotFoundException` payload for an id that names no application of
-/// this account — the application mirror of [`domain_not_found`].
+/// What the sub-APIs of an application state about the same miss: the id the request
+/// carried.
+///
+/// A call on an application's DATA SOURCES or its MIGRATION jobs is about one of those
+/// sub-resources, so the application is a value the request named among others and the
+/// refusal names it back — which is what tells a caller handed several ids which one
+/// could not be resolved.
+pub fn application_not_found_message(id: &str) -> String {
+    format!("Application {id} not found")
+}
+
+/// The same statement with the account the lookup was scoped to named after it, for the
+/// path whose refusal states both — so an operator can see the account the id was
+/// resolved in and not only that it was not found.
+pub fn application_not_found_for_account_message(id: &str, account_id: &str) -> String {
+    format!(
+        "{} for account {account_id}",
+        application_not_found_message(id)
+    )
+}
+
+/// The `ResourceNotFoundException` payload the application CRUD surface answers an id
+/// that names no application of this account with ([`APPLICATION_DOES_NOT_EXIST`]).
 pub fn application_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(APPLICATION_DOES_NOT_EXIST.to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` payload a SUB-API of an application answers the same
+/// miss with, naming the id ([`application_not_found_message`]).
+pub fn application_not_found_named(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(application_not_found_message(id)),
+    }
+}
+
+/// The same refusal, naming the account the id was resolved in
+/// ([`application_not_found_for_account_message`]).
+pub fn application_not_found_for_account(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(application_not_found_for_account_message(
+            id,
+            ::engine::emulator_account_id(),
+        )),
     }
 }
 
@@ -1881,9 +1924,27 @@ pub enum DataSourceActivation {
     Absent,
 }
 
-/// The `ResourceNotFoundException` payload for an application and data source pair this
-/// account holds no attachment record for.
+/// The `ResourceNotFoundException` payload for an application and data source pair the
+/// SINGLE-ATTACHMENT READ holds no attachment record for: "throws a
+/// ResourceNotFoundException if no attachment record exists for the specified
+/// application and data source combination".
+///
+/// The DETACH states the same miss as [`data_source_not_attached`] — the recorded
+/// sentences of the two operations differ, so each states its own and neither is a
+/// rewording of the other.
 pub fn attachment_not_found(id: &str, data_source_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Data source attachment not found for application {id} and data source \
+             {data_source_arn}"
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload the DETACH states for a data source the
+/// application holds no attachment record for: what the caller asked to undo was never
+/// done, so the sentence is about the link rather than about a record.
+pub fn data_source_not_attached(id: &str, data_source_arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!(
             "Data source {data_source_arn} is not attached to application {id}."
@@ -1897,9 +1958,8 @@ pub fn attachment_not_found(id: &str, data_source_arn: &str) -> ResourceNotFound
 pub fn attachment_pending(id: &str, data_source_arn: &str) -> ConflictException {
     ConflictException {
         message: Some(format!(
-            "Data source {data_source_arn} has a {ATTACHMENT_STATUS_PENDING} attachment to \
-             application {id}. Wait for the attachment to complete before detaching the data \
-             source."
+            "Data source {data_source_arn} attachment to application {id} is still \
+             {ATTACHMENT_STATUS_PENDING}."
         )),
     }
 }
@@ -2182,22 +2242,77 @@ pub fn migration_application_id(migration_id: &str) -> &str {
         .map_or(migration_id, |(application_id, _)| application_id)
 }
 
+/// The expression this service validates a `migrationId` against, as a whole-value
+/// pattern: the `ApplicationId` the id names — `^[a-z0-9]{3,30}$`
+/// (`smithy_query(query="shape",shape="ApplicationId")`) — then the hyphen and the
+/// opaque part a start minted after it
+/// ([`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_migration_id`]).
+///
+/// The model types `migrationId` a plain `String` and declares no pattern for it, so
+/// this is the surface the SERVICE validates. BOTH halves are required: a read is
+/// addressed by the id ALONE, so an id that does not carry an application and a job
+/// addresses nothing in any account, whichever applications one holds. What the opaque
+/// half SPELLS is not constrained — it is the service's to mint and the caller's to
+/// quote back.
+///
+/// DOCUMENTATION of the rule [`is_migration_id`] applies, not the check itself: the
+/// expression is never compiled or matched against, because no `@pattern` of this model
+/// declares it and nothing in this crate runs a regex engine. The end-to-end table over
+/// that rule (`tests/all/control_plane_refusal_wording.rs`, one row per way a value
+/// leaves the form) is what keeps this sentence and that check from drifting.
+pub const MIGRATION_ID_PATTERN: &str = "^[a-z0-9]{3,30}-.+$";
+
+/// Whether `value` is a `migrationId` of the form [`MIGRATION_ID_PATTERN`] states.
+///
+/// A SHAPE test only, the way [`is_guid`] and [`is_index_name`] are: whether the id
+/// resolves to an application this account holds, and to a job of it, is the lookup's
+/// job. It is tested here rather than against the pattern text because the boundary's
+/// regex engine never sees a `@pattern` the model does not declare.
+pub fn is_migration_id(value: &str) -> bool {
+    let Some((application_id, opaque)) = value.split_once('-') else {
+        return false;
+    };
+    (3..=30).contains(&application_id.len())
+        && application_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && !opaque.is_empty()
+}
+
+/// How this service states that a `migrationId` is not one: AWS's own sentence for the
+/// condition, naming the member and the value the request carried.
+///
+/// The value is quoted through the ceiling every clause of this service echoes a
+/// submitted value under ([`::service_common::validation::quoted_echo`]): `migrationId`
+/// declares no `@length` of its own, so without it one request would size the response.
+pub fn invalid_migration_id_format(value: &str) -> String {
+    format!(
+        "Invalid migrationId format: {}",
+        ::service_common::validation::quoted_echo(value)
+    )
+}
+
+/// The `ValidationException` payload for a `migrationId` outside
+/// [`MIGRATION_ID_PATTERN`]: a value that names neither an application nor a job carries
+/// no reference to a resource, so it is a malformed request rather than a job that
+/// happens not to exist.
+pub fn malformed_migration_id(value: &str) -> ValidationException {
+    ValidationException {
+        message: Some(invalid_migration_id_format(value)),
+    }
+}
+
 /// The `ResourceNotFoundException` payload for a `migrationId` whose application
 /// ([`migration_application_id`]) is one this account does not hold: there is no
 /// application to resolve the job in, so what the refusal states is the missing
 /// application rather than the job.
 ///
-/// It names the application, where [`application_not_found`] — the refusal an operation
-/// that CARRIES an `applicationId` answers — states only that the account holds no such
-/// application. The two are not one sentence because the saved-object migration API
-/// words this one with the id it read out of the `migrationId`, which is the only place
-/// the caller can see which application the id resolved to: a read that names the id
-/// back is the recorded answer this operation gives, and the id it names is the
-/// request's, never a value from any one run.
+/// It is [`application_not_found_named`] itself: one sentence for "this account holds no
+/// such application" across the sub-APIs of an application, naming the id the request
+/// carried — here the id read out of the `migrationId`, which is the only place the
+/// caller can see which application the id resolved to.
 pub fn migration_application_not_found(application_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!("Application {application_id} not found")),
-    }
+    application_not_found_named(application_id)
 }
 
 /// The `ConflictException` payload for a start whose `clientToken` this account already
@@ -2292,15 +2407,15 @@ pub fn unsupported_migration_status(value: &str) -> ValidationException {
     }
 }
 
-/// The same missing-application statement as [`application_not_found`], carried by the
-/// client-input error an operation that models NO `ResourceNotFoundException` does
+/// The same missing-application statement as [`application_not_found_named`], carried by
+/// the client-input error an operation that models NO `ResourceNotFoundException` does
 /// model.
 ///
-/// One wording for "this account holds no such application", whichever error channel
-/// the asking operation has for it.
-pub fn unknown_application_id() -> ValidationException {
+/// One wording for "this account holds no such application" across the sub-APIs,
+/// whichever error channel the asking operation has for it.
+pub fn unknown_application_id(id: &str) -> ValidationException {
     ValidationException {
-        message: application_not_found().message,
+        message: Some(application_not_found_message(id)),
     }
 }
 
@@ -2326,6 +2441,12 @@ pub const INDEX_STATUS_CREATED: &str = "CREATED";
 /// publishes none — and it is what stops a caller looping with fresh index names
 /// from growing this process's state without end.
 pub const INDEX_QUOTA: usize = 100;
+
+/// `IndexName`'s `@pattern`, as the model declares it
+/// (`smithy_query(query="shape",shape="IndexName")`) — the expression a refusal of a
+/// name outside it quotes, so the clause names the rule the model carries rather than a
+/// sentence written here.
+pub const INDEX_NAME_PATTERN: &str = r#"^(?!\.\.?$)[^_ ,:"+/*\\|?#><A-Z-][^ ,:"+/*\\|?#><A-Z]*$"#;
 
 /// The characters `IndexName`'s pattern forbids ANYWHERE in the name, from its
 /// trailing character class `[^ ,:"+/*\\|?#><A-Z]` (the upper-case letters that
@@ -8753,12 +8874,21 @@ pub fn new_package_id() -> String {
     format!("pkg-{}", ::uuid::Uuid::new_v4().simple())
 }
 
-/// The `ResourceAlreadyExistsException` payload for a create naming a package the
-/// account already holds — the mirror of [`connection_alias_exists`], so one refusal
-/// reads like the other.
-pub fn package_name_exists(package_name: &str) -> ResourceAlreadyExistsException {
-    ResourceAlreadyExistsException {
-        message: Some(format!("Package already exists: {package_name}")),
+/// How this service states that a package the account already holds cannot be created
+/// again: the request asks for the package to be in a state it is already in. One fixed
+/// sentence with no variable part — it names no package, because the condition is about
+/// the create and not about which name it carried.
+pub const PACKAGE_ALREADY_IN_DESIRED_STATE: &str = "Package is already in desired state";
+
+/// The `BaseException` payload for a create naming a package the account already holds.
+///
+/// `CreatePackage` models `ResourceAlreadyExistsException` (409) and the generic
+/// `BaseException` envelope (400, defaulted) alike
+/// (`smithy_query(query="operation",operation="CreatePackage")`), and the refusal
+/// recorded for a second create of one name is the generic one.
+pub fn package_name_exists() -> BaseException {
+    BaseException {
+        message: Some(PACKAGE_ALREADY_IN_DESIRED_STATE.to_string()),
     }
 }
 
@@ -10855,6 +10985,21 @@ pub fn domain_not_found_base(domain_name: &str) -> BaseException {
     }
 }
 
+/// How this service states that there is no configuration-change progress to report:
+/// one fixed sentence with no variable part — it names neither the domain nor a change
+/// id, because what it reports is that the service holds no progress information for
+/// the request at all.
+pub const NO_PROGRESS_INFORMATION: &str = "No progress information found";
+
+/// The `BaseException` payload for a progress read that resolves no domain to report on
+/// — the generic envelope (HTTP 400) this operation models beside its not-found error,
+/// carrying [`NO_PROGRESS_INFORMATION`].
+pub fn no_progress_information() -> BaseException {
+    BaseException {
+        message: Some(NO_PROGRESS_INFORMATION.to_string()),
+    }
+}
+
 /// The `ResourceNotFoundException` payload for an id that addresses no cross-cluster
 /// connection the caller has a view of — one this service never minted, one since
 /// released, or one the caller's side of the connection has nothing to see yet.
@@ -10949,15 +11094,20 @@ pub fn index_exists(domain_name: &str, index_name: &str) -> ResourceAlreadyExist
 }
 
 /// The `ValidationException` payload for a member that must be an `IndexName` and
-/// is not ([`is_index_name`]). It names the member and the value, so the caller can
-/// fix the request from the refusal alone. It is NOT a constraint report: the rule it
-/// states is the search engine's own naming rule for an index, which no `@pattern` of
-/// this model declares, so there is no expression to quote.
+/// is not ([`is_index_name`]).
+///
+/// Stated as the constraint report every other value outside its member's declared
+/// expression is refused with ([`crate::service::validation::constraint_report`]): the
+/// request boundary enforces `IndexName`'s `@length` but not its `@pattern` — the
+/// negative lookahead is not a construct its regex engine compiles — so this is the
+/// SAME constraint reported one step later, and a caller cannot tell the two apart.
+/// `member` is the member's name as the model spells it.
 pub fn malformed_index_name(member: &str, value: &str) -> ValidationException {
     ValidationException {
-        message: Some(format!(
-            "{member} must not be '.' or '..', must not begin with '_' or '-', and must carry \
-             no upper-case letter, whitespace or any of ,:\"+/*\\|?#>< : {value}"
+        message: Some(crate::service::validation::constraint_report(
+            member,
+            value,
+            ::aws_smithy_schema_server::ViolationKind::Pattern(INDEX_NAME_PATTERN.to_owned()),
         )),
     }
 }

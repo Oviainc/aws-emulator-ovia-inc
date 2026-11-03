@@ -204,14 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_packages(now);
 
         // `PackageName` is the "unique name for the package", so a second create of
-        // the same name is the modelled already-exists refusal: the existing record
-        // stays exactly as it is rather than becoming a second package a caller could
-        // not tell apart by name.
+        // the same name is refused: the existing record stays exactly as it is rather
+        // than becoming a second package a caller could not tell apart by name. The
+        // refusal is the generic envelope this operation models beside its
+        // already-exists error, which is the one recorded for the condition
+        // ([`crate::state::package_name_exists`]).
         if store.package_named(&input.package_name).is_some() {
-            return Err(CreatePackageErrorModeled::ResourceAlreadyExistsException(
-                package_name_exists(&input.package_name),
-            )
-            .into());
+            return Err(CreatePackageErrorModeled::BaseException(package_name_exists()).into());
         }
 
         // The store is bounded: past its quota a create is refused rather than adding

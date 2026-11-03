@@ -299,11 +299,10 @@ async fn a_deleted_application_rests_in_deleting_until_the_clock_removes_it() {
     }
 }
 
-/// RULE: an id that names no resource of this account addresses nothing a delete can
-/// remove, which is the modelled not-found refusal — and a refused delete removes
-/// nothing else.
+/// RULE: an id that names no resource of this account is already in the state a delete
+/// asks for, so the call is ANSWERED rather than refused — and it removes nothing else.
 #[tokio::test]
-async fn an_id_that_names_no_application_cannot_be_deleted() {
+async fn an_id_that_names_no_application_is_answered_and_removes_nothing() {
     let emulator = Emulator::new();
 
     // The account holds one application throughout, so what each row below exercises is
@@ -343,25 +342,30 @@ async fn an_id_that_names_no_application_cannot_be_deleted() {
     for (case, id) in absent {
         let dropped = delete_application(&emulator, &id).await;
         assert_eq!(
-            dropped.status, 409,
-            "case {case}: an id naming no application is refused, got {} with {:?}",
+            dropped.status, 200,
+            "case {case}: an id naming no application is answered, got {} with {:?}",
             dropped.status, dropped.body
         );
+
+        // And the read of that id still reports nothing: the answered delete minted no
+        // record and the listing holds none under it.
+        let read = get_application(&emulator, &id).await;
         assert_eq!(
-            error_code(&dropped),
-            "ResourceNotFoundException",
-            "case {case}: the refusal is the modelled not-found, got {:?}",
-            dropped.body
+            (read.status, error_code(&read).as_str()),
+            (409, "ResourceNotFoundException"),
+            "case {case}: the id still names no application, got {} with {:?}",
+            read.status,
+            read.body
         );
         assert_eq!(
-            dropped.body["message"],
+            read.body["message"],
             json!(APPLICATION_DOES_NOT_EXIST),
-            "case {case}: the refusal states that the account holds no such application, got {:?}",
-            dropped.body
+            "case {case}: the read states that the account holds no such application, got {:?}",
+            read.body
         );
     }
 
-    // The application the account does hold is untouched by every refusal above.
+    // The application the account does hold is untouched by every delete above.
     let read = get_application(&emulator, &held).await;
     assert_eq!(
         read.status, 200,
@@ -371,7 +375,8 @@ async fn an_id_that_names_no_application_cannot_be_deleted() {
     let status = string_member(&read.body, "status", "held-ui");
     assert_ne!(
         status, APPLICATION_STATUS_DELETING,
-        "case held-ui: a refused delete does not start another resource's removal, got {status:?}"
+        "case held-ui: a delete of another id does not start this resource's removal, got \
+         {status:?}"
     );
 }
 
@@ -426,13 +431,13 @@ async fn deleting_twice_while_the_removal_is_in_flight_is_the_same_delete() {
     for (case, id) in &ids {
         assert_gone(&emulator, id, case).await;
 
-        // A delete of an application the clock has removed names nothing to remove.
+        // A delete of an application the clock has removed asks for the state the
+        // account is already in, so it is answered as the first delete was.
         let dropped = delete_application(&emulator, id).await;
         assert_eq!(
-            error_code(&dropped),
-            "ResourceNotFoundException",
-            "case {case}: a delete after the removal landed is the modelled not-found, got {:?}",
-            dropped.body
+            dropped.status, 200,
+            "case {case}: a delete after the removal landed is answered, got {} with {:?}",
+            dropped.status, dropped.body
         );
     }
 }

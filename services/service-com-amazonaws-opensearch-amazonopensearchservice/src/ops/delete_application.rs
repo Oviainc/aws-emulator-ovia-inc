@@ -4,7 +4,9 @@
 //! IMPLEMENTED: puts the stored [`crate::state::Application`] record into its
 //! deleting status and lets the clock take the record away, so what the read paths
 //! report is the record this call left behind and nothing reports the application
-//! once its removal has fallen due.
+//! once its removal has fallen due. IDEMPOTENT: an id the account holds no application
+//! under is already in the state the call asks for, so it is answered rather than
+//! refused.
 //!
 //! ## Shape of an operation
 //!
@@ -70,7 +72,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{application_not_found, service_state, state_unavailable};
+use crate::state::{service_state, state_unavailable};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,19 +157,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The record this call removes is resolved with whatever the clock already owed
         // it materialised, so the delete acts on the application as it stands at `now`
         // — and an application whose own removal has already fallen due is one this
-        // account no longer holds, which is the refusal below rather than a second
-        // delete of a record no read can reach.
-        let application = store
-            .settled_application_mut(&input.id, now)
-            .ok_or_else(|| {
-                DeleteApplicationErrorModeled::ResourceNotFoundException(application_not_found())
-            })?;
-
-        // The application is not gone the instant this call returns: it is being
-        // deleted, so the record rests in its deleting status — which is what a read of
-        // it and the listing then report — and the clock owes the record's removal, at
-        // which point no read reports the application again.
-        application.begin_deletion(now);
+        // account no longer holds.
+        //
+        // The delete is IDEMPOTENT: an id the account holds no application under is
+        // answered, not refused, because the state the call asks for — no application
+        // under that id — is the state the account is already in, so there is nothing to
+        // report as a failure and nothing to do. That is what the RECORDED step for such
+        // a call does: it SUCCEEDS, where the read of the same id refuses
+        // (`crate::ops::get_application`), so the two are not one answer.
+        // `ResourceNotFoundException` stays this operation's modelled refusal for the
+        // conditions that do fail.
+        if let Some(application) = store.settled_application_mut(&input.id, now) {
+            // The application is not gone the instant this call returns: it is being
+            // deleted, so the record rests in its deleting status — which is what a read
+            // of it and the listing then report — and the clock owes the record's
+            // removal, at which point no read reports the application again.
+            application.begin_deletion(now);
+        }
 
         // `DeleteApplicationResponse` declares no members, so the 200 is the whole
         // answer; what this call did is read back through `GetApplication` and

@@ -97,7 +97,7 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_found, migration_client_token_taken, migration_quota_exceeded,
+    application_not_found_named, migration_client_token_taken, migration_quota_exceeded,
     migration_workspace_refusal, service_state, state_unavailable,
     unsupported_conflict_resolution, Migration, CONFLICT_RESOLUTION_VALUES, MIGRATION_QUOTA,
     MIGRATION_STATUS_PENDING,
@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // naming no application of this account names nothing to migrate into.
         if !store.applications.contains_key(&input.application_id) {
             return Err(StartMigrationErrorModeled::ResourceNotFoundException(
-                application_not_found(),
+                application_not_found_named(&input.application_id),
             )
             .into());
         }

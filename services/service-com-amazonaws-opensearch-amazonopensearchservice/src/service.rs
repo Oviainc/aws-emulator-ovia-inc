@@ -93,6 +93,33 @@ fn claims_own_path_space(parts: &http::request::Parts, signing_name: &str) -> bo
     )
 }
 
+/// The member `ListMigrations` requires the application at, as the model spells it
+/// (`smithy_query(query="operation",operation="ListMigrations")`).
+const APPLICATION_ID_MEMBER: &str = "applicationId";
+
+/// Whether `req` is a read of the migrations COLLECTION with an empty last segment: the
+/// method `ListMigrations` binds and `GetMigration`'s route with nothing where its label
+/// goes.
+///
+/// The path is the model's — `GetMigration` is bound to
+/// `/2021-01-01/opensearch/app-migrations/{migrationId}` and `ListMigrations` to the
+/// segment before it — so this names no path shape of its own beyond that pair. The URI
+/// is parsed by the `http` crate rather than split by hand, the way [`domain_rest`]
+/// reads one, so an absolute-form target or a fragment is read as the server read it;
+/// a URI the parse rejects resolves to `/`, which this claims nothing for.
+fn addresses_the_migration_collection(req: &aws_smithy_runtime_api::http::Request) -> bool {
+    /// The path of `GetMigration` up to and including the separator the label follows.
+    const EMPTY_LABEL_PATH: &str = "/2021-01-01/opensearch/app-migrations/";
+
+    req.method() == "GET"
+        && req
+            .uri()
+            .parse::<http::Uri>()
+            .unwrap_or_default()
+            .path()
+            == EMPTY_LABEL_PATH
+}
+
 /// The `com-amazonaws-opensearch-amazonopensearchservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -337,6 +364,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // (rest -> 501) by returning `None`.
         if domain_rest::claims_request(&*self.engine, req) {
             return Some(domain_rest::serve(&*self.engine, req, None));
+        }
+        // One class of request lands here that this service DOES answer: a read of the
+        // migrations path with an EMPTY last segment. `GetMigration`'s label is
+        // `@required`, so the REST router matches no route for an empty one and the
+        // protocol default would answer 501 `NotImplemented` — claiming nobody
+        // implemented the read. Such a request addresses the COLLECTION the segment
+        // before it names, which is `ListMigrations`, and that operation requires an
+        // `applicationId` the request carries none of: so it is stated as the refusal
+        // that absent member earns, through the same seam the boundary's own refusals
+        // are worded by ([`Service::override_refusal`]). That is also the answer
+        // recorded for a read whose `migrationId` is empty, which is how a caller
+        // reaches this path at all.
+        if addresses_the_migration_collection(req) {
+            let violations = vec![aws_smithy_schema_server::Violation {
+                path: aws_smithy_schema_server::constraints::path::member(APPLICATION_ID_MEMBER),
+                kind: aws_smithy_schema_server::ViolationKind::MissingRequiredMember,
+                value: None,
+                sensitive: false,
+            }];
+            let chosen = self.override_refusal(&Refusal::Invalid(violations.clone()));
+            return Some(self.entry.refusal_response(
+                aws_smithy_schema_server::ProtocolError::Invalid(violations),
+                chosen,
+                req,
+            ));
         }
         None
     }

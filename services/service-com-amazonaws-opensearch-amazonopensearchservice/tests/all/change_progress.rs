@@ -363,7 +363,7 @@ async fn every_change_keeps_its_own_id_and_the_latest_is_the_implicit_one() {
 }
 
 #[tokio::test]
-async fn an_absent_domain_or_change_is_the_modelled_not_found() {
+async fn an_absent_domain_is_the_generic_envelope_and_an_absent_change_the_modelled_not_found() {
     let emulator = Emulator::new();
     create_baseline(&emulator, "present-domain").await;
     let known = string_member(
@@ -393,25 +393,45 @@ async fn an_absent_domain_or_change_is_the_modelled_not_found() {
         deleted.status, deleted.body
     );
 
-    for (name, change_id) in [
-        ("absent-domain", None),
-        ("absent-domain", Some(ABSENT_CHANGE_ID)),
-        ("other-domain", None),
-        ("present-domain", Some(ABSENT_CHANGE_ID)),
-        ("present-domain", Some(other.as_str())),
+    // Rows: a domain that was never created, a domain that was deleted, a well-formed
+    // change id no change carries, and another domain's change id — with the refusal each
+    // earns. A name this account holds no domain under resolves no progress to report at
+    // all, which is the generic envelope; a domain that IS held and carries no such change
+    // is the modelled not-found.
+    for (name, change_id, status, code) in [
+        ("absent-domain", None, 400, "BaseException"),
+        (
+            "absent-domain",
+            Some(ABSENT_CHANGE_ID),
+            400,
+            "BaseException",
+        ),
+        ("other-domain", None, 400, "BaseException"),
+        (
+            "present-domain",
+            Some(ABSENT_CHANGE_ID),
+            409,
+            "ResourceNotFoundException",
+        ),
+        (
+            "present-domain",
+            Some(other.as_str()),
+            409,
+            "ResourceNotFoundException",
+        ),
     ] {
         let answer = progress(&emulator, name, change_id).await;
         assert_eq!(
-            answer.status, 409,
-            "case DescribeDomainChangeProgress({name:?}, {change_id:?}): expected 409, got {} \
-             with {:?}",
+            answer.status, status,
+            "case DescribeDomainChangeProgress({name:?}, {change_id:?}): expected {status}, got \
+             {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             error_code(&answer),
-            "ResourceNotFoundException",
-            "case DescribeDomainChangeProgress({name:?}, {change_id:?}): expected \
-             ResourceNotFoundException, got {:?}",
+            code,
+            "case DescribeDomainChangeProgress({name:?}, {change_id:?}): expected {code}, got \
+             {:?}",
             answer.body
         );
     }

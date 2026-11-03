@@ -96,8 +96,8 @@
 use super::types::*;
 
 use crate::state::{
-    migration_application_id, migration_application_not_found, migration_not_found, service_state,
-    state_unavailable,
+    is_migration_id, malformed_migration_id, migration_application_id,
+    migration_application_not_found, migration_not_found, service_state, state_unavailable,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -174,6 +174,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        // The id is judged for its SHAPE before anything is resolved: `migrationId` is a
+        // plain string the model constrains not at all, and a value that cannot name an
+        // application ([`crate::state::is_migration_id`]) carries no reference to a job
+        // in any account — so it is the malformed request it is (400), not a resource
+        // that happens not to exist.
+        if !is_migration_id(&input.migration_id) {
+            return Err(GetMigrationErrorModeled::ValidationException(
+                malformed_migration_id(&input.migration_id),
+            )
+            .into());
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

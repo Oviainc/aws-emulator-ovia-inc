@@ -727,16 +727,14 @@ async fn an_id_naming_no_job_is_refused() {
 
     // (the id, the application its leading segment names, whether the refusal's message
     // is pinned). A row whose segment is an application this account holds is refused for
-    // the JOB; every other row is refused for the APPLICATION, because there is nothing
-    // to look a job up in. The message is pinned for every row whose id has the shape an
-    // id of this service has — which refusal a MALFORMED id earns is a separate question
-    // this suite leaves to the operation's own refusal rules, so that row pins the status
-    // and the code only.
+    // the JOB; a row whose segment is a well-formed `ApplicationId` this account does not
+    // hold is refused for the APPLICATION, because there is nothing to look a job up in;
+    // and a row whose segment is no `ApplicationId` at all names neither, so it is refused
+    // for its SHAPE before anything is resolved — the status and the code are pinned for
+    // those rows and the sentence is pinned by `control_plane_refusal_wording.rs`.
     let rows: Vec<(String, Option<&str>, bool)> = vec![
         ("mig-000000000000".to_string(), None, true),
         ("migration-1".to_string(), None, true),
-        ("0".to_string(), None, false),
-        (migration_id.to_uppercase(), None, true),
         (format!("{migration_id}x"), Some(id.as_str()), true),
         (format!("{id}-000000000000"), Some(id.as_str()), true),
     ];
@@ -764,6 +762,20 @@ async fn an_id_naming_no_job_is_refused() {
             answer.body["message"].as_str(),
             Some(expected.as_str()),
             "case {case:?}: expected the refusal to name what could not be resolved, got {:?}",
+            answer.body
+        );
+    }
+
+    // An id whose leading segment is no `ApplicationId` names no application in ANY
+    // account, so it is the malformed request it is rather than a resource that happens
+    // not to exist.
+    for case in ["0".to_string(), migration_id.to_uppercase()] {
+        let answer = get_migration(&emulator, &case).await;
+        assert_eq!(
+            (answer.status, error_code(&answer).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException, got {} with {:?}",
+            answer.status,
             answer.body
         );
     }

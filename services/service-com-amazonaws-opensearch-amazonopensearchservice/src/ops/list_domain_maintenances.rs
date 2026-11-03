@@ -195,10 +195,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Listing the actions materialises only what the clock already owed at
         // `now`: a step whose span has passed has happened whether or not anybody
         // asked. Nothing else about the record changes on a read.
+        //
+        // A name this account holds no domain under is refused with the GENERIC envelope
+        // this operation models beside its not-found error, which is the one recorded
+        // for the maintenance listing of an absent domain.
         let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
-            ListDomainMaintenancesErrorModeled::ResourceNotFoundException(
-                crate::state::domain_not_found(&input.domain_name),
-            )
+            ListDomainMaintenancesErrorModeled::BaseException(crate::state::domain_not_found_base(
+                &input.domain_name,
+            ))
         })?;
 
         // A maintenance action runs on ONE data node of the domain, so this listing

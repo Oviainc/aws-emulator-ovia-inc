@@ -89,8 +89,9 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_active, application_not_found, attachment_not_found, attachment_pending,
-    service_state, state_unavailable, APPLICATION_STATUS_ACTIVE, ATTACHMENT_STATUS_PENDING,
+    application_not_active, application_not_found_named, attachment_pending,
+    data_source_not_attached, service_state, state_unavailable, APPLICATION_STATUS_ACTIVE,
+    ATTACHMENT_STATUS_PENDING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -192,7 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The attachment belongs to the application, so an id naming none holds no
         // data source to detach.
         let application = store.applications.get_mut(&input.id).ok_or_else(|| {
-            DetachDataSourceErrorModeled::ResourceNotFoundException(application_not_found())
+            DetachDataSourceErrorModeled::ResourceNotFoundException(application_not_found_named(
+                &input.id,
+            ))
         })?;
 
         // "The application must be in the ACTIVE state": one that is still being
@@ -212,10 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let attachment = application
             .attachment(&input.data_source_arn)
             .ok_or_else(|| {
-                DetachDataSourceErrorModeled::ResourceNotFoundException(attachment_not_found(
-                    &input.id,
-                    &input.data_source_arn,
-                ))
+                DetachDataSourceErrorModeled::ResourceNotFoundException(
+                    data_source_not_attached(&input.id, &input.data_source_arn),
+                )
             })?;
         if attachment.status == ATTACHMENT_STATUS_PENDING {
             return Err(DetachDataSourceErrorModeled::ConflictException(attachment_pending(

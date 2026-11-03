@@ -32,7 +32,8 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::PACKAGE_TYPE_VALUES;
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    PACKAGE_QUOTA, PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING, PACKAGE_TYPE_ZIP_PLUGIN,
+    PACKAGE_ALREADY_IN_DESIRED_STATE, PACKAGE_QUOTA, PACKAGE_STATUS_AVAILABLE,
+    PACKAGE_STATUS_COPYING, PACKAGE_TYPE_ZIP_PLUGIN,
 };
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
@@ -479,14 +480,20 @@ async fn a_duplicate_package_name_is_refused() {
         });
         let second = create(&emulator, second_body).await;
         assert_eq!(
-            second.status, 409,
-            "case {case} again: expected 409, got {} with {:?}",
+            second.status, 400,
+            "case {case} again: expected 400, got {} with {:?}",
             second.status, second.body
         );
         assert_eq!(
             error_code(&second),
-            "ResourceAlreadyExistsException",
-            "case {case} again: expected the modelled already-exists refusal, got {:?}",
+            "BaseException",
+            "case {case} again: expected the generic envelope, got {:?}",
+            second.body
+        );
+        assert_eq!(
+            second.body["message"],
+            json!(PACKAGE_ALREADY_IN_DESIRED_STATE),
+            "case {case} again: expected the recorded sentence, got {:?}",
             second.body
         );
 

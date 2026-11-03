@@ -620,7 +620,7 @@ async fn the_listing_reports_every_action_once_and_narrows_by_action_and_status(
     }
 
     // A domain with no action listed holds an empty list rather than a refusal, and
-    // a name no domain is stored under is the modelled not-found.
+    // a name no domain is stored under is the generic envelope.
     create(&emulator, "quiet-domain", every_role(MAINTAINABLE_DATA_NODES)).await;
     let answer = list(&emulator, "quiet-domain", "").await;
     assert_eq!(
@@ -636,8 +636,8 @@ async fn the_listing_reports_every_action_once_and_narrows_by_action_and_status(
     let answer = list(&emulator, "absent-domain", "").await;
     assert_eq!(
         (answer.status, error_code(&answer).as_str()),
-        (409, "ResourceNotFoundException"),
-        "case an unknown domain: expected the modelled not-found, got {} with {:?}",
+        (400, "BaseException"),
+        "case an unknown domain: expected the generic envelope, got {} with {:?}",
         answer.status,
         answer.body
     );

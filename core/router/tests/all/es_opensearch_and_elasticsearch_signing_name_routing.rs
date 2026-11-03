@@ -431,7 +431,9 @@ fn the_es_endpoint_serves_both_api_versions() {
                     })),
                     expected_status: 409,
                     expected_error: Some("ResourceNotFoundException"),
-                    expected_contains: &["Application does not exist"],
+                    // A SUB-API of an application names the id it could not resolve;
+                    // only the modern model declares the operation at all.
+                    expected_contains: &["Application abc123xyz not found"],
                     expected_absent: &[],
                 },
                 Call {
@@ -447,7 +449,7 @@ fn the_es_endpoint_serves_both_api_versions() {
                     body: None,
                     expected_status: 400,
                     expected_error: Some("ValidationException"),
-                    expected_contains: &["Application does not exist"],
+                    expected_contains: &["Application abc123xyz not found"],
                     expected_absent: &[],
                 },
                 Call {

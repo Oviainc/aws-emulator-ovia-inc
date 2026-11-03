@@ -45,6 +45,8 @@ mod connection_decisions;
 mod connection_records_at_rest;
 #[path = "all/constraint_refusal_messages.rs"]
 mod constraint_refusal_messages;
+#[path = "all/control_plane_refusal_wording.rs"]
+mod control_plane_refusal_wording;
 #[path = "all/cross_cluster_connections.rs"]
 mod cross_cluster_connections;
 #[path = "all/cross_cluster_search.rs"]
