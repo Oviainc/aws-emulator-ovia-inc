@@ -4,10 +4,11 @@
 //!
 //! Deletes the member associations of the calling (administrator) account's hub, one
 //! per `AccountIds` entry: the association record is REMOVED, so the account is no
-//! longer a member of that hub and `GetMembers` reports it unprocessed. An id the hub
-//! holds no association for is reported in `UnprocessedAccounts` — "the list of Amazon
-//! Web Services accounts that were not deleted" — rather than failing the accounts in
-//! the same call that can be deleted.
+//! longer a member of that hub and `GetMembers` answers nothing at all for it. An id
+//! the hub holds no association for is a delete this call could not carry out, so it
+//! is reported in `UnprocessedAccounts` — "the list of Amazon Web Services accounts
+//! that were not deleted" — rather than failing the accounts in the same call that can
+//! be deleted.
 //!
 //! ## Shape of an operation
 //!

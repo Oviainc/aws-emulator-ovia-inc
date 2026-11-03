@@ -367,7 +367,9 @@ async fn re_creating_a_member_updates_it_in_place() {
 /// RULE: an account the call cannot associate is reported per account in
 /// `UnprocessedAccounts` with a reason, and the accounts in the SAME call that can be
 /// associated are still created. The administrator account is one such account: it is
-/// the other end of the association, so it cannot be its own member.
+/// the other end of the association, so it cannot be its own member. A later
+/// `GetMembers` for it answers nothing at all: it is a report of stored associations,
+/// and the hub holds none for that id.
 #[tokio::test]
 async fn the_administrator_account_is_reported_unprocessed() {
     let harness = Harness::enabled().await;
@@ -424,14 +426,10 @@ async fn the_administrator_account_is_reported_unprocessed() {
         "expected {member}, got {}",
         members[0]
     );
-    assert_eq!(
-        unprocessed_of(&body)
-            .iter()
-            .filter_map(|entry| entry["AccountId"].as_str())
-            .collect::<Vec<_>>(),
-        vec![ADMINISTRATOR_ID],
-        "the administrator account is not a member, so GetMembers must report it \
-         unprocessed, got {body}"
+    assert!(
+        unprocessed_of(&body).is_empty(),
+        "the hub holds no association for the administrator account, so GetMembers must \
+         report it in neither list, got {body}"
     );
 }
 
@@ -674,11 +672,10 @@ async fn members_are_scoped_to_the_hub_that_created_them() {
             usize::from(expect_member),
             "GetMembers in {region}: expected member present = {expect_member}, got {body}"
         );
-        assert_eq!(
-            unprocessed_of(&body).len(),
-            usize::from(!expect_member),
-            "GetMembers in {region}: an id that is not a member there must be unprocessed, \
-             got {body}"
+        assert!(
+            unprocessed_of(&body).is_empty(),
+            "GetMembers in {region}: an id that is not a member there is reported in \
+             neither list, got {body}"
         );
     }
 }

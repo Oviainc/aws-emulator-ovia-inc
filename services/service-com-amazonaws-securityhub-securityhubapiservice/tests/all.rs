@@ -25,6 +25,9 @@ mod error_envelope;
 #[path = "all/member_listing.rs"]
 mod member_listing;
 // And this one, for the same reason.
+#[path = "all/member_unknown_accounts.rs"]
+mod member_unknown_accounts;
+// And this one, for the same reason.
 #[path = "all/standards_controls.rs"]
 mod standards_controls;
 #[path = "all/action_targets.rs"]

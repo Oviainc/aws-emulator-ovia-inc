@@ -3,9 +3,11 @@
 //! @op GetMembers
 //!
 //! Reports the member associations of the calling (administrator) account's hub for
-//! the requested account ids, in the order they were asked for. An id the hub has no
-//! association for is reported in `UnprocessedAccounts` rather than failing the call,
-//! so one unknown id does not hide the members that ARE known.
+//! the requested account ids, in the order they were asked for. This is a pure report
+//! of what the hub holds: an id the hub holds no association for is reported in
+//! NEITHER list — it is absent from `Members`, and it is not an account the call
+//! failed to process, so no `UnprocessedAccounts` entry is made up for it. One unknown
+//! id therefore neither fails the call nor hides the members that ARE known.
 //!
 //! ## Shape of an operation
 //!
@@ -214,31 +216,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut members: Vec<Member> = Vec::new();
-        let mut unprocessed_accounts: Vec<Result2> = Vec::new();
 
         for account_id in &input.account_ids {
             let key = crate::state::member_key(&hub, account_id);
-            match store.members.get(&key) {
-                // One projection for every read of an association
-                // (`crate::state::member_view`, shared with `ListMembers`).
-                Some(association) => members.push(crate::state::member_view(
+            // An id the hub holds an association for is projected once, by the one
+            // projection every read of an association shares
+            // (`crate::state::member_view`, with `ListMembers`). An id it holds NO
+            // association for — never associated, already deleted, or the
+            // administrator's own account, which is the other end of an association —
+            // contributes nothing: this report has no record to answer with, and
+            // nothing about it failed to process.
+            if let Some(association) = store.members.get(&key) {
+                members.push(crate::state::member_view(
                     account_id,
                     association,
                     administrator_id,
-                )),
-                None => unprocessed_accounts.push(Result2 {
-                    account_id: Some(account_id.clone()),
-                    processing_result: Some(format!(
-                        "The request is rejected because the account {account_id} is not an \
-                         associated member account of {administrator_id}"
-                    )),
-                }),
+                ));
             }
         }
 
         Ok(GetMembersOutput {
             members: Some(members),
-            unprocessed_accounts: Some(unprocessed_accounts),
+            // `UnprocessedAccounts` is this operation's partial-failure channel: it
+            // carries the accounts whose association the hub resolved but could not
+            // report on. Every association this hub holds projects, so a report of
+            // stored state leaves none of them unprocessed.
+            unprocessed_accounts: Some(Vec::new()),
         })
     }
 }

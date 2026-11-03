@@ -161,7 +161,7 @@ fn unprocessed_ids(body: &Value) -> Vec<&str> {
 
 /// RULE: `DeleteMembers` removes the member association of each requested account from
 /// the calling account's hub, so afterwards that account is no longer a member at all —
-/// `GetMembers` answers no `Member` for it and reports it unprocessed — while the
+/// `GetMembers` answers no `Member` for it and reports it in neither list — while the
 /// associations the call did not name stay exactly as they were. Every account it did
 /// delete is absent from `UnprocessedAccounts`.
 ///
@@ -241,11 +241,10 @@ async fn delete_members_removes_exactly_the_requested_associations() {
         let mut deleted: Vec<&str> = requested.clone();
         deleted.sort_unstable();
         deleted.dedup();
-        assert_eq!(
-            unprocessed_ids(&body),
-            deleted,
-            "case {case:?}: a deleted account is no longer a member, so GetMembers must \
-             report {deleted:?} unprocessed, got {body}"
+        assert!(
+            unprocessed_of(&body).is_empty(),
+            "case {case:?}: a deleted account has no association left, so GetMembers must \
+             report {deleted:?} in neither list, got {body}"
         );
         // Every surviving association still carries the details it was created with.
         for member in members_of(&body) {
