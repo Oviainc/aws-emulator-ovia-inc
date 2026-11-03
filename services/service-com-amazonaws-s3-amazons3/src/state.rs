@@ -2142,6 +2142,20 @@ fn is_arn_of_service(arn: &str, service: &str) -> bool {
     is_arn_of(arn, service, ArnField::Present, ArnField::Present, "")
 }
 
+/// Whether `value` is the ARN of an S3 bucket: `arn:<partition>:s3:::<name>`.
+///
+/// A bucket ARN carries neither a Region nor an account id, because a bucket name is
+/// globally unique, and its resource part is the bare bucket name. Read through
+/// [`is_arn_of`], the crate's one ARN grammar.
+///
+/// Shared, because MORE than one member takes a bucket ARN: a replication rule's
+/// `Destination$Bucket` and the analytics export's `AnalyticsS3BucketDestination$Bucket`
+/// are both "the Amazon Resource Name (ARN) of the bucket", so neither may judge one its
+/// own way.
+pub fn is_s3_bucket_arn(value: &str) -> bool {
+    is_arn_of(value, "s3", ArnField::Empty, ArnField::Empty, "")
+}
+
 /// Why `value` is not an ARN, as AWS states it where a refusal quotes the reason.
 ///
 /// The ARN grammar is the published one [`is_arn_of`] reads —
@@ -11942,6 +11956,132 @@ pub const INVALID_CONFIG_ID_MESSAGE: &str =
 /// configuration it cannot apply.
 pub const INVALID_CONFIG_ID_STATUS: u16 = 400;
 
+/// The `<Message>` S3 sends beside [`INVALID_CONFIG_ID_CODE`] for an id spelled with a
+/// character a configuration id may not carry: the sentence QUOTES the pattern the id has to
+/// match ([`CONFIGURATION_ID_PATTERN`]), and nothing in it comes from the request.
+///
+/// A second sentence for the same code, beside [`INVALID_CONFIG_ID_MESSAGE`]: the code names
+/// the id as the field at fault and the sentence says WHICH rule about it the value broke —
+/// the character class here, the length bound there.
+pub const INVALID_CONFIG_ID_PATTERN_MESSAGE: &str =
+    r"Config Id does not match the pattern ^[a-zA-Z0-9\-_.]+$";
+
+/// The pattern a bucket configuration id has to match, as the refusal that quotes it spells
+/// it ([`INVALID_CONFIG_ID_PATTERN_MESSAGE`]): one or more of a letter, a number, a dash, an
+/// underscore or a period.
+///
+/// It is the character class the id members themselves publish — "can only contain letters,
+/// numbers, periods, dashes, and underscores" (`MetricsConfiguration$Id`) — written the way
+/// the wire refusal states it, and [`configuration_id_fault`] is the one reading of it.
+pub const CONFIGURATION_ID_PATTERN: &str = r"^[a-zA-Z0-9\-_.]+$";
+
+/// The code S3 answers a call on a bucket configuration that states NO id it could identify
+/// one by: `InvalidConfigurationId`, under HTTP 400.
+///
+/// Distinct from [`INVALID_CONFIG_ID_CODE`], which reports an id that WAS stated and broke a
+/// rule about its spelling: with no id at all there is no configuration to report a rule
+/// against, so S3 names the id itself as the thing that is not one.
+pub const INVALID_CONFIGURATION_ID_CODE: &str = "InvalidConfigurationId";
+
+/// See [`INVALID_CONFIGURATION_ID_CODE`] — the fixed text S3 sends for that condition,
+/// nothing of which comes from the request.
+pub const INVALID_CONFIGURATION_ID_MESSAGE: &str = "The specified configuration id is invalid.";
+
+/// The HTTP status [`INVALID_CONFIGURATION_ID_CODE`] is rendered with: 400, the status S3
+/// gives a request naming an argument it cannot act on.
+pub const INVALID_CONFIGURATION_ID_STATUS: u16 = 400;
+
+/// Why a value is not an id a bucket configuration may be identified by — which is what
+/// decides the refusal a call naming it answers with.
+///
+/// ONE type for every id-addressed bucket configuration family (analytics, metrics, S3
+/// Inventory and S3 Intelligent-Tiering), because the id rule is one rule: the families
+/// cannot drift apart on which values they record, nor on how a value outside the rule is
+/// reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigurationIdFault {
+    /// The call states no id at all, or an empty one: there is no value to judge against the
+    /// id rule, so the id itself is what the refusal names
+    /// ([`INVALID_CONFIGURATION_ID_CODE`]).
+    Unstated,
+    /// The id carries a character a configuration id may not
+    /// ([`CONFIGURATION_ID_PATTERN`]).
+    OutsidePattern,
+    /// The id is longer than [`MAX_CONFIGURATION_ID_CHARS`] characters.
+    TooLong,
+}
+
+impl ConfigurationIdFault {
+    /// The S3 error code a call naming such an id is refused with.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Unstated => INVALID_CONFIGURATION_ID_CODE,
+            Self::OutsidePattern | Self::TooLong => INVALID_CONFIG_ID_CODE,
+        }
+    }
+
+    /// The HTTP status that refusal is rendered with — 400 for every one of them: the id is
+    /// an argument of the request, and a request S3 cannot act on is a bad request.
+    pub fn status(self) -> u16 {
+        match self {
+            Self::Unstated => INVALID_CONFIGURATION_ID_STATUS,
+            Self::OutsidePattern | Self::TooLong => INVALID_CONFIG_ID_STATUS,
+        }
+    }
+
+    /// The `<Message>` that refusal carries: the fixed sentence S3 publishes for the rule the
+    /// value broke, with nothing of the request in it.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unstated => INVALID_CONFIGURATION_ID_MESSAGE,
+            Self::OutsidePattern => INVALID_CONFIG_ID_PATTERN_MESSAGE,
+            Self::TooLong => INVALID_CONFIG_ID_MESSAGE,
+        }
+    }
+}
+
+/// Why `value` is not an id a bucket configuration may be identified by, or `None` when it
+/// is one.
+///
+/// The one reading of the id rule: non-empty, spelled in [`CONFIGURATION_ID_PATTERN`]'s
+/// character class, and at most [`MAX_CONFIGURATION_ID_CHARS`] characters. The model
+/// constrains none of the id shapes (`smithy_query(query="shape",shape="AnalyticsId")`
+/// reports a plain string), so nothing refuses a value outside it before a handler does, and
+/// an id is what one bucket's configuration maps key on.
+pub fn configuration_id_fault(value: &str) -> Option<ConfigurationIdFault> {
+    if value.is_empty() {
+        return Some(ConfigurationIdFault::Unstated);
+    }
+    if !value.chars().all(is_configuration_id_character) {
+        return Some(ConfigurationIdFault::OutsidePattern);
+    }
+    if value.chars().count() > MAX_CONFIGURATION_ID_CHARS {
+        return Some(ConfigurationIdFault::TooLong);
+    }
+    None
+}
+
+/// Whether `character` is one [`CONFIGURATION_ID_PATTERN`]'s class holds: a letter, a
+/// number, a period, a dash or an underscore.
+fn is_configuration_id_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+}
+
+/// The code S3 answers a listing whose `continuation-token` is not one it issued:
+/// `MalformedContinuationToken`, under HTTP 400 — the token is an argument of the request
+/// and a token the service cannot resume from names no page of the listing.
+pub const MALFORMED_CONTINUATION_TOKEN_CODE: &str = "MalformedContinuationToken";
+
+/// See [`MALFORMED_CONTINUATION_TOKEN_CODE`] — the fixed text S3 sends for that condition,
+/// as the service words it on the wire (its grammar is S3's own), with nothing of the
+/// request in it: the token is "an opaque value that Amazon S3 understands"
+/// (`ListBucketAnalyticsConfigurationsRequest$ContinuationToken`), so a refusal does not
+/// echo it back.
+pub const MALFORMED_CONTINUATION_TOKEN_MESSAGE: &str = "The continuation-token you provided invalid.";
+
+/// The HTTP status [`MALFORMED_CONTINUATION_TOKEN_CODE`] is rendered with: 400.
+pub const MALFORMED_CONTINUATION_TOKEN_STATUS: u16 = 400;
+
 /// The most characters a bucket configuration id may carry.
 ///
 /// 64, the limit AWS publishes on the id members themselves: "The ID has a 64 character
@@ -12027,24 +12167,22 @@ pub const MAX_METRICS_CONFIGURATIONS_PER_BUCKET: usize = 1_000;
 pub const MAX_METRICS_ID_CHARS: usize = MAX_CONFIGURATION_ID_CHARS;
 
 /// Whether `value` is an id a metrics configuration may be identified by: a configuration
-/// id by length ([`is_valid_configuration_id`]), every character of which is a letter, a
-/// number, a period, a dash or an underscore — the rule quoted on
-/// [`MAX_METRICS_ID_CHARS`].
+/// id by length ([`MAX_METRICS_ID_CHARS`]), every character of which is a letter, a number,
+/// a period, a dash or an underscore — the rule quoted on [`MAX_METRICS_ID_CHARS`].
 ///
-/// An EMPTY id identifies no configuration, so it is not one either.
+/// An EMPTY id identifies no configuration, so it is not one either. The reading is
+/// [`configuration_id_fault`]'s, the one place the id rule lives, so this family and the
+/// others cannot drift apart on which values a bucket's map may key on.
 pub fn is_valid_metrics_id(value: &str) -> bool {
-    is_valid_configuration_id(value)
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+    configuration_id_fault(value).is_none()
 }
 
 /// Whether `value` is long enough and short enough to identify a bucket configuration:
 /// between one and [`MAX_CONFIGURATION_ID_CHARS`] characters.
 ///
 /// The LENGTH half every bucket configuration id shares, so the families cannot drift apart
-/// on it: [`is_valid_metrics_id`] composes it with the character set its own member
-/// documents, and [`is_valid_analytics_id`] is it alone. An EMPTY id identifies no
+/// on it: [`configuration_id_fault`] composes it with the character set the id members
+/// document, and [`is_valid_inventory_id`] is it alone. An EMPTY id identifies no
 /// configuration, so it is never one.
 pub fn is_valid_configuration_id(value: &str) -> bool {
     let characters = value.chars().count();
@@ -12168,13 +12306,6 @@ pub const MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET: usize = 1_000;
 /// reports a plain string with no `length` or `pattern` — so nothing refuses a longer id
 /// before a handler does, and an id is what one bucket's analytics map keys on.
 pub const MAX_ANALYTICS_ID_CHARS: usize = MAX_CONFIGURATION_ID_CHARS;
-
-/// Whether `value` is an id an analytics configuration may be identified by: a
-/// configuration id by length ([`is_valid_configuration_id`], i.e. between one and
-/// [`MAX_ANALYTICS_ID_CHARS`] characters), which is all `AnalyticsId` constrains.
-pub fn is_valid_analytics_id(value: &str) -> bool {
-    is_valid_configuration_id(value)
-}
 
 /// How many S3 Inventory configurations one bucket may hold, and so how many entries one
 /// bucket's inventory record can ever carry.

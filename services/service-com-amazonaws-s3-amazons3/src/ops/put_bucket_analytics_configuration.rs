@@ -6,16 +6,19 @@
 //! carried under THAT id and leaving every other id untouched. The payload IS the
 //! configuration, so what the request names becomes the stored configuration — every member
 //! of it, down to the export destination's own account id — and
-//! `GetBucketAnalyticsConfiguration` reports it back. Refused before anything is written
-//! when the request is not one S3 records: an id outside the published length, an id that
-//! disagrees with the payload's own `Id`, or an `And` filter naming fewer than two
-//! predicates (`InvalidArgument`), and a NEW configuration past
-//! [`crate::state::MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET`] (`TooManyConfigurations`).
+//! `GetBucketAnalyticsConfiguration` reports it back. Success is
+//! [`PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS`] with an empty body. Refused before
+//! anything is written when the request is not one S3 records: an id outside the id rule
+//! every bucket configuration id shares (`InvalidConfigurationId` for an id the request
+//! states none of, else `InvalidConfigId`; see
+//! [`crate::state::configuration_id_fault`]), an id that disagrees with the payload's own
+//! `Id` or an `And` filter naming fewer than two predicates (`InvalidArgument`), and a NEW
+//! configuration past [`crate::state::MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET`]
+//! (`TooManyConfigurations`).
 //!
-//! The read side is `GetBucketAnalyticsConfiguration`, implemented in the same change so a
-//! put can be read back; `DeleteBucketAnalyticsConfiguration` and
-//! `ListBucketAnalyticsConfigurations` are still the scaffold's 501 and are their own stub
-//! issues.
+//! The read side is `GetBucketAnalyticsConfiguration`; `DeleteBucketAnalyticsConfiguration`
+//! judges an id by the same rule, and `ListBucketAnalyticsConfigurations` reports what these
+//! puts recorded.
 //!
 //! ## Shape of an operation
 //!
@@ -119,9 +122,22 @@ impl PutBucketAnalyticsConfigurationOutput {
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "PUT",
         "/{Bucket}?analytics",
-        Some(200u16),
+        Some(PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS),
     ));
 }
+
+/// The HTTP status a successful `PutBucketAnalyticsConfiguration` answers: `204 No Content`.
+///
+/// A successful write of an analytics configuration has nothing to return — the modelled
+/// output shape is `smithy.api#Unit`, which
+/// `smithy_query(query="operation",operation="PutBucketAnalyticsConfiguration")` reports
+/// with no members — and S3 answers it 204 with an empty body, where the model's `@http`
+/// code says 200; the same subresource's `DeleteBucketAnalyticsConfiguration` carries 204 in
+/// the model itself. Named once here so the operation's `SUCCESS_STATUS` (what the
+/// serializer reads) and the output schema's `@http` code cannot drift apart — the reading
+/// `PutBucketTagging` and `PutBucketPolicy` give their own no-content writes
+/// ([`super::put_bucket_tagging::PUT_BUCKET_TAGGING_SUCCESS_STATUS`]).
+pub const PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS: u16 = 204;
 
 pub static PUT_BUCKET_ANALYTICS_CONFIGURATION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &PutBucketAnalyticsConfigurationOutput::SCHEMA;
 
@@ -190,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "PutBucketAnalyticsConfiguration";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_BUCKET_ANALYTICS_CONFIGURATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = PUT_BUCKET_ANALYTICS_CONFIGURATION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS;
 
     async fn handle(
         &self,
@@ -241,45 +257,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // An id is what the configuration is addressable by, bounded by the length every
-        // bucket configuration id shares: a value outside it identifies no configuration the
-        // service can record, which is what this operation's own `InvalidArgument` reports.
-        if !crate::state::is_valid_analytics_id(&input.id) {
-            return Err(invalid_analytics_id(&input.id));
+        // An id is what the configuration is addressable by, and a value outside the id rule
+        // every bucket configuration id shares identifies no configuration the service can
+        // record: refused with the code and the sentence S3 publishes for the rule it broke
+        // ([`crate::state::configuration_id_fault`]), before anything is written.
+        if let Some(fault) = crate::state::configuration_id_fault(&input.id) {
+            return Err(invalid_analytics_id(fault));
         }
 
         // The configuration a put "specified by the analytics configuration ID" sets and the
         // `Id` that "identifies the analytics configuration" in the payload name ONE
-        // configuration, so two different values name no configuration the service can
-        // record.
+        // configuration, so a document naming another one does not describe the
+        // configuration this request addresses — which is a document that "did not validate
+        // against our published schema", the fixed refusal
+        // [`crate::state::MALFORMED_XML_CODE`] carries however a document failed to validate.
         if input.analytics_configuration.id != input.id {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::INVALID_ARGUMENT_CODE,
-                crate::state::INVALID_ARGUMENT_STATUS,
-                format!(
-                    "AnalyticsConfiguration.Id {:?} does not identify the analytics \
-                     configuration the request names, {:?}",
-                    input.analytics_configuration.id, input.id
-                ),
-            ));
+            return Err(malformed_analytics_configuration());
         }
 
         // "A conjunction (logical AND) of predicates … The operator must have at least two
         // predicates" (`AnalyticsFilter$And`): a prefix and each tag are one predicate each,
-        // so an `And` carrying fewer than two is a filter the service cannot evaluate rather
-        // than a payload it cannot parse.
+        // and that minimum is part of the schema the API publishes for this payload as much
+        // as the `Id` rule is, so an `And` carrying fewer is the same schema refusal — the
+        // reading `PutBucketMetricsConfiguration` gives its own filter.
         if let Some(AnalyticsFilter::And(operator)) = &input.analytics_configuration.filter {
             let predicates =
                 usize::from(operator.prefix.is_some()) + operator.tags.as_ref().map_or(0, Vec::len);
             if predicates < MIN_AND_OPERATOR_PREDICATES {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::INVALID_ARGUMENT_CODE,
-                    crate::state::INVALID_ARGUMENT_STATUS,
-                    format!(
-                        "AnalyticsConfiguration.Filter.And names {predicates} predicate(s); the \
-                         operator must have at least {MIN_AND_OPERATOR_PREDICATES}"
-                    ),
-                ));
+                return Err(malformed_analytics_configuration());
+            }
+        }
+
+        // "The Amazon Resource Name (ARN) of the bucket to which data is exported"
+        // (`AnalyticsS3BucketDestination$Bucket`): a value that is not a bucket ARN — a bare
+        // bucket name, say — names no destination an export could be written to, so the
+        // document does not validate against the published schema either. Judged through the
+        // crate's one bucket-ARN reading ([`crate::state::is_s3_bucket_arn`]), the same one
+        // a replication rule's destination bucket is judged by.
+        if let Some(export) = &input
+            .analytics_configuration
+            .storage_class_analysis
+            .data_export
+        {
+            if !crate::state::is_s3_bucket_arn(&export.destination.s3_bucket_destination.bucket) {
+                return Err(malformed_analytics_configuration());
             }
         }
 
@@ -296,7 +317,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match bucket.put_analytics_configuration(input.id, input.analytics_configuration) {
             crate::state::BucketConfigurationWrite::Stored
             | crate::state::BucketConfigurationWrite::Replaced => Ok(
-                // `Unit` output: success is the modelled 200 and an empty body.
+                // `Unit` output: success is
+                // [`PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS`] and an empty body.
                 PutBucketAnalyticsConfigurationOutput,
             ),
             // "You are attempting to create a new configuration but have already reached the
@@ -314,18 +336,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The refusal for an `Id` whose value is not an analytics configuration id, naming the
-/// member and the rule it broke — what a caller has to fix the request from.
-fn invalid_analytics_id(value: &str) -> PutBucketAnalyticsConfigurationError {
+/// The refusal for an `Id` whose value is not an analytics configuration id: the code and
+/// the fixed sentence S3 publishes for the rule the value broke, which is what a caller
+/// fixes the request from. Nothing of the request is echoed into it — S3's wording for each
+/// of these states the rule rather than the value.
+fn invalid_analytics_id(
+    fault: crate::state::ConfigurationIdFault,
+) -> PutBucketAnalyticsConfigurationError {
+    crate::scaffolded::Scaffolded::unmodeled(fault.code(), fault.status(), fault.message())
+}
+
+/// The refusal for an `AnalyticsConfiguration` document that does not validate against the
+/// schema the API publishes for it.
+///
+/// It carries that code's own FIXED published text
+/// ([`crate::state::MALFORMED_XML_MESSAGE`]) rather than anything about this request — the
+/// reading `PutBucketMetricsConfiguration` gives its own payload: the code says the document
+/// did not validate against the published schema, and the schema is the same for every
+/// document.
+fn malformed_analytics_configuration() -> PutBucketAnalyticsConfigurationError {
     crate::scaffolded::Scaffolded::unmodeled(
-        crate::state::INVALID_ARGUMENT_CODE,
-        crate::state::INVALID_ARGUMENT_STATUS,
-        format!(
-            "Id {value:?} is not an analytics configuration id: between 1 and {} characters",
-            crate::state::MAX_ANALYTICS_ID_CHARS
-        ),
+        crate::state::MALFORMED_XML_CODE,
+        MALFORMED_XML_STATUS,
+        crate::state::MALFORMED_XML_MESSAGE,
     )
 }
+
+/// The HTTP status [`crate::state::MALFORMED_XML_CODE`] is rendered with: 400, as that
+/// code's own entry in Amazon S3's "Error responses" list publishes it.
+const MALFORMED_XML_STATUS: u16 = 400;
 
 /// The fewest predicates `AnalyticsFilter$And` may carry: "The operator must have at least
 /// two predicates" (that member's own documentation).

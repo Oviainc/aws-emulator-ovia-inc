@@ -37,7 +37,7 @@
 //!   `AccessDenied`.
 
 use service_com_amazonaws_s3_amazons3::state::{
-    INVALID_ARGUMENT_CODE, NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE,
+    MALFORMED_CONTINUATION_TOKEN_CODE, NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -423,7 +423,7 @@ async fn a_listing_refuses_what_it_cannot_report() {
             Some("not-a-token"),
             vec![],
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_CONTINUATION_TOKEN_CODE,
         ),
         (
             "a continuation token this listing did not issue",
@@ -431,7 +431,7 @@ async fn a_listing_refuses_what_it_cannot_report() {
             Some("6b657074"),
             vec![],
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_CONTINUATION_TOKEN_CODE,
         ),
         (
             "a continuation token minted for another listing",
@@ -439,7 +439,7 @@ async fn a_listing_refuses_what_it_cannot_report() {
             Some(&foreign_marker),
             vec![],
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_CONTINUATION_TOKEN_CODE,
         ),
     ];
 

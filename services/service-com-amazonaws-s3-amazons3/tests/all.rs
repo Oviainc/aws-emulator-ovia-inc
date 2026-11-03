@@ -25,6 +25,8 @@ mod bucket_acl;
 mod bucket_analytics_configuration;
 #[path = "all/bucket_analytics_configuration_listing.rs"]
 mod bucket_analytics_configuration_listing;
+#[path = "all/bucket_configuration_id_addressing.rs"]
+mod bucket_configuration_id_addressing;
 #[path = "all/bucket_cors.rs"]
 mod bucket_cors;
 #[path = "all/bucket_cors_delete.rs"]
@@ -261,6 +263,8 @@ mod refusal_resource_naming;
 mod refused_argument_envelope;
 #[path = "all/reserved_tag_key_prefix.rs"]
 mod reserved_tag_key_prefix;
+#[path = "all/scratch_probe.rs"]
+mod scratch_probe;
 #[path = "all/signature_refusal_wording.rs"]
 mod signature_refusal_wording;
 #[path = "all/state_roundtrip.rs"]

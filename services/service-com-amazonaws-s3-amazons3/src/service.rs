@@ -440,8 +440,9 @@ fn element_of(member_path_segment: &str) -> String {
 /// Each row's source is the AWS S3 API reference for the operation that binds the field —
 /// `CopyObject`'s two directive headers, `GetObjectAttributes`'
 /// `x-amz-object-attributes`, `CreateBucket`'s `x-amz-object-ownership`, `ListBuckets`'
-/// `max-buckets`, and `UpdateObjectEncryption`'s `ObjectEncryption` payload, whose
-/// `InvalidRequest` messages that operation's own `@documentation` lists
+/// `max-buckets`, the `id` query parameter the id-addressed bucket configuration operations
+/// share ([`CONFIGURATION_ID_PARAMETER`]), and `UpdateObjectEncryption`'s `ObjectEncryption`
+/// payload, whose `InvalidRequest` messages that operation's own `@documentation` lists
 /// (`smithy_query(query="doc",shape="UpdateObjectEncryption")`).
 fn published_refusal(violation: &Violation) -> Option<Refused> {
     let mut segments = violation.path.split('.');
@@ -492,6 +493,16 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
         "maxBuckets" => (
             crate::state::INVALID_ARGUMENT_CODE,
             "Argument max-buckets must be an integer between 1 and 10000".to_string(),
+        ),
+        // The id a bucket configuration is addressed by ([`CONFIGURATION_ID_PARAMETER`]): a
+        // call that states none names no configuration at all, which S3 reports against the
+        // id itself rather than as a bare bad argument — the same refusal a handler answers
+        // an id it was handed empty with
+        // (`crate::state::ConfigurationIdFault::Unstated`), so the two cannot disagree about
+        // a call that identifies nothing.
+        "id" => (
+            crate::state::INVALID_CONFIGURATION_ID_CODE,
+            crate::state::INVALID_CONFIGURATION_ID_MESSAGE.to_string(),
         ),
         // `UpdateObjectEncryption`'s payload: a KMS key ARN that is not one is an
         // `InvalidRequest` naming the requirement and then WHY the value does not meet it,
@@ -545,6 +556,23 @@ pub(crate) fn query_carries(query: &str, name: &str) -> bool {
         .any(|parameter| parameter.split('=').next().unwrap_or(parameter) == name)
 }
 
+/// The VALUE a request URI's query string gives the parameter `name`, or `None` when it
+/// carries no such parameter. A parameter spelled as a bare flag (`?id`) states the empty
+/// value, which is what it names.
+///
+/// The first occurrence is what answers, the way a query reader takes one value for one
+/// parameter; nothing here decodes, because the callers ask only whether a value is empty.
+fn query_value<'q>(query: &'q str, name: &str) -> Option<&'q str> {
+    query.split('&').find_map(|parameter| {
+        match parameter.split_once('=') {
+            Some((key, value)) if key == name => Some(value),
+            // A bare flag: the parameter is there and names the empty value.
+            None if parameter == name => Some(""),
+            _ => None,
+        }
+    })
+}
+
 /// Whether `path` addresses an OBJECT — S3's `/{Bucket}/{Key+}`, a non-empty bucket
 /// segment with a non-empty key below it — rather than a bucket or the service root.
 fn addresses_object(path: &str) -> bool {
@@ -585,6 +613,54 @@ const SESSION_SUBRESOURCE: &str = "session";
 /// ignores it — so what is left of the request is `GET /{Bucket}`, the bucket's own listing,
 /// which is the operation bound to that method and path with no subresource.
 const LISTING_WITHOUT_SUBRESOURCE: &str = "ListObjects";
+
+/// The query parameter a bucket configuration's id arrives in.
+///
+/// Every one of the twelve id-addressed bucket configuration operations binds its id as
+/// `Id` `@httpQuery("id")` (`smithy_query(query="operation",
+/// operation="PutBucketAnalyticsConfiguration")`; `OPERATIONS.md` restates the same binding
+/// for the metrics, S3 Inventory and S3 Intelligent-Tiering families), so ONE parameter
+/// name names the id of all of them.
+const CONFIGURATION_ID_PARAMETER: &str = "id";
+
+/// The bucket subresources whose READ, WRITE and DELETE are addressed by a configuration
+/// id, as `(subresource, method, operation)`.
+///
+/// Each row is one `@http` uri the model binds — `GET`/`PUT`/`DELETE`
+/// `/{Bucket}?<subresource>` with `Id` required — for the four families a bucket holds
+/// per-id configurations of: analytics, metrics, S3 Inventory and S3 Intelligent-Tiering.
+/// The `GET` row names the family's LISTING, which is the operation the model binds at that
+/// same method and path with NO id and so the one a read that identifies no configuration
+/// asks for.
+///
+/// Read by [`EmulatedService::configuration_subresource_operation`], the one place a
+/// subresource call that states no id is kept off the bucket-level route.
+const ID_ADDRESSED_CONFIGURATION_ROUTES: &[(&str, &str, &str)] = &[
+    ("analytics", "GET", "ListBucketAnalyticsConfigurations"),
+    ("analytics", "PUT", "PutBucketAnalyticsConfiguration"),
+    ("analytics", "DELETE", "DeleteBucketAnalyticsConfiguration"),
+    ("metrics", "GET", "ListBucketMetricsConfigurations"),
+    ("metrics", "PUT", "PutBucketMetricsConfiguration"),
+    ("metrics", "DELETE", "DeleteBucketMetricsConfiguration"),
+    ("inventory", "GET", "ListBucketInventoryConfigurations"),
+    ("inventory", "PUT", "PutBucketInventoryConfiguration"),
+    ("inventory", "DELETE", "DeleteBucketInventoryConfiguration"),
+    (
+        "intelligent-tiering",
+        "GET",
+        "ListBucketIntelligentTieringConfigurations",
+    ),
+    (
+        "intelligent-tiering",
+        "PUT",
+        "PutBucketIntelligentTieringConfiguration",
+    ),
+    (
+        "intelligent-tiering",
+        "DELETE",
+        "DeleteBucketIntelligentTieringConfiguration",
+    ),
+];
 
 /// The refusal S3 publishes for a body member whose value the validating walk WITHHELD.
 ///
@@ -745,6 +821,47 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 .bucket(name)
                 .is_some_and(|bucket| !bucket.is_directory())
         })
+    }
+
+    /// The operation a request on an ID-ADDRESSED bucket configuration subresource names
+    /// when it states no configuration id — none at all, or an empty one — or `None` for
+    /// every other request, which keeps the route the generated table gives it.
+    ///
+    /// The model binds each of those reads, writes and deletes at `/{Bucket}?<subresource>`
+    /// with `Id` as a REQUIRED `@httpQuery` member
+    /// ([`ID_ADDRESSED_CONFIGURATION_ROUTES`]), and the generated table drops a route whose
+    /// required bindings the request does not carry — so a call that names the subresource
+    /// but no id falls through to the route bound to the BARE path, which for `PUT` is
+    /// `CreateBucket` and for `DELETE` is `DeleteBucket`. A bucket subresource is not the
+    /// bucket: S3 serves such a request as the subresource call it addressed — the LISTING of
+    /// that subresource for a `GET`, which is the operation the model binds there with no id,
+    /// and the write or the delete it addressed for the other two, refused for the id it did
+    /// not state — so it is resolved here rather than becoming a create or a delete of the
+    /// bucket itself.
+    ///
+    /// An id the request states EMPTY identifies no configuration either, so it resolves the
+    /// same way: a `GET` of the subresource with an empty id is that subresource's listing.
+    ///
+    /// The address is read in the PATH-STYLE form every route of this service is bound in
+    /// ([`Self::path_style_path`]), so the two address forms resolve alike, and an OBJECT
+    /// path is left alone: these subresources are a bucket's.
+    fn configuration_subresource_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        let query = wire::request_query(req.uri());
+        // An id the request states non-empty leaves the generated table's own lookup to
+        // resolve the call, and the handler to judge the value.
+        if query_value(query, CONFIGURATION_ID_PARAMETER).is_some_and(|id| !id.is_empty()) {
+            return None;
+        }
+        let path = self.path_style_path(req);
+        if first_path_segment(&path).is_none() || addresses_object(&path) {
+            return None;
+        }
+        let operation = ID_ADDRESSED_CONFIGURATION_ROUTES
+            .iter()
+            .find_map(|(subresource, method, operation)| {
+                (*method == req.method() && query_carries(query, subresource)).then_some(*operation)
+            })?;
+        self.entry.routing_table().get(operation)
     }
 
     /// How this service answers the AUTHENTICATION refusal of the request it is serving, or
@@ -941,6 +1058,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 .entry
                 .routing_table()
                 .get(LISTING_WITHOUT_SUBRESOURCE);
+        }
+        // A write or a delete addressing an ID-ADDRESSED bucket configuration subresource
+        // that states no `id` is that subresource's call with an id missing, never the
+        // bucket-level `CreateBucket` or `DeleteBucket` bound to the same method and the bare
+        // path; see [`Self::configuration_subresource_operation`]. Resolved before the
+        // model's routing table, which drops the subresource route for the required binding
+        // the request does not carry.
+        if let Some(operation) = self.configuration_subresource_operation(req) {
+            return Some(operation);
         }
         // A VIRTUAL-HOSTED-STYLE request names its bucket in the host, so its path is the
         // key alone — `GET /key-name` — which the model's routing table cannot name: every

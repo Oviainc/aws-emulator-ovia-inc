@@ -271,10 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume_at = match input.continuation_token.as_deref() {
             Some(token) if !token.is_empty() => {
                 Some(decode_continuation_token(token).ok_or_else(|| {
+                    // A token this listing did not issue names no page of it: the refusal
+                    // every bucket-configuration listing shares
+                    // ([`crate::state::MALFORMED_CONTINUATION_TOKEN_CODE`]).
                     crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::INVALID_ARGUMENT_CODE,
-                        crate::state::INVALID_ARGUMENT_STATUS,
-                        "The continuation token provided is incorrect",
+                        crate::state::MALFORMED_CONTINUATION_TOKEN_CODE,
+                        crate::state::MALFORMED_CONTINUATION_TOKEN_STATUS,
+                        crate::state::MALFORMED_CONTINUATION_TOKEN_MESSAGE,
                     )
                 })?)
             }

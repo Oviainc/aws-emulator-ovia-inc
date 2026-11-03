@@ -23,8 +23,8 @@
 //!   the NextContinuationToken value to continue the pagination of the list by passing the
 //!   value in continuation-token in the request" (the operation's own documentation): the
 //!   pages partition the bucket's configurations, each page echoes the token the request
-//!   carried, and a token the service did not issue is refused with `InvalidArgument`
-//!   (HTTP 400).
+//!   carried, and a token the service did not issue is refused with
+//!   `MalformedContinuationToken` (HTTP 400).
 //! * A listing is a REPORT: two listings of an unchanged bucket report the same thing, and
 //!   neither consumes nor hides what a later read sees.
 //! * A call naming a bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404);
@@ -35,7 +35,9 @@ use service_com_amazonaws_s3_amazons3::ops::types::{
     INVENTORY_FORMAT_VALUES, INVENTORY_FREQUENCY_VALUES, INVENTORY_INCLUDED_OBJECT_VERSIONS_VALUES,
     INVENTORY_OPTIONAL_FIELD_VALUES,
 };
-use service_com_amazonaws_s3_amazons3::state::{INVALID_ARGUMENT_CODE, NO_SUCH_BUCKET_CODE};
+use service_com_amazonaws_s3_amazons3::state::{
+    MALFORMED_CONTINUATION_TOKEN_CODE, NO_SUCH_BUCKET_CODE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_analytics_configuration::FOREIGN_ACCOUNT_ID;
@@ -444,7 +446,7 @@ async fn a_listing_refuses_what_it_cannot_report() {
             Some("not-a-token"),
             vec![],
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_CONTINUATION_TOKEN_CODE,
         ),
         (
             "a continuation token this listing did not issue",
@@ -452,7 +454,7 @@ async fn a_listing_refuses_what_it_cannot_report() {
             Some("6b657074"),
             vec![],
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_CONTINUATION_TOKEN_CODE,
         ),
         (
             "a continuation token minted for another listing",
@@ -460,7 +462,7 @@ async fn a_listing_refuses_what_it_cannot_report() {
             Some(&foreign_marker),
             vec![],
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_CONTINUATION_TOKEN_CODE,
         ),
     ];
 

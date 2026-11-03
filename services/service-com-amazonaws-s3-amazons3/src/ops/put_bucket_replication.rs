@@ -333,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // store the results" (`Destination$Bucket`): the destination travels as a
             // bucket ARN, so a value that is not one — a bare bucket name, say — is
             // refused the same way the role is.
-            if !is_s3_bucket_arn(&rule.destination.bucket) {
+            if !crate::state::is_s3_bucket_arn(&rule.destination.bucket) {
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::INVALID_ARGUMENT_CODE,
                     crate::state::INVALID_ARGUMENT_STATUS,
@@ -379,20 +379,6 @@ fn is_iam_role_arn(value: &str) -> bool {
         crate::state::ArnField::Empty,
         crate::state::ArnField::Present,
         "role/",
-    )
-}
-
-/// Whether `value` is the ARN of an S3 bucket: `arn:<partition>:s3:::<name>`.
-///
-/// A bucket ARN carries neither a Region nor an account id, because a bucket name is
-/// globally unique, and its resource part is the bare bucket name.
-fn is_s3_bucket_arn(value: &str) -> bool {
-    crate::state::is_arn_of(
-        value,
-        "s3",
-        crate::state::ArnField::Empty,
-        crate::state::ArnField::Empty,
-        "",
     )
 }
 

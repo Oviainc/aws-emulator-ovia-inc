@@ -62,6 +62,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use service_com_amazonaws_s3_amazons3::state::{
     INVALID_ACCESS_TIER_CODE, INVALID_ARGUMENT_CODE, INVALID_CONFIG_ID_CODE,
+    MALFORMED_CONTINUATION_TOKEN_CODE,
     MAX_CONFIGURATION_ID_CHARS, MAX_INTELLIGENT_TIERING_CONFIGURATIONS_PER_BUCKET,
     NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE,
 };
@@ -721,8 +722,8 @@ async fn the_listing_pages_over_the_configurations() {
     );
     assert_eq!(
         refused.error_code(),
-        INVALID_ARGUMENT_CODE,
-        "case \"forged token\": expected {INVALID_ARGUMENT_CODE}, got {}",
+        MALFORMED_CONTINUATION_TOKEN_CODE,
+        "case \"forged token\": expected {MALFORMED_CONTINUATION_TOKEN_CODE}, got {}",
         refused.error_code()
     );
 }

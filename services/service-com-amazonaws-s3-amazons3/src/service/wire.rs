@@ -156,6 +156,21 @@ pub const UNWRAPPED_XML_OUTPUT_OPERATIONS: &[&str] = &["GetBucketLocation"];
 /// here, keyed on the operation, beside the other thing the generic serializer cannot know.
 pub const JSON_PAYLOAD_OUTPUT_OPERATIONS: &[&str] = &["GetBucketPolicy"];
 
+/// The operations whose response document names its ROOT element something other than the
+/// `xmlName` this model declares for the output shape, as `(operation, modelled, served)`.
+///
+/// The root element of a restXml response is the output shape's `xmlName`, and for the
+/// analytics listing the model declares `ListBucketAnalyticsConfigurationResult`
+/// (`smithy_query(query="shape",shape="ListBucketAnalyticsConfigurationsOutput")`) where the
+/// service answers the PLURAL `ListBucketAnalyticsConfigurationsResult`. A client reads the
+/// result out of the element the service sends, so the served name is the contract and the
+/// modelled one is what this table corrects; nothing else about the document changes.
+const SERVED_OUTPUT_ROOT_ELEMENTS: &[(&str, &str, &str)] = &[(
+    "ListBucketAnalyticsConfigurations",
+    "ListBucketAnalyticsConfigurationResult",
+    "ListBucketAnalyticsConfigurationsResult",
+)];
+
 /// The `content-type` a response whose body is a JSON document carries — see
 /// [`JSON_PAYLOAD_OUTPUT_OPERATIONS`].
 pub const JSON_PAYLOAD_CONTENT_TYPE: &str = "application/json";
@@ -577,6 +592,124 @@ fn xml_charset_violation(request: &Request, input_schema: &Schema) -> Option<Vio
 /// about a scalar binding of a member of the same name.
 pub(crate) const XML_CHARACTER_SET: &str =
     "#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]";
+
+/// The violation to refuse `request` with when its body is an XML DOCUMENT in which a member
+/// the model declares a UNION does not carry EXACTLY ONE member, or `None` when every union
+/// the document spells carries one (and for every request whose body is not a document).
+///
+/// A union is a choice: "a filter must have exactly one prefix, one tag, or one conjunction
+/// (AnalyticsAndOperator)" (`AnalyticsFilter`'s own documentation). A document naming two of
+/// such a union's members, or none, is therefore not a document of that shape — it is one the
+/// published schema does not validate, which is S3's `MalformedXML`
+/// (`crate::service::s3_refusal` chooses the code from the member the violation names).
+/// Refused HERE, before the codec reads the body, because the codec reports the same document
+/// as a failure it has no S3 code for and a client would then read the framework's own
+/// generic one instead.
+fn union_arity_violation(request: &Request, input_schema: &Schema) -> Option<Violation> {
+    let payload = input_schema
+        .members()
+        .iter()
+        .find(|member| is_xml_document_payload(member))?;
+    let payload_member = path::member(payload.member_name()?);
+    let unions: Vec<&(&str, &str, &[&str])> = EXACTLY_ONE_MEMBER_UNIONS
+        .iter()
+        .filter(|(document, _, _)| *document == payload_member)
+        .collect();
+    if unions.is_empty() {
+        return None;
+    }
+    let document = request.body().bytes()?;
+    let index = union_without_exactly_one_member(document, &unions)?;
+    let (_, _, members) = unions[index];
+    Some(Violation {
+        path: ::aws_smithy_schema_server::constraints::path::join(&[
+            payload_member,
+            path::member(unions[index].1),
+        ]),
+        kind: ViolationKind::EnumValue(members.iter().map(|name| (*name).to_string()).collect()),
+        value: None,
+        sensitive: false,
+    })
+}
+
+/// The UNION members of this service's request documents whose own documentation states that
+/// the choice is EXACTLY ONE, as `(payload member, element, the members it chooses between)`.
+///
+/// `AnalyticsFilter` is one: "a filter must have exactly one prefix, one tag, or one
+/// conjunction (AnalyticsAndOperator)", and its members are the ones
+/// `smithy_query(query="shape",shape="AnalyticsFilter")` declares. The lifecycle and
+/// replication rule filters are deliberately NOT here: S3 documents an EMPTY `<Filter>` on a
+/// lifecycle rule as the way to apply the rule to every object in the bucket, so the choice
+/// there may be none and a document naming none still validates.
+const EXACTLY_ONE_MEMBER_UNIONS: &[(&str, &str, &[&str])] = &[(
+    "analyticsConfiguration",
+    "Filter",
+    &["Prefix", "Tag", "And"],
+)];
+
+/// The index in `unions` of the first union element of `document` that does not carry exactly
+/// one child element, or `None` when every one of them carries one.
+///
+/// A union's element is matched by NAME, which is what the codec matches it by too; its
+/// children are counted at the one level below it, so a predicate's own children (a tag's
+/// `Key` and `Value`) are not counted as members of the choice.
+fn union_without_exactly_one_member(
+    document: &[u8],
+    unions: &[&(&str, &str, &[&str])],
+) -> Option<usize> {
+    let mut reader = Reader::from_reader(document);
+    let mut depth = 0usize;
+    // The union being counted: its index in `unions`, the depth its element opened at, and
+    // how many child elements have been seen inside it so far.
+    let mut counting: Option<(usize, usize, usize)> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) => {
+                let local = String::from_utf8_lossy(start.name().as_ref()).into_owned();
+                depth += 1;
+                match counting.as_mut() {
+                    Some((_, opened_at, children)) if depth == *opened_at + 1 => *children += 1,
+                    Some(_) => {}
+                    None => {
+                        if let Some(index) =
+                            unions.iter().position(|(_, element, _)| *element == local)
+                        {
+                            counting = Some((index, depth, 0));
+                        }
+                    }
+                }
+            }
+            Ok(Event::Empty(empty)) => {
+                let local = String::from_utf8_lossy(empty.name().as_ref()).into_owned();
+                match counting.as_mut() {
+                    Some((_, opened_at, children)) if depth == *opened_at => *children += 1,
+                    Some(_) => {}
+                    None => {
+                        // A self-closing union element carries no member at all.
+                        if let Some(index) =
+                            unions.iter().position(|(_, element, _)| *element == local)
+                        {
+                            return Some(index);
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(_)) => {
+                if let Some((index, opened_at, children)) = counting {
+                    if depth == opened_at {
+                        if children != 1 {
+                            return Some(index);
+                        }
+                        counting = None;
+                    }
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
 
 /// `document` with every `@xmlAttribute` member moved out of its element's start tag and
 /// into a child element of that element, or `None` when it carries none (in which case
@@ -1154,6 +1287,38 @@ fn with_request_correlation(
     response
 }
 
+/// `response` with its document's ROOT element named the way the service names it, or
+/// `response` unchanged for an operation whose root the model already names correctly (see
+/// [`SERVED_OUTPUT_ROOT_ELEMENTS`]).
+///
+/// The root name appears exactly twice in a document — its start tag and its end tag — and
+/// no member of these outputs shares the name, so renaming both occurrences renames the root
+/// and nothing else. The `content-length` the serializer set is corrected rather than left
+/// stale, the way [`with_attribute_members`] corrects it: a header that disagrees with the
+/// body is worse than none.
+fn with_served_root_element(mut response: Response, operation_name: &str) -> Response {
+    let Some((_, modelled, served)) = SERVED_OUTPUT_ROOT_ELEMENTS
+        .iter()
+        .find(|(operation, _, _)| *operation == operation_name)
+    else {
+        return response;
+    };
+    let Some(body) = response.body().bytes() else {
+        return response;
+    };
+    let document = String::from_utf8_lossy(body)
+        .replace(&format!("<{modelled}"), &format!("<{served}"))
+        .replace(&format!("</{modelled}>"), &format!("</{served}>"));
+    let length = document.len();
+    *response.body_mut() = SdkBody::from(document);
+    if response.headers().get("content-length").is_some() {
+        response
+            .headers_mut()
+            .insert("content-length", length.to_string());
+    }
+    response
+}
+
 /// `response` with every `@xmlAttribute` member written where the API publishes it, or
 /// `response` unchanged when its body carries none.
 ///
@@ -1404,6 +1569,11 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         if let Some(violation) = xml_charset_violation(request, input_schema) {
             return Err(ProtocolError::Invalid(vec![violation]));
         }
+        // And when a UNION member of that document does not carry exactly one member, which
+        // is not a document of the shape it claims to be. See [`union_arity_violation`].
+        if let Some(violation) = union_arity_violation(request, input_schema) {
+            return Err(ProtocolError::Invalid(vec![violation]));
+        }
         // The PATH the `@httpLabel` members are bound from. A VIRTUAL-HOSTED-STYLE request
         // names its bucket in the host and leaves its path as the key alone, so the bucket
         // is put back in front of it — the same normalization the routing seam resolved the
@@ -1549,7 +1719,7 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         Ok(with_request_correlation(
             without_unbound_body(
                 with_date_time_timestamp_headers(with_partial_content_status(
-                    with_attribute_members(response),
+                    with_served_root_element(with_attribute_members(response), operation_name),
                 )),
                 output_schema,
             ),

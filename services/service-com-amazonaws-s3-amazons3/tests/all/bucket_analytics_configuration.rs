@@ -13,9 +13,10 @@
 //! * `PutBucketAnalyticsConfiguration` "Sets an analytics configuration for the bucket
 //!   (specified by the analytics configuration ID)" (the operation's own documentation): the
 //!   `AnalyticsConfiguration` payload becomes the configuration stored under THAT id in
-//!   full, every other id is left alone, and the call answers the modelled 200 with an empty
-//!   body. A second put under one id replaces that configuration rather than merging into
-//!   it, so a member the replacement omits is gone.
+//!   full, every other id is left alone, and the call answers
+//!   [`PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS`] with an empty body. A second put
+//!   under one id replaces that configuration rather than merging into it, so a member the
+//!   replacement omits is gone.
 //! * `GetBucketAnalyticsConfiguration` reports exactly that container, with every member the
 //!   request named — including `AnalyticsS3BucketDestination$BucketAccountId`, "The account
 //!   ID that owns the destination S3 bucket", which is a value of the request and so comes
@@ -25,20 +26,28 @@
 //!   special error "TooManyConfigurations … HTTP 400 Bad Request": a put that would create
 //!   one past [`MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET`] is refused, while replacing an id
 //!   already stored creates nothing and is not.
-//! * The request's `Id` and the payload's `Id` identify ONE configuration, and an id is
-//!   bounded by [`MAX_ANALYTICS_ID_CHARS`]: a value outside that bound, or two values that
-//!   disagree, is refused with `InvalidArgument` (HTTP 400).
-//! * "The operator must have at least two predicates" (`AnalyticsFilter$And`): an `And`
-//!   naming fewer is refused with `InvalidArgument` (HTTP 400).
+//! * An id identifies the configuration, and a value that is not one identifies nothing: an
+//!   id the request states empty is refused with `InvalidConfigurationId` and one spelled
+//!   outside the id pattern or longer than [`MAX_ANALYTICS_ID_CHARS`] with `InvalidConfigId`
+//!   (both HTTP 400).
+//! * The document is judged against the schema the API publishes for it, which is
+//!   `MalformedXML` (HTTP 400) for every way it fails to validate: a payload `Id` that is not
+//!   the configuration the request names, a `Filter` that does not name exactly one
+//!   predicate ("a filter must have exactly one prefix, one tag, or one conjunction",
+//!   `AnalyticsFilter`), an `And` naming fewer than the two predicates that member documents,
+//!   and an export destination that is not "the Amazon Resource Name (ARN) of the bucket to
+//!   which data is exported" (`AnalyticsS3BucketDestination$Bucket`).
 //! * A call naming a bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404);
 //!   one naming an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //!   `AccessDenied`. Every refusal leaves the stored configurations exactly as they were.
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use service_com_amazonaws_s3_amazons3::ops::put_bucket_analytics_configuration::PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS;
 use service_com_amazonaws_s3_amazons3::state::{
-    INVALID_ARGUMENT_CODE, MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET, MAX_ANALYTICS_ID_CHARS,
-    NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE, TOO_MANY_CONFIGURATIONS_CODE,
+    INVALID_CONFIGURATION_ID_CODE, INVALID_CONFIG_ID_CODE, MALFORMED_XML_CODE,
+    MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET, MAX_ANALYTICS_ID_CHARS, NO_SUCH_BUCKET_CODE,
+    NO_SUCH_CONFIGURATION_CODE, TOO_MANY_CONFIGURATIONS_CODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -136,13 +145,17 @@ pub(crate) struct DataExport {
 }
 
 impl DataExport {
-    /// An export to `bucket`, owned by `bucket_account_id` when the request names one, under
-    /// `prefix` when it names one.
+    /// An export to the bucket NAMED `bucket`, owned by `bucket_account_id` when the request
+    /// names one, under `prefix` when it names one.
+    ///
+    /// `AnalyticsS3BucketDestination$Bucket` is "the Amazon Resource Name (ARN) of the bucket
+    /// to which data is exported", so what travels on the wire — and what a read reports back
+    /// — is that bucket's ARN ([`bucket_arn`]), not its bare name.
     pub(crate) fn new(bucket: &str, bucket_account_id: Option<&str>, prefix: Option<&str>) -> Self {
         Self {
             output_schema_version: SCHEMA_VERSION.to_string(),
             format: EXPORT_FORMAT.to_string(),
-            bucket: bucket.to_string(),
+            bucket: bucket_arn(bucket),
             bucket_account_id: bucket_account_id.map(str::to_string),
             prefix: prefix.map(str::to_string),
         }
@@ -167,6 +180,15 @@ impl DataExport {
     }
 }
 
+/// The ARN of the bucket named `bucket`: `arn:aws:s3:::<name>`, the form an S3 bucket's ARN
+/// takes — a bucket name is globally unique, so neither the Region nor the account-id field
+/// of it carries anything.
+///
+/// `pub(crate)`: the listing suite beside this one names a destination the same way.
+pub(crate) fn bucket_arn(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}")
+}
+
 /// One whole `AnalyticsConfiguration`, as a put carries it and as a read reports it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Configuration {
@@ -178,7 +200,10 @@ pub(crate) struct Configuration {
 impl Configuration {
     /// The payload a client's XML writer spells for this configuration, in the member order
     /// `smithy_query(query="shape",shape="AnalyticsConfiguration")` declares.
-    fn xml(&self) -> String {
+    ///
+    /// `pub(crate)`: the addressing suite beside this one sends the same document under ids
+    /// of its own rather than spelling a second writer.
+    pub(crate) fn xml(&self) -> String {
         let mut body = format!(
             "<AnalyticsConfiguration xmlns=\"{XMLNS}\"><Id>{}</Id>",
             self.id
@@ -559,8 +584,9 @@ async fn an_analytics_configuration_round_trips_under_its_own_id() {
         let put = put_analytics(&router, &name, &wanted).await;
         assert_eq!(
             put.status,
-            200,
-            "case {case:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected the put to answer \
+             {PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             put.status,
             String::from_utf8_lossy(&put.body)
         );
@@ -591,8 +617,9 @@ async fn an_analytics_configuration_round_trips_under_its_own_id() {
         let replacement = configuration(&wanted.id, None, None);
         let answer = put_analytics(&router, &name, &replacement).await;
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected the replacing put to answer 200, got {}",
+            answer.status, PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS,
+            "case {case:?}: expected the replacing put to answer \
+             {PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS}, got {}",
             answer.status
         );
         let after = reported_configuration(&get_analytics(&router, &name, &wanted.id).await);
@@ -637,8 +664,9 @@ async fn each_id_carries_its_own_configuration() {
         let put = put_analytics(&router, name, wanted).await;
         assert_eq!(
             put.status,
-            200,
-            "case {:?}: expected the put to answer 200, got {} ({})",
+            PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS,
+            "case {:?}: expected the put to answer \
+             {PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             wanted.id,
             put.status,
             String::from_utf8_lossy(&put.body)
@@ -667,8 +695,9 @@ async fn each_id_carries_its_own_configuration() {
     let replaced = configuration("gold-tier", Some(Filter::Prefix("gold/".to_string())), None);
     let answer = put_analytics(&router, name, &replaced).await;
     assert_eq!(
-        answer.status, 200,
-        "case \"replacing one of several ids\": expected 200, got {}",
+        answer.status, PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS,
+        "case \"replacing one of several ids\": expected \
+         {PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS}, got {}",
         answer.status
     );
     for wanted in &stored {
@@ -721,8 +750,9 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
     let put = put_analytics(&router, name, &stored).await;
     assert_eq!(
         put.status,
-        200,
-        "case setup: expected the put to answer 200, got {} ({})",
+        PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS,
+        "case setup: expected the put to answer \
+         {PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
         put.status,
         String::from_utf8_lossy(&put.body)
     );
@@ -738,21 +768,35 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
             too_long.clone(),
             configuration(&too_long, None, None).xml(),
             400,
-            INVALID_ARGUMENT_CODE,
+            INVALID_CONFIG_ID_CODE,
         ),
         (
             "an empty id, which identifies no configuration",
             String::new(),
             configuration("", None, None).xml(),
             400,
-            INVALID_ARGUMENT_CODE,
+            INVALID_CONFIGURATION_ID_CODE,
+        ),
+        (
+            "an id spelled with a character the id pattern does not hold",
+            "not~an~id".to_string(),
+            configuration("not~an~id", None, None).xml(),
+            400,
+            INVALID_CONFIG_ID_CODE,
+        ),
+        (
+            "an id carrying a space, percent-encoded in the query",
+            "has%20space".to_string(),
+            configuration("has space", None, None).xml(),
+            400,
+            INVALID_CONFIG_ID_CODE,
         ),
         (
             "a payload Id that is not the configuration the request names",
             "query-id".to_string(),
             configuration("payload-id", None, None).xml(),
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_XML_CODE,
         ),
         (
             "an And naming one predicate where the operator takes two",
@@ -763,7 +807,7 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
                  </AnalyticsConfiguration>"
             ),
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_XML_CODE,
         ),
         (
             "an And naming no predicate at all",
@@ -773,7 +817,32 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
                  <Filter><And></And></Filter>{analysis}</AnalyticsConfiguration>"
             ),
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_XML_CODE,
+        ),
+        (
+            "a filter naming two predicates where the choice is exactly one",
+            "two-predicates".to_string(),
+            format!(
+                "<AnalyticsConfiguration xmlns=\"{XMLNS}\"><Id>two-predicates</Id>\
+                 <Filter><Prefix>both/</Prefix><Tag><Key>team</Key><Value>both</Value></Tag>\
+                 </Filter>{analysis}</AnalyticsConfiguration>"
+            ),
+            400,
+            MALFORMED_XML_CODE,
+        ),
+        (
+            "an export destination that is not a bucket ARN",
+            "bare-destination".to_string(),
+            format!(
+                "<AnalyticsConfiguration xmlns=\"{XMLNS}\"><Id>bare-destination</Id>\
+                 <StorageClassAnalysis><DataExport>\
+                 <OutputSchemaVersion>{SCHEMA_VERSION}</OutputSchemaVersion><Destination>\
+                 <S3BucketDestination><Format>{EXPORT_FORMAT}</Format>\
+                 <Bucket>analytics-destination</Bucket></S3BucketDestination></Destination>\
+                 </DataExport></StorageClassAnalysis></AnalyticsConfiguration>"
+            ),
+            400,
+            MALFORMED_XML_CODE,
         ),
     ];
 
@@ -864,7 +933,14 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
     }
 
     // Nothing any refusal above named reached the store.
-    for id in ["query-id", "payload-id", "one-predicate", "owner-mismatch"] {
+    for id in [
+        "query-id",
+        "payload-id",
+        "one-predicate",
+        "two-predicates",
+        "bare-destination",
+        "owner-mismatch",
+    ] {
         let read = get_analytics(&router, name, id).await;
         assert_eq!(
             read.error_code(),
@@ -879,7 +955,7 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
 
 /// "You can have up to 1,000 analytics configurations per bucket": the 1,001st NEW
 /// configuration is refused with the operation's own `TooManyConfigurations`, while
-/// replacing one of the 1,000 creates none and still answers 200.
+/// replacing one of the 1,000 creates none and is still recorded.
 #[tokio::test]
 async fn one_configuration_past_the_per_bucket_limit_is_refused() {
     let router = router();
@@ -891,7 +967,7 @@ async fn one_configuration_past_the_per_bucket_limit_is_refused() {
         let answer = put_analytics(&router, name, &configuration(&id, None, None)).await;
         assert_eq!(
             answer.status,
-            200,
+            PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS,
             "case {id:?}: a configuration within the limit must be recorded, got {} ({})",
             answer.status,
             String::from_utf8_lossy(&answer.body)
@@ -922,8 +998,9 @@ async fn one_configuration_past_the_per_bucket_limit_is_refused() {
     let answer = put_analytics(&router, name, &replacement).await;
     assert_eq!(
         answer.status,
-        200,
-        "case \"replacing a configuration at the limit\": expected HTTP 200, got {} ({})",
+        PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS,
+        "case \"replacing a configuration at the limit\": expected HTTP \
+         {PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
         answer.status,
         String::from_utf8_lossy(&answer.body)
     );

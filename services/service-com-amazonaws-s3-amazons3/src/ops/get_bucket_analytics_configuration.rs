@@ -182,6 +182,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetBucketAnalyticsConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
             );
         };
+        // An id outside the id rule every bucket configuration id shares identifies no
+        // configuration a put could have recorded, so the read is refused for the id rather
+        // than answered about stored state — the same refusal
+        // `PutBucketAnalyticsConfiguration` gives such a value
+        // ([`crate::state::configuration_id_fault`]), so the two sides of one configuration
+        // cannot disagree about which ids name one.
+        if let Some(fault) = crate::state::configuration_id_fault(&input.id) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                fault.code(),
+                fault.status(),
+                fault.message(),
+            ));
+        }
         // A bucket carrying no configuration under that id has nothing to report, and
         // `GetBucketAnalyticsConfigurationOutput` has no way to say so in a 200: S3 answers
         // `NoSuchConfiguration` for it, the way `GetBucketMetricsConfiguration` answers it

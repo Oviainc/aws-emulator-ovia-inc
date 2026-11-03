@@ -37,8 +37,9 @@
 //!   one naming an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //!   `AccessDenied`.
 
+use service_com_amazonaws_s3_amazons3::ops::put_bucket_analytics_configuration::PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS;
 use service_com_amazonaws_s3_amazons3::state::{
-    INVALID_ARGUMENT_CODE, NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE,
+    MALFORMED_CONTINUATION_TOKEN_CODE, NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -124,7 +125,7 @@ async fn stand_up(
         let put = put_analytics(router, name, wanted).await;
         assert_eq!(
             put.status,
-            200,
+            PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS,
             "case {case:?}: setup must put {:?}, got {} ({})",
             wanted.id,
             put.status,
@@ -432,7 +433,7 @@ async fn a_listing_refuses_what_it_cannot_report() {
             Some("not-a-token"),
             vec![],
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_CONTINUATION_TOKEN_CODE,
         ),
         (
             "a continuation token this listing did not issue",
@@ -440,7 +441,7 @@ async fn a_listing_refuses_what_it_cannot_report() {
             Some("6b657074"),
             vec![],
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_CONTINUATION_TOKEN_CODE,
         ),
         (
             "a continuation token minted for another listing",
@@ -448,7 +449,7 @@ async fn a_listing_refuses_what_it_cannot_report() {
             Some(&foreign_marker),
             vec![],
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_CONTINUATION_TOKEN_CODE,
         ),
     ];
 
@@ -653,8 +654,9 @@ async fn a_delete_is_reflected_in_the_listing_and_in_the_read() {
         .await;
         assert_eq!(
             again.status,
-            200,
-            "case {deleted_id:?}: expected a put under the deleted id to answer 200, got {} ({})",
+            PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS,
+            "case {deleted_id:?}: expected a put under the deleted id to answer \
+             {PUT_BUCKET_ANALYTICS_CONFIGURATION_SUCCESS_STATUS}, got {} ({})",
             again.status,
             body_of(&again)
         );
