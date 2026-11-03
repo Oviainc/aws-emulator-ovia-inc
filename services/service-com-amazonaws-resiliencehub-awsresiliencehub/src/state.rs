@@ -6,6 +6,7 @@ use crate::ops::types::{
     App, AppComponent, FailurePolicy, LogicalResourceId, PhysicalResource, ResiliencyPolicy,
     ESTIMATED_COST_TIER_VALUES,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// The region every minted ARN falls back to when the request carries no usable
@@ -677,6 +678,46 @@ pub fn logical_resource_key(logical: &LogicalResourceId) -> String {
     })
     .collect::<Vec<_>>()
     .join("/")
+}
+
+/// The identity `ListAppVersionResources` reports for the resource mapping of an
+/// app version that no resolution of its own has been started for.
+///
+/// Every listing answers `resolutionId` — the model makes the member REQUIRED —
+/// and an app version's mapping is resolved from the moment something is written
+/// into it, whether or not a client ever asked for a resolution of that version.
+/// The identity is therefore derived from what is PERSISTED: the version
+/// addressed and the mapping it holds, each logical id together with the physical
+/// resource and the type it maps to. Two reads of an unchanged mapping answer the
+/// same identity, a mapping that changed answers a different one, two versions
+/// holding the same mapping answer different ones, and no part of the value
+/// depends on when it was read or on anything in the request other than the
+/// version it addresses.
+///
+/// OPAQUE: a SHA-256 digest, so a client can read no count, instant or ordering
+/// out of it, and it is well inside the modelled `@length` of `String255`.
+pub fn mapping_resolution_id(
+    app_arn: &str,
+    app_version: &str,
+    contents: Option<&AppVersionContents>,
+) -> String {
+    let mut digest = Sha256::new();
+    absorb(&mut digest, app_arn);
+    absorb(&mut digest, app_version);
+    for (key, resource) in contents.into_iter().flat_map(|held| held.resources.iter()) {
+        absorb(&mut digest, key);
+        absorb(&mut digest, &resource.physical_resource_id.identifier);
+        absorb(&mut digest, &resource.physical_resource_id.r#type);
+        absorb(&mut digest, &resource.resource_type);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// Feed one LENGTH-PREFIXED part into `digest`, so two mappings that differ only
+/// in where text falls across parts cannot absorb the same bytes — the reason
+/// [`logical_resource_key`] length-prefixes its members too.
+fn absorb(digest: &mut Sha256, part: &str) {
+    digest.update(format!("{}:{part}", part.len()).as_bytes());
 }
 
 /// The REGION and ACCOUNT an ARN names, each `None` when the ARN carries none

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAppVersionResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAppVersionResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAppVersionResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the resource the request addresses — by `resourceName`,
+//! `logicalResourceId` or `physicalResourceId`, exactly one of the three — from
+//! the addressed application's DRAFT version, and reports the record it removed.
+//! Every resource this emulator stores was added through `CreateAppVersionResource`
+//! and so is manually added (`sourceType` `AppTemplate`), which is the only kind
+//! this operation may delete.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +182,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAppVersionResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAppVersionResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAppVersionResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        // "This API accepts only one of the following parameters to describe the
+        // resource: resourceName, logicalResourceId, physicalResourceId (Along with
+        // physicalResourceId, you can also provide awsAccountId, and awsRegion)" —
+        // the wording the sibling `DescribeAppVersionResource` carries for the same
+        // three selectors. A request naming none addresses no resource, and one
+        // naming two may address two.
+        let selectors = usize::from(input.resource_name.is_some())
+            + usize::from(input.logical_resource_id.is_some())
+            + usize::from(input.physical_resource_id.is_some());
+        if selectors != 1 {
+            return Err(invalid_request(format!(
+                "exactly one of resourceName, logicalResourceId and physicalResourceId \
+                 identifies the resource to delete; this request names {selectors}"
+            )));
+        }
+        if input.physical_resource_id.is_none()
+            && (input.aws_region.is_some() || input.aws_account_id.is_some())
+        {
+            return Err(invalid_request(
+                "awsRegion and awsAccountId narrow a physicalResourceId; this request names \
+                 neither a physicalResourceId nor a resource they could narrow"
+                    .to_string(),
+            ));
+        }
+
+        let mut store = state.lock();
+
+        // The resource is addressed through its application, so that link has to
+        // resolve before anything is removed.
+        if !store.apps.contains_key(&input.app_arn) {
+            return Err(app_not_found(&input.app_arn));
+        }
+
+        // This operation "updates the Resilience Hub application draft version"
+        // (the model's own documentation for it), so the DRAFT is the only version
+        // it removes a resource from: a published snapshot stays frozen, and
+        // `PublishAppVersion` is what carries the removal into a new one.
+        let draft = store.app_version(&input.app_arn, crate::state::DRAFT_APP_VERSION);
+        let addressed = draft.and_then(|draft| {
+            if let Some(resource_name) = input.resource_name.as_deref() {
+                return draft.resource_by_name(resource_name);
+            }
+            if let Some(logical_resource_id) = input.logical_resource_id.as_ref() {
+                return draft.resource_by_logical_id(logical_resource_id);
+            }
+            let identifier = input.physical_resource_id.as_deref()?;
+            draft.resource_by_physical_id(
+                identifier,
+                input.aws_region.as_deref(),
+                input.aws_account_id.as_deref(),
+            )
+        });
+        // Deleting a resource is destructive and not idempotent: the second delete
+        // of one resource finds nothing to delete, which is the same 404 as a
+        // resource the draft never held.
+        let Some(addressed) = addressed else {
+            return Err(resource_not_found(&input));
+        };
+        let resource_key = crate::state::logical_resource_key(&addressed.logical_resource_id);
+
+        let removed = store
+            .draft_app_version_mut(&input.app_arn)
+            .resources
+            .remove(&resource_key);
+        let Some(removed) = removed else {
+            return Err(resource_not_found(&input));
+        };
+        // Release what the create allocated: the idempotency token that recorded
+        // this resource, so an add/delete workload cannot grow the token store.
+        // The token key is the sub-resource form `CreateAppVersionResource`
+        // records, which `DeleteApp` releases the same way.
+        store.forget_idempotency_tokens_for(&format!("{}/resource/{resource_key}", input.app_arn));
+
+        Ok(DeleteAppVersionResourceOutput {
+            app_arn: input.app_arn,
+            app_version: crate::state::DRAFT_APP_VERSION.to_string(),
+            physical_resource: Some(removed),
+        })
     }
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> DeleteAppVersionResourceError {
+    DeleteAppVersionResourceErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 400 `ValidationException` for a request that does not address exactly one
+/// resource.
+fn invalid_request(message: String) -> DeleteAppVersionResourceError {
+    DeleteAppVersionResourceErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted, worded as this service words that error class.
+fn app_not_found(app_arn: &str) -> DeleteAppVersionResourceError {
+    DeleteAppVersionResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("App not found for appArn {app_arn}")),
+        resource_id: Some(app_arn.to_string()),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
+}
+
+/// A 404 for a resource the draft version does not hold — one it never held, or
+/// one an earlier delete already removed.
+///
+/// `resourceId` is the selector the request addressed the resource by, which is
+/// the only identity the service has for a resource it does not hold.
+fn resource_not_found(input: &DeleteAppVersionResourceInput) -> DeleteAppVersionResourceError {
+    let resource_id = input
+        .resource_name
+        .clone()
+        .or_else(|| {
+            input
+                .logical_resource_id
+                .as_ref()
+                .map(|logical| logical.identifier.clone())
+        })
+        .or_else(|| input.physical_resource_id.clone());
+    DeleteAppVersionResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "App version {} of appArn {} holds no such resource",
+            crate::state::DRAFT_APP_VERSION,
+            input.app_arn
+        )),
+        resource_id,
+        resource_type: Some("PhysicalResource".to_string()),
+    })
+    .into()
 }

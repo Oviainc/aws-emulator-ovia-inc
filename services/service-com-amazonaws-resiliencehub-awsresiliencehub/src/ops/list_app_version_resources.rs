@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAppVersionResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAppVersionResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAppVersionResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the physical resources the addressed app version holds —
+//! the DRAFT's as the draft writers left them, a published version's as the
+//! snapshot `PublishAppVersion` froze — under the identity of the resolution the
+//! listing is against, honouring `maxResults` as a real page bound with a
+//! resumable `nextToken`. A pure read.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +166,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAppVersionResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAppVersionResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAppVersionResources"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_token(token).ok_or_else(|| {
+                invalid("nextToken: not a token this operation issued".to_string())
+            })?),
+        };
+        // `maxResults` is modeled `@range(min: 1, max: 100)`, which the boundary
+        // validator already enforces; absent means "as many as a page allows". A
+        // value that reaches here outside the range is refused rather than clamped,
+        // so a validator regression cannot be masked by silently narrowing a page.
+        let page_size = match input.max_results {
+            None => MAX_PAGE_SIZE,
+            Some(requested) if (1..=MAX_PAGE_SIZE).contains(&requested) => requested,
+            Some(requested) => {
+                return Err(invalid(format!(
+                    "maxResults: {requested} is outside the modeled range of 1 to {MAX_PAGE_SIZE}"
+                )))
+            }
+        } as usize;
+
+        let store = state.lock();
+
+        // The resources listed are the resources OF an app version OF an
+        // application, so each link of that path has to resolve before anything is
+        // reported: an empty list would say "this version holds no resource", which
+        // is not what "there is no such application, or no such version of it"
+        // means.
+        if !store.apps.contains_key(&input.app_arn) {
+            return Err(app_not_found(&input.app_arn));
+        }
+        if !store.app_version_exists(&input.app_arn, &input.app_version) {
+            return Err(app_version_not_found(&input.app_arn, &input.app_version));
+        }
+
+        let held = store.app_version(&input.app_arn, &input.app_version);
+        let resolution_id = resolution_of(&store, &input, held)?;
+
+        // `AppVersionContents::resources` is a `BTreeMap` keyed by the
+        // `logicalResourceId` each resource was created with, so iterating it IS a
+        // total order over the page: a `nextToken` resumes at exactly the element
+        // after the last one returned, and past anything removed since.
+        let listed: Vec<(&String, &PhysicalResource)> = held
+            .into_iter()
+            .flat_map(|held| held.resources.iter())
+            .collect();
+        let start = match resume_from.as_deref() {
+            None => 0,
+            Some(token) => listed
+                .iter()
+                .position(|(key, _)| key.as_str() > token)
+                .unwrap_or(listed.len()),
+        };
+        let page = &listed[start..];
+        let returned = &page[..page_size.min(page.len())];
+
+        let next_token = (page.len() > returned.len())
+            .then(|| returned.last().map(|(key, _)| encode_token(key)))
+            .flatten();
+
+        Ok(ListAppVersionResourcesOutput {
+            physical_resources: returned
+                .iter()
+                .map(|(_, resource)| (*resource).clone())
+                .collect(),
+            resolution_id,
+            next_token,
+        })
     }
+}
+
+/// The largest page `maxResults` allows. Source: the `maxResults` member's
+/// `@range(min: 1, max: 100)` (smithy_query query="operation"
+/// operation="ListAppVersionResources").
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The resolution this listing is against, as the REQUIRED `resolutionId`: the one
+/// the request names, else the addressed version's CURRENT resolution, else the
+/// identity of the mapping itself ([`crate::state::mapping_resolution_id`]) — so
+/// the member is answered for every version a client can list, including one
+/// nobody ever asked for a resolution of.
+///
+/// A `resolutionId` the request NAMES has to be a resolution OF the addressed
+/// version: reporting this version's resources under another version's resolution
+/// would answer a mapping that resolution never produced, so it is the modelled
+/// 404 instead.
+fn resolution_of(
+    store: &crate::state::ComAmazonawsResiliencehubAwsresiliencehubState,
+    input: &ListAppVersionResourcesInput,
+    held: Option<&crate::state::AppVersionContents>,
+) -> Result<String, ListAppVersionResourcesError> {
+    if let Some(named) = input.resolution_id.as_deref() {
+        return store
+            .resolution(&input.app_arn, &input.app_version, named)
+            .map(|resolution| resolution.resolution_id.clone())
+            .ok_or_else(|| resolution_not_found(input, named));
+    }
+    Ok(store
+        .current_resolution(&input.app_arn, &input.app_version)
+        .map(|resolution| resolution.resolution_id.clone())
+        .unwrap_or_else(|| {
+            crate::state::mapping_resolution_id(&input.app_arn, &input.app_version, held)
+        }))
+}
+
+/// The `nextToken` form of the stored key a page stopped at: hex-encoded with the
+/// workspace `hex` crate, the same codec `ListApps` and `ListAppVersions` use for
+/// their tokens. Hex is an ENCODING, not a secret, so the safety comes from
+/// [`decode_token`] doing bounded work: a token it cannot read is refused with a
+/// 400, and one it reads that no longer matches a stored resource simply resumes
+/// past everything up to it. The result carries no whitespace, so it satisfies
+/// `NextToken`'s `^\S{1,2000}$`.
+fn encode_token(key: &str) -> String {
+    ::hex::encode(key)
+}
+
+/// Parse a token this operation issued; `None` for anything else. Bounded work:
+/// one hex decode and one UTF-8 check.
+fn decode_token(token: &str) -> Option<String> {
+    let key = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    (!key.is_empty()).then_some(key)
+}
+
+/// A 400 `ValidationException` carrying `message`.
+///
+/// The MODELED error, not `crate::scaffolded::Scaffolded::validation`: this
+/// operation declares `ValidationException`, so the modeled shape is what a client
+/// deserializes (see the note in `crate::scaffolded`).
+fn invalid(message: impl Into<String>) -> ListAppVersionResourcesError {
+    ListAppVersionResourcesErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted, worded as this service words that error class.
+fn app_not_found(app_arn: &str) -> ListAppVersionResourcesError {
+    ListAppVersionResourcesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("App not found for appArn {app_arn}")),
+        resource_id: Some(app_arn.to_string()),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
+}
+
+/// A 404 for an `appVersion` the application does not have.
+fn app_version_not_found(app_arn: &str, app_version: &str) -> ListAppVersionResourcesError {
+    ListAppVersionResourcesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "App version {app_version} not found for appArn {app_arn}"
+        )),
+        resource_id: Some(app_version.to_string()),
+        resource_type: Some("AppVersion".to_string()),
+    })
+    .into()
+}
+
+/// A 404 for a `resolutionId` the addressed app version has no resolution for —
+/// one it never had, one another version recorded, or one its remembered history
+/// no longer holds.
+fn resolution_not_found(
+    input: &ListAppVersionResourcesInput,
+    resolution_id: &str,
+) -> ListAppVersionResourcesError {
+    ListAppVersionResourcesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "App version resources resolution {resolution_id} not found for appArn {}",
+            input.app_arn
+        )),
+        resource_id: Some(resolution_id.to_string()),
+        resource_type: Some("AppVersionResourcesResolution".to_string()),
+    })
+    .into()
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> ListAppVersionResourcesError {
+    ListAppVersionResourcesErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
 }

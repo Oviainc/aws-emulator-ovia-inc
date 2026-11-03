@@ -28,12 +28,14 @@ hex = { workspace = true }
 # Mints the version-4 UUIDs this service's server-generated identifiers (appArn and
 # policyArn ids, resolutionId) are, rather than hand-rolling the version/variant bits.
 uuid = { version = "1", features = ["v4"] }
+# Digests the app-version resource mapping whose own identity ListAppVersionResources
+# reports when no resolution of that version was ever started. Already recorded as an
+# edge of this package in Cargo.lock (which does not distinguish a dev dependency), so
+# moving it out of [dev-dependencies] leaves the lock file untouched.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

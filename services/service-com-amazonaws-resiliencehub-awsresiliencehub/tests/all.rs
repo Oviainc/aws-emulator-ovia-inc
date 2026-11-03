@@ -15,6 +15,8 @@
 mod app_component_and_resource_identity;
 #[path = "all/app_version_app_components.rs"]
 mod app_version_app_components;
+#[path = "all/app_version_resource_listing.rs"]
+mod app_version_resource_listing;
 #[path = "all/app_version_resource_resolution.rs"]
 mod app_version_resource_resolution;
 #[path = "all/app_version_resources.rs"]
