@@ -162,10 +162,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A report of what a vendor publishes: the per-account store (reached
-        // through `self.engine`) holds nothing about a vendor's products, so nothing
-        // here reads or writes it. `ctx` is read only for the signed region a
-        // product's notification topic ARN carries.
-        let _ = &self.engine;
+        // through `self.engine`) holds nothing about a vendor's products, and
+        // nothing in the answer comes from the request's own metadata either, so
+        // neither is read here.
+        let _ = (&self.engine, ctx);
         if !crate::state::is_known_scope(&input.scope) {
             return Err(
                 DescribeManagedProductsByVendorErrorModeled::WAFInvalidParameterException(
@@ -180,19 +180,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Every catalogued group is published in both scopes; the scope and the
-        // signed region only decide which region a product's notification topic ARN
-        // names (see `ManagedRuleGroupDescriptor::product`). `VendorName` is the one
-        // filter this call adds: it is "the name of the managed rule group vendor.
+        // Every catalogued group is published in both scopes, and what a describe
+        // reports about one is its publisher's (see
+        // `ManagedRuleGroupDescriptor::product`), so the scope narrows nothing here.
+        // `VendorName` is the one filter this call adds: it is "the name of the
+        // managed rule group vendor.
         // You use this, along with the rule group name, to identify a rule group"
         // (the member's own doc), so it is matched exactly against each group's
         // publishing vendor, and a vendor that publishes nothing here reports an
         // empty list rather than a refusal.
-        let region = crate::state::request_region(ctx.parts());
         let managed_products = crate::state::MANAGED_RULE_GROUP_CATALOGUE
             .iter()
             .filter(|group| group.vendor_name == input.vendor_name)
-            .map(|group| group.product(&input.scope, &region))
+            .map(crate::state::ManagedRuleGroupDescriptor::product)
             .collect();
 
         Ok(DescribeManagedProductsByVendorOutput {

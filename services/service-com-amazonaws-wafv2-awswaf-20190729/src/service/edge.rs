@@ -1249,12 +1249,15 @@ impl Evaluation<'_> {
             // scope-down statement. With this option, the counted requests aren't
             // further aggregated."
             "CONSTANT" => Some(String::new()),
-            "IP" => Some(self.request.client_ip.clone()),
+            "IP" => Some(clamped(
+                &self.request.client_ip,
+                MAX_AGGREGATE_KEY_COMPONENT_BYTES,
+            )),
             "FORWARDED_IP" => {
                 let config = rate.forwarded_ip_config.as_ref()?;
                 forwarded_addresses(self.request, &config.header_name)
                     .first()
-                    .cloned()
+                    .map(|address| clamped(address, MAX_AGGREGATE_KEY_COMPONENT_BYTES))
             }
             "CUSTOM_KEYS" => {
                 let mut parts: Vec<String> = Vec::new();
@@ -1683,14 +1686,26 @@ fn add_label(labels: &mut Vec<String>, namespace: &str, name: &str) {
     }
 }
 
-/// `awswaf:managed:<vendor>:<rule group name>:` — the namespace a label added by a
-/// rule of a managed group carries
+/// The namespace a label added by a rule of a managed group carries
 /// (`DescribeManagedRuleGroupResponse$LabelNamespace`).
+///
+/// The publishing vendor states it, so for a group this service's catalogue publishes
+/// it is the namespace that catalogue publishes
+/// ([`ManagedRuleGroupDescriptor::managed_label_namespace`]) — the same text
+/// `DescribeManagedRuleGroup` qualifies the group's labels with, so a
+/// `LabelMatchStatement` written against a published label matches the label a
+/// matching request carries. For a group no catalogued vendor publishes, which
+/// contributes no rules at all, it is the documented syntax over the names the
+/// statement carries.
 fn managed_namespace(managed: &ManagedRuleGroupStatement) -> String {
-    format!(
-        "awswaf:managed:{}:{}:",
-        managed.vendor_name, managed.name
-    )
+    catalogued(&managed.vendor_name, &managed.name)
+        .map(ManagedRuleGroupDescriptor::managed_label_namespace)
+        .unwrap_or_else(|| {
+            format!(
+                "awswaf:managed:{}:{}:",
+                managed.vendor_name, managed.name
+            )
+        })
 }
 
 /// Whether the fully qualified label `carried` lies in the namespace `namespace`.

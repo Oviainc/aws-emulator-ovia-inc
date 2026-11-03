@@ -24,28 +24,27 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_wafv2_awswaf_20190729::state::{
-    self, ManagedRuleGroupDescriptor, ManagedVersionState, PublishedRuleAction,
+    ManagedRuleGroupDescriptor, ManagedVersionState, PublishedRuleAction,
     MANAGED_RULE_GROUP_CATALOGUE,
 };
 
 use crate::managed_rule_groups::managed_statement;
-use crate::web_acl_lifecycle::{visibility, Waf, TEST_REGION};
+use crate::web_acl_lifecycle::{visibility, Waf};
 
 /// A `DescribeManagedRuleGroup` request body for `(vendor, name)` in `scope`.
 fn request(scope: &str, vendor: &str, name: &str) -> Value {
     json!({ "Scope": scope, "VendorName": vendor, "Name": name })
 }
 
-/// The region a group's notification topic lives in: a CLOUDFRONT-scoped group is
-/// reached through one endpoint — "API and SDKs - For all calls, use the Region
-/// endpoint us-east-1" (the `Scope` member's own doc) — while a REGIONAL one is
-/// reached through the region the caller signed for.
-fn topic_region(scope: &str) -> &str {
-    if scope == "CLOUDFRONT" {
-        state::DEFAULT_REGION
-    } else {
-        TEST_REGION
-    }
+/// The notification topic every change to an AWS-published managed rule group is
+/// announced on: ONE topic, in the region its publisher publishes it in, whatever
+/// group is asked about and whatever region the caller signed for. Written out here
+/// rather than imported so the table does not restate the code under test.
+fn expected_topic() -> String {
+    format!(
+        "arn:aws:sns:us-east-1:{}:aws-managed-waf-rule-notifications",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// The `RuleAction` a published action is reported as, written out here rather than
@@ -122,14 +121,9 @@ async fn every_catalogued_group_is_described_from_the_published_catalogue() {
                  default, got {response}"
             );
 
-            // One topic per group, in this scope's region and in the emulator's
-            // account, exactly as `DescribeAllManagedProducts` reports it.
-            let expected_topic = format!(
-                "arn:aws:sns:{}:{}:{}",
-                topic_region(scope),
-                ::engine::emulator_account_id(),
-                group.name
-            );
+            // One topic for every announced change, exactly as
+            // `DescribeAllManagedProducts` reports it.
+            let expected_topic = expected_topic();
             assert_eq!(
                 response["SnsTopicArn"],
                 json!(expected_topic),
@@ -137,15 +131,13 @@ async fn every_catalogued_group_is_described_from_the_published_catalogue() {
                  got {response}"
             );
 
-            // "awswaf:managed:<vendor>:<rule group name>:", the syntax
-            // `DescribeManagedRuleGroupResponse$LabelNamespace` states.
-            let expected_namespace =
-                format!("awswaf:managed:{}:{}:", group.vendor_name, group.name);
-            assert_eq!(
-                response["LabelNamespace"],
-                json!(expected_namespace),
-                "case {case:?}: expected the label namespace {expected_namespace:?}, \
-                 got {response}"
+            // A vendor publishes its own group's labels FULLY QUALIFIED, so the
+            // namespace is the prefix they carry and is not reported a second time
+            // on its own.
+            assert!(
+                response["LabelNamespace"].is_null(),
+                "case {case:?}: a vendor's own group reports no separate label \
+                 namespace, got {response}"
             );
 
             let expected_rules: Vec<(String, Value)> = group
@@ -165,14 +157,16 @@ async fn every_catalogued_group_is_described_from_the_published_catalogue() {
             );
 
             // "The labels that one or more rules in this rule group add to matching
-            // web requests": the labels the catalogue CITES for the group's rules,
-            // as each rule specifies it, so the fully qualified label a matching
-            // request carries is the namespace above followed by it. A rule whose
-            // published label the catalogue cannot cite contributes none.
+            // web requests": the labels the catalogue CITES for the group, each
+            // fully qualified under the group's published namespace, plus the
+            // vendor-independent token labels it publishes. A group the catalogue
+            // cites none for reports no such member at all.
+            let namespace = group.managed_label_namespace();
             let expected_labels: BTreeSet<String> = group
                 .rules
                 .iter()
-                .filter_map(|rule| rule.label().map(str::to_string))
+                .filter_map(|rule| rule.label().map(|label| format!("{namespace}{label}")))
+                .chain(group.token_labels.iter().map(|label| (*label).to_string()))
                 .collect();
             assert_eq!(
                 reported_labels(&response, "AvailableLabels")
@@ -182,12 +176,40 @@ async fn every_catalogued_group_is_described_from_the_published_catalogue() {
                 "case {case:?}: expected exactly the cited labels of the group's \
                  rules, got {response}"
             );
+            if expected_labels.is_empty() {
+                assert!(
+                    response["AvailableLabels"].is_null(),
+                    "case {case:?}: a group whose labels nobody published reports no \
+                     list rather than an empty one, got {response}"
+                );
+            }
+
+            // "The labels that one or more rules in this rule group match against in
+            // label match statements": the matched labels the catalogue cites, and
+            // no member at all for a group that matches on none.
+            let expected_consumed: BTreeSet<String> = group
+                .rules
+                .iter()
+                .filter_map(|rule| {
+                    rule.consumed_label()
+                        .map(|label| format!("{namespace}{label}"))
+                })
+                .collect();
             assert_eq!(
-                reported_labels(&response, "ConsumedLabels"),
-                Vec::<String>::new(),
-                "case {case:?}: no rule of a published group matches on a label, so \
-                 the consumed list is empty, got {response}"
+                reported_labels(&response, "ConsumedLabels")
+                    .into_iter()
+                    .collect::<BTreeSet<String>>(),
+                expected_consumed,
+                "case {case:?}: expected exactly the cited matched labels, \
+                 got {response}"
             );
+            if expected_consumed.is_empty() {
+                assert!(
+                    response["ConsumedLabels"].is_null(),
+                    "case {case:?}: a group whose rules match on no label reports no \
+                     consumed list rather than an empty one, got {response}"
+                );
+            }
         }
     }
 }
@@ -519,20 +541,32 @@ fn the_published_rules_are_well_formed() {
                 rule.name
             );
             // A label is reported only where the catalogue cites the published
-            // text; where it does, it must satisfy the modelled `LabelName`.
+            // text; where it does, the fully qualified label must satisfy the
+            // modelled `LabelName`.
             if let Some(label) = rule.label() {
+                let qualified = format!("{}{label}", group.managed_label_namespace());
                 assert!(
-                    (1..=1024).contains(&label.len())
-                        && label
+                    (1..=1024).contains(&qualified.len())
+                        && qualified
                             .bytes()
                             .all(|byte| byte.is_ascii_alphanumeric() || b"_-:".contains(&byte)),
-                    "case {case:?}: the label {label:?} of rule {:?} must satisfy LabelName",
+                    "case {case:?}: the label {qualified:?} of rule {:?} must satisfy LabelName",
                     rule.name
                 );
-                assert_ne!(
-                    label, rule.name,
-                    "case {case:?}: a cited label is the vendor's published text, not \
-                     the rule's own name"
+                assert!(
+                    !qualified.contains(group.name),
+                    "case {case:?}: a published label carries the group's published \
+                     slug, not its API name, got {qualified:?}"
+                );
+            }
+            // A matched label is one of the group's own published labels, so a rule
+            // that matches on one also publishes it.
+            if let Some(matched) = rule.consumed_label() {
+                assert_eq!(
+                    Some(matched),
+                    rule.label(),
+                    "case {case:?}: rule {:?} matches on a label the group publishes",
+                    rule.name
                 );
             }
             let action = rule.action.rule_action();
@@ -553,11 +587,11 @@ fn the_published_rules_are_well_formed() {
                 rule.name
             );
         }
-        // The namespace every one of those labels acquires at match time, which a
-        // caller composes with the label to get the fully qualified one.
+        // The namespace every one of those labels carries, which qualifies each of
+        // them in what the describe publishes.
         let namespace = group.managed_label_namespace();
         assert!(
-            namespace.starts_with("awswaf:managed:") && namespace.ends_with(':'),
+            namespace.starts_with("awswaf:managed:aws:") && namespace.ends_with(':'),
             "case {case:?}: expected a managed label namespace prefix, got {namespace:?}"
         );
     }

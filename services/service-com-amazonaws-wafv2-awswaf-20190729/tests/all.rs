@@ -59,6 +59,8 @@ mod managed_products;
 mod managed_products_by_vendor;
 #[path = "all/managed_rule_group_description.rs"]
 mod managed_rule_group_description;
+#[path = "all/managed_rule_group_labels.rs"]
+mod managed_rule_group_labels;
 #[path = "all/managed_rule_group_version_expiry.rs"]
 mod managed_rule_group_version_expiry;
 #[path = "all/managed_rule_group_versioning.rs"]

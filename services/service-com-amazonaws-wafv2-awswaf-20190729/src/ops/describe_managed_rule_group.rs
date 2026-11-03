@@ -5,7 +5,8 @@
 //! Reports the high-level information a VENDOR publishes about one of its managed
 //! rule groups: the group the `(VendorName, Name)` pair names, at the version the
 //! request names or at the vendor's default, with the capacity a web ACL spends to
-//! run it, the rules it runs and the labels those rules add.
+//! run it, the rules it runs, the labels those rules add and match, and the topic a
+//! change to the group is announced on.
 //!
 //! Every one of those is read from this service's managed-rule-group catalogue
 //! ([`crate::state::MANAGED_RULE_GROUP_CATALOGUE`]) — the same catalogue that
@@ -205,17 +206,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A read of PUBLISHED data: what a vendor offers is not state this account
         // owns — nothing creates, updates or deletes a managed rule group — so the
-        // engine's store holds none of it and nothing here writes. `ctx` is read
-        // only for the signed region the notification topic's ARN carries.
-        let _ = &self.engine;
+        // engine's store holds none of it and nothing here writes. Nothing in the
+        // answer comes from the request's own metadata either: every figure is the
+        // vendor's, so `ctx` is read for nothing.
+        let _ = (&self.engine, ctx);
 
         // `Scope` names the namespace the request is made in, and WAF recognises
         // only the two values the enum declares. It narrows nothing below: a
         // managed rule group is identified by its `(VendorName, Name)` pair alone
         // ("you use this, along with the vendor name, to identify the rule group",
         // `Name`'s own doc), so a vendor publishes the same group in either
-        // namespace — the scope only decides which region the group's notification
-        // topic ARN names.
+        // namespace, and the same description of it.
         if !crate::state::is_known_scope(&input.scope) {
             return Err(
                 DescribeManagedRuleGroupErrorModeled::WAFInvalidParameterException(
@@ -291,10 +292,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        let region = crate::state::request_region(ctx.parts());
-        Ok(DescribeManagedRuleGroupOutput {
-            version_name: version_name.map(|version| version.to_string()),
-            sns_topic_arn: Some(group.sns_topic_arn(&input.scope, &region)),
+        Ok(DescribeManagedRuleGroupOutput {            version_name: version_name.map(|version| version.to_string()),
+            // "The ARN of the Amazon Simple Notification Service SNS topic that's
+            // used to provide notification of changes to the managed rule group":
+            // the ONE topic its publisher announces every such change on, so the
+            // same ARN whatever was asked about and whoever asked (see
+            // `crate::state::AWS_MANAGED_RULE_NOTIFICATION_TOPIC`).
+            sns_topic_arn: Some(group.sns_topic_arn()),
             // "The web ACL capacity units (WCUs) required for this rule group …
             // Rule group capacity is fixed at creation": the one published figure
             // this service also prices a `ManagedRuleGroupStatement` from, so what
@@ -302,14 +306,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // this call reports.
             capacity: Some(group.capacity),
             rules: Some(group.rule_summaries()),
-            label_namespace: Some(group.managed_label_namespace()),
-            available_labels: Some(group.available_labels()),
-            // "The labels that one or more rules in this rule group match against
-            // in label match statements": no rule of a published group matches on
-            // a label, so the list is empty — reported as a list, like the rule
-            // group projections this service derives from stored rules, rather than
-            // left unknown.
-            consumed_labels: Some(Vec::new()),
+            // A VENDOR publishes the labels of its own group FULLY QUALIFIED — each
+            // entry is the whole label a matching request carries, which is the text
+            // a `LabelMatchStatement` composing against the group is written with —
+            // so the namespace is the prefix those labels already carry and is not
+            // reported a second time on its own. `AvailableLabels` and
+            // `ConsumedLabels` report what the catalogue publishes for the group,
+            // and a list the vendor publishes nothing for is left OFF rather than
+            // answered empty: an empty list states the group adds or matches no
+            // label at all, which is not what a group whose label texts nobody
+            // published has said.
+            label_namespace: None,
+            available_labels: published(group.available_labels()),
+            consumed_labels: published(group.consumed_labels()),
         })
     }
+}
+
+/// `labels` as the response member reports them, or `None` when the catalogue
+/// publishes none: a label list the vendor states nothing for is not reported as a
+/// list with nothing in it.
+fn published(labels: Vec<LabelSummary>) -> Option<Vec<LabelSummary>> {
+    Some(labels).filter(|labels| !labels.is_empty())
 }

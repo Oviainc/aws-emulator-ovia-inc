@@ -19,10 +19,10 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_wafv2_awswaf_20190729::state::{self, MANAGED_RULE_GROUP_CATALOGUE};
+use service_com_amazonaws_wafv2_awswaf_20190729::state::MANAGED_RULE_GROUP_CATALOGUE;
 
 use crate::managed_rule_groups::managed_statement;
-use crate::web_acl_lifecycle::{create_web_acl, visibility, Waf, TEST_REGION};
+use crate::web_acl_lifecycle::{create_web_acl, visibility, Waf};
 
 /// The products a response reports, in the order it reported them.
 fn reported(response: &Value) -> Vec<Value> {
@@ -32,16 +32,14 @@ fn reported(response: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// The region a product's notification topic lives in: a CLOUDFRONT-scoped group
-/// is reached through one endpoint — "API and SDKs - For all calls, use the Region
-/// endpoint us-east-1" (the `Scope` member's own doc) — while a REGIONAL one is
-/// reached through the region the caller signed for.
-fn topic_region(scope: &str) -> &str {
-    if scope == "CLOUDFRONT" {
-        state::DEFAULT_REGION
-    } else {
-        TEST_REGION
-    }
+/// The notification topic every change to a published managed rule group is
+/// announced on: ONE topic, in the region its publisher publishes it in, whichever
+/// group is reported and whatever region the caller signed for.
+fn expected_topic() -> String {
+    format!(
+        "arn:aws:sns:us-east-1:{}:aws-managed-waf-rule-notifications",
+        ::engine::emulator_account_id()
+    )
 }
 
 /// Every group the catalogue publishes is reported as a managed product, in
@@ -126,14 +124,9 @@ async fn every_published_group_is_reported_as_a_managed_product() {
                 "case {case:?}: expected IsAdvancedManagedRuleSet {}, got {product}",
                 group.is_advanced_managed_rule_set
             );
-            // One topic per group, in this scope's region and in the emulator's
-            // account, like every other ARN this service answers.
-            let expected_topic = format!(
-                "arn:aws:sns:{}:{}:{}",
-                topic_region(scope),
-                ::engine::emulator_account_id(),
-                group.name
-            );
+            // One topic for every announced change, in the emulator's account, like
+            // every other ARN this service answers.
+            let expected_topic = expected_topic();
             assert_eq!(
                 product["SnsTopicArn"],
                 json!(expected_topic),
