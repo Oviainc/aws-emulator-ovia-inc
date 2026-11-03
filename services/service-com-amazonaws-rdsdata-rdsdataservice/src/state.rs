@@ -9,6 +9,16 @@
 //! executed by that engine — no code here inspects SQL text, and no result is
 //! synthesised.
 //!
+//! ## The PostgreSQL the API advertises
+//!
+//! The engine behind the Data API is Aurora PostgreSQL, so a statement is parsed
+//! as PostgreSQL and its results are described as PostgreSQL's catalog describes
+//! them. [`postgres`] is that front end: it parses the statement, renders it in
+//! the form this engine's own grammar accepts, and names the PostgreSQL type of
+//! every column — which is what `columnMetadata` reports and what decides the
+//! `Field` member each value comes back in. A result whose type the `Field` union
+//! has no member for is refused rather than reported as something it is not.
+//!
 //! ## Transactions
 //!
 //! `BeginTransaction` snapshots the committed database into a private one
@@ -95,7 +105,14 @@ use rusqlite::limits::Limit;
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::Connection;
 
-use crate::ops::types::{ColumnMetadata, Field, ResultSetOptions, SqlParameter};
+use crate::ops::types::{ArrayValue, ColumnMetadata, Field, ResultSetOptions, SqlParameter};
+
+/// The PostgreSQL front end every statement goes through: the dialect the Data
+/// API's statements are written in, and the type catalog `columnMetadata` reports
+/// from.
+pub mod postgres;
+
+use postgres::{PgType, Plan, TypeClass};
 
 /// A handle on this service's store, as a handler gets it from [`service_state`].
 pub type Store = ::engine::ServiceState<ComAmazonawsRdsdataRdsdataserviceState>;
@@ -143,7 +160,7 @@ const MAX_SQL_BYTES: i32 = 65_536;
 /// `SQLITE_LIMIT_VARIABLE_NUMBER`: complexity bounds on one statement, well above
 /// anything a client writes by hand and far below what exhausts the parser.
 const MAX_EXPRESSION_DEPTH: i32 = 200;
-const MAX_COMPOUND_SELECT: i32 = 20;
+pub(crate) const MAX_COMPOUND_SELECT: i32 = 20;
 const MAX_BOUND_PARAMETERS: i32 = 1_000;
 
 /// `max_page_count`: 64 MiB per database at SQLite's 4 KiB default page size. The
@@ -204,7 +221,7 @@ const MAX_DECIMAL_SCALE: i32 = 38;
 /// The largest value reported for a declared type's arguments (`VARCHAR(n)`'s
 /// length, `DECIMAL(p,s)`'s precision and scale). Caps what a declaration can put
 /// into `columnMetadata` and into any arithmetic over it.
-const MAX_DECLARED_ARGUMENT: i32 = 65_535;
+pub(crate) const MAX_DECLARED_ARGUMENT: i32 = 65_535;
 
 /// The only pragmas caller SQL — and this module's own schema introspection — may
 /// run: `table_info`/`table_xinfo` report the columns a table declares, which is
@@ -222,12 +239,14 @@ const SCHEMA_INTROSPECTION_PRAGMAS: &[&str] = &["table_info", "table_xinfo"];
 ///
 /// The names are SQLite's own documented library functions: the core scalar
 /// functions (<https://sqlite.org/lang_corefunc.html>), the date and time
-/// functions (<https://sqlite.org/lang_datefunc.html>), the aggregate functions
+/// functions (<https://sqlite.org/lang_datefunc.html>) and the three date and
+/// time KEYWORDS the engine resolves as functions of the same names
+/// (<https://sqlite.org/lang_expr.html>), the aggregate functions
 /// (<https://sqlite.org/lang_aggfunc.html>), the built-in window functions
 /// (<https://sqlite.org/windowfunctions.html>), the math functions
 /// (<https://sqlite.org/lang_mathfunc.html>) and the JSON functions
 /// (<https://sqlite.org/json1.html>) — every one of which computes over the
-/// values in this database and nothing else.
+/// values in this database, or over the clock, and nothing else.
 ///
 /// DELIBERATELY ABSENT, so they are denied by the default arm: `load_extension`
 /// (the engine's own code loader), the `sqlite3` shell's file functions
@@ -280,6 +299,9 @@ const PERMITTED_FUNCTIONS: &[&str] = &[
     "upper",
     "zeroblob",
     // Date and time functions.
+    "current_date",
+    "current_time",
+    "current_timestamp",
     "date",
     "datetime",
     "julianday",
@@ -515,6 +537,15 @@ pub fn database_key(database: Option<&String>) -> String {
 #[derive(Debug)]
 pub struct Database {
     conn: Connection,
+    /// The name the declaration gave each sequence-carrying column of this
+    /// database, keyed by (table, column), both lower-cased.
+    ///
+    /// A `serial` column is declared to the engine as the integer key it is, so
+    /// the engine assigns its values; what the engine then reports for it is
+    /// `INTEGER`, and this is what remembers that the DECLARATION said `serial`,
+    /// which is the type `columnMetadata` reports. Replaced wholesale when a
+    /// table is created and dropped with the table.
+    sequence_columns: HashMap<(String, String), String>,
 }
 
 impl Database {
@@ -610,7 +641,10 @@ impl Database {
         // Default deny on every SQL action, installed LAST so the settings above
         // (which are themselves pragmas) are not refused by it.
         conn.authorizer(Some(confine_to_data_plane));
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            sequence_columns: HashMap::new(),
+        })
     }
 
     /// A private copy of this database — the same schema and the same rows — for a
@@ -626,11 +660,73 @@ impl Database {
                 .run_to_completion(1024, Duration::ZERO, None)
                 .map_err(SqlError::from_engine)?;
         }
+        // The copy carries the same schema, so it carries the same declarations.
+        copy.sequence_columns = self.sequence_columns.clone();
         Ok(copy)
     }
 
+    /// The high-water mark the engine keeps for each table whose key it assigns:
+    /// the largest key the sequence has handed out, by table name.
+    ///
+    /// A database that has handed out none (no table declares a sequence, or
+    /// none has been inserted into) reports nothing.
+    pub fn sequence_marks(&self) -> Vec<(String, i64)> {
+        let Ok(mut statement) = self.conn.prepare("SELECT name, seq FROM sqlite_sequence") else {
+            return Vec::new();
+        };
+        let Ok(marks) = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }) else {
+            return Vec::new();
+        };
+        marks.filter_map(Result::ok).collect()
+    }
+
+    /// Carry `marks` into this database's own sequences, each to the larger of
+    /// the two.
+    ///
+    /// A sequence is NOT part of the transaction that read from it: PostgreSQL
+    /// documents that "changes made by nextval are not undone if the transaction
+    /// rolls back", so the values a rolled-back statement took out of a sequence
+    /// are not handed out again. The transaction's own copy of the database is
+    /// what held those values, which is why they are carried back out of it
+    /// before it is dropped.
+    pub fn advance_sequences(&self, marks: &[(String, i64)]) {
+        for (table, mark) in marks {
+            // Only for a table this database has, and only forwards.
+            let advanced = self
+                .conn
+                .execute(
+                    "UPDATE sqlite_sequence SET seq = ?2 WHERE name = ?1 AND seq < ?2",
+                    rusqlite::params![table, mark],
+                )
+                .and_then(|_| {
+                    self.conn.execute(
+                        "INSERT INTO sqlite_sequence (name, seq) SELECT ?1, ?2 \
+                         WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = ?1) \
+                           AND EXISTS \
+                             (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                        rusqlite::params![table, mark],
+                    )
+                });
+            if let Err(error) = advanced {
+                // The sequence would hand a value out twice, which is the one
+                // thing this is for, so it is reported rather than passed over.
+                tracing::warn!(
+                    %error,
+                    table = %table,
+                    "the rds-data data plane could not carry a sequence's mark out of a transaction"
+                );
+            }
+        }
+    }
+
     /// Run `sql` with `parameters` bound by name, under a budget of its own.
-    pub fn run(&self, sql: &str, parameters: &[SqlParameter]) -> Result<StatementOutcome, SqlError> {
+    pub fn run(
+        &mut self,
+        sql: &str,
+        parameters: &[SqlParameter],
+    ) -> Result<StatementOutcome, SqlError> {
         self.run_within(&mut RequestBudget::new(), sql, parameters)
     }
 
@@ -643,10 +739,10 @@ impl Database {
     /// number of statements it asks for.
     ///
     /// The engine decides everything: whether the statement produces a result set
-    /// (`column_count`), how many rows it changed (`total_changes`), and the type
-    /// of every value it returns.
+    /// (`column_count`), how many rows it changed (`changes`), and the type of
+    /// every value it returns.
     pub fn run_within(
-        &self,
+        &mut self,
         budget: &mut RequestBudget,
         sql: &str,
         parameters: &[SqlParameter],
@@ -663,16 +759,17 @@ impl Database {
     }
 
     fn run_bounded(
-        &self,
+        &mut self,
         budget: &mut RequestBudget,
         sql: &str,
         parameters: &[SqlParameter],
     ) -> Result<StatementOutcome, SqlError> {
-        let changes_before = self.conn.total_changes();
-        let rowid_before = self.conn.last_insert_rowid();
-
-        let mut statement = self.conn.prepare(sql).map_err(SqlError::from_engine)?;
-        let mut columns = self.describe(&statement);
+        // The statement is PostgreSQL, so it is parsed as PostgreSQL and the
+        // engine is handed this plan's rendering of that parse.
+        let plan = postgres::plan(sql)?;
+        let mut statement = self.conn.prepare(&plan.sql).map_err(SqlError::from_engine)?;
+        let mut columns = self.describe(&statement, &plan);
+        require_returnable(&columns)?;
         bind_named_parameters(&mut statement, parameters)?;
 
         let mut rows = Vec::new();
@@ -696,28 +793,66 @@ impl Database {
             statement.raw_execute().map_err(SqlError::from_engine)?;
         }
 
-        let changed = self.conn.total_changes().saturating_sub(changes_before);
-        let rowid_after = self.conn.last_insert_rowid();
+        // Only a data-manipulation statement has a row count, and it is the rows
+        // the statement itself changed: the engine does not count what a
+        // sequence's trigger then wrote, any more than PostgreSQL's command tag
+        // counts what a trigger did.
+        let changed = if plan.changes_rows {
+            i64::try_from(self.conn.changes()).unwrap_or(i64::MAX)
+        } else {
+            0
+        };
+        drop(statement);
+        // The statements that complete this one: the sequence a declaration
+        // needs, once the table it belongs to exists, and the further tables a
+        // statement empties.
+        for follow_on in &plan.follow_on {
+            self.conn
+                .execute(follow_on, [])
+                .map_err(SqlError::from_engine)?;
+        }
+        // What the statement declared, and what it dropped: a table's
+        // declarations are replaced wholesale when it is created, and go with it
+        // when it is dropped, so a table's remembered declarations are the ones
+        // its current definition made.
+        for table in plan
+            .dropped_tables
+            .iter()
+            .chain(plan.sequence_columns.iter().map(|column| &column.table))
+        {
+            self.sequence_columns
+                .retain(|(declared_in, _), _| declared_in != table);
+        }
+        for column in &plan.sequence_columns {
+            self.sequence_columns.insert(
+                (column.table.clone(), column.column.clone()),
+                column.type_name.clone(),
+            );
+        }
         Ok(StatementOutcome {
             columns,
             rows,
-            records_updated: i64::try_from(changed).unwrap_or(i64::MAX),
-            // SQLite reports the rowid it assigned to the row an INSERT added; that
-            // is the key the engine generated for it. A statement that inserted
-            // nothing leaves the value untouched.
-            generated_key: (rowid_after != rowid_before).then_some(rowid_after),
+            records_updated: changed,
         })
     }
 
-    /// The declared shape of each column of a prepared statement's result set,
-    /// read from the engine: the column's label, its declared type, and — when the
-    /// result column is a stored column — the `NOT NULL` and primary-key
-    /// declarations of the table it is stored in.
-    fn describe(&self, statement: &rusqlite::Statement<'_>) -> Vec<ColumnInfo> {
+    /// The declared shape of each column of a prepared statement's result set:
+    /// the column's label, its PostgreSQL type, and — when the result column is a
+    /// stored column — the `NOT NULL` and primary-key declarations of the table
+    /// it is stored in.
+    ///
+    /// A column's type comes from the table that declares it when there is one,
+    /// and otherwise from `plan`, which carries the type the statement's own text
+    /// gives a computed column (a cast, a literal). A column neither names is
+    /// left for [`name_undeclared_types`] to name from the storage class its
+    /// values arrive in.
+    fn describe(&self, statement: &rusqlite::Statement<'_>, plan: &Plan) -> Vec<ColumnInfo> {
+        let count = statement.column_count();
         statement
             .columns()
             .iter()
-            .map(|column| {
+            .enumerate()
+            .map(|(index, column)| {
                 let label = column.name().to_string();
                 // The engine reports a declared type only for a column that is
                 // stored in a table, so its absence means this result column is
@@ -730,27 +865,59 @@ impl Database {
                     Some((table, declared)) => (table, Some(declared)),
                     None => (None, None),
                 };
-                let (type_name, precision, scale) = split_declared_type(declared_type.as_deref());
+                let (pg, named_type) = match declared_type.as_deref() {
+                    Some(declared_type) => (
+                        // A column the engine reports as an integer may be one
+                        // this database declared with a sequence, which is the
+                        // type the catalog holds for it.
+                        match self.declared_sequence(table_name.as_deref(), &label) {
+                            Some(sequence) => postgres::pg_type(&sequence),
+                            None => postgres::pg_type(declared_type),
+                        },
+                        true,
+                    ),
+                    None => match plan.result_type(index, count) {
+                        Some(pg) => (pg.clone(), true),
+                        None => (postgres::type_of_storage_class(None), false),
+                    },
+                };
                 ColumnInfo {
                     label,
                     table_name,
                     declared: declared_type.is_some(),
-                    type_name,
-                    precision,
-                    scale,
+                    named_type,
+                    // A primary key is NOT NULL, whatever the engine's own
+                    // nullability flag says about the column it stores it in.
                     nullable: match &declared {
-                        Some(column) if column.not_null => COLUMN_NO_NULLS,
+                        Some(column) if column.not_null || column.primary_key => COLUMN_NO_NULLS,
                         Some(_) => COLUMN_NULLABLE,
                         None => COLUMN_NULLABLE_UNKNOWN,
                     },
-                    // An INTEGER PRIMARY KEY is the table's rowid, which the engine
-                    // assigns when an INSERT leaves it out.
-                    auto_increment: declared.as_ref().is_some_and(|declared| {
-                        declared.primary_key && declared.type_name.eq_ignore_ascii_case("INTEGER")
-                    }),
+                    // A `serial` declaration carries a sequence, and the engine
+                    // also assigns the value of an integer primary key an INSERT
+                    // leaves out.
+                    auto_increment: pg.auto_increment
+                        || declared.as_ref().is_some_and(|declared| {
+                            declared.primary_key && declared.type_name.eq_ignore_ascii_case("INTEGER")
+                        }),
+                    pg,
                 }
             })
             .collect()
+    }
+
+    /// The type a sequence-carrying column was declared with, when the column a
+    /// result set reports is one.
+    ///
+    /// Keyed by the table the column is stored in, so it answers only for the
+    /// column that was declared: a result column whose table the schema cannot
+    /// name unambiguously is reported with the type the ENGINE holds for it
+    /// rather than a declaration that might belong to another table's column.
+    fn declared_sequence(&self, table: Option<&str>, label: &str) -> Option<String> {
+        let table = table?.to_ascii_lowercase();
+        self.sequence_columns
+            .get(&(table, label.to_ascii_lowercase()))
+            .cloned()
     }
 
     /// How this database's schema declares a column named `label` of type
@@ -885,8 +1052,6 @@ pub struct StatementOutcome {
     /// Rows the statement inserted, updated or deleted — 0 for DDL and for a
     /// statement that only reads.
     pub records_updated: i64,
-    /// The key the engine generated for an inserted row, when it generated one.
-    pub generated_key: Option<i64>,
 }
 
 impl StatementOutcome {
@@ -896,7 +1061,10 @@ impl StatementOutcome {
     }
 
     /// The result set as `records`: one list of [`Field`]s per row.
-    pub fn records(&self, returns: ReturnTypes) -> Vec<Vec<Field>> {
+    ///
+    /// `Err` when a value has no `Field` member to come back in — answered with
+    /// the modelled `UnsupportedResultException`.
+    pub fn records(&self, returns: ReturnTypes) -> Result<Vec<Vec<Field>>, SqlError> {
         self.rows
             .iter()
             .map(|row| {
@@ -960,10 +1128,15 @@ impl StatementOutcome {
     }
 
     /// `generatedFields` for a statement that changed rows.
+    ///
+    /// ALWAYS EMPTY: `ExecuteStatementResponse.generatedFields`'s own
+    /// documentation says "The generatedFields data isn't supported by Aurora
+    /// PostgreSQL. To get the values of generated fields, use the RETURNING
+    /// clause", and this data plane is Aurora PostgreSQL. A client that read a
+    /// generated key out of this list here would find it empty against the real
+    /// service, so the list it gets here is the list the real service returns.
     pub fn generated_fields(&self) -> Vec<Field> {
-        self.generated_key
-            .map(|key| vec![Field::longValue(key)])
-            .unwrap_or_default()
+        Vec::new()
     }
 }
 
@@ -977,12 +1150,12 @@ pub struct ColumnInfo {
     pub table_name: Option<String>,
     /// Whether the engine reported a declared type for this column.
     pub declared: bool,
-    /// The declared type with its arguments stripped (`VARCHAR(32)` -> `VARCHAR`).
-    pub type_name: String,
-    /// A declared type's first argument (`DECIMAL(10,2)` -> 10).
-    pub precision: i32,
-    /// A declared type's second argument (`DECIMAL(10,2)` -> 2).
-    pub scale: i32,
+    /// Whether this column's PostgreSQL type is known: declared by a table, or
+    /// given by the statement's own text. When it is not, the type is named from
+    /// the storage class the values arrive in.
+    pub named_type: bool,
+    /// This column's PostgreSQL type.
+    pub pg: PgType,
     /// `java.sql.ResultSetMetaData`'s nullability: 0, 1 or 2.
     pub nullable: i32,
     /// Whether the engine assigns this column's value when an INSERT omits it.
@@ -990,42 +1163,60 @@ pub struct ColumnInfo {
 }
 
 impl ColumnInfo {
-    /// A `BOOLEAN` column. `BOOL` is a documented synonym, and MySQL's `BOOL` is
-    /// `TINYINT(1)`, so both carry boolean values.
+    /// A boolean column.
     pub fn is_boolean(&self) -> bool {
-        self.type_name.eq_ignore_ascii_case("BOOLEAN")
-            || self.type_name.eq_ignore_ascii_case("BOOL")
-            || (self.type_name.eq_ignore_ascii_case("TINYINT") && self.precision == 1)
+        self.pg.class == TypeClass::Boolean
     }
 
     /// A fixed-point column, whose representation `decimalReturnType` controls.
     pub fn is_decimal(&self) -> bool {
-        self.type_name.eq_ignore_ascii_case("DECIMAL")
-            || self.type_name.eq_ignore_ascii_case("NUMERIC")
+        self.pg.class == TypeClass::Decimal
     }
 
     /// This column as modelled `ColumnMetadata`.
+    ///
+    /// Every member is this column's PostgreSQL type as the catalog holds it:
+    /// `type` is the type's `java.sql.Types` code, `typeName` its catalog name,
+    /// `precision` and `scale` the digits it carries, `isSigned` whether it is a
+    /// signed number and `isCaseSensitive` whether its values compare as text.
+    /// `schemaName` is the schema the column is in, which is empty here because
+    /// the database name alone selects the state a statement runs against — the
+    /// model's own `schema` member "isn't supported".
     fn metadata(&self) -> ColumnMetadata {
         ColumnMetadata {
             name: Some(self.label.clone()),
             label: Some(self.label.clone()),
-            type_name: Some(self.type_name.to_ascii_uppercase()),
-            r#type: jdbc_type_code(&self.type_name),
+            type_name: Some(self.pg.name.clone()),
+            r#type: self.pg.jdbc_type,
             table_name: self.table_name.clone(),
-            schema_name: None,
+            schema_name: Some(String::new()),
             nullable: self.nullable,
-            precision: self.precision,
-            scale: self.scale,
+            precision: self.pg.precision,
+            scale: self.pg.scale,
             is_auto_increment: self.auto_increment,
-            is_signed: matches!(
-                self.type_name.to_ascii_uppercase().as_str(),
-                "INT" | "INTEGER" | "TINYINT" | "SMALLINT" | "MEDIUMINT" | "BIGINT" | "REAL"
-                    | "DOUBLE" | "FLOAT" | "DECIMAL" | "NUMERIC"
-            ),
+            is_signed: self.pg.signed,
             is_currency: false,
-            is_case_sensitive: false,
+            is_case_sensitive: self.pg.case_sensitive,
+            // The recorded response carries no base type for an array column
+            // either: `arrayBaseColumnType` stays at its modelled default.
             array_base_column_type: 0,
         }
+    }
+}
+
+/// Refuse a result set carrying a column of a type the `Field` union has no
+/// member for.
+///
+/// The statement itself is valid and the engine ran it: it is the RESULT that
+/// cannot be returned, which is what the modelled `UnsupportedResultException`
+/// ("It contained an unsupported data type") says.
+fn require_returnable(columns: &[ColumnInfo]) -> Result<(), SqlError> {
+    match columns
+        .iter()
+        .find_map(|column| column.pg.refusal.as_ref())
+    {
+        Some(refusal) => Err(SqlError::UnsupportedResult(refusal.clone())),
+        None => Ok(()),
     }
 }
 
@@ -1476,15 +1667,21 @@ fn is_decimal(value: &str) -> bool {
 
 /// The `Field` member a stored value is returned in.
 ///
-/// The rule: NULL is `isNull`; a value in a BOOLEAN column is `booleanValue`; a
-/// value in a DECIMAL column follows `decimalReturnType` (the model documents
-/// `STRING` as its default, and `DOUBLE_OR_LONG` as "a Long value if its scale is
-/// 0, or a Double value otherwise"); an integer follows `longReturnType`
-/// (`LONG` by default, `STRING` on request); and otherwise the storage class the
-/// engine holds the value in decides — real to `doubleValue`, text to
-/// `stringValue`, binary to `blobValue`.
-pub fn field_for(value: &SqlValue, column: &ColumnInfo, returns: ReturnTypes) -> Field {
-    match value {
+/// The rule: NULL is `isNull`, and otherwise the COLUMN's PostgreSQL type
+/// decides — a boolean is `booleanValue`, an exact number follows
+/// `decimalReturnType` (the model documents `STRING` as its default, and
+/// `DOUBLE_OR_LONG` as "a Long value if its scale is 0, or a Double value
+/// otherwise"), an integer follows `longReturnType` (`LONG` by default, `STRING`
+/// on request) and a float is `doubleValue`. For a type whose values the engine
+/// stores as they come (text, binary, a date or a time, a type the catalog does
+/// not name) the storage class the engine holds the value in decides: real to
+/// `doubleValue`, text to `stringValue`, binary to `blobValue`.
+pub fn field_for(
+    value: &SqlValue,
+    column: &ColumnInfo,
+    returns: ReturnTypes,
+) -> Result<Field, SqlError> {
+    Ok(match value {
         SqlValue::Null => Field::isNull(true),
         SqlValue::Integer(number) => {
             if column.is_boolean() {
@@ -1495,16 +1692,25 @@ pub fn field_for(value: &SqlValue, column: &ColumnInfo, returns: ReturnTypes) ->
                     // COLUMN's declared scale that decides, not how the engine
                     // happens to hold the value: "a Long value if its scale is 0,
                     // or a Double value otherwise".
-                    if column.scale == 0 {
+                    if column.pg.scale == 0 {
                         Field::longValue(*number)
                     } else {
                         Field::doubleValue(*number as f64)
                     }
                 } else {
                     // Built from the integer itself, not through a float, so a value
-                    // beyond a float's 53 significant bits keeps every digit.
-                    Field::stringValue(decimal_text_of_integer(*number, column.scale))
+                    // beyond a float's 53 significant bits keeps every digit. A type
+                    // that declared no scale carries each value's own, so the value
+                    // keeps the digits it has instead of being padded to a scale
+                    // nobody declared.
+                    match column.pg.declared_scale {
+                        Some(scale) => Field::stringValue(decimal_text_of_integer(*number, scale)),
+                        None => Field::stringValue(number.to_string()),
+                    }
                 }
+            } else if column.pg.class == TypeClass::Float {
+                // A float column holding a whole number is still a float.
+                Field::doubleValue(*number as f64)
             } else if returns.long_as_string {
                 Field::stringValue(number.to_string())
             } else {
@@ -1516,19 +1722,219 @@ pub fn field_for(value: &SqlValue, column: &ColumnInfo, returns: ReturnTypes) ->
                 if returns.decimal_as_number {
                     // "a Long value if its scale is 0, or a Double value otherwise",
                     // and a value no integer can hold stays a double.
-                    match (column.scale == 0, in_integer_range(*number)) {
+                    match (column.pg.scale == 0, in_integer_range(*number)) {
                         (true, true) => Field::longValue(*number as i64),
                         _ => Field::doubleValue(*number),
                     }
                 } else {
-                    Field::stringValue(decimal_text(*number, column.scale))
+                    match column.pg.declared_scale {
+                        Some(scale) => Field::stringValue(decimal_text(*number, scale)),
+                        None => Field::stringValue(number.to_string()),
+                    }
                 }
             } else {
                 Field::doubleValue(*number)
             }
         }
+        SqlValue::Text(text) if column.pg.class == TypeClass::Array => {
+            Field::arrayValue(array_value(text, &column.pg)?)
+        }
         SqlValue::Text(text) => Field::stringValue(text.clone()),
         SqlValue::Blob(bytes) => Field::blobValue(bytes.clone()),
+    })
+}
+
+/// One array value, as the `ArrayValue` union carries it: the elements of the
+/// array the engine holds as text, each in the member the array's ELEMENT type
+/// names.
+///
+/// The text is read in either of the two forms an array value reaches the engine
+/// in: the JSON document this data plane builds for an array constructor, and
+/// PostgreSQL's own braced literal, which a caller can store as text.
+///
+/// `Err` for a result the union cannot carry: an array of arrays (the
+/// multidimensional array the model names), a value that is not an array at all,
+/// and an element the modelled list has no room for — `booleanValues`,
+/// `longValues`, `doubleValues` and `stringValues` are generated here as
+/// `Vec<bool>`, `Vec<i64>`, `Vec<f64>` and `Vec<String>` (see
+/// `ops/types/shared_types.rs`), which hold a value per element and nothing
+/// else, so an array carrying a NULL among its elements is refused rather than
+/// returned with that element silently dropped.
+fn array_value(text: &str, pg: &PgType) -> Result<ArrayValue, SqlError> {
+    let unsupported = || {
+        SqlError::UnsupportedResult(format!(
+            "The result contains the unsupported data type {}.",
+            pg.name.to_ascii_uppercase()
+        ))
+    };
+    let elements = read_array(text).ok_or_else(unsupported)?;
+    if elements
+        .iter()
+        .any(|element| matches!(element, serde_json::Value::Array(_)))
+    {
+        return Err(SqlError::UnsupportedResult(
+            "The result contains a multidimensional array.".to_string(),
+        ));
+    }
+    let element = pg.element().ok_or_else(unsupported)?;
+    Ok(match element.class {
+        TypeClass::Boolean => ArrayValue::booleanValues(
+            elements
+                .iter()
+                .map(boolean_element)
+                .collect::<Option<Vec<bool>>>()
+                .ok_or_else(unsupported)?,
+        ),
+        TypeClass::Integer => ArrayValue::longValues(
+            elements
+                .iter()
+                .map(integer_element)
+                .collect::<Option<Vec<i64>>>()
+                .ok_or_else(unsupported)?,
+        ),
+        TypeClass::Float => ArrayValue::doubleValues(
+            elements
+                .iter()
+                .map(float_element)
+                .collect::<Option<Vec<f64>>>()
+                .ok_or_else(unsupported)?,
+        ),
+        TypeClass::Decimal | TypeClass::Text | TypeClass::Temporal => ArrayValue::stringValues(
+            elements
+                .iter()
+                .map(text_element)
+                .collect::<Option<Vec<String>>>()
+                .ok_or_else(unsupported)?,
+        ),
+        // Binary has no array member of its own, and an array of arrays was
+        // refused above.
+        TypeClass::Binary | TypeClass::Array | TypeClass::Other => return Err(unsupported()),
+    })
+}
+
+/// The elements of an array value the engine holds as text: the JSON document
+/// this data plane builds for an array constructor, or PostgreSQL's braced array
+/// literal. `None` when the text is neither.
+fn read_array(text: &str) -> Option<Vec<serde_json::Value>> {
+    let text = text.trim();
+    if text.starts_with('[') {
+        return match serde_json::from_str(text) {
+            Ok(serde_json::Value::Array(elements)) => Some(elements),
+            _ => None,
+        };
+    }
+    read_braced_array(&mut text.chars().peekable(), 0)
+}
+
+/// PostgreSQL's braced array literal (`{1,2}`, `{"a","b"}`, `{NULL}`,
+/// `{{1,2},{3,4}}`), as the elements it holds: a quoted or bare element is its
+/// text, `NULL` is a null, and a brace opens a nested array, which the caller
+/// refuses as multidimensional.
+///
+/// Bounded by [`MAX_ARRAY_DEPTH`], so a literal cannot nest without limit.
+fn read_braced_array(
+    characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    depth: usize,
+) -> Option<Vec<serde_json::Value>> {
+    if depth > MAX_ARRAY_DEPTH || characters.next() != Some('{') {
+        return None;
+    }
+    let mut elements = Vec::new();
+    loop {
+        // Whatever comes next: the end of the array, a separator, a nested
+        // array, a quoted element or a bare one.
+        while characters.peek().is_some_and(|c| c.is_whitespace()) {
+            characters.next();
+        }
+        match characters.peek() {
+            None => return None,
+            Some('}') => {
+                characters.next();
+                return Some(elements);
+            }
+            Some(',') => {
+                characters.next();
+            }
+            Some('{') => elements.push(serde_json::Value::Array(read_braced_array(
+                characters,
+                depth + 1,
+            )?)),
+            Some('"') => {
+                characters.next();
+                let mut quoted = String::new();
+                loop {
+                    match characters.next()? {
+                        '\\' => quoted.push(characters.next()?),
+                        '"' => break,
+                        character => quoted.push(character),
+                    }
+                }
+                elements.push(serde_json::Value::String(quoted));
+            }
+            Some(_) => {
+                let mut bare = String::new();
+                while characters
+                    .peek()
+                    .is_some_and(|c| *c != ',' && *c != '}' && *c != '{')
+                {
+                    bare.push(characters.next()?);
+                }
+                let bare = bare.trim();
+                elements.push(if bare.eq_ignore_ascii_case("NULL") {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(bare.to_string())
+                });
+            }
+        }
+    }
+}
+
+/// How deeply an array literal may nest. An array of arrays is already a result
+/// this service cannot return, so this only has to be deep enough to SEE that
+/// nesting.
+const MAX_ARRAY_DEPTH: usize = 2;
+
+/// One element of an array as a boolean: the engine's own `true`/`false`, or the
+/// text PostgreSQL writes a boolean as.
+fn boolean_element(element: &serde_json::Value) -> Option<bool> {
+    match element {
+        serde_json::Value::Bool(value) => Some(*value),
+        serde_json::Value::Number(number) => Some(number.as_f64().is_some_and(|n| n != 0.0)),
+        serde_json::Value::String(text) => match text.to_ascii_lowercase().as_str() {
+            "t" | "true" | "yes" | "on" | "1" => Some(true),
+            "f" | "false" | "no" | "off" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// One element of an array as an integer.
+fn integer_element(element: &serde_json::Value) -> Option<i64> {
+    match element {
+        serde_json::Value::Number(number) => number.as_i64(),
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// One element of an array as a floating-point number.
+fn float_element(element: &serde_json::Value) -> Option<f64> {
+    match element {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// One element of an array as text.
+fn text_element(element: &serde_json::Value) -> Option<String> {
+    match element {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -1582,15 +1988,23 @@ fn json_for(value: &SqlValue, column: &ColumnInfo) -> Result<serde_json::Value, 
                     column.label
                 ))
             })?,
-        SqlValue::Text(text) => serde_json::Value::String(text.clone()),
-        // The JSON format's encoding of binary data is not implemented here, so the
-        // result is refused rather than encoded some other way.
-        SqlValue::Blob(_) => {
-            return Err(SqlError::UnsupportedResult(format!(
-                "column {} holds binary data, which this emulator cannot return in the JSON record format",
-                column.label
-            )))
+        // An array column's value is the list of its elements, not the text the
+        // engine holds that list as.
+        SqlValue::Text(text) if column.pg.class == TypeClass::Array => {
+            let elements = read_array(text).ok_or_else(|| {
+                SqlError::UnsupportedResult(format!(
+                    "The result contains the unsupported data type {}.",
+                    column.pg.name.to_ascii_uppercase()
+                ))
+            })?;
+            serde_json::Value::Array(elements)
         }
+        SqlValue::Text(text) => serde_json::Value::String(text.clone()),
+        // JSON has no form for binary data, so it is rendered the way PostgreSQL
+        // itself writes a binary value as text: `\x` followed by its bytes in
+        // hexadecimal, which is what its documented default `bytea_output`
+        // setting produces.
+        SqlValue::Blob(bytes) => serde_json::Value::String(format!("\\x{}", hex::encode(bytes))),
     })
 }
 
@@ -1617,36 +2031,12 @@ fn value_bytes(value: &ValueRef<'_>) -> usize {
     payload + std::mem::size_of::<SqlValue>()
 }
 
-/// Split a declared type into its name and arguments: `VARCHAR(32)` ->
-/// (`VARCHAR`, 32, 0), `DECIMAL(10,2)` -> (`DECIMAL`, 10, 2). Both arguments are
-/// clamped to [`MAX_DECLARED_ARGUMENT`], so a declaration cannot put an arbitrary
-/// number into `columnMetadata` or into arithmetic over it.
-fn split_declared_type(declared: Option<&str>) -> (String, i32, i32) {
-    let Some(declared) = declared else {
-        return (String::new(), 0, 0);
-    };
-    let (name, arguments) = match declared.split_once('(') {
-        Some((name, rest)) => (name, rest.trim_end_matches(')')),
-        None => (declared, ""),
-    };
-    let mut numbers = arguments.split(',').map(|argument| {
-        argument
-            .trim()
-            .parse::<i32>()
-            .unwrap_or(0)
-            .clamp(0, MAX_DECLARED_ARGUMENT)
-    });
-    let precision = numbers.next().unwrap_or(0);
-    let scale = numbers.next().unwrap_or(0);
-    (name.trim().to_string(), precision, scale)
-}
-
-/// Give a result column with no declared type (an expression, an aggregate) the
-/// name of the storage class its values actually arrived in, so `typeName` still
-/// describes the column.
+/// Give a result column whose type nothing has named — a computed column the
+/// statement's own text does not type — the PostgreSQL type of the storage class
+/// its values actually arrived in, so `typeName` still describes the column.
 fn name_undeclared_types(columns: &mut [ColumnInfo], rows: &[Vec<SqlValue>]) {
     for (index, column) in columns.iter_mut().enumerate() {
-        if column.declared {
+        if column.named_type {
             continue;
         }
         let storage_class = rows
@@ -1659,37 +2049,8 @@ fn name_undeclared_types(columns: &mut [ColumnInfo], rows: &[Vec<SqlValue>]) {
                 SqlValue::Text(_) => "TEXT",
                 SqlValue::Blob(_) => "BLOB",
                 SqlValue::Null => "NULL",
-            })
-            .unwrap_or("NULL");
-        column.type_name = storage_class.to_string();
-    }
-}
-
-/// The `java.sql.Types` code for a declared type — what `ColumnMetadata.type`
-/// carries. Codes are the constants of `java.sql.Types`; a type this table does
-/// not name gets `OTHER` (1111) rather than a wrong code.
-fn jdbc_type_code(type_name: &str) -> i32 {
-    match type_name.to_ascii_uppercase().as_str() {
-        "BIT" => -7,
-        "BOOLEAN" | "BOOL" => 16,
-        "TINYINT" => -6,
-        "SMALLINT" => 5,
-        "INT" | "INTEGER" | "MEDIUMINT" => 4,
-        "BIGINT" => -5,
-        "FLOAT" => 6,
-        "REAL" => 7,
-        "DOUBLE" => 8,
-        "NUMERIC" => 2,
-        "DECIMAL" => 3,
-        "CHAR" => 1,
-        "VARCHAR" => 12,
-        "TEXT" | "LONGTEXT" | "MEDIUMTEXT" => -1,
-        "DATE" => 91,
-        "TIME" => 92,
-        "TIMESTAMP" | "DATETIME" => 93,
-        "BLOB" | "VARBINARY" => -3,
-        "BINARY" => -2,
-        _ => 1111,
+            });
+        column.pg = postgres::type_of_storage_class(storage_class);
     }
 }
 
@@ -1742,7 +2103,7 @@ mod tests {
     /// cannot see it.
     #[test]
     fn the_engine_heap_ceiling_refuses_an_allocation_heavy_statement() {
-        let database = Database::open().expect("a confined database opens");
+        let mut database = Database::open().expect("a confined database opens");
         database
             .run_within(
                 &mut RequestBudget::new(),

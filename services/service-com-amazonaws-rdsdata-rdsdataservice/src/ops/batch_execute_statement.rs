@@ -255,9 +255,9 @@ fn execute_batch(
                 .get_mut(transaction_id)
                 .ok_or(crate::state::SqlError::TransactionNotFound)?;
             transaction.touch();
-            &transaction.pending
+            &mut transaction.pending
         }
-        None => &*cluster.database_mut(&crate::state::database_key(input.database.as_ref()))?,
+        None => cluster.database_mut(&crate::state::database_key(input.database.as_ref()))?,
     };
 
     // Exactly one `UpdateResult` per parameter set, in the order the sets arrived:

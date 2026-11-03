@@ -16,13 +16,14 @@ use smithy_server_runtime::MultiServiceRouter;
 const RESOURCE_ARN: &str = "arn:aws:rds:us-east-1:000000000000:cluster:demo";
 const SECRET_ARN: &str = "arn:aws:secretsmanager:us-east-1:000000000000:secret:demo";
 
-/// One emulator with one Data API client pointed at it.
-struct DataApi {
+/// One emulator with one Data API client pointed at it. The suites beside this
+/// one drive the same client.
+pub(crate) struct DataApi {
     router: MultiServiceRouter,
 }
 
 impl DataApi {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -31,7 +32,7 @@ impl DataApi {
     }
 
     /// Send one request the way an SDK client does, and read the status and body.
-    async fn post(&self, path: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, path: &str, body: Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://rds-data.us-east-1.amazonaws.com{path}"))
@@ -46,18 +47,18 @@ impl DataApi {
     }
 
     /// `ExecuteStatement` with whatever members the case needs.
-    async fn execute(&self, members: Value) -> (u16, Value) {
+    pub(crate) async fn execute(&self, members: Value) -> (u16, Value) {
         self.post("/Execute", with_target(members)).await
     }
 
     /// `ExecuteStatement` for a statement that must succeed.
-    async fn run(&self, members: Value) -> Value {
+    pub(crate) async fn run(&self, members: Value) -> Value {
         let (status, body) = self.execute(members.clone()).await;
         assert_eq!(status, 200, "statement {members} failed with {body}");
         body
     }
 
-    async fn batch(&self, members: Value) -> (u16, Value) {
+    pub(crate) async fn batch(&self, members: Value) -> (u16, Value) {
         self.post("/BatchExecute", with_target(members)).await
     }
 
@@ -66,7 +67,7 @@ impl DataApi {
     }
 
     /// Open a transaction that must succeed, and return its id.
-    async fn begin_transaction(&self, database: Option<&str>) -> String {
+    pub(crate) async fn begin_transaction(&self, database: Option<&str>) -> String {
         let mut members = json!({});
         if let Some(database) = database {
             members["database"] = json!(database);
@@ -87,7 +88,7 @@ impl DataApi {
         .await
     }
 
-    async fn rollback(&self, transaction_id: &str) -> (u16, Value) {
+    pub(crate) async fn rollback(&self, transaction_id: &str) -> (u16, Value) {
         self.post(
             "/RollbackTransaction",
             with_target(json!({"transactionId": transaction_id})),
@@ -107,12 +108,12 @@ fn with_target(mut members: Value) -> Value {
 }
 
 /// A number member, defaulting to the modelled default of 0 when the wire omits it.
-fn number(body: &Value, member: &str) -> i64 {
+pub(crate) fn number(body: &Value, member: &str) -> i64 {
     body.get(member).and_then(Value::as_i64).unwrap_or(0)
 }
 
 /// A list member, defaulting to empty when the wire omits it.
-fn list(body: &Value, member: &str) -> Vec<Value> {
+pub(crate) fn list(body: &Value, member: &str) -> Vec<Value> {
     body.get(member)
         .and_then(Value::as_array)
         .cloned()
@@ -120,12 +121,12 @@ fn list(body: &Value, member: &str) -> Vec<Value> {
 }
 
 /// The wire error code restJson1 carries in `__type`.
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
 
 /// One named parameter.
-fn parameter(name: &str, value: Value) -> Value {
+pub(crate) fn parameter(name: &str, value: Value) -> Value {
     json!({"name": name, "value": value})
 }
 
@@ -230,7 +231,7 @@ async fn a_data_api_client_script_runs_end_to_end() {
     );
     assert_eq!(
         metadata[0]["typeName"],
-        json!("INT"),
+        json!("int4"),
         "case id: got {metadata:?}"
     );
     assert_eq!(
@@ -240,7 +241,7 @@ async fn a_data_api_client_script_runs_end_to_end() {
     );
     assert_eq!(
         metadata[1]["typeName"],
-        json!("VARCHAR"),
+        json!("varchar"),
         "case name: got {metadata:?}"
     );
     assert_eq!(
@@ -294,15 +295,17 @@ async fn a_data_api_client_script_runs_end_to_end() {
 }
 
 /// RULE: the `Field` member a value comes back in is decided by the column's
-/// declared type and the storage class the engine holds the value in — `isNull`
-/// for NULL, `booleanValue` for a boolean column, `longValue` for an integer,
-/// `doubleValue` for a real, `stringValue` for text, `blobValue` for binary —
+/// PostgreSQL type and the storage class the engine holds the value in — `isNull`
+/// for NULL, `booleanValue` for `bool`, `longValue` for an integer type,
+/// `doubleValue` for a floating-point type, `stringValue` for a character type,
+/// `blobValue` for `bytea` —
 /// subject to `resultSetOptions`: the model documents `decimalReturnType=STRING`
 /// as the default for a `DECIMAL` column and `DOUBLE_OR_LONG` as "a Long value if
 /// its scale is 0, or a Double value otherwise", and `longReturnType=STRING` as
 /// returning a `LONG` as a string.
 ///
-/// The same table pins `columnMetadata`'s `typeName` and `java.sql.Types` code.
+/// The same table pins `columnMetadata`'s `typeName` (PostgreSQL's catalog name
+/// for the type the column was declared with) and its `java.sql.Types` code.
 #[tokio::test]
 async fn the_field_member_follows_the_column_type_and_result_set_options() {
     struct Case {
@@ -320,47 +323,63 @@ async fn the_field_member_follows_the_column_type_and_result_set_options() {
             bound: json!({"booleanValue": true}),
             options: None,
             expected: json!({"booleanValue": true}),
-            type_name: "BOOLEAN",
-            jdbc_type: 16,
+            type_name: "bool",
+            jdbc_type: -7,
         },
         Case {
             column: "value BOOLEAN",
             bound: json!({"booleanValue": false}),
             options: None,
             expected: json!({"booleanValue": false}),
-            type_name: "BOOLEAN",
-            jdbc_type: 16,
+            type_name: "bool",
+            jdbc_type: -7,
         },
         Case {
             column: "value INT",
             bound: json!({"longValue": 42}),
             options: None,
             expected: json!({"longValue": 42}),
-            type_name: "INT",
+            type_name: "int4",
             jdbc_type: 4,
+        },
+        Case {
+            column: "value SMALLINT",
+            bound: json!({"longValue": -32_768}),
+            options: None,
+            expected: json!({"longValue": -32_768}),
+            type_name: "int2",
+            jdbc_type: 5,
         },
         Case {
             column: "value BIGINT",
             bound: json!({"longValue": -9_007_199_254_740_993_i64}),
             options: None,
             expected: json!({"longValue": -9_007_199_254_740_993_i64}),
-            type_name: "BIGINT",
+            type_name: "int8",
             jdbc_type: -5,
         },
         Case {
-            column: "value DOUBLE",
+            column: "value DOUBLE PRECISION",
             bound: json!({"doubleValue": 1.5}),
             options: None,
             expected: json!({"doubleValue": 1.5}),
-            type_name: "DOUBLE",
+            type_name: "float8",
             jdbc_type: 8,
+        },
+        Case {
+            column: "value REAL",
+            bound: json!({"doubleValue": -0.5}),
+            options: None,
+            expected: json!({"doubleValue": -0.5}),
+            type_name: "float4",
+            jdbc_type: 7,
         },
         Case {
             column: "value VARCHAR(16)",
             bound: json!({"stringValue": "hello"}),
             options: None,
             expected: json!({"stringValue": "hello"}),
-            type_name: "VARCHAR",
+            type_name: "varchar",
             jdbc_type: 12,
         },
         Case {
@@ -368,25 +387,25 @@ async fn the_field_member_follows_the_column_type_and_result_set_options() {
             bound: json!({"stringValue": ""}),
             options: None,
             expected: json!({"stringValue": ""}),
-            type_name: "TEXT",
-            jdbc_type: -1,
+            type_name: "text",
+            jdbc_type: 12,
         },
         Case {
             // "AAAA" is the base64 of three zero bytes: restJson1 carries a blob
             // base64-encoded in both directions.
-            column: "value BLOB",
+            column: "value BYTEA",
             bound: json!({"blobValue": "AAAA"}),
             options: None,
             expected: json!({"blobValue": "AAAA"}),
-            type_name: "BLOB",
-            jdbc_type: -3,
+            type_name: "bytea",
+            jdbc_type: -2,
         },
         Case {
             column: "value VARCHAR(16)",
             bound: json!({"isNull": true}),
             options: None,
             expected: json!({"isNull": true}),
-            type_name: "VARCHAR",
+            type_name: "varchar",
             jdbc_type: 12,
         },
         Case {
@@ -394,24 +413,24 @@ async fn the_field_member_follows_the_column_type_and_result_set_options() {
             bound: json!({"stringValue": "12.34"}),
             options: None,
             expected: json!({"stringValue": "12.34"}),
-            type_name: "DECIMAL",
-            jdbc_type: 3,
+            type_name: "numeric",
+            jdbc_type: 2,
         },
         Case {
             column: "value DECIMAL(10,2)",
             bound: json!({"stringValue": "12.34"}),
             options: Some(json!({"decimalReturnType": "DOUBLE_OR_LONG"})),
             expected: json!({"doubleValue": 12.34}),
-            type_name: "DECIMAL",
-            jdbc_type: 3,
+            type_name: "numeric",
+            jdbc_type: 2,
         },
         Case {
             column: "value DECIMAL(10,0)",
             bound: json!({"stringValue": "12"}),
             options: Some(json!({"decimalReturnType": "DOUBLE_OR_LONG"})),
             expected: json!({"longValue": 12}),
-            type_name: "DECIMAL",
-            jdbc_type: 3,
+            type_name: "numeric",
+            jdbc_type: 2,
         },
         // The COLUMN's declared scale decides, not how the engine happens to hold
         // the value: an integer in a scaled DECIMAL is still "a Double value".
@@ -420,15 +439,25 @@ async fn the_field_member_follows_the_column_type_and_result_set_options() {
             bound: json!({"longValue": 12}),
             options: Some(json!({"decimalReturnType": "DOUBLE_OR_LONG"})),
             expected: json!({"doubleValue": 12.0}),
-            type_name: "DECIMAL",
-            jdbc_type: 3,
+            type_name: "numeric",
+            jdbc_type: 2,
         },
         Case {
             column: "value NUMERIC(8,3)",
             bound: json!({"doubleValue": 2.5}),
             options: None,
             expected: json!({"stringValue": "2.500"}),
-            type_name: "NUMERIC",
+            type_name: "numeric",
+            jdbc_type: 2,
+        },
+        // A `numeric` with no declared scale carries each value's own scale, so
+        // the value keeps the digits it has.
+        Case {
+            column: "value NUMERIC",
+            bound: json!({"doubleValue": 2.5}),
+            options: None,
+            expected: json!({"stringValue": "2.5"}),
+            type_name: "numeric",
             jdbc_type: 2,
         },
         Case {
@@ -436,7 +465,7 @@ async fn the_field_member_follows_the_column_type_and_result_set_options() {
             bound: json!({"longValue": 7}),
             options: Some(json!({"longReturnType": "STRING"})),
             expected: json!({"stringValue": "7"}),
-            type_name: "INT",
+            type_name: "int4",
             jdbc_type: 4,
         },
     ];
@@ -552,13 +581,21 @@ async fn row_counts_are_what_the_engine_changed() {
     }
 }
 
-/// RULE: `generatedFields` carries the key the engine generated for an inserted
-/// row, and that key is the value a later read of the row returns.
+/// RULE: `generatedFields` is EMPTY — the member's own documentation says "The
+/// generatedFields data isn't supported by Aurora PostgreSQL. To get the values
+/// of generated fields, use the RETURNING clause" — while the sequence a `serial`
+/// column declares still assigns that column's value when an INSERT leaves it
+/// out, so the key is what a RETURNING clause and a later read both report.
+///
+/// The rows differ along HOW the inserted key is asked for: not asked for at all,
+/// through RETURNING, and through a later SELECT; and along WHICH operation
+/// inserted, since `BatchExecuteStatement` carries the same member per parameter
+/// set.
 #[tokio::test]
-async fn a_generated_key_is_reported_and_stored() {
+async fn a_sequence_assigns_the_key_and_generated_fields_stays_empty() {
     let api = DataApi::new();
     api.run(json!({
-        "sql": "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+        "sql": "CREATE TABLE notes (id serial PRIMARY KEY, body TEXT NOT NULL)",
     }))
     .await;
 
@@ -570,14 +607,49 @@ async fn a_generated_key_is_reported_and_stored() {
             }))
             .await;
         assert_eq!(
-            inserted["generatedFields"],
-            json!([{"longValue": expected_key}]),
-            "case key {expected_key}: the engine's generated key is reported, got {inserted}"
+            list(&inserted, "generatedFields"),
+            Vec::<Value>::new(),
+            "case key {expected_key}: generatedFields is not supported by this engine, \
+             got {inserted}"
         );
         assert_eq!(
             number(&inserted, "numberOfRecordsUpdated"),
             1,
             "case key {expected_key}: one row was inserted, got {inserted}"
+        );
+    }
+
+    // RETURNING is the documented way to read a generated field, so it carries
+    // the key the sequence assigned.
+    let returned = api
+        .run(json!({
+            "sql": "INSERT INTO notes (body) VALUES (:body) RETURNING id",
+            "parameters": [parameter("body", json!({"stringValue": "note 4"}))],
+        }))
+        .await;
+    assert_eq!(
+        returned["records"],
+        json!([[{"longValue": 4}]]),
+        "case RETURNING: the sequence's next value is returned, got {returned}"
+    );
+
+    // And a batch, whose own `generatedFields` is empty per parameter set.
+    let (status, batch) = api
+        .batch(json!({
+            "sql": "INSERT INTO notes (body) VALUES (:body)",
+            "parameterSets": [
+                [parameter("body", json!({"stringValue": "note 5"}))],
+                [parameter("body", json!({"stringValue": "note 6"}))],
+            ],
+        }))
+        .await;
+    assert_eq!(status, 200, "BatchExecuteStatement failed with {batch}");
+    for (index, result) in list(&batch, "updateResults").iter().enumerate() {
+        assert_eq!(
+            list(result, "generatedFields"),
+            Vec::<Value>::new(),
+            "case batch row {index}: generatedFields is not supported by this engine, \
+             got {batch}"
         );
     }
 
@@ -593,14 +665,27 @@ async fn a_generated_key_is_reported_and_stored() {
             [{"longValue": 1}, {"stringValue": "note 1"}],
             [{"longValue": 2}, {"stringValue": "note 2"}],
             [{"longValue": 3}, {"stringValue": "note 3"}],
+            [{"longValue": 4}, {"stringValue": "note 4"}],
+            [{"longValue": 5}, {"stringValue": "note 5"}],
+            [{"longValue": 6}, {"stringValue": "note 6"}],
         ]),
-        "the generated keys are the stored ids, got {selected}"
+        "every assigned key is the stored id, got {selected}"
     );
     let metadata = list(&selected, "columnMetadata");
     assert_eq!(
         metadata[0]["isAutoIncrement"],
         json!(true),
-        "case id: an INTEGER PRIMARY KEY increments automatically, got {metadata:?}"
+        "case id: a serial column's value is assigned by its sequence, got {metadata:?}"
+    );
+    assert_eq!(
+        metadata[0]["typeName"],
+        json!("serial"),
+        "case id: got {metadata:?}"
+    );
+    assert_eq!(
+        number(&metadata[0], "nullable"),
+        0,
+        "case id: a primary key is NOT NULL, got {metadata:?}"
     );
     assert_eq!(
         number(&metadata[1], "nullable"),
@@ -633,7 +718,7 @@ async fn a_generated_key_is_reported_and_stored() {
 async fn the_json_record_format_returns_the_result_set_as_json() {
     let api = DataApi::new();
     api.run(json!({
-        "sql": "CREATE TABLE readings (id INT, label VARCHAR(8), flag BOOLEAN, score DOUBLE, note TEXT)",
+        "sql": "CREATE TABLE readings (id INT, label VARCHAR(8), flag BOOLEAN, score DOUBLE PRECISION, note TEXT)",
     }))
     .await;
     let rows = [
@@ -699,29 +784,26 @@ async fn the_json_record_format_returns_the_result_set_as_json() {
         "case NONE: the result set is returned in records, got {plain}"
     );
 
-    // Binary data has no JSON form here, so the result is refused with the
-    // modelled error for an unsupported result rather than encoded some other way.
-    api.run(json!({"sql": "CREATE TABLE blobs (payload BLOB)"}))
+    // Binary data has no JSON form of its own, so it is rendered the way
+    // PostgreSQL writes a binary value as text: `\x` and the bytes in
+    // hexadecimal.
+    api.run(json!({"sql": "CREATE TABLE blobs (payload BYTEA)"}))
         .await;
     api.run(json!({
         "sql": "INSERT INTO blobs (payload) VALUES (:payload)",
         "parameters": [parameter("payload", json!({"blobValue": "AAAA"}))],
     }))
     .await;
-    let (status, refused) = api
-        .execute(json!({
+    let rendered = api
+        .run(json!({
             "sql": "SELECT payload FROM blobs",
             "formatRecordsAs": "JSON",
         }))
         .await;
     assert_eq!(
-        status, 400,
-        "case JSON over a blob: got {status} {refused}"
-    );
-    assert_eq!(
-        error_code(&refused),
-        "UnsupportedResultException",
-        "case JSON over a blob: got {refused}"
+        rendered["formattedRecords"],
+        json!("[{\"payload\":\"\\\\x000000\"}]"),
+        "case JSON over a binary value: got {rendered}"
     );
 
     // Nor a number JSON cannot represent: a non-finite REAL the engine produced is
@@ -1393,19 +1475,19 @@ async fn every_schema_a_statement_writes_into_is_bounded() {
     let cases = [
         (
             "the stored schema",
-            "CREATE TABLE stored (payload BLOB)",
+            "CREATE TABLE stored (payload BYTEA)",
             "stored",
             None,
         ),
         (
             "the temp schema of the default database",
-            "CREATE TEMP TABLE scratch (payload BLOB)",
+            "CREATE TEMP TABLE scratch (payload BYTEA)",
             "scratch",
             None,
         ),
         (
             "the temp schema of a named database",
-            "CREATE TEMP TABLE scratch (payload BLOB)",
+            "CREATE TEMP TABLE scratch (payload BYTEA)",
             "scratch",
             Some("shop"),
         ),

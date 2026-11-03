@@ -302,7 +302,7 @@ fn execute(
         } else {
             output.records = Some(outcome.records(crate::state::ReturnTypes::from_options(
                 input.result_set_options.as_ref(),
-            )));
+            ))?);
             if input.include_result_metadata {
                 output.column_metadata = Some(outcome.column_metadata());
             }

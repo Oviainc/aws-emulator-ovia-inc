@@ -204,11 +204,24 @@ fn rollback(
         .transactions
         .remove(&input.transaction_id)
         .ok_or(crate::state::SqlError::TransactionNotFound)?;
+    // A sequence is not part of the transaction that took values out of it, so
+    // the values its statements were handed are not handed out again: the marks
+    // its own copy of the database holds are carried into the committed one
+    // before that copy is dropped. Only into a database this cluster still has —
+    // reporting a rollback creates nothing.
+    let marks = transaction.pending.sequence_marks();
+    let database = crate::state::database_key(transaction.database.as_ref());
     // Discarding the transaction drops the database copy it was writing into, so
     // none of its writes ever reach the committed database.
     drop(transaction);
+    if let Some(committed) = cluster.databases.get_mut(&database) {
+        committed.advance_sequences(&marks);
+    }
+    // `transactionStatus` is "The status of the rollback operation": the status
+    // the service reports for a rollback that finished, not a sentence about the
+    // transaction.
     Ok(RollbackTransactionOutput {
-        transaction_status: Some("Transaction Rolled Back".to_string()),
+        transaction_status: Some("Rollback complete".to_string()),
     })
 }
 

@@ -20,6 +20,10 @@ tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# Hexadecimal, for the text form PostgreSQL gives a binary value
+# (`bytea_output = hex`), which is how a binary value is rendered in the JSON
+# record format.
+hex = { workspace = true }
 tracing = { workspace = true }
 # The SQL engine this service's data plane runs on: caller statements are parsed,
 # planned and executed by SQLite in-process, never by a hand-written SQL subset.
@@ -36,6 +40,11 @@ tracing = { workspace = true }
 # authorizer, extension loading is off, defensive mode is on, and memory, value
 # size, statement size, expression depth and query complexity are all capped.
 rusqlite = { version = "0.37", features = ["bundled", "backup", "column_decltype", "hooks", "limits"] }
+# The PostgreSQL parser in front of that engine: a Data API statement is Aurora
+# PostgreSQL, so it is parsed with this crate's PostgreSQL dialect and rendered
+# back out in the form the engine's own grammar accepts. `visitor` is what walks
+# the parsed statement to rewrite it; no SQL text is inspected by hand.
+sqlparser = { version = "0.59", features = ["visitor"] }
 # Opaque, unique transaction identifiers for BeginTransaction.
 uuid = { version = "1", features = ["v4"] }
 # The calendar and clock behind the DATE/TIME/TIMESTAMP `typeHint`s: a hinted
@@ -49,7 +58,6 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
