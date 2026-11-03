@@ -16,8 +16,8 @@
 //!
 //! The rows below span the kinds of response the framework renders — an `@httpPayload`
 //! structure on a read and on a write, a document output, an empty (`Unit`) output, a
-//! modelled refusal, a refusal the framework makes before any handler runs, the
-//! scaffold's 501 and a request that names no operation at all — because the rule is a
+//! modelled refusal, a refusal the framework makes before any handler runs, a required
+//! list output and a request that names no operation at all — because the rule is a
 //! property of this service's response path, not of one operation. Every case goes
 //! through `MultiServiceRouter::dispatch`, so each exercises routing, the handler and
 //! serialization exactly as a served request does.
@@ -352,11 +352,11 @@ async fn every_response_carries_the_front_doors_media_type_and_validator() {
             carries_a_representation: true,
         },
         Case {
-            about: "ListThemes: the scaffold's 501",
+            about: "ListThemes: a required list output",
             method: "GET",
             uri: themes_uri(),
             body: None,
-            status: 501,
+            status: 200,
             carries_a_representation: true,
         },
         Case {

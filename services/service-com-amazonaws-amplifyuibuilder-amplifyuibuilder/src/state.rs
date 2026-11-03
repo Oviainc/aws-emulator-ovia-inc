@@ -32,7 +32,8 @@
 //! reports it from the single [`StoredTheme`] record, `UpdateTheme` merges into
 //! that record and `DeleteTheme` removes it, all keyed by the same
 //! (appId, environmentName) a component is keyed by and all with the projection
-//! the model asks for.
+//! the model asks for — `ListThemes` reports a page of the `ThemeSummary`
+//! projection of the same records.
 //!
 //! ## The tagging surface
 //!
@@ -52,13 +53,14 @@ use crate::ops::types::{
     ComponentDataConfiguration,
     ComponentEvent, ComponentProperty, ComponentSummary, ComponentVariant, FieldConfig, Form,
     FormCTA, FormDataTypeConfig, FormStyle, InvalidParameterException, ResourceConflictException,
-    ResourceNotFoundException, SectionalElement, Theme, ThemeValues,
+    ResourceNotFoundException, SectionalElement, Theme, ThemeSummary, ThemeValues,
 };
 
-/// The largest page `ListComponents` serves, and the page size it uses when the
+/// The largest page an entity list serves, and the page size it uses when the
 /// request names no `maxResults`: that member targets `ListEntityLimit`, which
-/// the model constrains `@range(min: 1, max: 100)`.
-pub const COMPONENT_PAGE_LIMIT: i32 = 100;
+/// the model constrains `@range(min: 1, max: 100)`, on every operation that
+/// pages over an app environment's entities (`ListComponents`, `ListThemes`).
+pub const LIST_ENTITY_PAGE_LIMIT: i32 = 100;
 
 /// How many records one export page carries, for every export this service
 /// serves (`ExportComponents`, `ExportForms`, `ExportThemes`).
@@ -68,7 +70,7 @@ pub const COMPONENT_PAGE_LIMIT: i32 = 100;
 /// caller asks for. This emulator serves the same largest page its component
 /// list does, so a caller walking any of those operations walks pages of one
 /// bound.
-pub const EXPORT_PAGE_LIMIT: usize = COMPONENT_PAGE_LIMIT as usize;
+pub const EXPORT_PAGE_LIMIT: usize = LIST_ENTITY_PAGE_LIMIT as usize;
 
 /// How many components the store holds before `CreateComponent` refuses with the
 /// modelled `ServiceQuotaExceededException`.
@@ -503,6 +505,17 @@ pub struct StoredTheme {
 }
 
 impl StoredTheme {
+    /// The `ThemeSummary` projection `ListThemes` returns: the four members the
+    /// model declares on it, read off the one stored record.
+    pub fn to_summary(&self) -> ThemeSummary {
+        ThemeSummary {
+            app_id: self.app_id.clone(),
+            environment_name: self.environment_name.clone(),
+            id: self.id.clone(),
+            name: self.name.clone(),
+        }
+    }
+
     /// The `Theme` the create and get operations return.
     pub fn to_theme(&self) -> Theme {
         Theme {

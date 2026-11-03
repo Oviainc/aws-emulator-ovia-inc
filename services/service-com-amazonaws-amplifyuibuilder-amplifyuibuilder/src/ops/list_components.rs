@@ -161,12 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // validator bug, which the debug assertion surfaces.
         let requested = input
             .max_results
-            .unwrap_or(crate::state::COMPONENT_PAGE_LIMIT);
+            .unwrap_or(crate::state::LIST_ENTITY_PAGE_LIMIT);
         debug_assert!(
-            (1..=crate::state::COMPONENT_PAGE_LIMIT).contains(&requested),
+            (1..=crate::state::LIST_ENTITY_PAGE_LIMIT).contains(&requested),
             "maxResults {requested} should have been refused at the boundary"
         );
-        let page_size = usize::try_from(requested.clamp(1, crate::state::COMPONENT_PAGE_LIMIT))
+        let page_size = usize::try_from(requested.clamp(1, crate::state::LIST_ENTITY_PAGE_LIMIT))
             .expect("a page size clamped into 1..=100 fits in usize");
 
         let key = (input.app_id.clone(), input.environment_name.clone());
