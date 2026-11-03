@@ -2,21 +2,31 @@
 
 //! Engine state for the com-amazonaws-appconfigdata-appconfigdata service.
 //!
-//! AppConfigData is a two-operation polling data plane, so the only thing it owns is
-//! one map: [`ComAmazonawsAppconfigdataAppconfigdataState::sessions`], every live
-//! configuration session keyed by the opaque token the client currently holds.
-//! `StartConfigurationSession` inserts one; each `GetLatestConfiguration` inserts the
-//! rotated successor of the token it was called with, so the token a client holds is
-//! always resolvable until that token's lifetime runs out.
+//! AppConfigData is a two-operation polling data plane, so what it owns is two maps:
+//! [`ComAmazonawsAppconfigdataAppconfigdataState::sessions`], every live
+//! configuration session keyed by the opaque token the client currently holds, and
+//! the name bindings of [`NameBindings`].
+//! `StartConfigurationSession` inserts one session; each `GetLatestConfiguration`
+//! inserts the rotated successor of the token it was called with, so the token a client
+//! holds is always resolvable until that token's lifetime runs out.
 //!
 //! Everything else a poll answers with — which applications, environments and
 //! configuration profiles exist, which configuration version is deployed into an
 //! environment, and the bytes of that version — belongs to the AppConfig CONTROL
 //! PLANE, and is read out of that service's own store through the one shared engine
 //! rather than copied into a second map here ([`resolve_deployed_triple`],
-//! [`served_configuration`]). A session therefore resolves against the same records
-//! AppConfig's own operations report, and a configuration deployed through
-//! `StartDeployment` is the one a poll serves.
+//! [`served_configuration`]). A configuration deployed through `StartDeployment` is
+//! therefore the one a poll serves.
+//!
+//! The one thing the data plane keeps of its own about that hierarchy is how a NAME
+//! resolves. Every session identifier is "the ID or the name" of its level, and an id
+//! is immutable while a name is not: the control plane may rename a record, which frees
+//! the old name for another record to take. So the data plane binds a name the first
+//! time it resolves one — to the id it resolved to — and answers that name from the
+//! binding afterwards ([`NameBindings`]), instead of asking the control plane again
+//! what currently carries it. A rename therefore neither breaks the consumers
+//! configured with the old name nor re-points that name at whatever record claims it
+//! next.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -120,17 +130,142 @@ impl Session {
     }
 }
 
+/// Upper bound on the number of name bindings [`NameBindings`] holds.
+///
+/// A binding is recorded only for a name that actually resolved, so the map grows with
+/// the names the control plane's records have CARRIED rather than with the number of
+/// requests; renaming a record in a loop would still grow it without limit, so the store
+/// also keeps a hard cap, past which the bindings recorded longest ago are dropped first.
+pub const MAX_NAME_BINDINGS: usize = 4_096;
+
+/// One name the data plane has bound, as the map of [`NameBindings`] is keyed.
+///
+/// A name addresses a record only within its own parent — an environment and a
+/// configuration profile are children of one application — so the key carries the scope
+/// the name was resolved in alongside the level it names. Two applications may each hold
+/// an environment called the same thing, and the two bindings are different keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct BoundName {
+    /// The level of the hierarchy the name names, as the modelled `ResourceType` value
+    /// for it ([`RESOURCE_TYPE_APPLICATION`] and the two below it).
+    level: &'static str,
+    /// The id of the record the name is scoped to: the application for an environment or
+    /// a configuration profile, and [`ACCOUNT_SCOPE`] for an application, whose names
+    /// are scoped to the account.
+    scope: String,
+    /// The name as the request spelled it.
+    name: String,
+}
+
+/// The scope an application name is bound in: an application has no parent record, so
+/// its name is unique within the account rather than within another resource.
+const ACCOUNT_SCOPE: &str = "";
+
+/// A name this service resolved against the control plane for the first time, and the id
+/// it resolved to — handed back by [`resolve_deployed_triple`] for the caller to record
+/// once it has decided the call succeeds.
+#[derive(Debug, Clone)]
+pub struct LearnedName {
+    key: BoundName,
+    id: String,
+}
+
+/// Which id each NAME this data plane has seen resolves to.
+///
+/// A session identifier is "the ID or the name" of its level. An id is immutable, so it
+/// needs no binding; a name is not, so the first resolution of one is recorded here and
+/// every later resolution of that name answers from the record it was bound to — even
+/// after the control plane renames that record, and even after another record takes the
+/// freed name, which therefore keeps answering for the record that held it rather than
+/// for the one that holds it now.
+#[derive(Debug, Default, Clone)]
+pub struct NameBindings {
+    /// Each bound name, with the id it resolves to and when it was bound (which is the
+    /// order the cap reclaims by).
+    bound: HashMap<BoundName, (String, SystemTime)>,
+}
+
+impl NameBindings {
+    /// The id `name` is bound to at `level` within `scope`, if it is bound at all.
+    fn bound_id(&self, level: &'static str, scope: &str, name: &str) -> Option<&str> {
+        self.bound
+            .get(&BoundName {
+                level,
+                scope: scope.to_string(),
+                name: name.to_string(),
+            })
+            .map(|(id, _)| id.as_str())
+    }
+
+    /// Record the names a resolution learned, and hold the map to
+    /// [`MAX_NAME_BINDINGS`].
+    ///
+    /// A name resolved live is bound to the id it resolved to, replacing a binding whose
+    /// record the control plane no longer holds (that is the only way a name is resolved
+    /// live again once it has been bound).
+    fn bind(&mut self, learned: Vec<LearnedName>, now: SystemTime) {
+        for LearnedName { key, id } in learned {
+            self.bound.insert(key, (id, now));
+        }
+        if self.bound.len() <= MAX_NAME_BINDINGS {
+            return;
+        }
+        let excess = self.bound.len() - MAX_NAME_BINDINGS;
+        let mut candidates: Vec<(SystemTime, BoundName)> = self
+            .bound
+            .iter()
+            .map(|(key, (_, bound_at))| (*bound_at, key.clone()))
+            .collect();
+        // Oldest binding first; the key breaks a tie so reclaiming does not depend on
+        // hash order.
+        candidates.sort();
+        for (_, key) in candidates.into_iter().take(excess) {
+            self.bound.remove(&key);
+        }
+    }
+
+    /// How many names are bound — the cap of [`MAX_NAME_BINDINGS`] applies to this.
+    pub fn len(&self) -> usize {
+        self.bound.len()
+    }
+
+    /// Whether no name is bound yet.
+    pub fn is_empty(&self) -> bool {
+        self.bound.is_empty()
+    }
+}
+
 /// Per-service state for com-amazonaws-appconfigdata-appconfigdata. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppconfigdataAppconfigdataState {
     /// Live sessions, keyed by the configuration token that resolves to them.
     pub sessions: HashMap<String, Session>,
+    /// Which id each name this data plane has resolved is bound to; see [`NameBindings`].
+    name_bindings: NameBindings,
     /// How many tokens this store has minted; part of the token material, so no two
     /// tokens are ever derived from the same input.
     tokens_minted: u64,
 }
 
 impl ComAmazonawsAppconfigdataAppconfigdataState {
+    /// The name bindings as they stand, to resolve a request's identifiers with.
+    ///
+    /// Handed out as an owned COPY so the resolution — which takes the AppConfig control
+    /// plane's own lock — runs with no guard of this store held: the two stores are
+    /// taken one at a time, never nested.
+    pub fn name_bindings(&self) -> NameBindings {
+        self.name_bindings.clone()
+    }
+
+    /// Record the names a resolution learned ([`NameBindings::bind`]).
+    ///
+    /// Called only by the operation that MINTS a session: a call this service refuses
+    /// persists nothing, and a poll resolves the identifiers its session was started
+    /// with, which were bound when that session was minted.
+    pub fn bind_names(&mut self, learned: Vec<LearnedName>, now: SystemTime) {
+        self.name_bindings.bind(learned, now);
+    }
+
     /// Start a session over `(application, environment, profile)` and return the
     /// token that resolves to it.
     pub fn start_session(
@@ -420,10 +555,17 @@ fn app_config_state<Eng: Send + Sync + 'static>(
 /// `StartConfigurationSession` must before it mints a session: the three identifiers,
 /// and the deployment that put a configuration into that environment.
 ///
-/// Each identifier is "the ID or the name" of its level, so each resolves either way,
-/// and the levels are resolved outermost first: an environment or a profile is a child
-/// of the application, so a request naming an application that does not exist is
-/// refused on the application rather than on its children.
+/// Each identifier is "the ID or the name" of its level, so each resolves either way. An
+/// id is resolved against the control plane's records, because an id names one record for
+/// as long as it exists; a NAME is resolved through `bindings`, this service's own record
+/// of what that name resolved to the first time it did, and the names this resolution
+/// learned are handed back for the caller to bind once it has decided the call succeeds
+/// ([`ComAmazonawsAppconfigdataAppconfigdataState::bind_names`]).
+///
+/// The application is resolved first, because the other two levels are its children. Of
+/// those two the configuration PROFILE is resolved before the environment — it is what
+/// identifies the configuration a session is over — so a request that resolves neither is
+/// refused on the configuration profile.
 ///
 /// A session is over a DEPLOYED configuration — the operation's own doc is "starts a
 /// configuration session used to retrieve a deployed configuration" — so a triple whose
@@ -439,20 +581,22 @@ fn app_config_state<Eng: Send + Sync + 'static>(
 /// deployment record is not something the clock changes.
 pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    bindings: &NameBindings,
     application_identifier: &str,
     environment_identifier: &str,
     configuration_profile_identifier: &str,
-) -> Option<Result<(), UnresolvedResource>> {
+) -> Option<Result<Vec<LearnedName>, UnresolvedResource>> {
     let state = app_config_state(engine)?;
     let store = state.lock();
-    let resolved = match resolve_in(
+    let (resolved, learned) = match resolve_in(
         &store,
+        bindings,
         application_identifier,
         environment_identifier,
         configuration_profile_identifier,
     ) {
         Err(unresolved) => return Some(Err(unresolved)),
-        Ok(resolved) => resolved,
+        Ok(resolution) => resolution,
     };
     // Every id came out of the resolution above, so each lookup holds.
     let deployed = store
@@ -470,7 +614,7 @@ pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
             configuration_profile_identifier,
         )));
     }
-    Some(Ok(()))
+    Some(Ok(learned))
 }
 
 /// The configuration a session over this triple polls, at `now`.
@@ -488,9 +632,13 @@ pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
 /// resolved from it.
 ///
 /// Reporting-only: the environment is brought up to whatever state the CLOCK already
-/// owes it on a COPY, so a poll never writes to the control plane.
+/// owes it on a COPY, so a poll never writes to the control plane. The session's
+/// identifiers are resolved through `bindings` exactly as the session's own mint
+/// resolved them ([`resolve_deployed_triple`]), and a poll binds no name of its own: the
+/// names it resolves were bound when the session was started.
 pub fn served_configuration<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    bindings: &NameBindings,
     application_identifier: &str,
     environment_identifier: &str,
     configuration_profile_identifier: &str,
@@ -498,8 +646,9 @@ pub fn served_configuration<Eng: Send + Sync + 'static>(
 ) -> Option<Result<ServedConfiguration, UnresolvedResource>> {
     let state = app_config_state(engine)?;
     let store = state.lock();
-    let resolved = match resolve_in(
+    let (resolved, _learned) = match resolve_in(
         &store,
+        bindings,
         application_identifier,
         environment_identifier,
         configuration_profile_identifier,
@@ -507,7 +656,7 @@ pub fn served_configuration<Eng: Send + Sync + 'static>(
         // The poll's own input named none of these levels — see
         // `UnresolvedResource::referenced_by`.
         Err(unresolved) => return Some(Err(unresolved.unreferenced())),
-        Ok(resolved) => resolved,
+        Ok(resolution) => resolution,
     };
     // Every id came out of the resolution above, so each lookup holds.
     let application = store.application(&resolved.application_id)?;
@@ -555,41 +704,133 @@ struct ResolvedTriple {
     configuration_profile_id: String,
 }
 
-/// Resolve the three identifiers against `store`, outermost level first.
+/// Resolve the three identifiers against `store` and `bindings`: the application first,
+/// then — of its two children — the configuration profile before the environment (see
+/// [`resolve_deployed_triple`]), answering the ids and the names this resolution learned.
 fn resolve_in(
     store: &AppConfigState,
+    bindings: &NameBindings,
     application_identifier: &str,
     environment_identifier: &str,
     configuration_profile_identifier: &str,
-) -> Result<ResolvedTriple, UnresolvedResource> {
-    let application = store.resolve_application(application_identifier).ok_or_else(|| {
+) -> Result<(ResolvedTriple, Vec<LearnedName>), UnresolvedResource> {
+    let mut learned = Vec::new();
+    let unresolved_application = || {
         UnresolvedResource::named(
             RESOURCE_TYPE_APPLICATION,
             APPLICATION_IDENTIFIER_MEMBER,
             application_identifier,
         )
+    };
+    let application_id = resolve_identifier(
+        bindings,
+        &mut learned,
+        RESOURCE_TYPE_APPLICATION,
+        ACCOUNT_SCOPE,
+        application_identifier,
+        |id| store.application(id).is_some(),
+        |name| {
+            store
+                .resolve_application(name)
+                .map(|application| application.id.clone())
+        },
+    )
+    .ok_or_else(unresolved_application)?;
+    // The id came out of the resolution above, which answers only for an application
+    // this store holds.
+    let application = store
+        .application(&application_id)
+        .ok_or_else(unresolved_application)?;
+    let configuration_profile_id = resolve_identifier(
+        bindings,
+        &mut learned,
+        RESOURCE_TYPE_CONFIGURATION_PROFILE,
+        &application_id,
+        configuration_profile_identifier,
+        |id| application.profiles.contains_key(id),
+        |name| {
+            application
+                .resolve_profile(name)
+                .map(|profile| profile.id.clone())
+        },
+    )
+    .ok_or_else(|| {
+        UnresolvedResource::named(
+            RESOURCE_TYPE_CONFIGURATION_PROFILE,
+            CONFIGURATION_PROFILE_IDENTIFIER_MEMBER,
+            configuration_profile_identifier,
+        )
     })?;
-    let environment = application
-        .resolve_environment(environment_identifier)
-        .ok_or_else(|| {
-            UnresolvedResource::named(
-                RESOURCE_TYPE_ENVIRONMENT,
-                ENVIRONMENT_IDENTIFIER_MEMBER,
-                environment_identifier,
-            )
-        })?;
-    let profile = application
-        .resolve_profile(configuration_profile_identifier)
-        .ok_or_else(|| {
-            UnresolvedResource::named(
-                RESOURCE_TYPE_CONFIGURATION_PROFILE,
-                CONFIGURATION_PROFILE_IDENTIFIER_MEMBER,
-                configuration_profile_identifier,
-            )
-        })?;
-    Ok(ResolvedTriple {
-        application_id: application.id.clone(),
-        environment_id: environment.id.clone(),
-        configuration_profile_id: profile.id.clone(),
-    })
+    let environment_id = resolve_identifier(
+        bindings,
+        &mut learned,
+        RESOURCE_TYPE_ENVIRONMENT,
+        &application_id,
+        environment_identifier,
+        |id| application.environments.contains_key(id),
+        |name| {
+            application
+                .resolve_environment(name)
+                .map(|environment| environment.id.clone())
+        },
+    )
+    .ok_or_else(|| {
+        UnresolvedResource::named(
+            RESOURCE_TYPE_ENVIRONMENT,
+            ENVIRONMENT_IDENTIFIER_MEMBER,
+            environment_identifier,
+        )
+    })?;
+    Ok((
+        ResolvedTriple {
+            application_id,
+            environment_id,
+            configuration_profile_id,
+        },
+        learned,
+    ))
+}
+
+/// Resolve ONE identifier of a session's triple: the id of the record it names, or
+/// `None` when nothing at this level answers to it.
+///
+/// `holds_id` says whether the control plane holds a record with that id at this level
+/// and scope, and `by_name` resolves a NAME against the control plane's current records.
+/// An identifier is answered, in order, by:
+///
+/// 1. the record the control plane holds under it as an ID — an id names one record for
+///    as long as that record exists, so nothing about it is remembered here;
+/// 2. the binding this service already recorded for the name, for as long as the record
+///    it was bound to is still there — so a control-plane rename neither breaks the name
+///    nor hands it to whatever record claims it next;
+/// 3. the control plane's current records, by name — the first resolution of a name, and
+///    the only one that LEARNS a binding (which is also how a binding whose record is
+///    gone gives way to the record that holds the name now).
+fn resolve_identifier(
+    bindings: &NameBindings,
+    learned: &mut Vec<LearnedName>,
+    level: &'static str,
+    scope: &str,
+    identifier: &str,
+    holds_id: impl Fn(&str) -> bool,
+    by_name: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if holds_id(identifier) {
+        return Some(identifier.to_string());
+    }
+    if let Some(bound) = bindings.bound_id(level, scope, identifier) {
+        if holds_id(bound) {
+            return Some(bound.to_string());
+        }
+    }
+    let id = by_name(identifier)?;
+    learned.push(LearnedName {
+        key: BoundName {
+            level,
+            scope: scope.to_string(),
+            name: identifier.to_string(),
+        },
+        id: id.clone(),
+    });
+    Some(id)
 }

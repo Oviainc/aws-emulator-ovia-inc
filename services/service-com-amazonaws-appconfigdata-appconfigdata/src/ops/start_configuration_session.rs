@@ -3,9 +3,12 @@
 //! @op StartConfigurationSession
 //!
 //! Implemented: resolves the requested (application, environment, configuration
-//! profile) triple against the AppConfig control plane's own state, refuses an
-//! unresolvable level — and a triple into which that configuration profile has never
-//! been deployed — with the modelled `ResourceNotFoundException`, and otherwise
+//! profile) triple against the AppConfig control plane's own state — an identifier
+//! given as a NAME through this service's own name bindings
+//! ([`crate::state::NameBindings`]), so a control-plane rename neither breaks the old
+//! name nor re-points it — refuses an unresolvable level, and a triple into which that
+//! configuration profile has never been deployed, with the modelled
+//! `ResourceNotFoundException`, and otherwise
 //! mints a configuration session over that triple and persists it in this service's
 //! engine state, keyed by the opaque token it returns. `GetLatestConfiguration`
 //! resolves that token back to the session.
@@ -187,14 +190,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // level that does not exist cannot be polled, so an unresolvable one is
         // refused here rather than surfacing later as a poll that never succeeds.
         //
+        // A NAME, though, is resolved through this service's OWN bindings rather than
+        // against whatever the control plane says carries the name now: an id addresses
+        // one record for as long as it exists, a name does not, so the first resolution
+        // of a name is what it keeps resolving to (`crate::state::NameBindings`). The
+        // bindings are read out as an owned copy, so the control plane below is read with
+        // no guard of this store held.
+        //
         // A session is over a DEPLOYED configuration, so the control plane is also
         // asked whether the configuration profile has been deployed into that
         // environment at all: for a triple that resolves but has no deployment there is
         // no configuration to poll, the missing resource is the deployment, and no token
         // is minted (a client bootstrapping against the service reads that refusal as
         // "nothing deployed yet" and keeps waiting).
+        let bindings = state.lock().name_bindings();
         let Some(resolution) = crate::state::resolve_deployed_triple(
             &*self.engine,
+            &bindings,
             &input.application_identifier,
             &input.environment_identifier,
             &input.configuration_profile_identifier,
@@ -209,35 +221,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        if let Err(unresolved) = resolution {
-            tracing::debug!(
-                operation = "StartConfigurationSession",
-                outcome = "ResourceNotFoundException",
-                resource_type = unresolved.resource_type,
-                "refused a session for a resource the control plane does not hold"
-            );
-            return Err(StartConfigurationSessionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(unresolved.message.clone()),
-                    resource_type: Some(unresolved.resource_type.to_string()),
-                    referenced_by: unresolved.referenced_by(),
-                },
-            )
-            .into());
-        }
+        let learned_names = match resolution {
+            Err(unresolved) => {
+                tracing::debug!(
+                    operation = "StartConfigurationSession",
+                    outcome = "ResourceNotFoundException",
+                    resource_type = unresolved.resource_type,
+                    "refused a session for a resource the control plane does not hold"
+                );
+                return Err(StartConfigurationSessionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(unresolved.message.clone()),
+                        resource_type: Some(unresolved.resource_type.to_string()),
+                        referenced_by: unresolved.referenced_by(),
+                    },
+                )
+                .into());
+            }
+            Ok(learned_names) => learned_names,
+        };
 
         // The stored session carries its own expiry (`crate::state::TOKEN_LIFETIME`,
         // the 24 hours the token members above document) and the store is bounded and
         // self-reclaiming: `start_session` sweeps the entries that can no longer serve
         // a poll and holds the map to `crate::state::MAX_SESSIONS`, so a client minting
         // sessions in a loop cannot grow it without limit.
-        let token = state.lock().start_session(
-            &input.application_identifier,
-            &input.environment_identifier,
-            &input.configuration_profile_identifier,
-            input.required_minimum_poll_interval_in_seconds,
-            std::time::SystemTime::now(),
-        );
+        //
+        // The names this call resolved for the first time are bound here, under the same
+        // guard the session is stored under — only a call that MINTS a session records
+        // anything, so a refused session still persists nothing.
+        let now = std::time::SystemTime::now();
+        let token = {
+            let mut store = state.lock();
+            store.bind_names(learned_names, now);
+            store.start_session(
+                &input.application_identifier,
+                &input.environment_identifier,
+                &input.configuration_profile_identifier,
+                input.required_minimum_poll_interval_in_seconds,
+                now,
+            )
+        };
 
         // An access record for the session mint: which configuration the session
         // will poll. The minted token is never recorded — it is the client's

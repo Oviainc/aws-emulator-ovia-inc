@@ -294,8 +294,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // STEP 1 — resolve the token and check it may be used, under this service's
         // own lock, which is RELEASED before the control plane is read: the two stores
-        // are taken one at a time, never nested.
-        let session = {
+        // are taken one at a time, never nested. The same guard hands out the name
+        // bindings STEP 2 resolves the session's identifiers through, so the control
+        // plane is read with no guard of this store held.
+        let (session, bindings) = {
             let state = state.lock();
 
             // The token is opaque, so one this store never minted carries no session
@@ -330,15 +332,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(bad_configuration_token("PollIntervalNotSatisfied"));
                 }
             }
-            session
+            (session, state.name_bindings())
         };
 
         // STEP 2 — the configuration the session polls is read out of the AppConfig
         // CONTROL PLANE: the application, environment and configuration profile the
         // session named must exist there, and the version the environment's in-force
         // deployment deployed is what this call serves.
+        //
+        // A name is resolved through the bindings the session's own mint recorded, not
+        // against whatever the control plane says carries that name now, so renaming a
+        // record does not redirect or break a session already polling it. The poll binds
+        // nothing itself: a read must not change what a later caller sees.
         let Some(deployed) = crate::state::served_configuration(
             &*self.engine,
+            &bindings,
             &session.application_identifier,
             &session.environment_identifier,
             &session.configuration_profile_identifier,

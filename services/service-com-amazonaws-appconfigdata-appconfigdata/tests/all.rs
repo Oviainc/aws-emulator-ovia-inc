@@ -15,6 +15,8 @@
 mod configuration_session_poll;
 #[path = "all/feature_flag_resolution.rs"]
 mod feature_flag_resolution;
+#[path = "all/name_bindings_survive_renames.rs"]
+mod name_bindings_survive_renames;
 #[path = "all/next_poll_token_poll_rate.rs"]
 mod next_poll_token_poll_rate;
 #[path = "all/session_requires_a_deployment.rs"]
