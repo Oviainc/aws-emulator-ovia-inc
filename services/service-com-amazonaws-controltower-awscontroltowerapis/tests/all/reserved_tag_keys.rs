@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use service_com_amazonaws_controltower_awscontroltowerapis::state::RESERVED_TAG_KEY_PREFIX;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::landing_zone_lifecycle::{call, emulator, simple_manifest, Answer};
+use crate::landing_zone_lifecycle::{call, emulator, set_up_account, simple_manifest, Answer};
 use crate::resource_tags::{apply_tags, read_tags, reported_tags, resources, tags};
 
 /// Tag keys in the reserved namespace: the prefix ALONE, the AWS-generated keys a client
@@ -259,6 +259,12 @@ struct Writer {
     body: serde_json::Value,
     list_path: &'static str,
     list_member: &'static str,
+    /// Whether that list operation is one of the enablement reads Control Tower serves only
+    /// for an account it has been set up in, so this row has to set the account up before it
+    /// can read whether the refused call created anything. The `CreateLandingZone` row is
+    /// the one that must NOT: it is the call that sets the account up, and an account holds
+    /// one landing zone.
+    requires_a_set_up_account: bool,
 }
 
 /// Every operation of this service that writes tags OTHER than `TagResource`: the `tags`
@@ -271,6 +277,7 @@ fn writers() -> Vec<Writer> {
             body: serde_json::json!({ "version": "3.3", "manifest": simple_manifest() }),
             list_path: "/list-landingzones",
             list_member: "landingZones",
+            requires_a_set_up_account: false,
         },
         Writer {
             case: "EnableControl",
@@ -281,6 +288,7 @@ fn writers() -> Vec<Writer> {
             }),
             list_path: "/list-enabled-controls",
             list_member: "enabledControls",
+            requires_a_set_up_account: true,
         },
         Writer {
             case: "EnableBaseline",
@@ -292,6 +300,7 @@ fn writers() -> Vec<Writer> {
             }),
             list_path: "/list-enabled-baselines",
             list_member: "enabledBaselines",
+            requires_a_set_up_account: true,
         },
     ]
 }
@@ -322,6 +331,9 @@ async fn the_create_and_enable_paths_refuse_a_reserved_tag_key_and_write_nothing
         // A fresh emulator per writer: the account holds one landing zone, and a control
         // or baseline is enabled once per target, so each row starts from an empty store.
         let router = emulator();
+        if writer.requires_a_set_up_account {
+            set_up_account(&router).await;
+        }
         let before = listed_count(&router, writer.list_path, writer.list_member).await;
 
         for (case, key) in reserved_keys() {

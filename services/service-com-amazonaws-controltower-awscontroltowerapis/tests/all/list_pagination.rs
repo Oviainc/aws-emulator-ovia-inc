@@ -42,7 +42,7 @@ use crate::baseline_operations::{enable as enable_baseline, enablements};
 use crate::enabled_control_lifecycle::{control, enable as enable_control, entries, ou};
 use crate::front_door_validation::FRONT_DOOR_CODE;
 use crate::landing_zone_lifecycle::{
-    call, emulator, manifest_governing, past_the_settle_span, Answer,
+    call, emulator, manifest_governing, past_the_settle_span, set_up_account, Answer,
 };
 
 /// One listing that pages by the shared rule: the operation its refusal names, the path its
@@ -64,6 +64,21 @@ pub(crate) struct Listing {
     /// a plain `String`, `false` where its modelled pattern admits no empty value, so the
     /// front door refuses one.
     pub(crate) empty_token_reaches_the_handler: bool,
+    /// Whether this listing is one of the enablement reads Control Tower serves only for an
+    /// account it has been set up in, so a case that lists an EMPTY one has to set the
+    /// account up before the listing answers at all.
+    pub(crate) requires_a_set_up_account: bool,
+}
+
+/// A fresh emulator holding no record of `listing`'s own store but ready to be listed: the
+/// account is set up only for the listings whose precondition that is, so a listing over
+/// the landing zone's own stores still starts out empty.
+pub(crate) async fn emulator_for_empty_listing(listing: Listing) -> MultiServiceRouter {
+    let router = emulator();
+    if listing.requires_a_set_up_account {
+        set_up_account(&router).await;
+    }
+    router
 }
 
 /// `ListLandingZones`, whose handler held one copy of the rule.
@@ -75,6 +90,7 @@ const LANDING_ZONES: Listing = Listing {
     max_results_range: (1, 1),
     token_scoped_to_parameters: false,
     empty_token_reaches_the_handler: true,
+    requires_a_set_up_account: false,
 };
 
 /// `ListLandingZoneOperations`, whose handler held another.
@@ -86,6 +102,7 @@ const LANDING_ZONE_OPERATIONS: Listing = Listing {
     max_results_range: (1, 100),
     token_scoped_to_parameters: true,
     empty_token_reaches_the_handler: true,
+    requires_a_set_up_account: false,
 };
 
 /// `ListControlOperations`, whose handler held another.
@@ -98,6 +115,7 @@ const CONTROL_OPERATIONS: Listing = Listing {
     token_scoped_to_parameters: true,
     // `ListControlOperationsNextToken` is modelled `pattern \S+`.
     empty_token_reaches_the_handler: false,
+    requires_a_set_up_account: false,
 };
 
 /// `ListEnabledControls`, whose handler held another.
@@ -109,6 +127,7 @@ const ENABLED_CONTROLS: Listing = Listing {
     max_results_range: (1, 200),
     token_scoped_to_parameters: true,
     empty_token_reaches_the_handler: true,
+    requires_a_set_up_account: true,
 };
 
 /// `ListEnabledBaselines`, whose handler held another.
@@ -121,6 +140,7 @@ const ENABLED_BASELINES: Listing = Listing {
     token_scoped_to_parameters: true,
     // `ListEnabledBaselinesNextToken` is modelled `pattern \S+`.
     empty_token_reaches_the_handler: false,
+    requires_a_set_up_account: true,
 };
 
 /// `ListBaselines`, whose handler held the sixth copy.
@@ -132,6 +152,7 @@ const BASELINES: Listing = Listing {
     max_results_range: (4, 100),
     token_scoped_to_parameters: false,
     empty_token_reaches_the_handler: true,
+    requires_a_set_up_account: false,
 };
 
 /// Every listing that reaches the shared rule.
@@ -521,9 +542,12 @@ async fn every_listing_pages_by_the_one_shared_page_token_rule() {
 /// wording a populated one does.
 #[tokio::test]
 async fn an_empty_listing_is_one_untokened_page_and_refuses_an_unhandled_token() {
-    let router = emulator();
-
     for listing in listings() {
+        // One emulator per listing, so the account's setup — the precondition the
+        // enablement listings are served under — does not populate the landing zone's own
+        // stores for the listings that page over those.
+        let router = emulator_for_empty_listing(listing).await;
+
         // `ListBaselines` reports the AWS-managed catalog, which no call creates or
         // deletes, so it is the one listing that is never empty; its refusals are asserted
         // against the catalog's own length.

@@ -91,6 +91,8 @@ mod landing_zone_lifecycle;
 mod landing_zone_operations;
 #[path = "all/landing_zone_pending_transitions.rs"]
 mod landing_zone_pending_transitions;
+#[path = "all/landing_zone_precondition.rs"]
+mod landing_zone_precondition;
 #[path = "all/landing_zone_reset.rs"]
 mod landing_zone_reset;
 #[path = "all/landing_zone_update.rs"]

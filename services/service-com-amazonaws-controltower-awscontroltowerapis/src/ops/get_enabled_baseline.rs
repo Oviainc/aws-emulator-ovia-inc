@@ -12,6 +12,13 @@
 //! applying, a torn-down enablement disappearing) and would hold at the same instant
 //! whether or not anybody called.
 //!
+//! Served only for an account Control Tower has been set up in
+//! ([`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::is_set_up`]): in one
+//! it has provisioned nothing there is no landing zone and no service role to read
+//! enablement state through, so the call is the modelled `ValidationException` (400)
+//! naming the role rather than a report about the identifier — see `crate::state` for the
+//! one precondition the enablement reads share.
+//!
 //! `driftStatusSummary` reports the INHERITANCE drift of the enablement, which is the one
 //! drift type the model declares for a baseline: Control Tower "detects inheritance drift
 //! on the enabled baselines that target OUs" and "does not detect drift on the baselines
@@ -191,6 +198,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only materialises transitions the clock already owed; this operation is
         // `@readonly` and writes nothing else.
         store.settle(::std::time::SystemTime::now());
+
+        // The same precondition the sibling enabled-baseline listing applies: an account
+        // Control Tower has provisioned nothing in has no service role for this read to
+        // reach enablement state through, so it refuses rather than reporting the
+        // identifier as the thing that is missing.
+        if !store.is_set_up() {
+            return Err(GetEnabledBaselineErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::SETUP_REQUIRED_FOR_BASELINES.to_string(),
+                },
+            )
+            .into());
+        }
 
         let Some(enabled_baseline) = store
             .resolve_enabled_baseline_arn(&input.enabled_baseline_identifier)

@@ -8,7 +8,9 @@
 //!
 //! The rules under test, each asserted over a TABLE of inputs rather than one case:
 //!
-//! * the listing is the stored set of enablements: empty before any `EnableBaseline`,
+//! * the listing is the stored set of enablements: empty before any `EnableBaseline` (in an
+//!   account Control Tower has been set up in, which is the precondition the enablement
+//!   reads share — see `landing_zone_precondition` for the un-set-up account),
 //!   reporting for each one the baseline, version, target and operation that call
 //!   persisted — the same record `GetEnabledBaseline` reports, with the status the clock
 //!   has reached — and losing an enablement the clock has torn down;
@@ -38,7 +40,7 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::assesses_inhe
 use crate::baseline_operations::{disable, enable, enablements, Enablement};
 use crate::enabled_control_lifecycle::entries;
 use crate::front_door_validation::FRONT_DOOR_CODE;
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, set_up_account, Answer};
 
 /// POST `/list-enabled-baselines` with `body`.
 async fn list(router: &MultiServiceRouter, body: serde_json::Value) -> Answer {
@@ -123,6 +125,10 @@ async fn enable_rows(router: &MultiServiceRouter, rows: &[Enablement]) -> Vec<(S
 #[tokio::test]
 async fn the_listing_reports_every_enablement_the_store_holds() {
     let router = emulator();
+    // The account is set up first, because Control Tower lists enablements for an account it
+    // has been set up in; what this case is about is the listing of a set-up account that
+    // has enabled nothing yet.
+    set_up_account(&router).await;
 
     let empty = list(&router, serde_json::json!({})).await;
     assert_eq!(

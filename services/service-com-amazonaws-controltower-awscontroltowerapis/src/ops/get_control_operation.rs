@@ -9,6 +9,12 @@
 //! [`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::settle`]
 //! materialises. `ListControlOperations` reports the same records as summaries.
 //!
+//! Served only for an account Control Tower has been set up in
+//! ([`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::is_set_up`]): in one
+//! it has provisioned nothing there is no landing zone for this read to resolve, so the
+//! 404 reports the landing zone as what is missing rather than the identifier the caller
+//! is polling — see `crate::state` for the one precondition the enablement reads share.
+//!
 //! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
 //! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
 //! unreachable from this handler: the emulator verifies the request signature at its
@@ -173,6 +179,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // records whose details have stopped being available. This operation is
         // `@readonly` and writes nothing else.
         store.settle(::std::time::SystemTime::now());
+
+        // The same precondition the enabled-control reads apply: an account Control Tower
+        // has provisioned nothing in holds no landing zone for this read to resolve, so
+        // the landing zone is what is reported missing rather than the operation
+        // identifier the caller is polling.
+        if !store.is_set_up() {
+            return Err(GetControlOperationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SETUP_REQUIRED_FOR_CONTROLS.to_string(),
+                },
+            )
+            .into());
+        }
 
         // The control operation log is its own store: an identifier a landing zone or a
         // baseline call returned is not a control operation, so it does not resolve here.

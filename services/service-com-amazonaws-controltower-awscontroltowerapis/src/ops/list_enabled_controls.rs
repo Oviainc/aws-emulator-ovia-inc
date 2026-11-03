@@ -18,6 +18,13 @@
 //!
 //! Implemented: this operation no longer answers HTTP 501.
 //!
+//! Served only for an account Control Tower has been set up in
+//! ([`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::is_set_up`]): in one
+//! it has provisioned nothing there is no landing zone for this listing to resolve, so the
+//! call is the modelled `ResourceNotFoundException` (404) reporting the landing zone as
+//! what is missing, not an empty listing — see `crate::state` for the one precondition the
+//! enablement reads share.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -222,6 +229,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only materialises transitions the clock already owed; this operation is
         // `@readonly` and writes nothing else.
         store.settle(::std::time::SystemTime::now());
+
+        // Control Tower lists control enablements for an account it has been set up in;
+        // one it has provisioned nothing in holds no landing zone for this listing to
+        // resolve, so the landing zone is what is reported missing rather than an empty
+        // listing a caller would read as a clean slate. Asked BEFORE the store is
+        // projected, because an un-set-up account's store is exactly the store that
+        // projects to nothing.
+        if !store.is_set_up() {
+            return Err(ListEnabledControlsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SETUP_REQUIRED_FOR_CONTROLS.to_string(),
+                },
+            )
+            .into());
+        }
 
         // A stable total order over the page boundary, so a `nextToken` resumes where the
         // previous page stopped whatever order the map iterates in. The records are

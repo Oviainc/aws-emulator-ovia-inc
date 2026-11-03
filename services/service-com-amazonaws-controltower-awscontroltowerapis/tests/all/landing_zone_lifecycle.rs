@@ -224,6 +224,18 @@ async fn create(
     answer
 }
 
+/// Set the account up: create the one landing zone whose setup Control Tower serves the
+/// enablement reads for, asserting it succeeded and handing back its ARN.
+///
+/// For the suites whose subject lies PAST that precondition — what a listing holds, what a
+/// refused call persisted, which refusals the front door owns — so a case that is about
+/// something else is not answered by the un-set-up account's refusal. The version and the
+/// manifest are the ones a row whose subject is not the landing zone uses elsewhere in this
+/// target.
+pub(crate) async fn set_up_account(router: &MultiServiceRouter) -> String {
+    create(router, "3.3", simple_manifest()).await.string("arn")
+}
+
 /// The modeled `OperationIdentifier` pattern:
 /// `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`, length 36.
 pub(crate) fn is_operation_identifier(value: &str) -> bool {

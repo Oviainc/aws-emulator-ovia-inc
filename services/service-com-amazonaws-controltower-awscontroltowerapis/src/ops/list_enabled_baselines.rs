@@ -36,6 +36,13 @@
 //!
 //! Implemented: this operation no longer answers HTTP 501.
 //!
+//! Served only for an account Control Tower has been set up in
+//! ([`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::is_set_up`]): in one
+//! it has provisioned nothing there is no landing zone and no service role to read
+//! enablement state through, so the call is the modelled `ValidationException` (400)
+//! naming the role, not an empty listing — see `crate::state` for the one precondition the
+//! enablement reads share.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -229,6 +236,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only materialises transitions the clock already owed; this operation is
         // `@readonly` and writes nothing else.
         store.settle(::std::time::SystemTime::now());
+
+        // Control Tower lists enablements for an account it has been set up in; in one it
+        // has provisioned nothing, it has neither the landing zone nor the service role
+        // this listing would read enablement state through, so it refuses here rather than
+        // reporting an empty listing a caller would read as a clean slate. Asked BEFORE the
+        // store is projected, because an un-set-up account's store is exactly the store
+        // that projects to nothing.
+        if !store.is_set_up() {
+            return Err(ListEnabledBaselinesErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::SETUP_REQUIRED_FOR_BASELINES.to_string(),
+                },
+            )
+            .into());
+        }
 
         // WHAT this call lists: the stored enablements, less the ones that INHERITED their
         // configuration from another enablement unless the request asked for those

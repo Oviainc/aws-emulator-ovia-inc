@@ -7,6 +7,12 @@
 //! parameters the enablement was given and the regions the landing zone governs now.
 //! An identifier no enablement minted is `ResourceNotFoundException` (HTTP 404).
 //!
+//! Served only for an account Control Tower has been set up in
+//! ([`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::is_set_up`]): in one
+//! it has provisioned nothing there is no landing zone for this read to resolve, so the
+//! 404 reports the landing zone as what is missing rather than the identifier the caller
+//! sent — see `crate::state` for the one precondition the enablement reads share.
+//!
 //! Implemented: this operation no longer answers HTTP 501. It is the round-trip reader
 //! for `EnableControl`, so it is implemented alongside it.
 //!
@@ -164,6 +170,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only materialises transitions the clock already owed; this operation is
         // `@readonly` and writes nothing else.
         store.settle(::std::time::SystemTime::now());
+
+        // The same precondition the sibling enabled-control listing applies: an account
+        // Control Tower has provisioned nothing in holds no landing zone for this read to
+        // resolve, so the landing zone is what is reported missing rather than the
+        // identifier the caller sent.
+        if !store.is_set_up() {
+            return Err(GetEnabledControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SETUP_REQUIRED_FOR_CONTROLS.to_string(),
+                },
+            )
+            .into());
+        }
 
         // `enabledControlIdentifier` is modelled as an `Arn`, so the only identifier the
         // front door lets through is the ARN `EnableControl` minted — which is this

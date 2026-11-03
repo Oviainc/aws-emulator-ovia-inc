@@ -22,7 +22,7 @@
 //! ListEnabledBaselinesMaxResults,ListControlOperationsNextToken")` on this crate's
 //! `smithy-model/`.
 
-use crate::landing_zone_lifecycle::{call, emulator, simple_manifest};
+use crate::landing_zone_lifecycle::{call, emulator, set_up_account, simple_manifest};
 
 /// The error code the front door names an input-validation refusal with.
 pub(crate) const FRONT_DOOR_CODE: &str = "BadRequestException";
@@ -234,6 +234,10 @@ async fn a_request_within_every_modeled_bound_is_not_a_front_door_bad_request() 
 
     for (case, path, body) in cases {
         let router = emulator();
+        // The account is set up first: the enablement reads Control Tower serves only for a
+        // set-up account refuse an un-set-up one with their own modelled error, and what
+        // this case is about is which refusals the FRONT DOOR owns.
+        set_up_account(&router).await;
         let answer = call(&router, path, body).await;
         assert!(
             answer.status != 400 && answer.error_code.as_deref() != Some(FRONT_DOOR_CODE),

@@ -28,7 +28,7 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::enabled_control_lifecycle::catalog_arn;
-use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
+use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, set_up_account, Answer};
 
 /// The AWS Control Tower ARN of a control, whose resource segment is the control's name.
 fn control_arn(name: &str) -> String {
@@ -103,6 +103,16 @@ fn configured_parameters(details: &serde_json::Value) -> serde_json::Value {
         .get("parameters")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]))
+}
+
+/// A fresh emulator with the account set up, which is what lets [`listed`] report an empty
+/// store: Control Tower serves the enablement reads for an account it has been set up in,
+/// and these cases are about what `EnableControl` accepts rather than about that
+/// precondition.
+async fn emulator_for_enablement() -> MultiServiceRouter {
+    let router = emulator();
+    set_up_account(&router).await;
+    router
 }
 
 /// Every enablement `ListEnabledControls` reports, so a case can assert a refusal wrote
@@ -360,7 +370,7 @@ async fn a_control_identifier_naming_no_catalog_control_is_refused() {
     ];
 
     for (case, identifier, status, code) in cases {
-        let router = emulator();
+        let router = emulator_for_enablement().await;
         let refused = enable(&router, &identifier, &ou("nf"), None).await;
         assert_refused(case, &refused, status, code);
         assert_eq!(
@@ -382,7 +392,7 @@ async fn a_mandatory_catalog_control_is_not_a_callers_to_enable() {
         "the catalog must publish controls a caller may not enable"
     );
 
-    let router = emulator();
+    let router = emulator_for_enablement().await;
     for (index, control) in mandatory.into_iter().enumerate() {
         for (form_index, (form, identifier)) in [
             ("control ARN", control_arn(control.name)),
@@ -469,7 +479,7 @@ async fn a_target_that_is_not_an_organizational_unit_is_refused() {
     ];
 
     for (case, target) in cases {
-        let router = emulator();
+        let router = emulator_for_enablement().await;
         let refused = enable(&router, &enablable, &target, None).await;
         assert_refused(case, &refused, 400, "ValidationException");
         assert_eq!(
@@ -490,7 +500,7 @@ async fn parameters_the_named_control_does_not_declare_are_refused() {
     // parameter, and the ones that declare keys are refused the keys outside their set.
     for (index, control) in enablable().into_iter().enumerate() {
         let identifier = control_arn(control.name);
-        let router = emulator();
+        let router = emulator_for_enablement().await;
 
         let undeclared = undeclared_key(control.name.trim_start_matches("AWS-GR_"));
         let case = format!("{}: a key it does not declare", control.name);

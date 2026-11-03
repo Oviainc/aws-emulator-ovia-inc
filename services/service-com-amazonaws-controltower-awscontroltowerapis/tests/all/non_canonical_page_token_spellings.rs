@@ -37,7 +37,8 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state;
 
 use crate::landing_zone_lifecycle::{call, emulator};
 use crate::list_pagination::{
-    identities, list, listings, page_body, reported_token, seed, unhandled_token_refusal, Listing,
+    emulator_for_empty_listing, identities, list, listings, page_body, reported_token, seed,
+    unhandled_token_refusal, Listing,
 };
 
 /// The two parts of a token a page handed out: the listing it indexes and the position in
@@ -227,12 +228,14 @@ async fn only_the_spelling_a_page_hands_out_resumes_a_listing() {
 /// wording a populated listing refuses it with.
 #[tokio::test]
 async fn an_empty_listing_hands_out_no_token_and_refuses_every_token() {
-    let router = emulator();
     // A token-shaped string no call of this service wrote: an unseeded listing hands out no
     // token, so this and every spelling of it resume nothing.
     let unissued = "0123456789abcdef.0";
 
     for listing in listings() {
+        // One emulator per listing, so the account's setup — the precondition the
+        // enablement listings are served under — leaves every listing here empty.
+        let router = emulator_for_empty_listing(listing).await;
         let answer = list(&router, listing, serde_json::json!({})).await;
         assert_eq!(
             reported_token(&answer),

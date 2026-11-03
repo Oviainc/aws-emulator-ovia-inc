@@ -93,6 +93,16 @@
 //! which stored status becomes which reported member — and whether the member is reported
 //! at all — cannot drift between the detail and the listing.
 //!
+//! The enablement reads share one PRECONDITION, so it lives here once as well: Control
+//! Tower serves them for an account it has been set up in, and [`is_set_up`] is that
+//! question asked of the stores above. An account it has provisioned nothing in has no
+//! landing zone and no service role for a read to reach enablement state through, so each
+//! such read refuses rather than reporting out of its empty store, in the words its
+//! resource family uses — [`SETUP_REQUIRED_FOR_BASELINES`] for the enabled-baseline reads
+//! and [`SETUP_REQUIRED_FOR_CONTROLS`] for the enabled-control and control-operation
+//! ones.
+//!
+//! [`is_set_up`]: ComAmazonawsControltowerAwscontroltowerapisState::is_set_up
 //! [`merge_tags`]: ComAmazonawsControltowerAwscontroltowerapisState::merge_tags
 //! [`remove_tags`]: ComAmazonawsControltowerAwscontroltowerapisState::remove_tags
 //!
@@ -1770,6 +1780,31 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         self.landing_zones
             .get_key_value(identifier)
             .map(|(arn, _)| arn.clone())
+    }
+
+    /// Whether AWS Control Tower has been set up in this account at all.
+    ///
+    /// Setting Control Tower up is what creates the account's landing zone and the service
+    /// role (`AWSControlTowerAdmin`) its enablement APIs act through, so an account it has
+    /// provisioned NOTHING in has neither, and a call that would have to reach the
+    /// enablement state through them cannot be served from the store at all — see
+    /// [`SETUP_REQUIRED_FOR_BASELINES`] and [`SETUP_REQUIRED_FOR_CONTROLS`] for the two
+    /// refusals that reports, each in the words the resource family's own reads carry.
+    ///
+    /// Read off the stores rather than from a flag, so it answers the same question every
+    /// one of those reads asks: anything this service has provisioned — the landing zone,
+    /// an enablement of a control or a baseline, or a record in one of the three operation
+    /// logs — means setup has run, and an account holding none of it has never been set
+    /// up. A landing zone a caller has since decommissioned leaves its operation log
+    /// behind, so a read after the teardown is still served (and reports what the cascade
+    /// left: nothing enabled).
+    pub fn is_set_up(&self) -> bool {
+        !self.landing_zones.is_empty()
+            || !self.landing_zone_operations.is_empty()
+            || !self.enabled_controls.is_empty()
+            || !self.control_operations.is_empty()
+            || !self.enabled_baselines.is_empty()
+            || !self.baseline_operations.is_empty()
     }
 
     /// Whether the landing zone `arn` names is still being changed by an operation of its
@@ -4019,6 +4054,36 @@ pub fn non_landing_zone_identifier_message(identifier: &str) -> Option<String> {
          arn:aws:controltower:<region>:<account>:landingzone/<id>"
     ))
 }
+
+/// What an enabled-BASELINE read answers in an account Control Tower was never set up in
+/// ([`is_set_up`]).
+///
+/// The baseline enablement APIs act through the service role that setting Control Tower up
+/// creates, so without it the service reports that it could not assume that role rather
+/// than reporting out of a store it never reached. Written here once, so the two reads
+/// that carry it cannot word one precondition two ways. The role is the fixed service role
+/// of that name, so the whole message is fixed text; it is a `ValidationException` (400),
+/// which is the only client error `ListEnabledBaselines` models at all.
+///
+/// [`is_set_up`]: ComAmazonawsControltowerAwscontroltowerapisState::is_set_up
+pub const SETUP_REQUIRED_FOR_BASELINES: &str =
+    "AWS Control Tower could not complete the operation because it could not assume the \
+     'AWSControlTowerAdmin' role. Check the configuration for this role and try again.";
+
+/// What an enabled-CONTROL or control-operation read answers in an account Control Tower
+/// was never set up in ([`is_set_up`]).
+///
+/// The control enablement APIs resolve the account's landing zone, so without one the
+/// service reports the landing zone as the resource that is missing — a
+/// `ResourceNotFoundException` (404) — and names the call that creates it, rather than
+/// reporting out of a store it never reached. Written here once, so every read that
+/// carries it words the one precondition the same way.
+///
+/// [`is_set_up`]: ComAmazonawsControltowerAwscontroltowerapisState::is_set_up
+pub const SETUP_REQUIRED_FOR_CONTROLS: &str =
+    "AWS Control Tower cannot complete the operation, because you must create a landing \
+     zone first. To continue, create your landing zone from the console, or call the \
+     CreateLandingZone API.";
 
 /// A fresh landing zone resource id, used as the ARN's resource segment.
 ///
