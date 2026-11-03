@@ -241,9 +241,9 @@ async fn an_absent_studio_or_session_mapping_is_refused_with_the_not_found_code(
 /// THE OTHER HALF of the rule: a refusal that is NOT about an absent resource and that
 /// Amazon EMR publishes no code of its own for carries no discriminator, so
 /// `ResourceNotFound` means exactly one thing. Rows span those classes — a malformed
-/// document, a name already taken, a marker naming no held row, a mutually exclusive pair
-/// of members and a step id Amazon EMR rejects as not valid — across the modelled
-/// `InvalidRequestException` channel and the `ValidationException` one.
+/// document, a name already taken, a mutually exclusive pair of members and a step id
+/// Amazon EMR rejects as not valid — across the modelled `InvalidRequestException`
+/// channel and the `ValidationException` one.
 #[tokio::test]
 async fn a_refusal_of_another_class_carries_no_discriminator() {
     let emr = Emr::new();
@@ -274,16 +274,6 @@ async fn a_refusal_of_another_class_carries_no_discriminator() {
             json!({ "Name": "malformed", "SecurityConfiguration": "{not json" }),
         ),
         (
-            "a marker naming no held configuration",
-            "ListSecurityConfigurations",
-            json!({ "Marker": "no-such-marker" }),
-        ),
-        (
-            "a marker naming no held mapping",
-            "ListStudioSessionMappings",
-            json!({ "StudioId": &live_studio, "Marker": "no-such-marker" }),
-        ),
-        (
             "both ways of naming one identity",
             "GetStudioSessionMapping",
             json!({
@@ -297,11 +287,6 @@ async fn a_refusal_of_another_class_carries_no_discriminator() {
             "a step id Amazon EMR rejects as not valid",
             "DescribeStep",
             json!({ "ClusterId": &live_cluster, "StepId": "s-ZZZZZZZZZZZZZ" }),
-        ),
-        (
-            "a release label Amazon EMR rejects as not valid",
-            "ListSupportedInstanceTypes",
-            json!({ "ReleaseLabel": "emr-6.99.0" }),
         ),
     ];
 

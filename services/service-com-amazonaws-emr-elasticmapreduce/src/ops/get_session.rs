@@ -144,6 +144,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
+        // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — the request-validation
+        // envelope, HTTP 400, naming the member — rather than looked up. The qualified
+        // session path below names the cluster id too, so the id leading it is settled
+        // first.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
+        }
+
         // The SHAPE of the session id is settled BEFORE any resource is resolved: a
         // value carrying characters no session id is drawn from names no session on any
         // cluster, so it is a bad REQUEST rather than a bad target, and it is refused as

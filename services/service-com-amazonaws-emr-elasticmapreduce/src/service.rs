@@ -42,16 +42,18 @@
 //!
 //! # Which layer a refusal belongs to
 //!
-//! A value outside a modelled enum is refused by one of two layers, and BOTH the error
-//! code and the message come from the layer that reached it.
+//! A request the framework refuses before any handler runs is refused by one of two
+//! layers, and BOTH the error code and the message come from the layer that reached it.
 //!
-//! Amazon EMR checks the enum-valued members of an operation's own INPUT SHAPE itself,
-//! ahead of the generic request validator, and answers its own modelled client-input
-//! error [`INVALID_REQUEST_EXCEPTION`] (HTTP 400) — the identity an SDK client branching
-//! on `emr.exceptions.InvalidRequestException` catches. A value carried deeper, inside a
-//! nested request structure, is reached only by the generic validator, which keeps its
-//! [`VALIDATION_EXCEPTION`]; `structure_steps` is that distinction, and it is what the
-//! recorded `PutAutoScalingPolicy` refusal of a nested comparison operator answers.
+//! Amazon EMR checks the INPUT SHAPE of an operation itself, ahead of the generic
+//! request validator, and answers its own modelled client-input error
+//! [`INVALID_REQUEST_EXCEPTION`] (HTTP 400) — the identity an SDK client branching on
+//! `emr.exceptions.InvalidRequestException` catches — for a value outside a modelled
+//! enum and for an input member the request did not carry at all. A value carried
+//! deeper, inside a nested request structure, is reached only by the generic validator,
+//! which keeps its [`VALIDATION_EXCEPTION`]; `structure_steps` is that distinction, and
+//! it is what the recorded `PutAutoScalingPolicy` refusal of a nested comparison
+//! operator answers.
 //!
 //! The code is also a per-OPERATION fact, because the error SET is: the legacy job-flow
 //! and the policy put/get/remove families declare no client error at all
@@ -63,15 +65,32 @@
 //!
 //! The MESSAGE is EMR's own where EMR has something of its own to say, and the
 //! framework's envelope otherwise: the rejected values of ONE collection-valued filter
-//! member are enumerated in the request's own order (`rejected_values_message`), and an
-//! undeclared value of a CloudWatch metric alarm's enum member is stated in EMR's prose
-//! for that member (`cloud_watch_alarm_message`).
+//! member are enumerated in the request's own order (`rejected_values_message`), an
+//! absent member is stated by the sentence an unusable value of it gets
+//! (`absent_member_refusal`), and an undeclared value of a CloudWatch metric alarm's
+//! enum member is stated in EMR's prose for that member (`cloud_watch_alarm_message`).
+//!
+//! `Refused`, the framework's answer type, carries a code and a sentence. EMR's own
+//! error carries its sentence in `Message` BESIDE the `ErrorCode` that tells one refusal
+//! class from another, so a refusal reworded into that shape is answered by
+//! [`OperationScopedRefusal`] from the shape itself, serialized through the model's own
+//! schema.
+//!
+//! [`OperationScopedRefusal`] also restores the ORDER the checks run in. Amazon EMR
+//! resolves the cluster a cluster-scoped request names before it checks the request's
+//! other members, while the framework checks every member before the handler runs, so a
+//! request carrying both a cluster id the service cannot use and another unusable member
+//! is refused for the CLUSTER — which is what the recorded `ListSteps` carrying an
+//! unresolvable cluster id beside an undeclared step state answers.
 
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service, Violation,
     ViolationKind,
 };
+use std::cell::RefCell;
 use std::sync::Arc;
+
+use crate::ops::types::InvalidRequestException;
 
 /// The wire error code of `com.amazonaws.emr#InvalidRequestException`, this
 /// service's modelled client-input error: "This exception occurs when there is
@@ -79,6 +98,13 @@ use std::sync::Arc;
 /// [`EmulatedService::override_refusal`] so a refusal the framework raises before
 /// any handler runs carries an error identity this service's model declares.
 const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+
+/// The status both of this service's client-error envelopes carry: the model's
+/// `httpError` for `com.amazonaws.emr#InvalidRequestException`
+/// (`smithy_query(query="shape", shape="InvalidRequestException")`), and the request
+/// validator's own — the status a handler raising either answers, so a refusal reworded
+/// into one answers the same.
+const REFUSED_STATUS: u16 = 400;
 
 /// The wire error code the generic request validator answers a refused request with
 /// (HTTP 400). Named here because Amazon EMR keeps that identity for the refusals it
@@ -133,35 +159,179 @@ fn models_invalid_request_exception(operation: &str) -> bool {
     NO_INVALID_REQUEST_EXCEPTION.binary_search(&operation).is_err()
 }
 
-tokio::task_local! {
-    /// Whether the operation the current request is being served as declares
-    /// [`INVALID_REQUEST_EXCEPTION`], set by [`OperationScopedRefusal::run`] around that
-    /// operation's whole run and read back by [`EmulatedService::override_refusal`],
-    /// which the framework hands no request and no operation.
-    ///
-    /// Absent altogether means the refusal happened outside an operation's run (an
-    /// authentication refusal, which the framework words), which reads as `false`.
-    static SERVED_MODELS_CLIENT_ERROR: bool;
+/// The operations that RESOLVE a cluster from a `ClusterId` of their own input shape and
+/// can answer [`INVALID_REQUEST_EXCEPTION`] for one they cannot use.
+///
+/// Amazon EMR resolves that cluster BEFORE it checks the request's other members: a
+/// recorded `ListSteps` carrying both a cluster id the service holds no cluster for and
+/// an undeclared step state is refused for the CLUSTER. The framework validates the whole
+/// input ahead of the handler, which would invert that order, so this table is what
+/// [`OperationScopedRefusal`] restores it with — see `cluster_first_response`.
+///
+/// Read off this crate's handlers: these are the operations whose handler resolves
+/// `input.cluster_id` against the cluster store. An operation still scaffolded resolves
+/// nothing, and the rest of the legacy job-flow and policy family declares no client
+/// error ([`NO_INVALID_REQUEST_EXCEPTION`]), so neither is here.
+///
+/// Sorted, which [`resolves_cluster_id`] relies on for `binary_search` and
+/// `the_operations_that_resolve_a_cluster_id_are_sorted` pins.
+const RESOLVES_CLUSTER_ID: &[&str] = &[
+    "AddInstanceFleet",
+    "CancelSteps",
+    "DescribeCluster",
+    "DescribeStep",
+    "GetClusterSessionCredentials",
+    "GetSession",
+    "ListInstanceFleets",
+    "ListInstanceGroups",
+    "ListSteps",
+    "ModifyCluster",
+];
+
+/// Whether `operation` resolves a cluster from a `ClusterId` of its own input shape.
+fn resolves_cluster_id(operation: &str) -> bool {
+    RESOLVES_CLUSTER_ID.binary_search(&operation).is_ok()
 }
 
-/// Whether the operation this task is serving declares [`INVALID_REQUEST_EXCEPTION`].
-fn served_models_client_error() -> bool {
-    SERVED_MODELS_CLIENT_ERROR
-        .try_with(|models| *models)
-        .unwrap_or(false)
+/// The `ClusterId` member as the wire spells it, which is how a request names it and how
+/// a validator member path spells it once lower-camelled.
+const CLUSTER_ID: &str = "ClusterId";
+
+/// The input member whose absence this service refuses as a cluster id it cannot
+/// resolve, as a validator member path spells it.
+const CLUSTER_ID_MEMBER: &str = "clusterId";
+
+/// The input member whose absence this service refuses as a release label it cannot
+/// resolve, as a validator member path spells it.
+const RELEASE_LABEL_MEMBER: &str = "releaseLabel";
+
+/// The legacy job-flow surface's refusal of a `ClusterId` it cannot use: that surface
+/// states one fixed sentence, so the value is no part of it.
+fn unusable_job_flow(_cluster_id: &str) -> InvalidRequestException {
+    crate::state::unknown_job_flow()
+}
+
+/// `GetClusterSessionCredentials`'s refusal of a `ClusterId` it cannot use: the
+/// cluster-id sentence with no id in it, so the value is no part of it either.
+fn unusable_cluster_without_id(_cluster_id: &str) -> InvalidRequestException {
+    crate::state::unknown_cluster_without_id()
+}
+
+/// How `operation` refuses a `ClusterId` it cannot use — one the request omitted, or one
+/// it holds no cluster under: the refusal of the SURFACE it reaches a cluster through.
+///
+/// Every operation reports it as a cluster id, quoting the value
+/// (`crate::state::unknown_cluster`), except the two that word that refusal otherwise and
+/// say so at their own call site: the legacy job-flow surface, which calls a cluster a
+/// job flow, and `GetClusterSessionCredentials`, which states the cluster-id sentence
+/// with no id in it. The rest of that surface declares no client error at all
+/// ([`NO_INVALID_REQUEST_EXCEPTION`]), so the generic validator answers there whatever
+/// the violation.
+fn cluster_id_refusal_of(operation: &str) -> fn(&str) -> InvalidRequestException {
+    match operation {
+        "AddInstanceFleet" => unusable_job_flow,
+        "GetClusterSessionCredentials" => unusable_cluster_without_id,
+        _ => crate::state::unknown_cluster,
+    }
+}
+
+/// The per-operation facts [`EmulatedService::override_refusal`] needs, which the
+/// framework hands it neither of: it is called with the refusal alone, with no request
+/// and no operation.
+#[derive(Debug, Clone, Copy)]
+struct ServedOperation {
+    /// Whether this operation's model declares [`INVALID_REQUEST_EXCEPTION`], and so
+    /// whether that is an identity it can answer.
+    models_client_error: bool,
+    /// Whether it resolves a cluster from a `ClusterId` of its own input shape.
+    resolves_cluster_id: bool,
+    /// How it refuses a `ClusterId` it cannot use.
+    cluster_id_refusal: fn(&str) -> InvalidRequestException,
+}
+
+impl ServedOperation {
+    /// The facts of `operation`, read off the per-operation tables above.
+    fn of(operation: &str) -> Self {
+        Self {
+            models_client_error: models_invalid_request_exception(operation),
+            resolves_cluster_id: resolves_cluster_id(operation),
+            cluster_id_refusal: cluster_id_refusal_of(operation),
+        }
+    }
+}
+
+/// What the framework refused about this request, left for [`OperationScopedRefusal`] by
+/// [`EmulatedService::override_refusal`] — which is handed the refusal alone, and can
+/// answer with a code and a sentence and nothing else.
+#[derive(Debug, Default)]
+struct FrameworkRefusal {
+    /// Whether the framework refused this request as invalid before any handler ran, so
+    /// no handler has checked anything about it yet.
+    refused: bool,
+    /// Whether one of the violations is on the `ClusterId` member itself, in which case
+    /// that member's own refusal is the one being answered.
+    on_cluster_id: bool,
+    /// The modelled client error chosen for it, when EMR's own refusal was chosen rather
+    /// than the generic validator's: `InvalidRequestException` carries its sentence in
+    /// `Message` BESIDE an `ErrorCode`, the discriminator a client branches on, so the
+    /// shape itself travels here and is serialized through the model's own schema.
+    chosen: Option<InvalidRequestException>,
+}
+
+tokio::task_local! {
+    /// The operation the current request is being served as, set by
+    /// [`OperationScopedRefusal::run`] around that operation's whole run and read back by
+    /// [`EmulatedService::override_refusal`].
+    ///
+    /// Absent altogether means the refusal happened outside an operation's run (an
+    /// authentication refusal, which the framework words), where no operation's facts
+    /// apply.
+    static SERVED_OPERATION: ServedOperation;
+
+    /// What the framework refused about this request, for the scope of that same run.
+    static FRAMEWORK_REFUSAL: RefCell<FrameworkRefusal>;
+}
+
+/// The facts of the operation this task is serving, if it is serving one.
+fn served_operation() -> Option<ServedOperation> {
+    SERVED_OPERATION.try_with(|served| *served).ok()
+}
+
+/// Leave what the framework refused for [`OperationScopedRefusal::run`] to answer with.
+/// Dropped when the refusal happened outside an operation's run, where there is no
+/// operation to answer for.
+fn remember_framework_refusal(refusal: FrameworkRefusal) {
+    let _ = FRAMEWORK_REFUSAL.try_with(|slot| *slot.borrow_mut() = refusal);
 }
 
 /// Serves a request as the operation the generated routing table names, with that
-/// operation's modelled-error fact ([`models_invalid_request_exception`]) in scope for
+/// operation's facts ([`ServedOperation`]) in scope for
 /// the whole run.
 ///
-/// It adds nothing else: the request, the service and the context are handed to the
-/// modelled operation unchanged, so deserialization, validation, the handler and the
-/// response are the framework's and the operation's own. The routing table holds only
-/// generated operations, so the inner lookup can never resolve back to this type.
-struct OperationScopedRefusal;
+/// It adds nothing else to the SERVED request: the request, the service and the context
+/// are handed to the modelled operation unchanged, so deserialization, validation, the
+/// handler and the response are the framework's and the operation's own. The routing
+/// table holds only generated operations, so the inner lookup can never resolve back to
+/// this type.
+///
+/// A request the framework REFUSES before any handler ran is answered here, because the
+/// refusal hook cannot answer it alone:
+///
+/// - `InvalidRequestException` carries its sentence in `Message` BESIDE an `ErrorCode`,
+///   and [`Refused`] has no member for the second, so the chosen shape travels through
+///   [`FRAMEWORK_REFUSAL`] and is serialized here through the model's own schema;
+/// - Amazon EMR resolves the cluster a cluster-scoped request names BEFORE it checks the
+///   request's other members, while the framework checks every member before the handler
+///   runs — so the cluster-id refusal the handler would have answered takes precedence
+///   here over the one the validator raised.
+///
+/// Both need the request and this service's store, which the refusal hook is handed
+/// neither of, so the engine is held here.
+struct OperationScopedRefusal<Eng> {
+    engine: Arc<Eng>,
+}
 
-impl ErasedOperation for OperationScopedRefusal {
+impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedRefusal<Eng> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -181,14 +351,129 @@ impl ErasedOperation for OperationScopedRefusal {
             let Some((operation, op)) = routed else {
                 return svc.definition().routing_error_response(req);
             };
-            SERVED_MODELS_CLIENT_ERROR
+            let served = ServedOperation::of(operation);
+            let (response, refused) = SERVED_OPERATION
                 .scope(
-                    models_invalid_request_exception(operation),
-                    op.run(svc, req, ctx),
+                    served,
+                    FRAMEWORK_REFUSAL.scope(RefCell::new(FrameworkRefusal::default()), async {
+                        let response = op.run(svc, req, ctx).await;
+                        let refused = FRAMEWORK_REFUSAL.with(|slot| slot.take());
+                        (response, refused)
+                    }),
                 )
-                .await
+                .await;
+            if !refused.refused {
+                // The operation itself answered, in its own order: nothing to reword.
+                return response;
+            }
+            // The cluster the request names is resolved first — unless the refusal is
+            // about the `ClusterId` member itself, which is then the member being
+            // answered for.
+            if !refused.on_cluster_id {
+                if let Some(first) = self.cluster_first_response(served, svc, req) {
+                    return first;
+                }
+            }
+            // The framework rendered the chosen code and sentence already; what it
+            // cannot render is the modelled shape's OTHER member. Re-serializing is
+            // therefore an improvement on an answer that is already correct in code,
+            // status and prose, so a protocol that cannot carry the shape keeps it.
+            match refused.chosen {
+                Some(refusal) => modelled_refusal_response(svc, req, refusal).unwrap_or(response),
+                None => response,
+            }
         })
     }
+}
+
+impl<Eng: Send + Sync + 'static> OperationScopedRefusal<Eng> {
+    /// The refusal the served operation would have answered for the `ClusterId` the
+    /// request carries, when that id is one it cannot use. `None` when the operation
+    /// resolves no cluster id, when the request carries none — the absent member is its
+    /// own refusal — or when the id names a cluster this service holds.
+    ///
+    /// A value outside the class an identifier is drawn from is the request-validation
+    /// envelope's, exactly as the handler answers it; an id of that class the store has
+    /// no record under is the service's own.
+    fn cluster_first_response(
+        &self,
+        served: ServedOperation,
+        svc: &dyn Service,
+        req: &aws_smithy_runtime_api::http::Request,
+    ) -> Option<aws_smithy_runtime_api::http::Response> {
+        if !served.resolves_cluster_id {
+            return None;
+        }
+        let cluster_id = request_member(req, CLUSTER_ID)?;
+        if !crate::state::is_cluster_id_shaped(&cluster_id) {
+            return validation_refusal_response(
+                svc,
+                req,
+                crate::state::malformed_cluster_id_message(&cluster_id),
+            );
+        }
+        let state = crate::state::service_state(&*self.engine)?;
+        // A read of the key alone: resolving a cluster id is not a report of the cluster,
+        // so nothing the clock owes is materialised here — the handler the request
+        // reaches does that for the cluster it serves.
+        if state.lock().clusters.contains_key(&cluster_id) {
+            return None;
+        }
+        modelled_refusal_response(svc, req, (served.cluster_id_refusal)(&cluster_id))
+    }
+}
+
+/// The string `member` of `req`'s body, as the request spelled it, or `None` when the
+/// body carries no such member, carries it as something other than a string, or is not
+/// readable as this service's one protocol
+/// (`smithy_query(query="service_info")`: awsJson1_1).
+fn request_member(req: &aws_smithy_runtime_api::http::Request, member: &str) -> Option<String> {
+    let body = req.body().bytes()?;
+    ::serde_json::from_slice::<::serde_json::Value>(body)
+        .ok()?
+        .get(member)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// `refusal` as this service answers it: the modelled client error, serialized through
+/// the model's own schema in the envelope of the protocol `req` is served in — the same
+/// path a handler-raised `InvalidRequestException` takes.
+fn modelled_refusal_response(
+    svc: &dyn Service,
+    req: &aws_smithy_runtime_api::http::Request,
+    refusal: InvalidRequestException,
+) -> Option<aws_smithy_runtime_api::http::Response> {
+    svc.definition()
+        .wire_protocol(req)
+        .protocol()
+        .serialize_error(
+            &refusal,
+            &crate::ops::types::SCHEMA_INVALID_REQUEST_EXCEPTION,
+            INVALID_REQUEST_EXCEPTION,
+            REFUSED_STATUS,
+        )
+        .ok()
+}
+
+/// `message` as the request-validation envelope answers it, in the envelope of the
+/// protocol `req` is served in — the same path a handler refusing a request through
+/// [`crate::scaffolded::Scaffolded::validation`] takes.
+fn validation_refusal_response(
+    svc: &dyn Service,
+    req: &aws_smithy_runtime_api::http::Request,
+    message: String,
+) -> Option<aws_smithy_runtime_api::http::Response> {
+    svc.definition()
+        .wire_protocol(req)
+        .protocol()
+        .serialize_error(
+            &crate::scaffolded::ValidationException::new(message),
+            &crate::scaffolded::VALIDATION_EXCEPTION_SCHEMA,
+            VALIDATION_EXCEPTION,
+            REFUSED_STATUS,
+        )
+        .ok()
 }
 
 /// The member of `com.amazonaws.emr#ScalingTrigger` that carries the CloudWatch
@@ -312,6 +597,67 @@ fn cloud_watch_alarm_message(violations: &[Violation]) -> Option<String> {
         })
 }
 
+/// The prefix of the discriminator Amazon EMR answers rejected values of one input
+/// member with: the code names that member, so a client branching on it learns WHICH
+/// filter it has to fix. Recorded for the cluster-states filter.
+const INVALID_VALUES_CODE: &str = "Invalid";
+
+/// The first member of the operation's own input shape that the request did not carry,
+/// if any. A member absent from a NESTED request structure is the generic validator's:
+/// nothing has told EMR's own business logic about the request yet, exactly as for an
+/// enum carried that deep.
+fn absent_input_member(violations: &[Violation]) -> Option<&str> {
+    violations.iter().find_map(|violation| {
+        if !matches!(violation.kind, ViolationKind::MissingRequiredMember) {
+            return None;
+        }
+        match structure_steps(&violation.path).as_slice() {
+            [member] => Some(*member),
+            _ => None,
+        }
+    })
+}
+
+/// The refusal for an input member the request did not carry: the refusal that member's
+/// own value class carries on the surface the served operation reaches it through,
+/// stated by the SAME sentence a value it cannot use gets, with
+/// [`crate::state::ABSENT_VALUE`] in the value's place.
+///
+/// The members a `@required` member can be omitted on at all are the ones the model
+/// marks `clientOptional` (`smithy_query(query="operation", operation="DescribeCluster")`
+/// shows `ClusterId` as both), which is why the service — not the request validator —
+/// answers for them. A member this service publishes no refusal class for is left to the
+/// generic validator, whose envelope names it.
+fn absent_member_refusal(
+    served: ServedOperation,
+    violations: &[Violation],
+) -> Option<InvalidRequestException> {
+    match absent_input_member(violations)? {
+        CLUSTER_ID_MEMBER => Some((served.cluster_id_refusal)(crate::state::ABSENT_VALUE)),
+        RELEASE_LABEL_MEMBER => Some(crate::state::invalid_release_label(
+            crate::state::ABSENT_VALUE,
+        )),
+        _ => None,
+    }
+}
+
+/// The refusal for values outside a modelled enum on the operation's own input shape:
+/// the discriminator names the member whose values were rejected, in the casing the
+/// model spells it ([`INVALID_VALUES_CODE`]), beside the sentence that enumerates them.
+fn rejected_enum_values_refusal(violations: &[Violation]) -> Option<InvalidRequestException> {
+    let on_input_member = input_member_enum_violations(violations);
+    let first = on_input_member.first()?;
+    let member = first.path.split('.').next()?;
+    let message = match rejected_values_message(&on_input_member) {
+        Some(sentence) => sentence,
+        None => aws_smithy_schema_server::envelope(violations)?,
+    };
+    Some(InvalidRequestException {
+        error_code: Some(format!("{INVALID_VALUES_CODE}{}", opening(member))),
+        message: Some(message),
+    })
+}
+
 /// The `com-amazonaws-emr-elasticmapreduce` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -320,8 +666,9 @@ fn cloud_watch_alarm_message(violations: &[Violation]) -> Option<String> {
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// Borrowed by `override_operation` so the operation being served is in scope on the
-    /// refusal path. Holds nothing: it reaches the real operation through `svc`.
-    refusal_scope: OperationScopedRefusal,
+    /// refusal path, and so a refusal that depends on this service's own state can be
+    /// answered there. It reaches the real operation through `svc`.
+    refusal_scope: OperationScopedRefusal<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -330,8 +677,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
-            refusal_scope: OperationScopedRefusal,
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            refusal_scope: OperationScopedRefusal { engine },
         }
     }
 }
@@ -359,7 +706,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
         // Serve the operation the generated routing table names, through the scope
-        // that carries its modelled-error fact into `override_refusal`. The routing
+        // that carries its own facts into `override_refusal`. The routing
         // decision itself is NOT overridden: the key is resolved by the model's own
         // protocol, and a request the table cannot serve is declined here so the
         // framework's routing-error path stays exactly as it was.
@@ -373,42 +720,50 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this
         // service reword it.
         //
-        // Amazon EMR validates the ENUM-valued members of an operation's own input
-        // shape itself, ahead of the generic request validator, and refuses a value
-        // outside such an enum's value set with its own modelled client-input error
+        // Amazon EMR checks two classes of its own input itself, ahead of the generic
+        // request validator, and refuses both with its own modelled client-input error
         // `InvalidRequestException` ("This exception occurs when there is something
         // wrong with user input", HTTP 400) — the identity an SDK client branching
         // on `emr.exceptions.InvalidRequestException` catches. The framework's
         // default code here, the synthetic `smithy.framework#ValidationException`,
         // is an identity no EMR operation declares, so such a client would see only
-        // a generic `ClientError`.
+        // a generic `ClientError`:
         //
-        // That check reaches the members of the input shape, including the elements
-        // of its collections (`clusterStates.1.member`) — and only those. An enum
-        // carried deeper, inside a nested request structure, is reached by the
-        // GENERIC request validator instead and keeps its `ValidationException`:
-        // nothing has told EMR's own business logic about the request yet.
-        // `structure_steps` is that distinction.
+        // - a value outside the value set of an ENUM-valued member of the operation's
+        //   own input shape, including the elements of its collections
+        //   (`clusterStates.1.member`);
+        // - an input member the request did not carry AT ALL, for a member whose
+        //   refusal class EMR publishes a code for: the model marks those members
+        //   `clientOptional` beside `@required`, so a client omits them and the
+        //   SERVICE, not the request validator, answers.
+        //
+        // Both reach the members of the input shape, and only those. A value carried
+        // deeper, inside a nested request structure, is reached by the GENERIC request
+        // validator instead and keeps its `ValidationException`: nothing has told EMR's
+        // own business logic about the request yet. `structure_steps` is that
+        // distinction.
         //
         // And the identity is the SERVED OPERATION's to declare: the legacy job-flow
         // and policy families name no client error at all, so there the generic
-        // identity stands too, whatever the violation. `served_models_client_error`
+        // identity stands too, whatever the violation. `ServedOperation`
         // reads that fact off the operation the request routed to.
         //
-        // Every OTHER modelled constraint — a `@length`, a `@range`, a required
-        // member absent — is likewise left to the generic validator's
-        // `ValidationException`, which is what EMR is recorded answering for one
-        // (`RunJobFlow`'s `ManagedScalingPolicy` bounds, and the refusals its own
-        // handler raises). A request violating both classes at once is refused as
-        // the enum class, because that is the check EMR runs first.
+        // Every OTHER modelled constraint — a `@length`, a `@range` — is likewise left
+        // to the generic validator's `ValidationException`, which is what EMR is
+        // recorded answering for one (`RunJobFlow`'s `ManagedScalingPolicy` bounds, and
+        // the refusals its own handler raises). A request violating both classes at
+        // once is refused as EMR's own, because that is the check it runs first.
         //
-        // The MESSAGE is chosen separately from the code, because EMR words some of
-        // these refusals itself:
+        // The MESSAGE is chosen separately from the code, because EMR words these
+        // refusals itself:
         //
         // - rejected values that are elements of ONE collection-valued filter member
         //   are enumerated, in the order the request spelled them: that sentence is
         //   the only part of the refusal telling a caller WHICH of several submitted
         //   values was rejected;
+        // - an absent member is stated by the sentence an unusable value of it gets, in
+        //   EITHER envelope — an operation that cannot answer EMR's own error still
+        //   answers EMR's sentence, under the generic code;
         // - an undeclared value of a CloudWatch metric alarm's enum member is stated
         //   in EMR's own prose for that member, under the generic code, because EMR
         //   validates that alarm itself;
@@ -421,20 +776,49 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
-        let on_input_member = input_member_enum_violations(violations);
-        if on_input_member.is_empty() || !served_models_client_error() {
+        let Some(served) = served_operation() else {
+            // No operation is being served, so no operation's facts apply.
             return Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),
                 message: cloud_watch_alarm_message(violations)?,
             });
-        }
-        let message = match rejected_values_message(&on_input_member) {
-            Some(sentence) => sentence,
-            None => aws_smithy_schema_server::envelope(violations)?,
         };
+        // The sentence for an input member the request did not carry is that member's
+        // class's in EITHER envelope: an operation that declares no client error still
+        // answers it, under the generic code — which is what EMR is recorded answering
+        // for `GetManagedScalingPolicy` called with no `ClusterId`.
+        let absent = absent_member_refusal(served, violations);
+        let chosen = served
+            .models_client_error
+            .then(|| {
+                absent
+                    .clone()
+                    .or_else(|| rejected_enum_values_refusal(violations))
+            })
+            .flatten();
+        // What was refused travels to `OperationScopedRefusal::run`, which answers it:
+        // this hook can name a code and a sentence and nothing else, while EMR's own
+        // error carries an `ErrorCode` beside its `Message`, and the cluster a
+        // cluster-scoped request names is resolved ahead of its other members.
+        remember_framework_refusal(FrameworkRefusal {
+            refused: true,
+            on_cluster_id: violations
+                .iter()
+                .any(|violation| structure_steps(&violation.path) == [CLUSTER_ID_MEMBER]),
+            chosen: chosen.clone(),
+        });
+        if let Some(chosen) = chosen {
+            return Some(Refused {
+                code: INVALID_REQUEST_EXCEPTION.to_string(),
+                message: chosen.message.unwrap_or_default(),
+            });
+        }
         Some(Refused {
-            code: INVALID_REQUEST_EXCEPTION.to_string(),
-            message,
+            code: VALIDATION_EXCEPTION.to_string(),
+            message: match absent {
+                Some(absent) => absent.message.unwrap_or_default(),
+                None => cloud_watch_alarm_message(violations)?,
+            },
         })
     }
 
@@ -470,9 +854,72 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 #[cfg(test)]
 mod tests {
     use super::{
-        member_words, models_invalid_request_exception, structure_steps,
-        NO_INVALID_REQUEST_EXCEPTION,
+        member_words, models_invalid_request_exception, structure_steps, ServedOperation,
+        NO_INVALID_REQUEST_EXCEPTION, RESOLVES_CLUSTER_ID,
     };
+
+    /// Each operation words a `ClusterId` it cannot use through the surface it reaches a
+    /// cluster by: the cluster surface quotes the id, the legacy job-flow surface names a
+    /// job flow, and the session-credentials read states the cluster-id sentence with no
+    /// id in it. Rows span all three.
+    #[test]
+    fn an_absent_cluster_id_is_refused_by_its_operations_surface() {
+        let cases = [
+            ("DescribeCluster", "MalformedClusterId", "Cluster id 'null' is not valid."),
+            ("ListSteps", "MalformedClusterId", "Cluster id 'null' is not valid."),
+            ("GetSession", "MalformedClusterId", "Cluster id 'null' is not valid."),
+            (
+                "AddInstanceFleet",
+                "INVALID_JOB_ID_MALFORMED",
+                "Specified job flow ID not valid.",
+            ),
+            (
+                "GetClusterSessionCredentials",
+                "MalformedClusterId",
+                "Cluster id is not valid.",
+            ),
+        ];
+        for (operation, code, sentence) in cases {
+            let refusal = (ServedOperation::of(operation).cluster_id_refusal)(
+                crate::state::ABSENT_VALUE,
+            );
+            assert_eq!(
+                refusal.error_code.as_deref(),
+                Some(code),
+                "case {operation:?}: expected ErrorCode {code:?}, got {:?}",
+                refusal.error_code
+            );
+            assert_eq!(
+                refusal.message.as_deref(),
+                Some(sentence),
+                "case {operation:?}: expected {sentence:?}, got {:?}",
+                refusal.message
+            );
+        }
+    }
+
+    /// The table is searched with `binary_search`, so it must be sorted and hold no
+    /// duplicate.
+    #[test]
+    fn the_operations_that_resolve_a_cluster_id_are_sorted() {
+        assert!(
+            RESOLVES_CLUSTER_ID.windows(2).all(|pair| pair[0] < pair[1]),
+            "case {RESOLVES_CLUSTER_ID:?}: the table must be sorted and hold no duplicate"
+        );
+    }
+
+    /// Every operation that resolves a cluster id can answer EMR's own client error, so
+    /// the refusal it would answer is one the operation declares.
+    #[test]
+    fn every_operation_that_resolves_a_cluster_id_models_the_client_error() {
+        for operation in RESOLVES_CLUSTER_ID {
+            assert!(
+                models_invalid_request_exception(operation),
+                "case {operation:?}: an operation that answers the cluster-id refusal must \
+                 declare the client error it arrives in"
+            );
+        }
+    }
 
     /// The table is searched with `binary_search`, so it must be sorted and hold no
     /// duplicate.

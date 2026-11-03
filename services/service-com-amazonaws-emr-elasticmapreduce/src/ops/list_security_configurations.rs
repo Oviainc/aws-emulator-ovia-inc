@@ -180,7 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(marker) => match held.iter().position(|record| record.name == *marker) {
                 Some(at) => at,
                 None => {
-                    return Err(invalid_request(format!("Marker '{marker}' is not valid.")));
+                    return Err(ListSecurityConfigurationsErrorModeled::InvalidRequestException(
+                        crate::state::malformed_marker(marker),
+                    )
+                    .into());
                 }
             },
             None => 0,
@@ -200,13 +203,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             marker,
         })
     }
-}
-
-/// Refuse the request with this operation's modeled client error (HTTP 400).
-fn invalid_request(message: String) -> ListSecurityConfigurationsError {
-    ListSecurityConfigurationsErrorModeled::InvalidRequestException(InvalidRequestException {
-        error_code: None,
-        message: Some(message),
-    })
-    .into()
 }

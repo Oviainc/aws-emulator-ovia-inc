@@ -3,15 +3,18 @@
 //! EMR refuses a value outside a modelled CONSTRAINT with the error identity it models.
 //!
 //! The rule under test: every modelled constraint class other than an enum — a
-//! `@length`, a `@range`, a required member absent — is refused by the generic request
-//! validator with its `ValidationException` and its member-path envelope, which is what
-//! EMR is recorded answering for one, and a value the model DOES admit is not refused at
-//! the boundary at all but reaches the handler.
+//! `@length`, a `@range` — is refused by the generic request validator with its
+//! `ValidationException` and its member-path envelope, which is what EMR is recorded
+//! answering for one, and a value the model DOES admit is not refused at the boundary at
+//! all but reaches the handler.
 //!
 //! The enum class is the other half of that rule, and it is not here: which layer
 //! refuses an out-of-enum value, the code it answers and the sentence it states are
 //! asserted by `tests/all/enum_refusal_identity.rs`, which owns those rows so the two
-//! suites do not hold two copies of one table.
+//! suites do not hold two copies of one table. An input member the request omits
+//! altogether is EMR's own refusal where EMR publishes a code for that member's class,
+//! which `tests/all/cluster_id_refusal_code.rs` owns; the row below keeps the other
+//! half, a member it publishes none for.
 //!
 //! Every case drives the real HTTP path — `POST /` with
 //! `X-Amz-Target: ElasticMapReduce.<Op>` and an `awsJson1_1` body — through the
@@ -207,13 +210,8 @@ fn cases() -> Vec<Case> {
                 "ClusterId": over_long_cluster_id,
             }),
         ),
-        // A required member absent is the generic validator's too.
-        refused_generic(
-            "DescribeCluster with no ClusterId at all",
-            "DescribeCluster",
-            "clusterId",
-            json!({}),
-        ),
+        // A required member absent, on a member whose refusal class Amazon EMR
+        // publishes no code for, is the generic validator's too.
         refused_generic(
             "AddTags with no Tags at all",
             "AddTags",

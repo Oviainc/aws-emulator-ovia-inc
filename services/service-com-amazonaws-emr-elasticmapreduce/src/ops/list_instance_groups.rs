@@ -143,6 +143,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
+        // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — the request-validation
+        // envelope, HTTP 400, naming the member — rather than looked up.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListInstanceGroupsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -175,10 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(at) => at,
                     None => {
                         return Err(ListInstanceGroupsErrorModeled::InvalidRequestException(
-                            InvalidRequestException {
-                                error_code: None,
-                                message: Some(format!("Marker '{marker}' is not valid.")),
-                            },
+                            crate::state::malformed_marker(marker),
                         )
                         .into())
                     }

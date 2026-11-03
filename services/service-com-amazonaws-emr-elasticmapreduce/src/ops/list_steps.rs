@@ -155,21 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
-        // "You can specify a maximum of 10 stepIDs." (ListSteps doc.)
-        if let Some(ids) = input.step_ids.as_ref() {
-            if ids.len() > LIST_STEPS_MAX_STEP_IDS {
-                return Err(ListStepsErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        error_code: None,
-                        message: Some(format!(
-                            "StepIds carries {} ids; a maximum of {LIST_STEPS_MAX_STEP_IDS} \
-                             stepIDs may be specified.",
-                            ids.len()
-                        )),
-                    },
-                )
-                .into());
-            }
+        // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — the request-validation
+        // envelope, HTTP 400, naming the member — rather than looked up.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -186,6 +179,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The cluster is resolved FIRST and the request's other members are checked
+        // against the resolved cluster, which is the order Amazon EMR answers a request
+        // that gets both wrong in.
+        //
+        // "You can specify a maximum of 10 stepIDs." (ListSteps doc.)
+        if let Some(ids) = input.step_ids.as_ref() {
+            if ids.len() > LIST_STEPS_MAX_STEP_IDS {
+                return Err(ListStepsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        error_code: None,
+                        message: Some(format!(
+                            "StepIds carries {} ids; a maximum of {LIST_STEPS_MAX_STEP_IDS} \
+                             stepIDs may be specified.",
+                            ids.len()
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
 
         // "Provides a list of steps for the cluster in reverse order" (ListSteps doc):
         // the records are held in submission order, so the newest is reported first.
@@ -214,10 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(at) => at,
                 None => {
                     return Err(ListStepsErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            error_code: None,
-                            message: Some(format!("Marker '{marker}' is not valid.")),
-                        },
+                        crate::state::malformed_marker(marker),
                     )
                     .into())
                 }

@@ -219,12 +219,11 @@ async fn every_unresolvable_cluster_id_is_refused_with_its_surfaces_code() {
 }
 
 /// THE OTHER HALF of the rule: on the SAME operations, a refusal that is not about an
-/// unresolvable cluster id carries no discriminator at all. Rows span the other classes
-/// these operations answer — a step id the cluster carries none of, a marker naming no
-/// held row, a member outside its documented range, a session the cluster has none of, a
-/// tag the service will not hold, and a fleet add to a cluster built from instance
-/// groups — so `MalformedClusterId` and `INVALID_JOB_ID_MALFORMED` each mean exactly one
-/// thing.
+/// unresolvable cluster id, and whose class Amazon EMR publishes no code for, carries no
+/// discriminator at all. Rows span those classes — a step id the cluster carries none of,
+/// a member outside its documented range, a session the cluster has none of, a tag the
+/// service will not hold, and a fleet add to a cluster built from instance groups — so
+/// `MalformedClusterId` and `INVALID_JOB_ID_MALFORMED` each mean exactly one thing.
 #[tokio::test]
 async fn a_refusal_of_another_class_on_the_same_operations_carries_no_code() {
     let emr = Emr::new();
@@ -235,16 +234,6 @@ async fn a_refusal_of_another_class_on_the_same_operations_carries_no_code() {
             "a step id the cluster carries none of",
             "DescribeStep",
             json!({ "ClusterId": &live, "StepId": "s-ZZZZZZZZZZZZZ" }),
-        ),
-        (
-            "a marker naming no held step",
-            "ListSteps",
-            json!({ "ClusterId": &live, "Marker": "no-such-marker" }),
-        ),
-        (
-            "a marker naming no held instance group",
-            "ListInstanceGroups",
-            json!({ "ClusterId": &live, "Marker": "no-such-marker" }),
         ),
         (
             "a step concurrency level outside its documented range",

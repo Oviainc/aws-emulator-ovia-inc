@@ -171,6 +171,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
+        // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — naming the member the caller
+        // has to fix — rather than looked up. The member is optional here, so there is
+        // nothing to check when the request omits it.
+        if let Some(cluster_id) = input
+            .cluster_id
+            .as_deref()
+            .filter(|cluster_id| !cluster_id.is_empty())
+        {
+            if !crate::state::is_cluster_id_shaped(cluster_id) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::malformed_cluster_id_message(cluster_id),
+                ));
+            }
+        }
+
         let modifications = input.instance_groups.unwrap_or_default();
         // "Instance groups to change" (`ModifyInstanceGroups$InstanceGroups` doc): a
         // request that names none changes nothing, and nothing is what it is answered

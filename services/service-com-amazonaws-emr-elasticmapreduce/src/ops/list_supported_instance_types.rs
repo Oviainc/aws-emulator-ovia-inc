@@ -159,20 +159,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The release must be one the service's release catalog offers — the same
         // catalog `DescribeReleaseLabel` reads: the instance types a release supports
         // are a fact ABOUT that release, so a malformed label or one naming no
-        // catalogued release is a bad request rather than an empty list.
+        // catalogued release is a bad request rather than an empty list. Amazon EMR's
+        // own sentence and discriminator for that class live in one place
+        // (`crate::state::invalid_release_label`); `DescribeReleaseLabel` words the same
+        // class differently and echoes nothing, so neither sentence is shared.
         let Some(release) = crate::state::catalog_release(&input.release_label) else {
             return Err(ListSupportedInstanceTypesErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    error_code: None,
-                    // Amazon EMR's own sentence for this class on THIS operation, which
-                    // names the label the request sent. `DescribeReleaseLabel` words the
-                    // same class differently and echoes nothing, so neither sentence is
-                    // shared.
-                    message: Some(format!(
-                        "The supplied release label is invalid: {}.",
-                        input.release_label
-                    )),
-                },
+                crate::state::invalid_release_label(&input.release_label),
             )
             .into());
         };
@@ -189,10 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(at) => at,
                 None => {
                     return Err(ListSupportedInstanceTypesErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            error_code: None,
-                            message: Some(format!("Marker '{marker}' is not valid.")),
-                        },
+                        crate::state::malformed_marker(marker),
                     )
                     .into())
                 }

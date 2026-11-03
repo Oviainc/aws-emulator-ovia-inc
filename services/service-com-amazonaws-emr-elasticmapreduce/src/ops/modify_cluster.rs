@@ -147,6 +147,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
+        // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — the request-validation
+        // envelope, HTTP 400, naming the member — rather than looked up.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ModifyClusterErrorModeled::InternalServerError(InternalServerError {}).into(),
+            );
+        };
+        let mut store = state.lock();
+
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(ModifyClusterErrorModeled::InvalidRequestException(
+                crate::state::unknown_cluster(&input.cluster_id),
+            )
+            .into());
+        };
+
+        // The cluster is resolved FIRST and the request's other members are checked
+        // against the resolved cluster, which is the order Amazon EMR answers a request
+        // that gets both wrong in.
+        //
         // "The number of steps that can be executed concurrently. You can specify a
         // minimum of 1 step and a maximum of 256 steps."
         // (`ModifyCluster$StepConcurrencyLevel` doc.) The model types the member as a
@@ -165,20 +193,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(
-                ModifyClusterErrorModeled::InternalServerError(InternalServerError {}).into(),
-            );
-        };
-        let mut store = state.lock();
-
-        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
-            return Err(ModifyClusterErrorModeled::InvalidRequestException(
-                crate::state::unknown_cluster(&input.cluster_id),
-            )
-            .into());
-        };
 
         // A member the request omits is not a change: the cluster keeps the value it
         // holds, and the response reports what it now carries either way.

@@ -35,6 +35,8 @@ mod instance_store_catalog;
 mod job_flow_lifecycle;
 #[path = "all/job_flow_role.rs"]
 mod job_flow_role;
+#[path = "all/malformed_input_refusals.rs"]
+mod malformed_input_refusals;
 #[path = "all/managed_scaling_policy.rs"]
 mod managed_scaling_policy;
 #[path = "all/modify_instance_groups.rs"]

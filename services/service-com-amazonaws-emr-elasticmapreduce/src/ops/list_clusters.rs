@@ -196,10 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(at) => at,
                 None => {
                     return Err(ListClustersErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            error_code: None,
-                            message: Some(format!("Marker '{marker}' is not valid.")),
-                        },
+                        crate::state::malformed_marker(marker),
                     )
                     .into())
                 }

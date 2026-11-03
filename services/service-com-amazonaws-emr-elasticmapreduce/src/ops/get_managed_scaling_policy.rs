@@ -140,6 +140,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
+        // The SHAPE of the cluster id is settled BEFORE any cluster is resolved: a value
+        // carrying characters no cluster id is drawn from names no cluster the service
+        // could hold, so it is refused as a bad REQUEST — naming the member the caller
+        // has to fix — rather than looked up. This operation models no client error, so
+        // both refusals travel the 400 `ValidationException` channel and the SENTENCE is
+        // what tells them apart.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetManagedScalingPolicyErrorModeled::InternalServerException(
                 InternalServerException {

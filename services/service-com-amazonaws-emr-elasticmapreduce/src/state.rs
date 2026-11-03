@@ -230,7 +230,24 @@ pub mod error_code {
     /// exception shape, one status, but its own discriminator — so a client branching on
     /// the code learns which surface refused it.
     pub const INVALID_JOB_ID_MALFORMED: &str = "INVALID_JOB_ID_MALFORMED";
+
+    /// The code for a `Marker` a listing did not mint — the continuation token class
+    /// ([`super::malformed_marker_message`]). It is what lets a paginating client tell a
+    /// stale or tampered page token from any other refusal of the same listing, instead
+    /// of retrying the token that cannot work.
+    pub const MALFORMED_MARKER: &str = "MalformedMarker";
+
+    /// The code for a `ReleaseLabel` that names no release of the service's catalog
+    /// ([`super::invalid_release_label_message`]).
+    pub const INVALID_RELEASE_LABEL: &str = "INVALID_RELEASE_LABEL";
 }
+
+/// How a sentence that quotes an input member's value renders a value the request did
+/// NOT carry: the member was absent, and the slot the value fills says so.
+///
+/// Recorded behavior: a cluster-id refusal of a request that omitted the member states
+/// the same sentence an unusable id gets, with this in the id's place.
+pub const ABSENT_VALUE: &str = "null";
 
 /// The refusal for a request that names a resource this service holds none of: the
 /// absent-resource discriminator ([`error_code::RESOURCE_NOT_FOUND`]) beside the
@@ -304,6 +321,82 @@ pub fn unknown_cluster(cluster_id: &str) -> InvalidRequestException {
     InvalidRequestException {
         error_code: Some(error_code::MALFORMED_CLUSTER_ID.to_string()),
         message: Some(unknown_cluster_message(cluster_id)),
+    }
+}
+
+/// The characters a cluster id is drawn from, beside ASCII letters and digits.
+///
+/// Amazon EMR mints a cluster id as [`CLUSTER_ID_PREFIX`] and a body of letters and
+/// digits, so the hyphen and the underscore are the only non-alphanumerics one can
+/// carry. `ClusterId` is constrained by length alone (`len 0..256`, no `@pattern`:
+/// `smithy_query(query="shape", shape="ClusterId")`), so the boundary validator passes
+/// anything that fits and this class is what the service itself then enforces
+/// ([`is_cluster_id_shaped`]) — the same division the session surface follows
+/// ([`is_session_id_shaped`]).
+const CLUSTER_ID_PUNCTUATION: [char; 2] = ['-', '_'];
+
+/// Whether `cluster_id` could be a cluster id at all: every character is an ASCII letter
+/// or digit, or one of [`CLUSTER_ID_PUNCTUATION`].
+///
+/// A value carrying anything else — an ARN's colons and slashes, a URL, a path, a space
+/// — names no cluster Amazon EMR could ever have minted, so it is refused on its SHAPE
+/// rather than looked up (see [`malformed_cluster_id_message`]).
+pub fn is_cluster_id_shaped(cluster_id: &str) -> bool {
+    cluster_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || CLUSTER_ID_PUNCTUATION.contains(&c))
+}
+
+/// How a cluster-scoped operation refuses a `ClusterId` that is not a cluster id at all.
+///
+/// Recorded behavior for the text: Amazon EMR states the MEMBER the value came in on,
+/// named in the casing the wire uses for it, then the value exactly as the request sent
+/// it, then that it is not valid — the same form the session surface states a malformed
+/// session id in ([`malformed_session_id_message`]). This is the request-validation
+/// refusal, which is why it names the member rather than the resource: nothing has been
+/// looked up.
+pub fn malformed_cluster_id_message(cluster_id: &str) -> String {
+    format!("clusterId {}", not_valid_message(cluster_id))
+}
+
+/// How every listing refuses a `Marker` it did not mint: the member, the value the
+/// request sent and that it is not valid.
+///
+/// Recorded behavior for the text, shared by every `Marker`-paged listing of this
+/// service — one template in one place, so two listings cannot come to word the same
+/// refusal differently.
+pub fn malformed_marker_message(marker: &str) -> String {
+    format!("Marker {}", not_valid_message(marker))
+}
+
+/// The refusal a listing answers a `Marker` it did not mint with: that sentence under
+/// the continuation-token discriminator ([`error_code::MALFORMED_MARKER`]).
+///
+/// The code is paired with the wording HERE, in the one place the wording is built, so
+/// no listing can answer the marker sentence without the marker code.
+pub fn malformed_marker(marker: &str) -> InvalidRequestException {
+    InvalidRequestException {
+        error_code: Some(error_code::MALFORMED_MARKER.to_string()),
+        message: Some(malformed_marker_message(marker)),
+    }
+}
+
+/// How an operation that answers a fact ABOUT a release refuses a `ReleaseLabel` that
+/// names none of the catalog's releases.
+///
+/// Recorded behavior for the text: Amazon EMR states that the supplied label is invalid
+/// and echoes the label the request sent, with [`ABSENT_VALUE`] in its place when the
+/// request carried no label at all.
+pub fn invalid_release_label_message(release_label: &str) -> String {
+    format!("The supplied release label is invalid: {release_label}.")
+}
+
+/// The refusal an operation answers an unusable `ReleaseLabel` with: that sentence under
+/// the release-label discriminator ([`error_code::INVALID_RELEASE_LABEL`]).
+pub fn invalid_release_label(release_label: &str) -> InvalidRequestException {
+    InvalidRequestException {
+        error_code: Some(error_code::INVALID_RELEASE_LABEL.to_string()),
+        message: Some(invalid_release_label_message(release_label)),
     }
 }
 

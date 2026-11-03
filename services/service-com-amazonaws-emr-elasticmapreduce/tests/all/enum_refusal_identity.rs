@@ -31,7 +31,7 @@
 use serde_json::{json, Value};
 
 use crate::input_refusals::error_message;
-use crate::job_flow_lifecycle::{at, Emr};
+use crate::job_flow_lifecycle::{at, kept_alive_request, Emr};
 
 /// The client-input error EMR's own model declares, which its own enum check answers on
 /// an operation that declares it (`smithy_query(query="operation",
@@ -189,8 +189,10 @@ fn good_rule(name: &str) -> Value {
     scaling_rule(name, COMPARISON_OPERATORS[1], "AVERAGE", "CHANGE_IN_CAPACITY")
 }
 
-fn refused_cases() -> Vec<Case> {
-    let cluster = "j-ABCDEFGHIJKLM";
+/// Every row names a cluster that EXISTS, because a cluster-scoped request's cluster is
+/// resolved BEFORE its other members are checked: an unresolvable id would be the
+/// refusal, and these rows are about the enum value.
+fn refused_cases(cluster: &str) -> Vec<Case> {
     let group = "ig-ABCDEFGHIJKLM";
     vec![
         // ---- EMR's own check, on a collection-valued filter member --------------
@@ -494,7 +496,8 @@ fn refused_cases() -> Vec<Case> {
 #[tokio::test]
 async fn an_out_of_enum_value_is_refused_by_the_layer_that_reaches_it() {
     let emr = Emr::new();
-    for case in refused_cases() {
+    let cluster = emr.run_job_flow(kept_alive_request("filtered")).await;
+    for case in refused_cases(&cluster) {
         let label = &case.case;
         let (status, payload) = emr.call(case.operation, case.body.clone()).await;
         assert_eq!(
