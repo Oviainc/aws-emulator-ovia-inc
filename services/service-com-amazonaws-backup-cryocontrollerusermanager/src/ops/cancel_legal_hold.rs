@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelLegalHold
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelLegalHold`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelLegalHold::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the hold one stored legal hold ([`crate::state::LegalHoldRecord`])
+//! places, by recording the cancellation on it: the hold stops being in force,
+//! and every later read of it reports the status, reason and record retention
+//! this call recorded — "Removes the specified legal hold on a recovery point"
+//! (model doc), and a cancelled hold is still reported, so the record is kept
+//! rather than removed.
+//!
+//! Only a hold that is IN FORCE can be released: one still being placed and one
+//! a cancellation has already released are refused for the state they are in
+//! ([`crate::state::legal_hold_not_active`]).
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +151,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelLegalHold` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelLegalHoldErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelLegalHold"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelLegalHoldErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The activation the clock already owes every hold: a hold whose
+        // creation came due is in force from that instant whether or not anybody
+        // called, and a hold in force is one this call can release.
+        store.settle_legal_holds(now);
+
+        // Resolved and checked BEFORE anything is recorded, so a refused request
+        // writes nothing: the hold is reached once, and its cancellation is
+        // written only after its state admits one.
+        let Some(hold) = store.legal_holds.get_mut(&input.legal_hold_id) else {
+            // The id resolution this service words once for a legal hold
+            // (`crate::state`), so this call and a read of the same id cannot
+            // disagree about which ids the account holds.
+            return Err(CancelLegalHoldErrorModeled::ResourceNotFoundException(
+                crate::state::legal_hold_not_found(),
+            )
+            .into());
+        };
+        if hold.status != crate::state::LEGAL_HOLD_STATUS_ACTIVE {
+            return Err(CancelLegalHoldErrorModeled::InvalidResourceStateException(
+                crate::state::legal_hold_not_active(),
+            )
+            .into());
+        }
+
+        // How long the cancelled hold's record is retained: "The integer amount,
+        // in days, after which to remove legal hold" (model doc for
+        // `RetainRecordInDays`), counted from this cancellation. A request that
+        // names none retains the record for as long as the account holds it, so
+        // nothing is due.
+        let retain_record_until = input.retain_record_in_days.and_then(|days| {
+            let seconds = u64::try_from(days)
+                .ok()?
+                .checked_mul(crate::state::SECONDS_PER_DAY)?;
+            now.checked_add(::std::time::Duration::from_secs(seconds))
+        });
+
+        hold.status = crate::state::LEGAL_HOLD_STATUS_CANCELED.to_string();
+        hold.cancellation_date = Some(now);
+        hold.cancel_description = Some(input.cancel_description);
+        hold.retain_record_until = retain_record_until;
+        Ok(CancelLegalHoldOutput {})
     }
 }

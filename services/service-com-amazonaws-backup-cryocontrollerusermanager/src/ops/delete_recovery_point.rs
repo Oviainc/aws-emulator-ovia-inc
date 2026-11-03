@@ -14,6 +14,11 @@
 //! * the vault is configured with a Backup Vault Lock that still retains the point,
 //!   and the call is refused `InvalidRequestException` and deletes nothing
 //!   ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::lock_retains_recovery_point`]);
+//! * an active legal hold is on the point — "Any actions to delete or
+//!   disassociate a recovery point will fail with an error if one or more active
+//!   legal holds are on the recovery point" (model doc for `CreateLegalHold`) —
+//!   and the call is refused `InvalidRequestException` and deletes nothing
+//!   ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::legal_hold_restrains_recovery_point`]);
 //! * otherwise the point is removed from the store and the call answers the
 //!   modelled empty 200, so every later read reports it absent and the vault's
 //!   `NumberOfRecoveryPoints` follows.
@@ -196,11 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The transition the clock already owes this vault's recovery points: one
         // whose backup came due completed at that instant whether or not anybody
-        // called, and a completed point is one this call can address.
+        // called, and a completed point is one this call can address. The same for
+        // the legal holds, so a hold the clock has already placed restrains this
+        // delete.
         store.settle_recovery_points_in(&input.backup_vault_name, now);
+        store.settle_legal_holds(now);
 
         // Resolved BEFORE anything is removed, so a refused request writes nothing.
-        let retained = match store
+        let (retained, held) = match store
             .stored_recovery_point(&input.backup_vault_name, &input.recovery_point_arn)
         {
             Err(absent) => {
@@ -208,7 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DeleteRecoveryPointErrorModeled::ResourceNotFoundException(absent).into(),
                 )
             }
-            Ok(point) => store.lock_retains_recovery_point(point, now),
+            Ok(point) => (
+                store.lock_retains_recovery_point(point, now),
+                store.legal_hold_restrains_recovery_point(point),
+            ),
         };
         // A Backup Vault Lock is what makes retention the SERVICE's refusal, so a
         // point its vault's lock still retains is refused for that condition — not
@@ -216,6 +227,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if retained {
             return Err(DeleteRecoveryPointErrorModeled::InvalidRequestException(
                 crate::state::recovery_point_locked(),
+            )
+            .into());
+        }
+        // A legal hold is the other restraint on deleting a stored point, and it
+        // stands whatever the vault's configuration is: the point goes only once
+        // the hold that is on it is released.
+        if held {
+            return Err(DeleteRecoveryPointErrorModeled::InvalidRequestException(
+                crate::state::recovery_point_held(),
             )
             .into());
         }

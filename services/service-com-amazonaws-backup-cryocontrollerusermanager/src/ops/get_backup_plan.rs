@@ -5,9 +5,14 @@
 //! Reports the plan `CreateBackupPlan` stored under the requested
 //! `BackupPlanId`, projected through
 //! [`crate::state::BackupPlanRecord::backup_plan`] so the body read back is the
-//! body that was stored. A `VersionId` naming a version the plan does not have
-//! is the same condition as an unknown plan id and answers the same modelled
-//! refusal.
+//! body that was stored.
+//!
+//! Only a version the account still HOLDS is reported: a plan whose deletion
+//! `DeleteBackupPlan` recorded, like a `VersionId` naming a version the plan
+//! never had, is no longer there to read and is refused with the modelled
+//! `ResourceNotFoundException` — the resolution step
+//! [`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::backup_plan`]
+//! performs for every plan read.
 //!
 //! `ScheduledRunsPreview` is reported only for a caller that asks for one
 //! (`MaxScheduledRunsPreview` defaults to 0, and the model documents the member
@@ -380,8 +385,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let store = state.lock();
         // A read, so nothing here writes: the plan is reported exactly as it was
-        // stored. `MaxScheduledRunsPreview`'s range is enforced by the framework
-        // before this handler runs.
+        // stored, and only while the account still holds the version asked for.
+        // `MaxScheduledRunsPreview`'s range is enforced by the framework before
+        // this handler runs.
         let plan = store
             .backup_plan(&input.backup_plan_id, input.version_id.as_deref())
             .map_err(GetBackupPlanErrorModeled::ResourceNotFoundException)?;
@@ -393,6 +399,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version_id: Some(plan.version_id.clone()),
             creator_request_id: plan.creator_request_id.clone(),
             creation_date: Some(::aws_smithy_types::DateTime::from(plan.creation_date)),
+            // The stored member, which a resolved plan never carries: a
+            // version whose deletion is recorded is refused above rather than
+            // reported. `DeleteBackupPlan` is what answers the deletion
+            // instant.
             deletion_date: plan.deletion_date.map(::aws_smithy_types::DateTime::from),
             last_execution_date: plan
                 .last_execution_date

@@ -25,8 +25,9 @@
 //!   value it was given;
 //! * "a backup plan can only be deleted after all associated selections of
 //!   resources have been deleted": a plan that still holds one is
-//!   `InvalidRequestException`, and a deleted plan reports the `DeletionDate` the
-//!   delete recorded while its name becomes free again.
+//!   `InvalidRequestException`, and once the plan is deleted the delete reports
+//!   the `DeletionDate` it recorded, no read of the plan reports its body any
+//!   more and its name becomes free again.
 //!
 //! The request harness (`router`, `call`, `error_code`) is the one
 //! `vault_and_backup_job.rs` exposes to this test binary, so there is ONE wire
@@ -527,8 +528,9 @@ async fn a_rule_carries_the_windows_it_was_created_with_or_the_service_defaults(
     }
 }
 
-/// A plan is deletable only once its selections are: the delete is refused while/// the plan holds one, the deleted plan reports the `DeletionDate` it recorded,
-/// and the name it held is free again.
+/// A plan is deletable only once its selections are: the delete is refused while
+/// the plan holds one, the delete reports the `DeletionDate` it recorded, no
+/// later read of the plan reports its body, and the name it held is free again.
 #[tokio::test]
 async fn a_plan_is_deleted_only_after_its_selections_are() {
     let router = router();
@@ -591,19 +593,17 @@ async fn a_plan_is_deleted_only_after_its_selections_are() {
         "expected the delete to report a DeletionDate, got {deleted:?}"
     );
 
-    // A deleted plan is still readable and reports the same deletion instant...
+    // A deleted plan is no longer there to read: the version the account held
+    // is gone, so the read is refused rather than reporting the body again
+    // (`backup_plan_deletion.rs` spans that rule).
     let (status, read) = get_plan(&router, &plan_id).await;
     assert_eq!(
-        status, 200,
-        "expected a deleted plan to stay readable, got {status} {read:?}"
-    );
-    assert_eq!(
-        read.get("DeletionDate"),
-        deleted.get("DeletionDate"),
-        "expected the read to report the recorded DeletionDate, got {read:?}"
+        (status, error_code(&read).as_str()),
+        (400, "ResourceNotFoundException"),
+        "expected a deleted plan to be unreadable, got {status} {read:?}"
     );
 
-    // ...while the account no longer holds it: a second delete is not found, and
+    // ...and the account no longer holds it: a second delete is not found, and
     // the name is free for another plan.
     let (status, again) = delete_plan(&router, &plan_id).await;
     assert_eq!(

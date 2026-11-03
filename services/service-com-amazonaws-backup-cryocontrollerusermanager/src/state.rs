@@ -20,7 +20,8 @@
 //!   controls and deployment status every framework read answers from.
 //! * [`LegalHoldRecord`] — the legal hold `CreateLegalHold` inserts, whose
 //!   stored members every legal-hold read projects through
-//!   [`LegalHoldRecord::listed`].
+//!   [`LegalHoldRecord::listed`] and whose stored selection decides, through
+//!   [`LegalHoldRecord::holds`], which recovery points the hold is on.
 //!
 //! `recovery_points_by_vault` is the ONLY per-vault list: both
 //! `ListRecoveryPointsByBackupVault`'s page and `DescribeBackupVault`'s
@@ -51,8 +52,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupRule, BackupRuleInput,
     BackupSelection, CalculatedLifecycle, ConflictException, CopyJob, FrameworkControl,
-    InvalidParameterValueException, InvalidRequestException, LegalHold, Lifecycle,
-    MissingParameterValueException, RecoveryPointSelection, ResourceNotFoundException, ScanSetting,
+    InvalidParameterValueException, InvalidRequestException, InvalidResourceStateException,
+    LegalHold, Lifecycle, MissingParameterValueException, RecoveryPointSelection,
+    ResourceNotFoundException, ScanSetting,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -330,6 +332,11 @@ pub const LEGAL_HOLD_STATUS_CREATING: &str = "CREATING";
 /// `LegalHoldStatus` of a legal hold that is in force (same enum).
 pub const LEGAL_HOLD_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// `LegalHoldStatus` of a legal hold a cancellation has released (same enum).
+/// A cancelled hold is still reported: `CancelLegalHold` records why and when it
+/// was cancelled, which the hold's reads answer from.
+pub const LEGAL_HOLD_STATUS_CANCELED: &str = "CANCELED";
+
 /// `DeploymentStatus` of a framework whose deployment has not settled yet, as
 /// the model lists the statuses for `Framework$DeploymentStatus`
 /// (`CREATE_IN_PROGRESS | UPDATE_IN_PROGRESS | DELETE_IN_PROGRESS | COMPLETED |
@@ -365,9 +372,10 @@ pub const MIN_RETENTION_DAYS_FLOOR: i64 = 7;
 /// an operation on a vault still in `CREATING` state.
 pub const ERROR_CODE_VAULT_STILL_CREATING: &str = "ERROR_9100";
 
-/// A seconds-per-day constant for turning `Lifecycle` day counts into the
-/// instants `CalculatedLifecycle` reports.
-const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+/// A seconds-per-day constant for turning day counts a request states — a
+/// `Lifecycle`'s retention, a cancelled legal hold's record retention — into the
+/// instants a read reports.
+pub const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 /// The ARN of a backup vault: `arn:aws:backup:<region>:<account>:backup-vault:<name>`.
 pub fn backup_vault_arn(region: &str, name: &str) -> String {
@@ -717,6 +725,16 @@ pub const MESSAGE_VAULT_ALREADY_EXISTS: &str = "Backup vault with the same name 
 /// No `Code`: this condition has no observed token.
 pub const MESSAGE_BACKUP_PLAN_NOT_FOUND: &str = "Cannot find Backup plan";
 
+/// `Code` for "the version of the backup plan this read asks for cannot be
+/// read".
+pub const ERROR_CODE_BACKUP_PLAN_VERSION_UNREADABLE: &str = "ERROR_2202";
+/// The sentence AWS states for that condition — fixed: it names neither the
+/// plan id nor the version asked about. It is the condition a read is in once
+/// the plan's deletion is recorded, and the one a `VersionId` the plan does not
+/// carry puts it in: in both, the version named is no longer there to read.
+pub const MESSAGE_BACKUP_PLAN_VERSION_UNREADABLE: &str =
+    "Failed reading Backup plan with provided version";
+
 /// The sentence AWS states for "the recovery point asked about is not one the
 /// named vault holds" — fixed, and worded as this service words the same
 /// condition for a backup job ([`MESSAGE_BACKUP_JOB_NOT_FOUND`]): it names no
@@ -731,6 +749,17 @@ pub const MESSAGE_RECOVERY_POINT_NOT_FOUND: &str = "Cannot find recovery point";
 /// has no observed token.
 pub const MESSAGE_RECOVERY_POINT_LOCKED: &str =
     "RecoveryPoint cannot be deleted or updated (Backup vault configured with Lock)";
+
+/// The sentence AWS states for "an active legal hold is on this recovery point,
+/// so the action just requested is restrained": "Any actions to delete or
+/// disassociate a recovery point will fail with an error if one or more active
+/// legal holds are on the recovery point" (model doc for `CreateLegalHold`).
+/// Fixed text, like the restraint the vault's own lock states
+/// ([`MESSAGE_RECOVERY_POINT_LOCKED`]): it names the condition, not the
+/// request, so neither the point nor the hold appears in it. No `Code`: this
+/// condition has no observed token.
+pub const MESSAGE_RECOVERY_POINT_HELD: &str =
+    "The recovery point cannot be deleted because it has active legal hold(s).";
 
 /// The sentence AWS states for "the backup selection asked about is not one the
 /// named plan holds" — fixed, and worded as this service words the same
@@ -780,6 +809,15 @@ pub const MESSAGE_MAX_RESULTS_INVALID: &str = "Max Results is invalid";
 /// of the request, so the id asked about does not appear in it. No `Code`: this
 /// condition has no observed token.
 pub const MESSAGE_LEGAL_HOLD_NOT_FOUND: &str = "Cannot find legal hold";
+
+/// The sentence this service states for "the legal hold named is not one a
+/// cancellation can release": it is still being placed, or a cancellation has
+/// already released it. No recording of this condition is available, so the
+/// wording is this service's own, built like the sentences above: fixed text
+/// naming the condition (the status the hold has to be in) rather than any part
+/// of the request. No `Code`: this condition has no observed token.
+pub const MESSAGE_LEGAL_HOLD_NOT_ACTIVE: &str =
+    "Legal hold cannot be canceled because it is not in the ACTIVE state";
 
 /// The sentence AWS states for "the legal hold this create would make selects no
 /// recovery points" — fixed, like the ones above: it names no part of the
@@ -925,10 +963,32 @@ pub fn backup_plan_not_found() -> ResourceNotFoundException {
     }
 }
 
+/// The modelled refusal for a read of a plan VERSION that is no longer there:
+/// the account holds a plan of that id, but the version the read asks for has
+/// been deleted or was never one of the plan's — see
+/// [`MESSAGE_BACKUP_PLAN_VERSION_UNREADABLE`], with the condition's own token.
+pub fn backup_plan_version_unreadable() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        code: Some(ERROR_CODE_BACKUP_PLAN_VERSION_UNREADABLE.to_string()),
+        message: Some(MESSAGE_BACKUP_PLAN_VERSION_UNREADABLE.to_string()),
+        ..Default::default()
+    }
+}
+
 /// The modelled refusal for a legal hold id this account does not hold.
 pub fn legal_hold_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(MESSAGE_LEGAL_HOLD_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a cancellation of a legal hold that is not in force
+/// — see [`MESSAGE_LEGAL_HOLD_NOT_ACTIVE`]. The hold's STATE is what refuses the
+/// call, which is the condition `InvalidResourceStateException` names.
+pub fn legal_hold_not_active() -> InvalidResourceStateException {
+    InvalidResourceStateException {
+        message: Some(MESSAGE_LEGAL_HOLD_NOT_ACTIVE.to_string()),
         ..Default::default()
     }
 }
@@ -969,6 +1029,15 @@ pub fn recovery_point_not_found() -> ResourceNotFoundException {
 pub fn recovery_point_locked() -> InvalidRequestException {
     InvalidRequestException {
         message: Some(MESSAGE_RECOVERY_POINT_LOCKED.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a call that would delete or disassociate a recovery
+/// point an active legal hold is on — see [`MESSAGE_RECOVERY_POINT_HELD`].
+pub fn recovery_point_held() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(MESSAGE_RECOVERY_POINT_HELD.to_string()),
         ..Default::default()
     }
 }
@@ -1905,6 +1974,53 @@ impl LegalHoldRecord {
                 .map(::aws_smithy_types::DateTime::from),
         }
     }
+
+    /// Whether `point` is one of the recovery points this hold is ON — the ONE
+    /// place that question is decided, so what a read reports the hold covers
+    /// is what its stored selection names.
+    ///
+    /// A hold is "a restraint on altering or deleting a backup" (model doc for
+    /// `CreateLegalHold`), placed when it was created on the recovery points
+    /// its `RecoveryPointSelection` named then. Each member the selection
+    /// states NARROWS the set, and one it states none of restricts nothing:
+    ///
+    /// * `VaultNames` are "the names of the vaults in which the selected
+    ///   recovery points are contained", so a point in a vault the selection
+    ///   does not name is not held;
+    /// * `ResourceIdentifiers` are "the resources included in the resource
+    ///   selection", which a recovery point names by its protected resource;
+    /// * `DateRange` is a window of creation instants, its `FromDate` "the
+    ///   beginning date, inclusive" and its `ToDate` "the end date, inclusive".
+    ///
+    /// A point created after the hold was placed is held by none of them:
+    /// "Future DateTime values are not permitted" for a selection's range (model
+    /// doc for `DateRange`), so a selection names recovery points that already
+    /// exist.
+    pub fn holds(&self, point: &RecoveryPoint) -> bool {
+        if point.creation_date > self.creation_date {
+            return false;
+        }
+        let selection = &self.recovery_point_selection;
+        let vault_names = selection.vault_names.as_deref().unwrap_or_default();
+        if !vault_names.is_empty() && !vault_names.contains(&point.backup_vault_name) {
+            return false;
+        }
+        let resources = selection.resource_identifiers.as_deref().unwrap_or_default();
+        if !resources.is_empty() && !resources.contains(&point.resource_arn) {
+            return false;
+        }
+        match &selection.date_range {
+            None => true,
+            Some(range) => {
+                // Compared as the epoch offsets the model's timestamps carry,
+                // so a bound outside the span a `SystemTime` can express still
+                // orders against the point's creation instant.
+                let created = ::aws_smithy_types::DateTime::from(point.creation_date).as_secs_f64();
+                created >= range.from_date.as_secs_f64()
+                    && created <= range.to_date.as_secs_f64()
+            }
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-backup-cryocontrollerusermanager. A handler reaches it through [`service_state`].
@@ -1980,19 +2096,36 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     /// Resolve a backup plan for a read, by the id it is stored under and
     /// optionally the version asked for.
     ///
-    /// A plan id this account does not hold, or a `VersionId` that names no
-    /// version of the plan it does hold, is one condition: the resource asked
-    /// about is not there, so both answer the same modelled refusal and neither
-    /// tells the caller which half of the pair was wrong.
+    /// A read answers from a version the account still HOLDS, so two conditions
+    /// are refused here and this is the one place either is decided — every
+    /// plan read goes through it:
+    ///
+    /// * the id names no plan of this account at all
+    ///   ([`backup_plan_not_found`]);
+    /// * the plan is there but the version asked for is not there to be read
+    ///   ([`backup_plan_version_unreadable`]) — because `DeleteBackupPlan`
+    ///   recorded the plan's deletion, or because the `VersionId` names a
+    ///   version the plan never had. Neither refusal tells the caller which
+    ///   half of the pair was wrong.
+    ///
+    /// A deleted plan's record is KEPT (the deletion instant is part of it),
+    /// but it is no longer readable: the body of a plan the account has deleted
+    /// is not reported again.
     pub fn backup_plan(
         &self,
         plan_id: &str,
         version_id: Option<&str>,
     ) -> Result<&BackupPlanRecord, ResourceNotFoundException> {
-        self.backup_plans
+        let plan = self
+            .backup_plans
             .get(plan_id)
-            .filter(|plan| version_id.is_none_or(|version| version == plan.version_id))
-            .ok_or_else(backup_plan_not_found)
+            .ok_or_else(backup_plan_not_found)?;
+        let version_is_there = plan.deletion_date.is_none()
+            && version_id.is_none_or(|version| version == plan.version_id);
+        if !version_is_there {
+            return Err(backup_plan_version_unreadable());
+        }
+        Ok(plan)
     }
 
     /// The plan a `CreatorRequestId` names, if this account holds one: "If the
@@ -2020,8 +2153,9 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     }
 
     /// The plan a mutating call must find: one this account holds whose deletion
-    /// has not been recorded. A deleted plan is still READABLE (it reports its
-    /// `DeletionDate`), but nothing is added to it and nothing deletes it twice.
+    /// has not been recorded. A deleted plan's record is kept, but nothing is
+    /// added to it, nothing deletes it twice and no read reports its body
+    /// ([`Self::backup_plan`]).
     pub fn live_backup_plan(&self, plan_id: &str) -> Option<&BackupPlanRecord> {
         self.backup_plans
             .get(plan_id)
@@ -2132,6 +2266,40 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         self.legal_holds
             .values()
             .find(|hold| hold.idempotency_token.as_deref() == Some(token))
+    }
+
+    /// Every stored recovery point `hold` is on, in `RecoveryPointArn` order —
+    /// the recovery points "of the specified legal hold" a read of the hold's
+    /// coverage reports.
+    ///
+    /// `recovery_points` is a `BTreeMap` keyed by that ARN, so this walk is
+    /// already in ARN order, which is what makes an ARN-valued page cursor
+    /// resolve to the same position on every request. Membership is
+    /// [`LegalHoldRecord::holds`]'s single decision, so the holds a point is
+    /// under and the points a hold covers can never disagree.
+    pub fn recovery_points_held_by(&self, hold: &LegalHoldRecord) -> Vec<&RecoveryPoint> {
+        self.recovery_points
+            .values()
+            .filter(|point| hold.holds(point))
+            .collect()
+    }
+
+    /// Whether an ACTIVE legal hold is on `point`, so a call that would delete
+    /// or disassociate it is refused ([`recovery_point_held`]): "Any actions to
+    /// delete or disassociate a recovery point will fail with an error if one or
+    /// more active legal holds are on the recovery point" (model doc for
+    /// `CreateLegalHold`).
+    ///
+    /// A hold still being placed is not in force yet and a cancelled one has
+    /// released what it held, so only a hold in the model's `ACTIVE` status
+    /// restrains anything — read AFTER [`Self::settle_legal_holds`], so a hold
+    /// the clock has already activated counts here. Membership is
+    /// [`LegalHoldRecord::holds`]'s single decision, so what restrains a point
+    /// is exactly what a read of the hold's coverage reports.
+    pub fn legal_hold_restrains_recovery_point(&self, point: &RecoveryPoint) -> bool {
+        self.legal_holds
+            .values()
+            .any(|hold| hold.status == LEGAL_HOLD_STATUS_ACTIVE && hold.holds(point))
     }
 
     /// Materialise the transition the clock has already made due for every legal

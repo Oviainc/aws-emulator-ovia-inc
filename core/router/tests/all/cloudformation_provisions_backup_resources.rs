@@ -699,18 +699,21 @@ async fn a_stack_provisions_the_backup_resources_its_template_declares() {
             "case {case:?}: expected GetBackupSelection to refuse the deleted selection, got \
              {status} with body {gone}"
         );
-        // A deleted plan keeps the `DeletionDate` AWS Backup recorded for it, which is how
-        // that service reports a plan the account no longer holds.
+        // A deleted plan is no longer there to read: AWS Backup records the deletion on
+        // the version the account held and refuses every later read of it, so this is how
+        // the stack's plan is observed gone.
         let (status, gone) =
             backup(&router, region, "GET", &format!("/backup/plans/{plan_id}")).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected the deleted plan to stay readable, got {status} with \
-             body {gone}"
+            status, 400,
+            "case {case:?}: expected GetBackupPlan to refuse the deleted plan, got {status} \
+             with body {gone}"
         );
-        assert!(
-            gone.get("DeletionDate").is_some(),
-            "case {case:?}: expected the deleted plan to report a DeletionDate, got {gone}"
+        assert_eq!(
+            gone.get("__type").and_then(Value::as_str),
+            Some("ResourceNotFoundException"),
+            "case {case:?}: expected the modelled not-found refusal for the deleted plan, \
+             got {gone}"
         );
         let (status, gone) =
             backup(&router, region, "GET", &format!("/backup-vaults/{vault}")).await;

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecoveryPointsByLegalHold
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecoveryPointsByLegalHold`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecoveryPointsByLegalHold::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the recovery points the named legal hold is on: the stored recovery
+//! points its stored `RecoveryPointSelection` names
+//! ([`crate::state::LegalHoldRecord::holds`], the ONE decision about what a hold
+//! covers), projected through the service's single recovery-point read
+//! projection so this page and a direct read of the same point cannot disagree.
+//!
+//! A page is `MaxResults` of them plus an opaque cursor to the next, like every
+//! other paginated read of this service. The operation models no not-found
+//! error, so a `LegalHoldId` the account holds nothing under is refused as the
+//! parameter value it is.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +151,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecoveryPointsByLegalHold` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecoveryPointsByLegalHoldErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecoveryPointsByLegalHold"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        // A page size outside the model's `@range` is this service's own
+        // `InvalidParameterValueException`, answered before the hold is resolved
+        // so the body is the modelled shape carrying `Code` and `Message`.
+        if let Some(refusal) = crate::state::rejected_max_results(input.max_results) {
+            return Err(
+                ListRecoveryPointsByLegalHoldErrorModeled::InvalidParameterValueException(refusal)
+                    .into(),
+            );
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRecoveryPointsByLegalHoldErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        // A read: nothing here writes. What a hold covers follows from its
+        // stored selection and the stored recovery points, and no member this
+        // page reports depends on a status, so there is no transition to
+        // materialise first.
+        let store = state.lock();
+        // This operation models no `ResourceNotFoundException` — its only client
+        // errors are `InvalidParameterValueException` and
+        // `MissingParameterValueException` — so an id the account holds nothing
+        // under is refused as the value of the member that named it, with the
+        // refusal `crate::state` words once for every such member.
+        let Some(hold) = store.legal_holds.get(&input.legal_hold_id) else {
+            return Err(
+                ListRecoveryPointsByLegalHoldErrorModeled::InvalidParameterValueException(
+                    crate::state::rejected_parameter("LegalHoldId"),
+                )
+                .into(),
+            );
+        };
+        let held = store.recovery_points_held_by(hold);
+
+        // The cursor names the first item of the page being asked for.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let key = crate::state::decode_page_token(token);
+                let position = key.and_then(|key| held.iter().position(|point| point.arn == key));
+                let Some(position) = position else {
+                    return Err(
+                        ListRecoveryPointsByLegalHoldErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(
+                                    "NextToken does not name a page of this result set".to_string(),
+                                ),
+                                ..Default::default()
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                position
+            }
+        };
+        // No `MaxResults` means one page: the model's own maximum. A page size
+        // the model's `@range(1..1000)` refuses was answered above, so the
+        // clamp here only applies the default.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+        let end = start.saturating_add(page_size).min(held.len());
+        let next_token = held
+            .get(end)
+            .map(|point| crate::state::encode_page_token(&point.arn));
+
+        let recovery_points: Vec<RecoveryPointMember> = held[start..end]
+            .iter()
+            .map(|point| {
+                // The ONE recovery-point read projection, so a point this page
+                // reports and the same point read on its own can never disagree
+                // about it.
+                let view = store.recovery_point_view(point, now);
+                RecoveryPointMember {
+                    recovery_point_arn: Some(view.arn),
+                    resource_arn: Some(view.resource_arn),
+                    resource_type: view.resource_type,
+                    backup_vault_name: Some(view.backup_vault_name),
+                }
+            })
+            .collect();
+
+        Ok(ListRecoveryPointsByLegalHoldOutput {
+            recovery_points: Some(recovery_points),
+            next_token,
+        })
     }
 }

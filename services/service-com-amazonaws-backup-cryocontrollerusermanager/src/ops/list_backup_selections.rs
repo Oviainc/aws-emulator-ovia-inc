@@ -169,9 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
-        // A plan this account does not hold holds no selections to list: the
-        // resource asked about is not there, which is this operation's modelled
-        // not-found refusal rather than an empty page.
+        // A plan this account does not hold — one it never held, and one whose
+        // deletion is recorded — holds no selections to list: the resource asked
+        // about is not there, which is this operation's modelled not-found
+        // refusal rather than an empty page. The resolution is the plan read's
+        // own (`crate::state`), so this listing and `GetBackupPlan` cannot
+        // disagree about which plans the account holds.
         store
             .backup_plan(&input.backup_plan_id, None)
             .map_err(ListBackupSelectionsErrorModeled::ResourceNotFoundException)?;

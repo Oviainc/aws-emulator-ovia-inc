@@ -15,6 +15,8 @@
 mod backup_job_listing;
 #[path = "all/backup_plan.rs"]
 mod backup_plan;
+#[path = "all/backup_plan_deletion.rs"]
+mod backup_plan_deletion;
 #[path = "all/backup_selection.rs"]
 mod backup_selection;
 #[path = "all/copy_job.rs"]
@@ -27,6 +29,8 @@ mod framework;
 mod framework_update;
 #[path = "all/legal_hold.rs"]
 mod legal_hold;
+#[path = "all/legal_hold_coverage.rs"]
+mod legal_hold_coverage;
 #[path = "all/logically_air_gapped_vault.rs"]
 mod logically_air_gapped_vault;
 #[path = "all/recovery_point_deletion.rs"]
