@@ -92,6 +92,12 @@
 //!   from children the walk reached, so a collection past the count could not be echoed at
 //!   all.
 //!
+//! * [`MAX_RECORDED_DEPTH`] (64) — how deep into nested composites the walk descends. The
+//!   leaf count bounds LEAF positions, which a value made only of composites never spends,
+//!   and a model may declare a recursive shape; so the depth is bounded by its own stated
+//!   constant, and a value nested past it is left to the framework's own text exactly as a
+//!   spent leaf budget leaves it.
+//!
 //! Beyond any of these the framework's elided text stands: a shortened echo is a
 //! divergence in one message, while an unbounded one is a response sized by the request.
 //!
@@ -906,6 +912,16 @@ const MAX_RECORDED_RENDERINGS: usize = MAX_RECORDED_LEAVES;
 
 /// The owned bytes — paths plus renderings — [`submitted_renderings`] may hold.
 const MAX_RECORDED_RENDERED_BYTES: usize = MAX_RECORDED_BYTES;
+
+/// The most composites deep this walk descends into one request.
+///
+/// The leaf budget counts LEAF positions, so a value built only of composites — a model
+/// may declare a recursive shape, so the nesting is the caller's to choose — would reach
+/// the recursion below without ever spending it. This is the depth half of the same
+/// bound: past it the walk stops descending, and the composite it stopped inside renders
+/// as nothing exactly as a spent leaf budget makes it. Deeper than any input shape a
+/// model nests, and shallow enough that the walk's own frames cannot run the stack out.
+const MAX_RECORDED_DEPTH: usize = 64;
 
 /// The most children ONE composite renders from. A composite with more keeps no
 /// rendering at all, rather than one stating fewer elements than were sent.
@@ -2310,6 +2326,15 @@ impl SubmittedValues {
         frame: Frame,
         write_children: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
+        // The one place this walk recurses, so the one place its DEPTH is bounded: the
+        // leaf budget counts leaf positions only, which a value made of composites never
+        // spends. Past the ceiling nothing is descended into, and the composite the walk
+        // stopped inside renders as nothing rather than as a value with a part left out.
+        if self.collections.len() >= MAX_RECORDED_DEPTH {
+            self.skipped = true;
+            self.abandoned();
+            return Ok(());
+        }
         self.collections.push(frame);
         if self.renders {
             self.open.push(Composite::default());
@@ -2542,8 +2567,9 @@ mod tests {
         echo_held_to, rendered_declared_structure, rendered_entries, rendered_map,
         rendered_sequence, rendered_structure, unanchored, unanchored_grouping_alternation,
         unanchored_keeping_inner_anchors, Composite, RenderedChild, Submitted, SubmittedEcho,
-        SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES, MAX_RECORDED_RENDERED_BYTES,
-        MAX_RECORDED_RENDERINGS, MAX_RENDERED_CHILDREN, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
+        SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_DEPTH, MAX_RECORDED_LEAVES,
+        MAX_RECORDED_RENDERED_BYTES, MAX_RECORDED_RENDERINGS, MAX_RENDERED_CHILDREN,
+        MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
     };
     use super::whole_value_expression;
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
@@ -2682,6 +2708,70 @@ mod tests {
             dropping.done() && dropping.skipped,
             "case a walk of oversized values: expected it to be done and incomplete"
         );
+    }
+
+    /// RULE: the traversal's DEPTH is bounded by a stated constant just as its leaf count
+    /// is — a value nested past the ceiling is not descended into and marks the collection
+    /// incomplete — so a value built only of composites, which spends no leaf budget at
+    /// all, cannot set how deep the walk goes.
+    #[test]
+    fn the_depth_ceiling_bounds_a_value_built_only_of_composites() {
+        use aws_smithy_schema::serde::{SerdeError, ShapeSerializer};
+        use aws_smithy_schema::{Schema, ShapeId, ShapeType};
+
+        static ELEMENT: Schema = Schema::new_member(
+            ShapeId::from_static("test#Nested$member", "test", "member"),
+            ShapeType::String,
+            "member",
+            0,
+        );
+        static LIST: Schema = Schema::new_member(
+            ShapeId::from_static("test#Nested$values", "test", "values"),
+            ShapeType::List,
+            "values",
+            0,
+        );
+
+        /// `depth` lists nested one inside the other, holding one string at the bottom.
+        fn nest(
+            serializer: &mut dyn ShapeSerializer,
+            depth: usize,
+        ) -> Result<(), SerdeError> {
+            if depth == 0 {
+                return serializer.write_string(&ELEMENT, "innermost");
+            }
+            let deeper = move |inner: &mut dyn ShapeSerializer| nest(inner, depth - 1);
+            serializer.write_list(&LIST, &deeper)
+        }
+
+        // (case, how deep the value nests, whether the walk reaches the bottom of it)
+        let rows: [(&str, usize, bool); 5] = [
+            ("one list", 1, true),
+            ("a handful of lists", 8, true),
+            ("nested exactly to the ceiling", MAX_RECORDED_DEPTH, true),
+            ("one list past the ceiling", MAX_RECORDED_DEPTH + 1, false),
+            ("nested far past the ceiling", 16 * MAX_RECORDED_DEPTH, false),
+        ];
+        for (case, depth, reached) in rows {
+            let mut walk = SubmittedValues::default();
+            nest(&mut walk, depth).unwrap_or_else(|e| panic!("case {case:?}: the walk failed: {e}"));
+            assert!(
+                walk.collections.is_empty(),
+                "case {case:?}: expected every frame closed, got {} open",
+                walk.collections.len()
+            );
+            assert_eq!(
+                !walk.leaves.is_empty(),
+                reached,
+                "case {case:?}: expected the innermost value recorded == {reached}, got {} leaves",
+                walk.leaves.len()
+            );
+            assert_eq!(
+                walk.skipped, !reached,
+                "case {case:?}: expected incomplete == {}, got {}",
+                !reached, walk.skipped
+            );
+        }
     }
 
     /// RULE: a clause quotes the value itself up to the ceiling one clause may carry, and

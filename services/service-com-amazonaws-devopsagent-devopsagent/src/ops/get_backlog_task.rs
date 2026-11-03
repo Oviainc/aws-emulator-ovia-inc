@@ -152,21 +152,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `@readonly`: this reports the stored task and writes nothing. A task is
-        // reachable only through the agent space that owns it, so a task id belonging
-        // to another space is as absent as one that never existed.
+        // reachable only through the agent space that owns it, and the caller is
+        // authorised against that space before anything inside it can be known, so
+        // an `agentSpaceId` that resolves to no space fails CLOSED instead of
+        // disclosing which spaces exist; only inside a space the caller reached is a
+        // missing task reported as one, which makes a task id belonging to another
+        // space as absent as one that never existed.
         let store = state.lock();
-        let task = store
+        let space = store
             .agent_spaces
             .get(&input.agent_space_id)
-            .and_then(|space| space.tasks.get(&input.task_id))
             .ok_or_else(|| {
-                GetBacklogTaskErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!(
-                        "task {} was not found in agent space {}",
-                        input.task_id, input.agent_space_id
-                    ),
+                GetBacklogTaskErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
                 })
             })?;
+        let task = space.tasks.get(&input.task_id).ok_or_else(|| {
+            GetBacklogTaskErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::task_not_found_message(&input.task_id),
+            })
+        })?;
 
         Ok(GetBacklogTaskOutput {
             task: task.to_api(),

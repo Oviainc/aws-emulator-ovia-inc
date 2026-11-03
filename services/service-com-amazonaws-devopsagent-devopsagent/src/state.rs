@@ -264,6 +264,17 @@ pub fn goal_not_found_message(goal_id: &str) -> String {
     format!("Goal not found: {goal_id}")
 }
 
+/// The refusal message an operation in the backlog plane answers with when the
+/// identifier it was given names no task in the agent space the caller reached.
+///
+/// The fixed text names the kind of resource that was resolved and the identifier
+/// the request carried, taken verbatim from it; the parent space is already known
+/// to the caller, so it is not repeated — the same form as
+/// [`goal_not_found_message`] and [`asset_not_found_message`].
+pub fn task_not_found_message(task_id: &str) -> String {
+    format!("Task not found: {task_id}")
+}
+
 /// The UUID a minted goal identifier carries, rendered from `sequence`.
 ///
 /// The 16 bytes are the store's monotonic sequence and its complement, so no two

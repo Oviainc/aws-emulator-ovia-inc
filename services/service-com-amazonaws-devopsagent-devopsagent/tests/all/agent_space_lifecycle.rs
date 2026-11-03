@@ -628,14 +628,34 @@ async fn created_backlog_task_is_returned_unchanged_by_get() {
         );
     }
 
-    // A task id that names nothing, and a task that belongs to another agent
-    // space, are both 404 — a task is reachable only through its owner.
+    // Inside a space the caller reaches, a task id that names nothing — including
+    // one that belongs to another space — is 404: a task is reachable only through
+    // its owner. An `agentSpaceId` that resolves to no space is refused BEFORE
+    // anything inside it is looked up, so it fails closed with 403 instead.
     let other_space = create_space(&router, "other-space").await;
     let borrowed = task_ids.iter().next().expect("at least one task").clone();
-    for (case, space, task) in [
-        ("unknown task", space_id.as_str(), "does-not-exist"),
-        ("unknown space", other_space.as_str(), borrowed.as_str()),
-        ("absent space", "as-0000000000000000", borrowed.as_str()),
+    for (case, space, task, expected_status, expected_code) in [
+        (
+            "unknown task",
+            space_id.as_str(),
+            "does-not-exist",
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "task of another space",
+            other_space.as_str(),
+            borrowed.as_str(),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "absent space",
+            "as-0000000000000000",
+            borrowed.as_str(),
+            403,
+            "AccessDeniedException",
+        ),
     ] {
         let (status, body) = call(
             &router,
@@ -645,17 +665,18 @@ async fn created_backlog_task_is_returned_unchanged_by_get() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404 from GetBacklogTask, got {status}: {body}"
+            status, expected_status,
+            "case {case:?}: expected {expected_status} from GetBacklogTask, got {status}: {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body}"
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
         );
     }
 
-    // Creating a task under an agent space that does not exist is a 404 too.
+    // Creating a task under an agent space that does not exist fails closed the
+    // same way.
     let (status, body) = call(
         &router,
         "POST",
@@ -664,12 +685,12 @@ async fn created_backlog_task_is_returned_unchanged_by_get() {
     )
     .await;
     assert_eq!(
-        status, 404,
+        status, 403,
         "CreateBacklogTask against an unknown agent space got {status}: {body}"
     );
     assert_eq!(
         error_code(&body),
-        "ResourceNotFoundException",
+        "AccessDeniedException",
         "CreateBacklogTask against an unknown agent space produced {body}"
     );
 
@@ -755,9 +776,16 @@ async fn deleted_agent_space_and_its_tasks_are_gone() {
                 None,
             )
             .await;
+            // The space is gone, so the request no longer reaches anything inside
+            // it: the refusal is the fail-closed one, not a report about the task.
             assert_eq!(
-                status, 404,
+                status, 403,
                 "case {case:?}: task {task} outlived its agent space: {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "AccessDeniedException",
+                "case {case:?}: reading task {task} in a deleted space produced {body}"
             );
         }
 

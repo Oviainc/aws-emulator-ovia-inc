@@ -180,12 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
+        // A task lives inside the agent space that owns it, and the caller is
+        // authorised against that space before anything inside it can be known, so
+        // an `agentSpaceId` that resolves to no space fails CLOSED rather than
+        // disclosing which spaces exist.
         let task_count = match store.agent_spaces.get(&input.agent_space_id) {
             Some(space) => space.tasks.len(),
             None => {
-                return Err(CreateBacklogTaskErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!("agent space {} was not found", input.agent_space_id),
+                return Err(CreateBacklogTaskErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
                     },
                 )
                 .into())
@@ -255,11 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .agent_spaces
             .get_mut(&input.agent_space_id)
             .ok_or_else(|| {
-                CreateBacklogTaskErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!("agent space {} was not found", input.agent_space_id),
-                    },
-                )
+                CreateBacklogTaskErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
+                })
             })?;
         space.tasks.insert(task_id.clone(), record);
 

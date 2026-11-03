@@ -21,6 +21,8 @@ mod asset_file_updates;
 mod asset_files;
 #[path = "all/assets.rs"]
 mod assets;
+#[path = "all/backlog_task_refusal_arms.rs"]
+mod backlog_task_refusal_arms;
 #[path = "all/operator_app.rs"]
 mod operator_app;
 #[path = "all/state_roundtrip.rs"]
