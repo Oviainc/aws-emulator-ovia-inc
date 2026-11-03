@@ -537,40 +537,64 @@ pub const TRAFFIC_POLICY_INSTANCE_APPLIED: &str = "Applied";
 pub const TRAFFIC_POLICY_FORMAT_VERSION: &str = "2015-10-01";
 
 /// The IPv4 CIDR blocks Route 53's health checkers send their health checks
-/// from, as the service publishes them.
+/// from, as the service publishes them TODAY.
 ///
 /// `GetCheckerIpRanges`'s own model documentation points at the published
 /// source: "we recommend that you download ip-ranges.json, which includes IP
-/// address ranges for all Amazon Web Services services" — these are the blocks
-/// that file publishes under the Route 53 health-checks service, one `/26` per
-/// health-checking region (several regions publish more than one). They are
-/// spelled out here, in no particular order, because the ORDER the wire carries
-/// is computed by [`checker_ip_ranges`] rather than being a property of this
-/// table; duplicates in it collapse there too.
+/// address ranges for all Amazon Web Services services" — this is the set that
+/// file publishes under the Route 53 health-checks service, which has two parts
+/// since the checkers were consolidated:
 ///
-/// A caller reads this set to allow health-check traffic through a firewall, so
-/// what matters about it is that every entry is a well-formed IPv4 CIDR block
-/// and that two reads of it agree — never that a particular block is in it.
+/// * the `/23` sub-blocks of the single `15.177.0.0/18` allocation the checkers
+///   now source from — two per `/21` inside it, at the `/21`'s third and
+///   seventh `/23`, so sixteen blocks across the `/18`;
+/// * one single-address `/32` left in each of the sixteen legacy regional
+///   blocks, at the first address of that block's upper half, which is what the
+///   regions that have not been migrated still probe from.
+///
+/// The retired per-region `/26` blocks themselves are NOT published here any
+/// more: a caller programmes a firewall from this set, so publishing a block no
+/// checker sources from would have it allow traffic Route 53 never sends and
+/// (worse) omit the addresses it does.
+///
+/// The entries are spelled out in no particular order, because the ORDER the
+/// wire carries is computed by [`checker_ip_ranges`] rather than being a
+/// property of this table; duplicates in it collapse there too.
 pub const CHECKER_IP_RANGES: &[&str] = &[
-    "54.183.255.128/26",
-    "54.228.16.0/26",
-    "54.232.40.64/26",
-    "54.241.32.64/26",
-    "54.243.31.192/26",
-    "54.244.52.192/26",
-    "54.245.168.0/26",
-    "54.248.220.0/26",
-    "54.250.253.192/26",
-    "54.251.31.128/26",
-    "54.252.79.128/26",
-    "54.252.254.192/26",
-    "54.255.254.192/26",
-    "107.23.255.0/26",
-    "176.34.159.192/26",
-    "177.71.207.128/26",
-    "13.57.226.0/26",
-    "13.124.199.0/26",
-    "13.210.244.128/26",
+    // The consolidated 15.177.0.0/18 allocation, two /23s per /21.
+    "15.177.2.0/23",
+    "15.177.6.0/23",
+    "15.177.10.0/23",
+    "15.177.14.0/23",
+    "15.177.18.0/23",
+    "15.177.22.0/23",
+    "15.177.26.0/23",
+    "15.177.30.0/23",
+    "15.177.34.0/23",
+    "15.177.38.0/23",
+    "15.177.42.0/23",
+    "15.177.46.0/23",
+    "15.177.50.0/23",
+    "15.177.54.0/23",
+    "15.177.58.0/23",
+    "15.177.62.0/23",
+    // One checker address left in each legacy regional block.
+    "54.183.255.160/32",
+    "54.228.16.32/32",
+    "54.232.40.96/32",
+    "54.241.32.96/32",
+    "54.243.31.224/32",
+    "54.244.52.224/32",
+    "54.245.168.32/32",
+    "54.248.220.32/32",
+    "54.250.253.224/32",
+    "54.251.31.160/32",
+    "54.252.79.160/32",
+    "54.252.254.224/32",
+    "54.255.254.224/32",
+    "107.23.255.32/32",
+    "176.34.159.224/32",
+    "177.71.207.160/32",
 ];
 
 /// The health-checker CIDR blocks in the order the API reports them, with any
@@ -1351,10 +1375,18 @@ pub fn checker_address(region: &str) -> Option<String> {
 }
 
 /// The first address inside an `a.b.c.d/nn` block: the one after its network
-/// address, which is the first an interface in the block can carry.
+/// address, which is the first an interface in the block can carry — except in a
+/// block that has no host bits to spare, where the single address the block
+/// names IS that address.
 fn first_address_in(cidr: &str) -> Option<String> {
-    let (address, _prefix) = cidr.split_once('/')?;
+    let (address, prefix) = cidr.split_once('/')?;
     let network = address.parse::<Ipv4Addr>().ok()?;
+    let prefix: u8 = prefix.parse().ok()?;
+    // A /31 holds two addresses and a /32 one, so stepping past the network
+    // address would leave the block the caller allow-listed.
+    if prefix >= 31 {
+        return Some(network.to_string());
+    }
     let first = u32::from(network).checked_add(1)?;
     Some(Ipv4Addr::from(first).to_string())
 }

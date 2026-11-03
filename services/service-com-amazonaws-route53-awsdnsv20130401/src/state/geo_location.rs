@@ -23,9 +23,10 @@
 //! * a COUNTRY carries `CountryCode`/`CountryName`. `GeoLocation$CountryCode`:
 //!   "Amazon Route 53 uses the two-letter country codes that are specified in ISO
 //!   standard 3166-1 alpha-2", so [`COUNTRIES`] is that standard's assigned codes
-//!   with their English short names, beside the one-character `*` the same member
-//!   documents as the default location ("the default resource record set", the
-//!   location queries that match no other location are answered from).
+//!   beside the one-character `*` the same member documents as the default
+//!   location ("the default resource record set", the location queries that match
+//!   no other location are answered from). The NAMES are the service's own, not
+//!   the standard's English spelling — see [`COUNTRIES`].
 //! * a SUBDIVISION carries its country's code and name PLUS
 //!   `SubdivisionCode`/`SubdivisionName`. `GeoLocationDetails$SubdivisionName`:
 //!   "Route 53 currently supports only states in the United States", and
@@ -64,11 +65,21 @@ pub const DEFAULT_COUNTRY_CODE: &str = "*";
 
 /// The countries Route 53 supports, as `(code, name)`.
 ///
-/// Source: the codes assigned by ISO 3166-1 alpha-2, which is the standard
-/// `GeoLocation$CountryCode` names, with that standard's English short names; the
-/// `*` row is the default location the same member documents. The rows are
-/// spelled out in code order, but the ORDER the wire carries is computed by
-/// [`catalog`] rather than being a property of this table.
+/// Source of the CODES: the ones assigned by ISO 3166-1 alpha-2, which is the
+/// standard `GeoLocation$CountryCode` names; the `*` row is the default location
+/// the same member documents.
+///
+/// Source of the NAMES: the service's own country naming, which is NOT the ISO
+/// standard's own English spelling. It keeps a name's non-ASCII letters rather
+/// than folding them to ASCII (`Åland`, `Saint Barthélemy`, `Côte d'Ivoire`,
+/// `Curaçao`, `Réunion`, `São Tomé and Príncipe`), it uses a country's short
+/// form rather than an ISO long form (`Bonaire`, `Cape Verde`), and it brackets
+/// a parenthetical with square brackets (`Cocos [Keeling] Islands`). A client
+/// displays `CountryName` to a user and compares it against what Route 53
+/// returns, so a folded or re-worded name is a name AWS does not use.
+///
+/// The rows are spelled out in code order, but the ORDER the wire carries is
+/// computed by [`catalog`] rather than being a property of this table.
 pub const COUNTRIES: &[(&str, &str)] = &[
     (DEFAULT_COUNTRY_CODE, "Default"),
     ("AD", "Andorra"),
@@ -85,7 +96,7 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("AT", "Austria"),
     ("AU", "Australia"),
     ("AW", "Aruba"),
-    ("AX", "Aland Islands"),
+    ("AX", "Åland"),
     ("AZ", "Azerbaijan"),
     ("BA", "Bosnia and Herzegovina"),
     ("BB", "Barbados"),
@@ -96,11 +107,11 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("BH", "Bahrain"),
     ("BI", "Burundi"),
     ("BJ", "Benin"),
-    ("BL", "Saint Barthelemy"),
+    ("BL", "Saint Barthélemy"),
     ("BM", "Bermuda"),
     ("BN", "Brunei"),
     ("BO", "Bolivia"),
-    ("BQ", "Bonaire, Sint Eustatius and Saba"),
+    ("BQ", "Bonaire"),
     ("BR", "Brazil"),
     ("BS", "Bahamas"),
     ("BT", "Bhutan"),
@@ -109,12 +120,12 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("BY", "Belarus"),
     ("BZ", "Belize"),
     ("CA", "Canada"),
-    ("CC", "Cocos (Keeling) Islands"),
+    ("CC", "Cocos [Keeling] Islands"),
     ("CD", "Congo - Kinshasa"),
     ("CF", "Central African Republic"),
     ("CG", "Congo - Brazzaville"),
     ("CH", "Switzerland"),
-    ("CI", "Cote d'Ivoire"),
+    ("CI", "Côte d'Ivoire"),
     ("CK", "Cook Islands"),
     ("CL", "Chile"),
     ("CM", "Cameroon"),
@@ -122,8 +133,8 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("CO", "Colombia"),
     ("CR", "Costa Rica"),
     ("CU", "Cuba"),
-    ("CV", "Cabo Verde"),
-    ("CW", "Curacao"),
+    ("CV", "Cape Verde"),
+    ("CW", "Curaçao"),
     ("CX", "Christmas Island"),
     ("CY", "Cyprus"),
     ("CZ", "Czechia"),
@@ -258,7 +269,7 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("PW", "Palau"),
     ("PY", "Paraguay"),
     ("QA", "Qatar"),
-    ("RE", "Reunion"),
+    ("RE", "Réunion"),
     ("RO", "Romania"),
     ("RS", "Serbia"),
     ("RU", "Russia"),
@@ -279,7 +290,7 @@ pub const COUNTRIES: &[(&str, &str)] = &[
     ("SO", "Somalia"),
     ("SR", "Suriname"),
     ("SS", "South Sudan"),
-    ("ST", "Sao Tome and Principe"),
+    ("ST", "São Tomé and Príncipe"),
     ("SV", "El Salvador"),
     ("SX", "Sint Maarten"),
     ("SY", "Syria"),

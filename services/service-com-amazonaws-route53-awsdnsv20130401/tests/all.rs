@@ -84,6 +84,8 @@ mod hosted_zone_records;
 mod hosted_zones_by_name;
 #[path = "all/hosted_zones_by_vpc.rs"]
 mod hosted_zones_by_vpc;
+#[path = "all/reference_catalogs.rs"]
+mod reference_catalogs;
 #[path = "all/refusal_message_rules.rs"]
 mod refusal_message_rules;
 #[path = "all/record_name_canonical_form.rs"]

@@ -64,7 +64,10 @@ pub(crate) async fn reported_blocks(router: &MultiServiceRouter) -> Vec<String> 
 /// Written here, on `std::net::Ipv4Addr`, rather than reached from the crate under
 /// test: the expected order and the validity of each entry have to be computed
 /// independently of the code that produced them.
-fn parse_cidr(block: &str) -> Option<(u32, u8)> {
+///
+/// `pub(crate)` so the catalog-contents suite reads a block the same way rather
+/// than growing a third copy of this parser.
+pub(crate) fn parse_cidr(block: &str) -> Option<(u32, u8)> {
     let (address, prefix) = block.split_once('/')?;
     let address = u32::from(address.parse::<Ipv4Addr>().ok()?);
     let prefix: u8 = prefix.parse().ok()?;

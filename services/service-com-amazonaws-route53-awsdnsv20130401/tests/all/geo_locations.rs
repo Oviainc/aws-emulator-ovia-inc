@@ -83,9 +83,13 @@ const PUBLISHED_LOCATIONS: &[(&str, &str)] = &[
     ("US", "RI"),
 ];
 
-/// The published bound on a Route 53 listing's page: `ListHostedZones$MaxItems`
-/// ("If you specify a value greater than 100, Route 53 returns only the first
-/// 100"), which is the bound this service's listings share.
+/// The page bound Route 53 documents on the listings of its CALLER-OWNED
+/// resources: `ListHostedZones$MaxItems` ("If you specify a value greater than
+/// 100, Route 53 returns only the first 100").
+///
+/// This operation's own `MaxItems` documents no such bound, so 100 is just one
+/// row of the `maxitems` tables below; the rows past it are what assert that a
+/// larger `maxitems` really is honoured here.
 const PAGE_BOUND: i32 = 100;
 
 /// One `GeoLocationDetails` as the wire carried it.
@@ -94,13 +98,13 @@ const PAGE_BOUND: i32 = 100;
 /// types: what a client sees is the XML, and the kinds below are decided by which
 /// members that XML carries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Entry {
-    continent_code: Option<String>,
-    continent_name: Option<String>,
-    country_code: Option<String>,
-    country_name: Option<String>,
-    subdivision_code: Option<String>,
-    subdivision_name: Option<String>,
+pub(crate) struct Entry {
+    pub(crate) continent_code: Option<String>,
+    pub(crate) continent_name: Option<String>,
+    pub(crate) country_code: Option<String>,
+    pub(crate) country_name: Option<String>,
+    pub(crate) subdivision_code: Option<String>,
+    pub(crate) subdivision_name: Option<String>,
 }
 
 impl Entry {
@@ -166,7 +170,9 @@ fn element(block: &str, name: &str) -> Option<String> {
 /// responses. `<GeoLocationDetails>` cannot be confused with the
 /// `<GeoLocationDetailsList>` that wraps it, because the split is on the closing
 /// angle bracket too.
-fn entries(body: &str) -> Vec<Entry> {
+/// `pub(crate)` so the catalog-contents suite reads one response the same way
+/// rather than growing a second parser.
+pub(crate) fn entries(body: &str) -> Vec<Entry> {
     body.split("<GeoLocationDetails>")
         .skip(1)
         .map(|rest| {
@@ -190,7 +196,9 @@ fn entries(body: &str) -> Vec<Entry> {
 ///
 /// A 501 here means the operation is still a scaffold, which is exactly what the
 /// message says, so a regression to the stub reads as one.
-async fn list(router: &MultiServiceRouter, query: &str) -> Reply {
+/// `pub(crate)` so the catalog-contents suite calls the operation through the
+/// same reader.
+pub(crate) async fn list(router: &MultiServiceRouter, query: &str) -> Reply {
     let uri = if query.is_empty() {
         "/2013-04-01/geolocations".to_string()
     } else {
@@ -222,7 +230,10 @@ async fn walk(router: &MultiServiceRouter, page_size: Option<i32>) -> Vec<Entry>
         let query = query.join("&");
         let reply = list(router, &query).await;
         let page = entries(&reply.body);
-        let wanted = page_size.unwrap_or(PAGE_BOUND).clamp(1, PAGE_BOUND) as usize;
+        // "The maximum number of geolocations to be included in the response body
+        // for this request" — the request's own bound, and no bound at all when it
+        // names none.
+        let wanted = page_size.map_or(usize::MAX, |size| size.max(1) as usize);
         assert!(
             page.len() <= wanted,
             "case {query:?}: a page carries at most {wanted} location(s), got {}",
@@ -484,10 +495,11 @@ async fn a_page_is_bounded_by_maxitems_and_the_next_codes_resume_after_it() {
 #[tokio::test]
 async fn the_response_echoes_the_maxitems_the_request_asked_for() {
     // "The value that you specified for MaxItems in the request" — echoed as
-    // asked, including a value past the page bound, while the page itself stays
-    // bounded. The row with no `maxitems` at all reads back the bound that
-    // applied.
+    // asked, and the page bounded by that same value and by nothing else: this
+    // operation's `MaxItems` documents no bound of Route 53's own, so the rows
+    // past `PAGE_BOUND` are answered in full rather than cut to 100.
     let router = router();
+    let catalog = walk(&router, Some(50)).await.len();
     for asked in [1, 5, PAGE_BOUND, PAGE_BOUND + 1, 4_096] {
         let reply = list(&router, &format!("maxitems={asked}")).await;
         assert_eq!(
@@ -497,18 +509,58 @@ async fn the_response_echoes_the_maxitems_the_request_asked_for() {
             reply.first("MaxItems")
         );
         let page = entries(&reply.body);
-        assert!(
-            page.len() <= asked.clamp(1, PAGE_BOUND) as usize,
-            "case maxitems={asked}: a page is bounded by {PAGE_BOUND}, got {} location(s)",
+        let expected = (asked as usize).min(catalog);
+        assert_eq!(
+            page.len(),
+            expected,
+            "case maxitems={asked}: a page carries what was asked for, bounded only by the \
+             {catalog} location(s) left, got {} location(s)",
             page.len()
         );
+        let truncated = reply.first("IsTruncated");
+        assert_eq!(
+            truncated,
+            Some(if expected < catalog { "true" } else { "false" }),
+            "case maxitems={asked}: IsTruncated says whether a location follows the page of \
+             {expected} of {catalog}, got {truncated:?}"
+        );
     }
+}
+
+#[tokio::test]
+async fn a_request_naming_no_maxitems_reads_the_whole_catalog_in_one_page() {
+    // A `maxitems` the request does not name bounds nothing, so the one page
+    // carries every location, nothing follows it, and the `MaxItems` read back is
+    // the bound that did apply — the number of locations the catalog holds.
+    let router = router();
+    let whole = walk(&router, Some(50)).await;
 
     let reply = list(&router, "").await;
+    let page = entries(&reply.body);
+    assert_eq!(
+        page.len(),
+        whole.len(),
+        "case {:?}: the one page carries every location, got {} of {}",
+        "no maxitems",
+        page.len(),
+        whole.len()
+    );
+    assert_eq!(
+        page, whole,
+        "case {:?}: the one page carries the catalog in its one order",
+        "no maxitems"
+    );
+    assert_eq!(
+        reply.first("IsTruncated"),
+        Some("false"),
+        "case {:?}: nothing follows a page that carries the whole catalog, got body {}",
+        "no maxitems",
+        reply.body
+    );
     assert_eq!(
         reply.first("MaxItems"),
-        Some(PAGE_BOUND.to_string().as_str()),
-        "case {:?}: a request naming no maxitems reads back the bound that applied, got {:?}",
+        Some(whole.len().to_string().as_str()),
+        "case {:?}: the bound that applied is the catalog's own size, got {:?}",
         "no maxitems",
         reply.first("MaxItems")
     );
