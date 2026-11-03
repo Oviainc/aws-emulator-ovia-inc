@@ -91,23 +91,16 @@ pub fn settle_verifications(engine: &Arc<engine::InMemoryEngine>) {
 
 /// One awsQuery call: `(status, body)`.
 pub async fn call(router: &MultiServiceRouter, action: &str, params: &[Field]) -> (u16, String) {
-    let mut body = format!("Action={action}&Version={VERSION}");
-    for (name, value) in params {
-        body.push('&');
-        body.push_str(&form_encode(name));
-        body.push('=');
-        body.push_str(&form_encode(value));
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("http://localhost/")
-        .header("authorization", AUTHORIZATION)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(bytes::Bytes::from(body))
-        .expect("the request builds");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    (status, String::from_utf8_lossy(response.body()).into_owned())
+    let answer = call_keeping_headers(router, action, params).await;
+    (answer.status, answer.body)
+}
+
+/// How many times `needle` occurs in `text`.
+///
+/// Here rather than in one suite because every suite that asserts an envelope is ONE
+/// document counts the same way.
+pub fn occurrences(text: &str, needle: &str) -> usize {
+    text.matches(needle).count()
 }
 
 /// The header AWS reports a response's request id in, beside the `<RequestId>`

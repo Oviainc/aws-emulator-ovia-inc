@@ -48,7 +48,7 @@
 
 use crate::harness::{
     account, call, call_keeping_headers, element, emulator_and_engine, field, is_request_id,
-    settle_verifications, Field, REQUEST_ID_HEADER,
+    occurrences, settle_verifications, Field, REQUEST_ID_HEADER,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -64,11 +64,6 @@ struct Row {
     /// modelled enum, which the framework refuses and this service words — where the row
     /// pins only that a non-empty code is reported.
     code: Option<&'static str>,
-}
-
-/// How many times `needle` occurs in `text`.
-fn occurrences(text: &str, needle: &str) -> usize {
-    text.matches(needle).count()
 }
 
 /// The `CreateCustomVerificationEmailTemplate` form fields, every one of which the model

@@ -39,7 +39,7 @@
 //! stays in `<ResponseMetadata>`.
 
 use crate::harness::{
-    call_keeping_headers as call, element, emulator, field, is_request_id, Field,
+    call_keeping_headers as call, element, emulator, field, is_request_id, occurrences, Field,
     REQUEST_ID_HEADER,
 };
 
@@ -54,11 +54,6 @@ struct Row {
     /// service's wording for a refusal no model describes — the row then pins only that a
     /// non-empty code is reported.
     code: Option<&'static str>,
-}
-
-/// How many times `needle` occurs in `text`.
-fn occurrences(text: &str, needle: &str) -> usize {
-    text.matches(needle).count()
 }
 
 /// The `Template.*` form fields a template-plane write carries.
