@@ -45,3 +45,5 @@ mod state_roundtrip;
 mod support;
 #[path = "all/tag_and_untag_resource.rs"]
 mod tag_and_untag_resource;
+#[path = "all/update_investigation_state_pair_scope.rs"]
+mod update_investigation_state_pair_scope;
