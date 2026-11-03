@@ -45,6 +45,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// How this service words a boundary refusal. Private: it is reached through
+/// `override_refusal` below, not by a caller.
+mod validation;
+
 /// The `com-amazonaws-networkfirewall-networkfirewall-20201112` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -98,15 +102,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // This endpoint states such a refusal without the VALUE the caller sent, reports a
+        // constraint declared on the ELEMENTS of a collection member at that member with
+        // the element shape's whole constraint set, and enumerates an enumerated type's
+        // value set as the service accepts it. See `validation`, which owns those three
+        // rules; the envelope, the member paths and every requirement sentence stay the
+        // framework's, as does the error code, restated there because this seam replaces
+        // the code and the message together.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

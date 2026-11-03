@@ -51,3 +51,5 @@ mod state_roundtrip;
 mod subnet_associations;
 #[path = "all/subnet_disassociations.rs"]
 mod subnet_disassociations;
+#[path = "all/validation_refusal_wording.rs"]
+mod validation_refusal_wording;

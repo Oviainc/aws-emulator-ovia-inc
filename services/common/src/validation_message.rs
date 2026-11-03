@@ -987,23 +987,80 @@ pub fn aws_validation_refusal_over_elements_quoting(
     quote_pattern: impl Fn(&str) -> String,
     quoted_collection: impl Fn(&str) -> Option<String>,
 ) -> Option<Refused> {
+    // Nothing is withheld unless a service says so, exactly as for the ungrouped entry
+    // points: the model trait that decides it is not in the runtime schemas.
+    grouped_refusal(
+        refusal,
+        input_schemas,
+        &quote_pattern,
+        &quoted_collection,
+        &|_| false,
+    )
+}
+
+/// [`aws_validation_refusal_over_elements`], with the members whose value the refusal
+/// WITHHOLDS chosen by the caller — the one entry point that takes BOTH halves a service
+/// decides here: the grouping over a collection's elements, and the value half of every
+/// OTHER clause.
+///
+/// `withholds_value` is asked about a violation's member path and a clause it answers `true`
+/// for states no value at all — neither the submitted bytes nor the `null` the framework
+/// writes for an absent member — which is [`aws_validation_refusal_withholding`]'s rule, so a
+/// service whose refusals quote no value anywhere passes `|_| true`. A grouped clause states
+/// no value either way, so the two rules compose rather than overlap. Everything neither
+/// choice covers is the same body [`aws_validation_refusal_over_elements_quoting`] runs, so no
+/// combination can drift into a second envelope.
+pub fn aws_validation_refusal_over_elements_withholding(
+    refusal: &Refusal,
+    input_schemas: &[&'static Schema],
+    quote_pattern: impl Fn(&str) -> String,
+    withholds_value: impl Fn(&str) -> bool,
+) -> Option<Refused> {
+    grouped_refusal(
+        refusal,
+        input_schemas,
+        &quote_pattern,
+        &|_| None,
+        &withholds_value,
+    )
+}
+
+/// The ONE body behind both grouped entry points: the framework's envelope over the
+/// framework's clauses, with a violation at a list ELEMENT stated at the collection member
+/// carrying the element shape's whole set, and the value half dropped from a clause that
+/// states none (a collection's `@length`, or a member the caller withholds the value of).
+///
+/// LINEAR in the number of violations, which the walk itself bounds
+/// ([`restated_violations`]): each clause is decided once, and an identical clause is
+/// recognised through a set rather than by rescanning the clauses already collected.
+fn grouped_refusal(
+    refusal: &Refusal,
+    input_schemas: &[&'static Schema],
+    quote_pattern: &dyn Fn(&str) -> String,
+    quoted_collection: &dyn Fn(&str) -> Option<String>,
+    withholds_value: &dyn Fn(&str) -> bool,
+) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
-    let quote = &quote_pattern as &dyn Fn(&str) -> String;
     let mut clauses: Vec<String> = Vec::new();
     // Dedupe through a set rather than by scanning what is already collected, so the cost
     // stays linear in the clause count.
     let mut stated: HashSet<String> = HashSet::new();
-    for violation in &restated_violations(violations, quote) {
+    for violation in &restated_violations(violations, quote_pattern) {
         let clause = list_of_element(&violation.path)
             .and_then(|collection| {
                 element_set_clause(
                     collection,
                     input_schemas,
-                    quote,
+                    quote_pattern,
                     quoted_collection(collection).as_deref(),
                 )
+            })
+            .or_else(|| {
+                withholds_value(&violation.path)
+                    .then(|| valueless_clause(violation))
+                    .flatten()
             })
             .or_else(|| collection_length_clause(violation))
             .unwrap_or_else(|| violation.message());
