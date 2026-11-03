@@ -1424,7 +1424,8 @@ async fn a_rule_set_in_use_by_a_configuration_cannot_be_deleted() {
     }
 
     // Three configurations use it, then two, then one: the delete is refused each time, by
-    // name and by ARN alike, and the rule set is still there afterwards.
+    // name and by ARN alike, with the one in-use sentence whatever the number still
+    // referencing it, and the rule set is still there afterwards.
     let users = ["shared", "shared-user-0", "shared-user-1"];
     for (index, user) in users.iter().enumerate() {
         let still_using = users.len() - index;
@@ -1434,10 +1435,7 @@ async fn a_rule_set_in_use_by_a_configuration_cannot_be_deleted() {
                 "DeleteMatchmakingRuleSet",
                 json!({"Name": &probe}),
                 "InvalidRequestException",
-                &format!(
-                    "Rule set shared-rules is being used by {still_using} matchmaking \
-                     configurations and cannot be deleted."
-                ),
+                "Matchmaking rule set is still in use, cannot delete",
                 &format!("{still_using} configurations still using it"),
             )
             .await;

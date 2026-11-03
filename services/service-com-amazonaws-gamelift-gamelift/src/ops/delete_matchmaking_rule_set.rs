@@ -75,6 +75,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// What this operation answers when a matchmaking configuration still references the rule
+/// set the request named: the service's own sentence for that class, reporting the one
+/// thing the caller has to act on — the rule set is in use, so it cannot be deleted yet.
+///
+/// The WHOLE text is fixed. The refusal is about the rule set being referenced at all, not
+/// about any particular request or any particular referencing matchmaker, so nothing of
+/// the request (the name or ARN it supplied) and nothing of this service's state (which
+/// configurations reference it, or how many) has a slot in it: the sentence a client
+/// matches on and an operator reads is the same for every request that fails this way.
+const RULE_SET_IN_USE_MESSAGE: &str = "Matchmaking rule set is still in use, cannot delete";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -182,20 +193,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same Region", so removing the record would leave that matchmaker pointing at rules
         // nothing holds. The parameter names a resource that cannot be deleted YET, which is
         // the modelled `InvalidRequestException` ("one or more parameter values in the
-        // request are invalid"), and the rule set is left exactly as it was.
-        let used_by = state
+        // request are invalid"), carried with [`RULE_SET_IN_USE_MESSAGE`], and the rule set
+        // is left exactly as it was.
+        let in_use = state
             .matchmaking_configurations
             .values()
-            .filter(|configuration| configuration.rule_set_name == name)
-            .count();
-        if used_by > 0 {
+            .any(|configuration| configuration.rule_set_name == name);
+        if in_use {
             return Err(
                 DeleteMatchmakingRuleSetErrorModeled::InvalidRequestException(
                     InvalidRequestException {
-                        message: Some(format!(
-                            "Rule set {name} is being used by {used_by} matchmaking \
-                             configurations and cannot be deleted."
-                        )),
+                        message: Some(RULE_SET_IN_USE_MESSAGE.to_string()),
                     },
                 )
                 .into(),
