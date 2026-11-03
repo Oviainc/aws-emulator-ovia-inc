@@ -1,0 +1,54 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: bedrock.e2e-evaluation-job-runs-and-is-purged
+Issue-Shape-Id: com.amazonaws.bedrock#AmazonBedrockControlPlaneService
+Issue-Key: bedrock.e2e-evaluation-job-runs-and-is-purged|_poll_until#12|Timeout|time.sleep(interval_s)
+Issue-Commit: 693e56bfaa4159f6333ea367977c7471ac0df2f0
+
+# bedrock: a Completed automated evaluation job (QuestionAndAnswer / Builtin.BoolQ / Builtin.Accuracy) writes no result object under outputDataConfig.s3Uri, and the InProgress→Completed move is the only thing its run performs
+
+> _Note: this issue was identified against the code base at commit `693e56bfaa4159f6333ea367977c7471ac0df2f0`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateEvaluationJob
+
+## Description
+ONE net-new-grounded root cause on the Bedrock control plane's evaluation-job execution path, grounded in failing check bedrock.e2e-evaluation-job-runs-and-is-purged (the only failing check in this replay that is neither marked ALREADY FILED nor OWNED).
+
+Scope note, so this is not closed blind: the open issue 20261028T021122Z-bedrock-an-evaluation-job-reports-completed-but-performs.md describes the same execution-path defect but carries ONLY bedrock.e2e-evaluation-job-with-guardrail-results-teardown in its Issue-Trace-Ids / replay key, so this check is not covered by its replay gate. If that issue's fix lands, re-replay this check as well; this issue exists so the QuestionAndAnswer/Builtin.BoolQ/Builtin.Accuracy grounding is not closed unrun.
+
+Cause 1 of 1: an automated evaluation job submitted by CreateEvaluationJob is a status record and nothing else. It never runs the configured datasetMetricConfigs against the model named in inferenceConfig, never writes a single object under outputDataConfig.s3Uri, and still advances to status 'Completed' purely on a stored due-instant.
+
+AWS: Smithy com.amazonaws.bedrock#CreateEvaluationJob (POST /evaluation-jobs, 202) requires outputDataConfig -> EvaluationOutputDataConfig, documented as "The Amazon S3 location where the results of your evaluation job are saved" / s3Uri "The Amazon S3 URI where the results of the evaluation job are saved", and requires evaluationConfig -> AutomatedEvaluationConfig.datasetMetricConfigs (EvaluationDatasetMetricConfig: required taskType, dataset, metricNames — here taskType=QuestionAndAnswer, dataset Builtin.BoolQ, metric Builtin.Accuracy) plus inferenceConfig naming the evaluated model. GetEvaluationJob.status is EvaluationJobStatus = [InProgress, Completed, Failed, Stopping, Stopped, Deleting]. A job AWS reports 'Completed' has run the dataset through the model, scored the configured metrics and left result objects under the output prefix (so ListObjectsV2 over that prefix has KeyCount > 0); a run that cannot produce results takes the 'Failed' path with failureMessages, which the model bounds at 20 entries.
+
+Emulator: CreateEvaluationJob validates the request, performs the iam:PassRole decision, mints a job id/ARN and stores an EvaluationJobRecord holding identity, roleArn, key id, applicationType, job type, the ECHOED evaluationConfig/inferenceConfig/outputDataConfig, tags, status='InProgress' and the due-instants for the Completed/Stopped/deleted transitions (services/service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice/src/ops/create_evaluation_job.rs:319-353). Nothing on that path, and nothing in the clock-driven materialisation of 'Completed' (EVALUATION_JOB_COMPLETE_AFTER = 3s, state.rs), opens the dataset, invokes the model, scores a metric, or PUTs any object under outputDataConfig.s3Uri — the handler's own doc comment states 'the clock owes that non-terminal status its move to Completed', which is the entire run. Replay symptom for this check: 'Error: Check timed out after 60.0s'. The check probes GetEvaluationJob immediately (job still 'InProgress' for the first 3s of emulator time) and then waits on its own 60s poll interval, so the 60s check budget expires before the status flip is observed; the assertion it is heading for, `assert listed.get("KeyCount", 0) > 0, "expected retrievable evaluation output objects in S3"` over Prefix=eval-output/, is unsatisfiable against this emulator regardless, because the completion writes nothing. Not claimed here: the check's later purge assertions (BatchDeleteEvaluationJob errors==[] and its bare-job-id echo, GetEvaluationJob answering ResourceNotFoundException after the purge, absence from ListEvaluationJobs) were never reached in this replay, so nothing is asserted about them.
+
+Why: for an evaluation job the RESULT is the S3 output, not the response body. A client that waits for 'Completed' and then reads its report out of the output prefix finds nothing there — parsing the per-metric jsonl report, reading accuracy scores, comparing two models, or gating a release on Builtin.Accuracy all silently process zero rows instead of failing loudly, and a job that did no work is indistinguishable from a job that evaluated the whole dataset. A caller also cannot tell a successful evaluation from a broken one, because the 'Failed' + failureMessages path is never minted.
+
+Fix: the evaluation-job execution step of this crate — the CreateEvaluationJob handler's submission plus the EvaluationJobRecord and the settle/clock path in state.rs that moves the job to a terminal status. The move into 'Completed' must actually run the configured datasetMetricConfigs against the model named in inferenceConfig and write the result objects under outputDataConfig.s3Uri, so that a job reported 'Completed' has output agreeing with its configuration; a job whose dataset, model or output location cannot be used must take the modelled 'Failed' path with failureMessages instead of reporting 'Completed' with nothing done.
+
+Traces: failing check bedrock.e2e-evaluation-job-runs-and-is-purged (GROUP state-machine). Code for the fixer: services/service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice/src/ops/create_evaluation_job.rs:319-362 (the stored record — no dataset read, no inference, no S3 write) and the EvaluationJobRecord / EVALUATION_JOB_COMPLETE_AFTER clock in services/service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice/src/state.rs:~624-680 (the status move is the only thing completion performs).
+
+## Evidence
+Expected (AWS / Smithy): CreateEvaluationJob with roleArn=<bedrock-assumable role>, evaluationConfig.automated.datasetMetricConfigs=[{taskType:"QuestionAndAnswer", dataset:{name:"Builtin.BoolQ"}, metricNames:["Builtin.Accuracy"]}], inferenceConfig.models=[{bedrockModel:{modelIdentifier:"arn:aws:bedrock:<region>::foundation-model/amazon.nova-lite-v1:0"}}] and outputDataConfig.s3Uri="s3://<bucket>/eval-output/" is accepted 202 with a jobArn; GetEvaluationJob polls InProgress -> Completed, and once Completed, ListObjectsV2(Bucket=<bucket>, Prefix="eval-output/") returns KeyCount > 0 (the scored result objects). Smithy: CreateEvaluationJob.outputDataConfig (required) -> EvaluationOutputDataConfig.s3Uri (required) "The Amazon S3 URI where the results of the evaluation job are saved"; GetEvaluationJob.status -> EvaluationJobStatus = [InProgress, Completed, Failed, Stopping, Stopped, Deleting], with failureMessages for the Failed path.
+
+Actual (emulator), replay output for bedrock.e2e-evaluation-job-runs-and-is-purged [mismatch]:
+
+  Error: Check timed out after 60.0s
+
+The bucket, the IAM role and the job itself are all accepted (no error code is raised before the timeout), and the job's completion is a pure status flip: services/service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice/src/ops/create_evaluation_job.rs:321-345 stores arn/name/region/description/role_arn/customer_encryption_key_id/application_type/job_type/evaluation_config/inference_config/output_data_config/tags/status=InProgress/completed_due_at/stopped_due_at/deleted_due_at/created_at/last_modified_at and nothing else, and state.rs's EVALUATION_JOB_COMPLETE_AFTER (3s) only materialises status='Completed' on the next call that reads the record. No code path between submission and 'Completed' reads the dataset, invokes the model named in inferenceConfig, scores a metric, or PUTs an object under outputDataConfig.s3Uri — so the check's `KeyCount > 0` assertion over Prefix="eval-output/" cannot be satisfied, and no 'Failed'/failureMessages path is minted either.
+
+Not attributed to the emulator here: the exact 60s wall-clock budget interacting with the check's own 60s poll interval is a harness cadence detail (the per-run timing value itself is not a requirement); the filed defect is the empty output of a job the emulator reports Completed, which is a property of the emulator's state machine and is visible in the source above.
+
+Related open issue naming the same execution-path cause from a different grounding: 20261028T021122Z-bedrock-an-evaluation-job-reports-completed-but-performs.md (its replay key names only bedrock.e2e-evaluation-job-with-guardrail-results-teardown).
+
+## Steps to Reproduce
+1. git_clone the repo and let the behavioral suite build and boot the emulator; re-replay bedrock.e2e-evaluation-job-runs-and-is-purged.
+2. CreateBucket (with CreateBucketConfiguration.LocationConstraint outside us-east-1) and PutBucketTagging on a fresh bucket.
+3. CreateRole with a trust policy allowing bedrock.amazonaws.com to sts:AssumeRole (Condition aws:SourceAccount = the caller's account) and PutRolePolicy granting s3:PutObject/GetObject/ListBucket on that bucket plus bedrock:InvokeModel/GetFoundationModel; GetRole for its ARN.
+4. CreateEvaluationJob with that roleArn, evaluationConfig.automated.datasetMetricConfigs=[{taskType:"QuestionAndAnswer", dataset:{name:"Builtin.BoolQ"}, metricNames:["Builtin.Accuracy"]}], inferenceConfig.models=[{bedrockModel:{modelIdentifier:"arn:aws:bedrock:<region>::foundation-model/amazon.nova-lite-v1:0"}}], outputDataConfig.s3Uri="s3://<bucket>/eval-output/". Observe 202 + jobArn.
+5. Poll GetEvaluationJob(jobIdentifier=<jobArn>) until the status is terminal. Observe 'Completed' (the emulator flips it off a stored due instant a few seconds after creation).
+6. ListObjectsV2(Bucket=<bucket>, Prefix="eval-output/"). Expected: KeyCount > 0 — the scored evaluation result objects. Observed: nothing under the prefix; the Completed job wrote no output at all.
+7. (Checked by the same check once step 6 is satisfiable, not asserted here) BatchDeleteEvaluationJob(jobIdentifiers=[<jobArn>]) returns errors==[] and echoes the bare job id, GetEvaluationJob then answers ResourceNotFoundException and ListEvaluationJobs no longer lists the jobArn.
+8. Clean up: StopEvaluationJob if still running, empty and delete the bucket, delete the role policy and role.
