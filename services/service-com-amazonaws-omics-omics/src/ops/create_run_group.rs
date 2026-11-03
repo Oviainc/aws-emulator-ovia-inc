@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRunGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRunGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRunGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a run group and PERSISTS it in [`crate::state`]: this handler mints the
+//! numeric id and the ARN, stores the name, the caps and the tags the request carried,
+//! and answers from that record. `requestId` is this operation's `@idempotencyToken`, so
+//! a replay of the same token answers with the group the first call created instead of
+//! minting a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +164,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRunGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRunGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRunGroup"))
+        // Every string length and pattern on this input, and the 1..100000 range on each
+        // of the four caps, are modelled constraints the centralized walk has already
+        // refused anything outside of. The `tags` map carries NO modelled length, so its
+        // bound is checked here, under the one rule every tag-storing operation in this
+        // crate applies.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            CreateRunGroupErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics run group registry is unavailable".to_string(),
+            })
+        })?;
+
+        if let Some(why) = crate::state::tag_bounds_rejection(input.tags.as_ref()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                None,
+            );
+            return Err(CreateRunGroupErrorModeled::ValidationException(
+                ValidationException { message: why },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now_ms = crate::state::now_epoch_millis();
+
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // A replayed idempotency token answers with the group the first call created:
+        // same id, same ARN, same tags. `requestId` is `@required`, so every request
+        // carries one and every create through this operation is deduped.
+        if let Some(key) = registry.replayed(
+            crate::state::IdempotencyScope::CreateRunGroup,
+            &input.request_id,
+        ) {
+            let group = registry.run_groups.get(&key).ok_or_else(|| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::StoreUnavailable,
+                    None,
+                );
+                CreateRunGroupErrorModeled::InternalServerException(InternalServerException {
+                    message: "the run group this requestId created is no longer held".to_string(),
+                })
+            })?;
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NoChange,
+                Some(&group.id),
+            );
+            return Ok(reported(group));
+        }
+
+        // The registry is finite: a create that would take it past its cap is refused
+        // rather than growing it, the way the service refuses one past its quota.
+        if registry.run_groups.len() >= crate::state::MAX_RUN_GROUPS {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::QuotaExceeded,
+                None,
+            );
+            return Err(CreateRunGroupErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} run groups",
+                        crate::state::MAX_RUN_GROUPS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let (key, id) = registry.next_run_group_id();
+        let group = crate::state::RunGroup {
+            arn: crate::state::run_group_arn(&region, &id),
+            id: id.clone(),
+            name: input.name,
+            // A cap the request omitted stays unset: the group then caps that resource
+            // not at all, which is not the same as capping it at zero.
+            max_cpus: input.max_cpus,
+            max_runs: input.max_runs,
+            max_duration: input.max_duration,
+            max_gpus: input.max_gpus,
+            creation_time_ms: now_ms,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+        let response = reported(&group);
+        registry.run_groups.insert(key, group);
+        registry.remember(
+            crate::state::IdempotencyScope::CreateRunGroup,
+            input.request_id,
+            key,
+        );
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::RunGroupCreated,
+            Some(&id),
+        );
+
+        Ok(response)
+    }
+}
+
+/// This operation's response for `group`, read from the stored record alone, so a fresh
+/// create and a replayed `requestId` answer with exactly the same members.
+fn reported(group: &crate::state::RunGroup) -> CreateRunGroupOutput {
+    CreateRunGroupOutput {
+        arn: Some(group.arn.clone()),
+        id: Some(group.id.clone()),
+        tags: group.tags_output(),
     }
 }

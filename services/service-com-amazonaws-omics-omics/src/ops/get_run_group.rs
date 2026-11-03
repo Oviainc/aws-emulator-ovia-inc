@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRunGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRunGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRunGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the run group `CreateRunGroup` stored, read from [`crate::state`] alone: its
+//! ARN, id, name, caps, creation time and tags. Reporting only — nothing about the
+//! stored record changes here, so two reads of one group answer identically. An id this
+//! emulator holds no group for is answered with the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +157,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRunGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRunGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRunGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            GetRunGroupErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics run group registry is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        let group = registry.run_group(&input.id).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.id),
+            );
+            GetRunGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("no run group with id {} exists in this region", input.id),
+            })
+        })?;
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::Reported,
+            Some(&group.id),
+        );
+
+        Ok(GetRunGroupOutput {
+            arn: Some(group.arn.clone()),
+            id: Some(group.id.clone()),
+            name: group.name.clone(),
+            // A cap the create left unset is reported unset, not as a zero the group
+            // never enforced.
+            max_cpus: group.max_cpus,
+            max_runs: group.max_runs,
+            max_duration: group.max_duration,
+            max_gpus: group.max_gpus,
+            creation_time: Some(crate::state::timestamp(group.creation_time_ms)),
+            tags: group.tags_output(),
+        })
     }
 }

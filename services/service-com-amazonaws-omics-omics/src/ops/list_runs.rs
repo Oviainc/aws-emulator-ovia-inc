@@ -7,9 +7,10 @@
 //! sees the same value `GetRun` reports) and writes nothing else. A run `DeleteRun`
 //! removed is gone from the store, so it cannot appear here.
 //!
-//! A `batchId` or `runGroupId` filter is REFUSED rather than answered with an empty page:
-//! run batches and run groups are their own resources and their creates are still 501
-//! here, so neither exists and an empty 200 would read as "it exists and has no runs".
+//! A `runGroupId` filter narrows the listing to the runs that joined that group, and a
+//! `batchId` filter is REFUSED rather than answered with an empty page: a run batch is its
+//! own resource whose create is still 501 here, so none exists and an empty 200 would read
+//! as "it exists and has no runs". An id no run group carries is refused the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -225,34 +226,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now_ms);
 
-        // A `batchId` names a run batch and a `runGroupId` names a run group. Both are
-        // their own resources, and their creates (`StartRunBatch`, `CreateRunGroup`) are
-        // still 501 in this crate, so neither exists and no stored run can belong to one
-        // — `StartRun` refuses both members for the same reason. The filter is refused
-        // the same way: an empty 200 page would read as "the batch/group exists and has
-        // no runs".
-        for (member, resource, value) in [
-            ("batchId", "run batch", input.batch_id.as_deref()),
-            ("runGroupId", "run group", input.run_group_id.as_deref()),
-        ] {
-            if let Some(value) = value {
-                crate::state::audit(
-                    Self::NAME,
-                    ctx,
-                    crate::state::AuditOutcome::NotFound,
-                    Some(value),
-                );
-                return Err(ListRunsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "{member} names {resource} {value}, which does not exist in this \
-                             region; {resource}s are not emulated yet"
-                        ),
-                    },
-                )
-                .into());
-            }
+        // A `batchId` names a run batch, whose create (`StartRunBatch`) is still a 501 in
+        // this crate, so no stored run can belong to one — `StartRun` refuses that member
+        // for the same reason. The filter is refused rather than answered with an empty
+        // 200 page, which would read as "the batch exists and has no runs".
+        if let Some(value) = input.batch_id.as_deref() {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(value),
+            );
+            return Err(ListRunsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "batchId names run batch {value}, which does not exist in this \
+                         region; run batches are not emulated yet"
+                    ),
+                },
+            )
+            .into());
         }
+
+        // A `runGroupId` names a run group, which this crate holds: an id no group carries
+        // is "not found" rather than an empty page, and one that resolves narrows the
+        // listing to the runs that joined that group. The group's CANONICAL id is what the
+        // comparison uses, so the filter is insensitive to the spelling of a `^[0-9]+$` id
+        // in exactly the way every other lookup is.
+        let run_group_id = match input.run_group_id.as_deref() {
+            Some(requested) => Some(
+                store
+                    .run_group(requested)
+                    .map(|group| group.id.clone())
+                    .ok_or_else(|| {
+                        crate::state::audit(
+                            Self::NAME,
+                            ctx,
+                            crate::state::AuditOutcome::NotFound,
+                            Some(requested),
+                        );
+                        ListRunsErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: format!(
+                                    "no run group with id {requested} exists in this region"
+                                ),
+                            },
+                        )
+                    })?,
+            ),
+            None => None,
+        };
 
         // Reserve no more than the store can actually yield.
         let mut items = Vec::with_capacity(page_size.min(store.runs.len()));
@@ -265,7 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && input
                     .status
                     .as_deref()
-                    .is_none_or(|status| run.status == status);
+                    .is_none_or(|status| run.status == status)
+                && run_group_id
+                    .as_deref()
+                    .is_none_or(|group| run.run_group_id.as_deref() == Some(group));
             if !kept {
                 continue;
             }

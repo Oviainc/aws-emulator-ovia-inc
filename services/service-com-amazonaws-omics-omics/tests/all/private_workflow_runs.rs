@@ -173,11 +173,11 @@ async fn list_workflows(router: &MultiServiceRouter, query: &str) -> (u16, Value
     call(router, "GET", &format!("/workflow{query}"), None).await
 }
 
-async fn start_run(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+pub(crate) async fn start_run(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "POST", "/run", Some(body)).await
 }
 
-async fn get_run(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn get_run(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/run/{id}"), None).await
 }
 
@@ -185,7 +185,7 @@ async fn delete_run(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "DELETE", &format!("/run/{id}"), None).await
 }
 
-async fn list_runs(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
+pub(crate) async fn list_runs(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
     call(router, "GET", &format!("/run{query}"), None).await
 }
 
@@ -289,7 +289,7 @@ pub(crate) fn assert_absent(case: &str, members: &[&str], actual: &Value) {
 }
 
 /// The `items` list of a 200 List response, after asserting the status.
-fn items(case: &str, status: u16, body: &Value) -> Vec<Value> {
+pub(crate) fn items(case: &str, status: u16, body: &Value) -> Vec<Value> {
     assert_eq!(status, 200, "case {case:?}: expected 200, got {body:?}");
     body.get("items")
         .and_then(Value::as_array)
@@ -888,7 +888,7 @@ async fn a_workflow_settles_to_active_on_the_clock() {
 // ---------------------------------------------------------------------------
 
 /// Create a workflow that must succeed, and return its id.
-async fn workflow_for_runs(router: &MultiServiceRouter, request_id: &str) -> String {
+pub(crate) async fn workflow_for_runs(router: &MultiServiceRouter, request_id: &str) -> String {
     let (status, body) = create_workflow(
         router,
         &json!({
@@ -1375,7 +1375,7 @@ fn run_cases() -> Vec<RunCase> {
 }
 
 /// A `StartRun` body: the three members every row needs, plus the row's own.
-fn start_run_body(workflow_id: &str, request_id: &str, extra: &Value) -> Value {
+pub(crate) fn start_run_body(workflow_id: &str, request_id: &str, extra: &Value) -> Value {
     let mut body = Map::new();
     body.insert("workflowId".to_string(), json!(workflow_id));
     body.insert("roleArn".to_string(), json!(ROLE_ARN));

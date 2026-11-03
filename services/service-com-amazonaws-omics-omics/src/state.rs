@@ -5,9 +5,10 @@
 //! This slice holds the service's primary resources: the **private workflow**
 //! (`CreateWorkflow` / `GetWorkflow` / `ListWorkflows` / `DeleteWorkflow`), the
 //! **versions** of that workflow (`CreateWorkflowVersion` / `GetWorkflowVersion`), the
-//! **run** started from it (`StartRun` / `GetRun` / `ListRuns` / `DeleteRun`) and the
-//! **sequence store** that holds read sets (`CreateSequenceStore` /
-//! `GetSequenceStore`). Each resource is stored exactly once, keyed by the numeric id
+//! **run** started from it (`StartRun` / `GetRun` / `ListRuns` / `DeleteRun`), the
+//! **run group** that caps the compute those runs may use (`CreateRunGroup` /
+//! `GetRunGroup`) and the **sequence store** that holds read sets
+//! (`CreateSequenceStore` / `GetSequenceStore`). Each resource is stored exactly once, keyed by the numeric id
 //! the model's `^[0-9]+$` patterns describe (a version by its name, inside its
 //! workflow's record), so every operation reads and writes the one record.
 //!
@@ -47,6 +48,9 @@ pub const RUN_ARN_RESOURCE_PREFIX: &str = "run/";
 /// The resource portion a sequence store ARN carries before its id.
 pub const SEQUENCE_STORE_ARN_RESOURCE_PREFIX: &str = "sequenceStore/";
 
+/// The resource portion a run group ARN carries before its id.
+pub const RUN_GROUP_ARN_RESOURCE_PREFIX: &str = "runGroup/";
+
 /// The first id either counter mints.
 ///
 /// The modelled `WorkflowId` / `RunId` are `^[0-9]+$` with length 1..18, so any
@@ -62,6 +66,13 @@ pub const FIRST_RESOURCE_ID: u64 = 1_000_000;
 /// `GetRun`) would then resolve to an unrelated record instead of answering "not found",
 /// masking the mistake. Offsetting the run counter makes that mix-up visible.
 pub const RUN_ID_OFFSET: u64 = 500_000;
+
+/// How far above [`FIRST_RESOURCE_ID`] the run group counter starts, for the same
+/// reason [`RUN_ID_OFFSET`] exists: a run group id handed to `GetRun` (or a run id
+/// handed to `GetRunGroup`) resolves to nothing and is answered "not found" instead of
+/// reaching an unrelated record. The three offsets are far enough apart that no store
+/// can reach another's range under the caps below.
+pub const RUN_GROUP_ID_OFFSET: u64 = 250_000;
 
 /// `WorkflowStatus` a freshly created private workflow carries, from the modelled
 /// `WorkflowStatus` enum.
@@ -238,6 +249,11 @@ pub const MAX_WORKFLOW_VERSIONS: usize = 100;
 /// with the modelled `ServiceQuotaExceededException`.
 pub const MAX_SEQUENCE_STORES: usize = 500;
 
+/// The most run groups this emulator will hold. Emulator resource guard, not an AWS
+/// quota. A create past it is refused with the modelled
+/// `ServiceQuotaExceededException`.
+pub const MAX_RUN_GROUPS: usize = 500;
+
 /// The most tags one workflow or run may carry.
 ///
 /// From the `tags` member's own documentation on `CreateWorkflow`: "You can define
@@ -249,7 +265,8 @@ pub const MAX_TAGS: usize = 50;
 /// Emulator resource guard: the map is keyed by caller-supplied `requestId`, so it
 /// is capped at one entry per resource either store can hold, and a token whose
 /// resource is gone is reclaimed with it.
-pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_WORKFLOWS + MAX_RUNS + MAX_SEQUENCE_STORES;
+pub const MAX_IDEMPOTENCY_TOKENS: usize =
+    MAX_WORKFLOWS + MAX_RUNS + MAX_SEQUENCE_STORES + MAX_RUN_GROUPS;
 
 /// One stored private workflow: every member `GetWorkflow` reports.
 #[derive(Debug, Clone, Default)]
@@ -597,6 +614,35 @@ impl Run {
     }
 }
 
+/// One stored run group: every member `GetRunGroup` reports.
+///
+/// A run group carries no status member in the model — `CreateRunGroup` answers with the
+/// group's ARN, id and tags and nothing is provisioned for it — so no record here owes
+/// the clock a transition.
+#[derive(Debug, Clone, Default)]
+pub struct RunGroup {
+    /// The decimal numeric id: this record's store key, rendered.
+    pub id: String,
+    pub arn: String,
+    pub name: Option<String>,
+    /// The caps the group enforces on the runs added to it, exactly as the request set
+    /// them; a cap the request omitted is unset, which is the group not capping that
+    /// resource at all rather than capping it at zero.
+    pub max_cpus: Option<i32>,
+    pub max_runs: Option<i32>,
+    pub max_duration: Option<i32>,
+    pub max_gpus: Option<i32>,
+    pub creation_time_ms: i64,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl RunGroup {
+    /// `tags` as the wire shapes want it: omitted when none were ever set.
+    pub fn tags_output(&self) -> Option<HashMap<String, String>> {
+        tags_output(&self.tags)
+    }
+}
+
 /// Whether `status` is one a run stays in until something other than the clock moves
 /// it, from [`TERMINAL_RUN_STATUSES`].
 pub fn is_terminal_run_status(status: &str) -> bool {
@@ -620,6 +666,7 @@ pub enum IdempotencyScope {
     CreateWorkflow,
     StartRun,
     CreateSequenceStore,
+    CreateRunGroup,
 }
 
 /// Per-service state for com-amazonaws-omics-omics. A handler reaches it through
@@ -634,6 +681,8 @@ pub struct ComAmazonawsOmicsOmicsState {
     /// Every sequence store, keyed by its numeric id, in creation order for the same
     /// reason.
     pub sequence_stores: BTreeMap<u64, SequenceStore>,
+    /// Every run group, keyed by its numeric id, in creation order for the same reason.
+    pub run_groups: BTreeMap<u64, RunGroup>,
     /// `(operation, requestId)` -> the numeric id of the resource that request
     /// created, so a replayed `@idempotencyToken` answers with the original resource
     /// instead of minting a second one.
@@ -641,6 +690,7 @@ pub struct ComAmazonawsOmicsOmicsState {
     next_workflow_id: u64,
     next_run_id: u64,
     next_sequence_store_id: u64,
+    next_run_group_id: u64,
 }
 
 impl ComAmazonawsOmicsOmicsState {
@@ -681,6 +731,11 @@ impl ComAmazonawsOmicsOmicsState {
         self.sequence_stores.get(&numeric_id(id)?)
     }
 
+    /// The run group the modelled `RunGroupId` `id` names, or `None`.
+    pub fn run_group(&self, id: &str) -> Option<&RunGroup> {
+        self.run_groups.get(&numeric_id(id)?)
+    }
+
     /// Mint the next workflow id, as the decimal string the model's pattern wants
     /// and the numeric key the store is ordered by.
     pub fn next_workflow_id(&mut self) -> (u64, String) {
@@ -705,6 +760,16 @@ impl ComAmazonawsOmicsOmicsState {
         (key, key.to_string())
     }
 
+    /// Mint the next run group id, the same way, from a counter offset by
+    /// [`RUN_GROUP_ID_OFFSET`] so no run group shares an id with a workflow or a run.
+    /// The modelled `RunGroupId` is `^[0-9]+$` with length 1..18, which every value this
+    /// mints satisfies.
+    pub fn next_run_group_id(&mut self) -> (u64, String) {
+        let key = FIRST_RESOURCE_ID + RUN_GROUP_ID_OFFSET + self.next_run_group_id;
+        self.next_run_group_id += 1;
+        (key, key.to_string())
+    }
+
     /// The resource a replayed `requestId` already created, if this emulator still
     /// holds it. A token whose resource has since been deleted is forgotten, so the
     /// same `requestId` can create a fresh one — the service cannot answer with a
@@ -716,6 +781,7 @@ impl ComAmazonawsOmicsOmicsState {
             IdempotencyScope::CreateWorkflow => self.workflows.contains_key(&id),
             IdempotencyScope::StartRun => self.runs.contains_key(&id),
             IdempotencyScope::CreateSequenceStore => self.sequence_stores.contains_key(&id),
+            IdempotencyScope::CreateRunGroup => self.run_groups.contains_key(&id),
         };
         if still_held {
             return Some(id);
@@ -734,10 +800,12 @@ impl ComAmazonawsOmicsOmicsState {
             let workflows = &self.workflows;
             let runs = &self.runs;
             let sequence_stores = &self.sequence_stores;
+            let run_groups = &self.run_groups;
             self.idempotency.retain(|key, id| match key.0 {
                 IdempotencyScope::CreateWorkflow => workflows.contains_key(id),
                 IdempotencyScope::StartRun => runs.contains_key(id),
                 IdempotencyScope::CreateSequenceStore => sequence_stores.contains_key(id),
+                IdempotencyScope::CreateRunGroup => run_groups.contains_key(id),
             });
         }
         if self.idempotency.len() < MAX_IDEMPOTENCY_TOKENS {
@@ -831,6 +899,18 @@ pub fn workflow_version_arn(region: &str, workflow_id: &str, version_name: &str)
 /// The ARN of the run `id` in `region`.
 pub fn run_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("{RUN_ARN_RESOURCE_PREFIX}{id}"))
+}
+
+/// The ARN of the run group `id` in `region`.
+///
+/// Well inside the modelled `RunGroupArn` length (1..128): the account and region are
+/// fixed and the id is at most 18 characters.
+pub fn run_group_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{RUN_GROUP_ARN_RESOURCE_PREFIX}{id}"),
+    )
 }
 
 /// The ARN of the sequence store `id` in `region`.
@@ -1077,6 +1157,8 @@ pub enum AuditOutcome {
     RunDeleted,
     /// A sequence store was minted and stored.
     SequenceStoreCreated,
+    /// A run group was minted and stored.
+    RunGroupCreated,
     /// A replayed `@idempotencyToken` changed nothing and answered with the resource the
     /// first call created.
     NoChange,
@@ -1108,6 +1190,7 @@ impl AuditOutcome {
             Self::RunStarted => "run-started",
             Self::RunDeleted => "run-deleted",
             Self::SequenceStoreCreated => "sequence-store-created",
+            Self::RunGroupCreated => "run-group-created",
             Self::NoChange => "no-change",
             Self::Reported => "reported",
             Self::ValidationRefused => "validation-refused",
